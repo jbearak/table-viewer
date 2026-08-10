@@ -63,6 +63,7 @@ import {
     type ThemeSetting,
 } from './theme';
 import { notices_file_path } from './notices-path';
+import { save_open_window_paths, take_open_window_paths } from './window-restoration';
 import { REPOSITORY_URL, about_link_url } from './about-links';
 import { clamp_zoom_level } from './zoom';
 import {
@@ -104,6 +105,15 @@ declare const __APP_VERSION__: string;
 function is_supported_file(file_path: string): boolean {
     const ext = path.extname(file_path).toLowerCase().replace(/^\./, '');
     return SUPPORTED_FILE_EXTENSIONS.some((supported) => supported === ext);
+}
+
+function can_restore_file(file_path: string): boolean {
+    if (!is_supported_file(file_path)) return false;
+    try {
+        return fs.statSync(file_path).isFile();
+    } catch {
+        return false;
+    }
 }
 
 /** File arguments from a command line (drop flags and the electron/app paths).
@@ -191,12 +201,27 @@ const quit_shutdown: AppQuitShutdownPort = {
 // Constructed at module scope, before either the window manager or the state
 // backend exists, so every dependency is read through a closure over a mutable
 // module binding rather than captured now.
+let quitting_viewer_files: string[] = [];
 const coordinate_app_quit = create_app_quit_coordinator(
-    () => close_desktop_windows(
-        () => viewer_windows?.close_all() ?? Promise.resolve(true),
-        () => BrowserWindow.getAllWindows(),
-    ),
-    () => app.quit(),
+    () => {
+        quitting_viewer_files = viewer_windows?.open_file_paths() ?? [];
+        return close_desktop_windows(
+            () => viewer_windows?.close_all() ?? Promise.resolve(true),
+            () => BrowserWindow.getAllWindows(),
+        );
+    },
+    () => {
+        try {
+            save_open_window_paths(app.getPath('userData'), quitting_viewer_files);
+        } catch {
+            try {
+                console.error('Table Viewer could not remember its open windows while quitting.');
+            } catch {
+                // Reporting is best-effort; persistence must never prevent quit.
+            }
+        }
+        app.quit();
+    },
     quit_shutdown,
 );
 
@@ -1003,7 +1028,10 @@ if (!got_lock) {
         // window.
         submit_window_request({
             kind: 'startup',
-            files: file_args(process.argv.slice(app.isPackaged ? 1 : 2)),
+            files: [
+                ...take_open_window_paths(user_data_dir, can_restore_file),
+                ...file_args(process.argv.slice(app.isPackaged ? 1 : 2)),
+            ],
         });
     }
 

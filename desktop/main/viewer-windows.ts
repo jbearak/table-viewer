@@ -50,6 +50,7 @@ import {
 } from './window-geometry';
 
 interface ViewerWindow {
+    readonly filePath: string;
     readonly fileKey: string;
     readonly window: BrowserWindow;
     readonly panel: DesktopViewerPanel;
@@ -326,6 +327,12 @@ export class ViewerWindowManager {
     /** Open windows in the order they were created (the last one is cascaded
      *  from when the next window opens). */
     private readonly windows: ViewerWindow[] = [];
+
+    open_file_paths(): string[] {
+        return this.windows
+            .filter((entry) => !entry.window.isDestroyed())
+            .map((entry) => entry.filePath);
+    }
     /** Source of `ViewerWindow.resize_seq`; monotonic across all windows. */
     private resize_counter = 0;
     /** The sequence behind the size currently stored, so a write from an older
@@ -556,6 +563,7 @@ export class ViewerWindowManager {
         };
 
         const entry: ViewerWindow = {
+            filePath: file_path,
             fileKey: file_key,
             window,
             panel,

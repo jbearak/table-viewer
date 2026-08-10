@@ -1,12 +1,11 @@
 // Packaged desktop relaunch gates (plan: "Packaged macOS/Windows clean relaunch
 // and forced termination recover exact state under rollback journal").
 //
-// Two launches over one userData directory, twice: once ending in a clean quit
-// and once in a SIGKILL. The clean pair proves that view state a user produced
-// is durable across a normal restart; the killed pair proves that a process that
-// never got to run its shutdown leaves a database the next launch can open,
-// under the rollback journal, without a recovery blockade and without any
-// operator action.
+// Each case launches twice over one userData directory. The clean cases prove
+// that windows and view state survive a normal restart while vanished files are
+// skipped; the killed case proves that a process that never got to run its
+// shutdown leaves a database the next launch can open, under the rollback
+// journal, without a recovery blockade and without any operator action.
 //
 // Each launch gets its own app but shares the directory, because the directory
 // *is* the thing under test. Every wait is a poll on an observable — a window,
@@ -154,7 +153,9 @@ test.describe('desktop state relaunch gates', () => {
             recoveryBlocked: false,
         });
 
-        const second = await launch_app(user_data_dir, [csv_fixture]);
+        // No file argument: the viewer window itself is restored from the clean
+        // quit above, along with the file's durable view state.
+        const second = await launch_app(user_data_dir);
         try {
             const page = await viewer_page(second);
             // The state the first launch produced is on screen again, restored
@@ -179,6 +180,34 @@ test.describe('desktop state relaunch gates', () => {
             await second.close().catch(() => {
                 // Already gone.
             });
+        }
+    });
+
+    test('a clean relaunch skips a restored file that no longer exists', async () => {
+        const temporary_csv = path.join(user_data_dir, 'removed-after-quit.csv');
+        fs.copyFileSync(csv_fixture, temporary_csv);
+        const first = await launch_app(user_data_dir, [temporary_csv]);
+        try {
+            await viewer_page(first);
+            await quit_cleanly(first, user_data_dir);
+        } finally {
+            await first.close().catch(() => {});
+        }
+
+        fs.rmSync(temporary_csv);
+        const second = await launch_app(user_data_dir);
+        try {
+            await expect.poll(() => ({
+                viewers: second.windows().filter(
+                    (page) => page.url().startsWith(VIEWER_URL_PREFIX),
+                ).length,
+                launchers: second.windows().filter(
+                    (page) => page.url().endsWith('welcome.html'),
+                ).length,
+            }), { timeout: 30_000 }).toEqual({ viewers: 0, launchers: 1 });
+            await quit_cleanly(second, user_data_dir);
+        } finally {
+            await second.close().catch(() => {});
         }
     });
 
