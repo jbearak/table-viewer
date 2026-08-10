@@ -898,6 +898,16 @@ export function has_any_pending_edits(pending: PerFileState['pendingEdits']): bo
  * the last resort rather than the answer to any mismatch, because the draft is
  * the user's only copy of that work.
  *
+ * "Loses its draft" is scoped to what this workbook shows: the drop is applied to
+ * the snapshot a panel is projected from, and deliberately *not* written back to
+ * durable state. So a name that comes back — the file restored from a backup, a
+ * rename undone in Excel, a branch switched under the editor — brings its draft
+ * with it. The alternative is deleting unsaved work the first time a sheet is
+ * missing, with no undo and nothing shown to the user; a draft that reappears
+ * alongside its worksheet is visible and dismissable, which is the recoverable
+ * direction to be wrong in. (A slot only truly goes when some later write to this
+ * file commits state that no longer carries it.)
+ *
  * Slots with no recorded name are legacy CSV migrations (single-sheet by
  * construction) and stay where they are.
  */

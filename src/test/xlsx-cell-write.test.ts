@@ -373,6 +373,15 @@ describe('apply_cell_edits', () => {
             '<row r="1"><c r="A1"><x:f t="array" ref="A1:B2">SUM(1)</x:f><v>1</v></c></row>',
             "<row r='1'><c r='A1'><v>1</v></c></row>",
             '<row r="1"><c><v>1</v></c></row>',
+            // Not just `r`: an unreadable `s` silently drops the cell's formatting,
+            // an unreadable `t="b"` turns a boolean into a string, and an unreadable
+            // `t`/`ref` on `<f>` hides an array formula the writer then overwrites.
+            `<row r="1"><c r="A1" s='3'><v>1</v></c></row>`,
+            `<row r="1"><c r="A1" t='b'><v>1</v></c></row>`,
+            '<row r="1"><c r="A1"><f t = "array" ref = "A1:B2">SUM(1)</f><v>1</v></c></row>',
+            "<row r=\"1\"><c r=\"A1\"><f t='shared' si='0'>SUM(1)</f><v>1</v></c></row>",
+            // Parses as `A1`, so the scanner misses the cell and appends a duplicate.
+            '<row r="1"><c r="A&#49;"><v>1</v></c></row>',
         ];
         for (const inner of cases) {
             expect(() => apply_cell_edits(
@@ -381,6 +390,16 @@ describe('apply_cell_edits', () => {
                 OPTS,
             )).toThrow(/cannot\s+edit\s+safely/i);
         }
+    });
+
+    it('does not refuse ordinary attributes it never reads', () => {
+        // The guard is a subtraction — anything left after canonical `name="value"`
+        // pairs are removed is unreadable — so it has to leave attributes the writer
+        // does not consume alone, entities and all.
+        const inner = '<row r="1" spans="1:1" customFormat="1">'
+            + '<c r="A1" s="3" t="n"><v>1</v></c></row>';
+        expect(apply_cell_edits(doc(inner), [{ row: 0, col: 0, value: '2' }], OPTS))
+            .toContain('<c r="A1" s="3"><v>2</v></c>');
     });
 
     it('does not refuse over markup quoted inside a comment', () => {

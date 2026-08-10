@@ -534,9 +534,16 @@ function canonical_edits(edits: readonly XlsxCellEdit[]): readonly XlsxCellEdit[
  *    unprefixed rows and cells scan normally but a prefixed `<x:f>` is invisible:
  *    the edit overwrites an array formula without seeing it, and `formula_count`
  *    reports no loss, so `calcChain.xml` stays attached and stale.
- *  - A single-quoted or space-padded reference (`r='A1'`, `r = "A1"`). The cell is
- *    not found, so the edit *appends a second cell with the same reference* —
- *    duplicate coordinates, and a reader may take either value.
+ *  - An attribute spelled any way but `name="value"` — single-quoted (`r='A1'`),
+ *    space-padded (`r = "A1"`), or carrying an entity reference (`r="A&#49;"`).
+ *    Every attribute the writer consumes is matched literally, so each spelling
+ *    has its own silent failure: an unrecognized `r` *appends a second cell with
+ *    the same reference*, an unrecognized `s` drops the cell's formatting, an
+ *    unrecognized `t="b"` turns a boolean into a string, and an unrecognized
+ *    `t`/`ref` on `<f>` hides an array formula the writer would then overwrite.
+ *    Checked across every attribute of `<row>`, `<c>` and `<f>` rather than just
+ *    the consumed ones: the consumed set is a moving target, and a worksheet
+ *    that spells one attribute unusually will spell its neighbours that way too.
  *  - A cell with no `r` at all, whose column is implied by document order. Same
  *    duplicate-coordinate outcome, and the reader ignores such cells too, so the
  *    user is editing a cell they cannot see.
@@ -566,10 +573,21 @@ function assert_writable_sheet_data(xml: string, from: number, to: number): void
             unsupported('namespace-prefixed cell elements');
         }
     }
-    for (const m of xml.matchAll(/<(?:row|c)\b[^>]*>/g)) {
+    for (const m of xml.matchAll(/<(?:row|c|f)\b([^>]*)>/g)) {
         if (m.index < from || m.index >= to || !live(m.index)) continue;
-        if (/\br\s*=\s*'/.test(m[0]) || /\br\s+=/.test(m[0]) || /=\s+["']/.test(m[0])) {
-            unsupported('single-quoted or space-padded attributes');
+        // Whatever remains once every canonical `name="value"` pair is removed has
+        // to be nothing but the tag's own whitespace and its self-closing slash.
+        // Written as a subtraction so an attribute spelled some way not thought of
+        // here still fails closed rather than passing unexamined.
+        const rest = m[1].replace(/\s[A-Za-z_:][\w.:-]*="[^"]*"/g, '');
+        if (/\S/.test(rest.replace(/\/$/, ''))) {
+            unsupported('attributes this writer cannot read the way a parser would');
+        }
+        // Entities are only a hazard in the values this writer reads back: `r="A&#49;"`
+        // is `A1` to a parser and unmatchable here, so the cell is missed and the edit
+        // appends a duplicate. Elsewhere in the tag an `&amp;` is ordinary and legal.
+        if (/\s(?:r|s|t|ref)="[^"]*&/.test(m[1])) {
+            unsupported('cell references written with XML entities');
         }
         if (m[0].startsWith('<c') && !/\br="/.test(m[0])) {
             unsupported('cells whose position is implied rather than written');

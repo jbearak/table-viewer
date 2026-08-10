@@ -1327,9 +1327,17 @@ export function attach_viewer(
         return 'moved';
     }
 
-    /** Where `name` sits in the adopted workbook, or undefined if it is gone. */
-    function sheet_index_named(name: string): number | undefined {
-        const index = source?.meta().sheets.findIndex((sheet) => sheet.name === name);
+    /**
+     * Where `name` sits in the adopted workbook, or undefined if it is gone.
+     *
+     * `names` overrides the live workbook, for callers inside an `update_file_state`
+     * updater: those must resolve against the list the state was normalized with,
+     * not whatever `source` holds by the time the updater runs.
+     */
+    function sheet_index_named(name: string, names?: readonly string[]): number | undefined {
+        const index = names
+            ? names.indexOf(name)
+            : source?.meta().sheets.findIndex((sheet) => sheet.name === name);
         return index === undefined || index === -1 ? undefined : index;
     }
 
@@ -1959,10 +1967,13 @@ export function attach_viewer(
      * asking by name there would answer "deleted" for every worksheet and abandon
      * the cleanup a disposed save still owes.
      */
-    function operation_sheet_index(operation: CsvSaveOperation): number | undefined {
+    function operation_sheet_index(
+        operation: CsvSaveOperation,
+        names?: readonly string[],
+    ): number | undefined {
         const name = save_operation_sheet_names.get(operation);
         if (name === undefined || !source) return operation.sheetIndex;
-        return sheet_index_named(name);
+        return sheet_index_named(name, names);
     }
 
     function strip_operation_owned_pending_edits(
@@ -2068,12 +2079,12 @@ export function attach_viewer(
         let cleanup!: Promise<void>;
         cleanup = (async () => {
             try {
-                const committed = await update_file_state((current) => {
+                const committed = await update_file_state((current, names) => {
                     // Scoped to the operation's own sheet: another worksheet's
                     // slot is unrelated work this cleanup must not touch. Resolved
                     // by name, because `update_file_state` has already reconciled
                     // `current`'s slots against the adopted workbook.
-                    const sheet_index = operation_sheet_index(operation);
+                    const sheet_index = operation_sheet_index(operation, names);
                     if (sheet_index === undefined) return current;
                     const slot = current.pendingEdits?.[sheet_index];
                     const pending_edits = strip_operation_owned_pending_edits(
@@ -2269,7 +2280,18 @@ export function attach_viewer(
     }
 
     async function update_file_state(
-        updater: (current: PerFileState) => PerFileState,
+        // `names` is the list `current` was normalized against, and an updater that
+        // resolves a worksheet by name must use it rather than reading `source`
+        // again: the list is captured before the `read_file_state` await below, so a
+        // reload landing during that await would leave the two describing different
+        // workbook orders — and a cleanup aimed at one sheet would clear another's.
+        //
+        // No ordering was found that reaches it: the authority queue serializes a
+        // reload behind an in-flight state read, so `source` cannot change across
+        // this await today. Threaded anyway rather than relied upon, because that is
+        // a property of another module and the failure it would cause here is
+        // another worksheet's unsaved work deleted with nothing to show for it.
+        updater: (current: PerFileState, names: readonly string[]) => PerFileState,
         sheet_names = source?.meta().sheets.map((sheet) => sheet.name) ?? [],
         validate?: () => boolean,
         write_basis: FileStateWriteBasis | null = {
@@ -2280,7 +2302,7 @@ export function attach_viewer(
         for (;;) {
             if (validate && !validate()) return undefined;
             const current = normalize_host_state(snapshot.state, sheet_names);
-            const next = updater(current);
+            const next = updater(current, sheet_names);
             if (next === current) return undefined;
             const result = await state_store.compare_and_set(
                 state_path,
@@ -2433,7 +2455,7 @@ export function attach_viewer(
     async function update_edit_session_state(
         edit_session_id: string,
         admission: symbol,
-        updater: (current: PerFileState) => PerFileState,
+        updater: (current: PerFileState, names: readonly string[]) => PerFileState,
     ): Promise<EditStateWriteResult> {
         const is_current = () => {
             if (
@@ -2448,11 +2470,9 @@ export function attach_viewer(
         let snapshot = await read_file_state(false);
         for (;;) {
             if (!is_current()) return { type: 'aborted' };
-            const current = normalize_host_state(
-                snapshot.state,
-                source?.meta().sheets.map((sheet) => sheet.name) ?? [],
-            );
-            const next = updater(current);
+            const names = source?.meta().sheets.map((sheet) => sheet.name) ?? [];
+            const current = normalize_host_state(snapshot.state, names);
+            const next = updater(current, names);
             if (next === current) {
                 if (!disposed) update_session_state_material(snapshot);
                 return { type: 'unchanged', snapshot };
@@ -3422,7 +3442,7 @@ export function attach_viewer(
         sheet_index: number,
         sheet_name?: string,
     ): Promise<FileStateSnapshot> {
-        const committed = await update_file_state((current) => {
+        const committed = await update_file_state((current, names) => {
             if (!current.pendingEdits) return current;
             // Resolved inside the updater, because `current` has already been
             // reconciled against the adopted workbook: after a reorder the captured
@@ -3435,7 +3455,7 @@ export function attach_viewer(
             // position — see `operation_sheet_index`, which draws the same line.
             const target = sheet_name === undefined || !source
                 ? sheet_index
-                : sheet_index_named(sheet_name);
+                : sheet_index_named(sheet_name, names);
             if (target === undefined) return current;
             // One sheet's slot, not the leaf: a save or discard on this worksheet
             // must leave another worksheet's unsaved draft exactly where it is.
@@ -5712,6 +5732,7 @@ export function attach_viewer(
                 const write = pending_edit_writes.catch(() => {}).then(async () => {
                     const apply = (
                         current: PerFileState,
+                        names: readonly string[],
                         cells: SheetPendingEditCells | undefined,
                     ): PerFileState => {
                         // Resolved now, not at admission: if the workbook reordered
@@ -5735,13 +5756,13 @@ export function attach_viewer(
                         // than to depend on it staying true.
                         const target_index = posted_sheet_name === undefined
                             ? posted_sheet_index
-                            : sheet_index_named(posted_sheet_name);
+                            : sheet_index_named(posted_sheet_name, names);
                         if (target_index === undefined) return current;
                         const next = with_pending_edits_for_sheet(
                             current.pendingEdits,
                             target_index,
                             cells,
-                            sheet_name_at(target_index),
+                            names[target_index],
                         );
                         if (next) return { ...current, pendingEdits: next };
                         if (!current.pendingEdits) return current;
@@ -5752,12 +5773,12 @@ export function attach_viewer(
                         ? await update_edit_session_state(
                             edit_session_id,
                             admission,
-                            (current) => apply(current, edits),
+                            (current, names) => apply(current, names, edits),
                         )
                         : await update_edit_session_state(
                             edit_session_id,
                             admission,
-                            (current) => apply(current, undefined),
+                            (current, names) => apply(current, names, undefined),
                         );
                     if (result.type !== 'aborted') {
                         // A post used to be taken as proof the user moved on from a
