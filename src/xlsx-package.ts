@@ -45,9 +45,16 @@ function worksheet_part_path(cfb_file: ReturnType<typeof CFB.read>, sheet_index:
         const id = /\bId="([^"]*)"/.exec(tag);
         const target = /\bTarget="([^"]*)"/.exec(tag);
         if (!id || !target) continue;
+        // Decoded before it becomes a map key, and decoded again below on the
+        // workbook side, because the two parts need not spell the same id the
+        // same way: `Id="R1&#54;f42588"` and `r:id="R16f42588"` are one
+        // relationship to a parser and two strings to a raw compare. The lookup
+        // then missed, the entry was skipped as unresolvable, and every later
+        // worksheet shifted down one — an edit written to the wrong sheet.
+        const path = decode_xml(target[1]);
         worksheet_targets.set(
-            id[1],
-            target[1].startsWith('/') ? target[1].slice(1) : `xl/${target[1]}`,
+            decode_xml(id[1]),
+            path.startsWith('/') ? path.slice(1) : `xl/${path}`,
         );
     }
 
@@ -58,7 +65,7 @@ function worksheet_part_path(cfb_file: ReturnType<typeof CFB.read>, sheet_index:
     for (const [, tag] of live_tags_in(wb, 'sheet')) {
         if (!/\bname="/.test(tag)) continue;
         const id = /\br:[iI]d="([^"]*)"/.exec(tag);
-        const rel_id = id ? id[1] : '';
+        const rel_id = id ? decode_xml(id[1]) : '';
         if (!worksheet_targets.has(rel_id)) continue;
         rel_ids.push(rel_id);
     }
@@ -175,6 +182,15 @@ function read_style_date_predicate(
     const xml = read_part_text(cfb_file, '/xl/styles.xml');
     if (!xml) return () => false;
 
+    // `applyNumberFormat="0"` is deliberately not consulted. Excel reads it as
+    // "inherit the format from `cellStyleXfs` instead of using my own
+    // `numFmtId`", so honouring it here would be more faithful to the format —
+    // but `is_date_format`, which the *reader* uses, ignores it too. Teaching
+    // only the writer about it would make the two disagree about whether a cell
+    // is a date, which is a worse failure than the display quirk it fixes: a
+    // value written as a serial and read back as text. Both sides have to change
+    // together, and that is a reader change this branch does not make.
+    //
     // Quote-aware throughout, like the sheet enumeration above: a `>` inside a
     // quoted attribute value is legal XML, so `[^>]*` cut both the `<numFmts>`
     // opening tag and the `<numFmt>` entries short. A format code as ordinary as
@@ -184,14 +200,14 @@ function read_style_date_predicate(
     const num_fmts = element_content(xml, 'numFmts');
     if (num_fmts !== null) {
         for (const [, tag] of live_tags_in(num_fmts, 'numFmt')) {
-            const id = /\bnumFmtId="(\d+)"/.exec(tag);
+            const id = numeric_attr(tag, 'numFmtId');
             const code = /\bformatCode="([^"]*)"/.exec(tag);
             // Decoded before anything reads it: `formatCode` is an XML attribute, so
             // a perfectly ordinary format like `0 "&"` is stored as
             // `0 &quot;&amp;&quot;` — and `SSF.is_date` says *true* of that escaped
             // text and false of what it means. A cell under it would take a typed
             // date as a serial and show the user a five-digit number.
-            if (id && code) format_map.set(Number(id[1]), decode_xml(code[1]));
+            if (id !== null && code) format_map.set(id, decode_xml(code[1]));
         }
     }
 
@@ -199,11 +215,9 @@ function read_style_date_predicate(
     const cell_xfs = element_content(xml, 'cellXfs');
     if (cell_xfs !== null) {
         for (const [, tag] of live_tags_in(cell_xfs, 'xf')) {
-            const num_fmt_id = /\bnumFmtId="(\d+)"/.exec(tag);
-            const font_id = /\bfontId="(\d+)"/.exec(tag);
             xfs.push({
-                font_index: font_id ? Number(font_id[1]) : 0,
-                format_index: num_fmt_id ? Number(num_fmt_id[1]) : 0,
+                font_index: numeric_attr(tag, 'fontId') ?? 0,
+                format_index: numeric_attr(tag, 'numFmtId') ?? 0,
             });
         }
     }
@@ -223,6 +237,23 @@ function read_style_date_predicate(
     };
 }
 
+/**
+ * A non-negative integer attribute of `tag`, or null if absent or not one.
+ *
+ * The pattern cannot be `"(\d+)"` directly: an encoded digit is still a digit,
+ * so `numFmtId="16&#52;"` is `164` — a custom date format — and matching the raw
+ * text failed, left the index at its `0` default, and stored a typed date as an
+ * inline string under a format that renders dates. Decoding first and validating
+ * after also rejects the encoded spelling of a genuinely malformed value rather
+ * than reading it as `NaN`.
+ */
+function numeric_attr(tag: string, name: string): number | null {
+    const m = new RegExp(`\\b${name}="([^"]*)"`).exec(tag);
+    if (!m) return null;
+    const text = decode_xml(m[1]);
+    return /^\d+$/.test(text) ? Number(text) : null;
+}
+
 function read_datemode(cfb_file: ReturnType<typeof CFB.read>): DateMode {
     const wb = read_part_text(cfb_file, '/xl/workbook.xml');
     if (!wb) return 0;
@@ -232,8 +263,14 @@ function read_datemode(cfb_file: ReturnType<typeof CFB.read>): DateMode {
     // not a rounding error — it writes a date four years off.
     const [, m] = live_tags_in(wb, 'workbookPr').next().value ?? [];
     if (m === undefined) return 0;
+    // Decoded before the compare: `date1904="&#49;"` is `date1904="1"` to a
+    // parser, and reading it raw saw neither `1` nor `true` and fell back to the
+    // 1900 epoch. The two epochs are 1462 days apart, so this writes a date four
+    // years off rather than rounding one.
     const d = /\bdate1904="([^"]*)"/.exec(m);
-    return d && (d[1] === '1' || d[1] === 'true') ? 1 : 0;
+    if (!d) return 0;
+    const flag = decode_xml(d[1]);
+    return flag === '1' || flag === 'true' ? 1 : 0;
 }
 
 /**
@@ -372,7 +409,13 @@ function remove_content_type_override(cfb_file: ReturnType<typeof CFB.read>, par
     const stripped = remove_elements(
         xml,
         'Override',
-        (tag) => /\bPartName="([^"]*)"/.exec(tag)?.[1] === part_name,
+        (tag) => {
+            const attr = /\bPartName="([^"]*)"/.exec(tag);
+            // Decoded before comparing, as in `worksheet_part_path`: an encoded
+            // spelling of the same part name is the same part, and missing it
+            // leaves an override for a part that is no longer in the package.
+            return attr !== null && decode_xml(attr[1]) === part_name;
+        },
     );
     if (stripped !== xml) write_part_text(cfb_file, '/[Content_Types].xml', stripped);
 }
@@ -396,7 +439,8 @@ function remove_workbook_relationship(
     const stripped = remove_elements(xml, 'Relationship', (tag) => {
         const target = /\bTarget="([^"]*)"/.exec(tag);
         if (!target) return false;
-        const resolved = target[1].startsWith('/') ? target[1].slice(1) : `xl/${target[1]}`;
+        const path = decode_xml(target[1]);
+        const resolved = path.startsWith('/') ? path.slice(1) : `xl/${path}`;
         return resolved === wanted;
     });
     if (stripped !== xml) write_part_text(cfb_file, '/xl/_rels/workbook.xml.rels', stripped);

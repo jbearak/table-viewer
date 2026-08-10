@@ -25,18 +25,27 @@ function part(bytes: Uint8Array, path: string): Buffer | null {
 
 const OPTS = { datemode: 0 as const, is_date_style: () => false };
 
-/** `formatted.xlsx` with one substitution made in its styles part. */
-function patched_styles(from: string, to: string): Uint8Array {
+/** `formatted.xlsx` with one substitution made in each of the named parts. */
+function patched_parts(edits: Array<[part: string, from: string | RegExp, to: string]>): Uint8Array {
     const file = CFB.read(readFileSync(FORMATTED), { type: 'buffer' });
-    const entry = CFB.find(file, '/xl/styles.xml')!;
-    const patched = Buffer.from(
-        Buffer.from(entry.content as Uint8Array).toString('utf8').replace(from, to),
-        'utf8',
-    );
-    entry.content = patched;
-    entry.size = patched.length;
+    for (const [path, from, to] of edits) {
+        const entry = CFB.find(file, path)!;
+        const before = Buffer.from(entry.content as Uint8Array).toString('utf8');
+        const after = before.replace(from, to);
+        // A substitution that matched nothing would leave the fixture unpatched
+        // and the test passing for no reason at all.
+        expect(after, `${path}: ${String(from)}`).not.toBe(before);
+        const patched = Buffer.from(after, 'utf8');
+        entry.content = patched;
+        entry.size = patched.length;
+    }
     const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
     return written instanceof Uint8Array ? written : new Uint8Array(written as ArrayBufferLike);
+}
+
+/** `formatted.xlsx` with one substitution made in its styles part. */
+function patched_styles(from: string, to: string): Uint8Array {
+    return patched_parts([['/xl/styles.xml', from, to]]);
 }
 
 describe('iso_to_serial', () => {
@@ -900,6 +909,53 @@ describe('write_xlsx_cell_edits', () => {
         const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '2024-01-15' }]);
         expect(part(out, '/xl/worksheets/sheet1.xml')!.toString('utf8'))
             .toContain('<v>43844</v>');
+    });
+
+    it('matches a relationship id spelled with a character reference', () => {
+        // `Id="R1&#54;f42588a6664ec0"` and `r:id="R16f42588a6664ec0"` are one
+        // relationship to a parser and two strings to a raw compare. The lookup
+        // missed, the first worksheet was skipped as unresolvable, and the edit
+        // aimed at sheet 0 landed in sheet2.xml — a valid file, wrong sheet.
+        const file = CFB.read(readFileSync(SAMPLE), { type: 'buffer' });
+        const rels = CFB.find(file, '/xl/_rels/workbook.xml.rels')!;
+        const before = Buffer.from(rels.content as Uint8Array).toString('utf8');
+        const after = before.replace('Id="R16f42588a6664ec0"', 'Id="R1&#54;f42588a6664ec0"');
+        expect(after).not.toBe(before);
+        const patched = Buffer.from(after, 'utf8');
+        rels.content = patched;
+        rels.size = patched.length;
+        const w = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+        const bytes = w instanceof Uint8Array ? w : new Uint8Array(w as ArrayBufferLike);
+
+        const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: 'MARK' }]);
+        expect(part(out, '/xl/worksheets/sheet1.xml')!.toString('utf8')).toContain('MARK');
+        expect(part(out, '/xl/worksheets/sheet2.xml')!.toString('utf8')).not.toContain('MARK');
+    });
+
+    it('reads date1904 spelled with a character reference', () => {
+        const bytes = patched_parts([
+            ['/xl/styles.xml', 'formatCode="$#,##0.00"', 'formatCode="yyyy-mm-dd"'],
+            ['/xl/workbook.xml', '<workbookPr ', '<workbookPr date1904="&#49;" '],
+        ]);
+        const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '2024-01-15' }]);
+        // 1904 epoch. Read as 1900 it is 45306 — a date four years off, not a
+        // rounding error.
+        expect(part(out, '/xl/worksheets/sheet1.xml')!.toString('utf8'))
+            .toContain('<v>43844</v>');
+    });
+
+    it('reads a numFmtId spelled with a character reference', () => {
+        // An encoded digit is still a digit: `numFmtId="16&#52;"` is 164, the
+        // custom date format. Matched raw, `"(\d+)"` failed, the index fell back
+        // to 0, and a typed date was stored as an inline string under a format
+        // that renders dates.
+        const bytes = patched_parts([
+            ['/xl/styles.xml', 'formatCode="$#,##0.00"', 'formatCode="yyyy-mm-dd"'],
+            ['/xl/styles.xml', '<xf numFmtId="164"', '<xf numFmtId="16&#52;"'],
+        ]);
+        const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '2024-01-15' }]);
+        expect(part(out, '/xl/worksheets/sheet1.xml')!.toString('utf8'))
+            .toContain('<v>45306</v>');
     });
 
     it('leaves every part it did not edit byte-identical', () => {

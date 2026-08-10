@@ -20,8 +20,15 @@ import type { WorkbookData, SheetData, CellData, MergeRange } from './types';
 
 // --- XML Helpers ---
 
-/** Expand the five predefined XML entities. Exported for `xlsx-package`, which
- *  reads `formatCode` attributes that mean nothing until they are decoded. */
+/** Expand the five predefined XML entities and numeric character references.
+ *  Exported for `xlsx-package`, which reads `formatCode` attributes that mean
+ *  nothing until they are decoded.
+ *
+ *  Numeric references belong here because a writer may emit any character that
+ *  way — `Id="R1&#54;f42588"` is the same relationship id as `Id="R16f42588"`,
+ *  and comparing the raw text made them different strings. `&amp;` is expanded
+ *  last so `&amp;#60;`, which *means* the six characters `&#60;`, is not
+ *  re-decoded into `<`. */
 export function decode_xml(s: string): string {
     if (s.indexOf('&') === -1) return s;
     return s
@@ -29,6 +36,12 @@ export function decode_xml(s: string): string {
         .replace(/&gt;/g, '>')
         .replace(/&quot;/g, '"')
         .replace(/&apos;/g, "'")
+        .replace(/&#(?:x([0-9a-fA-F]+)|(\d+));/g, (whole, hex: string | undefined, dec: string | undefined) => {
+            const code = hex !== undefined ? parseInt(hex, 16) : Number(dec);
+            return Number.isFinite(code) && code >= 0 && code <= 0x10ffff
+                ? String.fromCodePoint(code)
+                : whole;
+        })
         .replace(/&amp;/g, '&');
 }
 
