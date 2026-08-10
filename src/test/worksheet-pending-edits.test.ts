@@ -306,6 +306,22 @@ describe('reconcile_pending_edit_sheets', () => {
         expect(JSON.stringify(after)).toContain('inv-b');
     });
 
+    it('does not let an untagged legacy slot outrank a sheet entitled to its index', () => {
+        // An untagged slot is a draft written before slots carried names: it holds
+        // its index by assumption only. Seating those before the named claimants let
+        // assumption beat entitlement — `Data` moved externally from 1 to 0, found 0
+        // already taken by the legacy slot, and was pushed aside, so opening `Data`
+        // showed a foreign draft while its own was invisible.
+        const pending: PerFileState['pendingEdits'] = [
+            { cells: { '0:0': entry('legacy') } },
+            { sheetName: 'Data', cells: { '0:0': entry('data') } },
+        ];
+        const after = reconcile_pending_edit_sheets(pending, ['Data', 'Other']);
+        expect(pending_edits_for_sheet(after, 0, 'Data')).toEqual({ '0:0': entry('data') });
+        // The legacy draft is kept, not deleted — just no longer in the way.
+        expect(JSON.stringify(after)).toContain('legacy');
+    });
+
     it('passes an absent leaf through', () => {
         expect(reconcile_pending_edit_sheets(undefined, ['A'])).toBeUndefined();
     });

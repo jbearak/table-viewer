@@ -1022,13 +1022,6 @@ export function reconcile_pending_edit_sheets(
 
     let changed = false;
     const next: (WorksheetPendingEdits | undefined)[] = [];
-    // Unnamed slots first, so a named slot positively identified by the workbook
-    // wins the position over one that only ever held it by assumption.
-    pending.forEach((slot, index) => {
-        if (!slot || slot.sheetName) return;
-        while (next.length <= index) next.push(undefined);
-        next[index] = slot;
-    });
     // Names are unique *within a workbook*, but two slots can still carry the same
     // tag: a sheet renamed externally onto a name another slot already recorded
     // leaves both tagged alike until the next write. Only one can have the named
@@ -1077,7 +1070,19 @@ export function reconcile_pending_edit_sheets(
         next[moved_to] = slot;
     });
     // Everything with no claim on an index goes last, into whatever the entitled
-    // slots left free: the duplicate-tag losers above, then the parked ones.
+    // slots left free: the duplicate-tag losers above, then the untagged slots,
+    // then the parked ones.
+    //
+    // An untagged slot is a legacy draft written before slots carried names, so it
+    // holds its index by assumption only. Seating those *first* let assumption beat
+    // entitlement: an untagged slot at 0 with `Data` moved externally from 1 to 0
+    // took index 0, and the `Data` draft — positively identified by the workbook —
+    // was pushed aside, so the worksheet the user opened showed a foreign draft and
+    // its own was invisible.
+    pending.forEach((slot, index) => {
+        if (!slot || slot.sheetName) return;
+        displaced.push({ slot, index });
+    });
     pending.forEach((slot, index) => {
         if (!slot?.sheetName) return;
         if (index_of_name.get(slot.sheetName) !== undefined) return;

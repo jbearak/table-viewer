@@ -498,6 +498,40 @@ describe('apply_cell_edits', () => {
         expect(out).toContain('<row><c r="A1"><v>1</v></c></row><row><c r="A1"><v>9</v></c></row>');
     });
 
+    it('resolves duplicate rows per coordinate, not per row element', () => {
+        // The reader settles precedence for each `<c r=…>` independently, so with a
+        // styled A1 in the first element and a D1 in the second it shows *both* —
+        // A1 from the earlier element, D1 from the later. Resolving a whole row to
+        // one span made the writer see no A1 in the element it had picked, so the
+        // edit inserted a fresh unstyled A1: the value changed, the currency format
+        // vanished, and the sheet gained a duplicate coordinate.
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A1" s="7"><v>1234.56</v></c></row>'
+                + '<row r="1"><c r="D1"><v>4</v></c></row>'),
+            [{ row: 0, col: 0, value: '999.5' }],
+            OPTS,
+        );
+        expect(out.match(/r="A1"/g)).toHaveLength(1);
+        expect(out).toContain('<c r="A1" s="7"><v>999.5</v></c>');
+    });
+
+    it('inserts a new cell into the element it is spliced into, not a duplicate row', () => {
+        // Positioning an insert against a higher-column cell that lives in a
+        // *different* row element aims at an offset outside the element being
+        // spliced, putting the new `<c>` inside the neighbouring row.
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="C1"><v>3</v></c></row>'
+                + '<row r="1"><c r="A1"><v>1</v></c></row>'),
+            [{ row: 0, col: 1, value: '2' }],
+            OPTS,
+        );
+        // C1 is the only higher-column cell, and it sits in the *first* element —
+        // an offset outside the one being spliced. Positioning against it put the
+        // new B1 in front of C1, in the row the reader does not read A1 from.
+        expect(out).toContain('<row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c></row>');
+        expect(out).toContain('<row r="1"><c r="C1"><v>3</v></c></row>');
+    });
+
     it('keeps a self-closing sheetData\'s attributes when expanding it', () => {
         // `<sheetData/>` has nowhere to splice into, so it is expanded to a pair
         // first — and the replacement was written as a bare `<sheetData>`, dropping
@@ -637,22 +671,6 @@ describe('apply_cell_edits', () => {
         // formulas were all still there.
         expect(formula_count('<!-- <f>not markup</f> --><![CDATA[<f/>]]>')).toBe(0);
         expect(formula_count('<f>SUM(A1:A2)</f><!-- <f>doc</f> -->')).toBe(1);
-    });
-
-    it('edits the live sheetData, not a commented-out one before it', () => {
-        // The element the whole splice is scoped to. Found by raw indexOf, a
-        // commented-out `<sheetData>` ahead of the live one took every edit into
-        // the comment: the worksheet never changed and the save reported success.
-        const out = apply_cell_edits(
-            '<?xml version="1.0"?><worksheet>'
-            + '<!-- <sheetData><row r="1"><c r="A1"><v>stale</v></c></row></sheetData> -->'
-            + '<sheetData><row r="1"><c r="A1"><v>live</v></c></row></sheetData></worksheet>',
-            [{ row: 0, col: 0, value: 'new' }],
-            OPTS,
-        );
-        expect(out).toContain('<!-- <sheetData><row r="1"><c r="A1"><v>stale</v></c></row></sheetData> -->');
-        expect(out).toContain('<t xml:space="preserve">new</t>');
-        expect(out).not.toContain('<v>live</v>');
     });
 
     it('widens the live dimension, not a commented-out one before it', () => {
@@ -996,6 +1014,24 @@ describe('apply_cell_edits', () => {
     it('refuses a document with no sheetData rather than emitting a broken part', () => {
         expect(() => apply_cell_edits('<worksheet/>', [{ row: 0, col: 0, value: '1' }], OPTS))
             .toThrow(/sheetData/);
+    });
+
+    it('refuses a worksheet whose first sheetData is commented out', () => {
+        // The writer skips comments; the reader does not. `parse_xlsx` scans raw
+        // text, so it finds the *commented* `<sheetData>` first and shows the values
+        // inside it. An edit therefore rewrote the live element the user was not
+        // looking at: the save reported success and the visible value never moved.
+        // Writing into the comment instead is not an option either — it is text
+        // every conforming parser discards. So this refuses, as with the other
+        // divergences the reader and writer cannot be reconciled on.
+        expect(() => apply_cell_edits(
+            '<worksheet>'
+            + '<!-- <sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData> -->'
+            + '<sheetData><row r="1"><c r="A1"><v>2</v></c></row></sheetData>'
+            + '</worksheet>',
+            [{ row: 0, col: 0, value: '9' }],
+            OPTS,
+        )).toThrow(/commented-out <sheetData>/);
     });
 });
 

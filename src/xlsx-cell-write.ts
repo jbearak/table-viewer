@@ -572,8 +572,27 @@ function end_tag_after(
     }
 }
 
-function scan_rows(xml: string, from: number, to: number): Map<number, Span> {
-    const out = new Map<number, Span>();
+/**
+ * Locate the `<row>` elements in `sheetData`, keyed by row index, **in document
+ * order and plural**.
+ *
+ * A row index can name more than one element — SpreadsheetML does not forbid two
+ * `<row r="1">`, and unnumbered rows can be attributed to a row by their cells.
+ * Keeping only one of them made the writer disagree with the reader, which never
+ * resolves a whole row at all: `parse_xlsx` keys every `<c r=…>` into a map as it
+ * scans, so precedence is settled independently *per coordinate*. With a styled
+ * `A1` in the first element and a `D1` in the second, the reader shows the first
+ * element's `A1`, while a writer that had picked one span saw no `A1` in it and
+ * inserted a fresh, unstyled one — the visible number kept its value but lost its
+ * currency format, and the sheet gained a duplicate coordinate.
+ */
+function scan_rows(xml: string, from: number, to: number): Map<number, Span[]> {
+    const out = new Map<number, Span[]>();
+    const add = (index: number, span: Span): void => {
+        const list = out.get(index);
+        if (list) list.push(span);
+        else out.set(index, [span]);
+    };
     const ignorable = ignorable_ranges(xml, from, to);
     let pos = from;
     while (pos < to) {
@@ -588,7 +607,7 @@ function scan_rows(xml: string, from: number, to: number): Map<number, Span> {
         const r = /\br="(\d+)"/.exec(open_tag);
         if (is_self_closing(xml, start, tag_end)) {
             // Nothing inside to infer a row number from, and nothing to edit either.
-            if (r) out.set(Number(r[1]) - 1, { start, end: tag_end + 1, inner_start: tag_end + 1, inner_end: tag_end + 1, open_tag });
+            if (r) add(Number(r[1]) - 1, { start, end: tag_end + 1, inner_start: tag_end + 1, inner_end: tag_end + 1, open_tag });
             pos = tag_end + 1;
             continue;
         }
@@ -605,18 +624,10 @@ function scan_rows(xml: string, from: number, to: number): Map<number, Span> {
         // see `row_indexes_from_cells`.
         const span = { start, end: after_close, inner_start: tag_end + 1, inner_end: close, open_tag };
         if (r) {
-            out.set(Number(r[1]) - 1, span);
+            add(Number(r[1]) - 1, span);
         } else {
-            // Last writer wins, because that is what the reader does: it keys
-            // every `<c r=…>` into a map as it scans, so with two row elements
-            // both naming row 1 the *later* one holds the cells the user sees.
-            // Preferring the earlier span sent the edit into the row element the
-            // reader had already overwritten — the save reported success, the
-            // visible value never changed, and the file gained a duplicate
-            // coordinate. Numbered rows already resolve last-wins for the same
-            // reason.
             for (const index of row_indexes_from_cells(xml, tag_end + 1, close, ignorable)) {
-                out.set(index, span);
+                add(index, span);
             }
         }
         pos = after_close;
@@ -1052,6 +1063,24 @@ export function apply_cell_edits(
     if (!sd_open) throw new Error('Worksheet XML has no <sheetData> element');
     const { inner_start, inner_end, self_closing, element_start, element_end } = sd_open;
 
+    // The reader takes the *first* `<sheetData` in the raw text — `get_text` uses
+    // `indexOf` and knows nothing about comments — while this scan skips quoted
+    // ones to find the live element. Usually the same element; when a commented-out
+    // `<sheetData>` sits ahead of the live one, not. Then every cell the user sees
+    // comes from inside the comment, the edit correctly rewrites the live element,
+    // and the value on screen never changes after a save that reported success.
+    //
+    // Refused rather than resolved, exactly as for cells quoted inside text: there
+    // is no position to splice that is right for both sides, since writing into the
+    // comment means writing into text every conforming parser discards.
+    if (raw_first_sheet_data(xml) !== element_start) {
+        throw new Error(
+            'Cannot edit this worksheet: it has a commented-out <sheetData> before the '
+            + 'live one, which Table Viewer cannot edit safely. Re-saving the file in '
+            + 'Excel will normally fix it.',
+        );
+    }
+
     // An empty `<sheetData/>` has nowhere to splice into, so expand it to a pair
     // first and re-derive the offsets from the expanded document.
     //
@@ -1096,8 +1125,8 @@ export function apply_cell_edits(
     }
 
     for (const [row, row_edits] of by_row) {
-        const row_span = rows.get(row);
-        if (!row_span) {
+        const row_spans = rows.get(row);
+        if (!row_spans || row_spans.length === 0) {
             // Whole row absent: synthesize it, with its cells in column order.
             const cells = [...row_edits]
                 .sort((a, b) => a.col - b.col)
@@ -1107,7 +1136,22 @@ export function apply_cell_edits(
             continue;
         }
 
-        const cells = scan_cells(xml, row_span.inner_start, row_span.end, row);
+        // Merged across every element claiming this row, last-wins per column —
+        // the reader's rule exactly, since it keys each `<c r=…>` into a map as it
+        // scans and never decides anything at row granularity. `owner` remembers
+        // which element a surviving cell came from, because an insert may only be
+        // positioned against cells inside the element it is being spliced into.
+        const cells = new Map<number, Span>();
+        const owner = new Map<number, Span>();
+        for (const span of row_spans) {
+            for (const [col, cell] of scan_cells(xml, span.inner_start, span.end, row)) {
+                cells.set(col, cell);
+                owner.set(col, span);
+            }
+        }
+        // New coordinates go into the element the reader treats as authoritative
+        // for anything it already holds: the last one.
+        const row_span = row_spans[row_spans.length - 1];
         const inserts: Array<{ col: number; text: string }> = [];
 
         for (const e of row_edits) {
@@ -1204,6 +1248,11 @@ export function apply_cell_edits(
             let at = row_span.inner_end;
             let best: number | undefined;
             for (const [col, span] of cells) {
+                // Only cells living inside the element being spliced can position an
+                // insert: a higher-column cell in a *different* `<row>` element is
+                // at an offset outside this one, and inserting there would splice
+                // the new `<c>` into somebody else's row.
+                if (owner.get(col) !== row_span) continue;
                 if (col > ins.col && (best === undefined || span.start < best)) best = span.start;
             }
             if (best !== undefined) at = best;
@@ -1217,8 +1266,13 @@ export function apply_cell_edits(
     for (const nr of new_rows) {
         let at = inner_end;
         let best: number | undefined;
-        for (const [r, span] of rows) {
-            if (r > nr.row && (best === undefined || span.start < best)) best = span.start;
+        for (const [r, spans] of rows) {
+            if (r <= nr.row) continue;
+            // Earliest element claiming a higher row: with duplicates, a later one
+            // would leave the new row after cells that belong ahead of it.
+            for (const span of spans) {
+                if (best === undefined || span.start < best) best = span.start;
+            }
         }
         if (best !== undefined) at = best;
         splices.push({ start: at, end: at, text: nr.text });
@@ -1252,6 +1306,24 @@ function apply_splices(xml: string, splices: Splice[]): string {
         out = out.slice(0, s.start) + s.text + out.slice(s.end);
     }
     return out;
+}
+
+/**
+ * Where the *reader* believes `<sheetData>` starts: the first raw occurrence.
+ *
+ * Deliberately comment-blind, because `parse_xlsx`'s `get_text` is — it scans with
+ * `indexOf` and applies the same tag-boundary test and nothing else. This exists
+ * only to be compared against the live element {@link find_sheet_data_open} finds,
+ * so it has to reproduce that scan rather than improve on it.
+ */
+function raw_first_sheet_data(xml: string): number {
+    let pos = 0;
+    while (true) {
+        const start = xml.indexOf('<sheetData', pos);
+        if (start === -1) return -1;
+        if (is_tag_boundary(xml[start + 10])) return start;
+        pos = start + 1;
+    }
 }
 
 function find_sheet_data_open(xml: string): {
