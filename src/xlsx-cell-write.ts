@@ -166,6 +166,19 @@ export function classify_value(
 }
 
 /**
+ * `'1'`/`'0'` for the two spellings Excel shows a boolean cell as, else null.
+ *
+ * Matched case-insensitively and trimmed, since that is how a user retypes what
+ * the grid displayed; anything else is a value, not a boolean.
+ */
+function boolean_literal(value: string): '1' | '0' | null {
+    const text = value.trim().toUpperCase();
+    if (text === 'TRUE') return '1';
+    if (text === 'FALSE') return '0';
+    return null;
+}
+
+/**
  * Build the replacement `<c>` element for one cell.
  *
  * Strings are written as `t="inlineStr"` rather than appended to
@@ -182,9 +195,20 @@ function build_cell_xml(
     value: string,
     xf_index: number | null,
     options: XlsxWriteOptions,
+    was_boolean = false,
 ): string {
     const ref = `${col_index_to_letter(col)}${row + 1}`;
     const style_attr = xf_index !== null && xf_index !== 0 ? ` s="${xf_index}"` : '';
+    // A boolean cell edited back to a boolean stays one. The reader renders `t="b"`
+    // as the text TRUE/FALSE, so that is what the user sees in the grid and types
+    // back — and without this it returned as an inline string that merely *looks*
+    // the same, silently changing the cell's type for every formula, filter and
+    // consumer downstream. Narrow on purpose: only a cell that was already boolean,
+    // so typing TRUE into a text cell still stores text.
+    if (was_boolean) {
+        const bool = boolean_literal(value);
+        if (bool !== null) return `<c r="${ref}"${style_attr} t="b"><v>${bool}</v></c>`;
+    }
     const classified = classify_value(value, xf_index ?? 0, options);
     switch (classified.kind) {
         case 'empty':
@@ -497,6 +521,60 @@ function canonical_edits(edits: readonly XlsxCellEdit[]): readonly XlsxCellEdit[
     return by_cell.size === edits.length ? edits : [...by_cell.values()];
 }
 
+/**
+ * Refuse a worksheet this writer cannot read the way an XML parser would.
+ *
+ * The scanners here match literal spellings — `<row`, `<c`, `<f`, `r="A1"` — which
+ * is exact for how Excel and every mainstream generator write a worksheet, and
+ * wrong for spellings that are equally valid XML. Three of them corrupt silently
+ * rather than failing loudly, which is why this refuses instead of trying harder:
+ *
+ *  - A namespace prefix (`<x:row>`, `<x:c>`, `<x:f>`). Prefixes bind to a URI, so
+ *    these are the same elements. The dangerous case is a *mixed* document, where
+ *    unprefixed rows and cells scan normally but a prefixed `<x:f>` is invisible:
+ *    the edit overwrites an array formula without seeing it, and `formula_count`
+ *    reports no loss, so `calcChain.xml` stays attached and stale.
+ *  - A single-quoted or space-padded reference (`r='A1'`, `r = "A1"`). The cell is
+ *    not found, so the edit *appends a second cell with the same reference* —
+ *    duplicate coordinates, and a reader may take either value.
+ *  - A cell with no `r` at all, whose column is implied by document order. Same
+ *    duplicate-coordinate outcome, and the reader ignores such cells too, so the
+ *    user is editing a cell they cannot see.
+ *
+ * Handling any of these properly means a namespace-aware tokenizer that preserves
+ * byte offsets — real work, and unnecessary for the files this feature is for. A
+ * refusal costs the user a save they could not safely have had anyway; the
+ * alternative costs them a workbook that looks fine and is not.
+ *
+ * Scoped to `<sheetData>`, since that is all the writer touches, and to the parts
+ * of it a splice depends on.
+ */
+function assert_writable_sheet_data(xml: string, from: number, to: number): void {
+    const region = xml.slice(from, to);
+    const unsupported = (what: string): Error => new Error(
+        `Cannot edit this worksheet: it uses ${what}, which Table Viewer cannot `
+        + 'edit safely. Re-saving the file in Excel will normally fix it.',
+    );
+    if (/<[A-Za-z_][\w.-]*:(?:row|c|f|is|v)\b/.test(region)) {
+        unsupported_throw(unsupported('namespace-prefixed cell elements'));
+    }
+    for (const m of region.matchAll(/<(?:row|c)\b[^>]*>/g)) {
+        if (/\br\s*=\s*'/.test(m[0]) || /\br\s+=/.test(m[0]) || /=\s+["']/.test(m[0])) {
+            unsupported_throw(unsupported('single-quoted or space-padded attributes'));
+        }
+    }
+    for (const m of region.matchAll(/<c\b[^>]*>/g)) {
+        if (!/\br="/.test(m[0])) {
+            unsupported_throw(unsupported('cells whose position is implied rather than written'));
+        }
+    }
+}
+
+/** Indirection so the checks above read as a list rather than a wall of throws. */
+function unsupported_throw(error: Error): never {
+    throw error;
+}
+
 /** One pending splice: replace `[start, end)` with `text`. */
 interface Splice { start: number; end: number; text: string }
 
@@ -525,6 +603,8 @@ export function apply_cell_edits(
         const expanded = xml.slice(0, element_start) + '<sheetData></sheetData>' + xml.slice(element_end);
         return apply_cell_edits(expanded, edits, options);
     }
+
+    assert_writable_sheet_data(xml, inner_start, inner_end);
 
     const rows = scan_rows(xml, inner_start, inner_end);
 
@@ -594,7 +674,14 @@ export function apply_cell_edits(
                 splices.push({
                     start: cell_span.start,
                     end: cell_span.end,
-                    text: build_cell_xml(e.row, e.col, e.value, xf, options),
+                    text: build_cell_xml(
+                        e.row,
+                        e.col,
+                        e.value,
+                        xf,
+                        options,
+                        /\bt="b"/.test(cell_span.open_tag),
+                    ),
                 });
             } else {
                 inserts.push({ col: e.col, text: build_cell_xml(e.row, e.col, e.value, null, options) });

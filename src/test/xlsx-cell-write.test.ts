@@ -364,6 +364,50 @@ describe('apply_cell_edits', () => {
         expect(out).toContain('<row r="1"><c r="A1"><v>2</v></c></row>');
     });
 
+    it('refuses a worksheet whose markup it cannot read the way a parser would', () => {
+        // Each of these scans as something other than what it is, and the failure
+        // is silent: the prefixed formula is overwritten unseen (and calcChain is
+        // left stale, since `formula_count` sees no loss), while the other two
+        // append a *second* cell carrying a reference that already exists.
+        const cases = [
+            '<row r="1"><c r="A1"><x:f t="array" ref="A1:B2">SUM(1)</x:f><v>1</v></c></row>',
+            "<row r='1'><c r='A1'><v>1</v></c></row>",
+            '<row r="1"><c><v>1</v></c></row>',
+        ];
+        for (const inner of cases) {
+            expect(() => apply_cell_edits(
+                doc(inner),
+                [{ row: 0, col: 0, value: '2' }],
+                OPTS,
+            )).toThrow(/cannot\s+edit\s+safely/i);
+        }
+    });
+
+    it('keeps a boolean cell boolean', () => {
+        // The reader renders `t="b"` as TRUE/FALSE, so that is the text the user
+        // retypes. Storing it as an inline string looks identical in the grid and
+        // silently changes the cell's type for every consumer of the file.
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A1" t="b"><v>1</v></c></row>'),
+            [{ row: 0, col: 0, value: 'FALSE' }],
+            OPTS,
+        );
+        expect(out).toContain('<c r="A1" t="b"><v>0</v></c>');
+        expect(out).not.toContain('inlineStr');
+
+        // Only for a cell that was already boolean, and only for those two words.
+        expect(apply_cell_edits(
+            doc('<row r="1"><c r="A1"><v>1</v></c></row>'),
+            [{ row: 0, col: 0, value: 'TRUE' }],
+            OPTS,
+        )).toContain('inlineStr');
+        expect(apply_cell_edits(
+            doc('<row r="1"><c r="A1" t="b"><v>1</v></c></row>'),
+            [{ row: 0, col: 0, value: 'maybe' }],
+            OPTS,
+        )).toContain('inlineStr');
+    });
+
     it('orders several new rows by row, whatever order they were edited in', () => {
         const out = apply_cell_edits(
             doc('<row r="1"><c r="A1"><v>1</v></c></row>'),

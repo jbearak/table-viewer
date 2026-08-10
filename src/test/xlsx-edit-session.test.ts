@@ -583,6 +583,58 @@ describe('xlsx edit sessions', () => {
         await wait_for_observable(() => save_results(panel).length > before);
     });
 
+    it('clears the discarded worksheet\u2019s slot after a reorder, not the neighbour\u2019s', async () => {
+        // The discard's durable clear fails, leaving the cleanup `uncertain`; the
+        // retry runs whenever editing is next requested, which may be long after an
+        // external reorder. Durable slots are reconciled by name on the way into
+        // that retry, so clearing by the captured *position* deleted People's
+        // unsaved draft and left Inventory's behind — the exact inverse of what the
+        // user asked for, and unrelated work lost silently.
+        const state = versioned_state_store({
+            pendingEdits: [
+                { sheetName: 'People', cells: { '1:0': { value: 'Draft', base: 'Alice' } } },
+                { sheetName: 'Inventory', cells: { '1:0': { value: 'Gadget', base: 'Widget' } } },
+            ],
+        });
+        const panel = await open_ready_xlsx(file_path, state);
+        // The draft on sheet 0 rehydrates a session there; release it so the
+        // discard below is about Inventory.
+        await panel.__receive({
+            type: 'releaseEditSession',
+            editSessionId: latest_snapshot(panel).capabilities.csvEditSessionId!,
+        });
+        await wait_for_observable(
+            () => latest_snapshot(panel).capabilities.csvEditSessionId === undefined,
+        );
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        // Fail the clear once, which is what strands the cleanup as `uncertain`.
+        const inner = state.store.compare_and_set.bind(state.store);
+        let failed_once = false;
+        state.store.compare_and_set = async (...args) => {
+            if (!failed_once && !JSON.stringify(args[2]).includes('Gadget')) {
+                failed_once = true;
+                throw new Error('state store is unavailable');
+            }
+            return inner(...args);
+        };
+        await panel.__receive({ type: 'discardEditSession', editSessionId: session });
+        expect(failed_once).toBe(true);
+        expect(JSON.stringify(state.get_state(file_path).pendingEdits)).toContain('Gadget');
+
+        bytes = swap_sheet_order(bytes);
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await wait_for_observable(() => sheet_names(panel)[0] === 'Inventory');
+
+        // Requesting a session drives the recovery retry.
+        await panel.__receive({ type: 'requestEditSession', requestId: 'y', sheetIndex: 0 });
+        await wait_for_observable(() => !JSON.stringify(
+            state.get_state(file_path).pendingEdits ?? null,
+        ).includes('Gadget'));
+        expect(JSON.stringify(state.get_state(file_path).pendingEdits)).toContain('Draft');
+    });
+
     it('preserves the styles part byte-for-byte across a save', async () => {
         const panel = await open_ready_xlsx(file_path);
         await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });

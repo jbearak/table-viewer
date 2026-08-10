@@ -218,8 +218,14 @@ type CsvEditFilePhase =
     // worksheet-scoped, so a clear is too: the other sheets' slots are unrelated
     // drafts, and a recovery that runs long after the session ended has no other
     // way left to learn which sheet it was for.
-    | { type: 'cleanupPending'; operation: symbol; sheetIndex: number }
-    | { type: 'uncertain'; operation: symbol; sheetIndex: number };
+    // `sheetName` beside `sheetIndex` for the same reason a save tombstone carries
+    // one: the index is a position captured when the cleanup began, durable slots
+    // are reconciled by name on every write, and an `uncertain` cleanup can be
+    // retried arbitrarily later — after an external reorder has moved the slot.
+    // Clearing by the stale position would delete another worksheet's unsaved
+    // draft and leave this one's edits behind.
+    | { type: 'cleanupPending'; operation: symbol; sheetIndex: number; sheetName?: string }
+    | { type: 'uncertain'; operation: symbol; sheetIndex: number; sheetName?: string };
 
 type CsvEditStateSubscriber = (snapshot?: Readonly<FileStateSnapshot>) => void;
 
@@ -1888,11 +1894,19 @@ export function attach_viewer(
         const operation = Symbol(file_key);
         // Read before the reset below: the clear is scoped to this sheet.
         const sheet_index = save_operation?.identity.sheetIndex ?? active_edit_sheet_index ?? 0;
+        const sheet_name = save_operation
+            ? save_operation_sheet_names.get(save_operation.identity)
+            : active_edit_sheet_name;
         active_save_operation = undefined;
         active_edit_session_id = undefined;
         active_edit_sheet_index = undefined;
         active_edit_sheet_name = undefined;
-        file_edit_state.phase = { type: 'cleanupPending', operation, sheetIndex: sheet_index };
+        file_edit_state.phase = {
+            type: 'cleanupPending',
+            operation,
+            sheetIndex: sheet_index,
+            sheetName: sheet_name,
+        };
         recapture_edit_capabilities();
         return operation;
     }
@@ -1910,7 +1924,12 @@ export function attach_viewer(
         ) return;
         file_edit_state.phase = success
             ? { type: 'free' }
-            : { type: 'uncertain', operation, sheetIndex: phase.sheetIndex };
+            : {
+                type: 'uncertain',
+                operation,
+                sheetIndex: phase.sheetIndex,
+                sheetName: phase.sheetName,
+            };
         if (success && cleared_snapshot !== undefined) {
             observe_durable_state(cleared_snapshot);
             file_edit_state.clearedStateRevision = Math.max(
@@ -3399,14 +3418,30 @@ export function attach_viewer(
     // CSV pending-edit persistence deliberately remains on FileStateStore's CAS
     // queue in this phase. Edit-session ownership is separate from file authority;
     // physical/projection/layout writes use the coordinator serialization above.
-    async function clear_pending_edits(sheet_index: number): Promise<FileStateSnapshot> {
+    async function clear_pending_edits(
+        sheet_index: number,
+        sheet_name?: string,
+    ): Promise<FileStateSnapshot> {
         const committed = await update_file_state((current) => {
             if (!current.pendingEdits) return current;
+            // Resolved inside the updater, because `current` has already been
+            // reconciled against the adopted workbook: after a reorder the captured
+            // position is somebody else's slot. A named worksheet that no longer
+            // resolves was deleted, and there is nothing of this session's left to
+            // clear — its slot went with it.
+            //
+            // A disposed panel has no source to resolve against, and no
+            // reconciliation to compensate for either, so it keeps the captured
+            // position — see `operation_sheet_index`, which draws the same line.
+            const target = sheet_name === undefined || !source
+                ? sheet_index
+                : sheet_index_named(sheet_name);
+            if (target === undefined) return current;
             // One sheet's slot, not the leaf: a save or discard on this worksheet
             // must leave another worksheet's unsaved draft exactly where it is.
             const next = with_pending_edits_for_sheet(
                 current.pendingEdits,
-                sheet_index,
+                target,
                 undefined,
             );
             if (next) return { ...current, pendingEdits: next };
@@ -3426,7 +3461,7 @@ export function attach_viewer(
             const operation = phase.operation;
             const recovery = (async () => {
                 try {
-                    const snapshot = await clear_pending_edits(phase.sheetIndex);
+                    const snapshot = await clear_pending_edits(phase.sheetIndex, phase.sheetName);
                     // Recovery only restores file availability. A live request waiter
                     // must subsequently win the ordinary free -> owned transition.
                     finish_edit_cleanup(operation, true, snapshot);
@@ -4266,6 +4301,7 @@ export function attach_viewer(
                     type: 'cleanupPending',
                     operation: cleanup_operation,
                     sheetIndex: identity.sheetIndex,
+                    sheetName: save_operation_sheet_names.get(identity),
                 };
             }
             console.error('CSV save lost edit ownership after writeFile');
@@ -4295,7 +4331,10 @@ export function attach_viewer(
             );
         });
 
-        void clear_pending_edits(identity.sheetIndex).then((snapshot) => {
+        void clear_pending_edits(
+            identity.sheetIndex,
+            save_operation_sheet_names.get(identity),
+        ).then((snapshot) => {
             finish_edit_cleanup(cleanup_operation, true, snapshot);
             if (!disposed) update_session_state_material(snapshot, false);
         }).catch((error) => {
@@ -5591,11 +5630,16 @@ export function attach_viewer(
                     if (writing) return;
                     active_save_dialog_request = undefined;
                     const discarded_sheet_index = active_edit_sheet_index ?? 0;
+                    // Read before `begin_edit_cleanup`, which clears it.
+                    const discarded_sheet_name = active_edit_sheet_name;
                     const operation = begin_edit_cleanup(msg.editSessionId);
                     if (!operation) return;
                     notify_edit_state();
                     try {
-                        const snapshot = await clear_pending_edits(discarded_sheet_index);
+                        const snapshot = await clear_pending_edits(
+                            discarded_sheet_index,
+                            discarded_sheet_name,
+                        );
                         finish_edit_cleanup(operation, true, snapshot);
                         if (!disposed) update_session_state_material(snapshot, false);
                     } catch (error) {
