@@ -65,7 +65,6 @@ import {
     portable_file_association_commands,
     register_portable_file_associations,
 } from '../main/windows-file-associations';
-import { sheet_edits } from '../../src/test/pending-edits-helper';
 
 describe('portable Windows file associations', () => {
     const executable = 'C:\\Tools\\Table Viewer Portable.exe';
@@ -353,7 +352,7 @@ describe('unsaved-edit indicator', () => {
             requestId: 'r',
             granted: true,
             editSessionId: 's',
-            pendingEdits: sheet_edits({ '0:0': { value: 'draft', base: 'a' } }),
+            pendingEdits: { '0:0': { value: 'draft', base: 'a' } },
         })).toBe(true);
         expect(dirty_from_host_message({
             type: 'editSessionResult',

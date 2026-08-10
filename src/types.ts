@@ -961,7 +961,10 @@ export type HostMessage =
     | { type: 'scrollToRow'; row: number }
     | { type: 'saveOperationStarted'; lifecycle: ActiveCsvSaveLifecycle }
     | { type: 'saveResult'; success: boolean; lifecycle: TerminalCsvSaveLifecycle; rejection?: CsvSaveRejection }
-    | { type: 'editSessionResult'; requestId: string; granted: boolean; editSessionId?: string; sheetIndex: number; pendingEdits?: SheetPendingEditCells }
+    // `sheetIndex` mirrors the request's: optional, defaulting to the only sheet
+    // a single-sheet source has. Every host answer echoes back the sheet it was
+    // asked about, so the webview can route a grant to the right worksheet store.
+    | { type: 'editSessionResult'; requestId: string; granted: boolean; editSessionId?: string; sheetIndex?: number; pendingEdits?: SheetPendingEditCells }
     | { type: 'editSessionRevoked'; reason: 'saved'; sheetIndex: number; lifecycle: Extract<TerminalCsvSaveLifecycle, { state: 'succeeded' }> }
     | { type: 'saveDialogResult'; requestId: string; editSessionId: string; choice: 'save' | 'discard' | 'cancel' }
     /** The current state backend accepted a pending-edit full map through this sequence. */
