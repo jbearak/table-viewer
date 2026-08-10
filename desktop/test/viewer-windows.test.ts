@@ -378,6 +378,21 @@ describe('viewer profile wiring', () => {
     });
 });
 
+describe('open viewer paths', () => {
+    it('reports only live windows in creation order', () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/first.csv');
+        viewer_manager.open_file('/tmp/second.xlsx');
+        expect(viewer_manager.open_file_paths()).toEqual([
+            '/tmp/first.csv',
+            '/tmp/second.xlsx',
+        ]);
+
+        electron_mock.BrowserWindow.instances[0].destroyed = true;
+        expect(viewer_manager.open_file_paths()).toEqual(['/tmp/second.xlsx']);
+    });
+});
+
 describe('viewer window close protocol', () => {
     it('finds a viewer entry by exact basename rather than substring', () => {
         const viewer_manager = manager();
