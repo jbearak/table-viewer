@@ -59,6 +59,61 @@ import {
     SYSTEM_FONT,
     font_family_with_fallback,
 } from '../main/theme-palette';
+import {
+    SUPPORTED_FILE_EXTENSIONS,
+    WINDOWS_FILE_ASSOCIATIONS,
+    portable_file_association_commands,
+    register_portable_file_associations,
+} from '../main/windows-file-associations';
+
+describe('portable Windows file associations', () => {
+    const executable = 'C:\\Tools\\Table Viewer Portable.exe';
+
+    it('registers every supported extension without replacing its default handler', () => {
+        const commands = portable_file_association_commands(executable);
+        const extension_keys = commands
+            .filter((command) => command[1].endsWith('\\OpenWithProgids'))
+            .map((command) => command[1].match(/\\\.([^\\]+)\\OpenWithProgids$/)?.[1]);
+
+        expect(extension_keys).toEqual(SUPPORTED_FILE_EXTENSIONS);
+        expect(commands).toHaveLength(SUPPORTED_FILE_EXTENSIONS.length * 4);
+        expect(commands).not.toContainEqual(expect.arrayContaining([
+            'HKCU\\Software\\Classes\\.csv',
+            '/ve',
+        ]));
+        expect(commands).toContainEqual([
+            'add',
+            'HKCU\\Software\\Classes\\TableViewerPortable.csv\\shell\\open\\command',
+            '/ve',
+            '/d',
+            `"${executable}" "%1"`,
+            '/f',
+        ]);
+    });
+
+    it('keeps the portable association set consistent with the NSIS installer', () => {
+        const installer = fs.readFileSync(
+            path.join(__dirname, '..', 'installer.nsh'),
+            'utf8',
+        );
+        const installed_associations = [...installer.matchAll(
+            /TV_REGISTER_TYPE "([^"]+)"\s+"[^"]+"\s+"([^"]+)"/g,
+        )].map((match) => ({ extension: match[1], description: match[2] }));
+
+        expect(installed_associations).toEqual(WINDOWS_FILE_ASSOCIATIONS);
+    });
+
+    it('attempts every write and reports a partial registration failure', async () => {
+        const seen: (readonly string[])[] = [];
+        const result = await register_portable_file_associations(executable, async (command) => {
+            seen.push(command);
+            if (seen.length === 2) throw new Error('denied');
+        });
+
+        expect(result).toBe(false);
+        expect(seen).toHaveLength(SUPPORTED_FILE_EXTENSIONS.length * 4);
+    });
+});
 
 describe('desktop-config', () => {
     let dir: string;

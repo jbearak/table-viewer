@@ -66,6 +66,10 @@ import { notices_file_path } from './notices-path';
 import { REPOSITORY_URL, about_link_url } from './about-links';
 import { clamp_zoom_level } from './zoom';
 import {
+    SUPPORTED_FILE_EXTENSIONS,
+    register_portable_file_associations,
+} from './windows-file-associations';
+import {
     APP_SCHEME,
     WEBVIEW_HOST,
     build_desktop_viewer_html,
@@ -85,8 +89,6 @@ import {
     CHANNEL_WELCOME_OPEN_PREFERENCES,
 } from '../shared/ipc';
 
-const SUPPORTED_EXTENSIONS = ['csv', 'tsv', 'xlsx', 'xls'];
-
 /**
  * The app's version, injected by desktop/build.mjs from the root package.json.
  *
@@ -101,7 +103,7 @@ declare const __APP_VERSION__: string;
 
 function is_supported_file(file_path: string): boolean {
     const ext = path.extname(file_path).toLowerCase().replace(/^\./, '');
-    return SUPPORTED_EXTENSIONS.includes(ext);
+    return SUPPORTED_FILE_EXTENSIONS.some((supported) => supported === ext);
 }
 
 /** File arguments from a command line (drop flags and the electron/app paths).
@@ -286,7 +288,12 @@ function submit_window_request(request: DesktopWindowRequest, source?: BrowserWi
         if (!viewer_windows) return;
         let opened_any = false;
         for (const file of action.files) {
-            if (viewer_windows.open_file(file)) opened_any = true;
+            if (viewer_windows.open_file(file)) {
+                if (process.platform === 'darwin' || process.platform === 'win32') {
+                    app.addRecentDocument(file);
+                }
+                opened_any = true;
+            }
         }
         const from_launcher = source !== undefined && welcome_windows.has(source);
         if (launcher_steps_aside(opened_any, from_launcher) && !source!.isDestroyed()) {
@@ -342,7 +349,7 @@ async function show_open_dialog(source?: BrowserWindow): Promise<void> {
     const options: Electron.OpenDialogOptions = {
         properties: ['openFile', 'multiSelections'],
         filters: [
-            { name: 'Tables', extensions: SUPPORTED_EXTENSIONS },
+            { name: 'Tables', extensions: [...SUPPORTED_FILE_EXTENSIONS] },
             { name: 'All Files', extensions: ['*'] },
         ],
     };
@@ -491,6 +498,15 @@ function build_menu(): void {
                     click: (_item, window) =>
                         void show_open_dialog(window as BrowserWindow | undefined),
                 },
+                ...(is_mac
+                    ? [{
+                        label: 'Open Recent',
+                        role: 'recentDocuments' as const,
+                        submenu: [
+                            { label: 'Clear Menu', role: 'clearRecentDocuments' as const },
+                        ],
+                    }]
+                    : []),
                 { type: 'separator' },
                 { role: 'close' },
                 ...(is_mac
@@ -893,6 +909,18 @@ if (!got_lock) {
      * all.
      */
     async function start_app(): Promise<void> {
+        const portable_executable = process.platform === 'win32'
+            ? process.env.PORTABLE_EXECUTABLE_FILE
+            : undefined;
+        if (portable_executable) {
+            const registered = await register_portable_file_associations(portable_executable);
+            if (!registered) {
+                console.warn(
+                    'Table Viewer could not register one or more portable file associations;'
+                    + ' Windows recent documents may not appear in the Jump List.',
+                );
+            }
+        }
         config_store = new DesktopConfigStore(
             settings_file_path(app.getPath('userData')),
         );
