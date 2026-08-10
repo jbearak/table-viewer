@@ -181,6 +181,26 @@ function read_style_date_predicate(
                 format_index: numeric_attr(tag, 'numFmtId') ?? 0,
             });
         }
+        // A cell's `s` is an *index* into this list, so the two sides must agree on
+        // how long it is or every style after the disagreement means a different
+        // format to each. `parse_xlsx` scans raw text, counting `<xf>` elements
+        // written inside a comment, a CDATA section or a PI; this skips them, which
+        // is right about XML and wrong about the file, because `s="0"` then named
+        // General to the reader and a date format here — and a typed date went in
+        // as the serial `45306`, which is what the user then saw.
+        //
+        // Counted rather than reconciled: matching the reader's scan here would
+        // make the writer read `<xf>` out of discarded text, and the count is
+        // enough to know the indexes have drifted. Refused, like every other
+        // reader/writer disagreement, because the alternative is a silently wrong
+        // value under a style neither side agrees about.
+        const reader_count = (cell_xfs.match(/<xf\b/g) ?? []).length;
+        if (reader_count !== xfs.length) {
+            throw new Error(
+                'Cannot edit this workbook: its styles are written in a way Table Viewer '
+                + 'cannot read safely. Re-saving the file in Excel will normally fix it.',
+            );
+        }
     }
 
     // Narrowed to the section the serial about to be written will be *displayed*

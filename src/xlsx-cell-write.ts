@@ -814,23 +814,27 @@ function assert_writable_sheet_data(xml: string, from: number, to: number): void
             unsupported('markup-compatibility alternate content');
         }
     }
-    // A commented-out cell that carries an `r`. Being right about XML is not
-    // enough here: `parse_xlsx` scans raw text with `indexOf`, so a `<c r="A1">`
-    // written inside a comment is a cell *to the reader*, and a later one wins over
-    // the live cell before it. The writer correctly edits the live cell, the reader
-    // correctly-for-itself keeps the commented value, and the save reports success
+    // A cell carrying an `r` written inside anything a parser treats as text —
+    // a comment, a CDATA section, a processing instruction. Being right about XML
+    // is not enough here: `parse_xlsx` scans raw text with `indexOf`, so such a
+    // `<c r="A1">` is a cell *to the reader*, and a later one wins over the live
+    // cell before it. The writer correctly edits the live cell, the reader
+    // correctly-for-itself keeps the quoted value, and the save reports success
     // having changed nothing the user can see.
     //
-    // Refused rather than followed: splicing the comment would mean writing into
-    // text every conforming parser discards, and teaching the reader to skip
-    // comments is a reader change this branch does not make. A comment with no `r`
-    // in it is invisible to both sides and stays allowed — that is the ordinary
-    // annotated worksheet, and refusing it would be a false positive.
+    // Refused rather than followed: splicing there would mean writing into text
+    // every conforming parser discards, and teaching the reader to skip these is a
+    // reader change this branch does not make. Text with no `r` in it is invisible
+    // to both sides and stays allowed — that is the ordinary annotated worksheet,
+    // and refusing it would be a false positive.
+    //
+    // All three kinds, not comments alone: the reader draws no distinction between
+    // them, so neither can this. Checking only comments left CDATA and PIs masking
+    // a successful write exactly as comments had.
     for (const [start, end] of ignorable) {
         if (start < from || start >= to) continue;
-        if (!xml.startsWith('<!--', start)) continue;
         if (/<c\s[^>]*\br=/.test(xml.slice(start, end))) {
-            unsupported('cells commented out but still carrying a reference');
+            unsupported('cells written inside text a parser discards');
         }
     }
     const tags: Array<[number, string]> = [];
@@ -840,6 +844,34 @@ function assert_writable_sheet_data(xml: string, from: number, to: number): void
         // so the fragment left over had an unbalanced quote in it, failed the
         // subtraction below, and refused a worksheet that edits perfectly well.
         for (const found of live_tags(xml, name, from, to, ignorable)) tags.push(found);
+    }
+    // A cell whose reference names a different row than the `<row r=…>` holding it.
+    // Legal XML, and the two sides read it oppositely: the reader keys cells off
+    // `<c r>` alone and puts `<row r="1"><c r="A2"/></row>` in row 2, while this
+    // writer files the cell under its container. Editing what the user sees as A2
+    // therefore found no such cell, took the synthesize-a-new-row path, and left the
+    // sheet with two `<c r="A2">` — duplicate coordinates whose displayed value
+    // depends on which one a reader keeps.
+    //
+    // Sorted, because `tags` is filled a name at a time: every `<row>` first, then
+    // every `<c>`, so document order has to be restored before "the row containing
+    // this cell" means anything.
+    tags.sort((a, b) => a[0] - b[0]);
+    let containing_row: number | undefined;
+    for (const [at, tag] of tags) {
+        if (!live(at)) continue;
+        if (tag.startsWith('<row')) {
+            const r = /\br="(\d+)"/.exec(tag);
+            // Absent `r` is legal and the reader infers it from the first cell, so
+            // there is nothing to disagree with — see `row_index_from_first_cell`.
+            containing_row = r ? Number(r[1]) : undefined;
+            continue;
+        }
+        if (!tag.startsWith('<c') || containing_row === undefined) continue;
+        const ref = /\br="([A-Z]+)(\d+)"/.exec(tag);
+        if (ref && Number(ref[2]) !== containing_row) {
+            unsupported('cells whose reference disagrees with the row holding them');
+        }
     }
     for (const [at, tag] of tags) {
         if (!live(at)) continue;

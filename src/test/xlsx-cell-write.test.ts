@@ -634,16 +634,55 @@ describe('apply_cell_edits', () => {
         // unconstrained, so a PI carrying element-shaped text is text. Scanning it
         // as markup put the edit *inside the PI* and left the live A1 untouched:
         // the save reports success and the cell on screen never changes.
+        //
+        // No `r` in the quoted text: one that carries a reference is refused, because
+        // the reader's raw scan reads it as a real cell that beats the live one.
         const out = apply_cell_edits(
             doc(
                 '<row r="1"><c r="A1"><v>1</v></c></row>'
-                + '<?note <row r="1"><c r="A1"><v>quoted</v></c></row> ?>',
+                + '<?note <row r="1"><c><v>quoted</v></c></row> ?>',
             ),
             [{ row: 0, col: 0, value: '2' }],
             OPTS,
         );
         expect(out).toContain('<row r="1"><c r="A1"><v>2</v></c></row>');
-        expect(out).toContain('<?note <row r="1"><c r="A1"><v>quoted</v></c></row> ?>');
+        expect(out).toContain('<?note <row r="1"><c><v>quoted</v></c></row> ?>');
+    });
+
+    it('refuses a cell reference quoted inside CDATA or a processing instruction', () => {
+        // The reader draws no distinction between text a parser discards and markup:
+        // it scans raw substrings, so a `<c r="A1">` in any of the three is a cell to
+        // it, and a later one beats the live cell before it. The writer edited the
+        // live cell and the grid went on showing the ghost after a successful save.
+        for (const inner of [
+            '<row r="1"><c r="A1" t="inlineStr"><is><t>old</t></is></c>'
+            + '<![CDATA[<c r="A1" t="inlineStr"><is><t>ghost</t></is></c>]]></row>',
+            '<row r="1"><c r="A1" t="inlineStr"><is><t>old</t></is></c>'
+            + '<?vendor <c r="A1" t="inlineStr"><is><t>ghost</t></is></c>?></row>',
+        ]) {
+            expect(() => apply_cell_edits(doc(inner), [{ row: 0, col: 0, value: 'new' }], OPTS))
+                .toThrow(/cannot\s+edit\s+safely/i);
+        }
+    });
+
+    it('refuses a cell whose reference disagrees with the row holding it', () => {
+        // `<row r="1"><c r="A2"/></row>` is legal, and the two sides read it
+        // oppositely: the reader keys cells off `<c r>` alone and shows A2, while the
+        // writer filed it under its container. Editing what the user sees as A2 found
+        // no such cell, synthesized a new row, and left two `<c r="A2">` behind —
+        // duplicate coordinates whose displayed value depends on which one wins.
+        expect(() => apply_cell_edits(
+            doc('<row r="1"><c r="A2"><v>7</v></c></row>'),
+            [{ row: 1, col: 0, value: '9' }],
+            OPTS,
+        )).toThrow(/cannot\s+edit\s+safely/i);
+        // An unnumbered row has nothing to disagree with — the reader infers its
+        // number from the first cell, exactly as the writer does.
+        expect(apply_cell_edits(
+            doc('<row><c r="A2"><v>7</v></c></row>'),
+            [{ row: 1, col: 0, value: '9' }],
+            OPTS,
+        )).toContain('<c r="A2"><v>9</v></c>');
     });
 
     it('refuses a worksheet whose markup it cannot read the way a parser would', () => {
@@ -1111,6 +1150,19 @@ describe('write_xlsx_cell_edits', () => {
         ]]);
         const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '9' }]);
         expect(part(out, '/xl/worksheets/sheet1.xml')!.toString('utf8')).toContain('>9<');
+    });
+
+    it('refuses styles whose xf indexes it would number differently than the reader', () => {
+        // A cell's `s` indexes `cellXfs`, so both sides must agree on its length or
+        // every style after the divergence means a different format to each. The
+        // reader counts an `<xf>` written inside CDATA; this writer skips it, which
+        // is right about XML and wrong about the file — `s="0"` named General to the
+        // reader and a date format here, so a typed date went in as the serial 45306
+        // and that is what the user saw.
+        const bytes = patched_parts([['/xl/styles.xml', /<cellXfs[\s\S]*<\/cellXfs>/,
+            '<cellXfs count="1"><![CDATA[<xf numFmtId="0"/>]]><xf numFmtId="14"/></cellXfs>']]);
+        expect(() => write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '2024-01-15' }]))
+            .toThrow(/cannot\s+read\s+safely/i);
     });
 
     it('numbers worksheets exactly as the reader does', () => {
