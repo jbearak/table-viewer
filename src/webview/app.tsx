@@ -2331,6 +2331,12 @@ export function App(): React.JSX.Element {
 
     const handle_sheet_select = useCallback(
         (sheet_index: number) => {
+            // The grid is keyed by the active sheet, so this unmounts the one
+            // holding any open overlay editor — and Glide portals that editor
+            // outside the tree, so its cleanup releases the captured row without
+            // committing the text. Fold it first, as the transform and refresh
+            // remounts do; the store lives above the grid and keeps it.
+            editing_ref.current?.commit_live_edit();
             set_filter_editor(null);
             set_grid_focus_restore(null);
             set_toolbar_focus_restore(null);

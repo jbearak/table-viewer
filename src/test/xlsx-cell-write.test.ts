@@ -313,6 +313,57 @@ describe('apply_cell_edits', () => {
         expect(out.match(/<c\b/g)).toHaveLength(3);
     });
 
+    it('lets the last edit to a cell win, on an existing cell and a new one', () => {
+        // Nothing upstream promises a cell is named at most once, and every stage
+        // assumed it was. On an existing cell the first edit won (wrong but valid);
+        // on an absent one both were spliced, emitting two `<c r="A1">` elements in
+        // one row — a file Excel offers to repair.
+        const existing = apply_cell_edits(
+            doc('<row r="1"><c r="A1"><v>1</v></c></row>'),
+            [{ row: 0, col: 0, value: '2' }, { row: 0, col: 0, value: '3' }],
+            OPTS,
+        );
+        expect(existing).toContain('<v>3</v>');
+        expect(existing).not.toContain('<v>2</v>');
+        expect(existing.match(/<c\b/g)).toHaveLength(1);
+
+        const absent = apply_cell_edits(
+            doc('<row r="1"><c r="B1"><v>1</v></c></row>'),
+            [{ row: 0, col: 0, value: '2' }, { row: 0, col: 0, value: '3' }],
+            OPTS,
+        );
+        expect(absent.match(/r="A1"/g)).toHaveLength(1);
+        expect(absent).toContain('<c r="A1"><v>3</v></c>');
+    });
+
+    it('edits the real row, not a commented-out one that names the same cell', () => {
+        // A commented-out row is text, but the scanners match raw `<row`/`<c`
+        // substrings. Treating one as live spliced the new value inside the comment:
+        // the file stays valid, the save reports success, and nothing changes.
+        const out = apply_cell_edits(
+            doc(
+                '<row r="1"><c r="A1"><v>1</v></c></row>'
+                + '<!-- <row r="1"><c r="A1"><v>stale</v></c></row> -->',
+            ),
+            [{ row: 0, col: 0, value: '2' }],
+            OPTS,
+        );
+        expect(out).toContain('<!-- <row r="1"><c r="A1"><v>stale</v></c></row> -->');
+        expect(out).toContain('<row r="1"><c r="A1"><v>2</v></c></row>');
+    });
+
+    it('does not refuse a cell whose only array formula is commented out', () => {
+        const out = apply_cell_edits(
+            doc(
+                '<!-- <row r="1"><c r="A1"><f t="array" ref="A1:B2">X</f></c></row> -->'
+                + '<row r="1"><c r="A1"><v>1</v></c></row>',
+            ),
+            [{ row: 0, col: 0, value: '2' }],
+            OPTS,
+        );
+        expect(out).toContain('<row r="1"><c r="A1"><v>2</v></c></row>');
+    });
+
     it('orders several new rows by row, whatever order they were edited in', () => {
         const out = apply_cell_edits(
             doc('<row r="1"><c r="A1"><v>1</v></c></row>'),
@@ -528,7 +579,10 @@ describe('write_xlsx_cell_edits', () => {
          * fixture: none of the sample files has one, and the point of the test is
          * the three references (part, content type, relationship) moving together.
          */
-        function with_calc_chain(raw: Uint8Array, paired = false): Uint8Array {
+        function with_calc_chain(
+            raw: Uint8Array,
+            paired: false | 'tight' | 'pretty' = false,
+        ): Uint8Array {
             const file = CFB.read(raw, { type: 'buffer' });
             CFB.utils.cfb_add(
                 file,
@@ -536,10 +590,13 @@ describe('write_xlsx_cell_edits', () => {
                 Buffer.from('<?xml version="1.0"?><calcChain><c r="B2" i="1"/></calcChain>'),
             );
             // XML lets an empty element be written either way, and writers in the
-            // wild use both. `paired` produces the `<X ...></X>` spelling.
-            const empty = (tag: string, attrs: string) => (paired
-                ? `<${tag} ${attrs}></${tag}>`
-                : `<${tag} ${attrs}/>`);
+            // wild use both. `paired` produces the `<X ...></X>` spelling —
+            // 'pretty' with the newline a pretty-printer puts between the halves.
+            const empty = (tag: string, attrs: string) => {
+                if (!paired) return `<${tag} ${attrs}/>`;
+                const gap = paired === 'pretty' ? '\n    ' : '';
+                return `<${tag} ${attrs}>${gap}</${tag}>`;
+            };
             for (const [path, insert] of [
                 ['/[Content_Types].xml', empty(
                     'Override',
@@ -573,10 +630,13 @@ describe('write_xlsx_cell_edits', () => {
                 .toContain('/xl/calcChain.xml');
         });
 
-        it('is detached completely when its references use paired empty elements', () => {
-            // Same as below, with `<Override ...></Override>` and
-            // `<Relationship ...></Relationship>`. Matching only the self-closing
-            // spelling left the package naming a part it no longer contains.
+        // Same as below, with `<Override ...></Override>` and
+        // `<Relationship ...></Relationship>`. Matching only the self-closing
+        // spelling left the package naming a part it no longer contains — and
+        // matching only a *tight* pair left a pretty-printed package the same way.
+        it.each(['tight', 'pretty'] as const)(
+            'is detached completely when its references use %s paired empty elements',
+            (spelling) => {
             const base = CFB.read(readFileSync(SAMPLE), { type: 'buffer' });
             const sheet = CFB.find(base, '/xl/worksheets/sheet3.xml')!;
             const patched = Buffer.from(
@@ -589,7 +649,7 @@ describe('write_xlsx_cell_edits', () => {
             const written = CFB.write(base, { type: 'buffer', fileType: 'zip', compression: true });
             const raw = with_calc_chain(
                 written instanceof Uint8Array ? written : new Uint8Array(written as ArrayBufferLike),
-                true,
+                spelling,
             );
 
             const out = write_xlsx_cell_edits(raw, 2, [{ row: 1, col: 1, value: '42' }]);
@@ -597,7 +657,8 @@ describe('write_xlsx_cell_edits', () => {
             expect(part(out, '/xl/calcChain.xml')).toBeNull();
             expect(text_part(out, '/[Content_Types].xml')).not.toContain('/xl/calcChain.xml');
             expect(text_part(out, '/xl/_rels/workbook.xml.rels')).not.toContain('calcChain.xml');
-        });
+            },
+        );
 
         it('is detached completely when an edit drops a formula', () => {
             // The chain caches recalculation order; a literal written over a

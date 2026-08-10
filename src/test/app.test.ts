@@ -3632,6 +3632,42 @@ describe('edit mode save exit', () => {
         );
     });
 
+    it('folds an open editor into the store before switching worksheets', async () => {
+        // Worksheet editing made this reachable: the grid is keyed by the active
+        // sheet, so clicking another tab unmounts the one holding the open overlay.
+        // Glide's editor is portalled outside that tree and its cleanup only
+        // releases the captured row — the typed text is gone unless it is folded
+        // into App's store first, exactly as the transform and refresh remounts do.
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'people-session',
+            sheetIndex: 0,
+        });
+        // Stand in for the real overlay fold, as the transform and refresh remount
+        // tests do. Only the owning sheet is handed the store, so this writes on
+        // the way *out* of People and is a no-op on the way back in.
+        grid_shell_mock.commit_live_edit.mockImplementation(() => {
+            (grid_shell_mock.latest_props?.edit_session as EditSessionStore | undefined)
+                ?.commit('people-session', '0:0', { value: 'typed', base: 'Alice' });
+        });
+
+        await click_sheet_tab('Inventory');
+        expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(1);
+
+        await click_sheet_tab('People');
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!))
+            .toEqual({ '0:0': { value: 'typed', base: 'Alice' } });
+    });
+
     it('adopts the worksheet the host names for a session it did not request', async () => {
         await render_app();
         await dispatch_host_message(initial_snapshot_message(

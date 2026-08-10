@@ -220,12 +220,59 @@ function row_index_from_first_cell(xml: string, from: number, to: number): numbe
 }
 
 /** Locate every `<row>` element in `sheetData`, in document order. */
+/**
+ * Ranges inside `[from, to)` whose contents are text, not markup: XML comments
+ * and CDATA sections.
+ *
+ * The scanners below match on raw `<row`/`<c` substrings, which is exact for real
+ * markup and wrong for anything quoting it. A commented-out row — the shape a
+ * generator leaves behind, and one Excel preserves on round-trip — looked like a
+ * live row to `scan_rows`, so an edit to a cell it names spliced the new value
+ * *into the comment*: the file stays valid, the save reports success, and the
+ * cell on screen never changes. Skipping these ranges makes the writer agree with
+ * an XML parser about what a row is, without needing one.
+ */
+function ignorable_ranges(xml: string, from: number, to: number): Array<[number, number]> {
+    const out: Array<[number, number]> = [];
+    let pos = from;
+    while (pos < to) {
+        const at = xml.indexOf('<!', pos);
+        if (at === -1 || at >= to) break;
+        let end: number;
+        if (xml.startsWith('<!--', at)) {
+            const close = xml.indexOf('-->', at + 4);
+            end = close === -1 ? to : close + 3;
+        } else if (xml.startsWith('<![CDATA[', at)) {
+            const close = xml.indexOf(']]>', at + 9);
+            end = close === -1 ? to : close + 3;
+        } else {
+            pos = at + 2;
+            continue;
+        }
+        out.push([at, end]);
+        pos = end;
+    }
+    return out;
+}
+
+/** Where to resume from if `at` falls inside an ignorable range, else undefined. */
+function ignorable_end(ranges: ReadonlyArray<[number, number]>, at: number): number | undefined {
+    for (const [start, end] of ranges) {
+        if (at < start) return undefined;
+        if (at < end) return end;
+    }
+    return undefined;
+}
+
 function scan_rows(xml: string, from: number, to: number): Map<number, Span> {
     const out = new Map<number, Span>();
+    const ignorable = ignorable_ranges(xml, from, to);
     let pos = from;
     while (pos < to) {
         const start = xml.indexOf('<row', pos);
         if (start === -1 || start >= to) break;
+        const skip_to = ignorable_end(ignorable, start);
+        if (skip_to !== undefined) { pos = skip_to; continue; }
         if (!is_tag_boundary(xml[start + 4])) { pos = start + 1; continue; }
         const tag_end = find_tag_end(xml, start);
         if (tag_end === -1) break;
@@ -259,10 +306,13 @@ function scan_rows(xml: string, from: number, to: number): Map<number, Span> {
 /** Locate every `<c>` element inside one row's inner range, keyed by column index. */
 function scan_cells(xml: string, from: number, to: number): Map<number, Span> {
     const out = new Map<number, Span>();
+    const ignorable = ignorable_ranges(xml, from, to);
     let pos = from;
     while (pos < to) {
         const start = xml.indexOf('<c', pos);
         if (start === -1 || start >= to) break;
+        const skip_to = ignorable_end(ignorable, start);
+        if (skip_to !== undefined) { pos = skip_to; continue; }
         if (!is_tag_boundary(xml[start + 2])) { pos = start + 1; continue; }
         const tag_end = find_tag_end(xml, start);
         if (tag_end === -1 || tag_end >= to) break;
@@ -328,7 +378,11 @@ interface GroupedRange {
  */
 function grouped_formula_ranges(xml: string): GroupedRange[] {
     const ranges: GroupedRange[] = [];
+    // Same reason `scan_rows` skips these: a commented-out array formula is text,
+    // and treating it as a live range refuses an edit to a cell that is not in one.
+    const ignorable = ignorable_ranges(xml, 0, xml.length);
     for (const m of xml.matchAll(/<f\b[^>]*>/g)) {
+        if (ignorable_end(ignorable, m.index) !== undefined) continue;
         const type = /\bt="([^"]*)"/.exec(m[0]);
         const kind = type?.[1];
         if (!is_grouped_formula_kind(kind)) continue;
@@ -424,6 +478,25 @@ export function formula_count(xml: string): number {
     }
 }
 
+/**
+ * Collapse repeated edits to one cell, last write winning.
+ *
+ * Nothing upstream promises a caller cannot name the same cell twice, and every
+ * stage below assumes it is unique: the grouped-formula check would report the
+ * first, the dimension would widen for both, and — the corruption case — a cell
+ * that does not exist yet gets *two* `<c r="A1">` elements spliced into the same
+ * row, which Excel rejects. Doing it once here keeps that assumption true for
+ * all of them rather than defending it stage by stage.
+ *
+ * Last wins because these arrive in the order the user made them, and an edit
+ * made later is the one they meant.
+ */
+function canonical_edits(edits: readonly XlsxCellEdit[]): readonly XlsxCellEdit[] {
+    const by_cell = new Map<string, XlsxCellEdit>();
+    for (const e of edits) by_cell.set(`${e.row}:${e.col}`, e);
+    return by_cell.size === edits.length ? edits : [...by_cell.values()];
+}
+
 /** One pending splice: replace `[start, end)` with `text`. */
 interface Splice { start: number; end: number; text: string }
 
@@ -440,6 +513,7 @@ export function apply_cell_edits(
     options: XlsxWriteOptions,
 ): string {
     if (edits.length === 0) return xml;
+    edits = canonical_edits(edits);
 
     const sd_open = find_sheet_data_open(xml);
     if (!sd_open) throw new Error('Worksheet XML has no <sheetData> element');

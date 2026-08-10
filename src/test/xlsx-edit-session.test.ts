@@ -96,6 +96,16 @@ async function open_ready_xlsx(
     return panel;
 }
 
+/** Worksheet names in the most recent delivered snapshot. */
+function sheet_names(panel: { __messages: unknown[] }): string[] {
+    const message = [...panel.__messages].reverse().find((candidate) => (
+        typeof candidate === 'object'
+        && candidate !== null
+        && (candidate as { type?: unknown }).type === 'workbookSnapshot'
+    )) as { snapshot: { meta?: { sheets?: { name: string }[] } } } | undefined;
+    return (message?.snapshot.meta?.sheets ?? []).map((sheet) => sheet.name);
+}
+
 function latest_edit_session(panel: { __messages: unknown[] }) {
     return panel.__messages.filter(
         (message): message is {
@@ -471,6 +481,106 @@ describe('xlsx edit sessions', () => {
         await wait_for_observable(() => save_results(panel).length > 0);
         expect(save_results(panel).at(-1)).toMatchObject({ success: false });
         expect((await parse_xlsx(bytes)).data.sheets[0].rows[1][0]?.raw).toBe('Alice');
+    });
+
+    it('clears a failed save\u2019s durable edits after its worksheet moves', async () => {
+        // The save accepts its edits into Inventory's slot and then fails at the
+        // write, leaving a tombstone whose cleanup runs when the session is
+        // released. A reorder in between moves the slot: durable state is
+        // reconciled by name on every write, so reading the captured *position*
+        // found nothing, cleared the tombstone anyway, and the edits the failed
+        // save made durable survived into the next session as a phantom draft.
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        vscode_mock.__setWriteFileImplementation(async () => {
+            throw new Error('disk is full');
+        });
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                sheetIndex: 1,
+                saveRequestId: 'save-1',
+                edits: { '1:0': 'Gadget' },
+                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+        expect(save_results(panel).at(-1)).toMatchObject({ success: false });
+        expect(state.get_state(file_path).pendingEdits?.[1]?.cells)
+            .toEqual({ '1:0': { value: 'Gadget', base: 'Widget' } });
+
+        bytes = swap_sheet_order(bytes);
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await wait_for_observable(
+            () => latest_snapshot(panel).capabilities.csvEditSheetIndex === 0,
+        );
+
+        await panel.__receive({
+            type: 'releaseEditSession',
+            editSessionId: latest_snapshot(panel).capabilities.csvEditSessionId!,
+        });
+        await wait_for_observable(
+            () => latest_snapshot(panel).capabilities.csvEditSessionId === undefined,
+        );
+        // Asserted against the whole leaf, not a fixed slot: the durable array is
+        // only reconciled when something writes it, so "gone" has to mean gone from
+        // every slot rather than absent from the one Inventory now occupies.
+        await wait_for_observable(() => !JSON.stringify(
+            state.get_state(file_path).pendingEdits ?? null,
+        ).includes('Gadget'));
+    });
+
+    it('fails a save whose worksheet is reordered away mid-flight', async () => {
+        // The reorder lands after the operation is installed, so it stops being
+        // current — but nothing else is holding the lifecycle. Returning quietly
+        // left it `active` forever: no later save could start and no edit post
+        // could be admitted, with no way for the user to get out of it.
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        // Reorder while the save is between its first await and the write.
+        let reordered = false;
+        vscode_mock.__setStatImplementation(async () => {
+            if (!reordered) {
+                reordered = true;
+                bytes = swap_sheet_order(bytes);
+                await vscode_mock.__getActiveWatchers()[0].__fireChange();
+            }
+            return { size: bytes.byteLength, mtime: 1 };
+        });
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                sheetIndex: 1,
+                saveRequestId: 'save-1',
+                edits: { '1:0': 'Gadget' },
+                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+        expect(save_results(panel).at(-1)).toMatchObject({ success: false });
+
+        // The lifecycle came back: a later save is admitted rather than blocked.
+        const before = save_results(panel).length;
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: latest_snapshot(panel).capabilities.csvEditSessionId ?? session,
+                sheetIndex: 0,
+                saveRequestId: 'save-2',
+                edits: { '1:0': 'Gadget' },
+                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > before);
     });
 
     it('preserves the styles part byte-for-byte across a save', async () => {

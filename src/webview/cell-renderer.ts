@@ -58,9 +58,18 @@ const BLANK: GridCell = {
 };
 
 /**
- * Per-cell editing state, supplied by the grid shell only in CSV edit mode
- * (CSV sheets have no merges, so this is applied solely to the plain-cell path).
- * Colors are theme-resolved by the caller to keep this module canvas/theme-free.
+ * Per-cell editing state, supplied by the grid shell whenever the sheet is
+ * editable, an edit exists, or a highlight applies. Colors are theme-resolved by
+ * the caller to keep this module canvas/theme-free.
+ *
+ * Where it is honoured, by cell shape:
+ *  - plain cells, and horizontal (`rowSpan === 1`) merges: fully — dirty value,
+ *    tint, and `editable`.
+ *  - `rowSpan > 1` merges, anchor and covered alike: not at all. Those blocks are
+ *    painted by the merge overlay canvas rather than by the Glide cell, so this
+ *    returns a blank non-overlay cell and the user cannot open an editor on one.
+ *    Read-only was the whole story while editing was CSV-only; with worksheet
+ *    editing it is a gap, tracked separately, not a rule.
  */
 export interface CellEditOverlay {
     /** When set, display this dirty value instead of the persisted content. */
@@ -162,14 +171,16 @@ export function build_grid_cell(
                 font_size_px,
             );
         }
-        // rowSpan > 1: the overlay paints content; keep the Glide cell blank.
+        // rowSpan > 1: the overlay canvas paints content, so the Glide cell stays
+        // blank — which also drops `overlay.editable`, leaving these blocks
+        // non-editable. See the `CellEditOverlay` doc comment.
         return BLANK;
     }
 
     const c = cells ? cells[col] : undefined;
     if (!c) {
-        // In CSV edit mode an empty cell can still be edited or hold a dirty
-        // value, so synthesize a blank editable cell; otherwise it's read-only.
+        // In edit mode an empty cell can still be edited or hold a dirty value,
+        // so synthesize a blank editable cell; otherwise it's read-only.
         return overlay
             ? text_cell(EMPTY_CELL, show_formatting, undefined, overlay, font_size_px)
             : BLANK;

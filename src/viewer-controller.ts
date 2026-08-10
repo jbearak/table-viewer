@@ -673,6 +673,15 @@ export function attach_viewer(
     // `release_edit_session`. Weak so a retired operation's entry goes with it —
     // `save_lifecycle.operation` is the only strong reference either way.
     const persisted_save_identities = new WeakSet<CsvSaveOperation>();
+    /**
+     * The worksheet name each operation was built against.
+     *
+     * Held beside the operation rather than inside it, like
+     * `persisted_save_identities`: `CsvSaveOperation` crosses the wire, and this is
+     * host bookkeeping the webview neither sends nor needs. See
+     * {@link operation_sheet_index} for what it is for.
+     */
+    const save_operation_sheet_names = new WeakMap<CsvSaveOperation, string>();
     const pending_rehydration_rejections = new WeakMap<PanelAdoption, {
         readonly operation: CsvSaveOperation;
         readonly rejection: CsvSaveRejection;
@@ -1573,9 +1582,51 @@ export function attach_viewer(
         return phase.type === 'owned' && phase.token === edit_session_token;
     }
 
-    function save_operation_is_current(operation: CsvSaveHostOperation): boolean {
+    /**
+     * The operation is no longer current *because its worksheet moved under it*.
+     *
+     * Distinguished from every other way currency is lost, because this one has no
+     * other actor to clean up after it. A superseded operation was replaced by one
+     * that owns the lifecycle; a released session retires it on the way out. But a
+     * reorder mid-save leaves `active_save_operation` installed and the lifecycle
+     * `active` with nobody holding either, and the bare `return`s below would strand
+     * it there: no further save could start, no pending-edit post would be admitted,
+     * transforms would stay blocked, and any edits `persist_accepted_save` already
+     * committed would keep their cleanup obligation unmet. Callers throw on this so
+     * the existing catch runs the ordinary failed-save path.
+     */
+    function save_sheet_moved(operation: CsvSaveHostOperation): boolean {
+        return save_operation_owns_lifecycle(operation)
+            && operation.identity.sheetIndex !== active_edit_sheet_index;
+    }
+
+    /**
+     * The operation still holds the save lifecycle, whatever its worksheet is doing.
+     *
+     * The terminal paths ask this rather than {@link save_operation_is_current}:
+     * their job is to *give the lifecycle back*, and refusing to do that because the
+     * worksheet moved is precisely how it gets stranded.
+     */
+    function save_operation_owns_lifecycle(operation: CsvSaveHostOperation): boolean {
         return active_save_operation === operation
-            && edit_message_is_current(operation.identity.editSessionId)
+            && edit_message_is_current(operation.identity.editSessionId);
+    }
+
+    /**
+     * `true` while the save may continue; `false` to return quietly.
+     *
+     * Throws instead of answering when the worksheet moved — see `save_sheet_moved`.
+     */
+    function save_may_continue(operation: CsvSaveHostOperation): boolean {
+        if (save_operation_is_current(operation)) return true;
+        if (save_sheet_moved(operation)) {
+            throw new Error('The worksheet being saved moved while the save was in flight.');
+        }
+        return false;
+    }
+
+    function save_operation_is_current(operation: CsvSaveHostOperation): boolean {
+        return save_operation_owns_lifecycle(operation)
             // The operation's worksheet is a position captured when the save began,
             // and an external reorder mid-save moves the session off it. Without
             // this term the operation stays "current" against a stale index:
@@ -1872,6 +1923,29 @@ export function attach_viewer(
         if (success) delete_shared_edit_state_if_unused();
     }
 
+    /**
+     * Where this operation's worksheet sits in durable state *now*.
+     *
+     * `operation.sheetIndex` is a position captured when the save began, but the
+     * durable leaf is reconciled by name on every write, so a workbook reordered
+     * since then has moved the slot out from under it. Asking by name keeps a
+     * tombstone's cleanup pointed at its own edits — and returns `undefined` when
+     * the worksheet was deleted, which is "nothing to clean" rather than a
+     * positional guess at somebody else's slot.
+     *
+     * An operation with no recorded name is a nameless source (or a legacy shape),
+     * whose slot is only ever reattached by position anyway. So is one whose panel
+     * has since been disposed: the reconciliation this compensates for is driven by
+     * the adopted sheet names, and with no source there is none to compensate for —
+     * asking by name there would answer "deleted" for every worksheet and abandon
+     * the cleanup a disposed save still owes.
+     */
+    function operation_sheet_index(operation: CsvSaveOperation): number | undefined {
+        const name = save_operation_sheet_names.get(operation);
+        if (name === undefined || !source) return operation.sheetIndex;
+        return sheet_index_named(name);
+    }
+
     function strip_operation_owned_pending_edits(
         pending_edits: SheetPendingEditCells | undefined,
         operation: CsvSaveOperation,
@@ -1977,8 +2051,11 @@ export function attach_viewer(
             try {
                 const committed = await update_file_state((current) => {
                     // Scoped to the operation's own sheet: another worksheet's
-                    // slot is unrelated work this cleanup must not touch.
-                    const sheet_index = operation.sheetIndex;
+                    // slot is unrelated work this cleanup must not touch. Resolved
+                    // by name, because `update_file_state` has already reconciled
+                    // `current`'s slots against the adopted workbook.
+                    const sheet_index = operation_sheet_index(operation);
+                    if (sheet_index === undefined) return current;
                     const slot = current.pendingEdits?.[sheet_index];
                     const pending_edits = strip_operation_owned_pending_edits(
                         slot?.cells,
@@ -3794,7 +3871,7 @@ export function attach_viewer(
         warning?: string,
         error?: unknown,
     ): void {
-        if (!save_operation_is_current(operation)) return;
+        if (!save_operation_owns_lifecycle(operation)) return;
         active_save_operation = undefined;
         const lifecycle = finish_save_lifecycle(operation.identity, 'failed');
         if (warning) show_owner_warning(warning);
@@ -3817,7 +3894,7 @@ export function attach_viewer(
                 Object.freeze({ value: entry.value, base: entry.base }),
             ]),
         );
-        return Object.freeze({
+        const operation = Object.freeze({
             editSessionId: input.editSessionId,
             // Normalized here, at the boundary where a wire message becomes an
             // identity: everything downstream compares whole operations, so the
@@ -3827,6 +3904,9 @@ export function attach_viewer(
             edits: Object.freeze({ ...input.edits }),
             dirtyEdits: Object.freeze(dirty_edits),
         });
+        const sheet_name = sheet_name_at(operation.sheetIndex);
+        if (sheet_name !== undefined) save_operation_sheet_names.set(operation, sheet_name);
+        return operation;
     }
 
     async function persist_accepted_save(operation: CsvSaveHostOperation): Promise<void> {
@@ -4014,21 +4094,21 @@ export function attach_viewer(
         let post_save_reservation: { cancel(): void } | undefined;
         try {
             await pending_edit_writes.catch(() => {});
-            if (!save_operation_is_current(operation)) return;
+            if (!save_may_continue(operation)) return;
             await persist_accepted_save(operation);
             operation.phase = 'accepted';
 
             const current_stat = await host.fs.stat(uri);
-            if (!save_operation_is_current(operation)) return;
+            if (!save_may_continue(operation)) return;
             const max_mib = host.config.max_file_size_mib();
             assert_safe_file_size(current_stat.size, max_mib);
 
             const current_raw = await host.fs.read_file(uri);
-            if (!save_operation_is_current(operation)) return;
+            if (!save_may_continue(operation)) return;
             assert_safe_file_size(current_raw.byteLength, max_mib);
 
             const verified_stat = await host.fs.stat(uri);
-            if (!save_operation_is_current(operation)) return;
+            if (!save_may_continue(operation)) return;
             const snapshot_changed = current_stat.mtime !== verified_stat.mtime
                 || current_stat.size !== verified_stat.size;
 
@@ -4040,7 +4120,7 @@ export function attach_viewer(
                     'File was modified externally. Please review the changes and try again.',
                 );
                 if (!disposed) await refresh_panel_source(true, 'recovery');
-                if (!save_operation_is_current(operation)) return;
+                if (!save_operation_owns_lifecycle(operation)) return;
                 finish_save_failure(operation);
             };
 
@@ -4097,11 +4177,11 @@ export function attach_viewer(
                 log_sanitized_failure('Pre-write stat failed before saving', error);
                 // Check currency first, matching the mismatch path below: a save
                 // already superseded during the stat must not emit a warning.
-                if (!save_operation_is_current(operation)) return;
+                if (!save_operation_owns_lifecycle(operation)) return;
                 await refuse_as_external_change();
                 return;
             }
-            if (!save_operation_is_current(operation)) return;
+            if (!save_may_continue(operation)) return;
             if (
                 final_stat.mtime !== verified_stat.mtime
                 || final_stat.size !== verified_stat.size
@@ -5594,9 +5674,25 @@ export function attach_viewer(
                         // while this write was queued, the sheet it was posted about
                         // is the one still carrying that name. An untagged post (the
                         // single-sheet CSV shape) has nothing to follow and stays put.
+                        //
+                        // A named sheet that no longer resolves was deleted, and
+                        // falling back to its old position would hand its edits to
+                        // whichever worksheet inherited that index — tagged with the
+                        // *new* sheet's name, so it reads as that sheet's own draft
+                        // ever after. `undefined` here means "write nothing", which
+                        // the caller turns into an unchanged state.
+                        //
+                        // Defensive rather than a fix for a demonstrated failure: no
+                        // ordering was found that reaches it, because a deletion
+                        // releases the session and `update_edit_session_state`'s
+                        // currency check aborts every write behind it. That argument
+                        // rests on the release draining admitted writes, which is a
+                        // property of another module — cheaper to be right locally
+                        // than to depend on it staying true.
                         const target_index = posted_sheet_name === undefined
                             ? posted_sheet_index
-                            : sheet_index_named(posted_sheet_name) ?? posted_sheet_index;
+                            : sheet_index_named(posted_sheet_name);
+                        if (target_index === undefined) return current;
                         const next = with_pending_edits_for_sheet(
                             current.pendingEdits,
                             target_index,
@@ -5649,7 +5745,12 @@ export function attach_viewer(
                             !post_echoes_operation(
                                 pending_edits_for_sheet(
                                     committed.pendingEdits,
-                                    operation.sheetIndex,
+                                    // By name, for the same reason the cleanup
+                                    // resolves that way: `committed` is reconciled
+                                    // state, so the captured position may no longer
+                                    // be this operation's sheet. A deleted sheet has
+                                    // no map to echo, so nothing supersedes.
+                                    operation_sheet_index(operation) ?? -1,
                                 ),
                                 operation,
                             )
