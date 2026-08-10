@@ -3688,7 +3688,7 @@ describe('edit mode save exit', () => {
             sheetIndex: 0,
         });
         await dispatch_host_message({
-            type: 'csvSaveLifecycle',
+            type: 'saveOperationStarted',
             lifecycle: {
                 revision: 1,
                 state: 'active',
@@ -3728,7 +3728,7 @@ describe('edit mode save exit', () => {
             sheetIndex: 0,
         });
         await dispatch_host_message({
-            type: 'csvSaveLifecycle',
+            type: 'saveOperationStarted',
             lifecycle: {
                 revision: 1,
                 state: 'active',
@@ -3784,6 +3784,57 @@ describe('edit mode save exit', () => {
         ).toBe(false);
     });
 
+    it('disables transform affordances on a non-owning sheet while a save runs', async () => {
+        // The grid on a worksheet that does not own the session is handed no
+        // lifecycle, so it truthfully reports `save_in_flight: false` about a save
+        // it cannot see. Deriving the affordance from that report re-enabled sort
+        // and filter while `transform_request_blocked` — reading the
+        // document-scoped fence — went on refusing them: the click posted no
+        // `setTransform` and gave no feedback.
+        await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'people-session',
+            sheetIndex: 0,
+        });
+        await dispatch_host_message({
+            type: 'saveOperationStarted',
+            lifecycle: {
+                revision: 1,
+                state: 'active',
+                operation: {
+                    editSessionId: 'people-session',
+                    sheetIndex: 0,
+                    saveRequestId: 'save-1',
+                    edits: { '0:0': 'Alicia' },
+                    dirtyEdits: { '0:0': { value: 'Alicia', base: 'Alice' } },
+                },
+            },
+        });
+        grid_shell_mock.save_in_flight = true;
+        await act(async () => {
+            grid_shell_mock.on_editing_change?.({
+                is_dirty: true,
+                has_live_uncommitted: false,
+                save_in_flight: true,
+                edits: { '0:0': { value: 'Alicia', base: 'Alice' } },
+                conflicted: [],
+            });
+        });
+
+        grid_shell_mock.save_in_flight = false;
+        await click_sheet_tab('Inventory');
+
+        expect(grid_shell_mock.latest_props?.transform_sections).toBe(false);
+    });
+
     it('lifts the save fence when the save settles while another worksheet is on screen', async () => {
         // The other half of the fence above. Refusing the non-owning grid's report
         // is right while the save is running, but a *failed* save keeps the
@@ -3812,7 +3863,7 @@ describe('edit mode save exit', () => {
             dirtyEdits: { '0:0': { value: 'Alicia', base: 'Alice' } },
         };
         await dispatch_host_message({
-            type: 'csvSaveLifecycle',
+            type: 'saveOperationStarted',
             lifecycle: { revision: 1, state: 'active', operation },
         });
         grid_shell_mock.save_in_flight = true;

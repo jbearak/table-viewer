@@ -3547,8 +3547,16 @@ export function App(): React.JSX.Element {
      * displayed order is not the user's to change (preview, an Excel header
      * change reshaping the rows underneath).
      */
+    // The save term is read from the authoritative lifecycle, not from the grid's
+    // report: a grid on a worksheet that does not own the session is handed no
+    // lifecycle and truthfully reports `save_in_flight: false` about a save it
+    // cannot see. Trusting it here re-enabled the sort and filter controls while
+    // `transform_request_blocked` — which reads the document-scoped fence — went on
+    // refusing them, so clicking one posted no `setTransform` and said nothing.
+    // These two have to name the same condition or the UI is lying about it.
     const transform_ui_blocked =
-        editing_status?.save_in_flight === true
+        save_lifecycle.state === 'active'
+        || editing_status?.save_in_flight === true
         || edit_session_pending
         || preview_mode
         || excel_header_pending;
