@@ -241,6 +241,13 @@ function log_sanitized_failure(message: string, error: unknown): void {
     console.error(message, { code: sanitized_error_code(error) });
 }
 
+function is_file_not_found_error(error: unknown): boolean {
+    const code = typeof error === 'object' && error !== null && 'code' in error
+        ? (error as { code?: unknown }).code
+        : undefined;
+    return code === 'ENOENT' || code === 'FileNotFound';
+}
+
 type PhysicalAuthorityCommitResult =
     | { type: 'committed'; receipt: PhysicalAuthorityCommitReceipt }
     | { type: 'stale' }
@@ -2991,7 +2998,9 @@ export function attach_viewer(
             return;
         }
         log_sanitized_failure('Failed to reload table viewer data', error);
-        const message = `Failed to reload: ${error instanceof Error ? error.message : String(error)}`;
+        const message = is_file_not_found_error(error)
+            ? 'The file was deleted or moved, so Table Viewer could not reload it.'
+            : `Failed to reload: ${error instanceof Error ? error.message : String(error)}`;
         if (post_save) {
             host.ui.show_warning(
                 `The file was saved, but Table Viewer could not refresh the table view. ${message}`);
