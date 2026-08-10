@@ -899,13 +899,20 @@ export function GridShell({
         grid_ref.current?.scrollTo(cell[0], cell[1]);
     }, [merges, write_grid_selection]);
     const select_active_display_cell_ref = useRef(select_active_display_cell);
-    select_active_display_cell_ref.current = select_active_display_cell;
     const focus_grid_ref = useRef(focus_grid);
-    focus_grid_ref.current = focus_grid;
     const row_count_ref = useRef(row_count);
-    row_count_ref.current = row_count;
     const display_column_count_ref = useRef(display_column_count);
-    display_column_count_ref.current = display_column_count;
+    useLayoutEffect(() => {
+        select_active_display_cell_ref.current = select_active_display_cell;
+        focus_grid_ref.current = focus_grid;
+        row_count_ref.current = row_count;
+        display_column_count_ref.current = display_column_count;
+    }, [
+        select_active_display_cell,
+        focus_grid,
+        row_count,
+        display_column_count,
+    ]);
     const previous_projection_ref = useRef(column_projection);
     useEffect(() => {
         if (previous_projection_ref.current === column_projection) return;
