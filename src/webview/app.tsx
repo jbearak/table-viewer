@@ -894,6 +894,16 @@ export function App(): React.JSX.Element {
         set_save_lifecycle(next.authoritative);
         set_save_operation(next.operation);
 
+        // The authoritative lifecycle is what the fence is really about; the
+        // owning grid's report is only the usual way it is heard. While the user
+        // is on another worksheet there is no owning grid mounted, and a *failed*
+        // save keeps the session, so nothing was left to lower the fence: every
+        // transform was silently refused and the close flush published nothing,
+        // until the user happened to visit the owning sheet again.
+        if (next.authoritative.state !== 'active') {
+            save_in_flight_ref.current = false;
+        }
+
         const current_session_id = csv_edit_session_id_ref.current;
         if (incoming.state === 'active') {
             if (

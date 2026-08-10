@@ -876,6 +876,14 @@ export function sheet_index_with_pending_edits(
  * does, and why it must not disturb the neighbouring sheets' unsaved work.
  * Returns `undefined` when no slot has any edits left, so callers can drop the
  * leaf entirely rather than persist an array of holes.
+ *
+ * A slot already sitting at `sheet_index` under some *other* worksheet's name is
+ * a displaced duplicate, not this sheet's old draft: reconciliation seats only
+ * one of two same-named slots at their sheet's own index and leaves the other
+ * wherever a free position happens to be. Overwriting it deleted unsaved work
+ * that no message ever asked to discard — and it is recoverable, since the loser
+ * moves back to its own index as soon as the winner clears — so the incumbent is
+ * moved to a free slot rather than dropped.
  */
 export function with_pending_edits_for_sheet(
     pending: PerFileState['pendingEdits'],
@@ -885,9 +893,21 @@ export function with_pending_edits_for_sheet(
 ): PerFileState['pendingEdits'] {
     const next = pending ? [...pending] : [];
     while (next.length <= sheet_index) next.push(undefined);
+    const incumbent = next[sheet_index];
+    const displaced = sheet_name !== undefined
+        && incumbent !== undefined
+        && incumbent.sheetName !== undefined
+        && incumbent.sheetName !== sheet_name
+        ? incumbent
+        : undefined;
     next[sheet_index] = cells && Object.keys(cells).length > 0
         ? (sheet_name === undefined ? { cells } : { sheetName: sheet_name, cells })
         : undefined;
+    if (displaced && next[sheet_index] !== undefined) {
+        let free = next.findIndex((slot, index) => index !== sheet_index && slot === undefined);
+        if (free === -1) free = next.push(undefined) - 1;
+        next[free] = displaced;
+    }
     while (next.length > 0 && next[next.length - 1] === undefined) next.pop();
     return next.length === 0 ? undefined : next;
 }

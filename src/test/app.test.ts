@@ -3764,19 +3764,97 @@ describe('edit mode save exit', () => {
             type: 'requestPendingEditsFlush',
             requestId: 'flush-1',
         });
-        await act(async () => new Promise((resolve) => window.setTimeout(resolve, 0)));
-
+        // The reply itself is the observable result, so wait for *it* rather than
+        // for a tick that happens to be long enough on this machine.
+        let flush: { highestProducedSequence?: number } | undefined;
+        for (let attempt = 0; attempt < 100 && !flush; attempt += 1) {
+            await act(async () => { await Promise.resolve(); });
+            flush = post_message.mock.calls
+                .map(([message]) => message)
+                .find((message) => message?.type === 'pendingEditsFlush');
+        }
         // Fenced: the flush reports the sequence already produced rather than
         // publishing a new one that could never be acknowledged.
-        const flush = post_message.mock.calls
-            .map(([message]) => message)
-            .find((message) => message?.type === 'pendingEditsFlush');
+        expect(flush).toBeDefined();
         expect(flush?.highestProducedSequence).toBe(0);
         expect(
             post_message.mock.calls.some(
                 ([message]) => message?.type === 'pendingEditsChanged',
             ),
         ).toBe(false);
+    });
+
+    it('lifts the save fence when the save settles while another worksheet is on screen', async () => {
+        // The other half of the fence above. Refusing the non-owning grid's report
+        // is right while the save is running, but a *failed* save keeps the
+        // worksheet session — so nothing changes `editing_another_sheet`, no owning
+        // grid is mounted to report the terminal state, and the fence stayed up
+        // until the user happened to visit the owning sheet again. Meanwhile every
+        // transform was silently refused and the close flush published nothing.
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'people-session',
+            sheetIndex: 0,
+        });
+        const operation = {
+            editSessionId: 'people-session',
+            sheetIndex: 0,
+            saveRequestId: 'save-1',
+            edits: { '0:0': 'Alicia' },
+            dirtyEdits: { '0:0': { value: 'Alicia', base: 'Alice' } },
+        };
+        await dispatch_host_message({
+            type: 'csvSaveLifecycle',
+            lifecycle: { revision: 1, state: 'active', operation },
+        });
+        grid_shell_mock.save_in_flight = true;
+        await act(async () => {
+            grid_shell_mock.on_editing_change?.({
+                is_dirty: true,
+                has_live_uncommitted: false,
+                save_in_flight: true,
+                edits: { '0:0': { value: 'Alicia', base: 'Alice' } },
+                conflicted: [],
+            });
+        });
+
+        grid_shell_mock.save_in_flight = false;
+        await click_sheet_tab('Inventory');
+
+        // The save fails while the user is still on Inventory.
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: { revision: 2, state: 'failed', operation },
+        });
+
+        post_message.mockClear();
+        await dispatch_host_message({
+            type: 'requestPendingEditsFlush',
+            requestId: 'flush-2',
+        });
+        // The reply itself is the observable result, so wait for *it* rather than
+        // for a tick that happens to be long enough on this machine.
+        const posted = (type: string) => post_message.mock.calls
+            .map(([message]) => message)
+            .find((message) => message?.type === type);
+        let flush: { highestProducedSequence?: number } | undefined;
+        for (let attempt = 0; attempt < 100 && !flush; attempt += 1) {
+            await act(async () => { await Promise.resolve(); });
+            flush = posted('pendingEditsFlush');
+        }
+        expect(flush).toBeDefined();
+        // No save is in flight any more, so the flush publishes the restored edits
+        // instead of advertising a sequence the host will never acknowledge.
+        expect(flush?.highestProducedSequence).toBeGreaterThan(0);
     });
 
     it('adopts the worksheet the host names for a session it did not request', async () => {

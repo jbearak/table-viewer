@@ -1024,6 +1024,104 @@ describe('xlsx edit sessions', () => {
         ]);
     });
 
+    it('clears every same-named slot while the panel is still open', async () => {
+        // Same ambiguity as above, reached by releasing the session rather than
+        // disposing the panel. With the workbook still adopted, cleanup resolved
+        // the worksheet's *position* and cleaned only the slot sitting there — but
+        // reconciliation seats just one of two same-named slots at that index, so
+        // the operation's entries survived in the other as a phantom draft, and
+        // the tombstone was retired regardless.
+        const failed = { '1:0': { value: 'Gadget', base: 'Widget' } };
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        vscode_mock.__setWriteFileImplementation(async () => {
+            throw new Error('disk is full');
+        });
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                sheetIndex: 1,
+                saveRequestId: 'save-1',
+                edits: { '1:0': 'Gadget' },
+                dirtyEdits: failed,
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        // Both slots are tagged Inventory and both hold the failed entry; only one
+        // can occupy Inventory's own index.
+        const inner = state.store.compare_and_set.bind(state.store);
+        let injected = false;
+        state.store.compare_and_set = async (...args) => {
+            if (!injected) {
+                injected = true;
+                const current = await state.store.read(args[0]);
+                await inner(args[0], current.revision, {
+                    ...(current.state as object),
+                    pendingEdits: [
+                        { sheetName: 'Inventory', cells: { ...failed } },
+                        { sheetName: 'Inventory', cells: { ...failed } },
+                    ],
+                } as never);
+            }
+            return inner(...args);
+        };
+
+        await panel.__receive({ type: 'releaseEditSession', editSessionId: session });
+        await wait_for_observable(() => injected);
+        await controller_of(panel).drain();
+
+        // The cleanup commit lands after the release settles, so poll for the
+        // durable state rather than assuming a fixed number of turns.
+        const remaining = () => (state.get_state(file_path).pendingEdits ?? [])
+            .filter((slot: unknown) => slot !== undefined && slot !== null);
+        await wait_for_observable(() => remaining().length === 0);
+        expect(JSON.stringify(remaining())).toBe('[]');
+    });
+
+
+    it('keeps a displaced duplicate-tag draft when the sheet at its index is written', async () => {
+        // Reconciliation seats only one of two same-named slots at their sheet's
+        // own index; the other sits wherever a free position happens to be. That
+        // position can be another worksheet's, and writing that worksheet's own
+        // edits overwrote the displaced draft — unsaved work deleted with no
+        // message asking to discard it, and recoverable work at that: the loser
+        // moves back to its own index as soon as the winner clears.
+        const state = versioned_state_store({
+            pendingEdits: [
+                { sheetName: 'Inventory', cells: { '1:0': { value: 'Mallory', base: 'Widget' } } },
+                { sheetName: 'Inventory', cells: { '1:0': { value: 'Draft', base: 'Widget' } } },
+            ],
+        });
+        const panel = await open_ready_xlsx(file_path, state);
+        // Rehydration adopts Inventory at its own index; release it so People can
+        // be requested.
+        await panel.__receive({
+            type: 'releaseEditSession',
+            editSessionId: latest_snapshot(panel).capabilities.csvEditSessionId!,
+        });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session,
+            sequence: 1,
+            edits: { '0:0': { value: 'Bob', base: 'Alice' } },
+        });
+        await controller_of(panel).drain();
+        const durable = () => JSON.stringify(state.get_state(file_path).pendingEdits ?? []);
+        await wait_for_observable(() => durable().includes('Bob'));
+
+        // People's own draft is stored, and neither Inventory draft was lost.
+        expect(durable()).toContain('Mallory');
+        expect(durable()).toContain('Draft');
+    });
+
     it('preserves the styles part byte-for-byte across a save', async () => {
         const panel = await open_ready_xlsx(file_path);
         await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });

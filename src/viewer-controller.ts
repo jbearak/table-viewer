@@ -2051,18 +2051,23 @@ export function attach_viewer(
     ): number[] {
         const name = save_operation_sheet_names.get(operation);
         if (name === undefined) return [operation.sheetIndex];
-        if (source) {
-            const index = sheet_index_named(name, names);
-            return index === undefined ? [] : [index];
-        }
+        // Entries first, whether or not the workbook is adopted. Knowing the
+        // worksheet's live position tells us where *it* sits, not where its draft
+        // does: reconciliation can seat only one of two same-named slots at that
+        // index, so resolving by position alone cleaned at most one of them and
+        // retired the tombstone with the operation's own entries still durable —
+        // a phantom draft that came back next session.
         const holding: number[] = [];
         slots?.forEach((slot, index) => {
             if (slot?.sheetName !== name) return;
             if (holds_operation_entries(slot.cells, operation)) holding.push(index);
         });
         if (holding.length > 0) return holding;
-        const single = slot_index_tagged(slots, name, operation.sheetIndex);
-        return [single];
+        if (source) {
+            const index = sheet_index_named(name, names);
+            return index === undefined ? [] : [index];
+        }
+        return [slot_index_tagged(slots, name, operation.sheetIndex)];
     }
 
     /**
