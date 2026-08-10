@@ -44,7 +44,14 @@ function open_xlsx(
         fake_viewer_host,
     );
     panel.onDidDispose(() => controller.dispose());
+    // Stashed rather than returned: every caller wants the panel, and only the
+    // disposed-cleanup test below needs to dispose and drain the controller itself.
+    (panel as { __controller?: unknown }).__controller = controller;
     return panel;
+}
+
+function controller_of(panel: unknown) {
+    return (panel as { __controller: { dispose(): void; drain(): Promise<void> } }).__controller;
 }
 
 async function wait_for_observable(predicate: () => boolean): Promise<void> {
@@ -633,6 +640,73 @@ describe('xlsx edit sessions', () => {
             state.get_state(file_path).pendingEdits ?? null,
         ).includes('Gadget'));
         expect(JSON.stringify(state.get_state(file_path).pendingEdits)).toContain('Draft');
+    });
+
+    it('clears a disposed panel’s failed save by name, not by its old index', async () => {
+        // Disposal drops `source` before the failed save's cleanup runs, so there is
+        // no workbook left to resolve the operation's sheet name against — but
+        // another window still attached can reorder the workbook and write
+        // name-reconciled slots that this cleanup then reads. Falling back to the
+        // captured position cleared whatever draft had inherited that index and left
+        // the failed save's own entries behind, tombstone retired either way.
+        const failed = { '1:0': { value: 'Gadget', base: 'Widget' } };
+        const other = { '2:0': { value: 'Bob', base: 'Alice' } };
+        const state = versioned_state_store({
+            pendingEdits: [{ sheetName: 'People', cells: other }],
+        });
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({
+            type: 'releaseEditSession',
+            editSessionId: latest_snapshot(panel).capabilities.csvEditSessionId!,
+        });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        vscode_mock.__setWriteFileImplementation(async () => {
+            throw new Error('disk is full');
+        });
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                sheetIndex: 1,
+                saveRequestId: 'save-1',
+                edits: { '1:0': 'Gadget' },
+                dirtyEdits: failed,
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+        expect(save_results(panel).at(-1)).toMatchObject({ success: false });
+
+        // Stand in for the other window: commit the reordered, reconciled slots
+        // under the cleanup's first write, so it retries against the new order.
+        const inner = state.store.compare_and_set.bind(state.store);
+        let reordered = false;
+        state.store.compare_and_set = async (...args) => {
+            if (!reordered) {
+                reordered = true;
+                const current = await state.store.read(args[0]);
+                await inner(args[0], current.revision, {
+                    ...(current.state as object),
+                    pendingEdits: [
+                        { sheetName: 'Inventory', cells: failed },
+                        { sheetName: 'People', cells: other },
+                    ],
+                } as never);
+            }
+            return inner(...args);
+        };
+
+        controller_of(panel).dispose();
+        await wait_for_observable(() => reordered);
+        await controller_of(panel).drain();
+
+        // Inventory's entries are the failed save's own and must go; People's draft
+        // belongs to nobody in this flow and must stay.
+        expect(state.get_state(file_path).pendingEdits).toEqual([
+            undefined,
+            { sheetName: 'People', cells: other },
+        ]);
     });
 
     it('preserves the styles part byte-for-byte across a save', async () => {

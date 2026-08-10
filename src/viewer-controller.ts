@@ -1961,19 +1961,33 @@ export function attach_viewer(
      * positional guess at somebody else's slot.
      *
      * An operation with no recorded name is a nameless source (or a legacy shape),
-     * whose slot is only ever reattached by position anyway. So is one whose panel
-     * has since been disposed: the reconciliation this compensates for is driven by
-     * the adopted sheet names, and with no source there is none to compensate for —
-     * asking by name there would answer "deleted" for every worksheet and abandon
-     * the cleanup a disposed save still owes.
+     * whose slot is only ever reattached by position anyway.
+     *
+     * A disposed panel is the awkward case: it has no source to name sheets from,
+     * but another window may still be attached, reordering the workbook and writing
+     * name-reconciled slots that this cleanup then reads. Falling back to the
+     * captured position there cleared whichever draft had inherited that index and
+     * left the failed save's own entries behind — the tombstone retired regardless,
+     * so the phantom survived into the next session. `slots` is the durable array
+     * this cleanup is about to modify, and its own `sheetName` tags say where the
+     * operation's sheet went without needing a workbook at all.
      */
     function operation_sheet_index(
         operation: CsvSaveOperation,
         names?: readonly string[],
+        slots?: PerFileState['pendingEdits'],
     ): number | undefined {
         const name = save_operation_sheet_names.get(operation);
-        if (name === undefined || !source) return operation.sheetIndex;
-        return sheet_index_named(name, names);
+        if (name === undefined) return operation.sheetIndex;
+        if (source) return sheet_index_named(name, names);
+        const tagged = slots?.findIndex((slot) => slot?.sheetName === name) ?? -1;
+        if (tagged !== -1) return tagged;
+        // Nothing tagged with this name: either the slots predate name tagging, or
+        // the sheet is gone. Neither is distinguishable from here without a
+        // workbook, and the captured position is the only answer left — the same
+        // one an untagged operation gets, and the shape that held before any of
+        // this was worksheet-scoped.
+        return operation.sheetIndex;
     }
 
     function strip_operation_owned_pending_edits(
@@ -2084,7 +2098,11 @@ export function attach_viewer(
                     // slot is unrelated work this cleanup must not touch. Resolved
                     // by name, because `update_file_state` has already reconciled
                     // `current`'s slots against the adopted workbook.
-                    const sheet_index = operation_sheet_index(operation, names);
+                    const sheet_index = operation_sheet_index(
+                        operation,
+                        names,
+                        current.pendingEdits,
+                    );
                     if (sheet_index === undefined) return current;
                     const slot = current.pendingEdits?.[sheet_index];
                     const pending_edits = strip_operation_owned_pending_edits(
@@ -5815,7 +5833,11 @@ export function attach_viewer(
                                     // state, so the captured position may no longer
                                     // be this operation's sheet. A deleted sheet has
                                     // no map to echo, so nothing supersedes.
-                                    operation_sheet_index(operation) ?? -1,
+                                    operation_sheet_index(
+                                        operation,
+                                        undefined,
+                                        committed.pendingEdits,
+                                    ) ?? -1,
                                 ),
                                 operation,
                             )

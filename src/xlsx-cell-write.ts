@@ -529,11 +529,14 @@ function canonical_edits(edits: readonly XlsxCellEdit[]): readonly XlsxCellEdit[
  * wrong for spellings that are equally valid XML. Three of them corrupt silently
  * rather than failing loudly, which is why this refuses instead of trying harder:
  *
- *  - A namespace prefix (`<x:row>`, `<x:c>`, `<x:f>`). Prefixes bind to a URI, so
- *    these are the same elements. The dangerous case is a *mixed* document, where
- *    unprefixed rows and cells scan normally but a prefixed `<x:f>` is invisible:
- *    the edit overwrites an array formula without seeing it, and `formula_count`
- *    reports no loss, so `calcChain.xml` stays attached and stale.
+ *  - A namespace prefix (`<x:row>`, `<x:c>`, `<x:f>`), or a default-namespace
+ *    override (`<row xmlns="urn:other">`). Both bind the element to a URI, so they
+ *    are the same elements to a parser and invisible to these scanners. A mixed
+ *    document is the dangerous case: unprefixed rows and cells scan normally but a
+ *    prefixed `<x:f>` is not seen, so the edit overwrites an array formula and
+ *    `formula_count` reports no loss, leaving `calcChain.xml` attached and stale.
+ *    An override is worse still — a `<c>` spliced into an overridden row inherits
+ *    the foreign namespace, so the save succeeds and writes no worksheet cell.
  *  - An attribute spelled any way but `name="value"` — single-quoted (`r='A1'`),
  *    space-padded (`r = "A1"`), or carrying an entity reference (`r="A&#49;"`).
  *    Every attribute the writer consumes is matched literally, so each spelling
@@ -591,6 +594,13 @@ function assert_writable_sheet_data(xml: string, from: number, to: number): void
         }
         if (m[0].startsWith('<c') && !/\br="/.test(m[0])) {
             unsupported('cells whose position is implied rather than written');
+        }
+        // A prefix is not the only way to move an element out of SpreadsheetML: a
+        // default-namespace override (`<row xmlns="urn:other">`) rebinds the row and
+        // every unprefixed child. A `<c>` spliced in there inherits the foreign
+        // namespace, so the save reports success and no worksheet cell is written.
+        if (/\sxmlns(?::[\w.-]+)?=/.test(m[1])) {
+            unsupported('worksheet elements in a different XML namespace');
         }
     }
 }

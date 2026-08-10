@@ -20,7 +20,9 @@ import type { WorkbookData, SheetData, CellData, MergeRange } from './types';
 
 // --- XML Helpers ---
 
-function decode_xml(s: string): string {
+/** Expand the five predefined XML entities. Exported for `xlsx-package`, which
+ *  reads `formatCode` attributes that mean nothing until they are decoded. */
+export function decode_xml(s: string): string {
     if (s.indexOf('&') === -1) return s;
     return s
         .replace(/&lt;/g, '<')

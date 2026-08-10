@@ -1,6 +1,7 @@
 import CFB from 'cfb';
 import { apply_cell_edits, formula_count, widen_dimension, type XlsxCellEdit } from './xlsx-cell-write';
 import { is_date_format } from './spreadsheet-format';
+import { decode_xml } from './parse-xlsx';
 import type { XfEntry, DateMode } from './spreadsheet-format';
 
 /**
@@ -83,7 +84,12 @@ function read_style_date_predicate(cfb_file: ReturnType<typeof CFB.read>): (xf_i
         for (const m of num_fmts[1].matchAll(/<numFmt\b[^>]*>/g)) {
             const id = /\bnumFmtId="(\d+)"/.exec(m[0]);
             const code = /\bformatCode="([^"]*)"/.exec(m[0]);
-            if (id && code) format_map.set(Number(id[1]), code[1]);
+            // Decoded before anything reads it: `formatCode` is an XML attribute, so
+            // a perfectly ordinary format like `0 "&"` is stored as
+            // `0 &quot;&amp;&quot;` — and `SSF.is_date` says *true* of that escaped
+            // text and false of what it means. A cell under it would take a typed
+            // date as a serial and show the user a five-digit number.
+            if (id && code) format_map.set(Number(id[1]), decode_xml(code[1]));
         }
     }
 

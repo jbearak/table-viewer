@@ -382,6 +382,10 @@ describe('apply_cell_edits', () => {
             "<row r=\"1\"><c r=\"A1\"><f t='shared' si='0'>SUM(1)</f><v>1</v></c></row>",
             // Parses as `A1`, so the scanner misses the cell and appends a duplicate.
             '<row r="1"><c r="A&#49;"><v>1</v></c></row>',
+            // A default-namespace override rebinds the row and every unprefixed
+            // child, so a `<c>` spliced in is not a SpreadsheetML cell at all — the
+            // save would report success having written nothing Excel can see.
+            '<row xmlns="urn:not-spreadsheet" r="1"><c r="B1"><v>1</v></c></row>',
         ];
         for (const inner of cases) {
             expect(() => apply_cell_edits(
@@ -589,6 +593,33 @@ describe('write_xlsx_cell_edits', () => {
         const cell = data.sheets[0].rows[0][2]!;
         expect(cell.rawType).toBe('date');
         expect(String(cell.raw)).toContain('2024-01-15');
+    });
+
+    it('reads a format code as it means, not as it is escaped', async () => {
+        // `formatCode` is an XML attribute, so an ordinary custom format that
+        // happens to contain a quote or an ampersand — `0 "&"` — is stored escaped.
+        // `SSF.is_date` answers *true* for the escaped text and false for what it
+        // means, so a cell under that format took a typed date as a serial and
+        // showed the user a five-digit number under a format that is not a date.
+        const raw = readFileSync(FORMATTED);
+        const file = CFB.read(raw, { type: 'buffer' });
+        const entry = CFB.find(file, '/xl/styles.xml')!;
+        const patched = Buffer.from(
+            Buffer.from(entry.content as Uint8Array).toString('utf8')
+                .replace('formatCode="$#,##0.00"', 'formatCode="0 &quot;&amp;&quot;"'),
+            'utf8',
+        );
+        entry.content = patched;
+        entry.size = patched.length;
+        const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+        const bytes = written instanceof Uint8Array
+            ? written
+            : new Uint8Array(written as ArrayBufferLike);
+
+        // A1 carries style 1, which is that format.
+        const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '2024-01-15' }]);
+        const { data } = await parse_xlsx(out);
+        expect(data.sheets[0].rows[0][0]!.raw).toBe('2024-01-15');
     });
 
     it('leaves every part it did not edit byte-identical', () => {
