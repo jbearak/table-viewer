@@ -758,6 +758,13 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
 }
 
 /* Raven-style integrated table controls. */
+.toolbar-lead {
+    display: flex;
+    align-items: center;
+    flex: 0 0 auto;
+    gap: 8px;
+}
+
 .toolbar-chips {
     display: flex;
     align-items: center;
@@ -767,6 +774,12 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     min-width: 0;
     max-width: 100%;
     overflow: visible;
+}
+
+/* With no sort, filter, or notice to show, the chip region would only contribute
+   a stray gap between the lead control and the actions. */
+.toolbar-chips:empty {
+    display: none;
 }
 
 .toolbar-actions {
