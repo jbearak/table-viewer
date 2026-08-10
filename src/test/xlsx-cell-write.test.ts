@@ -383,6 +383,19 @@ describe('apply_cell_edits', () => {
         }
     });
 
+    it('does not refuse over markup quoted inside a comment', () => {
+        // The guard scans raw text like the scanners do, so it has the same hazard
+        // in the opposite direction: refusing a worksheet that edits perfectly well
+        // because a comment happens to quote a shape it rejects.
+        for (const inner of [
+            '<row r="1"><c r="A1"><v>1</v></c></row><!-- <row r="2"><c><v>x</v></c></row> -->',
+            '<row r="1"><c r="A1"><v>1</v></c></row><!-- <x:row><x:c/></x:row> -->',
+        ]) {
+            expect(apply_cell_edits(doc(inner), [{ row: 0, col: 0, value: '2' }], OPTS))
+                .toContain('<c r="A1"><v>2</v></c>');
+        }
+    });
+
     it('keeps a boolean cell boolean', () => {
         // The reader renders `t="b"` as TRUE/FALSE, so that is the text the user
         // retypes. Storing it as an inline string looks identical in the grid and

@@ -550,29 +550,31 @@ function canonical_edits(edits: readonly XlsxCellEdit[]): readonly XlsxCellEdit[
  * of it a splice depends on.
  */
 function assert_writable_sheet_data(xml: string, from: number, to: number): void {
-    const region = xml.slice(from, to);
-    const unsupported = (what: string): Error => new Error(
-        `Cannot edit this worksheet: it uses ${what}, which Table Viewer cannot `
-        + 'edit safely. Re-saving the file in Excel will normally fix it.',
-    );
-    if (/<[A-Za-z_][\w.-]*:(?:row|c|f|is|v)\b/.test(region)) {
-        unsupported_throw(unsupported('namespace-prefixed cell elements'));
+    // Offsets kept absolute so the ignorable ranges line up; comments and CDATA are
+    // text, and refusing a worksheet over markup quoted inside one would be a
+    // false positive on a file that edits perfectly well.
+    const ignorable = ignorable_ranges(xml, from, to);
+    const live = (at: number): boolean => ignorable_end(ignorable, at) === undefined;
+    const unsupported = (what: string): never => {
+        throw new Error(
+            `Cannot edit this worksheet: it uses ${what}, which Table Viewer cannot `
+            + 'edit safely. Re-saving the file in Excel will normally fix it.',
+        );
+    };
+    for (const m of xml.matchAll(/<[A-Za-z_][\w.-]*:(?:row|c|f|is|v)\b/g)) {
+        if (m.index >= from && m.index < to && live(m.index)) {
+            unsupported('namespace-prefixed cell elements');
+        }
     }
-    for (const m of region.matchAll(/<(?:row|c)\b[^>]*>/g)) {
+    for (const m of xml.matchAll(/<(?:row|c)\b[^>]*>/g)) {
+        if (m.index < from || m.index >= to || !live(m.index)) continue;
         if (/\br\s*=\s*'/.test(m[0]) || /\br\s+=/.test(m[0]) || /=\s+["']/.test(m[0])) {
-            unsupported_throw(unsupported('single-quoted or space-padded attributes'));
+            unsupported('single-quoted or space-padded attributes');
+        }
+        if (m[0].startsWith('<c') && !/\br="/.test(m[0])) {
+            unsupported('cells whose position is implied rather than written');
         }
     }
-    for (const m of region.matchAll(/<c\b[^>]*>/g)) {
-        if (!/\br="/.test(m[0])) {
-            unsupported_throw(unsupported('cells whose position is implied rather than written'));
-        }
-    }
-}
-
-/** Indirection so the checks above read as a list rather than a wall of throws. */
-function unsupported_throw(error: Error): never {
-    throw error;
 }
 
 /** One pending splice: replace `[start, end)` with `text`. */
