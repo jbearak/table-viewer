@@ -709,6 +709,61 @@ describe('xlsx edit sessions', () => {
         ]);
     });
 
+    it('clears a disposed save’s own slot when two carry the same name', async () => {
+        // Two slots tagged alike is what an external rename onto a name another
+        // slot already recorded leaves behind. Taking the first match cleared a
+        // draft this operation never owned and left its own failed-save entries
+        // standing; the captured position still carries the name, so prefer it.
+        const failed = { '1:0': { value: 'Gadget', base: 'Widget' } };
+        const other = { '2:0': { value: 'Bob', base: 'Alice' } };
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        vscode_mock.__setWriteFileImplementation(async () => {
+            throw new Error('disk is full');
+        });
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                sheetIndex: 1,
+                saveRequestId: 'save-1',
+                edits: { '1:0': 'Gadget' },
+                dirtyEdits: failed,
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        const inner = state.store.compare_and_set.bind(state.store);
+        let injected = false;
+        state.store.compare_and_set = async (...args) => {
+            if (!injected) {
+                injected = true;
+                const current = await state.store.read(args[0]);
+                await inner(args[0], current.revision, {
+                    ...(current.state as object),
+                    pendingEdits: [
+                        { sheetName: 'Inventory', cells: other },
+                        { sheetName: 'Inventory', cells: failed },
+                    ],
+                } as never);
+            }
+            return inner(...args);
+        };
+
+        controller_of(panel).dispose();
+        await wait_for_observable(() => injected);
+        await controller_of(panel).drain();
+
+        // Trailing empty slots are trimmed, so the operation's own slot going is
+        // the array getting shorter — the neighbour's draft is what must remain.
+        expect(state.get_state(file_path).pendingEdits).toEqual([
+            { sheetName: 'Inventory', cells: other },
+        ]);
+    });
+
     it('preserves the styles part byte-for-byte across a save', async () => {
         const panel = await open_ready_xlsx(file_path);
         await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });

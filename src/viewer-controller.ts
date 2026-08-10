@@ -1980,6 +1980,11 @@ export function attach_viewer(
         const name = save_operation_sheet_names.get(operation);
         if (name === undefined) return operation.sheetIndex;
         if (source) return sheet_index_named(name, names);
+        // The captured position first, when it still carries this name: two slots
+        // can be tagged alike (a sheet renamed externally onto a name another slot
+        // already recorded), and a bare `findIndex` would then hand the cleanup the
+        // *other* one — clearing a draft it does not own and leaving its own behind.
+        if (slots?.[operation.sheetIndex]?.sheetName === name) return operation.sheetIndex;
         const tagged = slots?.findIndex((slot) => slot?.sheetName === name) ?? -1;
         if (tagged !== -1) return tagged;
         // Nothing tagged with this name: either the slots predate name tagging, or

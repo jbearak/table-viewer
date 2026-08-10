@@ -73,6 +73,28 @@ function write_part_text(cfb_file: ReturnType<typeof CFB.read>, path: string, te
     return true;
 }
 
+/**
+ * The first section of a number format — what a positive value is displayed by.
+ *
+ * A `;` inside a quoted literal, an escape, or a bracketed condition/colour is not
+ * a section break, so this cannot be a `split(';')`: `"a;b";0` is one section, and
+ * cutting it in half would leave a fragment that classifies as anything at all.
+ */
+function positive_section(code: string): string {
+    let quoted = false;
+    let bracket = 0;
+    for (let i = 0; i < code.length; i += 1) {
+        const ch = code[i];
+        if (ch === '\\') { i += 1; continue; }
+        if (ch === '"') { quoted = !quoted; continue; }
+        if (quoted) continue;
+        if (ch === '[') bracket += 1;
+        else if (ch === ']') bracket = Math.max(0, bracket - 1);
+        else if (ch === ';' && bracket === 0) return code.slice(0, i);
+    }
+    return code;
+}
+
 /** Parse just enough of `xl/styles.xml` to answer "is this style index a date format?". */
 function read_style_date_predicate(cfb_file: ReturnType<typeof CFB.read>): (xf_index: number) => boolean {
     const xml = read_part_text(cfb_file, '/xl/styles.xml');
@@ -106,7 +128,16 @@ function read_style_date_predicate(cfb_file: ReturnType<typeof CFB.read>): (xf_i
         }
     }
 
-    return (xf_index: number) => is_date_format(xf_index, xfs, format_map);
+    // Narrowed to the *positive* section, which is the one a value typed into an
+    // empty-or-numeric cell will be displayed under. A format's sections are
+    // `positive;negative;zero;text`, and `SSF.is_date` says true if any of them is
+    // a date — so `0;0;yyyy-mm-dd` counts, and a date typed there would be stored
+    // as a serial and rendered by its positive section as `45306`. Only the reading
+    // side wants the whole-format answer (a negative value really is displayed by
+    // section two); the writer is deciding what a new positive value becomes.
+    const positive_only = new Map<number, string>();
+    for (const [id, code] of format_map) positive_only.set(id, positive_section(code));
+    return (xf_index: number) => is_date_format(xf_index, xfs, positive_only);
 }
 
 function read_datemode(cfb_file: ReturnType<typeof CFB.read>): DateMode {
@@ -177,6 +208,14 @@ export function write_xlsx_cell_edits(
     if (formula_count(updated) < formula_count(sheet_xml)) {
         remove_part(cfb_file, '/xl/calcChain.xml');
     }
+
+    // `xl/sharedStrings.xml` is deliberately not touched, including its `count`.
+    // Writing over a `t="s"` cell drops one *reference* to the table, so `count`
+    // (total references) can read high afterwards while `uniqueCount` (entries)
+    // stays exact — no `<si>` is ever added or removed here, since values are
+    // written inline. Excel and openpyxl both index by position and ignore the
+    // tally; rewriting the part to correct it would give up the byte-identity
+    // guarantee for every string edit, in exchange for a number nothing reads.
 
     const out = CFB.write(cfb_file, { type: 'buffer', fileType: 'zip', compression: true });
     return out instanceof Uint8Array ? out : new Uint8Array(out as ArrayBufferLike);

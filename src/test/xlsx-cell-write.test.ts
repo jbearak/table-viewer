@@ -622,6 +622,54 @@ describe('write_xlsx_cell_edits', () => {
         expect(data.sheets[0].rows[0][0]!.raw).toBe('2024-01-15');
     });
 
+    it('does not treat a date section other than the first as a date cell', async () => {
+        // `0;0;yyyy-mm-dd` displays positives as plain numbers and only *zero* as a
+        // date, but `SSF.is_date` is true for the whole code. Storing a typed date
+        // as a serial under it showed the user `45306` — the format's own positive
+        // section rendering the serial it was just given.
+        const raw = readFileSync(FORMATTED);
+        const file = CFB.read(raw, { type: 'buffer' });
+        const entry = CFB.find(file, '/xl/styles.xml')!;
+        const patched = Buffer.from(
+            Buffer.from(entry.content as Uint8Array).toString('utf8')
+                .replace('formatCode="$#,##0.00"', 'formatCode="0;0;yyyy-mm-dd"'),
+            'utf8',
+        );
+        entry.content = patched;
+        entry.size = patched.length;
+        const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+        const bytes = written instanceof Uint8Array
+            ? written
+            : new Uint8Array(written as ArrayBufferLike);
+
+        const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '2024-01-15' }]);
+        const { data } = await parse_xlsx(out);
+        expect(data.sheets[0].rows[0][0]!.raw).toBe('2024-01-15');
+    });
+
+    it('still writes a serial when only the trailing text section differs', () => {
+        // `mm/dd/yy;@` is how Excel spells "date, and show text as typed" — the
+        // positive section is the date, so narrowing to it must not lose this.
+        const raw = readFileSync(FORMATTED);
+        const file = CFB.read(raw, { type: 'buffer' });
+        const entry = CFB.find(file, '/xl/styles.xml')!;
+        const patched = Buffer.from(
+            Buffer.from(entry.content as Uint8Array).toString('utf8')
+                .replace('formatCode="$#,##0.00"', 'formatCode="mm/dd/yy;@"'),
+            'utf8',
+        );
+        entry.content = patched;
+        entry.size = patched.length;
+        const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+        const bytes = written instanceof Uint8Array
+            ? written
+            : new Uint8Array(written as ArrayBufferLike);
+
+        const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '2024-01-15' }]);
+        expect(part(out, '/xl/worksheets/sheet1.xml')!.toString('utf8'))
+            .toContain('<v>45306</v>');
+    });
+
     it('leaves every part it did not edit byte-identical', () => {
         const raw = readFileSync(SAMPLE);
         const out = write_xlsx_cell_edits(raw, 2, [{ row: 1, col: 1, value: '42' }]);

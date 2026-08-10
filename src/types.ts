@@ -944,8 +944,23 @@ export function reconcile_pending_edit_sheets(
             changed = true;
             return;
         }
-        if (moved_to !== index) changed = true;
         while (next.length <= moved_to) next.push(undefined);
+        // Names are unique *within a workbook*, but two slots can still carry the
+        // same tag: a sheet renamed externally onto a name some other slot already
+        // recorded leaves both tagged alike until the next write. Overwriting here
+        // deleted the earlier slot's unsaved work outright, so the first claimant
+        // keeps the position and the loser stays where it is if that place is free.
+        // Both drafts survive, one of them attached to a worksheet that may not be
+        // its own — visible and dismissable, unlike a silent deletion.
+        if (next[moved_to] !== undefined) {
+            while (next.length <= index) next.push(undefined);
+            let landing = next[index] === undefined ? index : next.indexOf(undefined);
+            if (landing === -1) landing = next.length;
+            next[landing] = slot;
+            if (landing !== index) changed = true;
+            return;
+        }
+        if (moved_to !== index) changed = true;
         next[moved_to] = slot;
     });
     if (!changed) return pending;

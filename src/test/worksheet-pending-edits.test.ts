@@ -208,6 +208,23 @@ describe('reconcile_pending_edit_sheets', () => {
         expect(reconcile_pending_edit_sheets(pending, ['A'])).toHaveLength(1);
     });
 
+    it('keeps both drafts when two slots ended up tagged with one name', () => {
+        // Names are unique within a workbook, but slots are written over time: a
+        // sheet renamed externally onto a name another slot already recorded leaves
+        // two tags alike until the next write. Assigning both to the same position
+        // deleted the loser's unsaved work outright, which is the one outcome this
+        // whole reconciliation exists to avoid.
+        const pending: PerFileState['pendingEdits'] = [
+            { sheetName: 'Inventory', cells: { '0:0': entry('first') } },
+            { sheetName: 'Inventory', cells: { '0:0': entry('second') } },
+        ];
+        const after = reconcile_pending_edit_sheets(pending, ['People', 'Inventory']);
+        const kept = (after ?? []).map((slot) => slot?.cells?.['0:0']);
+        expect(kept).toEqual(
+            expect.arrayContaining([entry('first'), entry('second')]),
+        );
+    });
+
     it('passes an absent leaf through', () => {
         expect(reconcile_pending_edit_sheets(undefined, ['A'])).toBeUndefined();
     });
