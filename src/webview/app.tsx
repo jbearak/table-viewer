@@ -893,7 +893,19 @@ export function App(): React.JSX.Element {
             || csv_save_operations_equal(previous.operation, incoming.operation)
         ) {
             if (incoming.state === 'failed') {
-                if (incoming.operation.editSessionId === current_session_id) {
+                // A failure restores edits only when it settles an operation this
+                // renderer actually locked. Host-generated rehydration validation
+                // has no local operation: its rejection keys are compared with the
+                // live map below, but its historical map must never replace edits
+                // made after the initial snapshot was acknowledged.
+                if (
+                    previous.operation
+                    && incoming.operation.editSessionId === current_session_id
+                    && csv_save_operations_equal(
+                        previous.operation,
+                        incoming.operation,
+                    )
+                ) {
                     const hydrated = resolve_csv_save_hydration(
                         next,
                         current_session_id,

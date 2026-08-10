@@ -590,6 +590,14 @@ export function attach_viewer(
                     lifecycle,
                     rejection: rehydration_rejection.rejection,
                 }, session.current_receiver_epoch);
+                // This host-generated verdict did not lock or persist a save. Keep
+                // the failed envelope only long enough to deliver the existing
+                // rejection protocol; future snapshots must not treat its partial
+                // validated map as save hydration authority.
+                retire_save_lifecycle(
+                    rehydration_rejection.operation.editSessionId,
+                    'failed',
+                );
             }
             const digest = adoption.source === 'commitReceipt'
                 ? adoption.receipt.resultingBasis.physicalDigest

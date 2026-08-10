@@ -4335,6 +4335,49 @@ describe('edit mode save exit', () => {
     // Host-rejected saves. These are the deadlock case: the keys the host names are
     // exactly the ones the webview's residency-gated `is_entry_conflicted` cannot
     // flag, so every one of these tests reports NO webview-derived conflicts.
+    it('does not replace newer edits for a host-generated rehydration rejection', async () => {
+        await render_app();
+        const restored = { '4:1': { value: 'edited', base: 'stale' } };
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'test-edit-session',
+                },
+                state: { pendingEdits: restored },
+            }),
+        );
+        const store = grid_shell_mock.latest_props?.edit_session as EditSessionStore;
+        await act(async () => {
+            store.commit('test-edit-session', '9:0', {
+                value: 'newer edit',
+                base: 'current',
+            });
+        });
+
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 900,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'rehydration:1',
+                    edits: { '4:1': 'edited' },
+                    dirtyEdits: restored,
+                },
+            },
+            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+        });
+
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!)).toEqual({
+            ...restored,
+            '9:0': { value: 'newer edit', base: 'current' },
+        });
+    });
+
     it('shows the conflict banner for a host base mismatch with no derived conflicts', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(
