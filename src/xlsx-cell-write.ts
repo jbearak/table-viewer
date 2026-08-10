@@ -142,6 +142,24 @@ export function iso_to_serial(text: string, datemode: 0 | 1): number | null {
 const NUMBER_RE = /^[+-]?((0|[1-9]\d*)(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/;
 
 /**
+ * Significant digits a double holds exactly. Excel's own limit is the same 15,
+ * and for the same reason: `<v>` is read back as an IEEE double.
+ */
+const MAX_EXACT_DIGITS = 15;
+
+/**
+ * How many significant digits a numeric literal spells out.
+ *
+ * Leading zeros and the exponent do not count — `0.00012` and `1.2e-30` carry two
+ * — because neither costs precision. Only the digits that must survive the
+ * round-trip through a double are counted.
+ */
+function significant_digits(text: string): number {
+    const mantissa = text.replace(/[eE][+-]?\d+$/, '').replace(/[+-]/, '').replace('.', '');
+    return mantissa.replace(/^0+/, '').length;
+}
+
+/**
  * Decide how one typed string is stored, given the cell's existing style.
  *
  * Per the agreed `putexcel` semantics the cell keeps its existing `s=` style
@@ -164,9 +182,22 @@ export function classify_value(
         return { kind: 'number', text: String(serial) };
     }
 
-    if (NUMBER_RE.test(value.trim())) {
-        const n = Number(value.trim());
-        if (Number.isFinite(n)) return { kind: 'number', text: value.trim() };
+    // Numeric only when storing it as a number is *lossless*. `<v>` is read back
+    // as an IEEE double, so a token carrying more than ~15 significant digits —
+    // an account number, an order id, a long barcode — comes back rounded:
+    // `12345678901234567890` reads as `12345678901234567000`, and the digits the
+    // user typed are gone from the file. Round-tripping the parse is the exact
+    // test for that, and it costs nothing on the ordinary values that dominate.
+    //
+    // Such a token is stored as a string instead, which is also what Excel does
+    // with an identifier too long to hold as a number, and what editing the same
+    // text in a CSV already does here.
+    const trimmed = value.trim();
+    if (NUMBER_RE.test(trimmed)) {
+        const n = Number(trimmed);
+        if (Number.isFinite(n) && significant_digits(trimmed) <= MAX_EXACT_DIGITS) {
+            return { kind: 'number', text: trimmed };
+        }
     }
 
     return { kind: 'string', text: value };
@@ -708,9 +739,28 @@ function cell_reference(row: number, col: number): string {
     return `${col_index_to_letter(col)}${row + 1}`;
 }
 
+/**
+ * The cell's style index, read exactly as `parse_xlsx` reads it.
+ *
+ * The reader does `parseInt(s, 10)`, which takes a leading `+` — and `+3` is
+ * legal for the `unsignedInt` this attribute is typed as, so a generator may
+ * legitimately emit it. A digits-only match here made the same cell style 3 to
+ * the reader and unstyled to the writer, and the two disagreeing about a style is
+ * the whole bug class: the reader showed C1 as a date, the writer saw no style,
+ * so a retyped `2024-01-15` was stored as an inline string and the cell stopped
+ * being a date to every formula and filter downstream — while looking unchanged.
+ *
+ * So this matches `parseInt`'s grammar rather than a stricter one. Being more
+ * nearly correct about XML than the reader is not the goal; agreeing with the
+ * side that renders the result is.
+ */
 function existing_style(open_tag: string): number | null {
-    const m = /\bs="(\d+)"/.exec(open_tag);
-    return m ? Number(m[1]) : null;
+    const m = /\bs="\s*([+-]?\d+)/.exec(open_tag);
+    if (!m) return null;
+    const parsed = Number(m[1]);
+    // `parseInt` yields a negative for `s="-1"`; no such style exists, and the
+    // reader's own `get_style` falls back for an out-of-range index.
+    return parsed >= 0 ? parsed : null;
 }
 
 /**

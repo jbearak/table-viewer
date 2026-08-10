@@ -1222,6 +1222,49 @@ describe('write_xlsx_cell_edits', () => {
         expect(data.sheets[0].rows[0][0]!.raw).toBe('2024-01-15');
     });
 
+    it('stores a long identifier as text rather than rounding it away', async () => {
+        // `<v>` reads back as a double, so past ~15 significant digits the digits
+        // the user typed are gone from the file: an account number entered as
+        // 12345678901234567890 came back 12345678901234567000.
+        const out = write_xlsx_cell_edits(readFileSync(EMPTY), 0, [
+            { row: 0, col: 0, value: '12345678901234567890' },
+        ]);
+        const { data } = await parse_xlsx(out);
+        expect(String(data.sheets[0].rows[0][0]!.raw)).toBe('12345678901234567890');
+    });
+
+    it('still stores ordinary numbers as numbers', async () => {
+        // The guard above must not sweep in the values that actually dominate;
+        // trailing zeros and exponents cost no precision and stay numeric.
+        const out = write_xlsx_cell_edits(readFileSync(EMPTY), 0, [
+            { row: 0, col: 0, value: '1234.56' },
+            { row: 1, col: 0, value: '-0.000125' },
+            { row: 2, col: 0, value: '1.2e-30' },
+            { row: 3, col: 0, value: '999999999999999' },
+        ]);
+        const { data } = await parse_xlsx(out);
+        for (const [row, expected] of [1234.56, -0.000125, 1.2e-30, 999999999999999].entries()) {
+            expect(data.sheets[0].rows[row][0]!.raw, `row ${row}`).toBe(expected);
+        }
+    });
+
+    it('reads a style index exactly as the reader does, leading plus included', async () => {
+        // The reader's `parseInt` takes `+3`, which is legal for the `unsignedInt`
+        // this attribute is typed as. A digits-only match here made the cell styled
+        // to the reader and unstyled to the writer, so a date cell the user retyped
+        // came back an inline string — unchanged on screen, no longer a date to
+        // anything downstream.
+        const bytes = patched_parts([[
+            '/xl/worksheets/sheet1.xml',
+            '<c r="C1" s="3"',
+            '<c r="C1" s="+3"',
+        ]]);
+        expect((await parse_xlsx(bytes)).data.sheets[0].rows[0][2]!.rawType).toBe('date');
+
+        const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 2, value: '2024-01-15' }]);
+        expect((await parse_xlsx(out)).data.sheets[0].rows[0][2]!.rawType).toBe('date');
+    });
+
     it('keeps an ISO date cell typed as a date', async () => {
         // `t="d"` stores the date as text and the reader shows it verbatim, so the
         // user retypes what looks like the same value — and got back an inline
