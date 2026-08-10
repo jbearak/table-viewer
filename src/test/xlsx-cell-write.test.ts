@@ -1152,17 +1152,90 @@ describe('write_xlsx_cell_edits', () => {
         expect(part(out, '/xl/worksheets/sheet1.xml')!.toString('utf8')).toContain('>9<');
     });
 
-    it('refuses styles whose xf indexes it would number differently than the reader', () => {
+    it('numbers xf indexes exactly as the reader does', async () => {
         // A cell's `s` indexes `cellXfs`, so both sides must agree on its length or
         // every style after the divergence means a different format to each. The
-        // reader counts an `<xf>` written inside CDATA; this writer skips it, which
-        // is right about XML and wrong about the file — `s="0"` named General to the
-        // reader and a date format here, so a typed date went in as the serial 45306
-        // and that is what the user saw.
+        // reader counts an `<xf>` written inside CDATA. This writer used to skip it —
+        // right about XML and wrong about the file, because `s="0"` then named
+        // General to the reader and a date format here, and a typed date went in as
+        // the serial 45306, which is what the user saw.
+        //
+        // Both sides now share `parse_styles`, so the disagreement has nowhere to
+        // arise: the discarded `<xf>` is index 0 to each of them and `numFmtId="14"`
+        // is index 1 to each. A1 is `s="1"`, so it is a date style to *both*, the
+        // serial is the right thing to store, and — the part that matters — the
+        // reader hands back the date that was typed rather than a five-digit number.
         const bytes = patched_parts([['/xl/styles.xml', /<cellXfs[\s\S]*<\/cellXfs>/,
             '<cellXfs count="1"><![CDATA[<xf numFmtId="0"/>]]><xf numFmtId="14"/></cellXfs>']]);
-        expect(() => write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '2024-01-15' }]))
-            .toThrow(/cannot\s+read\s+safely/i);
+        const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '2024-01-15' }]);
+        const { data } = await parse_xlsx(out);
+        expect(String(data.sheets[0].rows[0][0]!.raw)).toContain('2024-01-15');
+    });
+
+    it('reads a number format the reader sees, not one hidden in a comment', async () => {
+        // A commented-out `<numFmt>` is text to a parser and a format to the reader,
+        // whose scan is comment-blind — so a commented entry repeating a live
+        // `numFmtId` *wins* there and is invisible to a comment-aware writer. Style 1
+        // was a date to the writer and plain `0` to the reader, so the typed date was
+        // stored as a serial the user then saw as `45306`.
+        const bytes = patched_parts([[
+            '/xl/styles.xml',
+            '<numFmt numFmtId="164" formatCode="$#,##0.00"/>',
+            '<numFmt numFmtId="164" formatCode="yyyy-mm-dd"/>'
+                + '<!-- <numFmt numFmtId="164" formatCode="0"/> -->',
+        ]]);
+        const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '2024-01-15' }]);
+        const { data } = await parse_xlsx(out);
+        expect(data.sheets[0].rows[0][0]!.raw).toBe('2024-01-15');
+    });
+
+    it('reads the date epoch the reader reads, comments included', async () => {
+        // Same blindness, on `workbookPr`. A commented `date1904="1"` is the epoch to
+        // the reader and invisible to a comment-aware writer, and the two epochs are
+        // 1462 days apart — so this is not a rounding error: `2024-01-15` was saved on
+        // the 1900 epoch and read straight back as `2028-01-16`.
+        const bytes = patched_parts([
+            ['/xl/styles.xml', 'formatCode="$#,##0.00"', 'formatCode="yyyy-mm-dd"'],
+            [
+                '/xl/workbook.xml',
+                '<workbookPr defaultThemeVersion="164011" filterPrivacy="1"/>',
+                '<workbookPr defaultThemeVersion="164011" filterPrivacy="1"/>'
+                    + '<!-- <workbookPr date1904="1"/> -->',
+            ],
+        ]);
+        const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '2024-01-15' }]);
+        const { data } = await parse_xlsx(out);
+        expect(String(data.sheets[0].rows[0][0]!.raw)).toContain('2024-01-15');
+    });
+
+    it('reads an xf numFmtId exactly as the reader does, single quotes included', async () => {
+        // `numFmtId='164'` is legal XML the reader's `get_attr` cannot see, so the
+        // style is General there and index 164 — a date format — to a both-quotes
+        // writer. The count guard cannot catch this one: both sides count the same
+        // number of `<xf>` elements and disagree only about what one of them says.
+        const bytes = patched_parts([
+            ['/xl/styles.xml', 'formatCode="$#,##0.00"', 'formatCode="yyyy-mm-dd"'],
+            ['/xl/styles.xml', '<xf numFmtId="164"', "<xf numFmtId='164'"],
+        ]);
+        const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '2024-01-15' }]);
+        const { data } = await parse_xlsx(out);
+        expect(data.sheets[0].rows[0][0]!.raw).toBe('2024-01-15');
+    });
+
+    it('keeps an ISO date cell typed as a date', async () => {
+        // `t="d"` stores the date as text and the reader shows it verbatim, so the
+        // user retypes what looks like the same value — and got back an inline
+        // string. Identical on screen, and no longer a date to any formula, filter or
+        // consumer downstream, exactly as a boolean rewritten as text would be.
+        const bytes = patched_parts([[
+            '/xl/worksheets/sheet1.xml',
+            '<c r="A1" s="1"><v>1234.56</v></c>',
+            '<c r="A1" t="d"><v>2024-01-01</v></c>',
+        ]]);
+        const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '2024-01-15' }]);
+        const { data } = await parse_xlsx(out);
+        expect(data.sheets[0].rows[0][0]!.rawType).toBe('date');
+        expect(data.sheets[0].rows[0][0]!.raw).toBe('2024-01-15');
     });
 
     it('numbers worksheets exactly as the reader does', () => {
@@ -1212,16 +1285,23 @@ describe('write_xlsx_cell_edits', () => {
             .toContain('2024-01-15');
     });
 
-    it('reads a formatCode written with single quotes', () => {
-        // Both quote styles are legal XML, and calling one of them malformed was
-        // this module's own invention: `formatCode='yyyy-mm-dd'` went unread, so the
-        // style did not look like a date and a typed date was written as text.
+    it('reads a formatCode exactly as the reader does, single quotes included', () => {
+        // Both quote styles are legal XML — but the reader's `get_attr` reads only
+        // `"…"`, so `formatCode='yyyy-mm-dd'` is a format it never sees, and a serial
+        // written under it would be displayed to the user as `45306`. This writer
+        // used to read it and store the serial for exactly that reason.
+        //
+        // Being more nearly correct about XML is not the requirement; agreeing with
+        // the side that renders the result is. Sharing `parse_styles` settles it:
+        // unreadable to the reader means not a date format to the writer either, so
+        // the typed date is stored as the text it was typed as.
         const bytes = patched_parts([
             ['/xl/styles.xml', /formatCode="([^"]*)"/, "formatCode='yyyy-mm-dd'"],
         ]);
         const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '2024-01-15' }]);
-        expect(part(out, '/xl/worksheets/sheet1.xml')!.toString('utf8'))
-            .toContain('<v>45306</v>');
+        const sheet = part(out, '/xl/worksheets/sheet1.xml')!.toString('utf8');
+        expect(sheet).toContain('2024-01-15');
+        expect(sheet).not.toContain('<v>45306</v>');
     });
 
     it('matches a relationship id spelled with a character reference', () => {

@@ -203,9 +203,25 @@ function build_cell_xml(
     xf_index: number | null,
     options: XlsxWriteOptions,
     was_boolean = false,
+    was_iso_date = false,
 ): string {
     const ref = `${col_index_to_letter(col)}${row + 1}`;
     const style_attr = xf_index !== null && xf_index !== 0 ? ` s="${xf_index}"` : '';
+    // An ISO-date cell edited back to a date stays one, for the same reason a
+    // boolean does. `t="d"` stores the date as text and the reader shows it
+    // verbatim — no serial, no style consulted — so the user retypes what looks
+    // like the same thing and got back an inline string: identical on screen,
+    // and no longer a date to any formula, filter or consumer downstream.
+    //
+    // Checked before `classify_value`, which would otherwise turn the typed date
+    // into a serial whenever the cell also carries a date *style*. A serial under
+    // `t="d"` is not a date at all — the reader reads that element's text — so the
+    // two spellings cannot be mixed, and the cell's existing type is the one to
+    // keep. Narrow like the boolean case: only a cell that was already `t="d"`,
+    // and only when what was typed is still a date.
+    if (was_iso_date && ISO_DATE_RE.test(value.trim())) {
+        return `<c r="${ref}"${style_attr} t="d"><v>${encode_xml(value.trim())}</v></c>`;
+    }
     // A boolean cell edited back to a boolean stays one. The reader renders `t="b"`
     // as the text TRUE/FALSE, so that is what the user sees in the grid and types
     // back — and without this it returned as an inline string that merely *looks*
@@ -1022,6 +1038,7 @@ export function apply_cell_edits(
                         xf,
                         options,
                         /\bt="b"/.test(cell_span.open_tag),
+                        /\bt="d"/.test(cell_span.open_tag),
                     ),
                 });
             } else {

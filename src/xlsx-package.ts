@@ -9,7 +9,13 @@ import {
     type XlsxCellEdit,
 } from './xlsx-cell-write';
 import { is_date_format } from './spreadsheet-format';
-import { decode_xml, resolve_part_path, worksheet_part_paths } from './parse-xlsx';
+import {
+    decode_xml,
+    parse_styles,
+    parse_workbook_xml,
+    resolve_part_path,
+    worksheet_part_paths,
+} from './parse-xlsx';
 import type { XfEntry, DateMode } from './spreadsheet-format';
 
 /**
@@ -136,72 +142,32 @@ function section_for_value(code: string, value: number): string {
     return numeric[numeric.length - 1];
 }
 
-/** Parse just enough of `xl/styles.xml` to answer "is this style index a date format?". */
+/**
+ * Answer "is this style index a date format, for this value?" from the styles part.
+ *
+ * The parse is the *reader's* — `parse_styles`, imported, not a second scan
+ * written to match it. This module had its own, quote-aware and comment-aware
+ * where the reader's is neither, and every difference between them was a cell
+ * stored under a format only one side agreed about: a commented-out `<numFmt>`
+ * shadowing the live entry, or a legally single-quoted `numFmtId='164'`, made a
+ * style a date to the writer and General to the reader, so a typed `2024-01-15`
+ * went in as the serial `45306` and that is what the user then saw. Being more
+ * nearly correct about XML is not the requirement here; agreeing with the side
+ * that renders the result is.
+ *
+ * `applyNumberFormat="0"` is deliberately not consulted, and now cannot be: Excel
+ * reads it as "inherit the format from `cellStyleXfs`", so honouring it would be
+ * more faithful to the format — and `is_date_format`, which the reader uses,
+ * ignores it. Teaching only this side about it would recreate exactly the
+ * disagreement above. Both sides have to change together, and that is a reader
+ * change this branch does not make.
+ */
 function read_style_date_predicate(
     cfb_file: ReturnType<typeof CFB.read>,
 ): (xf_index: number, serial: number) => boolean {
     const xml = read_part_text(cfb_file, '/xl/styles.xml');
     if (!xml) return () => false;
-
-    // `applyNumberFormat="0"` is deliberately not consulted. Excel reads it as
-    // "inherit the format from `cellStyleXfs` instead of using my own
-    // `numFmtId`", so honouring it here would be more faithful to the format —
-    // but `is_date_format`, which the *reader* uses, ignores it too. Teaching
-    // only the writer about it would make the two disagree about whether a cell
-    // is a date, which is a worse failure than the display quirk it fixes: a
-    // value written as a serial and read back as text. Both sides have to change
-    // together, and that is a reader change this branch does not make.
-    //
-    // Quote-aware throughout, like the sheet enumeration above: a `>` inside a
-    // quoted attribute value is legal XML, so `[^>]*` cut both the `<numFmts>`
-    // opening tag and the `<numFmt>` entries short. A format code as ordinary as
-    // `yyyy>mm` then went unread, its date style was invisible here, and a typed
-    // date was stored as an inline string under a format that renders dates.
-    const format_map = new Map<number, string>();
-    const num_fmts = element_content(xml, 'numFmts');
-    if (num_fmts !== null) {
-        for (const [, tag] of live_tags_in(num_fmts, 'numFmt')) {
-            const id = numeric_attr(tag, 'numFmtId');
-            const code = attr(tag, 'formatCode');
-            // `attr` decodes, and that matters most here: `formatCode` is an XML
-            // attribute, so a perfectly ordinary format like `0 "&"` is stored as
-            // `0 &quot;&amp;&quot;` — and `SSF.is_date` says *true* of that escaped
-            // text and false of what it means. A cell under it would take a typed
-            // date as a serial and show the user a five-digit number.
-            if (id !== null && code) format_map.set(id, code);
-        }
-    }
-
-    const xfs: XfEntry[] = [];
-    const cell_xfs = element_content(xml, 'cellXfs');
-    if (cell_xfs !== null) {
-        for (const [, tag] of live_tags_in(cell_xfs, 'xf')) {
-            xfs.push({
-                font_index: numeric_attr(tag, 'fontId') ?? 0,
-                format_index: numeric_attr(tag, 'numFmtId') ?? 0,
-            });
-        }
-        // A cell's `s` is an *index* into this list, so the two sides must agree on
-        // how long it is or every style after the disagreement means a different
-        // format to each. `parse_xlsx` scans raw text, counting `<xf>` elements
-        // written inside a comment, a CDATA section or a PI; this skips them, which
-        // is right about XML and wrong about the file, because `s="0"` then named
-        // General to the reader and a date format here — and a typed date went in
-        // as the serial `45306`, which is what the user then saw.
-        //
-        // Counted rather than reconciled: matching the reader's scan here would
-        // make the writer read `<xf>` out of discarded text, and the count is
-        // enough to know the indexes have drifted. Refused, like every other
-        // reader/writer disagreement, because the alternative is a silently wrong
-        // value under a style neither side agrees about.
-        const reader_count = (cell_xfs.match(/<xf\b/g) ?? []).length;
-        if (reader_count !== xfs.length) {
-            throw new Error(
-                'Cannot edit this workbook: its styles are written in a way Table Viewer '
-                + 'cannot read safely. Re-saving the file in Excel will normally fix it.',
-            );
-        }
-    }
+    const { xfs, format_map } = parse_styles(xml);
 
     // Narrowed to the section the serial about to be written will be *displayed*
     // by. `SSF.is_date` says true if any section of a format is a date, so
@@ -256,22 +222,19 @@ function numeric_attr(tag: string, name: string): number | null {
     return text !== null && /^\d+$/.test(text) ? Number(text) : null;
 }
 
+/**
+ * The workbook's date epoch, read exactly as `parse_xlsx` reads it.
+ *
+ * Shared for the same reason as {@link read_style_date_predicate}. This module's
+ * own `workbookPr` scan skipped comments, so a commented-out
+ * `<workbookPr date1904="1"/>` left the writer on the 1900 epoch while the reader
+ * used 1904 — and the two are 1462 days apart, so a saved `2024-01-15` read back
+ * as `2028-01-16`. Not a rounding error: a date four years off.
+ */
 function read_datemode(cfb_file: ReturnType<typeof CFB.read>): DateMode {
     const wb = read_part_text(cfb_file, '/xl/workbook.xml');
     if (!wb) return 0;
-    // Quote-aware for the same reason: `[^>]*` cuts `<workbookPr>` at a legal `>`
-    // in an earlier attribute value, and the fragment no longer carries
-    // `date1904`. The two epochs are 1462 days apart, so misreading the mode is
-    // not a rounding error — it writes a date four years off.
-    const [, m] = live_tags_in(wb, 'workbookPr').next().value ?? [];
-    if (m === undefined) return 0;
-    // `attr` decodes and takes either quote style: `date1904="&#49;"` and
-    // `date1904='1'` both mean 1904, and a raw double-quote-only compare saw
-    // neither `1` nor `true` in either, falling back to the 1900 epoch. The two
-    // epochs are 1462 days apart, so this writes a date four years off rather than
-    // rounding one.
-    const flag = attr(m, 'date1904');
-    return flag === '1' || flag === 'true' ? 1 : 0;
+    return parse_workbook_xml(wb).datemode;
 }
 
 /**

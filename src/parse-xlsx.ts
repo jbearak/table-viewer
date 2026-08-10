@@ -245,7 +245,20 @@ function parse_shared_strings(xml: string): string[] {
     return sst;
 }
 
-function parse_styles(xml: string): { fonts: FontEntry[]; xfs: XfEntry[]; format_map: Map<number, string> } {
+/**
+ * `xl/styles.xml` as this reader understands it.
+ *
+ * Exported for the writer, which used to parse the same part itself — quote-aware
+ * and comment-aware where this scan is neither — and every difference between the
+ * two was a cell stored under a format only one side agreed about. A commented-out
+ * `<numFmt numFmtId="164" …/>` shadowing the live entry, or a legally
+ * single-quoted `numFmtId='164'`, made a style a date here and a number there, so
+ * a typed `2024-01-15` went in as the serial `45306` and that is what the grid
+ * then showed. Being right about XML is not the requirement; agreeing with the
+ * side that renders the result is, and one parse is the only way to have that
+ * hold for the next difference nobody thought of.
+ */
+export function parse_styles(xml: string): { fonts: FontEntry[]; xfs: XfEntry[]; format_map: Map<number, string> } {
     const fonts: FontEntry[] = [];
     const xfs: XfEntry[] = [];
     const format_map = new Map<number, string>();
@@ -290,7 +303,16 @@ function parse_styles(xml: string): { fonts: FontEntry[]; xfs: XfEntry[]; format
     return { fonts, xfs, format_map };
 }
 
-function parse_workbook_xml(xml: string): { sheets: Array<{ name: string; rId: string }>; datemode: DateMode } {
+/**
+ * `xl/workbook.xml` as this reader understands it: the sheet list, in the order
+ * this reader numbers them, and the date epoch.
+ *
+ * Exported alongside {@link parse_styles} and for the same reason. The writer's
+ * own `workbookPr` scan skipped comments, so a commented `date1904="1"` left the
+ * writer on the 1900 epoch while the reader used 1904 — and the two are 1462 days
+ * apart, so a saved `2024-01-15` read back as `2028-01-16`.
+ */
+export function parse_workbook_xml(xml: string): { sheets: Array<{ name: string; rId: string }>; datemode: DateMode } {
     const sheets: Array<{ name: string; rId: string }> = [];
 
     iter_elements(xml, 'sheet', (open_tag) => {
