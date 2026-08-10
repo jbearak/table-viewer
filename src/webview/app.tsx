@@ -10,9 +10,11 @@ import {
     EMPTY_TRANSFORM,
     MAX_PERSISTED_ROW_HEIGHTS,
     is_range_filter_operator,
+    pending_edits_for_sheet,
     transform_has_entries,
     transform_is_active,
     transform_schema_for_sheet,
+    with_pending_edits_for_sheet,
     type CellHighlightColor,
     type CellHighlightMutation,
     type CellHighlightSelection,
@@ -22,6 +24,7 @@ import {
     type CsvSaveOperation,
     type DisplayRowInterval,
     type PerFileState,
+    type SheetPendingEditCells,
     type HostMessage,
     type SheetTransformState,
     type FilterEntry,
@@ -384,6 +387,14 @@ export function App(): React.JSX.Element {
     const [csv_editing_supported, set_csv_editing_supported] = useState(false);
     const [csv_edit_session_id, set_csv_edit_session_id_state] = useState<string>();
     const csv_edit_session_id_ref = useRef<string>();
+    /**
+     * The worksheet the held edit session belongs to. Editing is worksheet-scoped,
+     * so the dirty map, the save operation and the hydration reads all live in one
+     * sheet's key space; this names which. Set from the grant the host echoes back
+     * rather than from the active tab, so a sheet switch mid-session cannot
+     * silently retarget an in-flight save.
+     */
+    const edit_session_sheet_index_ref = useRef<number>(0);
     const renderer_publication_fenced_session_ref = useRef<string>();
     const set_csv_edit_session_id = useCallback((next: string | undefined) => {
         const previous = csv_edit_session_id_ref.current;
@@ -569,7 +580,11 @@ export function App(): React.JSX.Element {
     const save_projection_ref = useRef<CsvSaveProjection>(
         INITIAL_CSV_SAVE_PROJECTION,
     );
-    const latest_live_edits_ref = useRef<PerFileState['pendingEdits']>(undefined);
+    // One sheet's live dirty cells — the sheet this renderer holds a session for.
+    // Editing is worksheet-scoped, so everything from here down works in a single
+    // sheet's key space; the whole-workbook leaf is assembled only at the durable
+    // boundary, where the host writes it into the owning sheet's slot.
+    const latest_live_edits_ref = useRef<SheetPendingEditCells | undefined>(undefined);
     // The dirty map itself, owned here so it survives the generation-keyed
     // GridShell remounts that a transform or refresh snapshot forces.
     const edit_session_ref = useRef<EditSessionStore | null>(null);
@@ -774,6 +789,8 @@ export function App(): React.JSX.Element {
         if (!csv_edit_session_id || save_projection_ref.current.operation) return undefined;
         const operation = Object.freeze<CsvSaveOperation>({
             editSessionId: csv_edit_session_id,
+            // The sheet this session is editing; a save writes only its slot.
+            sheetIndex: edit_session_sheet_index_ref.current,
             saveRequestId: [
                 'save',
                 save_request_prefix_ref.current,
@@ -804,7 +821,7 @@ export function App(): React.JSX.Element {
     // generation-keyed grid; the install stamps the session so a write from a
     // previously mounted hook cannot land in another session's map.
     const install_edit_session = useCallback((
-        edits: PerFileState['pendingEdits'],
+        edits: SheetPendingEditCells | undefined,
         session_id: string | undefined,
     ) => {
         latest_live_edits_ref.current = edits;
@@ -1233,7 +1250,10 @@ export function App(): React.JSX.Element {
                         ? resolve_csv_save_hydration(
                             applied_save_transition.next,
                             snapshot_edit_session_id,
-                            refresh_authoritative_state?.pendingEdits,
+                            pending_edits_for_sheet(
+                                refresh_authoritative_state?.pendingEdits,
+                                edit_session_sheet_index_ref.current,
+                            ),
                         )
                         : undefined;
                     if (refresh_editing_current_session) {
@@ -1385,7 +1405,10 @@ export function App(): React.JSX.Element {
                         const restored_edits = resolve_csv_save_hydration(
                             applied_save_transition.next,
                             snapshot_edit_session_id,
-                            normalized.pendingEdits,
+                            pending_edits_for_sheet(
+                                normalized.pendingEdits,
+                                edit_session_sheet_index_ref.current,
+                            ),
                         );
                         const exact_session_succeeded =
                             applied_save_transition.next.authoritative.state === 'succeeded'
@@ -1490,8 +1513,17 @@ export function App(): React.JSX.Element {
                             columnVisibility: next_column_visibility,
                             cellHighlights: snapshot_highlights,
                             activeSheetIndex: authoritative_state.activeSheetIndex,
+                            // Back into the owning sheet's slot: this ref mirrors the
+                            // whole-workbook leaf, while the hydration above works in
+                            // one sheet's key space.
                             ...(refresh_editing_current_session
-                                ? { pendingEdits: refresh_edits }
+                                ? {
+                                    pendingEdits: with_pending_edits_for_sheet(
+                                        state_ref.current.pendingEdits,
+                                        edit_session_sheet_index_ref.current,
+                                        refresh_edits,
+                                    ),
+                                }
                                 : {}),
                         };
                     }
@@ -2426,6 +2458,9 @@ export function App(): React.JSX.Element {
             host_bridge.postMessage({
                 type: 'requestEditSession',
                 requestId: request_id,
+                // The sheet the Edit button belongs to. Each worksheet has its own
+                // Edit button and its own session.
+                sheetIndex: active_sheet_index,
             });
             return;
         }
@@ -2762,6 +2797,11 @@ export function App(): React.JSX.Element {
                 set_edit_session_pending(false);
                 if (msg.granted && msg.editSessionId) {
                     set_csv_edit_session_id(msg.editSessionId);
+                    // Taken from the grant rather than from the active tab: the two
+                    // can differ if the user switched sheets while the request was
+                    // in flight, and the session belongs to the sheet the host
+                    // granted.
+                    edit_session_sheet_index_ref.current = msg.sheetIndex;
                     // The grant owns the complete pending-edit projection, including
                     // authoritative absence. Always cross a hydration boundary so a
                     // previously mounted editing hook cannot retain another session.
