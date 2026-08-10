@@ -2922,15 +2922,31 @@ export function App(): React.JSX.Element {
                     // sessionless store reports nothing to save, so the exit path
                     // runs and releases the session instead. Answering "save" must
                     // never end in "exited without saving".
+                    //
+                    // Deliberately untested, and deliberately kept: no message the
+                    // host can currently send moves the active sheet while a dialog
+                    // is open without also tearing the session down — `workbookSnapshot`
+                    // is the only route and it ends edit mode, so the branch is
+                    // unreachable today. It guards the invariant rather than a known
+                    // path, and a future lighter-weight restore would reach it.
                     const on_session_sheet =
                         active_sheet_index_ref.current === edit_session_sheet_index_ref.current;
                     const editing = on_session_sheet ? editing_ref.current : null;
-                    // request_save() has side effects, so it must be evaluated first.
                     if (!on_session_sheet) {
                         // Stay in edit mode with the edits intact rather than
                         // exiting: the draft is preserved and the user can press
-                        // Edit again on the owning worksheet.
-                        pending_save_dialog_ref.current = null;
+                        // Edit again on the owning worksheet. Said out loud, though
+                        // — the user pressed Save, and silence there reads as "saved"
+                        // for work that is still only a draft.
+                        const owning = meta_ref.current
+                            ?.sheets[edit_session_sheet_index_ref.current]?.name;
+                        host_bridge.postMessage({
+                            type: 'showWarning',
+                            message: 'Your changes are still unsaved. Switch to '
+                                + (owning ? `"${owning}"` : 'the worksheet being edited')
+                                + ' and press Edit again to save them.',
+                        });
+                    // request_save() has side effects, so it is evaluated first.
                     } else if (editing?.request_save() || editing?.has_uncommitted_changes()) {
                         pending_exit_ref.current = true;
                     } else {

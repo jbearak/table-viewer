@@ -324,12 +324,20 @@ export function write_xlsx_cell_edits(
 function remove_part(cfb_file: ReturnType<typeof CFB.read>, part_path: string): void {
     if (!CFB.find(cfb_file, part_path)) return;
     try {
-        CFB.utils.cfb_del(cfb_file, part_path);
+        // References first, container entry last. With the delete leading, a throw
+        // from either reference edit left the part gone but still pointed at -- a
+        // package advertising a file it does not contain, which is precisely the
+        // corruption this function exists to avoid, and the catch below then hid it.
+        // This order cannot produce that: either every step ran, or the part is
+        // still present and the package is internally consistent.
         remove_content_type_override(cfb_file, part_path);
         remove_workbook_relationship(cfb_file, part_path);
+        CFB.utils.cfb_del(cfb_file, part_path);
     } catch {
-        // A workbook we cannot fully detach the part from is still savable; the
-        // worst case is Excel offering to repair the recalculation cache.
+        // Swallowed on purpose, and now safely. calcChain is a pure recalculation
+        // cache: leaving it in place costs a stale chain Excel rebuilds, while
+        // failing the save costs the user the edit they asked to keep. The reordering
+        // above is what makes "leave it in place" the actual worst case.
     }
 }
 

@@ -297,6 +297,25 @@ describe('apply_cell_edits', () => {
         expect(noncharacters).toContain('xyz');
         expect(noncharacters).not.toContain('\uFFFE');
         expect(noncharacters).not.toContain('\uFFFF');
+
+        // An unpaired surrogate is equally illegal and arrives the same way: a
+        // JavaScript string can hold one, so a paste from a program that split a
+        // code point carries it in unseen, and the part stops being readable.
+        const lone = apply_cell_edits(
+            doc('<row r="1"><c r="A1" t="s"><v>0</v></c></row>'),
+            [{ row: 0, col: 0, value: 'p\uD800q\uDC00r' }],
+            OPTS,
+        );
+        expect(lone).toContain('pqr');
+        expect(lone).not.toContain('\uD800');
+        expect(lone).not.toContain('\uDC00');
+
+        // A *paired* surrogate is an ordinary character and must survive.
+        expect(apply_cell_edits(
+            doc('<row r="1"><c r="A1" t="s"><v>0</v></c></row>'),
+            [{ row: 0, col: 0, value: 'a\u{1F600}b' }],
+            OPTS,
+        )).toContain('a\u{1F600}b');
     });
 
     it('drops a formula when a literal overwrites it', () => {

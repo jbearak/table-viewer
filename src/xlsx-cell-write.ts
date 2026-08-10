@@ -61,7 +61,14 @@ function encode_xml(s: string): string {
         // one in without ever seeing it, and the result would be a worksheet part
         // no reader accepts — a corrupt workbook from one invisible character.
         // eslint-disable-next-line no-control-regex
-        .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g, '');
+        .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g, '')
+        // An unpaired surrogate is no more a legal XML character than those, and it
+        // arrives the same way: a JavaScript string can hold one, so a paste from a
+        // program that split a code point carries it in unseen. Left in, it reaches
+        // the part as an unencodable half-character and the workbook stops opening --
+        // the same corrupt-from-one-invisible-character outcome the line above exists
+        // to prevent.
+        .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '');
 }
 
 /** Convert a 0-based column index to its letter form (0 → A, 26 → AA). */
@@ -358,7 +365,12 @@ function row_indexes_from_cells(
     to: number,
     ranges: ReadonlyArray<[number, number]>,
 ): number[] {
-    const found: number[] = [];
+    // A Set, not an array with `includes`: this runs once per `<c>` in the row, and
+    // an unnumbered row whose cells name many distinct rows made the scan quadratic
+    // in the number of cells. A worksheet may hold a million rows, so a generator
+    // that emits one unnumbered row per cell could stall the save before it applies
+    // a single edit. Insertion order is preserved either way.
+    const found = new Set<number>();
     let pos = from;
     while (pos < to) {
         // A commented-out `<c r="A1"/>` ahead of the row's real cells named the
@@ -370,13 +382,10 @@ function row_indexes_from_cells(
         const tag_end = find_tag_end(xml, at);
         if (tag_end === -1 || tag_end >= to) break;
         const ref = /\br="[A-Z]+(\d+)"/.exec(xml.slice(at, tag_end + 1));
-        if (ref) {
-            const index = Number(ref[1]) - 1;
-            if (!found.includes(index)) found.push(index);
-        }
+        if (ref) found.add(Number(ref[1]) - 1);
         pos = tag_end + 1;
     }
-    return found;
+    return [...found];
 }
 
 /** Locate every `<row>` element in `sheetData`, in document order. */
