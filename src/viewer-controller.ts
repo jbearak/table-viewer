@@ -400,16 +400,6 @@ function excel_hidden_rows_for_source(
 }
 
 /**
- * `putexcel`-shaped save: rewrite exactly the edited cells, leave the rest of
- * the package alone.
- *
- * Edit keys are canonical *source* rows of the worksheet, which for xlsx are its
- * physical rows — the same space `xl/worksheets/sheetN.xml` numbers, offset by
- * one. A promoted header row shifts only the *projected* space the grid shows,
- * so it never reaches these keys; it does have to be undone to read a base back
- * out, which is what `projected_row_for_source` is for.
- */
-/**
  * Read the current value of each wanted `row:col`, keyed by *source* row.
  *
  * The projection step is the whole of it. Edits are source-keyed, but a
@@ -458,6 +448,16 @@ function harvest_source_bases(
     return observed_bases;
 }
 
+/**
+ * `putexcel`-shaped save: rewrite exactly the edited cells, leave the rest of
+ * the package alone.
+ *
+ * Edit keys are canonical *source* rows of the worksheet, which for xlsx are its
+ * physical rows — the same space `xl/worksheets/sheetN.xml` numbers, offset by
+ * one. A promoted header row shifts only the *projected* space the grid shows,
+ * so it never reaches these keys; it does have to be undone to read a base back
+ * out, which is what `projected_row_for_source` is for.
+ */
 function plan_xlsx_save(input: SavePlanInput): SavePlan {
     const { source: src, sheet_index, edits, wanted_bases } = input;
 
@@ -1852,7 +1852,14 @@ export function attach_viewer(
         const slot = pending_edits[sheet_index];
         // Preserve identity when nothing changed, so callers can keep using
         // reference equality to detect a no-op projection.
-        if (projected === slot?.cells && pending_edits.length === 1) return pending_edits;
+        //
+        // "Nothing changed" needs the owned slot to be the *only* populated one,
+        // not merely the only index in the array. A leaf of `[undefined]` with the
+        // session on sheet 0 satisfied both old terms — `projected` and `cells`
+        // are each undefined — so a length-1 array holding another shape returned
+        // unchanged instead of being projected down to this sheet's share.
+        const only_owned_slot = pending_edits.length === 1 && sheet_index === 0;
+        if (projected === slot?.cells && only_owned_slot) return pending_edits;
         return with_pending_edits_for_sheet(
             undefined,
             sheet_index,
@@ -1955,8 +1962,14 @@ export function attach_viewer(
                         false,
                         undefined,
                         // Rehydration adopts whichever sheet the durable slot
-                        // belongs to, rather than assuming sheet 0.
-                        state.pendingEdits?.findIndex((slot) => slot !== undefined) ?? 0,
+                        // belongs to, rather than assuming sheet 0. `findIndex`
+                        // answers -1 for an all-holes array, which is not a sheet:
+                        // clamped rather than left to `??`, which only catches the
+                        // absent leaf.
+                        Math.max(
+                            0,
+                            state.pendingEdits?.findIndex((slot) => slot !== undefined) ?? 0,
+                        ),
                     )
                 )
             );
@@ -3802,11 +3815,19 @@ export function attach_viewer(
         // The webview cannot answer this alone: its conflict detection is
         // residency-gated (see csv-base-validation.ts's header), so a filtered,
         // evicted, or shrunk-away row is never flagged there.
-        const validation = validate_dirty_bases(
-            identity.dirtyEdits,
-            src.meta().sheets[identity.sheetIndex].sourceRowCount,
-            (source_row, col) => plan.observed_bases.get(`${source_row}:${col}`),
-        );
+        // The sheet is guaranteed by the session guard above, which refuses any
+        // index but `active_edit_sheet_index` — and that one was bounded when the
+        // session was granted. Read defensively anyway: this line sits outside the
+        // try below, so a lookup that ever did come back undefined would throw past
+        // every failure path and leave the save lifecycle stuck in flight.
+        const sheet_meta = src.meta().sheets[identity.sheetIndex];
+        const validation = sheet_meta
+            ? validate_dirty_bases(
+                identity.dirtyEdits,
+                sheet_meta.sourceRowCount,
+                (source_row, col) => plan.observed_bases.get(`${source_row}:${col}`),
+            )
+            : { type: 'baseMismatch' as const, keys: Object.keys(identity.dirtyEdits) };
         if (validation.type !== 'valid') {
             // Same shape as the sibling early-returns above: a begin/finish pair so
             // the webview sees a terminal 'failed' lifecycle for this exact

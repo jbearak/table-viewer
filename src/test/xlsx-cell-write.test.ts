@@ -72,11 +72,22 @@ describe('classify_value', () => {
     });
 
     it('keeps number-adjacent strings as strings', () => {
-        // Leading zeros, phone numbers and IDs must survive as typed.
-        expect(classify_value('007', 0, OPTS).kind).toBe('number');
+        // Zip codes, phone extensions and account ids are typed for their
+        // spelling; storing them as numbers loses the padding irreversibly, and
+        // the same text in a CSV round-trips verbatim.
+        expect(classify_value('007', 0, OPTS)).toEqual({ kind: 'string', text: '007' });
+        expect(classify_value('00', 0, OPTS).kind).toBe('string');
+        expect(classify_value('007.5', 0, OPTS).kind).toBe('string');
         expect(classify_value('1,000', 0, OPTS).kind).toBe('string');
         expect(classify_value('12abc', 0, OPTS).kind).toBe('string');
         expect(classify_value('Infinity', 0, OPTS).kind).toBe('string');
+    });
+
+    it('still reads a single leading zero as part of the number', () => {
+        // `0`, `0.5` and `0e0` spell their value; the zero is not padding.
+        for (const text of ['0', '0.5', '-0.5', '.5', '0e0', '1.']) {
+            expect(classify_value(text, 0, OPTS).kind, text).toBe('number');
+        }
     });
 
     it('stores a date as a serial only when the cell is already date-formatted', () => {
@@ -137,6 +148,17 @@ describe('apply_cell_edits', () => {
         )).toThrow(/A1.*array formula/);
     });
 
+    it('refuses a cell inside an array formula that carries no <f> of its own', () => {
+        // The master holds the only `<f>`; B1 is part of the result range and has
+        // just a value, so a per-cell check never meets a formula there.
+        expect(() => apply_cell_edits(
+            doc('<row r="1"><c r="A1"><f t="array" ref="A1:B1">SUM(C1:D1)</f><v>3</v></c>'
+                + '<c r="B1"><v>4</v></c></row>'),
+            [{ row: 0, col: 1, value: '9' }],
+            OPTS,
+        )).toThrow(/B1.*array formula/);
+    });
+
     it('drops control characters XML 1.0 cannot represent', () => {
         // Pasted from a terminal or a PDF, invisible in the grid, and fatal in the
         // part: there is no escape for these, so a numeric reference would be just
@@ -182,6 +204,23 @@ describe('apply_cell_edits', () => {
         expect(out.indexOf('r="A1"')).toBeLessThan(out.indexOf('r="B1"'));
         expect(out.indexOf('r="B1"')).toBeLessThan(out.indexOf('r="D1"'));
         expect(out.indexOf('r="D1"')).toBeLessThan(out.indexOf('r="E1"'));
+    });
+
+    it('edits an existing cell while inserting a lower-column one beside it', () => {
+        // Both splices start at C1: the insert goes before it, the replacement
+        // covers it. Applied right-to-left the replacement has to win the tie, or
+        // it overwrites the text just inserted.
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A1"><v>1</v></c><c r="C1"><v>3</v></c></row>'),
+            [{ row: 0, col: 2, value: '30' }, { row: 0, col: 1, value: '2' }],
+            OPTS,
+        );
+        expect(out.indexOf('r="A1"')).toBeLessThan(out.indexOf('r="B1"'));
+        expect(out.indexOf('r="B1"')).toBeLessThan(out.indexOf('r="C1"'));
+        expect(out).toContain('<c r="B1"><v>2</v></c>');
+        expect(out).toContain('<c r="C1"><v>30</v></c>');
+        // Exactly three cells: a clobbered splice would drop or duplicate one.
+        expect(out.match(/<c\b/g)).toHaveLength(3);
     });
 
     it('orders several new rows by row, whatever order they were edited in', () => {

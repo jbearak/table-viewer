@@ -118,8 +118,17 @@ export function iso_to_serial(text: string, datemode: 0 | 1): number | null {
     return serial >= 60 ? serial + 1 : serial;
 }
 
-/** Excel's own numeric literal grammar — deliberately stricter than `Number()`. */
-const NUMBER_RE = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
+/**
+ * Excel's own numeric literal grammar — deliberately stricter than `Number()`.
+ *
+ * Redundant leading zeros are excluded on purpose: `007`, a zip code, a phone
+ * extension and an account id are all things a user types *as typed*, and
+ * storing them as numbers loses the zeros visibly and irreversibly. `0`, `0.5`
+ * and `-0.5` are still numbers — a single leading zero before a decimal point is
+ * a spelling of the value, not padding. This matches what editing the same text
+ * in a CSV does, where it round-trips verbatim.
+ */
+const NUMBER_RE = /^[+-]?((0|[1-9]\d*)(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/;
 
 /**
  * Decide how one typed string is stored, given the cell's existing style.
@@ -253,6 +262,36 @@ function letter_to_index(letters: string): number {
 }
 
 /**
+ * Every cell covered by a grouped formula's `ref`, keyed `row:col`.
+ *
+ * An array formula writes one `<f t="array" ref="A1:B2">` on its top-left cell;
+ * the other cells in that range hold a value and no `<f>` at all. So the
+ * per-cell check below cannot see them, and an edit to one would drop a member
+ * of the group without ever meeting a formula. A shared master's `ref` spans its
+ * followers the same way — those *do* carry an `<f>`, but scanning the range
+ * catches them uniformly and costs one pass either way.
+ */
+function grouped_formula_cells(xml: string): Set<string> {
+    const covered = new Set<string>();
+    for (const m of xml.matchAll(/<f\b[^>]*>/g)) {
+        const type = /\bt="([^"]*)"/.exec(m[0]);
+        if (type?.[1] !== 'shared' && type?.[1] !== 'array') continue;
+        const ref = /\bref="([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?"/.exec(m[0]);
+        if (!ref) continue;
+        const start_col = letter_to_index(ref[1]);
+        const start_row = Number(ref[2]) - 1;
+        const end_col = ref[3] !== undefined ? letter_to_index(ref[3]) : start_col;
+        const end_row = ref[4] !== undefined ? Number(ref[4]) - 1 : start_row;
+        for (let row = start_row; row <= end_row; row += 1) {
+            for (let col = start_col; col <= end_col; col += 1) {
+                covered.add(`${row}:${col}`);
+            }
+        }
+    }
+    return covered;
+}
+
+/**
  * `'shared'` / `'array'` when the cell's `<f>` belongs to a multi-cell group.
  *
  * Both a shared master (`t="shared"` with an `si`) and a shared *follower* (an
@@ -336,6 +375,9 @@ export function apply_cell_edits(
 
     const splices: Splice[] = [];
     const new_rows: Array<{ row: number; text: string }> = [];
+    // Scanned once for the whole sheet, because an array formula's members are
+    // only identifiable from the master's `ref` — see `grouped_formula_cells`.
+    const grouped_cells = grouped_formula_cells(xml);
 
     for (const [row, row_edits] of by_row) {
         const row_span = rows.get(row);
@@ -370,7 +412,7 @@ export function apply_cell_edits(
                 // refuses and says why instead of quietly corrupting the sheet.
                 const grouped = grouped_formula_kind(
                     xml.slice(cell_span.inner_start, cell_span.end),
-                );
+                ) ?? (grouped_cells.has(`${e.row}:${e.col}`) ? 'array' : null);
                 if (grouped) {
                     throw new Error(
                         `Cannot edit ${cell_reference(e.row, e.col)}: it is part of `
@@ -447,11 +489,21 @@ export function apply_cell_edits(
  * computed against the original string. Ties (two zero-width inserts at the same
  * offset) keep their relative order, which matters when two new cells insert
  * before the same existing cell.
+ *
+ * A replacement and an insert can share a start offset: inserting a new cell
+ * before existing `C1` puts the insert at `C1`'s start, and editing `C1` itself
+ * replaces from there. Applying right-to-left, the *replacement* has to go first
+ * — otherwise the insert lands at that offset and the replacement, still holding
+ * the original `[start, end)`, overwrites the text just inserted. So among ties,
+ * nonzero-width splices sort ahead of zero-width ones.
  */
 function apply_splices(xml: string, splices: Splice[]): string {
+    const is_insert = (s: Splice) => (s.end > s.start ? 0 : 1);
     const ordered = splices
         .map((s, i) => ({ s, i }))
-        .sort((a, b) => (b.s.start - a.s.start) || (b.i - a.i));
+        .sort((a, b) => (b.s.start - a.s.start)
+            || (is_insert(a.s) - is_insert(b.s))
+            || (b.i - a.i));
     let out = xml;
     for (const { s } of ordered) {
         out = out.slice(0, s.start) + s.text + out.slice(s.end);
