@@ -291,6 +291,22 @@ describe('write_xlsx_cell_edits', () => {
         expect(data.sheets[0].rows[5][3]!.raw).toBe('far');
     });
 
+    it('numbers sheets exactly as the reader does', async () => {
+        // The one way this can be wrong without anything failing: the writer
+        // resolves `sheet_index` through a different enumeration than
+        // `parse_xlsx`, and the edit lands in a valid file, on the wrong sheet.
+        // The 8-sheet sample is the check, one sheet at a time.
+        const raw = readFileSync(SAMPLE);
+        const before = (await parse_xlsx(raw)).data.sheets;
+        for (let index = 0; index < before.length; index += 1) {
+            const out = write_xlsx_cell_edits(raw, index, [
+                { row: 0, col: 0, value: `marker-${index}` },
+            ]);
+            const after = (await parse_xlsx(out)).data.sheets;
+            expect(after[index].rows[0][0]!.raw, before[index].name).toBe(`marker-${index}`);
+        }
+    });
+
     it('returns the input untouched when there are no edits', () => {
         const raw = readFileSync(FORMATTED);
         expect(write_xlsx_cell_edits(raw, 0, [])).toBe(raw);

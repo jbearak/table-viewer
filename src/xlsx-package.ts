@@ -25,24 +25,34 @@ function worksheet_part_path(cfb_file: ReturnType<typeof CFB.read>, sheet_index:
     const rels = read_part_text(cfb_file, '/xl/_rels/workbook.xml.rels');
     if (!wb || !rels) return null;
 
+    // Indexed exactly as the reader indexes them, or `sheet_index` names a
+    // different worksheet here than the one the user was looking at — a valid
+    // file, silently wrong. So: skip unnamed `<sheet>` entries, and resolve only
+    // through worksheet relationships, which is what drops chartsheets and
+    // dialogsheets from the numbering on both sides.
+    const worksheet_targets = new Map<string, string>();
+    for (const m of rels.matchAll(/<Relationship\b[^>]*>/g)) {
+        const type = /\bType="([^"]*)"/.exec(m[0]);
+        if (!type?.[1].endsWith('/worksheet')) continue;
+        const id = /\bId="([^"]*)"/.exec(m[0]);
+        const target = /\bTarget="([^"]*)"/.exec(m[0]);
+        if (!id || !target) continue;
+        worksheet_targets.set(
+            id[1],
+            target[1].startsWith('/') ? target[1].slice(1) : `xl/${target[1]}`,
+        );
+    }
+
     const rel_ids: string[] = [];
-    const sheet_re = /<sheet\b[^>]*>/g;
-    for (const m of wb.matchAll(sheet_re)) {
+    for (const m of wb.matchAll(/<sheet\b[^>]*>/g)) {
+        if (!/\bname="/.test(m[0])) continue;
         const id = /\br:[iI]d="([^"]*)"/.exec(m[0]);
-        rel_ids.push(id ? id[1] : '');
+        const rel_id = id ? id[1] : '';
+        if (!worksheet_targets.has(rel_id)) continue;
+        rel_ids.push(rel_id);
     }
     const rel_id = rel_ids[sheet_index];
-    if (!rel_id) return null;
-
-    const rel_re = /<Relationship\b[^>]*>/g;
-    for (const m of rels.matchAll(rel_re)) {
-        const id = /\bId="([^"]*)"/.exec(m[0]);
-        if (!id || id[1] !== rel_id) continue;
-        const target = /\bTarget="([^"]*)"/.exec(m[0]);
-        if (!target) return null;
-        return target[1].startsWith('/') ? target[1].slice(1) : `xl/${target[1]}`;
-    }
-    return null;
+    return rel_id ? worksheet_targets.get(rel_id) ?? null : null;
 }
 
 function read_part_text(cfb_file: ReturnType<typeof CFB.read>, path: string): string | null {
