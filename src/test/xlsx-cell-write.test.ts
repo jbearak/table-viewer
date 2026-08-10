@@ -481,6 +481,23 @@ describe('apply_cell_edits', () => {
         expect(out.match(/r="A2"/g)).toHaveLength(1);
     });
 
+    it('edits the row element the reader actually shows, when two claim one row', () => {
+        // The reader keys every `<c r=…>` into a map as it scans, so with two row
+        // elements both naming row 1 the *later* one holds the cell the user sees —
+        // confirmed for numbered and unnumbered rows alike. Preferring the earlier
+        // span sent the edit into the element the reader had already overwritten:
+        // the save reported success, the visible value never changed, and the file
+        // gained a duplicate coordinate.
+        const out = apply_cell_edits(
+            doc('<row><c r="A1"><v>1</v></c></row><row><c r="A1"><v>2</v></c></row>'),
+            [{ row: 0, col: 0, value: '9' }],
+            OPTS,
+        );
+        expect(out.match(/r="A1"/g)).toHaveLength(2);
+        // The edit lands in the second element; the first keeps its shadowed value.
+        expect(out).toContain('<row><c r="A1"><v>1</v></c></row><row><c r="A1"><v>9</v></c></row>');
+    });
+
     it('keeps a self-closing sheetData\'s attributes when expanding it', () => {
         // `<sheetData/>` has nowhere to splice into, so it is expanded to a pair
         // first — and the replacement was written as a bare `<sheetData>`, dropping

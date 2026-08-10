@@ -607,10 +607,16 @@ function scan_rows(xml: string, from: number, to: number): Map<number, Span> {
         if (r) {
             out.set(Number(r[1]) - 1, span);
         } else {
-            // First writer wins: with two spans naming a row, the earlier one is
-            // where a reader scanning in document order finds that row's cells.
+            // Last writer wins, because that is what the reader does: it keys
+            // every `<c r=…>` into a map as it scans, so with two row elements
+            // both naming row 1 the *later* one holds the cells the user sees.
+            // Preferring the earlier span sent the edit into the row element the
+            // reader had already overwritten — the save reported success, the
+            // visible value never changed, and the file gained a duplicate
+            // coordinate. Numbered rows already resolve last-wins for the same
+            // reason.
             for (const index of row_indexes_from_cells(xml, tag_end + 1, close, ignorable)) {
-                if (!out.has(index)) out.set(index, span);
+                out.set(index, span);
             }
         }
         pos = after_close;
