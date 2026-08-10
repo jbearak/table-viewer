@@ -10,11 +10,6 @@ on:
         description: 'Tag to release (e.g., v0.1.1)'
         required: true
         type: string
-      allow_missing_windows:
-        description: 'Publish even though the Windows desktop artifact is absent. Only consulted for a hand-dispatched publish; set it to acknowledge that the omission is intentional.'
-        required: false
-        default: false
-        type: boolean
 
 concurrency:
   group: release-publish-${{ inputs.tag || github.event.workflow_run.head_branch }}
@@ -133,9 +128,6 @@ jobs:
           # named variable rather than interpolated into the middle of a
           # conditional.
           PUBLISH_TRIGGER: ${{ github.event_name }}
-          # Only ever true when a human dispatched with it explicitly; the
-          # workflow_run trigger has no way to supply it. See the Windows branch.
-          ALLOW_MISSING_WINDOWS: ${{ inputs.allow_missing_windows }}
           VERSION: ${{ steps.version.outputs.version }}
           RELEASE_SHA: ${{ steps.release.outputs.sha }}
         run: |
@@ -233,53 +225,11 @@ jobs:
             echo "::warning::No desktop-${THE_TAG} artifact; publishing without the macOS app and skipping the Homebrew bump."
           fi
 
-          # Same story for the Windows exes, in their own directory for the same
-          # reason. What a *missing* one means, though, depends entirely on which
-          # trigger fired — and getting that wrong once made every tag-triggered
-          # publish impossible, so the two cases are spelled out.
-          #
-          # release-build.yml's `desktop-windows` job packages nothing today. The
-          # SQLite backend runs on Windows, but complete packaged-runtime NTFS
-          # kill-crash evidence is still pending, so the release fence intentionally
-          # emits no Windows artifact. See the long comment on that job.
-          #
-          # `workflow_run` — a pushed tag. A successful Release Build is the policy
-          # signal that the known fence, including its absent Windows artifact, was
-          # evaluated for this commit. Warn and continue so it cannot withhold the
-          # macOS dmg, the .vsix, the GitHub Release, or the Homebrew bump.
-          #
-          # `workflow_dispatch` — a human. Artifact selection still requires a
-          # successful Release Build for the pinned commit, but a manual publish is
-          # an exceptional action rather than the automatic continuation of that
-          # build. Require allow_missing_windows=true as an explicit, auditable
-          # acknowledgement that the omission is intended.
-          if grep -Fxq "windows-${THE_TAG}" <<< "$RUN_ARTIFACTS"; then
-            gh run download "$BUILD_RUN_ID" --name "windows-${THE_TAG}" --dir windows-dist
-            echo "windows=true" >> "$GITHUB_OUTPUT"
-          elif [[ "$PUBLISH_TRIGGER" == "workflow_run" ]]; then
-            echo "windows=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::No windows-${THE_TAG} artifact; publishing without the Windows app. The desktop-windows job in release-build.yml is fenced off pending durability verification, and the build run's own success is what vouches for this publish."
-          elif [[ "${ALLOW_MISSING_WINDOWS:-false}" == "true" ]]; then
-            echo "windows=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::No windows-${THE_TAG} artifact; publishing without the Windows app because allow_missing_windows was set."
-          else
-            echo "windows=false" >> "$GITHUB_OUTPUT"
-            cat >&2 <<MESSAGE
-          ERROR: no windows-${THE_TAG} artifact, and this hand-dispatched publish has
-          not acknowledged that the Windows downloads are intentionally omitted.
-
-          Artifact selection already proved that a successful Release Build produced the
-          required VSIX for this pinned commit. A pushed-tag publish treats the absent
-          Windows artifact as the expected state of the release fence. A manual publish is
-          exceptional, so it requires the operator to acknowledge that same omission.
-
-          Re-run the build for this tag, or, if Windows is meant to be omitted from the
-          release page, say so explicitly:
-
-            gh workflow run release-publish.yml -f tag=${THE_TAG} -f allow_missing_windows=true
-          MESSAGE
+          if ! grep -Fxq "windows-${THE_TAG}" <<< "$RUN_ARTIFACTS"; then
+            echo "ERROR: successful Release Build has no windows-${THE_TAG} artifact" >&2
             exit 1
           fi
+          gh run download "$BUILD_RUN_ID" --name "windows-${THE_TAG}" --dir windows-dist
 
       - name: Verify main and desktop checksums
         shell: bash
@@ -291,9 +241,7 @@ jobs:
           if [[ "${{ steps.artifacts.outputs.desktop }}" == "true" ]]; then
             (cd desktop-dist && sha256sum -c ./*.sha256)
           fi
-          if [[ "${{ steps.artifacts.outputs.windows }}" == "true" ]]; then
-            (cd windows-dist && sha256sum -c ./*.sha256)
-          fi
+          (cd windows-dist && sha256sum -c ./*.sha256)
 
       - name: Install locked publish tools
         working-directory: .github/release-tools
