@@ -14,20 +14,22 @@ export interface EditorKeyEvent {
     ctrlKey: boolean;
 }
 
+export type EditorCommitNavigation = 'next' | 'previous' | 'below';
+
 /**
  * What a keypress means inside the editor:
- *  - `cancel`        Escape — discard, close the overlay.
- *  - `commit-right`  Tab — commit, move to the next column.
- *  - `commit-left`   Shift+Tab — commit, move to the previous column.
- *  - `commit-down`   Enter — commit, move to the next row.
- *  - `newline`       Shift/Alt+Enter — insert a newline, grow to multiline.
- *  - `save`          Cmd/Ctrl+S — let it bubble to the window save handler.
- *  - `default`       everything else — the input handles it normally.
+ *  - `cancel`               Escape — discard, close the overlay.
+ *  - `commit-tab-forward`   Tab — commit, traverse forward.
+ *  - `commit-tab-backward`  Shift+Tab — commit, traverse backward.
+ *  - `commit-down`          Enter — commit, move to the next row.
+ *  - `newline`              Shift/Alt+Enter — insert a newline, grow multiline.
+ *  - `save`                 Cmd/Ctrl+S — bubble to the window save handler.
+ *  - `default`              everything else — the input handles it normally.
  */
 export type EditorKeyIntent =
     | 'cancel'
-    | 'commit-right'
-    | 'commit-left'
+    | 'commit-tab-forward'
+    | 'commit-tab-backward'
     | 'commit-down'
     | 'newline'
     | 'save'
@@ -35,7 +37,9 @@ export type EditorKeyIntent =
 
 export function editor_key_intent(e: EditorKeyEvent): EditorKeyIntent {
     if (e.key === 'Escape') return 'cancel';
-    if (e.key === 'Tab') return e.shiftKey ? 'commit-left' : 'commit-right';
+    if (e.key === 'Tab') {
+        return e.shiftKey ? 'commit-tab-backward' : 'commit-tab-forward';
+    }
     if (e.key === 'Enter' && (e.shiftKey || e.altKey)) return 'newline';
     if (e.key === 'Enter') return 'commit-down';
     if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) return 'save';

@@ -688,6 +688,48 @@ test('the About window shows the app version and its notice links', async () => 
     }
 });
 
+test('CSV keyboard navigation wraps and remains active after editing', async () => {
+    const page = await focus_viewer('basic.csv');
+    const edit_toggle = page.getByRole('button', { name: 'Edit' });
+    await edit_toggle.click();
+    await expect(edit_toggle).toHaveAttribute('aria-pressed', 'true');
+
+    // Start at the first displayed data cell. Glide's accessibility columns
+    // include the row marker at index 0, so the CSV columns are 1..3.
+    await click_grid_cell(page, { column: 1, row: 0 }, { x: 120, y: 50 });
+    await page.keyboard.press('Tab');
+    await expect(page.locator('#glide-cell-2-0')).toHaveAttribute('aria-selected', 'true');
+    await page.keyboard.press('Tab');
+    await expect(page.locator('#glide-cell-3-0')).toHaveAttribute('aria-selected', 'true');
+    await page.keyboard.press('Tab');
+    await expect(page.locator('#glide-cell-1-1')).toHaveAttribute('aria-selected', 'true');
+    await page.keyboard.press('Shift+Tab');
+    await expect(page.locator('#glide-cell-3-0')).toHaveAttribute('aria-selected', 'true');
+
+    // Open the last cell in the row and commit its unchanged value with Tab. The
+    // wrap proves application-owned post-edit movement; the immediately following
+    // Tab proves focus returned to a functional grid target without a mouse click.
+    await page.keyboard.press('Enter');
+    const cell_editor = page.locator('.cell-editor-input');
+    await expect(cell_editor).toBeVisible();
+    await expect(cell_editor).toBeFocused();
+    await cell_editor.press('Tab');
+    await expect(cell_editor).toBeHidden();
+    await expect(page.locator('#glide-cell-1-1')).toHaveAttribute('aria-selected', 'true');
+    await page.keyboard.press('Tab');
+    await expect(page.locator('#glide-cell-2-1')).toHaveAttribute('aria-selected', 'true');
+
+    // Enter retains the displayed column and moves down after a commit.
+    await page.keyboard.press('Enter');
+    await expect(cell_editor).toBeVisible();
+    await cell_editor.press('Enter');
+    await expect(cell_editor).toBeHidden();
+    await expect(page.locator('#glide-cell-2-2')).toHaveAttribute('aria-selected', 'true');
+
+    await edit_toggle.click();
+    await expect(edit_toggle).toHaveAttribute('aria-pressed', 'false');
+});
+
 // Desktop editing uses the complete shared path: the renderer obtains an edit
 // session, SQLite accepts the draft, and Cmd/Ctrl+S reaches the controller's
 // conflict checks and the desktop filesystem port. The fixture is a temporary

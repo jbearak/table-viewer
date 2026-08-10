@@ -68,7 +68,11 @@ import {
     display_row_indices,
     DEFAULT_MAX_ROWS,
 } from './grid-copy-model';
-import { resolve_nav, is_copy_key } from './grid-nav-model';
+import {
+    resolve_nav,
+    is_copy_key,
+    move_sequential_cell,
+} from './grid-nav-model';
 import { move_active_cell } from './selection';
 import { MergeIndex } from './merge-index';
 import { build_grid_cell, type CellEditOverlay } from './cell-renderer';
@@ -442,32 +446,34 @@ export function GridShell({
     const preview_restore_timer_ref = useRef<number | null>(null);
     const preview_restore_token_ref = useRef(0);
 
+    const focus_grid = useCallback((): boolean => {
+        // Glide's ref can exist before its internal focus target is wired after a
+        // remount. Prefer the mounted tabbable element itself.
+        const target = grid_root_ref.current?.querySelector<HTMLElement>(
+            '[tabindex="0"]',
+        );
+        if (target) {
+            target.focus();
+            if (document.activeElement === target) return true;
+        }
+        const grid = grid_ref.current;
+        if (!grid) return false;
+        grid.focus();
+        const active = document.activeElement;
+        return !!active && !!grid_root_ref.current?.contains(active);
+    }, []);
+
     useLayoutEffect(() => {
         if (!grid_focus_ref) return;
         const handle: GridFocusHandle = {
             generation,
-            focus: () => {
-                // Glide's ref can exist before its internal focus target is wired
-                // after a remount. Prefer the mounted tabbable element itself.
-                const target = grid_root_ref.current?.querySelector<HTMLElement>(
-                    '[tabindex="0"]',
-                );
-                if (target) {
-                    target.focus();
-                    if (document.activeElement === target) return true;
-                }
-                const grid = grid_ref.current;
-                if (!grid) return false;
-                grid.focus();
-                const active = document.activeElement;
-                return !!active && !!grid_root_ref.current?.contains(active);
-            },
+            focus: focus_grid,
         };
         grid_focus_ref.current = handle;
         return () => {
             if (grid_focus_ref.current === handle) grid_focus_ref.current = null;
         };
-    }, [generation, grid_focus_ref, has_visible_columns]);
+    }, [focus_grid, generation, grid_focus_ref, has_visible_columns]);
 
     // Controlled selection. We intercept every change to snap it onto whole
     // merges (a click/drag landing on a covered cell selects the merge block);
@@ -869,6 +875,37 @@ export function GridShell({
     const focused_source_column_ref = useRef<number | undefined>(
         visible_source_columns[0],
     );
+    const write_grid_selection = useCallback((selection: GridSelection) => {
+        if (selection.current) {
+            focused_source_column_ref.current = source_column_for_display(
+                selection.current.cell[0],
+            );
+        }
+        grid_selection_ref.current = selection;
+        set_grid_selection(selection);
+    }, [source_column_for_display]);
+    const select_active_display_cell = useCallback((target: Item) => {
+        const { cell, range } = expand_glide_selection(
+            target,
+            { x: target[0], y: target[1], width: 1, height: 1 },
+            merges,
+        );
+        const selection: GridSelection = {
+            columns: CompactSelection.empty(),
+            rows: CompactSelection.empty(),
+            current: { cell, range, rangeStack: [] },
+        };
+        write_grid_selection(selection);
+        grid_ref.current?.scrollTo(cell[0], cell[1]);
+    }, [merges, write_grid_selection]);
+    const select_active_display_cell_ref = useRef(select_active_display_cell);
+    select_active_display_cell_ref.current = select_active_display_cell;
+    const focus_grid_ref = useRef(focus_grid);
+    focus_grid_ref.current = focus_grid;
+    const row_count_ref = useRef(row_count);
+    row_count_ref.current = row_count;
+    const display_column_count_ref = useRef(display_column_count);
+    display_column_count_ref.current = display_column_count;
     const previous_projection_ref = useRef(column_projection);
     useEffect(() => {
         if (previous_projection_ref.current === column_projection) return;
@@ -878,7 +915,7 @@ export function GridShell({
             && visible_source_columns.includes(focused_source)
             ? focused_source
             : visible_source_columns[0];
-        set_grid_selection({
+        write_grid_selection({
             columns: CompactSelection.empty(),
             rows: CompactSelection.empty(),
         });
@@ -900,7 +937,7 @@ export function GridShell({
             if (cells.length > 0) grid.updateCells(cells);
         }
         overlay_ref.current?.repaint();
-    }, [column_projection, display_column_count, visible_source_columns]);
+    }, [column_projection, display_column_count, visible_source_columns, write_grid_selection]);
 
     const cancel_pending_preview_restore = useCallback(() => {
         preview_restore_token_ref.current += 1;
@@ -1034,10 +1071,14 @@ export function GridShell({
     // reload (which clear the cache outright); the capture alone leaves the base
     // unreadable.
     const open_overlay_row_ref = useRef<{
-        display_row: number;
+        display_cell: Item;
         source_row: number;
         pin: symbol;
     } | null>(null);
+    const pending_editor_navigation_ref = useRef<Item | null>(null);
+    useEffect(() => {
+        pending_editor_navigation_ref.current = null;
+    }, [column_projection, generation]);
     // Stable handles so the tracking editor's memo identity never churns: Glide
     // remounts (and unfocuses) the overlay editor whenever the component identity
     // changes, which would defeat the very capture below.
@@ -1069,7 +1110,7 @@ export function GridShell({
         // leaving the ref null keeps the commit guards' early return intact.
         if (source_row === undefined) return;
         open_overlay_row_ref.current = {
-            display_row,
+            display_cell: [loc[0], display_row],
             source_row,
             pin: pin_rows_ref.current(display_row, display_row),
         };
@@ -1088,7 +1129,7 @@ export function GridShell({
         const resident = get_source_row(row);
         if (resident !== undefined) return resident;
         const captured = open_overlay_row_ref.current;
-        return captured !== null && captured.display_row === row
+        return captured !== null && captured.display_cell[1] === row
             ? captured.source_row
             : undefined;
     }, [get_source_row]);
@@ -1100,6 +1141,7 @@ export function GridShell({
     // rest of the session.
     useEffect(() => {
         if (editable_cells) return;
+        pending_editor_navigation_ref.current = null;
         release_open_overlay_row();
     }, [editable_cells, release_open_overlay_row]);
 
@@ -1860,8 +1902,14 @@ export function GridShell({
                     // tears the editor down (onFinishEditing commits, then clears the
                     // overlay), so releasing here cannot strip the capture out from
                     // under the commit that needs it.
+                    const target = pending_editor_navigation_ref.current;
+                    pending_editor_navigation_ref.current = null;
                     release_open_overlay_row();
                     set_live_uncommitted(false);
+                    if (target) {
+                        select_active_display_cell_ref.current(target);
+                        focus_grid_ref.current();
+                    }
                 };
             }, []);
             const handle_change = (next: GridCell) => {
@@ -1872,10 +1920,25 @@ export function GridShell({
                 // this snapshot synchronously; ordinary edits publish on commit.
                 refresh_live_uncommitted();
             };
+            const handle_commit_navigation: NonNullable<
+                CsvCellEditorProps['onCommitNavigation']
+            > = (navigation) => {
+                pending_editor_navigation_ref.current = null;
+                const captured = open_overlay_row_ref.current;
+                if (!captured) return;
+                const target = move_sequential_cell(
+                    captured.display_cell,
+                    navigation,
+                    row_count_ref.current,
+                    display_column_count_ref.current,
+                );
+                pending_editor_navigation_ref.current = [target[0], target[1]];
+            };
             const handle_finished: CsvCellEditorProps['onFinishedEditing'] = (
                 next,
                 movement,
             ) => {
+                if (next === undefined) pending_editor_navigation_ref.current = null;
                 props.onFinishedEditing(next, movement);
                 if (next !== undefined) return;
                 // Escape retracts the speculative overlay projection after Glide
@@ -1892,6 +1955,7 @@ export function GridShell({
                     {...props}
                     onChange={handle_change}
                     onFinishedEditing={handle_finished}
+                    onCommitNavigation={handle_commit_navigation}
                 />
             );
         }
@@ -1972,7 +2036,7 @@ export function GridShell({
                         display_column_count,
                     );
                     if (!columns.equals(grid_selection_ref.current.columns)) {
-                        set_grid_selection({
+                        write_grid_selection({
                             columns,
                             rows: CompactSelection.empty(),
                         });
@@ -2041,6 +2105,7 @@ export function GridShell({
             row_height_overlay,
             row_markers,
             schedule_cell_tooltip,
+            write_grid_selection,
         ],
     );
 
@@ -2151,13 +2216,12 @@ export function GridShell({
     }, []);
 
     const select_rect = useCallback((anchor: Item, range: Rectangle) => {
-        focused_source_column_ref.current = source_column_for_display(anchor[0]);
-        set_grid_selection({
+        write_grid_selection({
             columns: CompactSelection.empty(),
             rows: CompactSelection.empty(),
             current: { cell: anchor, range, rangeStack: [] },
         });
-    }, [source_column_for_display]);
+    }, [write_grid_selection]);
 
     const select_row = useCallback(
         (row: number) => {
@@ -2209,7 +2273,7 @@ export function GridShell({
                         sel.columns,
                     )
                     : null;
-                set_grid_selection(sel);
+                write_grid_selection(sel);
                 return;
             }
             header_drag_ref.current = null;
@@ -2218,14 +2282,13 @@ export function GridShell({
                 sel.current.range,
                 merges,
             );
-            focused_source_column_ref.current = source_column_for_display(cell[0]);
-            set_grid_selection({
+            write_grid_selection({
                 columns: sel.columns,
                 rows: sel.rows,
                 current: { cell, range, rangeStack: sel.current.rangeStack },
             });
         },
-        [display_column_count, merges, row_markers, select_all, source_column_for_display],
+        [display_column_count, merges, row_markers, select_all, write_grid_selection],
     );
 
     // --- Context menu: copy + select actions over the paged cache -------------
@@ -2490,11 +2553,11 @@ export function GridShell({
         const source_column = source_column_for_display(display_column);
         if (source_column === undefined) return;
         focused_source_column_ref.current = source_column;
-        set_grid_selection({
+        write_grid_selection({
             columns: CompactSelection.fromSingleSelection(display_column),
             rows: CompactSelection.empty(),
         });
-    }, [source_column_for_display]);
+    }, [source_column_for_display, write_grid_selection]);
 
     const on_header_context_menu = useCallback((
         display_column: number,
@@ -2585,11 +2648,9 @@ export function GridShell({
 
     const dismiss_context_menu = useCallback(() => set_context_menu(null), []);
 
-    // Merge-aware keyboard nav. Glide handles plain sheets, range extension, Tab,
-    // and Ctrl+A natively; we only intercept where it falls short — arrow keys on
-    // merged sheets (it otherwise gets stuck stepping into overlay-covered cells)
-    // and hjkl vim nav in view mode. resolve_nav decides; move_active_cell jumps
-    // past a merge to its far edge so navigation never stalls.
+    // Controlled keyboard nav. Tab/Shift+Tab use row-major wrapping; merged-sheet
+    // arrows and view-mode hjkl retain the existing merge-aware movement. Other
+    // range extension and shortcut behavior stays native to Glide.
     const on_key_down = useCallback(
         (args: GridKeyEventArgs) => {
             const shortcut = transform_shortcut({
@@ -2690,28 +2751,28 @@ export function GridShell({
             if (!cur) return;
             if (display_column_count === 0) return;
             const [cur_col, cur_row] = cur;
-            const next = move_active_cell(
-                cur_row,
-                cur_col,
-                decision.direction,
-                row_count,
-                display_column_count,
-                merges,
-            );
+            const target = decision.kind === 'sequential'
+                ? move_sequential_cell(
+                    cur,
+                    decision.navigation,
+                    row_count,
+                    display_column_count,
+                    (row, col) => merge_index.is_covered(row, col),
+                )
+                : (() => {
+                    const next = move_active_cell(
+                        cur_row,
+                        cur_col,
+                        decision.direction,
+                        row_count,
+                        display_column_count,
+                        merges,
+                    );
+                    return [next.col, next.row] as Item;
+                })();
             args.cancel();
             args.preventDefault();
-            const { cell, range } = expand_glide_selection(
-                [next.col, next.row],
-                { x: next.col, y: next.row, width: 1, height: 1 },
-                merges,
-            );
-            focused_source_column_ref.current = source_column_for_display(cell[0]);
-            set_grid_selection({
-                columns: CompactSelection.empty(),
-                rows: CompactSelection.empty(),
-                current: { cell, range, rangeStack: [] },
-            });
-            grid_ref.current?.scrollTo(cell[0], cell[1]);
+            select_active_display_cell([target[0], target[1]]);
         },
         [
             apply_column_sort,
@@ -2721,10 +2782,12 @@ export function GridShell({
             display_column_count,
             display_column_for_source,
             editable_cells,
+            merge_index,
             merges,
             on_open_filter,
             on_transform_change,
             row_count,
+            select_active_display_cell,
             source_column_for_display,
             transform_pending,
             transform_sections,
