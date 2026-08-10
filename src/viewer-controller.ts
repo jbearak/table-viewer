@@ -2926,6 +2926,18 @@ export function attach_viewer(
                         projected_state ?? committed.receipt.stateSnapshot,
                         true,
                     );
+                    // A session the projection above just rehydrated was claimed
+                    // through `sheet_name_at`, which reads the module-level `source`
+                    // — still the *previous* one here, and undefined on a first open,
+                    // since `source = next` happens below. So the claim cannot have
+                    // named its sheet correctly, and an unnamed session is one that
+                    // will not follow a later reorder. Name it from the workbook
+                    // actually being installed.
+                    if (!owned_before_projection && owns_edit_session()) {
+                        active_edit_sheet_name = active_edit_sheet_index === undefined
+                            ? undefined
+                            : next.meta().sheets[active_edit_sheet_index]?.name;
+                    }
                     const adoption: PanelAdoption = {
                         source: 'commitReceipt',
                         canonicalFileId: file_key,

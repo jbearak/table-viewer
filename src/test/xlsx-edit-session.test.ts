@@ -367,6 +367,48 @@ describe('xlsx edit sessions', () => {
         expect(people.rows[1][0]?.raw).toBe('Alice');
     });
 
+    it('keeps a rehydrated session on its worksheet through a reorder', async () => {
+        // A session nobody claimed interactively: the draft on disk rehydrates one
+        // during adoption, and that claim happens *before* the new source is
+        // installed, so it cannot name its own sheet from the workbook being
+        // adopted. Unnamed, it would not follow the reorder below.
+        const state = versioned_state_store({
+            pendingEdits: [
+                undefined,
+                { sheetName: 'Inventory', cells: { '1:0': { value: 'Draft', base: 'Widget' } } },
+            ],
+        });
+        const panel = await open_ready_xlsx(file_path, state);
+        const session = latest_snapshot(panel).capabilities.csvEditSessionId!;
+        expect(latest_snapshot(panel).capabilities.csvEditSheetIndex).toBe(1);
+
+        bytes = swap_sheet_order(bytes);
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await wait_for_observable(
+            () => latest_snapshot(panel).capabilities.csvEditSheetIndex === 0,
+        );
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                sheetIndex: 0,
+                saveRequestId: 'save-1',
+                edits: { '1:0': 'Gadget' },
+                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+        await flush_promises();
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+        const after = await parse_xlsx(bytes);
+        const inventory = after.data.sheets.find((sheet) => sheet.name === 'Inventory')!;
+        const people = after.data.sheets.find((sheet) => sheet.name === 'People')!;
+        expect(inventory.rows[1][0]?.raw).toBe('Gadget');
+        expect(people.rows[1][0]?.raw).toBe('Alice');
+    });
+
     it('gives up the session when its worksheet is gone from the workbook', async () => {
         // Not a relocation: there is no honest index to move the session to, so it
         // must not silently land on whatever sheet now holds that position.

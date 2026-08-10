@@ -159,6 +159,27 @@ describe('apply_cell_edits', () => {
         )).toThrow(/B1.*array formula/);
     });
 
+    it('refuses a missing follower cell inside an array formula range', () => {
+        // B1 is inside the `ref` but was never written — a sparse result cell. The
+        // per-cell check has nothing to look at, so an edit here used to fall to
+        // the insertion path and drop a literal into the middle of the range.
+        expect(() => apply_cell_edits(
+            doc('<row r="1"><c r="A1"><f t="array" ref="A1:B2">SUM(C1:D1)</f><v>3</v></c></row>'),
+            [{ row: 0, col: 1, value: '9' }],
+            OPTS,
+        )).toThrow(/B1.*array formula/);
+    });
+
+    it('refuses a cell in an array range whose row is absent entirely', () => {
+        // Row 2 has no `<row>` at all, so the edit took the synthesize-the-row
+        // path, which never consulted a formula.
+        expect(() => apply_cell_edits(
+            doc('<row r="1"><c r="A1"><f t="array" ref="A1:B2">SUM(C1:D1)</f><v>3</v></c></row>'),
+            [{ row: 1, col: 0, value: '9' }],
+            OPTS,
+        )).toThrow(/A2.*array formula/);
+    });
+
     it('handles a whole-sheet array ref without expanding it', () => {
         // A `ref` is whatever wrote the file, and `A1:XFD1048576` is legal. Cells
         // inside it are still refused; the point is that an unrelated edit

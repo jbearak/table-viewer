@@ -306,6 +306,25 @@ function grouped_formula_ranges(xml: string): GroupedRange[] {
     return ranges;
 }
 
+/**
+ * Why an edit inside a shared or array formula is refused.
+ *
+ * Its `<f>` is not local to the cell: a shared master defines the formula its
+ * followers reference by `si`, and an array formula's `ref` spans a range.
+ * Dropping either leaves the rest of the group pointing at a definition that no
+ * longer exists — cells that silently stop calculating, or a workbook Excel
+ * offers to repair. Handling those groups properly means rewriting cells the
+ * user did not edit, which is the opposite of a surgical save, so this refuses
+ * and says why instead of quietly corrupting the sheet.
+ */
+function grouped_formula_error(row: number, col: number, kind: 'shared' | 'array'): Error {
+    return new Error(
+        `Cannot edit ${cell_reference(row, col)}: it is part of `
+        + `${kind === 'array' ? 'an array' : 'a shared'} formula. `
+        + 'Clear the formula in Excel first.',
+    );
+}
+
 /** `'shared'` / `'array'` when `row`/`col` falls inside some group's `ref`. */
 function grouped_range_kind(
     ranges: readonly GroupedRange[],
@@ -408,6 +427,16 @@ export function apply_cell_edits(
     // only identifiable from the master's `ref` — see `grouped_formula_ranges`.
     const grouped_ranges = grouped_formula_ranges(xml);
 
+    // Ahead of every row and cell lookup, because a grouped formula's range can
+    // cover coordinates that have no `<c>` — and, if the whole row is sparse, no
+    // `<row>` either. Left inside the existing-cell branch, those edits reached
+    // the insertion paths instead and wrote a literal into the middle of an array
+    // formula's result range, which is the corruption the refusal exists to stop.
+    for (const e of edits) {
+        const grouped = grouped_range_kind(grouped_ranges, e.row, e.col);
+        if (grouped) throw grouped_formula_error(e.row, e.col, grouped);
+    }
+
     for (const [row, row_edits] of by_row) {
         const row_span = rows.get(row);
         if (!row_span) {
@@ -439,16 +468,13 @@ export function apply_cell_edits(
                 // Handling those groups properly means rewriting cells the user did
                 // not edit, which is the opposite of a surgical save, so this
                 // refuses and says why instead of quietly corrupting the sheet.
+                // The range sweep above already covered every cell a group's `ref`
+                // names. This catches the one it cannot see: a shared *follower*,
+                // whose `<f t="shared" si="…"/>` carries no `ref` of its own.
                 const grouped = grouped_formula_kind(
                     xml.slice(cell_span.inner_start, cell_span.end),
-                ) ?? grouped_range_kind(grouped_ranges, e.row, e.col);
-                if (grouped) {
-                    throw new Error(
-                        `Cannot edit ${cell_reference(e.row, e.col)}: it is part of `
-                        + `${grouped === 'array' ? 'an array' : 'a shared'} formula. `
-                        + 'Clear the formula in Excel first.',
-                    );
-                }
+                );
+                if (grouped) throw grouped_formula_error(e.row, e.col, grouped);
                 const xf = existing_style(cell_span.open_tag);
                 splices.push({
                     start: cell_span.start,
