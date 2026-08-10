@@ -1001,8 +1001,23 @@ export function reconcile_pending_edit_sheets(
         if (!slot?.sheetName) return;
         const moved_to = index_of_name.get(slot.sheetName);
         if (moved_to === undefined) {
-            // The sheet is not in this workbook at all.
-            changed = true;
+            // The name is not in this workbook — and nothing here can tell why. A
+            // worksheet deleted and a worksheet *renamed* look identical from this
+            // side: both are a tag that no longer resolves. Dropping the slot was
+            // therefore not "forgetting a deleted sheet's draft", it was deleting
+            // unsaved work every time someone renamed a sheet in Excel while the
+            // file was open — and durably, so renaming it back recovered nothing.
+            //
+            // So the slot is parked at its own index instead. Its draft stays
+            // attached to a worksheet that may not be its own, exactly like the
+            // duplicate-tag loser below: visible and dismissable, which is the
+            // recoverable direction to be wrong in. A genuinely deleted sheet leaves
+            // a draft the user can discard; a renamed one leaves the work intact.
+            while (next.length <= index) next.push(undefined);
+            let parked = next[index] === undefined ? index : next.indexOf(undefined);
+            if (parked === -1) parked = next.length;
+            next[parked] = slot;
+            if (parked !== index) changed = true;
             return;
         }
         while (next.length <= moved_to) next.push(undefined);

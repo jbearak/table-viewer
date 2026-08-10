@@ -1151,6 +1151,39 @@ describe('xlsx edit sessions', () => {
         expect(durable, 'Draft').toContain('Draft');
     });
 
+    it('keeps a durable draft when its worksheet is renamed externally', async () => {
+        // Renaming a sheet in Excel with the file open made the draft's tag stop
+        // resolving, and reconciliation dropped the slot — durably, so renaming it
+        // back recovered nothing. A rename is not a deletion, and from the tag alone
+        // the two are indistinguishable, so the draft has to survive.
+        const state = versioned_state_store({
+            pendingEdits: [
+                undefined,
+                { sheetName: 'Inventory', cells: { '1:0': { value: 'Draft', base: 'Widget' } } },
+            ],
+        });
+        const panel = await open_ready_xlsx(file_path, state);
+        expect(sheet_names(panel)).toContain('Inventory');
+
+        // Rename Inventory -> Stock in the workbook part, on disk, behind our back.
+        const file = CFB.read(bytes, { type: 'buffer' });
+        const wb = CFB.find(file, '/xl/workbook.xml')!;
+        const text = Buffer.from(wb.content as Uint8Array).toString('utf8')
+            .replace('name="Inventory"', 'name="Stock"');
+        const patched = Buffer.from(text, 'utf8');
+        wb.content = patched;
+        wb.size = patched.length;
+        const w = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+        bytes = w instanceof Uint8Array ? w : new Uint8Array(w as ArrayBufferLike);
+
+        await vscode_mock.__getWatchers()[0].__fireChange();
+        await wait_for_observable(() => sheet_names(panel).includes('Stock'));
+        await controller_of(panel).drain();
+
+        const durable = JSON.stringify(state.get_state(file_path).pendingEdits ?? null);
+        expect(durable, 'durable draft').toContain('Draft');
+    });
+
     it('preserves the styles part byte-for-byte across a save', async () => {
         const panel = await open_ready_xlsx(file_path);
         await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });

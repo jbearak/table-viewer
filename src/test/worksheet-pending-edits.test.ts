@@ -173,14 +173,20 @@ describe('reconcile_pending_edit_sheets', () => {
         expect(pending_edits_for_sheet(after, 1)).toEqual({ '0:0': entry('a') });
     });
 
-    it('drops only a sheet the workbook no longer has', () => {
+    it('parks a draft whose name the workbook no longer has', () => {
+        // A deleted worksheet and a *renamed* one are indistinguishable here: both
+        // are a tag that no longer resolves. Dropping the slot therefore deleted
+        // unsaved work every time someone renamed a sheet in Excel with the file
+        // open — durably, so renaming it back recovered nothing. Parked at its own
+        // index instead: visible and dismissable, the recoverable way to be wrong.
         const pending: PerFileState['pendingEdits'] = [
             { sheetName: 'A', cells: { '0:0': entry('a') } },
             { sheetName: 'B', cells: { '0:0': entry('b') } },
         ];
         const after = reconcile_pending_edit_sheets(pending, ['A', 'Renamed']);
         expect(pending_edits_for_sheet(after, 0)).toEqual({ '0:0': entry('a') });
-        expect(pending_edits_for_sheet(after, 1)).toBeUndefined();
+        expect(pending_edits_for_sheet(after, 1)).toEqual({ '0:0': entry('b') });
+        expect(after?.[1]?.sheetName).toBe('B');
     });
 
     it('moves a draft to a sheet that shifted position', () => {
@@ -200,12 +206,17 @@ describe('reconcile_pending_edit_sheets', () => {
         expect(reconcile_pending_edit_sheets(pending, ['Anything'])).toBe(pending);
     });
 
-    it('drops a slot past the end of a workbook that lost sheets', () => {
+    it('keeps a slot past the end of a workbook that lost sheets', () => {
+        // Same reason as above: the workbook shrinking does not distinguish a
+        // deletion from a rename, and the slot beyond the last sheet is still the
+        // user's unsaved work. It stays until they discard it.
         const pending: PerFileState['pendingEdits'] = [
             { sheetName: 'A', cells: { '0:0': entry('a') } },
             { sheetName: 'B', cells: { '0:0': entry('b') } },
         ];
-        expect(reconcile_pending_edit_sheets(pending, ['A'])).toHaveLength(1);
+        const after = reconcile_pending_edit_sheets(pending, ['A']);
+        expect(after).toHaveLength(2);
+        expect(pending_edits_for_sheet(after, 1)).toEqual({ '0:0': entry('b') });
     });
 
     it('keeps both drafts when two slots ended up tagged with one name', () => {
