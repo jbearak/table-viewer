@@ -5246,6 +5246,16 @@ export function attach_viewer(
                 const requested_sheet_exists = Number.isSafeInteger(requested_sheet_index)
                     && requested_sheet_index >= 0
                     && requested_sheet_index < (source?.meta().sheets.length ?? 0);
+                // The worksheet the user actually pressed Edit on, captured with the
+                // index and checked again after the awaits below. The index alone is a
+                // position, and an external reorder landing inside the state read moved
+                // what sits there: the request validated `Inventory` and the grant
+                // owned `People`, so the next keystroke edited a worksheet the user
+                // never opened. Undefined for a source with no sheet names, which is
+                // every CSV — nothing there can be reordered.
+                const requested_sheet_name = requested_sheet_exists
+                    ? sheet_name_at(requested_sheet_index)
+                    : undefined;
                 if (edit_admission_closed || !requested_sheet_exists) {
                     void post_to_receiver({
                         type: 'editSessionResult',
@@ -5354,10 +5364,18 @@ export function attach_viewer(
                 const denied_by_sheet = already_owned
                     && active_edit_sheet_index !== undefined
                     && active_edit_sheet_index !== requested_sheet_index;
+                // The workbook moved under the request. Refused rather than followed to
+                // wherever the name went: this is the answer to a button press, and by
+                // now the grid the user pressed it on is already being replaced by the
+                // reordered one. Refusing means pressing Edit again works; retargeting
+                // means a granted session on a worksheet they did not choose.
+                const sheet_moved = requested_sheet_name !== undefined
+                    && sheet_name_at(requested_sheet_index) !== requested_sheet_name;
                 const granted_sheet_index = active_edit_sheet_index
                     ?? requested_sheet_index;
                 const granted = can_edit
                     && !denied_by_sheet
+                    && !sheet_moved
                     && owner_still_available
                     && try_claim_edit_session(true, claim, requested_sheet_index);
                 if (!granted) cancel_edit_claim(claim);

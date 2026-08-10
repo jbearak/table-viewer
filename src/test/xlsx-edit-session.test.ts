@@ -394,6 +394,40 @@ describe('xlsx edit sessions', () => {
         expect(people.rows[1][0]?.raw).toBe('Alice');
     });
 
+    it('refuses an edit request whose worksheet moves out from under it', async () => {
+        // An established session *follows* its worksheet through a reorder (above),
+        // because it knows which sheet is its own. A request in flight does not have
+        // one yet: it validated an index before its state read, and a reorder landing
+        // inside that read made the index somebody else's worksheet. Granting it
+        // opened a session on `People` for a button pressed on `Inventory`, and every
+        // keystroke after went into a sheet the user never chose.
+        //
+        // Refused, not retargeted: by now the grid the button was pressed on is being
+        // replaced anyway, and pressing Edit again on the reordered grid works.
+        const store = versioned_state_store({});
+        let armed = false;
+        let swapped = false;
+        const read = store.store.read.bind(store.store);
+        store.store.read = async (target: string) => {
+            if (armed && !swapped) {
+                swapped = true;
+                bytes = swap_sheet_order(bytes);
+                await vscode_mock.__getActiveWatchers()[0].__fireChange();
+            }
+            return read(target);
+        };
+        const panel = await open_ready_xlsx(file_path, store);
+        expect(sheet_names(panel)).toEqual(['People', 'Inventory']);
+
+        armed = true;
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
+        await wait_for_observable(() => latest_edit_session(panel) !== undefined);
+
+        expect(latest_edit_session(panel)).toMatchObject({ granted: false, sheetIndex: 1 });
+        // And the reorder is what caused it, so the workbook really did move.
+        await wait_for_observable(() => sheet_names(panel)[0] === 'Inventory');
+    });
+
     it('keeps a rehydrated session on its worksheet through a reorder', async () => {
         // A session nobody claimed interactively: the draft on disk rehydrates one
         // during adoption, and that claim happens *before* the new source is

@@ -950,6 +950,22 @@ export function has_any_pending_edits(pending: PerFileState['pendingEdits']): bo
  *
  * Slots with no recorded name are legacy CSV migrations (single-sheet by
  * construction) and stay where they are.
+ *
+ * The name is the only identity there is, and it is not a strong one: delete
+ * `Inventory` elsewhere, rename another worksheet to `Inventory`, and this
+ * function reattaches the draft to a sheet that merely inherited the label. The
+ * save's base check is what stands between that and corruption, and it holds
+ * unless the targeted cell happens to hold the same value — so the failure needs
+ * an external delete, a name reuse, *and* a coincident base.
+ *
+ * Not fixed here, deliberately. A real identity means a stable per-worksheet key
+ * (`sheetId` from `xl/workbook.xml` survives renames and changes on recreate)
+ * persisted alongside the name — a durable-schema change, with a migration for
+ * every slot already written without one, threaded through reconciliation and
+ * rehydration both. That is a larger design than this branch's remit, and the
+ * cheap version is worse than nothing: keying on the name *and* refusing when it
+ * cannot prove identity would delete a draft on every ordinary rename, which is
+ * the far likelier event and the loss this function exists to prevent.
  */
 export function reconcile_pending_edit_sheets(
     pending: PerFileState['pendingEdits'],
