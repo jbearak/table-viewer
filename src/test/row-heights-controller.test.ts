@@ -733,6 +733,7 @@ describe('the setRowHeights host handler', () => {
                 type: 'saveCsv',
                 operation: {
                     editSessionId: edit_session_id,
+                    sheetIndex: 0,
                     saveRequestId: 'save',
                     edits: { '0:0': 'z' },
                     dirtyEdits: { '0:0': { value: 'z', base: 'c' } },

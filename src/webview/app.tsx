@@ -2801,7 +2801,9 @@ export function App(): React.JSX.Element {
                     // can differ if the user switched sheets while the request was
                     // in flight, and the session belongs to the sheet the host
                     // granted.
-                    edit_session_sheet_index_ref.current = msg.sheetIndex;
+                    // A grant that names no sheet is a single-sheet source's, whose
+                    // only sheet is 0.
+                    edit_session_sheet_index_ref.current = msg.sheetIndex ?? 0;
                     // The grant owns the complete pending-edit projection, including
                     // authoritative absence. Always cross a hydration boundary so a
                     // previously mounted editing hook cannot retain another session.

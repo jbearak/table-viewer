@@ -11,6 +11,7 @@ import * as vscode_mock from './mocks/vscode';
 import { fake_viewer_host } from './mocks/host-ports';
 import { with_in_memory_authority_transactions } from '../state-authority';
 import type { WorkbookSnapshotIdentity } from '../viewer-snapshot';
+import { sheet_cells, sheet_edits } from './pending-edits-helper';
 
 /**
  * Drive the CSV-table lifecycle through the shared controller, mirroring the
@@ -469,7 +470,7 @@ describe('CSV reload races', () => {
     it('delivers the latest durable panel state after physical finalization', async () => {
         const file_path = '/tmp/receipt-state.csv';
         const versioned = versioned_state_store({
-            pendingEdits: { '0:0': 'committed' },
+            pendingEdits: sheet_edits({ '0:0': 'committed' }),
         });
         const base = with_in_memory_authority_transactions(versioned.store);
         const store: AuthorityFileStateStore = {
@@ -480,7 +481,7 @@ describe('CSV reload races', () => {
                     await versioned.store.compare_and_set(
                         path,
                         finalized.snapshot.revision,
-                        { pendingEdits: { '0:0': 'later' } },
+                        { pendingEdits: sheet_edits({ '0:0': 'later' }) },
                     );
                 }
                 return finalized;
@@ -494,9 +495,9 @@ describe('CSV reload races', () => {
         await panel.__receive({ type: 'ready' });
 
         expect(initial_snapshots(panel)[0]).toMatchObject({
-            state: { pendingEdits: { '0:0': 'later' } },
+            state: { pendingEdits: sheet_edits({ '0:0': 'later' }) },
         });
-        expect(versioned.get_state(file_path).pendingEdits).toEqual({ '0:0': 'later' });
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual({ '0:0': 'later' });
     });
 
     it('adopts a candidate reconciled from an exact committed finalization', async () => {
@@ -1815,7 +1816,7 @@ describe('CSV reload races', () => {
     it('finishes durable cleanup when disposal makes panel.webview throw', async () => {
         const file_path = '/tmp/save-disposal.csv';
         const pendingEdits = { '0:0': { value: 'saved', base: 'a' } };
-        const versioned = versioned_state_store({ pendingEdits });
+        const versioned = versioned_state_store({ pendingEdits: sheet_edits(pendingEdits) });
         const store = with_in_memory_authority_transactions(versioned.store);
         let bytes = enc.encode('h\na\n');
         vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
@@ -1851,7 +1852,7 @@ describe('CSV reload races', () => {
         expect(panel.__messages.filter((message: any) => message?.type === 'saveResult'))
             .toEqual([]);
         await vi.waitFor(() => {
-            expect(versioned.get_state(file_path).pendingEdits).toBeUndefined();
+            expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toBeUndefined();
         });
     });
 

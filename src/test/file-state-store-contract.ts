@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { AuthorityFileStateStore } from '../state';
+import { sheet_edits } from './pending-edits-helper';
 
 export interface FileStateStoreContractInspection {
     readonly nextRevision: number;
@@ -235,9 +236,9 @@ export function file_state_store_contract(
                 { transforms: [{ sort: [{}], filters: [] }] },
                 { columnVisibility: [{ hiddenColumns: ['bad'] }] },
                 { cellHighlights: {} },
-                { pendingEdits: { '-1:0': 'bad' } },
-                { pendingEdits: { '01:0': 'bad' } },
-                { pendingEdits: { '9007199254740992:0': 'bad' } },
+                { pendingEdits: sheet_edits({ '-1:0': 'bad' }) },
+                { pendingEdits: sheet_edits({ '01:0': 'bad' }) },
+                { pendingEdits: sheet_edits({ '9007199254740992:0': 'bad' }) },
                 {
                     cellHighlights: {
                         sourceDigest: 'digest',
@@ -266,7 +267,7 @@ export function file_state_store_contract(
             ];
             for (const key of invalidKeys) {
                 expect(() => store.compare_and_set('/invalid-pending-key', 0, {
-                    pendingEdits: { [key]: 'value' },
+                    pendingEdits: sheet_edits({ [key]: 'value' }),
                 } as any)).toThrow('pendingEdits');
                 expect(() => store.compare_and_set('/invalid-highlight-key', 0, {
                     cellHighlights: {
@@ -280,7 +281,7 @@ export function file_state_store_contract(
                 '0:0', `${Number.MAX_SAFE_INTEGER}:0`, `0:${Number.MAX_SAFE_INTEGER}`,
             ].entries()) {
                 await expect(store.compare_and_set(`/valid-cell-key-${index}`, 0, {
-                    pendingEdits: { [key]: 'value' },
+                    pendingEdits: sheet_edits({ [key]: 'value' }),
                     cellHighlights: {
                         sourceDigest: 'digest',
                         sheets: [{ schema: 'sheet', cells: { [key]: 'yellow' } }],
@@ -292,14 +293,14 @@ export function file_state_store_contract(
         it('canonicalizes empty pending maps to absence and protects real pending work', async () => {
             const backend = fixture();
             const store = backend.create(1);
-            await store.compare_and_set('/empty', 0, { pendingEdits: {} });
+            await store.compare_and_set('/empty', 0, { pendingEdits: sheet_edits({}) });
             expect((await store.read('/empty')).state).toEqual({});
-            await store.compare_and_set('/pending', 0, { pendingEdits: { '0:0': 'value' } });
+            await store.compare_and_set('/pending', 0, { pendingEdits: sheet_edits({ '0:0': 'value' }) });
             await store.compare_and_set('/ordinary', 0, { activeSheetIndex: 1 });
 
             expect((await store.read('/empty')).state).toEqual({});
             expect((await store.read('/pending')).state).toEqual({
-                pendingEdits: { '0:0': 'value' },
+                pendingEdits: sheet_edits({ '0:0': 'value' }),
             });
         });
 
@@ -308,13 +309,13 @@ export function file_state_store_contract(
             const store = backend.create();
             const alias = 'C:\\Data\\pending.csv';
             const canonical = 'c:\\data\\pending.csv';
-            await store.compare_and_set(alias, 0, { pendingEdits: { '0:0': 'recover' } });
+            await store.compare_and_set(alias, 0, { pendingEdits: sheet_edits({ '0:0': 'recover' }) });
             await store.compare_and_set(canonical, 0, { activeSheetIndex: 2 });
 
             await expect(store.canonicalize_path!(canonical, (path) => path.toLowerCase()))
                 .rejects.toThrow(/pending/i);
             expect((await store.read(alias)).state).toEqual({
-                pendingEdits: { '0:0': 'recover' },
+                pendingEdits: sheet_edits({ '0:0': 'recover' }),
             });
             expect((await store.read(canonical)).state).toEqual({ activeSheetIndex: 2 });
         });
@@ -411,7 +412,7 @@ export function file_state_store_contract(
             const lease = await store.lease_entry!('/leased', (path) => path);
             const pendingBasis = await store.read('/pending');
             await store.compare_and_set('/pending', pendingBasis.revision, {
-                pendingEdits: { '0:0': 'protected' },
+                pendingEdits: sheet_edits({ '0:0': 'protected' }),
             });
             const newerBasis = await store.read('/newer');
             await store.compare_and_set('/newer', newerBasis.revision, { activeSheetIndex: 2 });
@@ -425,7 +426,7 @@ export function file_state_store_contract(
             await expect(lease.release()).resolves.toBeUndefined();
             expect((await store.read('/leased')).state).toEqual({});
             expect((await store.read('/pending')).state).toEqual({
-                pendingEdits: { '0:0': 'protected' },
+                pendingEdits: sheet_edits({ '0:0': 'protected' }),
             });
         });
 
@@ -690,7 +691,7 @@ export function file_state_store_contract(
             const store = backend.create();
             await store.compare_and_set('/complete-source', 0, {
                 activeSheetIndex: 3,
-                pendingEdits: { '0:0': 'pending' },
+                pendingEdits: sheet_edits({ '0:0': 'pending' }),
             });
             await store.stage_authority_transaction('/complete-source', {
                 id: 'physical', kind: 'physical', ordinal: 1,
@@ -723,7 +724,7 @@ export function file_state_store_contract(
                 '/complete-source', '/complete-destination', 'different-copy',
             )).resolves.toMatchObject({ type: 'destinationExists' });
             expect((await store.read('/complete-source')).state).toMatchObject({
-                pendingEdits: { '0:0': 'pending' },
+                pendingEdits: sheet_edits({ '0:0': 'pending' }),
             });
         });
 
@@ -732,7 +733,7 @@ export function file_state_store_contract(
             const backend = fixture();
             const store = backend.create();
             await store.compare_and_set('/pending-source', 0, {
-                pendingEdits: { '0:0': 'pending' },
+                pendingEdits: sheet_edits({ '0:0': 'pending' }),
             });
 
             await expect(store.copy_entry_if_absent!(

@@ -14,6 +14,7 @@ import {
     type SqliteVscodeFileStateIdentity,
 } from '../sqlite-file-state-schema';
 import { validate_sqlite_file_state_database } from '../sqlite-file-state-validation';
+import { sheet_edits } from './pending-edits-helper';
 
 let tempDirectory: string;
 let databases: DatabaseSync[];
@@ -173,7 +174,7 @@ describe('SQLite file-state structural validation', () => {
 
     it('requires the pending bit to match the decoded nonempty pending map', () => {
         const database = createDatabase();
-        insertEntry(database, { pendingEdits: {} }, { hasPending: true });
+        insertEntry(database, { pendingEdits: sheet_edits({}) }, { hasPending: true });
 
         expectValidationCategory(database, 'malformed-state');
     });
@@ -181,7 +182,7 @@ describe('SQLite file-state structural validation', () => {
     it('requires remote pending rows to carry recovery evidence', () => {
         const database = createDatabase();
         insertEntry(database, {
-            pendingEdits: { '0:0': { value: 'changed', base: 'original' } },
+            pendingEdits: sheet_edits({ '0:0': { value: 'changed', base: 'original' } }),
         }, { hasPending: true });
 
         try {

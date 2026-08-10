@@ -16,6 +16,7 @@ import { MAX_PERSISTED_ROW_HEIGHTS } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
 import type { WorkbookSnapshot } from '../viewer-snapshot';
 import type { EditSessionStore } from '../webview/edit-session-store';
+import { sheet_cells, sheet_edits } from './pending-edits-helper';
 
 const grid_shell_mock = vi.hoisted(() => ({
     is_dirty: false,
@@ -967,7 +968,7 @@ describe('workbook snapshot hydration', () => {
                 scrollPosition: [],
                 activeSheetIndex: 1,
                 tabOrientation: 'vertical',
-                pendingEdits: { '0:0': { value: 'new', base: 'old' } },
+                pendingEdits: sheet_edits({ '0:0': { value: 'new', base: 'old' } }),
                 transforms: [],
                 columnVisibility: [],
             },
@@ -1171,7 +1172,7 @@ describe('workbook snapshot hydration', () => {
             state: {
                 columnWidths: [], scrollPosition: [],
                 activeSheetIndex: 0, tabOrientation: null,
-                pendingEdits: authoritative,
+                pendingEdits: sheet_edits(authoritative),
                 transforms: [undefined],
                 columnVisibility: [undefined],
             },
@@ -3700,6 +3701,7 @@ describe('edit mode save exit', () => {
         post_message.mockClear();
         const operation: CsvSaveOperation = {
             editSessionId: 'test-edit-session',
+            sheetIndex: 0,
             saveRequestId: 'save:matching',
             edits: { '0:0': 'draft' },
             dirtyEdits: { '0:0': { value: 'draft', base: 'a' } },
@@ -3821,6 +3823,7 @@ describe('edit mode save exit', () => {
         grid_shell_mock.has_uncommitted_changes = true;
         const previous: CsvSaveOperation = {
             editSessionId: 'session-delayed-idle',
+            sheetIndex: 0,
             saveRequestId: 'failed-r2',
             edits: { '0:0': 'old' },
             dirtyEdits: { '0:0': { value: 'old', base: 'old-base' } },
@@ -3847,7 +3850,7 @@ describe('edit mode save exit', () => {
         expect(proposed.saveRequestId).toEqual(expect.any(String));
 
         await dispatch_host_message(refresh_snapshot_message(meta, {
-            state: { pendingEdits: proposed.dirtyEdits },
+            state: { pendingEdits: sheet_edits(proposed.dirtyEdits) },
             capabilities: {
                 csvEditable: true,
                 csvEditingSupported: true,
@@ -3914,6 +3917,7 @@ describe('edit mode save exit', () => {
     it('rehydrates an exact failed operation even when durable pending state is absent', async () => {
         const operation: CsvSaveOperation = {
             editSessionId: 'failed-session',
+            sheetIndex: 0,
             saveRequestId: 'failed-before-acceptance',
             edits: { '0:0': 'overlay' },
             dirtyEdits: {
@@ -3948,6 +3952,7 @@ describe('edit mode save exit', () => {
         const newer = { '0:0': { value: 'newer', base: 'new-base' } };
         const failed: CsvSaveOperation = {
             editSessionId: 'old-session',
+            sheetIndex: 0,
             saveRequestId: 'old-failure',
             edits: { '0:0': 'old' },
             dirtyEdits: { '0:0': { value: 'old', base: 'old-base' } },
@@ -3956,7 +3961,7 @@ describe('edit mode save exit', () => {
         await dispatch_host_message(initial_snapshot_message(
             make_meta(['Sheet1'], false),
             {
-                state: { pendingEdits: newer },
+                state: { pendingEdits: sheet_edits(newer) },
                 capabilities: {
                     csvEditable: true,
                     csvEditingSupported: true,
@@ -3977,6 +3982,7 @@ describe('edit mode save exit', () => {
     it('tombstones stale pending edits for a succeeded current session', async () => {
         const succeeded: CsvSaveOperation = {
             editSessionId: 'saved-session',
+            sheetIndex: 0,
             saveRequestId: 'saved-operation',
             edits: { '0:0': 'saved' },
             dirtyEdits: { '0:0': { value: 'saved', base: 'base' } },
@@ -3985,7 +3991,7 @@ describe('edit mode save exit', () => {
         await dispatch_host_message(initial_snapshot_message(
             make_meta(['Sheet1'], false),
             {
-                state: { pendingEdits: succeeded.dirtyEdits },
+                state: { pendingEdits: sheet_edits(succeeded.dirtyEdits) },
                 capabilities: {
                     csvEditable: true,
                     csvEditingSupported: true,
@@ -4006,6 +4012,7 @@ describe('edit mode save exit', () => {
     it('keeps saved entries cleared across reliable success, remount, and edit reacquisition', async () => {
         const operation: CsvSaveOperation = {
             editSessionId: 'saved-session',
+            sheetIndex: 0,
             saveRequestId: 'saved-operation',
             edits: { '0:0': 'saved' },
             dirtyEdits: { '0:0': { value: 'saved', base: 'base' } },
@@ -4022,7 +4029,7 @@ describe('edit mode save exit', () => {
         await dispatch_host_message(initial_snapshot_message(
             make_meta(['Sheet1'], false),
             {
-                state: { pendingEdits: operation.dirtyEdits },
+                state: { pendingEdits: sheet_edits(operation.dirtyEdits) },
                 capabilities: {
                     csvEditable: false,
                     csvEditingSupported: true,
@@ -4069,6 +4076,7 @@ describe('edit mode save exit', () => {
         const newer = { '0:0': { value: 'newer', base: 'new-base' } };
         const succeeded: CsvSaveOperation = {
             editSessionId: 'old-session',
+            sheetIndex: 0,
             saveRequestId: 'old-success',
             edits: { '0:0': 'old' },
             dirtyEdits: { '0:0': { value: 'old', base: 'old-base' } },
@@ -4077,7 +4085,7 @@ describe('edit mode save exit', () => {
         await dispatch_host_message(initial_snapshot_message(
             make_meta(['Sheet1'], false),
             {
-                state: { pendingEdits: newer },
+                state: { pendingEdits: sheet_edits(newer) },
                 capabilities: {
                     csvEditable: true,
                     csvEditingSupported: true,
@@ -4291,7 +4299,7 @@ describe('edit mode save exit', () => {
                     csvEditable: true,
                     csvEditingSupported: true,
                 },
-                state: { pendingEdits: { '0:0': { value: 'restored', base: 'base' } } },
+                state: { pendingEdits: sheet_edits({ '0:0': { value: 'restored', base: 'base' } }) },
                 generation: 2,
             })
         );
@@ -4345,7 +4353,7 @@ describe('edit mode save exit', () => {
                     csvEditingSupported: true,
                     csvEditSessionId: 'test-edit-session',
                 },
-                state: { pendingEdits: restored },
+                state: { pendingEdits: sheet_edits(restored) },
             }),
         );
         const store = grid_shell_mock.latest_props?.edit_session as EditSessionStore;
@@ -4364,6 +4372,7 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
                     saveRequestId: 'rehydration:1',
                     edits: { '4:1': 'edited' },
                     dirtyEdits: restored,
@@ -4399,6 +4408,7 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
                     saveRequestId: 'save-1',
                     edits: { '4:1': 'edited' },
                     dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
@@ -4444,6 +4454,7 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
                     saveRequestId: 'save-2',
                     edits: { '7:0': 'orphan', '7:2': 'orphan too' },
                     dirtyEdits: {
@@ -4491,6 +4502,7 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
                     saveRequestId: 'save-3',
                     edits: { '4:1': 'edited', '0:0': 'fine' },
                     dirtyEdits: {
@@ -4545,6 +4557,7 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
                     saveRequestId: 'save-4',
                     edits: { '4:1': 'edited', '9:3': 'local' },
                     dirtyEdits: {
@@ -4589,6 +4602,7 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
                     saveRequestId: 'save-4',
                     edits: { '4:1': 'edited', '0:0': 'fine' },
                     dirtyEdits: {
@@ -4647,6 +4661,7 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
                     saveRequestId: 'save-5',
                     edits: { '4:1': 'edited' },
                     dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
@@ -4704,6 +4719,7 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
                     saveRequestId: 'save-6',
                     edits: { '4:1': 'edited' },
                     dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
@@ -4763,6 +4779,7 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
                     saveRequestId: 'save-10',
                     edits: { '4:1': 'edited' },
                     dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
@@ -4784,7 +4801,7 @@ describe('edit mode save exit', () => {
             generation: 3,
             sourceGeneration: 3,
             state: {
-                pendingEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                pendingEdits: sheet_edits({ '4:1': { value: 'edited', base: 'stale' } }),
             },
             capabilities: {
                 csvEditable: true,
@@ -4829,6 +4846,7 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
                     saveRequestId: 'save-7',
                     edits: { '4:1': 'edited' },
                     dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
@@ -4852,6 +4870,7 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
                     saveRequestId: 'save-8',
                     edits: { '4:1': 'edited' },
                     dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
@@ -4891,6 +4910,7 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
                     saveRequestId: 'save-9',
                     edits: { '4:1': 'edited' },
                     dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
@@ -6086,7 +6106,7 @@ describe('edit session store hydration', () => {
         await dispatch_host_message(refresh_snapshot_message(meta, {
             generation: 1,
             sourceGeneration: 1,
-            state: { pendingEdits },
+            state: { pendingEdits: sheet_edits(pendingEdits) },
             capabilities: {
                 csvEditable: true,
                 csvEditingSupported: true,
@@ -6554,7 +6574,7 @@ describe('snapshots arriving during an in-flight transform', () => {
                 sourceGeneration: 1,
                 reason: 'other',
                 capabilities: CSV_CAPABILITIES,
-                state: { pendingEdits: { '0:0': { value: 'first', base: 'a' } } },
+                state: { pendingEdits: sheet_edits({ '0:0': { value: 'first', base: 'a' } }) },
             },
         ));
         // A second confirmed edit, typed while the compute is still outstanding.
@@ -8178,6 +8198,7 @@ describe('stale-view banner', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
                     saveRequestId: 'save-shrunk',
                     edits: { '7:1': 'orphan' },
                     dirtyEdits: removed,
@@ -8387,7 +8408,7 @@ describe('stale-view banner', () => {
         };
         const durable = (rules: SheetTransformState | undefined) => ({
             capabilities,
-            state: { transforms: [rules], pendingEdits: edits },
+            state: { transforms: [rules], pendingEdits: sheet_edits(edits) },
         });
 
         await install_durable(
@@ -8473,7 +8494,7 @@ describe('stale-view banner', () => {
                         }],
                         schema: '["Sheet1",1,null]',
                     }],
-                    pendingEdits: dirty('0:0'),
+                    pendingEdits: sheet_edits(dirty('0:0')),
                 },
             },
         ));
@@ -8558,7 +8579,7 @@ describe('stale-view banner', () => {
                         filters: [],
                         schema: '["Sheet1",1,null]',
                     }],
-                    pendingEdits: dirty('0:0'),
+                    pendingEdits: sheet_edits(dirty('0:0')),
                 },
             },
         ));
@@ -8592,7 +8613,7 @@ describe('stale-view banner', () => {
                             filters: [],
                             schema: '["Sheet1",1,null]',
                         }],
-                        pendingEdits: dirty('0:0'),
+                        pendingEdits: sheet_edits(dirty('0:0')),
                     },
                 },
             ));
@@ -8653,7 +8674,7 @@ describe('stale-view banner', () => {
                     hiddenRows: [1],
                     schema: '["Sheet1",2,null]',
                 }],
-                pendingEdits: edits,
+                pendingEdits: sheet_edits(edits),
             },
         }));
         await dispatch_host_message(transform_installed_message(

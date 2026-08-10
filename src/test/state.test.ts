@@ -12,6 +12,7 @@ import {
     create_memento_file_state_store,
     create_memento_keyed_file_state_persistence,
 } from './helpers/memento-file-state';
+import { sheet_edits } from './pending-edits-helper';
 
 function context_with(initial: unknown) {
     let stored: unknown = initial;
@@ -547,7 +548,7 @@ describe('FileStateStore versioned state', () => {
         const backing = context_with({});
         const store = create_memento_file_state_store(backing.context, () => 1);
         await store.compare_and_set('/pending', 0, {
-            pendingEdits: { '0:0': { value: 'next', base: 'old' } },
+            pendingEdits: sheet_edits({ '0:0': { value: 'next', base: 'old' } }),
         });
         const keyed = create_memento_keyed_file_state_persistence(backing.context);
         await expect(keyed.read_transaction((tx) => tx.read_entry_metadata('/pending')))
@@ -593,7 +594,7 @@ describe('FileStateStore versioned state', () => {
             entries: {
                 [alias]: {
                     revision: 1,
-                    state: { pendingEdits: { '0:0': 'value' } },
+                    state: { pendingEdits: sheet_edits({ '0:0': 'value' }) },
                     hasPendingEdits: false,
                 },
             },

@@ -209,12 +209,16 @@ export const SQLITE_FILE_STATE_V1_TABLE_SQL = {
                                    OR copy_source_revision BETWEEN 0 AND 9007199254740990
                                ),
 
+    -- 'array' is the worksheet-scoped leaf (one slot per sheet); 'object' is the
+    -- pre-worksheet flat map, still on disk in rows written by older versions and
+    -- migrated on read. A CHECK only runs on write, so accepting both keeps those
+    -- rows readable without a rewrite pass.
     CHECK (
         (has_pending_edits = 0
             AND json_type(state_json, '$.pendingEdits') IS NULL)
         OR
         (has_pending_edits = 1
-            AND json_type(state_json, '$.pendingEdits') = 'object')
+            AND json_type(state_json, '$.pendingEdits') IN ('array', 'object'))
     ),
     CHECK (
         (copy_id IS NULL

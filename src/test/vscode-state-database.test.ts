@@ -20,6 +20,7 @@ import {
     SQLITE_DIRECT_VSCODE_FILE_STATE_USER_VERSION,
 } from '../sqlite-file-state-schema';
 import { open_sqlite_file_state_store } from '../sqlite-file-state-persistence';
+import { sheet_edits } from './pending-edits-helper';
 
 let storageDirectory: string;
 let opened: OpenedVscodeStateDatabase[];
@@ -119,13 +120,13 @@ describe('VS Code state database open', () => {
         const initial = await database.store.read('/a.csv');
 
         const committed = await database.store.compare_and_set('/a.csv', initial.revision, {
-            pendingEdits: { '1:2': 'draft' },
+            pendingEdits: sheet_edits({ '1:2': 'draft' }),
             activeSheetIndex: 0,
         });
 
         expect(committed.type).toBe('committed');
         expect((await database.store.read('/a.csv')).state)
-            .toMatchObject({ pendingEdits: { '1:2': 'draft' } });
+            .toMatchObject({ pendingEdits: sheet_edits({ '1:2': 'draft' }) });
         expect(typeof database.store.read_authority).toBe('function');
     });
 

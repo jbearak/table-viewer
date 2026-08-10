@@ -2245,6 +2245,7 @@ describe('GridShell source-row edit identity', () => {
             edit_session_id: 'session-1',
             on_save_request: (edits, dirty_edits) => ({
                 editSessionId: 'session-1',
+                sheetIndex: 0,
                 saveRequestId: 'save-1',
                 edits,
                 dirtyEdits: dirty_edits,

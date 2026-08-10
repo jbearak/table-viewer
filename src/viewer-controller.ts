@@ -4574,7 +4574,10 @@ export function attach_viewer(
                 // so the request names its sheet and every answer echoes it back:
                 // the webview keeps one store per sheet and must not apply a grant
                 // to the wrong one.
-                const requested_sheet_index = msg.sheetIndex;
+                // A request that names no sheet means the first one: single-sheet
+                // sources (CSV/TSV) have nothing else to mean, and a webview from
+                // before worksheet editing sends the field not at all.
+                const requested_sheet_index = msg.sheetIndex ?? 0;
                 if (edit_admission_closed) {
                     void post_to_receiver({
                         type: 'editSessionResult',

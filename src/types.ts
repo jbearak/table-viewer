@@ -882,6 +882,11 @@ export function reconcile_pending_edit_sheets(
     sheet_names: readonly string[],
 ): PerFileState['pendingEdits'] {
     if (!pending) return undefined;
+    // No names is "we don't know", not "the workbook has no sheets". A save or
+    // cleanup can outlive its panel, and a disposed panel has no source to name
+    // them; treating that as a total mismatch would drop every tagged slot —
+    // silently discarding the user's unsaved work on the way past.
+    if (sheet_names.length === 0) return pending;
     let changed = false;
     const next = pending.map((slot, index) => {
         if (!slot?.sheetName) return slot;
@@ -1045,7 +1050,9 @@ export type WebviewMessage =
     | { type: 'requestRows'; sheetIndex: number; startRow: number; count: number; requestId: string; generation: number }
     | { type: 'stateChanged'; state: PerFileState; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity }
     | { type: 'visibleRowChanged'; row: number }
-    | { type: 'requestEditSession'; requestId: string; sheetIndex: number }
+    // `sheetIndex` is optional so a single-sheet source can omit it; the host
+    // reads a missing field as sheet 0, which is the only sheet such a source has.
+    | { type: 'requestEditSession'; requestId: string; sheetIndex?: number }
     | { type: 'releaseEditSession'; editSessionId: string }
     | { type: 'discardEditSession'; editSessionId: string }
     | { type: 'saveCsv'; operation: CsvSaveOperation }

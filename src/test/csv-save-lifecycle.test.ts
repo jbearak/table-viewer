@@ -10,6 +10,7 @@ import {
 function operation(id: string, edit_session_id = 'edit-session'): CsvSaveOperation {
     return {
         editSessionId: edit_session_id,
+        sheetIndex: 0,
         saveRequestId: id,
         edits: { '0:0': id },
         dirtyEdits: { '0:0': { value: id, base: `base:${id}` } },

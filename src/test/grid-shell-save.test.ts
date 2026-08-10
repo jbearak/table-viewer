@@ -201,6 +201,7 @@ async function render_grid(
             base: string;
         }>) => ({
             editSessionId: 'session-1',
+            sheetIndex: 0,
             saveRequestId: `save-${++save_request_sequence}`,
             edits,
             dirtyEdits,
@@ -560,6 +561,7 @@ describe('GridShell CSV save', () => {
     it('hydrates an active operation across remount and restores its exact map on failure', async () => {
         const operation: CsvSaveOperation = {
             editSessionId: 'session-1',
+            sheetIndex: 0,
             saveRequestId: 'accepted-overlay',
             edits: { '0:0': 'overlay' },
             dirtyEdits: {
@@ -590,6 +592,7 @@ describe('GridShell CSV save', () => {
     it('keeps the exact dirty map locked through delayed idle before active acceptance', async () => {
         const failed: CsvSaveOperation = {
             editSessionId: 'older-session',
+            sheetIndex: 0,
             saveRequestId: 'failed-r2',
             edits: { '0:0': 'older' },
             dirtyEdits: { '0:0': { value: 'older', base: 'older-base' } },
@@ -616,6 +619,7 @@ describe('GridShell CSV save', () => {
     it('does not rehydrate operation-owned edits from a succeeded snapshot', async () => {
         const operation: CsvSaveOperation = {
             editSessionId: 'session-1',
+            sheetIndex: 0,
             saveRequestId: 'already-written',
             edits: { '0:0': 'saved' },
             dirtyEdits: { '0:0': { value: 'saved', base: 'base' } },
@@ -633,6 +637,7 @@ describe('GridShell CSV save', () => {
         const newer = { '0:0': { value: 'newer', base: 'new-base' } };
         const failed: CsvSaveOperation = {
             editSessionId: 'old-session',
+            sheetIndex: 0,
             saveRequestId: 'old-failure',
             edits: { '0:0': 'old' },
             dirtyEdits: { '0:0': { value: 'old', base: 'old-base' } },
@@ -651,6 +656,7 @@ describe('GridShell CSV save', () => {
         const newer = { '0:0': { value: 'newer', base: 'new-base' } };
         const succeeded: CsvSaveOperation = {
             editSessionId: 'old-session',
+            sheetIndex: 0,
             saveRequestId: 'old-success',
             edits: { '0:0': 'old' },
             dirtyEdits: { '0:0': { value: 'old', base: 'old-base' } },
@@ -669,6 +675,7 @@ describe('GridShell CSV save', () => {
         const newer = { '0:0': { value: 'newer', base: 'new-base' } };
         const failed: CsvSaveOperation = {
             editSessionId: 'old-session',
+            sheetIndex: 0,
             saveRequestId: 'old-failure',
             edits: { '0:0': 'old' },
             dirtyEdits: { '0:0': { value: 'old', base: 'old-base' } },
@@ -789,6 +796,7 @@ describe('GridShell edits across a generation bump', () => {
         // install — including a session the host has since replaced.
         const failed: CsvSaveOperation = {
             editSessionId: 'session-1',
+            sheetIndex: 0,
             saveRequestId: 'failed-save',
             edits: { '0:0': 'from-failed' },
             dirtyEdits: { '0:0': { value: 'from-failed', base: 'base' } },

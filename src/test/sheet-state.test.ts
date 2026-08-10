@@ -7,6 +7,7 @@ import {
     trim_sheet_state_array,
 } from '../webview/sheet-state';
 import type { LegacyPerFileState, PerFileState } from '../types';
+import { sheet_cells, sheet_edits } from './pending-edits-helper';
 
 describe('sheet-state helpers', () => {
     it('clamps the active sheet index into range', () => {
@@ -99,7 +100,7 @@ describe('sheet-state helpers', () => {
         // that can never be flagged conflicted or resolved. Reject it here.
         const state: PerFileState = {
             activeSheetIndex: 0,
-            pendingEdits: {
+            pendingEdits: sheet_edits({
                 '1:2': 'good',
                 '0:0': { value: 'v', base: 'b' },
                 'bad-key': 'x',
@@ -107,12 +108,12 @@ describe('sheet-state helpers', () => {
                 '5:': 'z',
                 ':5': 'w',
                 '': 'empty',
-            } as PerFileState['pendingEdits'],
+            }) as PerFileState['pendingEdits'],
         };
 
         const normalized = normalize_per_file_state(state, ['Sheet1']);
 
-        expect(normalized.pendingEdits).toEqual({
+        expect(sheet_cells(normalized.pendingEdits)).toEqual({
             '1:2': 'good',
             '0:0': { value: 'v', base: 'b' },
         });

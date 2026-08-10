@@ -53,6 +53,7 @@ import {
 } from '../sqlite-runtime';
 import type { CsvDirtyMap, PerFileState, StoredPerFileState } from '../types';
 import { SqliteTestDatabase } from './helpers/sqlite-test-database';
+import { sheet_cells, sheet_edits } from './pending-edits-helper';
 
 /** The scan gate's fixture size — the figure the plan names. */
 const SCAN_ENTRY_COUNT = 10_000;
@@ -535,8 +536,8 @@ function large_pending_edits(): CsvDirtyMap {
 }
 
 /** The pending-edit map of a stored state, which may be a legacy envelope. */
-function pending_edits_of(state: StoredPerFileState): PerFileState['pendingEdits'] {
-    return 'pendingEdits' in state ? state.pendingEdits : undefined;
+function pending_edits_of(state: StoredPerFileState) {
+    return sheet_cells('pendingEdits' in state ? state.pendingEdits : undefined);
 }
 
 beforeEach(async () => {
@@ -738,7 +739,7 @@ describe('SQLite performance gates', () => {
             const started = performance.now();
             const result = await opened.store.compare_and_set('/large-pending.csv', 0, {
                 activeSheetIndex: 0,
-                pendingEdits: { ...pendingEdits },
+                pendingEdits: sheet_edits({ ...pendingEdits }),
             });
             const elapsed = performance.now() - started;
             report('FULL-sync CAS of a large pending-edit map', elapsed, {

@@ -19,6 +19,7 @@ import { file_coordinator_registry_size } from '../file-coordinator';
 import { with_in_memory_authority_transactions } from '../state-authority';
 import type { WorkbookSnapshot, WorkbookSnapshotIdentity } from '../viewer-snapshot';
 import { InvalidPersistedTransformError } from '../panel-core';
+import { sheet_cells, sheet_edits } from './pending-edits-helper';
 
 const enc = new TextEncoder();
 const empty_authority: DurableFileAuthority = {
@@ -588,7 +589,7 @@ describe('CSV edit sessions', () => {
         write_gate.resolve();
         await pending_write;
         await drain;
-        expect(versioned.get_state('/tmp/dispose-overlay.csv').pendingEdits).toEqual({
+        expect(sheet_cells(versioned.get_state('/tmp/dispose-overlay.csv').pendingEdits)).toEqual({
             '0:0': { value: 'last keystroke', base: 'a' },
         });
     });
@@ -1249,7 +1250,7 @@ describe('CSV edit sessions', () => {
         await wait_for_observable(() => state.get_state(file_path).pendingEdits === undefined);
 
         await panel.__receive({ type: 'ready' });
-        expect(latest_snapshot(panel).state.pendingEdits).toBeUndefined();
+        expect(sheet_cells(latest_snapshot(panel).state.pendingEdits)).toBeUndefined();
     });
 
     it.each(['read', 'touch'] as const)(
@@ -1298,6 +1299,7 @@ describe('CSV edit sessions', () => {
             ));
             expect(result).toEqual({
                 type: 'editSessionResult',
+                sheetIndex: 0,
                 requestId: `request-${failure}`,
                 granted: false,
             });
@@ -1334,7 +1336,7 @@ describe('CSV edit sessions', () => {
             csvEditable: true,
             csvEditSessionId: session_id,
         });
-        expect(restored.state.pendingEdits).toBeUndefined();
+        expect(sheet_cells(restored.state.pendingEdits)).toBeUndefined();
 
         await sibling.__receive({ type: 'requestEditSession', requestId: 'blocked' });
         expect(edit_session_results(sibling).at(-1)?.granted).toBe(false);
@@ -1389,7 +1391,7 @@ describe('CSV edit sessions', () => {
             editSessionId: undefined,
             edits: { '0:0': { value: 'idless stale', base: 'first' } },
         });
-        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+        expect(sheet_cells(state.get_state(file_path).pendingEdits)).toBeUndefined();
         await panel.__receive({
             type: 'saveCsv',
             editSessionId: undefined,
@@ -1403,7 +1405,7 @@ describe('CSV edit sessions', () => {
             editSessionId: second.editSessionId,
             edits: { '0:0': { value: 'second', base: 'first' } },
         });
-        expect(state.get_state(file_path).pendingEdits).toEqual({
+        expect(sheet_cells(state.get_state(file_path).pendingEdits)).toEqual({
             '0:0': { value: 'second', base: 'first' },
         });
         // Spelled out rather than using the mock's legacy `edits` shorthand, which
@@ -1414,6 +1416,7 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: second.editSessionId!,
+                sheetIndex: 0,
                 saveRequestId: 'second-session-save',
                 edits: { '0:0': 'second' },
                 dirtyEdits: { '0:0': { value: 'second', base: 'first' } },
@@ -1432,7 +1435,7 @@ describe('CSV edit sessions', () => {
         const store: FileStateStore = {
             ...versioned.store,
             async compare_and_set(path, expected, next, validate) {
-                if (next.pendingEdits?.['0:0']) {
+                if (next.pendingEdits?.[0]?.cells['0:0']) {
                     compare_started.resolve();
                     await compare_gate.promise;
                 }
@@ -1472,7 +1475,7 @@ describe('CSV edit sessions', () => {
             editSessionId: session_id,
             sequence: 7,
         });
-        expect(versioned.get_state(file_path).pendingEdits).toEqual({
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual({
             '0:0': { value: 'latest', base: 'a' },
         });
         await sibling.__receive({ type: 'requestEditSession', requestId: 'after-drain' });
@@ -1485,7 +1488,7 @@ describe('CSV edit sessions', () => {
     it('drains an admitted null clear before release transfers ownership', async () => {
         const file_path = '/tmp/pending-clear-release-drain.csv';
         const versioned = state_store({
-            pendingEdits: { '0:0': { value: 'draft', base: 'a' } },
+            pendingEdits: sheet_edits({ '0:0': { value: 'draft', base: 'a' } }),
         });
         const clear_started = deferred();
         const clear_gate = deferred();
@@ -1521,10 +1524,11 @@ describe('CSV edit sessions', () => {
 
         clear_gate.resolve();
         await Promise.all([clear, release]);
-        expect(versioned.get_state(file_path).pendingEdits).toBeUndefined();
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toBeUndefined();
         await sibling.__receive({ type: 'requestEditSession', requestId: 'after-clear' });
         expect(edit_session_results(sibling).at(-1)).toEqual({
             type: 'editSessionResult',
+            sheetIndex: 0,
             granted: true,
         });
     });
@@ -1564,7 +1568,7 @@ describe('CSV edit sessions', () => {
         await pending;
         await flush_promises();
 
-        expect(versioned.get_state(file_path).pendingEdits).toEqual({
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual({
             '0:0': { value: 'survives-close', base: 'a' },
         });
         await sibling.__receive({ type: 'requestEditSession', requestId: 'after-close' });
@@ -1610,7 +1614,7 @@ describe('CSV edit sessions', () => {
         first_gate.resolve();
         await Promise.all([first, second, release]);
         expect(attempts).toBe(2);
-        expect(versioned.get_state(file_path).pendingEdits).toEqual({
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual({
             '0:0': { value: 'second', base: 'a' },
         });
     });
@@ -1696,7 +1700,7 @@ describe('CSV edit sessions', () => {
 
     it('reports a restored base mismatch only after its initial snapshot is acknowledged', async () => {
         const pendingEdits = { '0:0': { value: 'draft', base: 'old' } };
-        const state = state_store({ pendingEdits });
+        const state = state_store({ pendingEdits: sheet_edits(pendingEdits) });
         const source = new RestoredEditSource(['current']);
         const panel = open_csv_table(uri('/tmp/rehydrated-mismatch.csv'), state.store, {
             editing: true,
@@ -1730,13 +1734,13 @@ describe('CSV edit sessions', () => {
             }),
             rejection: { reason: 'baseMismatch', keys: ['0:0'] },
         });
-        expect(state.get_state('/tmp/rehydrated-mismatch.csv').pendingEdits)
+        expect(sheet_cells(state.get_state('/tmp/rehydrated-mismatch.csv').pendingEdits))
             .toEqual(pendingEdits);
     });
 
     it('reports a restored edit whose source row was removed', async () => {
         const pendingEdits = { '3:0': { value: 'draft', base: 'gone' } };
-        const state = state_store({ pendingEdits });
+        const state = state_store({ pendingEdits: sheet_edits(pendingEdits) });
         const panel = open_csv_table(uri('/tmp/rehydrated-removed.csv'), state.store, {
             editing: true,
             build_source: async () => new RestoredEditSource(['only row']),
@@ -1755,7 +1759,7 @@ describe('CSV edit sessions', () => {
 
     it('does not reject restored edits whose bases still match', async () => {
         const pendingEdits = { '0:0': { value: 'draft', base: 'current' } };
-        const state = state_store({ pendingEdits });
+        const state = state_store({ pendingEdits: sheet_edits(pendingEdits) });
         const panel = open_csv_table(uri('/tmp/rehydrated-valid.csv'), state.store, {
             editing: true,
             build_source: async () => new RestoredEditSource(['current']),
@@ -1765,7 +1769,7 @@ describe('CSV edit sessions', () => {
         await settle_panel(panel);
         expect(panel.__messages.some((message: any) => message?.type === 'saveResult'))
             .toBe(false);
-        expect(latest_snapshot(panel).state.pendingEdits).toEqual(pendingEdits);
+        expect(sheet_cells(latest_snapshot(panel).state.pendingEdits)).toEqual(pendingEdits);
     });
 
     it('checks restored edits in sparse source-row windows outside renderer residency', async () => {
@@ -1777,7 +1781,7 @@ describe('CSV edit sessions', () => {
         const source = new RestoredEditSource(values);
         const panel = open_csv_table(
             uri('/tmp/rehydrated-sparse.csv'),
-            state_store({ pendingEdits }).store,
+            state_store({ pendingEdits: sheet_edits(pendingEdits) }).store,
             { editing: true, build_source: async () => source },
         );
 
@@ -1807,7 +1811,7 @@ describe('CSV edit sessions', () => {
         const source = new RestoredEditSource(values);
         const panel = open_csv_table(
             uri('/tmp/rehydrated-contiguous.csv'),
-            state_store({ pendingEdits }).store,
+            state_store({ pendingEdits: sheet_edits(pendingEdits) }).store,
             { editing: true, build_source: async () => source },
         );
 
@@ -1821,7 +1825,7 @@ describe('CSV edit sessions', () => {
 
     it('preserves restored edits when their targeted source read fails', async () => {
         const pendingEdits = { '0:0': { value: 'draft', base: 'current' } };
-        const state = state_store({ pendingEdits });
+        const state = state_store({ pendingEdits: sheet_edits(pendingEdits) });
         const error = vi.spyOn(console, 'error').mockImplementation(() => {});
         const panel = open_csv_table(uri('/tmp/rehydrated-read-failure.csv'), state.store, {
             editing: true,
@@ -1834,7 +1838,7 @@ describe('CSV edit sessions', () => {
             'Failed to validate restored CSV edit bases',
             { code: 'UNKNOWN' },
         );
-        expect(state.get_state('/tmp/rehydrated-read-failure.csv').pendingEdits)
+        expect(sheet_cells(state.get_state('/tmp/rehydrated-read-failure.csv').pendingEdits))
             .toEqual(pendingEdits);
         expect(panel.__messages.some((message: any) => message?.type === 'saveResult'))
             .toBe(false);
@@ -1842,7 +1846,7 @@ describe('CSV edit sessions', () => {
 
     it('drops a queued restored-edit verdict when its panel is disposed before acknowledgement', async () => {
         const pendingEdits = { '0:0': { value: 'draft', base: 'old' } };
-        const state = state_store({ pendingEdits });
+        const state = state_store({ pendingEdits: sheet_edits(pendingEdits) });
         const panel = open_csv_table(uri('/tmp/rehydrated-disposed.csv'), state.store, {
             editing: true,
             build_source: async () => new RestoredEditSource(['current']),
@@ -1850,13 +1854,13 @@ describe('CSV edit sessions', () => {
         panel.__autoAckSnapshots = false;
 
         await panel.__receive({ type: 'ready' });
-        expect(initial_snapshot(panel).state.pendingEdits).toEqual(pendingEdits);
+        expect(sheet_cells(initial_snapshot(panel).state.pendingEdits)).toEqual(pendingEdits);
         panel.dispose();
         await settle_panel(panel);
 
         expect(panel.__messages.some((message: any) => message?.type === 'saveResult'))
             .toBe(false);
-        expect(state.get_state('/tmp/rehydrated-disposed.csv').pendingEdits)
+        expect(sheet_cells(state.get_state('/tmp/rehydrated-disposed.csv').pendingEdits))
             .toEqual(pendingEdits);
     });
 
@@ -1877,6 +1881,7 @@ describe('CSV edit sessions', () => {
 
         const operation = {
             editSessionId: edit_session_id,
+            sheetIndex: 0,
             saveRequestId: 'save-mismatch',
             edits: { '0:0': 'next', '1:0': 'fine' },
             dirtyEdits: {
@@ -1917,6 +1922,7 @@ describe('CSV edit sessions', () => {
 
         const operation = {
             editSessionId: edit_session_id,
+            sheetIndex: 0,
             saveRequestId: 'save-removed',
             edits: { '3:0': 'orphan' },
             dirtyEdits: { '3:0': { value: 'orphan', base: 'gone' } },
@@ -1949,6 +1955,7 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: edit_session_id,
+                sheetIndex: 0,
                 saveRequestId: 'save-valid',
                 edits: { '1:0': 'B' },
                 dirtyEdits: { '1:0': { value: 'B', base: 'b' } },
@@ -2045,6 +2052,7 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: edit_session_id,
+                sheetIndex: 0,
                 saveRequestId: 'save-highlight',
                 edits: { '0:0': 'saved' },
                 dirtyEdits: { '0:0': { value: 'saved', base: 'a' } },
@@ -2085,7 +2093,7 @@ describe('CSV edit sessions', () => {
         const store: FileStateStore = {
             ...versioned.store,
             async compare_and_set(path, expected, next, validate) {
-                if (next.pendingEdits?.['0:0'] && next.pendingEdits?.['0:1']) {
+                if (next.pendingEdits?.[0]?.cells['0:0'] && next.pendingEdits?.[0]?.cells['0:1']) {
                     acceptance_started.resolve();
                     await acceptance_gate.promise;
                 }
@@ -2104,6 +2112,7 @@ describe('CSV edit sessions', () => {
 
         const operation = {
             editSessionId: edit_session_id,
+            sheetIndex: 0,
             saveRequestId: 'save-overlay',
             edits: { '0:0': 'overlay', '0:1': 'committed' },
             dirtyEdits: {
@@ -2130,7 +2139,7 @@ describe('CSV edit sessions', () => {
         await save;
 
         expect(write).toHaveBeenCalledTimes(1);
-        expect(versioned.get_state(file_path).pendingEdits).toEqual(operation.dirtyEdits);
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual(operation.dirtyEdits);
         expect(panel.__messages).toContainEqual(expect.objectContaining({
             type: 'saveResult',
             success: false,
@@ -2179,6 +2188,7 @@ describe('CSV edit sessions', () => {
 
         const operation = {
             editSessionId: edit_session_id,
+            sheetIndex: 0,
             saveRequestId: 'retry-accepted-map',
             edits: { '0:0': 'exact' },
             // 'a' is what the default fixture file holds at 0:0. Host-side base
@@ -2189,7 +2199,7 @@ describe('CSV edit sessions', () => {
         const save = panel.__receive({ type: 'saveCsv', operation });
         await write_started.promise;
 
-        expect(versioned.get_state(file_path).pendingEdits).toEqual(
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual(
             operation.dirtyEdits,
         );
         write_gate.resolve();
@@ -2199,7 +2209,7 @@ describe('CSV edit sessions', () => {
     it('ignores late pending-edit messages after save submission', async () => {
         const file_path = '/tmp/late-pending-after-save.csv';
         const original = { '0:0': { value: 'accepted', base: 'a' } };
-        const state = state_store({ pendingEdits: original });
+        const state = state_store({ pendingEdits: sheet_edits(original) });
         const write_started = deferred();
         const write_gate = deferred();
         vscode_mock.__setWriteFileImplementation(async () => {
@@ -2216,12 +2226,12 @@ describe('CSV edit sessions', () => {
             type: 'pendingEditsChanged',
             edits: { '0:0': { value: 'too late', base: 'a' } },
         });
-        expect(state.get_state(file_path).pendingEdits).toEqual(original);
+        expect(sheet_cells(state.get_state(file_path).pendingEdits)).toEqual(original);
 
         write_gate.resolve();
         await save;
         await flush_promises();
-        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+        expect(sheet_cells(state.get_state(file_path).pendingEdits)).toBeUndefined();
         expect(panel.__messages).toContainEqual(expect.objectContaining({ type: 'saveResult', success: true }));
     });
 
@@ -2249,6 +2259,7 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: edit_session_id,
+                sheetIndex: 0,
                 saveRequestId: 'save',
                 edits: { '0:0': 'saved' },
                 dirtyEdits: { '0:0': { value: 'saved', base: 'a' } },
@@ -2261,14 +2272,14 @@ describe('CSV edit sessions', () => {
             capabilities: { csvSaveLifecycle: { revision: number; state: string } };
         };
         expect(pending.capabilities.csvSaveLifecycle.state).toBe('succeeded');
-        expect(pending.state.pendingEdits).toBeUndefined();
+        expect(sheet_cells(pending.state.pendingEdits)).toBeUndefined();
 
         cleanup_gate.resolve();
         await flush_promises();
         panel.__messages.length = 0;
         await panel.__receive({ type: 'ready' });
         const cleared = latest_snapshot(panel) as typeof pending;
-        expect(cleared.state.pendingEdits).toBeUndefined();
+        expect(sheet_cells(cleared.state.pendingEdits)).toBeUndefined();
         expect(cleared.capabilities.csvSaveLifecycle).toEqual({
             revision: pending.capabilities.csvSaveLifecycle.revision + 1,
             state: 'idle',
@@ -2289,6 +2300,7 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: edit_session_id,
+                sheetIndex: 0,
                 saveRequestId: 'save-a',
                 edits: { '0:0': 'A' },
                 dirtyEdits: { '0:0': { value: 'A', base: 'a' } },
@@ -2313,7 +2325,7 @@ describe('CSV edit sessions', () => {
         const snapshot = latest_snapshot(panel) as ReturnType<typeof latest_snapshot> & {
             capabilities: { csvSaveLifecycle: { revision: number; state: string } };
         };
-        expect(snapshot.state.pendingEdits).toEqual(newer);
+        expect(sheet_cells(snapshot.state.pendingEdits)).toEqual(newer);
         expect(snapshot.capabilities.csvSaveLifecycle).toEqual({
             revision: failed.lifecycle.revision + 1,
             state: 'idle',
@@ -2334,6 +2346,7 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session_a,
+                sheetIndex: 0,
                 saveRequestId: 'failed-a',
                 edits: { '0:0': 'A' },
                 dirtyEdits: { '0:0': { value: 'A', base: 'a' } },
@@ -2357,10 +2370,10 @@ describe('CSV edit sessions', () => {
             };
         };
         expect(snapshot.capabilities.csvEditSessionId).toBe(session_b);
-        expect(snapshot.state.pendingEdits).toBeUndefined();
+        expect(sheet_cells(snapshot.state.pendingEdits)).toBeUndefined();
         expect(snapshot.capabilities.csvSaveLifecycle).toMatchObject({ state: 'idle' });
         expect(snapshot.capabilities.csvSaveLifecycle.operation).toBeUndefined();
-        expect(versioned.get_state(file_path).pendingEdits).toBeUndefined();
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toBeUndefined();
 
         const newer = { '0:0': { value: 'B', base: 'a' } };
         await panel.__receive({
@@ -2371,7 +2384,7 @@ describe('CSV edit sessions', () => {
         panel.__messages.length = 0;
         await panel.__receive({ type: 'ready' });
         const superseded = latest_snapshot(panel) as typeof snapshot;
-        expect(superseded.state.pendingEdits).toEqual(newer);
+        expect(sheet_cells(superseded.state.pendingEdits)).toEqual(newer);
         expect(superseded.capabilities.csvSaveLifecycle).toMatchObject({ state: 'idle' });
     });
 
@@ -2405,6 +2418,7 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session_a,
+                sheetIndex: 0,
                 saveRequestId: 'failed-a',
                 edits: { '0:0': 'A' },
                 dirtyEdits: failed_map,
@@ -2427,7 +2441,7 @@ describe('CSV edit sessions', () => {
         expect(grant_b.granted).toBe(true);
         expect(grant_b.editSessionId).not.toBe(session_a);
         expect(grant_b.pendingEdits).toBeUndefined();
-        expect(versioned.get_state(file_path).pendingEdits).toBeUndefined();
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toBeUndefined();
     });
 
     it('carries a genuinely newer edit past a failed save into the next session', async () => {
@@ -2451,6 +2465,7 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session_a,
+                sheetIndex: 0,
                 saveRequestId: 'failed-a',
                 edits: { '0:0': 'A' },
                 dirtyEdits: failed_map,
@@ -2493,7 +2508,7 @@ describe('CSV edit sessions', () => {
         const grant_b = latest_edit_session_message(panel)!;
         expect(grant_b.granted).toBe(true);
         expect(grant_b.pendingEdits).toEqual(newer);
-        expect(versioned.get_state(file_path).pendingEdits).toEqual(newer);
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual(newer);
     });
 
     // The tombstone gate records which saves actually made their edits durable, and
@@ -2549,6 +2564,7 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session_a,
+                sheetIndex: 0,
                 saveRequestId: 'failed-a',
                 edits: { '0:0': 'A', '1:0': 'UNPOSTED' },
                 dirtyEdits: {
@@ -2603,6 +2619,7 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session_a,
+                sheetIndex: 0,
                 saveRequestId: 'failed-a',
                 edits: { '0:0': 'A' },
                 dirtyEdits: failed_map,
@@ -2617,7 +2634,7 @@ describe('CSV edit sessions', () => {
             edits: null,
         });
         await flush_promises();
-        expect(versioned.get_state(file_path).pendingEdits).toBeUndefined();
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toBeUndefined();
 
         // Then retype the same value. Identical to the failed operation's entry by
         // value, but it is a new edit against a durable state that no longer holds
@@ -2636,7 +2653,7 @@ describe('CSV edit sessions', () => {
         const grant_b = latest_edit_session_message(panel)!;
         expect(grant_b.granted).toBe(true);
         expect(grant_b.pendingEdits).toEqual(retyped);
-        expect(versioned.get_state(file_path).pendingEdits).toEqual(retyped);
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual(retyped);
     });
 
     // The partial post: two edits fail together, and the user reverts one of them
@@ -2675,6 +2692,7 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session_a,
+                sheetIndex: 0,
                 saveRequestId: 'failed-a',
                 edits: { '0:0': 'A', '1:0': 'B' },
                 dirtyEdits: failed_map,
@@ -2699,7 +2717,7 @@ describe('CSV edit sessions', () => {
         const grant_b = latest_edit_session_message(panel)!;
         expect(grant_b.granted).toBe(true);
         expect(grant_b.pendingEdits).toEqual(kept);
-        expect(versioned.get_state(file_path).pendingEdits).toEqual(kept);
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual(kept);
     });
 
     // A save rejected *before* `persist_accepted_save` runs leaves nothing durable
@@ -2728,7 +2746,7 @@ describe('CSV edit sessions', () => {
             edits: user_map,
         });
         await flush_promises();
-        expect(versioned.get_state(file_path).pendingEdits).toEqual(user_map);
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual(user_map);
 
         // Save rejected by validate_dirty_bases: base 'stale' was never true.
         // Returns before active_save_operation is set, so nothing is persisted.
@@ -2736,6 +2754,7 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session_a,
+                sheetIndex: 0,
                 saveRequestId: 'rejected',
                 edits: { '0:0': 'A' },
                 dirtyEdits: user_map,
@@ -2759,7 +2778,7 @@ describe('CSV edit sessions', () => {
         const grant_b = latest_edit_session_message(panel)!;
         expect(grant_b.granted).toBe(true);
         expect(grant_b.pendingEdits).toEqual(user_map);
-        expect(versioned.get_state(file_path).pendingEdits).toEqual(user_map);
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual(user_map);
     });
 
     // The tombstone-clearing branch looks unreachable — the handler gates on
@@ -2793,6 +2812,7 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session_a,
+                sheetIndex: 0,
                 saveRequestId: 'failed-a',
                 edits: { '0:0': 'A' },
                 dirtyEdits: failed_map,
@@ -2830,7 +2850,7 @@ describe('CSV edit sessions', () => {
         const grant_b = latest_edit_session_message(panel)!;
         expect(grant_b.granted).toBe(true);
         expect(grant_b.pendingEdits).toEqual(newer);
-        expect(versioned.get_state(file_path).pendingEdits).toEqual(newer);
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual(newer);
     });
 
     it('does not hydrate a failed save tombstone into a later panel session', async () => {
@@ -2860,12 +2880,13 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: first_session,
+                sheetIndex: 0,
                 saveRequestId: 'panel-a-failed-save',
                 edits: { '0:0': 'panel-a' },
                 dirtyEdits: failed_map,
             },
         });
-        expect(versioned.get_state(file_path).pendingEdits).toEqual(failed_map);
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual(failed_map);
 
         reject_cleanup = true;
         const error = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -2883,7 +2904,7 @@ describe('CSV edit sessions', () => {
         const second_grant = latest_edit_session_message(second)!;
         expect(second_grant.granted).toBe(true);
         expect(second_grant.editSessionId).not.toBe(first_session);
-        expect(second_grant.pendingEdits).toBeUndefined();
+        expect(sheet_cells(second_grant.pendingEdits)).toBeUndefined();
 
         reject_cleanup = false;
         await second.__receive({
@@ -2898,7 +2919,7 @@ describe('CSV edit sessions', () => {
         // not fire for an editor the user already closed.
         const file_path = '/tmp/disposed-save-cleanup-warning.csv';
         const pendingEdits = { '0:0': { value: 'saved', base: 'a' } };
-        const versioned = state_store({ pendingEdits });
+        const versioned = state_store({ pendingEdits: sheet_edits(pendingEdits) });
         const cleanup_started = deferred();
         const cleanup_gate = deferred();
         let bytes = enc.encode('h\na\n');
@@ -2939,13 +2960,13 @@ describe('CSV edit sessions', () => {
         // The cleanup CAS threw, but the owning panel is gone: no popup fires.
         expect(warning).not.toHaveBeenCalled();
         // The durable edit remains uncleared, exactly as in the non-disposed case.
-        expect(versioned.get_state(file_path).pendingEdits).toEqual(pendingEdits);
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual(pendingEdits);
     });
 
     it('keeps disk success while a pending-edit cleanup failure disables editing', async () => {
         const file_path = '/tmp/save-cleanup-failure.csv';
         const pendingEdits = { '0:0': { value: 'saved', base: 'a' } };
-        const versioned = state_store({ pendingEdits });
+        const versioned = state_store({ pendingEdits: sheet_edits(pendingEdits) });
         let bytes = enc.encode('h\na\n');
         vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
         vscode_mock.__setReadFileImplementation(async () => bytes);
@@ -2978,16 +2999,17 @@ describe('CSV edit sessions', () => {
         expect(warning).toHaveBeenCalledWith(expect.stringContaining('file was saved'));
         expect(edit_session_results(peer).at(-1)).toEqual({
             type: 'editSessionResult',
+            sheetIndex: 0,
             granted: false,
         });
-        expect(latest_snapshot(panel).state.pendingEdits).toBeUndefined();
-        expect(versioned.get_state(file_path).pendingEdits).toEqual(pendingEdits);
+        expect(sheet_cells(latest_snapshot(panel).state.pendingEdits)).toBeUndefined();
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual(pendingEdits);
     });
 
     it('reports disk success before stalled cleanup and refresh, then blocks every panel', async () => {
         const file_path = '/tmp/stalled-save-followup.csv';
         const pendingEdits = { '0:0': { value: 'saved', base: 'a' } };
-        const versioned = state_store({ pendingEdits });
+        const versioned = state_store({ pendingEdits: sheet_edits(pendingEdits) });
         const cleanup_started = deferred();
         const cleanup_gate = deferred();
         let builds = 0;
@@ -3043,13 +3065,13 @@ describe('CSV edit sessions', () => {
             type: 'pendingEditsChanged',
             edits: { '0:0': { value: 'stale', base: 'a' } },
         });
-        expect(versioned.get_state(file_path).pendingEdits).toEqual(pendingEdits);
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual(pendingEdits);
     });
 
     it('recovers uncertain cleanup before another panel can claim', async () => {
         const file_path = '/tmp/recover-save-cleanup.csv';
         const pendingEdits = { '0:0': { value: 'saved', base: 'a' } };
-        const versioned = state_store({ pendingEdits });
+        const versioned = state_store({ pendingEdits: sheet_edits(pendingEdits) });
         let fail_cleanup = true;
         let bytes = enc.encode('h\na\n');
         vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
@@ -3084,6 +3106,7 @@ describe('CSV edit sessions', () => {
 
         expect(edit_session_results(peer).at(-1)).toEqual({
             type: 'editSessionResult',
+            sheetIndex: 0,
             granted: true,
         });
         const grant_index = peer.__messages.map((message: any) => (
@@ -3095,14 +3118,14 @@ describe('CSV edit sessions', () => {
         )).lastIndexOf(true);
         expect(capability_index).toBeGreaterThanOrEqual(0);
         expect(capability_index).toBeLessThan(grant_index);
-        expect(versioned.get_state(file_path).pendingEdits).toBeUndefined();
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toBeUndefined();
     });
 
     it('denies a timed-out recovery waiter and lets a sibling claim after late cleanup', async () => {
         expire_edit_cleanup_wait_observably();
         const file_path = '/tmp/timed-out-cleanup-waiter.csv';
         const pendingEdits = { '0:0': { value: 'saved', base: 'a' } };
-        const cleanup = uncertain_cleanup_store({ pendingEdits });
+        const cleanup = uncertain_cleanup_store({ pendingEdits: sheet_edits(pendingEdits) });
         const owner = open_csv_table(uri(file_path), cleanup.store);
         const timed_out = open_csv_table(uri(file_path), cleanup.store);
         const sibling = open_csv_table(uri(file_path), cleanup.store);
@@ -3128,7 +3151,7 @@ describe('CSV edit sessions', () => {
     it('leaves recovery free when its requester is disposed', async () => {
         const file_path = '/tmp/disposed-cleanup-waiter.csv';
         const pendingEdits = { '0:0': { value: 'saved', base: 'a' } };
-        const cleanup = uncertain_cleanup_store({ pendingEdits });
+        const cleanup = uncertain_cleanup_store({ pendingEdits: sheet_edits(pendingEdits) });
         const owner = open_csv_table(uri(file_path), cleanup.store);
         const disposed_waiter = open_csv_table(uri(file_path), cleanup.store);
         const survivor = open_csv_table(uri(file_path), cleanup.store);
@@ -3154,7 +3177,7 @@ describe('CSV edit sessions', () => {
     it('deletes free shared edit state after the last recovery attachment disposes', async () => {
         const file_path = '/tmp/last-attachment-recovery-cleanup.csv';
         const cleanup = uncertain_cleanup_store({
-            pendingEdits: { '0:0': { value: 'saved', base: 'a' } },
+            pendingEdits: sheet_edits({ '0:0': { value: 'saved', base: 'a' } }),
         });
         const owner = open_csv_table(uri(file_path), cleanup.store);
         await owner.__receive({ type: 'ready' });
@@ -3175,7 +3198,7 @@ describe('CSV edit sessions', () => {
         // A fresh store for the same path makes a leaked clearedStateRevision
         // observable: the new revision-zero pending map would be hidden.
         const fresh_pending = { '0:0': { value: 'fresh', base: 'fresh-base' } };
-        const fresh = state_store({ pendingEdits: fresh_pending });
+        const fresh = state_store({ pendingEdits: sheet_edits(fresh_pending) });
         const replacement = open_csv_table(uri(file_path), fresh.store);
         await replacement.__receive({ type: 'ready' });
         await replacement.__receive({
@@ -3190,7 +3213,7 @@ describe('CSV edit sessions', () => {
     it('allows exactly one live waiter to claim a shared cleanup recovery', async () => {
         const file_path = '/tmp/shared-cleanup-waiters.csv';
         const pendingEdits = { '0:0': { value: 'saved', base: 'a' } };
-        const cleanup = uncertain_cleanup_store({ pendingEdits });
+        const cleanup = uncertain_cleanup_store({ pendingEdits: sheet_edits(pendingEdits) });
         const owner = open_csv_table(uri(file_path), cleanup.store);
         const first = open_csv_table(uri(file_path), cleanup.store);
         const second = open_csv_table(uri(file_path), cleanup.store);
@@ -3219,7 +3242,7 @@ describe('CSV edit sessions', () => {
         expire_edit_cleanup_wait_observably();
         const file_path = '/tmp/retry-cleanup-waiter.csv';
         const pendingEdits = { '0:0': { value: 'saved', base: 'a' } };
-        const cleanup = uncertain_cleanup_store({ pendingEdits });
+        const cleanup = uncertain_cleanup_store({ pendingEdits: sheet_edits(pendingEdits) });
         const owner = open_csv_table(uri(file_path), cleanup.store);
         const waiter = open_csv_table(uri(file_path), cleanup.store);
         await owner.__receive({ type: 'ready' });
@@ -3267,13 +3290,14 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: edit_session_id,
+                sheetIndex: 0,
                 saveRequestId: 'accepted-before-dispose',
                 edits: { '0:0': 'saved' },
                 dirtyEdits: { '0:0': { value: 'saved', base: 'a' } },
             },
         });
         await verification_started.promise;
-        expect(versioned.get_state(file_path).pendingEdits).toEqual({
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual({
             '0:0': { value: 'saved', base: 'a' },
         });
 
@@ -3285,15 +3309,16 @@ describe('CSV edit sessions', () => {
         await peer.__receive({ type: 'requestEditSession', requestId: 'peer-edit' });
         expect(edit_session_results(peer).at(-1)).toEqual({
             type: 'editSessionResult',
+            sheetIndex: 0,
             granted: true,
         });
-        expect(versioned.get_state(file_path).pendingEdits).toBeUndefined();
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toBeUndefined();
     });
 
     it('finishes file cleanup after the saving owner is disposed', async () => {
         const file_path = '/tmp/disposed-owner-cleanup.csv';
         const pendingEdits = { '0:0': { value: 'saved', base: 'a' } };
-        const versioned = state_store({ pendingEdits });
+        const versioned = state_store({ pendingEdits: sheet_edits(pendingEdits) });
         const cleanup_started = deferred();
         const cleanup_gate = deferred();
         let bytes = enc.encode('h\na\n');
@@ -3347,7 +3372,7 @@ describe('CSV edit sessions', () => {
 
         await peer.__receive({ type: 'requestEditSession' });
         expect(edit_session_results(peer).at(-1)?.granted).toBe(true);
-        expect(versioned.get_state(file_path).pendingEdits).toBeUndefined();
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toBeUndefined();
     });
 
     it('retains visible and dormant highlights across value-only external replacement', async () => {
@@ -3714,14 +3739,14 @@ describe('CSV edit sessions', () => {
     it('does not resurrect cleared pending edits from a later visibility snapshot', async () => {
         const file_path = '/tmp/cleared-edits-visibility.csv';
         const restored = { '0:0': { value: 'draft', base: 'a' } };
-        const state = state_store({ pendingEdits: restored });
+        const state = state_store({ pendingEdits: sheet_edits(restored) });
         const panel = open_csv_table(uri(file_path), state.store);
         await panel.__receive({ type: 'ready' });
         await panel.__receive({ type: 'requestEditSession' });
         expect(edit_session_results(panel).at(-1)?.granted).toBe(true);
 
         await panel.__receive({ type: 'pendingEditsChanged', edits: null } as never);
-        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+        expect(sheet_cells(state.get_state(file_path).pendingEdits)).toBeUndefined();
 
         await panel.__receive({
             type: 'setColumnVisibility',
@@ -3740,7 +3765,7 @@ describe('CSV edit sessions', () => {
             },
         } as never);
 
-        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+        expect(sheet_cells(state.get_state(file_path).pendingEdits)).toBeUndefined();
         expect(state.get_state(file_path).columnVisibility).toEqual([{
             visibleColumns: [],
             schema: '["Sheet1",1,["h"]]',
@@ -5292,7 +5317,7 @@ describe('CSV edit sessions', () => {
         await claim;
 
         expect(edit_session_results(claimant).at(-1)).toEqual({
-            type: 'editSessionResult', granted: true,
+            type: 'editSessionResult', sheetIndex: 0, granted: true,
         });
         expect(versioned.get_state(file_path).transforms).toBeUndefined();
         expect(sibling.__messages).toContainEqual(expect.objectContaining({
@@ -5332,7 +5357,7 @@ describe('CSV edit sessions', () => {
         await transform;
 
         expect(edit_session_results(claimant)).toEqual([
-            { type: 'editSessionResult', granted: false },
+            { type: 'editSessionResult', sheetIndex: 0, granted: false },
         ]);
     });
 
@@ -5371,7 +5396,7 @@ describe('CSV edit sessions', () => {
         await claimant.__receive({ type: 'requestEditSession' } as never);
 
         expect(edit_session_results(claimant)).toEqual([
-            { type: 'editSessionResult', granted: true },
+            { type: 'editSessionResult', sheetIndex: 0, granted: true },
         ]);
         // And the sibling's installed transform survives the grant untouched.
         expect(shared.get_state(file_path).transforms?.[0]?.sort).toEqual([
@@ -5429,7 +5454,7 @@ describe('CSV edit sessions', () => {
 
         await panel.__receive({ type: 'requestEditSession' } as never);
         expect(edit_session_results(panel)).toEqual([
-            { type: 'editSessionResult', granted: true },
+            { type: 'editSessionResult', sheetIndex: 0, granted: true },
         ]);
         // `denied_by_transform` must not fire on an installed transform: nothing
         // was denied, so the user gets no warning telling them to wait or clear.
@@ -5455,7 +5480,7 @@ describe('CSV edit sessions', () => {
         const file_path = '/tmp/durable-edits-under-transform.csv';
         const pendingEdits = { '0:0': { value: 'cached-edit', base: 'c' } };
         const shared = state_store({
-            pendingEdits,
+            pendingEdits: sheet_edits(pendingEdits),
             transforms: [{
                 sort: [{ colIndex: 0, direction: 'asc' }],
                 filters: [],
@@ -5471,7 +5496,7 @@ describe('CSV edit sessions', () => {
         await reopened.__receive({ type: 'ready' });
 
         const snapshot = latest_snapshot(reopened);
-        expect(snapshot.state.pendingEdits).toEqual(pendingEdits);
+        expect(sheet_cells(snapshot.state.pendingEdits)).toEqual(pendingEdits);
         expect(snapshot.capabilities.csvEditable).toBe(true);
         expect(snapshot.capabilities.csvEditSessionId).toBeDefined();
     });
@@ -5498,12 +5523,12 @@ describe('CSV edit sessions', () => {
         const shared = state_store({
             // Source rows are c, a, b. Row 0 carries two edited cells and row 2 one;
             // row 1 is the only row the filter keeps, so its edit stays visible.
-            pendingEdits: {
+            pendingEdits: sheet_edits({
                 '0:0': { value: 'edited-c', base: 'c' },
                 '0:1': { value: 'new-column', base: '' },
                 '1:0': { value: 'edited-a', base: 'a' },
                 '2:0': { value: 'edited-b', base: 'b' },
-            },
+            }),
             transforms: [filter],
         });
         const bytes = enc.encode('h\nc\na\nb\n');
@@ -5574,7 +5599,7 @@ describe('CSV edit sessions', () => {
             editSessionId: session_id,
             edits: { '2:0': { value: 'edited-b', base: 'b' } },
         });
-        expect(shared.get_state(file_path).pendingEdits).toEqual({
+        expect(sheet_cells(shared.get_state(file_path).pendingEdits)).toEqual({
             '2:0': { value: 'edited-b', base: 'b' },
         });
 
@@ -5736,10 +5761,10 @@ describe('CSV edit sessions', () => {
             schema: '["Sheet1",2,["h","g"]]',
         };
         const shared = state_store({
-            pendingEdits: {
+            pendingEdits: sheet_edits({
                 '0:1': { value: 'edited-visible', base: 'x' },
                 '2:1': { value: 'edited-gone', base: 'z' },
-            },
+            }),
             transforms: [filter],
         });
         // One row left where there were three: source row 2 no longer exists.
@@ -5827,6 +5852,7 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session_a,
+                sheetIndex: 0,
                 saveRequestId: 'failing-save',
                 edits: { '2:0': 'edited-b' },
                 dirtyEdits,
@@ -5843,7 +5869,7 @@ describe('CSV edit sessions', () => {
         expect(session_b).not.toBe(session_a);
         expect(session_b).toBeDefined();
         expect(cleanup_writes).toBeGreaterThan(0);
-        expect(versioned.get_state(file_path).pendingEdits).toEqual(dirtyEdits);
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual(dirtyEdits);
 
         const snapshot = latest_snapshot(panel);
         await panel.__receive({
@@ -5910,7 +5936,7 @@ describe('CSV edit sessions', () => {
         await owner.__receive({ type: 'releaseEditSession', editSessionId: session_id });
         // The precondition: durable work with no panel holding the session, which is
         // what a closed tab leaves behind.
-        expect(shared.get_state(file_path).pendingEdits).toEqual(pendingEdits);
+        expect(sheet_cells(shared.get_state(file_path).pendingEdits)).toEqual(pendingEdits);
 
         const owner_snapshot = latest_snapshot(owner);
         const transform = owner.__receive({
@@ -5936,7 +5962,7 @@ describe('CSV edit sessions', () => {
         expect(transform_answers(owner)).toEqual([]);
 
         const snapshot = latest_snapshot(reopened);
-        expect(snapshot.state.pendingEdits).toEqual(pendingEdits);
+        expect(sheet_cells(snapshot.state.pendingEdits)).toEqual(pendingEdits);
         expect(snapshot.capabilities.csvEditSessionId).toBeDefined();
 
         await transform;
@@ -5991,7 +6017,7 @@ describe('CSV edit sessions', () => {
         await sibling.__receive({ type: 'releaseEditSession', editSessionId: session_id });
         // The precondition: durable work, phase free, so the transform below is
         // admitted for a legitimate reason and the reopen below can claim.
-        expect(versioned.get_state(file_path).pendingEdits).toEqual(pendingEdits);
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual(pendingEdits);
 
         const sibling_snapshot = latest_snapshot(sibling);
         gate_commit_read = true;
@@ -6019,7 +6045,7 @@ describe('CSV edit sessions', () => {
         const rehydrated = latest_snapshot(reopened);
         // The reopen really did rehydrate — the whole point of the unconditional
         // answer — so the phase the sibling was admitted under is gone.
-        expect(rehydrated.state.pendingEdits).toEqual(pendingEdits);
+        expect(sheet_cells(rehydrated.state.pendingEdits)).toEqual(pendingEdits);
         expect(rehydrated.capabilities.csvEditSessionId).toBeDefined();
         const natural = await reopened.__receive({
             type: 'requestRows', sheetIndex: 0, startRow: 0, count: 3,
@@ -6073,7 +6099,7 @@ describe('CSV edit sessions', () => {
             message?.type === 'rowData' && message.requestId === 'after-sibling-commit'
         )) as { rows: Array<Array<{ raw: string }>> }).rows.map((row) => row[0].raw));
         expect(after).toEqual(natural);
-        expect(latest_snapshot(reopened).state.pendingEdits).toMatchObject(pendingEdits);
+        expect(sheet_cells(latest_snapshot(reopened).state.pendingEdits)).toMatchObject(pendingEdits);
     });
 
     it('serializes rehydration behind a sibling transform commit CAS', async () => {
@@ -6112,7 +6138,7 @@ describe('CSV edit sessions', () => {
             edits: pendingEdits,
         });
         await sibling.__receive({ type: 'releaseEditSession', editSessionId: session_id });
-        expect(versioned.get_state(file_path).pendingEdits).toEqual(pendingEdits);
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual(pendingEdits);
 
         const sibling_snapshot = latest_snapshot(sibling);
         gate_transform_cas = true;
@@ -6153,7 +6179,7 @@ describe('CSV edit sessions', () => {
             requestId: 'lapsed-inside-cas',
         })]);
         const rehydrated = latest_snapshot(reopened);
-        expect(rehydrated.state.pendingEdits).toEqual(pendingEdits);
+        expect(sheet_cells(rehydrated.state.pendingEdits)).toEqual(pendingEdits);
         expect(rehydrated.state.transforms?.[0]?.sort).toEqual([
             { colIndex: 0, direction: 'asc' },
         ]);
@@ -6214,7 +6240,7 @@ describe('CSV edit sessions', () => {
         const durable_pending = () => {
             const entries = (blob as { entries?: Record<string, { state: PerFileState }> })
                 .entries ?? {};
-            return Object.values(entries)[0]?.state.pendingEdits;
+            return sheet_cells(Object.values(entries)[0]?.state.pendingEdits);
         };
         const bytes = enc.encode('h\nc\na\nb\n');
         vscode_mock.__setStatImplementation(async () => ({
@@ -6299,7 +6325,7 @@ describe('CSV edit sessions', () => {
                 .toEqual([{ colIndex: 0, direction: 'asc' }]);
         }
         const rehydrated = latest_snapshot(reopened);
-        expect(rehydrated.state.pendingEdits).toEqual(pendingEdits);
+        expect(sheet_cells(rehydrated.state.pendingEdits)).toEqual(pendingEdits);
         const rows = async (requestId: string) => {
             await reopened.__receive({
                 type: 'requestRows', sheetIndex: 0, startRow: 0, count: 3,
@@ -6419,13 +6445,13 @@ describe('CSV edit sessions', () => {
         // map after the releasing phase has ended.
         const file_path = '/tmp/rehydrate-during-release.csv';
         const committed = { '0:0': { value: 'committed-draft', base: 'c' } };
-        const versioned = state_store({ pendingEdits: committed });
+        const versioned = state_store({ pendingEdits: sheet_edits(committed) });
         const compare_started = deferred();
         const compare_gate = deferred();
         const store: FileStateStore = {
             ...versioned.store,
             async compare_and_set(path, expected, next, validate) {
-                if (next.pendingEdits?.['0:1']) {
+                if (next.pendingEdits?.[0]?.cells['0:1']) {
                     compare_started.resolve();
                     await compare_gate.promise;
                 }
@@ -6468,7 +6494,7 @@ describe('CSV edit sessions', () => {
         await Promise.all([pending, release, ready]);
 
         const rehydrated = latest_snapshot(reopened);
-        expect(rehydrated.state.pendingEdits).toEqual({
+        expect(sheet_cells(rehydrated.state.pendingEdits)).toEqual({
             ...committed,
             '0:1': { value: 'later-draft', base: 'c' },
         });
@@ -6594,7 +6620,7 @@ describe('CSV edit sessions', () => {
             async (label, rules, row_count, hidden, order) => {
                 const file_path = `/tmp/reopen-matrix-${label.replace(/\s+/g, '-')}.csv`;
                 const shared = state_store({
-                    pendingEdits: EDITS,
+                    pendingEdits: sheet_edits(EDITS),
                     ...(rules ? { transforms: [rules] } : {}),
                 });
                 csv_fixture();
@@ -6604,7 +6630,7 @@ describe('CSV edit sessions', () => {
                 // The load-bearing question first, and the same one in all four cells:
                 // the work is here and it is this panel's to hold.
                 const snapshot = latest_snapshot(reopened);
-                expect(snapshot.state.pendingEdits).toEqual(EDITS);
+                expect(sheet_cells(snapshot.state.pendingEdits)).toEqual(EDITS);
                 expect(snapshot.capabilities.csvEditSessionId).toBeDefined();
                 expect(snapshot.capabilities.csvEditable).toBe(true);
 
@@ -6643,7 +6669,7 @@ describe('CSV edit sessions', () => {
             await reopened.__receive({ type: 'ready' });
 
             const snapshot = latest_snapshot(reopened);
-            expect(snapshot.state.pendingEdits).toBeUndefined();
+            expect(sheet_cells(snapshot.state.pendingEdits)).toBeUndefined();
             // No durable work means no session to represent, so a reopen must not
             // silently take one — the file stays free for whichever panel asks.
             expect(snapshot.capabilities.csvEditSessionId).toBeUndefined();
@@ -6666,7 +6692,7 @@ describe('CSV edit sessions', () => {
             ['is still releasing it', 'releasing'],
         ] as const)('defers a reopen while a sibling %s, losing nothing', async (label, phase) => {
             const file_path = `/tmp/reopen-matrix-${phase}.csv`;
-            const versioned = state_store({ pendingEdits: EDITS });
+            const versioned = state_store({ pendingEdits: sheet_edits(EDITS) });
             const parked = deferred();
             const gate = deferred();
             let arm_read = false;
@@ -6684,7 +6710,7 @@ describe('CSV edit sessions', () => {
                     return versioned.store.read(path);
                 },
                 async compare_and_set(path, expected, next, validate) {
-                    if (arm_write && next.pendingEdits?.['1:0']) {
+                    if (arm_write && next.pendingEdits?.[0]?.cells['1:0']) {
                         arm_write = false;
                         parked.resolve();
                         await gate.promise;
@@ -6734,14 +6760,14 @@ describe('CSV edit sessions', () => {
                 gate.resolve();
                 await Promise.all([outstanding, ready]);
                 const rehydrated = latest_snapshot(reopened);
-                expect(rehydrated.state.pendingEdits).toMatchObject(EDITS);
+                expect(sheet_cells(rehydrated.state.pendingEdits)).toMatchObject(EDITS);
                 expect(rehydrated.capabilities.csvEditSessionId).toBeDefined();
             } else {
                 await ready;
                 const snapshot = latest_snapshot(reopened);
-                expect(snapshot.state.pendingEdits).toBeUndefined();
+                expect(sheet_cells(snapshot.state.pendingEdits)).toBeUndefined();
                 expect(snapshot.capabilities.csvEditSessionId).toBeUndefined();
-                expect(versioned.get_state(file_path).pendingEdits).toMatchObject(EDITS);
+                expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toMatchObject(EDITS);
 
                 gate.resolve();
                 await outstanding;
@@ -6771,7 +6797,7 @@ describe('CSV edit sessions', () => {
             ['a clear has failed and state is uncertain', 'uncertain'],
         ] as const)('withholds a session on reopen while %s', async (label, phase) => {
             const file_path = `/tmp/reopen-matrix-${phase}.csv`;
-            const versioned = state_store({ pendingEdits: { '0:0': { value: 'edited-c', base: 'c' } } });
+            const versioned = state_store({ pendingEdits: sheet_edits({ '0:0': { value: 'edited-c', base: 'c' } }) });
             const clear_started = deferred();
             const clear_gate = deferred();
             let bytes = enc.encode(SOURCE);
@@ -6802,6 +6828,7 @@ describe('CSV edit sessions', () => {
                 type: 'saveCsv',
                 operation: {
                     editSessionId: session_id,
+                    sheetIndex: 0,
                     saveRequestId: 'save-before-reopen',
                     edits: { '0:0': 'edited-c' },
                     dirtyEdits: { '0:0': { value: 'edited-c', base: 'c' } },
@@ -6820,7 +6847,7 @@ describe('CSV edit sessions', () => {
             // The precondition that makes this cell about the cleanup phases at all:
             // the entries the clear could not remove are still on disk, so the
             // projection below has something it could wrongly hand over.
-            expect(versioned.get_state(file_path).pendingEdits).toEqual({
+            expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual({
                 '0:0': { value: 'edited-c', base: 'c' },
             });
 
@@ -6837,7 +6864,7 @@ describe('CSV edit sessions', () => {
             } else {
                 await ready;
                 const snapshot = latest_snapshot(reopened);
-                expect(snapshot.state.pendingEdits).toBeUndefined();
+                expect(sheet_cells(snapshot.state.pendingEdits)).toBeUndefined();
                 expect(snapshot.capabilities.csvEditSessionId).toBeUndefined();
                 await reopened.__receive({
                     type: 'requestEditSession', requestId: 'during-cleanup',
@@ -6882,9 +6909,12 @@ describe('CSV edit sessions', () => {
                     ...versioned.store,
                     async compare_and_set(path, expected_revision, next, validate) {
                         const current = await versioned.store.read(path);
-                        const shrinking = Object.keys(
-                            (current.state as PerFileState).pendingEdits ?? {},
-                        ).length > Object.keys(next.pendingEdits ?? {}).length;
+                        // Cells, not slots: the leaf is a per-worksheet array, so
+                        // counting its top level counts sheets and never moves.
+                        const cell_count = (pending: PerFileState['pendingEdits']) =>
+                            Object.keys(sheet_cells(pending) ?? {}).length;
+                        const shrinking = cell_count((current.state as PerFileState).pendingEdits)
+                            > cell_count(next.pendingEdits);
                         if (reject_cleanup && shrinking) {
                             cleanup_writes += 1;
                             throw new Error('cleanup write failed');
@@ -6915,6 +6945,7 @@ describe('CSV edit sessions', () => {
                     type: 'saveCsv',
                     operation: {
                         editSessionId: session_id,
+                        sheetIndex: 0,
                         saveRequestId: 'failing-save',
                         edits: saved,
                         dirtyEdits,
@@ -6925,13 +6956,13 @@ describe('CSV edit sessions', () => {
                 // Preconditions: the cleanup was attempted and refused, so the failed
                 // operation's entries are still on disk under a standing tombstone.
                 expect(cleanup_writes).toBeGreaterThan(0);
-                expect(versioned.get_state(file_path).pendingEdits).toEqual(EDITS);
+                expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual(EDITS);
 
                 const reopened = open_csv_table(uri(file_path), store);
                 await reopened.__receive({ type: 'ready' });
 
                 const snapshot = latest_snapshot(reopened);
-                expect(snapshot.state.pendingEdits).toEqual(expected);
+                expect(sheet_cells(snapshot.state.pendingEdits)).toEqual(expected);
                 // Still a session either way: the tombstone says which entries are not
                 // this panel's, not that the panel may not edit.
                 expect(snapshot.capabilities.csvEditSessionId).toBeDefined();
@@ -6998,6 +7029,7 @@ describe('CSV edit sessions', () => {
                 type: 'saveCsv',
                 operation: {
                     editSessionId: failed_session,
+                    sheetIndex: 0,
                     saveRequestId: 'failing-save',
                     edits: { '2:0': 'edited-b' },
                     dirtyEdits,
@@ -7009,7 +7041,7 @@ describe('CSV edit sessions', () => {
             owner.dispose();
             await flush_promises();
             expect(cleanup_writes).toBeGreaterThan(0);
-            expect(versioned.get_state(file_path).pendingEdits).toEqual(dirtyEdits);
+            expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual(dirtyEdits);
 
             const reopened = open_csv_table(uri(file_path), store);
             await reopened.__receive({ type: 'ready' });
@@ -7018,7 +7050,7 @@ describe('CSV edit sessions', () => {
             expect(session_id).not.toBe(failed_session);
             // The precondition: the tombstone really is standing, so the panel opened
             // over the failed save's entries without being shown them.
-            expect(latest_snapshot(reopened).state.pendingEdits).toBeUndefined();
+            expect(sheet_cells(latest_snapshot(reopened).state.pendingEdits)).toBeUndefined();
 
             // The user types the same value again, and the host writes it.
             await reopened.__receive({
@@ -7026,7 +7058,7 @@ describe('CSV edit sessions', () => {
                 editSessionId: session_id,
                 edits: dirtyEdits,
             });
-            expect(latest_snapshot(reopened).state.pendingEdits).toEqual(dirtyEdits);
+            expect(sheet_cells(latest_snapshot(reopened).state.pendingEdits)).toEqual(dirtyEdits);
 
             // And it survives the next projection, whatever provokes one — here a
             // second post, which is what any further typing does.
@@ -7035,7 +7067,7 @@ describe('CSV edit sessions', () => {
                 editSessionId: session_id,
                 edits: { ...dirtyEdits, '0:0': EDITS['0:0'] },
             });
-            expect(latest_snapshot(reopened).state.pendingEdits).toEqual({
+            expect(sheet_cells(latest_snapshot(reopened).state.pendingEdits)).toEqual({
                 ...dirtyEdits,
                 '0:0': EDITS['0:0'],
             });
@@ -7057,7 +7089,7 @@ describe('CSV edit sessions', () => {
             // is holding rather than work already saved.
             const file_path = '/tmp/reopen-matrix-cleared-revision.csv';
             const versioned = state_store({
-                pendingEdits: { '0:0': { value: 'edited-c', base: 'c' } },
+                pendingEdits: sheet_edits({ '0:0': { value: 'edited-c', base: 'c' } }),
             });
             let stale: FileStateSnapshot | undefined;
             let serve_stale = false;
@@ -7088,6 +7120,7 @@ describe('CSV edit sessions', () => {
                 type: 'saveCsv',
                 operation: {
                     editSessionId: session_id,
+                    sheetIndex: 0,
                     saveRequestId: 'save-then-clear',
                     edits: { '0:0': 'edited-c' },
                     dirtyEdits: { '0:0': { value: 'edited-c', base: 'c' } },
@@ -7097,7 +7130,7 @@ describe('CSV edit sessions', () => {
             // Preconditions: the clear committed, and a pre-clear revision is on hand
             // to replay. The owner stays attached so the record — and with it the
             // recorded boundary — survives into the reopen.
-            expect(versioned.get_state(file_path).pendingEdits).toBeUndefined();
+            expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toBeUndefined();
             expect(stale).toBeDefined();
 
             serve_stale = true;
@@ -7105,7 +7138,7 @@ describe('CSV edit sessions', () => {
             await reopened.__receive({ type: 'ready' });
 
             const snapshot = latest_snapshot(reopened);
-            expect(snapshot.state.pendingEdits).toBeUndefined();
+            expect(sheet_cells(snapshot.state.pendingEdits)).toBeUndefined();
             expect(snapshot.capabilities.csvEditSessionId).toBeUndefined();
             expect(console_error.mock.calls.map((call) => call[0])).not.toContain(LOSS);
             console_error.mockRestore();
@@ -7118,7 +7151,7 @@ describe('CSV edit sessions', () => {
             // other. Crossed with the baseline alone, because order decides only who
             // holds the session.
             const file_path = '/tmp/reopen-matrix-order.csv';
-            const shared = state_store({ pendingEdits: EDITS });
+            const shared = state_store({ pendingEdits: sheet_edits(EDITS) });
             csv_fixture();
             const console_error = vi.spyOn(console, 'error').mockImplementation(() => {});
             const first = open_csv_table(uri(file_path), shared.store);
@@ -7127,11 +7160,11 @@ describe('CSV edit sessions', () => {
             await second.__receive({ type: 'ready' });
 
             const first_snapshot = latest_snapshot(first);
-            expect(first_snapshot.state.pendingEdits).toEqual(EDITS);
+            expect(sheet_cells(first_snapshot.state.pendingEdits)).toEqual(EDITS);
             const first_session = first_snapshot.capabilities.csvEditSessionId;
             expect(first_session).toBeDefined();
             const second_snapshot = latest_snapshot(second);
-            expect(second_snapshot.state.pendingEdits).toBeUndefined();
+            expect(sheet_cells(second_snapshot.state.pendingEdits)).toBeUndefined();
             expect(second_snapshot.capabilities.csvEditSessionId).toBeUndefined();
             expect(console_error.mock.calls.map((call) => call[0])).not.toContain(LOSS);
 
@@ -7291,6 +7324,7 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: edit_session_id,
+                sheetIndex: 0,
                 saveRequestId: 'save-during-transform',
                 edits: { '0:0': 'edited-c' },
                 dirtyEdits: { '0:0': { value: 'edited-c', base: 'c' } },
@@ -7320,6 +7354,7 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: edit_session_id,
+                sheetIndex: 0,
                 saveRequestId: 'save-after-transform',
                 edits: { '0:0': 'edited-c' },
                 dirtyEdits: { '0:0': { value: 'edited-c', base: 'c' } },
@@ -7389,6 +7424,7 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: edit_session_id,
+                sheetIndex: 0,
                 saveRequestId: 'save-natural-row',
                 edits: { '0:0': 'edited-c' },
                 dirtyEdits: { '0:0': { value: 'edited-c', base: 'c' } },
@@ -7451,6 +7487,7 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: edit_session_id,
+                sheetIndex: 0,
                 saveRequestId: 'save-under-owner-sort',
                 edits: { '0:0': 'edited-c' },
                 dirtyEdits: { '0:0': { value: 'edited-c', base: 'c' } },
@@ -7544,6 +7581,7 @@ describe('CSV edit sessions', () => {
                 type: 'saveCsv',
                 operation: {
                     editSessionId: edit_session_id,
+                    sheetIndex: 0,
                     saveRequestId: 'save-under-view',
                     edits: Object.fromEntries(
                         Object.entries(dirty).map(([key, entry]) => [key, entry.value]),
@@ -7657,6 +7695,7 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: edit_session_id,
+                sheetIndex: 0,
                 saveRequestId: 'gated-save',
                 edits: { '0:0': 'edited-c' },
                 dirtyEdits: { '0:0': { value: 'edited-c', base: 'c' } },
@@ -7726,7 +7765,7 @@ describe('CSV edit sessions', () => {
         // would race it.
         const file_path = '/tmp/transform-during-cleanup.csv';
         const versioned = state_store({
-            pendingEdits: { '0:0': { value: 'edited-a', base: 'a' } },
+            pendingEdits: sheet_edits({ '0:0': { value: 'edited-a', base: 'a' } }),
         });
         const cleanup_started = deferred();
         const cleanup_gate = deferred();
@@ -7793,7 +7832,7 @@ describe('CSV edit sessions', () => {
         const store: FileStateStore = {
             ...versioned.store,
             async compare_and_set(path, expected, next, validate) {
-                if (next.pendingEdits?.['0:0']) {
+                if (next.pendingEdits?.[0]?.cells['0:0']) {
                     compare_started.resolve();
                     await compare_gate.promise;
                 }
@@ -7839,7 +7878,7 @@ describe('CSV edit sessions', () => {
 
         compare_gate.resolve();
         await Promise.all([pending, release]);
-        expect(versioned.get_state(file_path).pendingEdits).toEqual({
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual({
             '0:0': { value: 'draining', base: 'c' },
         });
     });
@@ -7849,7 +7888,7 @@ describe('CSV edit sessions', () => {
         // not exist. Never admit under unknown durable state.
         const file_path = '/tmp/transform-during-uncertain.csv';
         const versioned = state_store({
-            pendingEdits: { '0:0': { value: 'edited-a', base: 'a' } },
+            pendingEdits: sheet_edits({ '0:0': { value: 'edited-a', base: 'a' } }),
         });
         let bytes = enc.encode('h\na\nb\nc\n');
         vscode_mock.__setStatImplementation(async () => ({
@@ -7924,7 +7963,7 @@ describe('CSV edit sessions', () => {
         await transform;
 
         expect(edit_session_results(panel)).toEqual([
-            { type: 'editSessionResult', granted: false },
+            { type: 'editSessionResult', sheetIndex: 0, granted: false },
         ]);
         // The refusal has to reach the user, and has to name the real reason. This is
         // the only observable `may_begin_editing()` owns on its own: the grant itself
@@ -7939,10 +7978,10 @@ describe('CSV edit sessions', () => {
     it('projects pending edits for the owner but not a pre-ready watcher adoption in a nonowner', async () => {
         const file_path = '/tmp/pre-ready-nonowner.csv';
         const pendingEdits = { '0:0': { value: 'owner', base: 'a' } };
-        const state = state_store({ pendingEdits });
+        const state = state_store({ pendingEdits: sheet_edits(pendingEdits) });
         const first = open_csv_table(uri(file_path), state.store);
         await first.__receive({ type: 'ready' });
-        expect(latest_snapshot(first).state.pendingEdits).toEqual(pendingEdits);
+        expect(sheet_cells(latest_snapshot(first).state.pendingEdits)).toEqual(pendingEdits);
 
         const second = open_csv_table(uri(file_path), state.store);
         expect(vscode_mock.__getActiveWatchers()).toHaveLength(1);
@@ -7950,7 +7989,7 @@ describe('CSV edit sessions', () => {
         await shared_watcher.__fireChange();
         expect(second.__messages).toHaveLength(0);
         await second.__receive({ type: 'ready' });
-        expect(latest_snapshot(second).state.pendingEdits).toBeUndefined();
+        expect(sheet_cells(latest_snapshot(second).state.pendingEdits)).toBeUndefined();
     });
 
     it('allows multiple viewers for one CSV file but grants edit mode to only one', async () => {
@@ -7969,10 +8008,10 @@ describe('CSV edit sessions', () => {
         await second.__receive({ type: 'requestEditSession' } as never);
 
         expect(edit_session_results(first)).toEqual([
-            { type: 'editSessionResult', granted: true },
+            { type: 'editSessionResult', sheetIndex: 0, granted: true },
         ]);
         expect(edit_session_results(second)).toEqual([
-            { type: 'editSessionResult', granted: false },
+            { type: 'editSessionResult', sheetIndex: 0, granted: false },
         ]);
     });
 
@@ -7995,7 +8034,7 @@ describe('CSV edit sessions', () => {
         await panel.__receive({ type: 'ready' });
         await panel.__receive({ type: 'requestEditSession' } as never);
         expect(edit_session_results(panel).at(-1)).toEqual({
-            type: 'editSessionResult', granted: true,
+            type: 'editSessionResult', sheetIndex: 0, granted: true,
         });
         panel.dispose();
         await vi.waitFor(() => expect(file_coordinator_registry_size()).toBe(registry_before));
@@ -8019,10 +8058,10 @@ describe('CSV edit sessions', () => {
         await first.__receive({ type: 'requestEditSession' } as never);
         await second.__receive({ type: 'requestEditSession' } as never);
         expect(edit_session_results(first).at(-1)).toEqual({
-            type: 'editSessionResult', granted: true,
+            type: 'editSessionResult', sheetIndex: 0, granted: true,
         });
         expect(edit_session_results(second).at(-1)).toEqual({
-            type: 'editSessionResult', granted: true,
+            type: 'editSessionResult', sheetIndex: 0, granted: true,
         });
         expect(latest_snapshot(first).identity.authority.fileId)
             .not.toBe(latest_snapshot(second).identity.authority.fileId);
@@ -8051,7 +8090,7 @@ describe('CSV edit sessions', () => {
             edits: { '0:0': { value: 'non-owner', base: 'a' } },
         });
 
-        expect(state.get_state(file_path).pendingEdits).toEqual({
+        expect(sheet_cells(state.get_state(file_path).pendingEdits)).toEqual({
             '0:0': { value: 'owner', base: 'a' },
         });
     });
@@ -8060,7 +8099,7 @@ describe('CSV edit sessions', () => {
         const file_path = '/tmp/session.csv';
         const file_uri = uri(file_path);
         const pendingEdits = { '0:0': { value: 'owner', base: 'a' } };
-        const state = state_store({ pendingEdits });
+        const state = state_store({ pendingEdits: sheet_edits(pendingEdits) });
         const first = open_csv_table(file_uri, state.store);
         const second = open_csv_table(file_uri, state.store);
 
@@ -8073,6 +8112,7 @@ describe('CSV edit sessions', () => {
 
         expect(edit_session_results(second)).toContainEqual({
             type: 'editSessionResult',
+            sheetIndex: 0,
             granted: true,
             pendingEdits,
         });
@@ -8096,9 +8136,10 @@ describe('CSV edit sessions', () => {
         await first.__receive({ type: 'discardEditSession' } as never);
         await second.__receive({ type: 'requestEditSession' });
 
-        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+        expect(sheet_cells(state.get_state(file_path).pendingEdits)).toBeUndefined();
         expect(edit_session_results(second)).toContainEqual({
             type: 'editSessionResult',
+            sheetIndex: 0,
             granted: true,
         });
     });
@@ -8106,7 +8147,7 @@ describe('CSV edit sessions', () => {
     it('strips pending edits from previews and cannot resurrect a cleared map', async () => {
         const file_path = '/tmp/preview-pending.csv';
         const pending = { '0:0': { value: 'draft', base: 'a' } };
-        const state = state_store({ pendingEdits: pending });
+        const state = state_store({ pendingEdits: sheet_edits(pending) });
         const profile: ViewerProfile = {
             editing: false,
             previewMode: true,
@@ -8115,7 +8156,7 @@ describe('CSV edit sessions', () => {
         const panel = open_csv_table(uri(file_path), state.store, profile);
         await panel.__receive({ type: 'ready' });
         const first = latest_snapshot(panel);
-        expect(first.state.pendingEdits).toBeUndefined();
+        expect(sheet_cells(first.state.pendingEdits)).toBeUndefined();
 
         await state.store.compare_and_set(file_path, state.revision(file_path), {});
         await panel.__receive({
@@ -8124,10 +8165,10 @@ describe('CSV edit sessions', () => {
             snapshotIdentity: first.identity,
             state: { ...first.state, pendingEdits: pending, columnWidths: [{ 0: 133 }] },
         });
-        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+        expect(sheet_cells(state.get_state(file_path).pendingEdits)).toBeUndefined();
         await panel.__receive({ type: 'ready' });
         const replay = latest_snapshot(panel);
-        expect(replay.state.pendingEdits).toBeUndefined();
+        expect(sheet_cells(replay.state.pendingEdits)).toBeUndefined();
         expect(replay.state.columnWidths).toEqual([{ 0: 133 }]);
     });
 
@@ -8323,7 +8364,7 @@ describe('CSV edit sessions', () => {
         await panel.__receive({ type: 'requestEditSession' });
 
         expect(edit_session_results(panel)).toEqual([
-            { type: 'editSessionResult', granted: false },
+            { type: 'editSessionResult', sheetIndex: 0, granted: false },
         ]);
         expect(warning_spy).not.toHaveBeenCalledWith(
             'This file is already being edited in another Table Viewer tab.'

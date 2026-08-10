@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { compare_authority } from './authority-order';
 import {
     decode_stored_per_file_state,
+    has_any_pending_edits,
     type PerFileState,
     type StoredPerFileState,
 } from './types';
@@ -370,8 +371,10 @@ function decode_stage(value: unknown): PersistedAuthorityStage {
 }
 
 export function state_has_pending_edits(state: StoredPerFileState): boolean {
-    const pending = (state as PerFileState).pendingEdits;
-    return !!pending && Object.keys(pending).length > 0;
+    // Not `Object.keys(...).length`: the worksheet-scoped leaf is a positional
+    // array whose empty slots are holes, so `[undefined]` has length 1 while
+    // holding nothing. Ask whether any *slot* has cells.
+    return has_any_pending_edits((state as PerFileState).pendingEdits);
 }
 
 function max_timestamp(existing: number | undefined, captured: number): number {
@@ -848,7 +851,7 @@ function serialized_states_equal(left: StoredPerFileState, right: StoredPerFileS
 
 function pending_json(state: StoredPerFileState): string | undefined {
     const pending = (state as PerFileState).pendingEdits;
-    return pending && Object.keys(pending).length > 0 ? JSON.stringify(pending) : undefined;
+    return has_any_pending_edits(pending) ? JSON.stringify(pending) : undefined;
 }
 
 function authorities_exactly_equal(left: DurableFileAuthority, right: DurableFileAuthority): boolean {
