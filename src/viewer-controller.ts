@@ -1341,6 +1341,39 @@ export function attach_viewer(
         return index === undefined || index === -1 ? undefined : index;
     }
 
+    /**
+     * Which worksheet a rehydrating panel should adopt from durable slots.
+     *
+     * The first occupied slot, but only if the workbook agrees that slot belongs
+     * to the sheet sitting at that index. Reconciliation cannot always place a
+     * slot at its own name: with two slots tagged alike the loser stays put, so a
+     * draft tagged `Inventory` can sit at index 0 while sheet 0 is `People`.
+     * Adopting it by position opened an edit session on `People` holding
+     * `Inventory`'s cells, and saving it wrote them into `People` — the exact
+     * cross-worksheet corruption the name tags exist to prevent.
+     *
+     * A slot whose name still resolves is followed to where the name now is. One
+     * that resolves nowhere, and every untagged slot, keeps the positional answer:
+     * untagged slots are single-sheet CSV by construction, and a name the workbook
+     * does not have cannot be checked against anything.
+     */
+    function rehydration_sheet_index(
+        slots: PerFileState['pendingEdits'],
+        names?: readonly string[],
+    ): number {
+        if (!slots) return 0;
+        for (let index = 0; index < slots.length; index += 1) {
+            const slot = slots[index];
+            if (!slot) continue;
+            if (!slot.sheetName) return index;
+            const named = sheet_index_named(slot.sheetName, names);
+            return named ?? index;
+        }
+        // An all-holes array names no sheet at all; sheet 0 is the answer the
+        // caller had before any of this was worksheet-scoped.
+        return 0;
+    }
+
     function durable_pending_edit_keys(sheet_index: number): readonly string[] {
         // Only the sheet the session is editing can have keys to report; asking
         // about any other sheet must not return this one's, since the caller
@@ -1958,10 +1991,18 @@ export function attach_viewer(
      * disposed panel has no workbook to resolve names against while another window
      * still attached goes on reconciling and committing them.
      *
-     * The captured position is tried first rather than a bare `findIndex`: two
-     * slots can be tagged alike (a sheet renamed externally onto a name another
-     * slot already recorded), and the first match would then be somebody else's —
-     * clearing a draft this caller does not own and leaving its own behind.
+     * Two slots can be tagged alike — a sheet renamed externally onto a name
+     * another slot already recorded — so the name alone does not identify one, and
+     * a bare `findIndex` would hand the caller somebody else's draft: clearing work
+     * it does not own and leaving its own behind.
+     *
+     * `owns` breaks that tie on evidence rather than on position. A caller cleaning
+     * up after an operation knows which entries are the operation's, and a slot
+     * that actually holds them is the operation's slot wherever it now sits.
+     * Position is only the tie-break of last resort, because it is precisely what
+     * goes stale: the captured index can have been inherited by an unrelated
+     * draft that happens to carry the same tag, and preferring it there left the
+     * failed save's own entries behind as a phantom draft.
      *
      * Nothing tagged with this name means either slots predating name tagging or a
      * deleted sheet; neither is distinguishable from here, and the captured
@@ -1971,10 +2012,23 @@ export function attach_viewer(
         slots: PerFileState['pendingEdits'],
         name: string,
         captured_index: number,
+        owns?: (cells: SheetPendingEditCells | undefined) => boolean,
     ): number {
-        if (slots?.[captured_index]?.sheetName === name) return captured_index;
-        const tagged = slots?.findIndex((slot) => slot?.sheetName === name) ?? -1;
-        return tagged === -1 ? captured_index : tagged;
+        const tagged: number[] = [];
+        slots?.forEach((slot, index) => {
+            if (slot?.sheetName === name) tagged.push(index);
+        });
+        if (tagged.length === 0) return captured_index;
+        if (tagged.length === 1) return tagged[0];
+        if (owns) {
+            const owning = tagged.filter((index) => owns(slots?.[index]?.cells));
+            if (owning.length === 1) return owning[0];
+            // Ambiguous either way: no slot holds the operation's entries (already
+            // cleaned, or never persisted), or several do. Fall through to position.
+            if (owning.length > 1 && owning.includes(captured_index)) return captured_index;
+            if (owning.length > 1) return owning[0];
+        }
+        return tagged.includes(captured_index) ? captured_index : tagged[0];
     }
 
     /**
@@ -2006,7 +2060,35 @@ export function attach_viewer(
         const name = save_operation_sheet_names.get(operation);
         if (name === undefined) return operation.sheetIndex;
         if (source) return sheet_index_named(name, names);
-        return slot_index_tagged(slots, name, operation.sheetIndex);
+        // Its own entries identify the operation's slot among same-named ones far
+        // better than a captured position does; see `slot_index_tagged`.
+        return slot_index_tagged(
+            slots,
+            name,
+            operation.sheetIndex,
+            (cells) => holds_operation_entries(cells, operation),
+        );
+    }
+
+    /**
+     * Does this slot hold any of `operation`'s own entries, unchanged?
+     *
+     * The same key/value test `strip_operation_owned_pending_edits` uses to decide
+     * what to remove, asked as a question instead — so "which slot would this
+     * cleanup actually strip something from" is answered before choosing one.
+     */
+    function holds_operation_entries(
+        cells: SheetPendingEditCells | undefined,
+        operation: CsvSaveOperation,
+    ): boolean {
+        if (!cells) return false;
+        return Object.entries(cells).some(([key, pending]) => {
+            const owned = operation.dirtyEdits[key];
+            if (!owned) return false;
+            return typeof pending === 'string'
+                ? pending === owned.value
+                : pending.value === owned.value && pending.base === owned.base;
+        });
     }
 
     function strip_operation_owned_pending_edits(
@@ -2171,6 +2253,11 @@ export function attach_viewer(
     function project_state_for_panel(
         snapshot: Readonly<FileStateSnapshot>,
         allow_claim = false,
+        // The workbook being adopted, when that is not yet the installed `source`:
+        // adoption projects *before* `source = next`, so a name resolved against
+        // the module-level source there is answered by the outgoing workbook or,
+        // on a first open, by nothing at all.
+        names?: readonly string[],
     ): FileStateSnapshot {
         observe_durable_state(snapshot);
         const state = snapshot.state as PerFileState;
@@ -2206,14 +2293,8 @@ export function attach_viewer(
                         false,
                         undefined,
                         // Rehydration adopts whichever sheet the durable slot
-                        // belongs to, rather than assuming sheet 0. `findIndex`
-                        // answers -1 for an all-holes array, which is not a sheet:
-                        // clamped rather than left to `??`, which only catches the
-                        // absent leaf.
-                        Math.max(
-                            0,
-                            state.pendingEdits?.findIndex((slot) => slot !== undefined) ?? 0,
-                        ),
+                        // belongs to, rather than assuming sheet 0.
+                        rehydration_sheet_index(state.pendingEdits, names),
                     )
                 )
             );
@@ -3139,6 +3220,7 @@ export function attach_viewer(
                             next,
                         ),
                         true,
+                        next.meta().sheets.map((sheet) => sheet.name),
                     );
                     // A session the projection above just rehydrated was claimed
                     // through `sheet_name_at`, which reads the module-level `source`

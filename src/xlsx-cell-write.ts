@@ -238,9 +238,27 @@ interface Span {
  * Undefined for a row with no referenced cell — there is nothing to edit in it,
  * so leaving it unmapped costs nothing.
  */
-function row_index_from_first_cell(xml: string, from: number, to: number): number | undefined {
-    const ref = /<c\b[^>]*\br="[A-Z]+(\d+)"/.exec(xml.slice(from, to));
-    return ref ? Number(ref[1]) - 1 : undefined;
+function row_index_from_first_cell(
+    xml: string,
+    from: number,
+    to: number,
+    ranges: ReadonlyArray<[number, number]>,
+): number | undefined {
+    let pos = from;
+    while (pos < to) {
+        // A commented-out `<c r="A1"/>` ahead of the row's real cells named the
+        // wrong row, so the edit missed the span it was aiming at and synthesized
+        // a duplicate row for a coordinate already present.
+        const at = indexOf_live(xml, '<c', pos, ranges);
+        if (at === -1 || at >= to) return undefined;
+        if (!is_tag_boundary(xml[at + 2])) { pos = at + 2; continue; }
+        const tag_end = find_tag_end(xml, at);
+        if (tag_end === -1 || tag_end >= to) return undefined;
+        const ref = /\br="[A-Z]+(\d+)"/.exec(xml.slice(at, tag_end + 1));
+        if (ref) return Number(ref[1]) - 1;
+        pos = tag_end + 1;
+    }
+    return undefined;
 }
 
 /** Locate every `<row>` element in `sheetData`, in document order. */
@@ -288,6 +306,31 @@ function ignorable_end(ranges: ReadonlyArray<[number, number]>, at: number): num
     return undefined;
 }
 
+/**
+ * The first `needle` at or after `from` that is real markup rather than quoted text.
+ *
+ * Every raw `indexOf` in these scanners needs this, not just the ones that find
+ * opening tags. Skipping a commented-out `<row>` but then closing the *live* row
+ * at a `</row>` inside a comment is the same bug wearing the other shoe: the span
+ * ends early, and the edit splices into the comment (silent no-op) or across it
+ * (malformed XML, which is worse than either).
+ */
+function indexOf_live(
+    xml: string,
+    needle: string,
+    from: number,
+    ranges: ReadonlyArray<[number, number]>,
+): number {
+    let pos = from;
+    while (true) {
+        const at = xml.indexOf(needle, pos);
+        if (at === -1) return -1;
+        const skip_to = ignorable_end(ranges, at);
+        if (skip_to === undefined) return at;
+        pos = skip_to;
+    }
+}
+
 function scan_rows(xml: string, from: number, to: number): Map<number, Span> {
     const out = new Map<number, Span>();
     const ignorable = ignorable_ranges(xml, from, to);
@@ -308,7 +351,7 @@ function scan_rows(xml: string, from: number, to: number): Map<number, Span> {
             pos = tag_end + 1;
             continue;
         }
-        const close = xml.indexOf('</row>', tag_end);
+        const close = indexOf_live(xml, '</row>', tag_end, ignorable);
         if (close === -1) break;
         // `r` is optional in SpreadsheetML, and the reader never needed it: it keys
         // cells off `<c r="A1">`. Skipping an unnumbered row here made the writer
@@ -318,7 +361,7 @@ function scan_rows(xml: string, from: number, to: number): Map<number, Span> {
         // Recover the number from the first cell reference inside instead.
         const row_index = r
             ? Number(r[1]) - 1
-            : row_index_from_first_cell(xml, tag_end + 1, close);
+            : row_index_from_first_cell(xml, tag_end + 1, close, ignorable);
         if (row_index !== undefined) {
             out.set(row_index, { start, end: close + 6, inner_start: tag_end + 1, open_tag });
         }
@@ -348,7 +391,7 @@ function scan_cells(xml: string, from: number, to: number): Map<number, Span> {
             pos = tag_end + 1;
             continue;
         }
-        const close = xml.indexOf('</c>', tag_end);
+        const close = indexOf_live(xml, '</c>', tag_end, ignorable);
         if (close === -1) break;
         if (col !== null) out.set(col, { start, end: close + 4, inner_start: tag_end + 1, open_tag });
         pos = close + 4;
@@ -490,12 +533,19 @@ function existing_style(open_tag: string): number | null {
  * string→string function. `<f>` is the only element in a worksheet part whose
  * name is exactly `f`, so a boundary-anchored count is exact; the tag-boundary
  * test is what keeps `<filters>` and friends out of it.
+ *
+ * Comments and CDATA are skipped for the same reason the scanners skip them: the
+ * count only exists to answer "did an edit drop a formula", and formula-shaped
+ * text in a comment is a constant on both sides — except that an edit *near* it
+ * can move it in or out of the counted range, which read as a dropped formula and
+ * deleted `xl/calcChain.xml` from a workbook that never lost one.
  */
 export function formula_count(xml: string): number {
+    const ignorable = ignorable_ranges(xml, 0, xml.length);
     let count = 0;
     let pos = 0;
     while (true) {
-        const at = xml.indexOf('<f', pos);
+        const at = indexOf_live(xml, '<f', pos, ignorable);
         if (at === -1) return count;
         if (is_tag_boundary(xml[at + 2])) count += 1;
         pos = at + 2;

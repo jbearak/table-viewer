@@ -101,8 +101,15 @@ function format_sections(code: string): string[] {
     return out;
 }
 
-/** A leading `[>=100]`-style condition, if the section carries one. */
-const CONDITION_RE = /^\s*\[\s*(<=|>=|<>|<|>|=)\s*(-?[\d.]+(?:[eE][+-]?\d+)?)\s*\]/;
+/**
+ * A `[>=100]`-style condition, if the section carries one.
+ *
+ * Not anchored to the very start: a section may carry a colour or a locale
+ * bracket ahead of its condition (`[Red][>50000]yyyy-mm-dd`), and requiring the
+ * condition to come first made those read as unconditional — which then took the
+ * positive/negative/zero path and picked the wrong section entirely.
+ */
+const CONDITION_RE = /^\s*(?:\[(?![<>=])[^\]]*\]\s*)*\[\s*(<=|>=|<>|<|>|=)\s*(-?[\d.]+(?:[eE][+-]?\d+)?)\s*\]/;
 
 function condition_holds(section: string, value: number): boolean | null {
     const m = CONDITION_RE.exec(section);

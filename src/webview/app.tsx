@@ -3728,8 +3728,15 @@ export function App(): React.JSX.Element {
             edit_mode={edit_mode_on_active_sheet}
             csv_editable={csv_editable}
             edit_session_id={csv_edit_session_id}
-            save_operation={save_operation}
-            save_lifecycle={save_lifecycle}
+            // Withheld alongside the session below, and for the same reason: a
+            // save in flight belongs to the worksheet that started it. A grid
+            // mounted on a different sheet has no hoisted store to use, so it
+            // builds its own from whatever save projection it is handed — and
+            // hydrating that from another sheet's operation painted that sheet's
+            // pending values and dirty tint here, at coordinates that mean
+            // something else, in a worksheet the user cannot even edit.
+            save_operation={editing_another_sheet ? undefined : save_operation}
+            save_lifecycle={editing_another_sheet ? undefined : save_lifecycle}
             on_save_request={begin_save_operation}
             initial_edits={editing_another_sheet ? undefined : initial_edits}
             // Withheld while a session is open on a *different* worksheet. Making

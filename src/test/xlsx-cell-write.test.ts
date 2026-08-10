@@ -7,6 +7,7 @@ import {
     apply_cell_edits,
     classify_value,
     col_index_to_letter,
+    formula_count,
     iso_to_serial,
     widen_dimension,
 } from '../xlsx-cell-write';
@@ -352,6 +353,56 @@ describe('apply_cell_edits', () => {
         expect(out).toContain('<row r="1"><c r="A1"><v>2</v></c></row>');
     });
 
+    it('does not end a row at a </row> quoted inside it', () => {
+        // Skipping commented-out *opening* tags but not closing ones is the same
+        // bug wearing the other shoe: the row's span ended at the comment's text,
+        // so the edit landed inside the comment and the live A1 kept its value.
+        const out = apply_cell_edits(
+            doc('<row r="1"><!-- note: </row> --><c r="A1"><v>1</v></c></row>'),
+            [{ row: 0, col: 0, value: '2' }],
+            OPTS,
+        );
+        expect(out).toContain('<!-- note: </row> -->');
+        expect(out).toContain('<c r="A1"><v>2</v></c>');
+        expect(out).not.toContain('<v>1</v>');
+    });
+
+    it('does not end a cell at a </c> quoted inside it', () => {
+        // Worse than a silent no-op: the replacement ran from the cell's start to
+        // the comment's text, cutting the comment in half and leaving the rest of
+        // it — and an orphaned `</c>` — as malformed XML in a saved workbook.
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A1"><!-- note: </c> --><v>1</v></c></row>'),
+            [{ row: 0, col: 0, value: '2' }],
+            OPTS,
+        );
+        expect(out).not.toContain('-->');
+        expect(out).toContain('<row r="1"><c r="A1"><v>2</v></c></row>');
+    });
+
+    it('infers an unnumbered row from a live cell, not a commented-out one', () => {
+        // The inference took the first raw `<c r=…>` in the row, comment or not, so
+        // the row was filed under the wrong number — and an edit to a cell plainly
+        // present took the synthesize-the-row path, appending a second row with a
+        // duplicate coordinate while the original kept its old value.
+        const out = apply_cell_edits(
+            doc('<row><!-- <c r="A1"/> --><c r="B2"><v>1</v></c></row>'),
+            [{ row: 1, col: 1, value: '9' }],
+            OPTS,
+        );
+        expect(out.match(/r="B2"/g)).toHaveLength(1);
+        expect(out).toContain('<c r="B2"><v>9</v></c>');
+    });
+
+    it('does not count formula-shaped text in comments or CDATA', () => {
+        // The count only exists to answer "did an edit drop a formula". Counting
+        // quoted text made an edit *near* a comment look like a formula appearing
+        // or vanishing, which deleted xl/calcChain.xml from a workbook whose
+        // formulas were all still there.
+        expect(formula_count('<!-- <f>not markup</f> --><![CDATA[<f/>]]>')).toBe(0);
+        expect(formula_count('<f>SUM(A1:A2)</f><!-- <f>doc</f> -->')).toBe(1);
+    });
+
     it('does not refuse a cell whose only array formula is commented out', () => {
         const out = apply_cell_edits(
             doc(
@@ -633,6 +684,34 @@ describe('write_xlsx_cell_edits', () => {
         const patched = Buffer.from(
             Buffer.from(entry.content as Uint8Array).toString('utf8')
                 .replace('formatCode="$#,##0.00"', 'formatCode="0;0;yyyy-mm-dd"'),
+            'utf8',
+        );
+        entry.content = patched;
+        entry.size = patched.length;
+        const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+        const bytes = written instanceof Uint8Array
+            ? written
+            : new Uint8Array(written as ArrayBufferLike);
+
+        const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '2024-01-15' }]);
+        const { data } = await parse_xlsx(out);
+        expect(data.sheets[0].rows[0][0]!.raw).toBe('2024-01-15');
+    });
+
+    it('reads a condition that follows a colour in the same section', async () => {
+        // `[Red][>50000]yyyy-mm-dd;0` is a date only above 50000; 45306 falls to the
+        // plain-number section. Requiring the condition to be the section's very
+        // first bracket made the colour hide it, so the code read as unconditional,
+        // took the positive section, and stored a serial the cell showed as 45306.
+        const raw = readFileSync(FORMATTED);
+        const file = CFB.read(raw, { type: 'buffer' });
+        const entry = CFB.find(file, '/xl/styles.xml')!;
+        const patched = Buffer.from(
+            Buffer.from(entry.content as Uint8Array).toString('utf8')
+                .replace(
+                    'formatCode="$#,##0.00"',
+                    'formatCode="[Red][&gt;50000]yyyy-mm-dd;0"',
+                ),
             'utf8',
         );
         entry.content = patched;

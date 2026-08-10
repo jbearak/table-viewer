@@ -3668,6 +3668,45 @@ describe('edit mode save exit', () => {
             .toEqual({ '0:0': { value: 'typed', base: 'Alice' } });
     });
 
+    it('withholds an in-flight save from a grid mounted on another worksheet', async () => {
+        // The session and its initial edits are already withheld from a sheet that
+        // does not own them, but the save projection was not — and a grid with no
+        // hoisted store builds its own from exactly that, so People's pending value
+        // and dirty tint appeared on Inventory at the same coordinates, in a sheet
+        // the user cannot even edit.
+        await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'people-session',
+            sheetIndex: 0,
+        });
+        await dispatch_host_message({
+            type: 'csvSaveLifecycle',
+            lifecycle: {
+                revision: 1,
+                state: 'active',
+                operation: {
+                    editSessionId: 'people-session',
+                    sheetIndex: 0,
+                    saveRequestId: 'save-1',
+                    edits: { '0:0': 'Alicia' },
+                    dirtyEdits: { '0:0': { value: 'Alicia', base: 'Alice' } },
+                },
+            },
+        });
+
+        await click_sheet_tab('Inventory');
+        expect(grid_shell_mock.latest_props?.save_operation).toBeUndefined();
+        expect(grid_shell_mock.latest_props?.save_lifecycle).toBeUndefined();
+    });
+
     it('adopts the worksheet the host names for a session it did not request', async () => {
         await render_app();
         await dispatch_host_message(initial_snapshot_message(

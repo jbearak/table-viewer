@@ -435,6 +435,40 @@ describe('xlsx edit sessions', () => {
         expect(people.rows[1][0]?.raw).toBe('Alice');
     });
 
+    it('rehydrates onto the worksheet a slot is tagged for, not the one it sits at', async () => {
+        // Two slots tagged alike is what an external rename onto a name another slot
+        // already recorded leaves behind, and reconciliation cannot place both: the
+        // loser stays where it is, so an Inventory-tagged draft can sit at index 0
+        // while sheet 0 is People. Adopting the first occupied slot by position
+        // opened a People session holding Inventory's cells — and saving it wrote
+        // them into People, the exact cross-worksheet corruption the tags prevent.
+        const state = versioned_state_store({
+            pendingEdits: [
+                { sheetName: 'Inventory', cells: { '1:0': { value: 'Mallory', base: 'Widget' } } },
+                { sheetName: 'Inventory', cells: { '1:0': { value: 'Draft', base: 'Widget' } } },
+            ],
+        });
+        const panel = await open_ready_xlsx(file_path, state);
+        expect(latest_snapshot(panel).capabilities.csvEditSheetIndex).toBe(1);
+
+        const session = latest_snapshot(panel).capabilities.csvEditSessionId!;
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                sheetIndex: 1,
+                saveRequestId: 'save-1',
+                edits: { '1:0': 'Gadget' },
+                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        const after = await parse_xlsx(bytes);
+        expect(after.data.sheets[1].rows[1][0]?.raw).toBe('Gadget');
+        expect(after.data.sheets[0].rows[1][0]?.raw).toBe('Alice');
+    });
+
     it('keeps a restored draft visible when the workbook is reordered', async () => {
         // Session and durable slots are *both* positional, and a reorder invalidates
         // each separately. Moving only the session leaves the projection reading the
@@ -831,6 +865,65 @@ describe('xlsx edit sessions', () => {
         expect(state.get_state(file_path).pendingEdits).toEqual([
             undefined,
             { sheetName: 'People', cells: other },
+        ]);
+    });
+
+    it('follows its own entries when a duplicate tag inherited its captured index', async () => {
+        // The captured position was preferred whenever the slot there carried the
+        // right name — but with two slots tagged alike that slot can be an
+        // unrelated draft that merely inherited the index, while the failed save's
+        // own entries sit elsewhere. Cleanup then stripped nothing, retired the
+        // tombstone anyway, and left its entries behind as a phantom draft that
+        // reappeared next session. The operation's own entries say which slot is
+        // really its own.
+        const failed = { '1:0': { value: 'Gadget', base: 'Widget' } };
+        const other = { '2:0': { value: 'Bob', base: 'Alice' } };
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        vscode_mock.__setWriteFileImplementation(async () => {
+            throw new Error('disk is full');
+        });
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                sheetIndex: 1,
+                saveRequestId: 'save-1',
+                edits: { '1:0': 'Gadget' },
+                dirtyEdits: failed,
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        // The save's own entries are at 0; an unrelated same-named draft holds the
+        // captured index 1.
+        const inner = state.store.compare_and_set.bind(state.store);
+        let injected = false;
+        state.store.compare_and_set = async (...args) => {
+            if (!injected) {
+                injected = true;
+                const current = await state.store.read(args[0]);
+                await inner(args[0], current.revision, {
+                    ...(current.state as object),
+                    pendingEdits: [
+                        { sheetName: 'Inventory', cells: failed },
+                        { sheetName: 'Inventory', cells: other },
+                    ],
+                } as never);
+            }
+            return inner(...args);
+        };
+
+        controller_of(panel).dispose();
+        await wait_for_observable(() => injected);
+        await controller_of(panel).drain();
+
+        expect(state.get_state(file_path).pendingEdits).toEqual([
+            undefined,
+            { sheetName: 'Inventory', cells: other },
         ]);
     });
 
