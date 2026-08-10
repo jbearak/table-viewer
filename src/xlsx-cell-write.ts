@@ -177,8 +177,15 @@ export function classify_value(
     // formatted as a date. Writing a bare serial into a General cell would show
     // the user "45000" where they typed a date — visibly wrong. Under a date
     // style the serial and the format agree, so it renders as they typed it.
+    //
+    // A negative serial is refused: Excel has no date before its own epoch, and
+    // shows one as `########` in a date-formatted cell. Typing `1899-12-30` into
+    // such a cell stored `<v>-1</v>`, which our own reader renders back as the
+    // date — so it looked right here and was unreadable in the application the
+    // file exists to be opened in. Falling through stores the text the user typed,
+    // which every consumer can at least display.
     const serial = iso_to_serial(value, options.datemode);
-    if (serial !== null && options.is_date_style(xf_index, serial)) {
+    if (serial !== null && serial >= 0 && options.is_date_style(xf_index, serial)) {
         return { kind: 'number', text: String(serial) };
     }
 

@@ -1295,6 +1295,19 @@ describe('write_xlsx_cell_edits', () => {
         expect((await parse_xlsx(out)).data.sheets[0].rows[0][2]!.rawType).toBe('date');
     });
 
+    it('refuses to store a date before Excel\'s epoch as a serial', async () => {
+        // Excel has no date before 1900, and shows a negative serial in a
+        // date-formatted cell as `########`. Storing `1899-12-30` as `<v>-1</v>`
+        // looked correct here — our own reader renders it back as the date — and
+        // was unreadable in the application the file exists to be opened in.
+        const out = write_xlsx_cell_edits(readFileSync(FORMATTED), 0, [
+            { row: 0, col: 2, value: '1899-12-30' },
+        ]);
+        const sheet = part(out, '/xl/worksheets/sheet1.xml')!.toString('utf8');
+        expect(sheet).not.toContain('<v>-1</v>');
+        expect(String((await parse_xlsx(out)).data.sheets[0].rows[0][2]!.raw)).toBe('1899-12-30');
+    });
+
     it('keeps an ISO date cell typed as a date', async () => {
         // `t="d"` stores the date as text and the reader shows it verbatim, so the
         // user retypes what looks like the same value — and got back an inline
