@@ -885,16 +885,21 @@ export function has_any_pending_edits(pending: PerFileState['pendingEdits']): bo
 }
 
 /**
- * Drop slots whose recorded `sheetName` does not match the workbook as loaded.
+ * Reattach slots to the workbook as loaded, by name where one was recorded.
  *
  * Guards the one case a positional array cannot: the workbook was reordered
  * externally, so slot *i* no longer describes sheet *i*. Reattaching by position
  * would apply a draft to the wrong worksheet, keyed to rows that mean something
- * else there — silent corruption. Dropping loses the draft, which is strictly
- * better and only happens when the alternative is wrong.
+ * else there — silent corruption.
+ *
+ * Worksheet names are unique within a workbook, so a reorder is not ambiguous:
+ * the draft moves to wherever its sheet went, and only a sheet that is gone
+ * entirely (deleted, or renamed outside this app) loses its draft. Dropping is
+ * the last resort rather than the answer to any mismatch, because the draft is
+ * the user's only copy of that work.
  *
  * Slots with no recorded name are legacy CSV migrations (single-sheet by
- * construction) and are always kept.
+ * construction) and stay where they are.
  */
 export function reconcile_pending_edit_sheets(
     pending: PerFileState['pendingEdits'],
@@ -906,12 +911,32 @@ export function reconcile_pending_edit_sheets(
     // them; treating that as a total mismatch would drop every tagged slot —
     // silently discarding the user's unsaved work on the way past.
     if (sheet_names.length === 0) return pending;
+
+    const index_of_name = new Map<string, number>();
+    sheet_names.forEach((name, index) => {
+        if (!index_of_name.has(name)) index_of_name.set(name, index);
+    });
+
     let changed = false;
-    const next = pending.map((slot, index) => {
-        if (!slot?.sheetName) return slot;
-        if (sheet_names[index] === slot.sheetName) return slot;
-        changed = true;
-        return undefined;
+    const next: (WorksheetPendingEdits | undefined)[] = [];
+    // Unnamed slots first, so a named slot positively identified by the workbook
+    // wins the position over one that only ever held it by assumption.
+    pending.forEach((slot, index) => {
+        if (!slot || slot.sheetName) return;
+        while (next.length <= index) next.push(undefined);
+        next[index] = slot;
+    });
+    pending.forEach((slot, index) => {
+        if (!slot?.sheetName) return;
+        const moved_to = index_of_name.get(slot.sheetName);
+        if (moved_to === undefined) {
+            // The sheet is not in this workbook at all.
+            changed = true;
+            return;
+        }
+        if (moved_to !== index) changed = true;
+        while (next.length <= moved_to) next.push(undefined);
+        next[moved_to] = slot;
     });
     if (!changed) return pending;
     while (next.length > 0 && next[next.length - 1] === undefined) next.pop();

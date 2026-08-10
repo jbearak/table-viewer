@@ -3725,7 +3725,14 @@ export function attach_viewer(
         const receiver_epoch = session.current_receiver_epoch;
         const identity = clone_save_operation(input);
         if (active_save_operation) return;
-        if (!edit_message_is_current(identity.editSessionId)) {
+        // The session's own worksheet, not the one the message names. A session
+        // belongs to one sheet, so a save naming another is not this session's to
+        // make — and the index would otherwise reach the planner and the meta
+        // lookup below as a caller-controlled number, splicing into a worksheet
+        // whose cells were never validated as the ones the user edited.
+        const wrong_sheet = active_edit_sheet_index === undefined
+            || identity.sheetIndex !== active_edit_sheet_index;
+        if (wrong_sheet || !edit_message_is_current(identity.editSessionId)) {
             const active = begin_save_lifecycle(identity);
             const lifecycle = finish_save_lifecycle(active.operation, 'failed');
             void post_to_receiver({
@@ -4753,7 +4760,13 @@ export function attach_viewer(
                 // sources (CSV/TSV) have nothing else to mean, and a webview from
                 // before worksheet editing sends the field not at all.
                 const requested_sheet_index = msg.sheetIndex ?? 0;
-                if (edit_admission_closed) {
+                // A wire number, so bounded here rather than trusted: it reaches
+                // `sheet_name_at` and the meta lookups downstream, and a session on
+                // a sheet the workbook does not have is not a session at all.
+                const requested_sheet_exists = Number.isSafeInteger(requested_sheet_index)
+                    && requested_sheet_index >= 0
+                    && requested_sheet_index < (source?.meta().sheets.length ?? 0);
+                if (edit_admission_closed || !requested_sheet_exists) {
                     void post_to_receiver({
                         type: 'editSessionResult',
                         requestId: msg.requestId,

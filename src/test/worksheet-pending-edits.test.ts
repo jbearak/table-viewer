@@ -160,19 +160,20 @@ describe('reconcile_pending_edit_sheets', () => {
         expect(reconcile_pending_edit_sheets(pending, ['A', 'B'])).toBe(pending);
     });
 
-    it('drops a slot whose sheet moved, rather than editing the wrong worksheet', () => {
-        // The workbook was reordered in Excel between sessions. Slot 0 says
-        // "Sales" but position 0 is now "Costs": honouring it by position would
-        // apply Sales' draft to Costs, keyed to rows that mean something else.
+    it('follows a sheet that moved, rather than editing the wrong worksheet', () => {
+        // The workbook was reordered in Excel between sessions. Honouring slot 0
+        // by position would apply Sales' draft to Costs, keyed to rows that mean
+        // something else there; names are unique, so it moves instead.
         const pending: PerFileState['pendingEdits'] = [
             { sheetName: 'Sales', cells: { '0:0': entry('a') } },
             { sheetName: 'Costs', cells: { '0:0': entry('b') } },
         ];
         const after = reconcile_pending_edit_sheets(pending, ['Costs', 'Sales']);
-        expect(after).toBeUndefined();
+        expect(pending_edits_for_sheet(after, 0)).toEqual({ '0:0': entry('b') });
+        expect(pending_edits_for_sheet(after, 1)).toEqual({ '0:0': entry('a') });
     });
 
-    it('drops only the moved sheet, keeping the ones that still line up', () => {
+    it('drops only a sheet the workbook no longer has', () => {
         const pending: PerFileState['pendingEdits'] = [
             { sheetName: 'A', cells: { '0:0': entry('a') } },
             { sheetName: 'B', cells: { '0:0': entry('b') } },
@@ -180,6 +181,18 @@ describe('reconcile_pending_edit_sheets', () => {
         const after = reconcile_pending_edit_sheets(pending, ['A', 'Renamed']);
         expect(pending_edits_for_sheet(after, 0)).toEqual({ '0:0': entry('a') });
         expect(pending_edits_for_sheet(after, 1)).toBeUndefined();
+    });
+
+    it('moves a draft to a sheet that shifted position', () => {
+        // A sheet inserted ahead of the edited one — the common reorder, and the
+        // one where dropping the draft would lose work for no reason.
+        const pending: PerFileState['pendingEdits'] = [
+            undefined,
+            { sheetName: 'Sales', cells: { '0:0': entry('a') } },
+        ];
+        const after = reconcile_pending_edit_sheets(pending, ['New', 'Extra', 'Sales']);
+        expect(pending_edits_for_sheet(after, 1)).toBeUndefined();
+        expect(pending_edits_for_sheet(after, 2)).toEqual({ '0:0': entry('a') });
     });
 
     it('keeps unnamed legacy slots, which are single-sheet CSV by construction', () => {

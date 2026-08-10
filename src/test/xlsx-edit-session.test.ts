@@ -174,6 +174,37 @@ describe('xlsx edit sessions', () => {
         expect(after.data.sheets[0].rows[1][0]?.raw).toBe(people_before);
     });
 
+    it('refuses a session on a worksheet the workbook does not have', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 9 });
+        expect(latest_edit_session(panel)?.granted).toBe(false);
+    });
+
+    it('refuses a save naming a worksheet the session does not hold', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const untouched = bytes;
+
+        // A valid session id naming the other worksheet. The host must not take
+        // the message's word for which sheet it is saving: the coordinates were
+        // validated against sheet 1, and sheet 0's cells were never checked.
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                sheetIndex: 0,
+                saveRequestId: 'save-1',
+                edits: { '1:0': 'Gadget' },
+                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+            },
+        });
+        await flush_promises();
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: false });
+        expect(bytes).toBe(untouched);
+    });
+
     it('refuses a save whose base no longer matches the cell', async () => {
         const panel = await open_ready_xlsx(file_path);
         await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });

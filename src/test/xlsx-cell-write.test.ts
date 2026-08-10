@@ -131,6 +131,44 @@ describe('apply_cell_edits', () => {
         expect(out.indexOf('r="B1"')).toBeLessThan(out.indexOf('r="C1"'));
     });
 
+    it('orders several new cells by column, whatever order they were edited in', () => {
+        // Both land in the same gap, so they share a splice offset and the caller's
+        // order would otherwise decide the document order.
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A1"><v>1</v></c><c r="E1"><v>5</v></c></row>'),
+            [{ row: 0, col: 3, value: '4' }, { row: 0, col: 1, value: '2' }],
+            OPTS,
+        );
+        expect(out.indexOf('r="A1"')).toBeLessThan(out.indexOf('r="B1"'));
+        expect(out.indexOf('r="B1"')).toBeLessThan(out.indexOf('r="D1"'));
+        expect(out.indexOf('r="D1"')).toBeLessThan(out.indexOf('r="E1"'));
+    });
+
+    it('orders several new rows by row, whatever order they were edited in', () => {
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A1"><v>1</v></c></row>'),
+            [{ row: 9, col: 0, value: 'ten' }, { row: 4, col: 0, value: 'five' }],
+            OPTS,
+        );
+        expect(out.indexOf('r="A5"')).toBeLessThan(out.indexOf('r="A10"'));
+    });
+
+    it('gives a self-closing row a body rather than splicing into its tag', () => {
+        // `<row r="2" ht="20" customHeight="1"/>` is what a row with a height but
+        // no cells looks like. There is no `</row>` to insert before.
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A1"><v>1</v></c></row><row r="2" ht="20" customHeight="1"/>'),
+            [{ row: 1, col: 0, value: 'here' }],
+            OPTS,
+        );
+        expect(out).toContain('<row r="2" ht="20" customHeight="1">');
+        expect(out).toContain('r="A2"');
+        expect(out).not.toContain('customHeight="1"/>');
+        // Still well-formed: one open and one close for every row.
+        expect(out.match(/<row\b/g)).toHaveLength(2);
+        expect(out.match(/<\/row>/g)).toHaveLength(2);
+    });
+
     it('inserts a new row in ascending row order', () => {
         const out = apply_cell_edits(
             doc('<row r="1"><c r="A1"><v>1</v></c></row><row r="3"><c r="A3"><v>3</v></c></row>'),
@@ -305,6 +343,76 @@ describe('write_xlsx_cell_edits', () => {
             const after = (await parse_xlsx(out)).data.sheets;
             expect(after[index].rows[0][0]!.raw, before[index].name).toBe(`marker-${index}`);
         }
+    });
+
+    describe('calcChain.xml', () => {
+        /**
+         * A workbook carrying a calculation chain, built rather than committed as a
+         * fixture: none of the sample files has one, and the point of the test is
+         * the three references (part, content type, relationship) moving together.
+         */
+        function with_calc_chain(raw: Uint8Array): Uint8Array {
+            const file = CFB.read(raw, { type: 'buffer' });
+            CFB.utils.cfb_add(
+                file,
+                '/xl/calcChain.xml',
+                Buffer.from('<?xml version="1.0"?><calcChain><c r="B2" i="1"/></calcChain>'),
+            );
+            for (const [path, insert] of [
+                ['/[Content_Types].xml',
+                    '<Override PartName="/xl/calcChain.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.calcChain+xml"/>'],
+                ['/xl/_rels/workbook.xml.rels',
+                    '<Relationship Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/calcChain" Target="calcChain.xml" Id="RcalcChain"/>'],
+            ] as const) {
+                const entry = CFB.find(file, path)!;
+                const text = Buffer.from(entry.content as Uint8Array).toString('utf8');
+                const at = text.lastIndexOf('</');
+                const next = Buffer.from(text.slice(0, at) + insert + text.slice(at), 'utf8');
+                entry.content = next;
+                entry.size = next.length;
+            }
+            const out = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+            return out instanceof Uint8Array ? out : new Uint8Array(out as ArrayBufferLike);
+        }
+
+        function text_part(bytes: Uint8Array, path: string): string {
+            return part(bytes, path)?.toString('utf8') ?? '';
+        }
+
+        it('survives an edit that overwrites no formula', () => {
+            const raw = with_calc_chain(readFileSync(SAMPLE));
+            const out = write_xlsx_cell_edits(raw, 2, [{ row: 1, col: 1, value: '42' }]);
+            expect(part(out, '/xl/calcChain.xml')).toEqual(part(raw, '/xl/calcChain.xml'));
+            expect(text_part(out, '/[Content_Types].xml'))
+                .toContain('/xl/calcChain.xml');
+        });
+
+        it('is detached completely when an edit drops a formula', () => {
+            // The chain caches recalculation order; a literal written over a
+            // formula makes it stale, and a stale chain is what Excel offers to
+            // repair. Every reference has to go with it, or the package points at
+            // a part it no longer contains.
+            const base = CFB.read(readFileSync(SAMPLE), { type: 'buffer' });
+            const sheet = CFB.find(base, '/xl/worksheets/sheet3.xml')!;
+            const patched = Buffer.from(
+                Buffer.from(sheet.content as Uint8Array).toString('utf8')
+                    .replace(/<c r="B2"[^>]*(?:\/>|>[\s\S]*?<\/c>)/, '<c r="B2"><f>1+1</f><v>2</v></c>'),
+                'utf8',
+            );
+            sheet.content = patched;
+            sheet.size = patched.length;
+            const written = CFB.write(base, { type: 'buffer', fileType: 'zip', compression: true });
+            const raw = with_calc_chain(
+                written instanceof Uint8Array ? written : new Uint8Array(written as ArrayBufferLike),
+            );
+            expect(text_part(raw, '/xl/worksheets/sheet3.xml')).toContain('<f>1+1</f>');
+
+            const out = write_xlsx_cell_edits(raw, 2, [{ row: 1, col: 1, value: '42' }]);
+
+            expect(part(out, '/xl/calcChain.xml')).toBeNull();
+            expect(text_part(out, '/[Content_Types].xml')).not.toContain('/xl/calcChain.xml');
+            expect(text_part(out, '/xl/_rels/workbook.xml.rels')).not.toContain('calcChain.xml');
+        });
     });
 
     it('returns the input untouched when there are no edits', () => {

@@ -250,6 +250,25 @@ function existing_style(open_tag: string): number | null {
     return m ? Number(m[1]) : null;
 }
 
+/**
+ * Did applying edits drop a formula?
+ *
+ * Counted rather than tracked through `apply_cell_edits`, which stays a pure
+ * string→string function. `<f>` is the only element in a worksheet part whose
+ * name is exactly `f`, so a boundary-anchored count is exact; the tag-boundary
+ * test is what keeps `<filters>` and friends out of it.
+ */
+export function formula_count(xml: string): number {
+    let count = 0;
+    let pos = 0;
+    while (true) {
+        const at = xml.indexOf('<f', pos);
+        if (at === -1) return count;
+        if (is_tag_boundary(xml[at + 2])) count += 1;
+        pos = at + 2;
+    }
+}
+
 /** One pending splice: replace `[start, end)` with `text`. */
 interface Splice { start: number; end: number; text: string }
 
@@ -328,6 +347,27 @@ export function apply_cell_edits(
         // specifies sorted, and some consumers (and Excel's own repair check) do
         // not. Insert each before the first existing cell of a higher column,
         // falling back to the row's end.
+        // Sorted, because several inserts landing in the same gap share a splice
+        // offset and `apply_splices` then keeps them in the order they arrived —
+        // which is the caller's edit order, not the column order the schema wants.
+        inserts.sort((a, b) => a.col - b.col);
+        if (inserts.length > 0 && row_span.inner_start === row_span.end) {
+            // `<row r="5" ht="20"/>` — a valid empty row, which is what a row given
+            // a height or a format but no cells looks like. There is no `</row>` to
+            // insert before, so the element is replaced by a paired one keeping its
+            // attributes; computing an offset from `'</row>'.length` here would
+            // splice into the middle of the opening tag and emit malformed XML.
+            const attributes = row_span.open_tag.slice(
+                '<row'.length,
+                row_span.open_tag.length - '/>'.length,
+            );
+            splices.push({
+                start: row_span.start,
+                end: row_span.end,
+                text: `<row${attributes}>${inserts.map((i) => i.text).join('')}</row>`,
+            });
+            continue;
+        }
         for (const ins of inserts) {
             let at = row_span.end - '</row>'.length;
             let best: number | undefined;
@@ -339,7 +379,9 @@ export function apply_cell_edits(
         }
     }
 
-    // New rows are likewise inserted in ascending row order.
+    // New rows are likewise inserted in ascending row order — and sorted for the
+    // same reason: several new rows before the same existing row share an offset.
+    new_rows.sort((a, b) => a.row - b.row);
     for (const nr of new_rows) {
         let at = inner_end;
         let best: number | undefined;
