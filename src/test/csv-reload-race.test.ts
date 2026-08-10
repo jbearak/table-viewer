@@ -415,37 +415,40 @@ describe('CSV reload races', () => {
         healthy_controller.dispose();
     });
 
-    it('retains the adopted view across delete retries and recovers on create', async () => {
-        let deleted = false;
-        let bytes = enc.encode('h\na\n');
-        vscode_mock.__setStatImplementation(async () => {
-            if (deleted) throw Object.assign(new Error('not found'), { code: 'FileNotFound' });
-            return { size: bytes.byteLength, mtime: 1 };
-        });
-        vscode_mock.__setReadFileImplementation(async () => bytes);
-        open_csv_table(uri('/tmp/delete-create.csv'));
-        const panel = vscode_mock.__getPanels()[0];
-        await panel.__receive({ type: 'ready' });
-        const error_spy = vi.spyOn(vscode_mock.window, 'showErrorMessage');
-        vi.useFakeTimers();
-        deleted = true;
+    it.each(['ENOENT', 'FileNotFound'])(
+        'retains the adopted view across %s delete retries and recovers on create',
+        async (code) => {
+            let deleted = false;
+            let bytes = enc.encode('h\na\n');
+            vscode_mock.__setStatImplementation(async () => {
+                if (deleted) throw Object.assign(new Error('not found'), { code });
+                return { size: bytes.byteLength, mtime: 1 };
+            });
+            vscode_mock.__setReadFileImplementation(async () => bytes);
+            open_csv_table(uri('/tmp/delete-create.csv'));
+            const panel = vscode_mock.__getPanels()[0];
+            await panel.__receive({ type: 'ready' });
+            const error_spy = vi.spyOn(vscode_mock.window, 'showErrorMessage');
+            vi.useFakeTimers();
+            deleted = true;
 
-        await vscode_mock.__getActiveWatchers()[0].__fireDelete();
-        await vi.advanceTimersByTimeAsync(500);
+            await vscode_mock.__getActiveWatchers()[0].__fireDelete();
+            await vi.advanceTimersByTimeAsync(500);
 
-        expect(refresh_snapshots(panel)).toHaveLength(0);
-        expect(error_spy).toHaveBeenCalledTimes(1);
-        expect(error_spy).toHaveBeenCalledWith(
-            'The file was deleted or moved, so Table Viewer could not reload it.',
-        );
+            expect(refresh_snapshots(panel)).toHaveLength(0);
+            expect(error_spy).toHaveBeenCalledTimes(1);
+            expect(error_spy).toHaveBeenCalledWith(
+                'The file was deleted or moved, so Table Viewer could not reload it.',
+            );
 
-        deleted = false;
-        bytes = enc.encode('h\na\nb\n');
-        await vscode_mock.__getActiveWatchers()[0].__fireCreate();
-        await vi.waitFor(() => expect(refresh_snapshots(panel)).toHaveLength(1));
-        expect(refresh_snapshots(panel)[0].meta.sheets[0].rowCount).toBe(2);
-        vi.useRealTimers();
-    });
+            deleted = false;
+            bytes = enc.encode('h\na\nb\n');
+            await vscode_mock.__getActiveWatchers()[0].__fireCreate();
+            await vi.waitFor(() => expect(refresh_snapshots(panel)).toHaveLength(1));
+            expect(refresh_snapshots(panel)[0].meta.sheets[0].rowCount).toBe(2);
+            vi.useRealTimers();
+        },
+    );
 
     it('closes a same-digest dedup candidate without transferring it', async () => {
         vscode_mock.__setStatImplementation(async () => ({ size: 20, mtime: 1 }));
