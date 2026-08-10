@@ -257,7 +257,14 @@ function build_cell_xml(
     // two spellings cannot be mixed, and the cell's existing type is the one to
     // keep. Narrow like the boolean case: only a cell that was already `t="d"`,
     // and only when what was typed is still a date.
-    if (was_iso_date && ISO_DATE_RE.test(value.trim())) {
+    //
+    // Validity is decided by `iso_to_serial`, not by `ISO_DATE_RE`, which only
+    // describes the *shape*: `2024-02-31` and `2024-01-01T25:00` match it and are
+    // not dates. Writing those under `t="d"` produced a cell claiming to be a date
+    // whose text no date parser accepts — Excel reports the workbook as needing
+    // repair. The shape test alone was the wrong gate; a value that cannot be a
+    // date falls through and is stored as the text the user typed.
+    if (was_iso_date && iso_to_serial(value, options.datemode) !== null) {
         return `<c r="${ref}"${style_attr} t="d"><v>${encode_xml(value.trim())}</v></c>`;
     }
     // A boolean cell edited back to a boolean stays one. The reader renders `t="b"`
@@ -1041,8 +1048,16 @@ export function apply_cell_edits(
 
     // An empty `<sheetData/>` has nowhere to splice into, so expand it to a pair
     // first and re-derive the offsets from the expanded document.
+    //
+    // The open tag is rebuilt from the original rather than written as a bare
+    // `<sheetData>`: the element may legitimately carry attributes — a namespace
+    // declaration that its descendants rely on, or vendor metadata — and emitting
+    // a bare tag dropped every one of them. This module's whole contract is that
+    // it changes the cells it was asked to change and nothing else.
     if (self_closing) {
-        const expanded = xml.slice(0, element_start) + '<sheetData></sheetData>' + xml.slice(element_end);
+        const open_tag = xml.slice(element_start, element_end)
+            .replace(/\/\s*>$/, '>');
+        const expanded = xml.slice(0, element_start) + open_tag + '</sheetData>' + xml.slice(element_end);
         return apply_cell_edits(expanded, edits, options);
     }
 

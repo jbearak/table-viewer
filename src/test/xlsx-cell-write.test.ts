@@ -481,6 +481,35 @@ describe('apply_cell_edits', () => {
         expect(out.match(/r="A2"/g)).toHaveLength(1);
     });
 
+    it('keeps a self-closing sheetData\'s attributes when expanding it', () => {
+        // `<sheetData/>` has nowhere to splice into, so it is expanded to a pair
+        // first — and the replacement was written as a bare `<sheetData>`, dropping
+        // whatever the element carried. A namespace declaration its descendants
+        // rely on, or vendor metadata, silently gone from a save that was asked to
+        // change one cell.
+        const out = apply_cell_edits(
+            '<?xml version="1.0"?><worksheet><sheetData vendor="keep"/></worksheet>',
+            [{ row: 0, col: 0, value: 'x' }],
+            OPTS,
+        );
+        expect(out).toContain('<sheetData vendor="keep">');
+    });
+
+    it('refuses a date-shaped non-date in a t="d" cell', () => {
+        // `ISO_DATE_RE` describes the shape only: `2024-02-31` matches and is not a
+        // date. Writing it under `t="d"` produced a cell claiming to be a date whose
+        // text no date parser accepts — the workbook Excel offers to repair.
+        for (const value of ['2024-02-31', '2024-01-01T25:00']) {
+            const out = apply_cell_edits(
+                doc('<row r="1"><c r="A1" t="d"><v>2024-01-01</v></c></row>'),
+                [{ row: 0, col: 0, value }],
+                OPTS,
+            );
+            expect(out, value).not.toContain('t="d"');
+            expect(out, value).toContain(value);
+        }
+    });
+
     it('replaces a cell whose end tag carries whitespace', () => {
         // XML permits whitespace between the name and the `>` of an end tag, so
         // `</c >` is ordinary — a pretty-printer may well write it. Matching only
