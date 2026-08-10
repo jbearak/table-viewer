@@ -706,25 +706,73 @@ test('CSV keyboard navigation wraps and remains active after editing', async () 
     await page.keyboard.press('Shift+Tab');
     await expect(page.locator('#glide-cell-3-0')).toHaveAttribute('aria-selected', 'true');
 
-    // Open the last cell in the row and commit its unchanged value with Tab. The
-    // wrap proves application-owned post-edit movement; the immediately following
-    // Tab proves focus returned to a functional grid target without a mouse click.
+    // Open the last cell in the row and change its value before committing with
+    // Tab. The value assertion proves this exercises the dirty-store update path;
+    // the focus assertion then checks that update did not strand the keyboard.
     await page.keyboard.press('Enter');
     const cell_editor = page.locator('.cell-editor-input');
     await expect(cell_editor).toBeVisible();
     await expect(cell_editor).toBeFocused();
+    await cell_editor.fill('New York!');
     await cell_editor.press('Tab');
     await expect(cell_editor).toBeHidden();
+    await expect(page.locator('#glide-cell-3-0')).toHaveText('New York!');
     await expect(page.locator('#glide-cell-1-1')).toHaveAttribute('aria-selected', 'true');
+    await expect(page.locator('#glide-cell-1-1')).toBeFocused();
     await page.keyboard.press('Tab');
     await expect(page.locator('#glide-cell-2-1')).toHaveAttribute('aria-selected', 'true');
 
     // Enter retains the displayed column and moves down after a commit.
     await page.keyboard.press('Enter');
     await expect(cell_editor).toBeVisible();
+    await cell_editor.fill('26');
     await cell_editor.press('Enter');
     await expect(cell_editor).toBeHidden();
+    await expect(page.locator('#glide-cell-2-1')).toHaveText('26');
     await expect(page.locator('#glide-cell-2-2')).toHaveAttribute('aria-selected', 'true');
+    await expect(page.locator('#glide-cell-2-2')).toBeFocused();
+
+    // The following Shift+Tab must be handled by the grid, proving the Enter
+    // commit restored a functional keyboard target rather than only moving the
+    // controlled selection while focus remained stranded in the closed editor.
+    await page.keyboard.press('Shift+Tab');
+    await expect(page.locator('#glide-cell-1-2')).toHaveAttribute('aria-selected', 'true');
+
+    // A Shift+Tab commit wraps backward to the preceding row. The following Tab
+    // likewise proves that commit returned keyboard handling to the real grid.
+    await page.keyboard.press('Enter');
+    await expect(cell_editor).toBeVisible();
+    await cell_editor.fill('Charlie!');
+    await cell_editor.press('Shift+Tab');
+    await expect(cell_editor).toBeHidden();
+    await expect(page.locator('#glide-cell-1-2')).toHaveText('Charlie!');
+    await expect(page.locator('#glide-cell-3-1')).toHaveAttribute('aria-selected', 'true');
+    await expect(page.locator('#glide-cell-3-1')).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(page.locator('#glide-cell-1-2')).toHaveAttribute('aria-selected', 'true');
+
+    // Restore the fixture through the same edit path so this test leaves no
+    // pending edits for the save smoke case that follows it.
+    await page.keyboard.press('Enter');
+    await cell_editor.fill('Charlie');
+    await cell_editor.press('Enter');
+    await expect(page.locator('#glide-cell-1-2')).toHaveText('Charlie');
+
+    await page.keyboard.press('Shift+Tab');
+    await page.keyboard.press('Shift+Tab');
+    await expect(page.locator('#glide-cell-2-1')).toHaveAttribute('aria-selected', 'true');
+    await page.keyboard.press('Enter');
+    await cell_editor.fill('25');
+    await cell_editor.press('Enter');
+    await expect(page.locator('#glide-cell-2-1')).toHaveText('25');
+
+    for (let step = 0; step < 5; step++) await page.keyboard.press('Shift+Tab');
+    await expect(page.locator('#glide-cell-3-0')).toHaveAttribute('aria-selected', 'true');
+    await page.keyboard.press('Enter');
+    await cell_editor.fill('New York');
+    await cell_editor.press('Enter');
+    await expect(page.locator('#glide-cell-3-0')).toHaveText('New York');
+    await expect(edit_toggle).not.toHaveClass(/has-unsaved/);
 
     await edit_toggle.click();
     await expect(edit_toggle).toHaveAttribute('aria-pressed', 'false');

@@ -551,6 +551,31 @@ describe('GridShell column projection', () => {
         expect(editing_ref.current?.has_uncommitted_changes()).toBe(true);
     });
 
+    it('retains display selection when a projection is recreated unchanged', async () => {
+        const GridShell = await render_grid(props());
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: {},
+            rows: {},
+            current: {
+                cell: [1, 0],
+                range: { x: 1, y: 0, width: 1, height: 1 },
+                rangeStack: [],
+            },
+        }));
+
+        await act(async () => root!.render(React.createElement(GridShell, props({
+            column_projection: {
+                visible_to_source: [0, 2],
+                source_to_visible: [0, undefined, 1],
+                hidden_count: 1,
+            },
+        }))));
+
+        expect((grid_mock.props!.gridSelection as any).current.cell).toEqual([1, 0]);
+    });
+
     it('retargets shortcuts when the previously focused source column is hidden', async () => {
         const on_transform_change = vi.fn();
         const GridShell = await render_grid(props({

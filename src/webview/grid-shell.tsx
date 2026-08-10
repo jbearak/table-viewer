@@ -40,7 +40,10 @@ import {
     type SheetTransformState,
     type SortDirection,
 } from '../types';
-import type { ColumnProjection } from './column-projection';
+import {
+    column_projections_equal,
+    type ColumnProjection,
+} from './column-projection';
 import { build_grid_columns } from './grid-model';
 import { ContextMenu } from './context-menu';
 import { cell_context_menu_items } from './cell-context-menu';
@@ -915,7 +918,10 @@ export function GridShell({
     ]);
     const previous_projection_ref = useRef(column_projection);
     useEffect(() => {
-        if (previous_projection_ref.current === column_projection) return;
+        if (column_projections_equal(previous_projection_ref.current, column_projection)) {
+            previous_projection_ref.current = column_projection;
+            return;
+        }
         previous_projection_ref.current = column_projection;
         const focused_source = focused_source_column_ref.current;
         focused_source_column_ref.current = focused_source !== undefined
