@@ -764,6 +764,76 @@ describe('xlsx edit sessions', () => {
         ]);
     });
 
+    it('clears a disposed successful save by name, not by its old index', async () => {
+        // The same hazard as the failed-save case, on the path that runs after every
+        // ordinary save. Disposal drops `source` before the cleanup resolves its
+        // sheet, and its fallback was the captured position — so a window still
+        // attached that reordered the workbook meanwhile made the cleanup delete
+        // whichever live draft had inherited that index, leaving the saved sheet's
+        // own now-stale entries behind to reappear as phantom edits next session.
+        const saved = { '1:0': { value: 'Gadget', base: 'Widget' } };
+        const other = { '2:0': { value: 'Bob', base: 'Alice' } };
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        // Hold the write open so disposal lands before the cleanup resolves its
+        // sheet — that is what leaves the cleanup with no source to ask.
+        let release_write: (() => void) | undefined;
+        let writing = false;
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            writing = true;
+            await new Promise<void>((done) => { release_write = done; });
+            bytes = new Uint8Array(content);
+        });
+
+        const save = panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                sheetIndex: 1,
+                saveRequestId: 'save-1',
+                edits: { '1:0': 'Gadget' },
+                dirtyEdits: saved,
+            },
+        });
+        await wait_for_observable(() => writing);
+
+        // Stand in for the other window: commit the reordered, reconciled slots
+        // under the cleanup's first write, so it retries against the new order.
+        // Inventory — the saved sheet, captured at index 1 — is now at index 0.
+        const inner = state.store.compare_and_set.bind(state.store);
+        let reordered = false;
+        state.store.compare_and_set = async (...args) => {
+            if (!reordered) {
+                reordered = true;
+                const current = await state.store.read(args[0]);
+                await inner(args[0], current.revision, {
+                    ...(current.state as object),
+                    pendingEdits: [
+                        { sheetName: 'Inventory', cells: saved },
+                        { sheetName: 'People', cells: other },
+                    ],
+                } as never);
+            }
+            return inner(...args);
+        };
+
+        controller_of(panel).dispose();
+        release_write?.();
+        await save;
+        await wait_for_observable(() => reordered);
+        await controller_of(panel).drain();
+
+        // Inventory's entries are the save's own and must go; People's draft
+        // belongs to nobody in this flow and must stay.
+        expect(state.get_state(file_path).pendingEdits).toEqual([
+            undefined,
+            { sheetName: 'People', cells: other },
+        ]);
+    });
+
     it('preserves the styles part byte-for-byte across a save', async () => {
         const panel = await open_ready_xlsx(file_path);
         await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });

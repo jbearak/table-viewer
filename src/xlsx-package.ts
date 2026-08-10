@@ -74,15 +74,17 @@ function write_part_text(cfb_file: ReturnType<typeof CFB.read>, path: string, te
 }
 
 /**
- * The first section of a number format — what a positive value is displayed by.
+ * Split a number format into its sections.
  *
  * A `;` inside a quoted literal, an escape, or a bracketed condition/colour is not
  * a section break, so this cannot be a `split(';')`: `"a;b";0` is one section, and
  * cutting it in half would leave a fragment that classifies as anything at all.
  */
-function positive_section(code: string): string {
+function format_sections(code: string): string[] {
+    const out: string[] = [];
     let quoted = false;
     let bracket = 0;
+    let start = 0;
     for (let i = 0; i < code.length; i += 1) {
         const ch = code[i];
         if (ch === '\\') { i += 1; continue; }
@@ -90,13 +92,69 @@ function positive_section(code: string): string {
         if (quoted) continue;
         if (ch === '[') bracket += 1;
         else if (ch === ']') bracket = Math.max(0, bracket - 1);
-        else if (ch === ';' && bracket === 0) return code.slice(0, i);
+        else if (ch === ';' && bracket === 0) {
+            out.push(code.slice(start, i));
+            start = i + 1;
+        }
     }
-    return code;
+    out.push(code.slice(start));
+    return out;
+}
+
+/** A leading `[>=100]`-style condition, if the section carries one. */
+const CONDITION_RE = /^\s*\[\s*(<=|>=|<>|<|>|=)\s*(-?[\d.]+(?:[eE][+-]?\d+)?)\s*\]/;
+
+function condition_holds(section: string, value: number): boolean | null {
+    const m = CONDITION_RE.exec(section);
+    if (!m) return null;
+    const bound = Number(m[2]);
+    if (!Number.isFinite(bound)) return null;
+    switch (m[1]) {
+        case '<': return value < bound;
+        case '>': return value > bound;
+        case '<=': return value <= bound;
+        case '>=': return value >= bound;
+        case '=': return value === bound;
+        default: return value !== bound;
+    }
+}
+
+/**
+ * The section of `code` that `value` will actually be displayed by.
+ *
+ * Sections are ordinarily `positive;negative;zero;text`, so a positive serial
+ * takes the first — but a section may instead carry its own condition
+ * (`[>50000]yyyy-mm-dd;0`), and then Excel uses the first condition that holds and
+ * the last section as the fallback. Getting this wrong is not cosmetic: the writer
+ * asks whether a typed date will *render* as a date, and both directions corrupt.
+ * Assuming section one, `[>50000]0;yyyy-mm-dd` stored an inline string where the
+ * cell would have shown a date, and `[>50000]yyyy-mm-dd;0` stored a serial the
+ * cell then displayed as `45306`.
+ */
+function section_for_value(code: string, value: number): string {
+    const sections = format_sections(code);
+    if (sections.length === 1) return sections[0];
+    const conditional = sections.some((section) => CONDITION_RE.test(section));
+    if (!conditional) {
+        if (value > 0) return sections[0];
+        if (value < 0) return sections[1] ?? sections[0];
+        return sections[2] ?? sections[0];
+    }
+    // The text section never applies to a number, and a trailing one would
+    // otherwise be picked up as the fallback below.
+    const numeric = sections.length === 4 ? sections.slice(0, 3) : sections;
+    for (const section of numeric) {
+        const holds = condition_holds(section, value);
+        if (holds === true) return section;
+        if (holds === null) return section;
+    }
+    return numeric[numeric.length - 1];
 }
 
 /** Parse just enough of `xl/styles.xml` to answer "is this style index a date format?". */
-function read_style_date_predicate(cfb_file: ReturnType<typeof CFB.read>): (xf_index: number) => boolean {
+function read_style_date_predicate(
+    cfb_file: ReturnType<typeof CFB.read>,
+): (xf_index: number, serial: number) => boolean {
     const xml = read_part_text(cfb_file, '/xl/styles.xml');
     if (!xml) return () => false;
 
@@ -128,16 +186,19 @@ function read_style_date_predicate(cfb_file: ReturnType<typeof CFB.read>): (xf_i
         }
     }
 
-    // Narrowed to the *positive* section, which is the one a value typed into an
-    // empty-or-numeric cell will be displayed under. A format's sections are
-    // `positive;negative;zero;text`, and `SSF.is_date` says true if any of them is
-    // a date — so `0;0;yyyy-mm-dd` counts, and a date typed there would be stored
-    // as a serial and rendered by its positive section as `45306`. Only the reading
-    // side wants the whole-format answer (a negative value really is displayed by
-    // section two); the writer is deciding what a new positive value becomes.
-    const positive_only = new Map<number, string>();
-    for (const [id, code] of format_map) positive_only.set(id, positive_section(code));
-    return (xf_index: number) => is_date_format(xf_index, xfs, positive_only);
+    // Narrowed to the section the serial about to be written will be *displayed*
+    // by. `SSF.is_date` says true if any section of a format is a date, so
+    // `0;0;yyyy-mm-dd` counted and a typed date was stored as a serial the cell
+    // then showed as `45306`. Which section applies depends on the value — plain
+    // formats split positive/negative/zero, and a conditional one
+    // (`[>50000]yyyy-mm-dd;0`) picks by its own test — so the predicate takes the
+    // candidate serial rather than answering for the format as a whole. Only the
+    // reading side wants that whole-format answer.
+    return (xf_index: number, serial: number) => {
+        const scoped = new Map<number, string>();
+        for (const [id, code] of format_map) scoped.set(id, section_for_value(code, serial));
+        return is_date_format(xf_index, xfs, scoped);
+    };
 }
 
 function read_datemode(cfb_file: ReturnType<typeof CFB.read>): DateMode {

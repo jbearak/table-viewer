@@ -225,6 +225,32 @@ describe('reconcile_pending_edit_sheets', () => {
         );
     });
 
+    it('settles duplicate tags instead of shuffling them on every write', () => {
+        // Reconciliation runs on every durable write, so its output is its own next
+        // input. With three slots claiming one name it used to hand the position to
+        // a different one each pass and displace the incumbent, so the drafts rotated
+        // through the array forever and no slot index ever meant anything stable.
+        const pending: PerFileState['pendingEdits'] = [
+            { sheetName: 'Inventory', cells: { '0:0': entry('first') } },
+            { sheetName: 'Inventory', cells: { '0:0': entry('second') } },
+            { sheetName: 'Inventory', cells: { '0:0': entry('third') } },
+        ];
+        const names = ['People', 'Inventory', 'Spare'];
+        const once = reconcile_pending_edit_sheets(pending, names);
+        const layout = (slots: PerFileState['pendingEdits']) =>
+            (slots ?? []).map((slot) => JSON.stringify(slot?.cells?.['0:0']));
+        expect(layout(once)).toEqual(
+            expect.arrayContaining(
+                ['first', 'second', 'third'].map((v) => JSON.stringify(entry(v))),
+            ),
+        );
+        let settled = once;
+        for (let pass = 0; pass < 4; pass++) {
+            settled = reconcile_pending_edit_sheets(settled, names);
+            expect(layout(settled)).toEqual(layout(once));
+        }
+    });
+
     it('passes an absent leaf through', () => {
         expect(reconcile_pending_edit_sheets(undefined, ['A'])).toBeUndefined();
     });

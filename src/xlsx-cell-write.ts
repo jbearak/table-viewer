@@ -36,7 +36,7 @@ export interface XlsxWriteOptions {
      * consults this to decide whether a date-looking input should become a
      * serial (keeping the cell's date format) or a plain string.
      */
-    readonly is_date_style: (xf_index: number) => boolean;
+    readonly is_date_style: (xf_index: number, serial: number) => boolean;
 }
 
 const MS_PER_DAY = 86400000;
@@ -153,7 +153,7 @@ export function classify_value(
     // the user "45000" where they typed a date — visibly wrong. Under a date
     // style the serial and the format agree, so it renders as they typed it.
     const serial = iso_to_serial(value, options.datemode);
-    if (serial !== null && options.is_date_style(xf_index)) {
+    if (serial !== null && options.is_date_style(xf_index, serial)) {
         return { kind: 'number', text: String(serial) };
     }
 

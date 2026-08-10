@@ -1951,6 +1951,33 @@ export function attach_viewer(
     }
 
     /**
+     * Which durable slot carries `name`, for a panel with no source to ask.
+     *
+     * `captured_index` is where the worksheet sat when the work began. The slots'
+     * own `sheetName` tags are the only record of where it went since, because a
+     * disposed panel has no workbook to resolve names against while another window
+     * still attached goes on reconciling and committing them.
+     *
+     * The captured position is tried first rather than a bare `findIndex`: two
+     * slots can be tagged alike (a sheet renamed externally onto a name another
+     * slot already recorded), and the first match would then be somebody else's —
+     * clearing a draft this caller does not own and leaving its own behind.
+     *
+     * Nothing tagged with this name means either slots predating name tagging or a
+     * deleted sheet; neither is distinguishable from here, and the captured
+     * position is the only answer left — the same one an untagged caller gets.
+     */
+    function slot_index_tagged(
+        slots: PerFileState['pendingEdits'],
+        name: string,
+        captured_index: number,
+    ): number {
+        if (slots?.[captured_index]?.sheetName === name) return captured_index;
+        const tagged = slots?.findIndex((slot) => slot?.sheetName === name) ?? -1;
+        return tagged === -1 ? captured_index : tagged;
+    }
+
+    /**
      * Where this operation's worksheet sits in durable state *now*.
      *
      * `operation.sheetIndex` is a position captured when the save began, but the
@@ -1969,8 +1996,7 @@ export function attach_viewer(
      * captured position there cleared whichever draft had inherited that index and
      * left the failed save's own entries behind — the tombstone retired regardless,
      * so the phantom survived into the next session. `slots` is the durable array
-     * this cleanup is about to modify, and its own `sheetName` tags say where the
-     * operation's sheet went without needing a workbook at all.
+     * this cleanup is about to modify; see {@link slot_index_tagged}.
      */
     function operation_sheet_index(
         operation: CsvSaveOperation,
@@ -1980,19 +2006,7 @@ export function attach_viewer(
         const name = save_operation_sheet_names.get(operation);
         if (name === undefined) return operation.sheetIndex;
         if (source) return sheet_index_named(name, names);
-        // The captured position first, when it still carries this name: two slots
-        // can be tagged alike (a sheet renamed externally onto a name another slot
-        // already recorded), and a bare `findIndex` would then hand the cleanup the
-        // *other* one — clearing a draft it does not own and leaving its own behind.
-        if (slots?.[operation.sheetIndex]?.sheetName === name) return operation.sheetIndex;
-        const tagged = slots?.findIndex((slot) => slot?.sheetName === name) ?? -1;
-        if (tagged !== -1) return tagged;
-        // Nothing tagged with this name: either the slots predate name tagging, or
-        // the sheet is gone. Neither is distinguishable from here without a
-        // workbook, and the captured position is the only answer left — the same
-        // one an untagged operation gets, and the shape that held before any of
-        // this was worksheet-scoped.
-        return operation.sheetIndex;
+        return slot_index_tagged(slots, name, operation.sheetIndex);
     }
 
     function strip_operation_owned_pending_edits(
@@ -3473,12 +3487,16 @@ export function attach_viewer(
             // resolves was deleted, and there is nothing of this session's left to
             // clear — its slot went with it.
             //
-            // A disposed panel has no source to resolve against, and no
-            // reconciliation to compensate for either, so it keeps the captured
-            // position — see `operation_sheet_index`, which draws the same line.
-            const target = sheet_name === undefined || !source
+            // A disposed panel has no source to resolve against, but another window
+            // still attached does, and can commit reconciled slots this clear then
+            // reads — so the captured position may already be someone else's. The
+            // durable slots' own tags answer without a workbook; see
+            // `slot_index_tagged`.
+            const target = sheet_name === undefined
                 ? sheet_index
-                : sheet_index_named(sheet_name, names);
+                : source
+                    ? sheet_index_named(sheet_name, names)
+                    : slot_index_tagged(current.pendingEdits, sheet_name, sheet_index);
             if (target === undefined) return current;
             // One sheet's slot, not the leaf: a save or discard on this worksheet
             // must leave another worksheet's unsaved draft exactly where it is.

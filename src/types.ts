@@ -936,6 +936,27 @@ export function reconcile_pending_edit_sheets(
         while (next.length <= index) next.push(undefined);
         next[index] = slot;
     });
+    // Names are unique *within a workbook*, but two slots can still carry the same
+    // tag: a sheet renamed externally onto a name another slot already recorded
+    // leaves both tagged alike until the next write. Only one can have the named
+    // position, and the other's draft must not simply be overwritten — that is the
+    // silent deletion this whole function exists to prevent.
+    //
+    // The slot *already sitting* at the named position keeps it, and only if none
+    // is does the first in order claim it. Picking the first unconditionally made
+    // the two swap places on every reconciliation and never settle: the winner was
+    // pulled to the named index and the loser fell into the one it vacated, so the
+    // next pass did the same in reverse. Preferring the incumbent is a fixed point.
+    const claimant = new Map<number, number>();
+    pending.forEach((slot, index) => {
+        if (!slot?.sheetName) return;
+        const moved_to = index_of_name.get(slot.sheetName);
+        if (moved_to === undefined) return;
+        const held = claimant.get(moved_to);
+        if (held === undefined || (held !== moved_to && index === moved_to)) {
+            claimant.set(moved_to, index);
+        }
+    });
     pending.forEach((slot, index) => {
         if (!slot?.sheetName) return;
         const moved_to = index_of_name.get(slot.sheetName);
@@ -945,14 +966,11 @@ export function reconcile_pending_edit_sheets(
             return;
         }
         while (next.length <= moved_to) next.push(undefined);
-        // Names are unique *within a workbook*, but two slots can still carry the
-        // same tag: a sheet renamed externally onto a name some other slot already
-        // recorded leaves both tagged alike until the next write. Overwriting here
-        // deleted the earlier slot's unsaved work outright, so the first claimant
-        // keeps the position and the loser stays where it is if that place is free.
-        // Both drafts survive, one of them attached to a worksheet that may not be
-        // its own — visible and dismissable, unlike a silent deletion.
-        if (next[moved_to] !== undefined) {
+        if (claimant.get(moved_to) !== index || next[moved_to] !== undefined) {
+            // A loser keeps its own index when that is free, so a reconciliation
+            // that changes nothing else moves nothing. Its draft stays attached to
+            // a worksheet that may not be its own — visible and dismissable, which
+            // is the recoverable direction to be wrong in.
             while (next.length <= index) next.push(undefined);
             let landing = next[index] === undefined ? index : next.indexOf(undefined);
             if (landing === -1) landing = next.length;
