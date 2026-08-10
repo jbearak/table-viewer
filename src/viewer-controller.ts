@@ -58,11 +58,13 @@ import {
     EMPTY_TRANSFORM,
     MAX_PERSISTED_HIDDEN_ROWS,
     MAX_PERSISTED_ROW_HEIGHTS,
+    pending_edits_for_sheet,
     sanitize_excel_header_overrides,
     sheet_name_from_transform_schema,
     transform_has_entries,
     transform_is_active,
     transform_schema_for_sheet,
+    with_pending_edits_for_sheet,
     type ActiveCsvSaveLifecycle,
     type CsvDirtyMap,
     type CsvSaveLifecycle,
@@ -70,6 +72,7 @@ import {
     type CsvSaveRejection,
     type HostMessage,
     type PerFileState,
+    type SheetPendingEditCells,
     type SheetTransformState,
     type StoredPerFileState,
     type WebviewMessage,
@@ -522,6 +525,14 @@ export function attach_viewer(
     const edit_session_token = Symbol(file_key);
     const transform_panel_token = Symbol(file_key);
     let active_edit_session_id: string | undefined;
+    /**
+     * The worksheet the active edit session belongs to. Editing is
+     * worksheet-scoped — each sheet has its own Edit button, dirty map and save —
+     * so every edit-session-shaped question ("whose pending edits?", "which
+     * sheet's bytes does this save rewrite?", "which sheet does a successful save
+     * revoke?") has to name a sheet. Undefined exactly when no session is held.
+     */
+    let active_edit_sheet_index: number | undefined;
     const excel_header_subscriber_token = Symbol(file_key);
     const cell_highlight_subscriber_token = Symbol(file_key);
     const header_receipt_queue: ExcelHeaderOperationReceipt[] = [];
@@ -1002,11 +1013,31 @@ export function attach_viewer(
      * tombstoned entries — durably present but not this session's to show — cannot
      * be counted as work the user is holding.
      *
-     * No sheet qualification, because there is none to give: `pendingEdits` is
-     * file-scoped, and CSV — the one editable format — has exactly one sheet.
+     * Sheet-qualified, because editing is worksheet-scoped: the caller intersects
+     * these keys with one sheet's row permutation, so returning another sheet's
+     * keys would report edits hidden that are not.
      */
-    function durable_pending_edit_keys(): readonly string[] {
-        const scoped = pending_edits_for_current_session(durable_pending_edits);
+    /**
+     * The worksheet name at `sheet_index`, for tagging a persisted edit slot so a
+     * workbook reordered externally cannot reattach it to the wrong sheet. Absent
+     * when no source is adopted, which is the legacy-slot shape and equally safe:
+     * an untagged slot is only ever reattached by position, which is what the old
+     * file-scoped leaf did unconditionally.
+     */
+    function sheet_name_at(sheet_index: number): string | undefined {
+        return source?.meta().sheets[sheet_index]?.name;
+    }
+
+    function durable_pending_edit_keys(sheet_index: number): readonly string[] {
+        // Only the sheet the session is editing can have keys to report; asking
+        // about any other sheet must not return this one's, since the caller
+        // intersects them with *that* sheet's row permutation.
+        if (active_edit_sheet_index !== undefined && active_edit_sheet_index !== sheet_index) {
+            return [];
+        }
+        const scoped = pending_edits_for_current_session(
+            pending_edits_for_sheet(durable_pending_edits, sheet_index),
+        );
         return scoped ? Object.keys(scoped) : [];
     }
 
@@ -1353,9 +1384,17 @@ export function attach_viewer(
         return true;
     }
 
+    /**
+     * `sheet_index` names the worksheet the session will own. Editing is
+     * worksheet-scoped, so a session without a sheet is meaningless — every
+     * consumer downstream (pending-edit projection, save, revocation) asks which
+     * sheet. A claim that reuses an already-owned session keeps that session's
+     * existing sheet rather than retargeting it.
+     */
     function try_claim_edit_session(
         notify = true,
         claim?: symbol,
+        sheet_index = 0,
     ): boolean {
         // The transform-shaped question at this site is `may_rehydrate_session()`,
         // and its answer is unconditional — see there for why declining would be
@@ -1366,7 +1405,10 @@ export function attach_viewer(
         const phase = file_edit_state.phase;
         if (phase.type === 'owned') {
             if (phase.token !== edit_session_token) return false;
-            active_edit_session_id ??= allocate_edit_session_id(file_key);
+            if (active_edit_session_id === undefined) {
+                active_edit_session_id = allocate_edit_session_id(file_key);
+                active_edit_sheet_index = sheet_index;
+            }
             return true;
         }
         if (
@@ -1377,6 +1419,7 @@ export function attach_viewer(
         ) {
             if (active_edit_claim === claim) active_edit_claim = undefined;
             active_edit_session_id = allocate_edit_session_id(file_key);
+            active_edit_sheet_index = sheet_index;
             file_edit_state.phase = { type: 'owned', token: edit_session_token };
             if (notify) notify_edit_state();
             return true;
@@ -1384,6 +1427,7 @@ export function attach_viewer(
         if (phase.type !== 'free' || claim !== undefined) return false;
         retire_save_lifecycle(undefined);
         active_edit_session_id = allocate_edit_session_id(file_key);
+        active_edit_sheet_index = sheet_index;
         file_edit_state.phase = { type: 'owned', token: edit_session_token };
         if (notify) notify_edit_state();
         return true;
@@ -1456,6 +1500,7 @@ export function attach_viewer(
                     && active_edit_session_id === edit_session_id
                 ) {
                     active_edit_session_id = undefined;
+                    active_edit_sheet_index = undefined;
                     file_edit_state.phase = { type: 'free' };
                     notify_edit_state();
                     void ensure_failed_save_cleanup();
@@ -1486,6 +1531,7 @@ export function attach_viewer(
         const operation = Symbol(file_key);
         active_save_operation = undefined;
         active_edit_session_id = undefined;
+        active_edit_sheet_index = undefined;
         file_edit_state.phase = { type: 'cleanupPending', operation };
         recapture_edit_capabilities();
         return operation;
@@ -1518,9 +1564,9 @@ export function attach_viewer(
     }
 
     function strip_operation_owned_pending_edits(
-        pending_edits: PerFileState['pendingEdits'],
+        pending_edits: SheetPendingEditCells | undefined,
         operation: CsvSaveOperation,
-    ): PerFileState['pendingEdits'] {
+    ): SheetPendingEditCells | undefined {
         if (!pending_edits) return undefined;
         const retained = Object.fromEntries(
             Object.entries(pending_edits).filter(([key, pending]) => {
@@ -1547,7 +1593,7 @@ export function attach_viewer(
      * a post missing one of the operation's keys dropped that edit deliberately.
      */
     function post_echoes_operation(
-        pending_edits: PerFileState['pendingEdits'],
+        pending_edits: SheetPendingEditCells | undefined,
         operation: CsvSaveOperation,
     ): boolean {
         const owned = Object.keys(operation.dirtyEdits).length;
@@ -1557,8 +1603,8 @@ export function attach_viewer(
     }
 
     function pending_edits_for_current_session(
-        pending_edits: PerFileState['pendingEdits'],
-    ): PerFileState['pendingEdits'] {
+        pending_edits: SheetPendingEditCells | undefined,
+    ): SheetPendingEditCells | undefined {
         let projected = pending_edits;
         if (save_lifecycle.state !== 'idle') {
             if (
@@ -1577,6 +1623,35 @@ export function attach_viewer(
         return projected;
     }
 
+    /**
+     * Apply the session projection across the whole worksheet-scoped leaf.
+     *
+     * Only the sheet the session owns can carry entries this panel is entitled to
+     * show; every other sheet's slot is another session's work (or nobody's) and
+     * is dropped rather than projected, exactly as the whole leaf used to be when
+     * the session belonged to a different panel.
+     */
+    function leaf_pending_edits_for_current_session(
+        pending_edits: PerFileState['pendingEdits'],
+    ): PerFileState['pendingEdits'] {
+        if (!pending_edits) return undefined;
+        const sheet_index = active_edit_sheet_index;
+        if (sheet_index === undefined) return undefined;
+        const projected = pending_edits_for_current_session(
+            pending_edits_for_sheet(pending_edits, sheet_index),
+        );
+        const slot = pending_edits[sheet_index];
+        // Preserve identity when nothing changed, so callers can keep using
+        // reference equality to detect a no-op projection.
+        if (projected === slot?.cells && pending_edits.length === 1) return pending_edits;
+        return with_pending_edits_for_sheet(
+            undefined,
+            sheet_index,
+            projected,
+            slot?.sheetName,
+        );
+    }
+
     function ensure_failed_save_cleanup(): Promise<void> {
         if (!file_edit_state?.failedSaveTombstone) return Promise.resolve();
         if (file_edit_state.failedSaveCleanup) return file_edit_state.failedSaveCleanup;
@@ -1585,12 +1660,22 @@ export function attach_viewer(
         cleanup = (async () => {
             try {
                 const committed = await update_file_state((current) => {
+                    // Scoped to the operation's own sheet: another worksheet's
+                    // slot is unrelated work this cleanup must not touch.
+                    const sheet_index = operation.sheetIndex;
+                    const slot = current.pendingEdits?.[sheet_index];
                     const pending_edits = strip_operation_owned_pending_edits(
-                        current.pendingEdits,
+                        slot?.cells,
                         operation,
                     );
-                    if (pending_edits === current.pendingEdits) return current;
-                    if (pending_edits) return { ...current, pendingEdits: pending_edits };
+                    if (pending_edits === slot?.cells) return current;
+                    const next = with_pending_edits_for_sheet(
+                        current.pendingEdits,
+                        sheet_index,
+                        pending_edits,
+                        slot?.sheetName,
+                    );
+                    if (next) return { ...current, pendingEdits: next };
                     const { pendingEdits: _drop, ...rest } = current;
                     return rest;
                 }, undefined, undefined, null);
@@ -1657,11 +1742,17 @@ export function attach_viewer(
                 || (
                     allow_claim
                     && may_rehydrate_session()
-                    && try_claim_edit_session(false)
+                    && try_claim_edit_session(
+                        false,
+                        undefined,
+                        // Rehydration adopts whichever sheet the durable slot
+                        // belongs to, rather than assuming sheet 0.
+                        state.pendingEdits?.findIndex((slot) => slot !== undefined) ?? 0,
+                    )
                 )
             );
         if (represents_session) {
-            const pending_edits = pending_edits_for_current_session(state.pendingEdits);
+            const pending_edits = leaf_pending_edits_for_current_session(state.pendingEdits);
             if (pending_edits === state.pendingEdits) {
                 return { revision: snapshot.revision, state };
             }
@@ -1698,7 +1789,7 @@ export function attach_viewer(
 
     function validate_restored_pending_edits(
         src: DataSource,
-        pending_edits: NonNullable<PerFileState['pendingEdits']>,
+        pending_edits: SheetPendingEditCells,
     ): { dirtyEdits: CsvDirtyMap; rejection: CsvSaveRejection } | undefined {
         const dirty_edits: CsvDirtyMap = Object.fromEntries(
             Object.entries(pending_edits).filter((entry): entry is [string, {
@@ -2612,13 +2703,20 @@ export function attach_viewer(
                             stateSnapshot: adoption_state,
                         }),
                     };
-                    const restored_pending_edits = (
-                        adoption_state.state as PerFileState
-                    ).pendingEdits;
+                    // Restored edits belong to the sheet the session holds; only
+                    // that slot is this panel's to validate and rehydrate.
+                    const restored_sheet_index = active_edit_sheet_index;
+                    const restored_pending_edits = restored_sheet_index === undefined
+                        ? undefined
+                        : pending_edits_for_sheet(
+                            (adoption_state.state as PerFileState).pendingEdits,
+                            restored_sheet_index,
+                        );
                     if (
                         !owned_before_projection
                         && owns_edit_session()
                         && active_edit_session_id
+                        && restored_sheet_index !== undefined
                         && restored_pending_edits
                     ) {
                         try {
@@ -2632,6 +2730,7 @@ export function attach_viewer(
                             if (validation) {
                                 const operation = clone_save_operation({
                                     editSessionId: active_edit_session_id,
+                                    sheetIndex: restored_sheet_index,
                                     saveRequestId: `rehydration:${seq}`,
                                     edits: Object.fromEntries(Object.entries(
                                         validation.dirtyEdits,
@@ -3373,6 +3472,7 @@ export function attach_viewer(
         );
         return Object.freeze({
             editSessionId: input.editSessionId,
+            sheetIndex: input.sheetIndex,
             saveRequestId: input.saveRequestId,
             edits: Object.freeze({ ...input.edits }),
             dirtyEdits: Object.freeze(dirty_edits),
@@ -3391,11 +3491,18 @@ export function attach_viewer(
         persisted_save_identities.add(operation.identity);
         const committed = await update_file_state((current) => ({
             ...current,
-            pendingEdits: Object.fromEntries(
-                Object.entries(operation.identity.dirtyEdits).map(([key, entry]) => [
-                    key,
-                    { value: entry.value, base: entry.base },
-                ]),
+            // Written into the operation's own slot: a save must never disturb a
+            // sibling worksheet's unsaved edits.
+            pendingEdits: with_pending_edits_for_sheet(
+                current.pendingEdits,
+                operation.identity.sheetIndex,
+                Object.fromEntries(
+                    Object.entries(operation.identity.dirtyEdits).map(([key, entry]) => [
+                        key,
+                        { value: entry.value, base: entry.base },
+                    ]),
+                ),
+                sheet_name_at(operation.identity.sheetIndex),
             ),
         }), undefined, () => save_operation_is_current(operation));
         if (!committed || !save_operation_is_current(operation)) {
@@ -3761,6 +3868,10 @@ export function attach_viewer(
         void post_to_receiver({
             type: 'editSessionRevoked',
             reason: 'saved',
+            // Scoped to the saved worksheet: a successful save ends *that* sheet's
+            // edit session, and must leave any other sheet the user is editing
+            // untouched.
+            sheetIndex: identity.sheetIndex,
             lifecycle: succeeded_lifecycle,
         });
         notify_edit_state();
@@ -4459,11 +4570,17 @@ export function attach_viewer(
                 return;
             }
             case 'requestEditSession': {
+                // The sheet the user pressed Edit on. Editing is worksheet-scoped,
+                // so the request names its sheet and every answer echoes it back:
+                // the webview keeps one store per sheet and must not apply a grant
+                // to the wrong one.
+                const requested_sheet_index = msg.sheetIndex;
                 if (edit_admission_closed) {
                     void post_to_receiver({
                         type: 'editSessionResult',
                         requestId: msg.requestId,
                         granted: false,
+                        sheetIndex: requested_sheet_index,
                     });
                     return;
                 }
@@ -4533,6 +4650,7 @@ export function attach_viewer(
                         type: 'editSessionResult',
                         requestId: request.requestId,
                         granted: false,
+                        sheetIndex: requested_sheet_index,
                     }, request.receiverEpoch);
                     return;
                 }
@@ -4557,7 +4675,7 @@ export function attach_viewer(
                     : phase.type === 'claiming' && phase.claim === claim;
                 const granted = can_edit
                     && owner_still_available
-                    && try_claim_edit_session(true, claim);
+                    && try_claim_edit_session(true, claim, requested_sheet_index);
                 if (!granted) cancel_edit_claim(claim);
                 if (granted && !already_owned) {
                     // Renderer edit sequences are scoped to one durable edit session.
@@ -4577,7 +4695,10 @@ export function attach_viewer(
                     && !may_begin_editing();
                 const pendingEdits = granted
                     ? pending_edits_for_current_session(
-                        (edit_state?.state as PerFileState | undefined)?.pendingEdits,
+                        pending_edits_for_sheet(
+                            (edit_state?.state as PerFileState | undefined)?.pendingEdits,
+                            requested_sheet_index,
+                        ),
                     )
                     : undefined;
                 if (!request_is_current()) return;
@@ -4586,6 +4707,7 @@ export function attach_viewer(
                     type: 'editSessionResult',
                     requestId: request.requestId,
                     granted,
+                    sheetIndex: requested_sheet_index,
                     ...(granted && active_edit_session_id
                         ? { editSessionId: active_edit_session_id }
                         : {}),
@@ -5093,21 +5215,35 @@ export function attach_viewer(
                 const edits = msg.edits ? structuredClone(msg.edits) : null;
                 const admission = Symbol(edit_session_id);
                 pending_edit_admissions.add(admission);
+                // The posting session's sheet. Writes land in that slot only, so a
+                // post about one worksheet cannot clear another's unsaved edits.
+                const posted_sheet_index = active_edit_sheet_index ?? 0;
                 const write = pending_edit_writes.catch(() => {}).then(async () => {
+                    const apply = (
+                        current: PerFileState,
+                        cells: SheetPendingEditCells | undefined,
+                    ): PerFileState => {
+                        const next = with_pending_edits_for_sheet(
+                            current.pendingEdits,
+                            posted_sheet_index,
+                            cells,
+                            sheet_name_at(posted_sheet_index),
+                        );
+                        if (next) return { ...current, pendingEdits: next };
+                        if (!current.pendingEdits) return current;
+                        const { pendingEdits: _drop, ...rest } = current;
+                        return rest;
+                    };
                     const result = edits
                         ? await update_edit_session_state(
                             edit_session_id,
                             admission,
-                            (current) => ({ ...current, pendingEdits: edits }),
+                            (current) => apply(current, edits),
                         )
                         : await update_edit_session_state(
                             edit_session_id,
                             admission,
-                            (current) => {
-                                if (!current.pendingEdits) return current;
-                                const { pendingEdits: _drop, ...rest } = current;
-                                return rest;
-                            },
+                            (current) => apply(current, undefined),
                         );
                     if (result.type !== 'aborted') {
                         // A post used to be taken as proof the user moved on from a
@@ -5136,7 +5272,13 @@ export function attach_viewer(
                         // strip a value the user discarded and then retyped).
                         const committed = result.snapshot.state as PerFileState;
                         const supersedes = (operation: CsvSaveOperation) => (
-                            !post_echoes_operation(committed.pendingEdits, operation)
+                            !post_echoes_operation(
+                                pending_edits_for_sheet(
+                                    committed.pendingEdits,
+                                    operation.sheetIndex,
+                                ),
+                                operation,
+                            )
                         );
                         const tombstone = file_edit_state?.failedSaveTombstone;
                         if (

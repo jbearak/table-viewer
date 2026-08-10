@@ -1,7 +1,7 @@
 import type {
     CsvSaveLifecycle,
     CsvSaveOperation,
-    PerFileState,
+    SheetPendingEditCells,
 } from '../types';
 
 export interface CsvSaveProjection {
@@ -59,9 +59,9 @@ export function csv_save_operations_equal(
 }
 
 function remove_operation_owned_pending_edits(
-    pending_edits: PerFileState['pendingEdits'],
+    pending_edits: SheetPendingEditCells | undefined,
     operation: CsvSaveOperation,
-): PerFileState['pendingEdits'] {
+): SheetPendingEditCells | undefined {
     if (!pending_edits) return undefined;
     let removed = false;
     const retained = Object.fromEntries(Object.entries(pending_edits).filter(([key, pending]) => {
@@ -96,8 +96,8 @@ export function propose_csv_save(
 export function resolve_csv_save_hydration(
     projection: Pick<CsvSaveProjection, 'authoritative' | 'operation'>,
     edit_session_id: string | undefined,
-    pending_edits: PerFileState['pendingEdits'],
-): PerFileState['pendingEdits'] {
+    pending_edits: SheetPendingEditCells | undefined,
+): SheetPendingEditCells | undefined {
     if (
         projection.operation
         && projection.operation.editSessionId === edit_session_id

@@ -817,8 +817,16 @@ export function decode_stored_per_file_state(value: unknown): StoredPerFileState
  */
 export interface WorksheetPendingEdits {
     readonly sheetName?: string;
-    readonly cells: Record<string, string | CsvDirtyEntry>;
+    readonly cells: SheetPendingEditCells;
 }
+
+/**
+ * One worksheet's pending cell edits, keyed `"<canonical source row>:<source
+ * column>"`. This is the unit the edit session and the save lifecycle work in —
+ * both are worksheet-scoped — so functions there take this rather than the
+ * whole-workbook leaf.
+ */
+export type SheetPendingEditCells = Record<string, string | CsvDirtyEntry>;
 
 /** One sheet's cell map out of the worksheet-scoped leaf, or undefined. */
 export function pending_edits_for_sheet(
@@ -908,9 +916,18 @@ export interface CsvSaveRejection {
     readonly keys: readonly string[];
 }
 
-/** Immutable identity and payload for one accepted CSV save operation. */
+/**
+ * Immutable identity and payload for one accepted save operation.
+ *
+ * `sheetIndex` is part of the identity, not a parameter: a save writes exactly
+ * one worksheet's edits, and every consumer that reconciles an operation against
+ * durable state (tombstone cleanup, hydration, revocation) has to know which
+ * sheet's slot it is talking about, or it will strip a neighbouring sheet's
+ * unsaved work.
+ */
 export interface CsvSaveOperation {
     readonly editSessionId: string;
+    readonly sheetIndex: number;
     readonly saveRequestId: string;
     readonly edits: Readonly<Record<string, string>>;
     readonly dirtyEdits: CsvDirtyMap;
@@ -939,8 +956,8 @@ export type HostMessage =
     | { type: 'scrollToRow'; row: number }
     | { type: 'saveOperationStarted'; lifecycle: ActiveCsvSaveLifecycle }
     | { type: 'saveResult'; success: boolean; lifecycle: TerminalCsvSaveLifecycle; rejection?: CsvSaveRejection }
-    | { type: 'editSessionResult'; requestId: string; granted: boolean; editSessionId?: string; pendingEdits?: PerFileState['pendingEdits'] }
-    | { type: 'editSessionRevoked'; reason: 'saved'; lifecycle: Extract<TerminalCsvSaveLifecycle, { state: 'succeeded' }> }
+    | { type: 'editSessionResult'; requestId: string; granted: boolean; editSessionId?: string; sheetIndex: number; pendingEdits?: SheetPendingEditCells }
+    | { type: 'editSessionRevoked'; reason: 'saved'; sheetIndex: number; lifecycle: Extract<TerminalCsvSaveLifecycle, { state: 'succeeded' }> }
     | { type: 'saveDialogResult'; requestId: string; editSessionId: string; choice: 'save' | 'discard' | 'cancel' }
     /** The current state backend accepted a pending-edit full map through this sequence. */
     | { type: 'pendingEditsAcknowledged'; editSessionId: string; sequence: number }
@@ -1028,7 +1045,7 @@ export type WebviewMessage =
     | { type: 'requestRows'; sheetIndex: number; startRow: number; count: number; requestId: string; generation: number }
     | { type: 'stateChanged'; state: PerFileState; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity }
     | { type: 'visibleRowChanged'; row: number }
-    | { type: 'requestEditSession'; requestId: string }
+    | { type: 'requestEditSession'; requestId: string; sheetIndex: number }
     | { type: 'releaseEditSession'; editSessionId: string }
     | { type: 'discardEditSession'; editSessionId: string }
     | { type: 'saveCsv'; operation: CsvSaveOperation }

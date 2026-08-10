@@ -252,7 +252,7 @@ export class ViewerPanelCore {
     private disposed = false;
     private readonly on_transform_commit?: TransformCommit;
     private readonly on_invalid_restore?: InvalidRestoreCleanup;
-    private readonly durable_pending_edit_keys?: () => readonly string[];
+    private readonly durable_pending_edit_keys?: (sheet_index: number) => readonly string[];
     private readonly durable_row_heights?: DurableRowHeightsProvider;
     /**
      * The last computed display-keyed projection, with the facts it is a function of.
@@ -292,12 +292,17 @@ export class ViewerPanelCore {
             onInvalidRestore?: InvalidRestoreCleanup;
             /**
              * Canonical `"sourceRow:sourceColumn"` keys of the durable pending edits
-             * the current edit session owns. The core owns view membership and the
-             * authority layer owns the dirty map, so `hiddenEditedCellKeys` needs
-             * both; absent (Excel, or any caller with no edit sessions) it is always
-             * empty.
+             * the current edit session owns *on the named sheet*. The core owns view
+             * membership and the authority layer owns the dirty map, so
+             * `hiddenEditedCellKeys` needs both; absent (any caller with no edit
+             * sessions) it is always empty.
+             *
+             * Sheet-qualified because editing is worksheet-scoped: each sheet has its
+             * own dirty map, and the caller asks about one sheet's row permutation.
+             * A file-scoped provider would test one sheet's edit keys against
+             * another's permutation and report edits hidden that are not.
              */
-            durablePendingEditKeys?: () => readonly string[];
+            durablePendingEditKeys?: (sheet_index: number) => readonly string[];
             /**
              * The durable per-sheet custom row heights, keyed by canonical source row.
              * Same division of labour as `durablePendingEditKeys` and the same reason
@@ -921,7 +926,7 @@ export class ViewerPanelCore {
         indices: Uint32Array | undefined,
     ): readonly string[] {
         if (!indices || !this.durable_pending_edit_keys) return [];
-        const keys = this.durable_pending_edit_keys();
+        const keys = this.durable_pending_edit_keys(sheet_index);
         if (keys.length === 0) return [];
         // Whether the permutation itself left rows out. `rules` is not consulted:
         // whatever an enabled filter or a `hiddenRows` list asked for, what a row's
@@ -1684,7 +1689,7 @@ export function adopt_source_into_core(
     opts?: {
         onTransformCommit?: TransformCommit;
         onInvalidRestore?: InvalidRestoreCleanup;
-        durablePendingEditKeys?: () => readonly string[];
+        durablePendingEditKeys?: (sheet_index: number) => readonly string[];
         durableRowHeights?: DurableRowHeightsProvider;
     },
     on_installed?: (installed: ViewerPanelCore) => void,
