@@ -291,6 +291,21 @@ describe('reconcile_pending_edit_sheets', () => {
         }
     });
 
+    it('does not let a duplicate-tag loser take an index another sheet is entitled to', () => {
+        // A loser has no more claim on a position than a parked slot does. Placing
+        // it as soon as it lost let it settle on an index a worksheet processed
+        // later had a right to: `Costs` is entitled to 1, and found it taken.
+        const pending: PerFileState['pendingEdits'] = [
+            { sheetName: 'Inventory', cells: { '0:0': entry('inv-a') } },
+            { sheetName: 'Inventory', cells: { '0:0': entry('inv-b') } },
+            { sheetName: 'Costs', cells: { '0:0': entry('costs') } },
+        ];
+        const after = reconcile_pending_edit_sheets(pending, ['Inventory', 'Costs', 'Spare']);
+        expect(pending_edits_for_sheet(after, 1, 'Costs')).toEqual({ '0:0': entry('costs') });
+        // And the displaced duplicate is kept, not deleted.
+        expect(JSON.stringify(after)).toContain('inv-b');
+    });
+
     it('passes an absent leaf through', () => {
         expect(reconcile_pending_edit_sheets(undefined, ['A'])).toBeUndefined();
     });

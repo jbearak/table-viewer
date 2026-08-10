@@ -451,6 +451,36 @@ describe('apply_cell_edits', () => {
         expect(out).toContain('<c r="B2"><v>9</v></c>');
     });
 
+    it('edits in place when one unnumbered row holds cells from two rows', () => {
+        // Nothing forces an unnumbered row's cells to name a single row, and the
+        // reader keys purely off `<c r=…>`, so it shows A1 and B2 on the two rows
+        // they name. Taking only the *first* reference called the whole row row 1,
+        // so editing B2 found no row 2, synthesized one, and left the file with two
+        // cells claiming B2 — the old value and the new one, and which a reader
+        // believes is its own business.
+        const out = apply_cell_edits(
+            doc('<row><c r="A1"><v>1</v></c><c r="B2"><v>2</v></c></row>'),
+            [{ row: 1, col: 1, value: '9' }],
+            OPTS,
+        );
+        expect(out.match(/r="B2"/g)).toHaveLength(1);
+        expect(out).toContain('<c r="B2"><v>9</v></c>');
+        // The neighbour sharing that row element must be left alone.
+        expect(out).toContain('<c r="A1"><v>1</v></c>');
+    });
+
+    it('does not hand one row an adjacent row\'s cell from a shared row element', () => {
+        // The same span now serves both rows, so a cell lookup keyed on the column
+        // alone would find A1 while editing row 2 and overwrite it.
+        const out = apply_cell_edits(
+            doc('<row><c r="A1"><v>1</v></c><c r="B2"><v>2</v></c></row>'),
+            [{ row: 1, col: 0, value: '9' }],
+            OPTS,
+        );
+        expect(out).toContain('<c r="A1"><v>1</v></c>');
+        expect(out.match(/r="A2"/g)).toHaveLength(1);
+    });
+
     it('replaces a cell whose end tag carries whitespace', () => {
         // XML permits whitespace between the name and the `>` of an end tag, so
         // `</c >` is ordinary — a pretty-printer may well write it. Matching only

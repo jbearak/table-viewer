@@ -296,32 +296,46 @@ interface Span {
 }
 
 /**
- * The row number an unnumbered `<row>` implies, taken from its first `<c r="…">`.
+ * Every row number an unnumbered `<row>` implies, taken from its `<c r="…">`s.
  *
- * Undefined for a row with no referenced cell — there is nothing to edit in it,
- * so leaving it unmapped costs nothing.
+ * Usually one. But `r` is optional on both `<row>` and — for the row number —
+ * nothing forces an unnumbered row's cells to agree: a generator may put `A1` and
+ * `B2` in one `<row>`, and the reader, which keys cells purely off `<c r="…">`,
+ * shows them on the two rows they name. Taking only the *first* reference made
+ * the writer call that whole row row 1, so an edit to `B2` found no row 2, took
+ * the synthesize-a-row path, and appended a second `B2`. Two cells with the same
+ * coordinate, and which one a reader believes is its own business.
+ *
+ * So the span is claimed by every row its cells actually name, and
+ * {@link scan_cells} then matches on the full coordinate rather than the column
+ * alone. Empty for a row with no referenced cell — there is nothing to edit in
+ * it, so leaving it unmapped costs nothing.
  */
-function row_index_from_first_cell(
+function row_indexes_from_cells(
     xml: string,
     from: number,
     to: number,
     ranges: ReadonlyArray<[number, number]>,
-): number | undefined {
+): number[] {
+    const found: number[] = [];
     let pos = from;
     while (pos < to) {
         // A commented-out `<c r="A1"/>` ahead of the row's real cells named the
         // wrong row, so the edit missed the span it was aiming at and synthesized
         // a duplicate row for a coordinate already present.
         const at = indexOf_live(xml, '<c', pos, ranges);
-        if (at === -1 || at >= to) return undefined;
+        if (at === -1 || at >= to) break;
         if (!is_tag_boundary(xml[at + 2])) { pos = at + 2; continue; }
         const tag_end = find_tag_end(xml, at);
-        if (tag_end === -1 || tag_end >= to) return undefined;
+        if (tag_end === -1 || tag_end >= to) break;
         const ref = /\br="[A-Z]+(\d+)"/.exec(xml.slice(at, tag_end + 1));
-        if (ref) return Number(ref[1]) - 1;
+        if (ref) {
+            const index = Number(ref[1]) - 1;
+            if (!found.includes(index)) found.push(index);
+        }
         pos = tag_end + 1;
     }
-    return undefined;
+    return found;
 }
 
 /** Locate every `<row>` element in `sheetData`, in document order. */
@@ -572,20 +586,34 @@ function scan_rows(xml: string, from: number, to: number): Map<number, Span> {
         // disagree, and an edit to a cell the user can plainly see took the
         // synthesize-the-row path — appending a *second* row with a second copy of
         // that cell. Duplicate coordinates, and a reader may pick either value.
-        // Recover the number from the first cell reference inside instead.
-        const row_index = r
-            ? Number(r[1]) - 1
-            : row_index_from_first_cell(xml, tag_end + 1, close, ignorable);
-        if (row_index !== undefined) {
-            out.set(row_index, { start, end: after_close, inner_start: tag_end + 1, inner_end: close, open_tag });
+        // Recover the numbers from the cell references inside instead — plural,
+        // because nothing forces an unnumbered row's cells to name a single row;
+        // see `row_indexes_from_cells`.
+        const span = { start, end: after_close, inner_start: tag_end + 1, inner_end: close, open_tag };
+        if (r) {
+            out.set(Number(r[1]) - 1, span);
+        } else {
+            // First writer wins: with two spans naming a row, the earlier one is
+            // where a reader scanning in document order finds that row's cells.
+            for (const index of row_indexes_from_cells(xml, tag_end + 1, close, ignorable)) {
+                if (!out.has(index)) out.set(index, span);
+            }
         }
         pos = after_close;
     }
     return out;
 }
 
-/** Locate every `<c>` element inside one row's inner range, keyed by column index. */
-function scan_cells(xml: string, from: number, to: number): Map<number, Span> {
+/**
+ * Locate every `<c>` element inside one row's inner range, keyed by column index.
+ *
+ * `row` is the row the caller is editing, and cells naming a *different* row are
+ * skipped. That matters only for an unnumbered `<row>` whose cells disagree about
+ * which row they are on — see `row_indexes_from_cells` — where one span is shared
+ * by several rows and keying on the column alone would return a neighbour's cell.
+ * For an ordinary row every cell names it, so nothing is filtered.
+ */
+function scan_cells(xml: string, from: number, to: number, row: number): Map<number, Span> {
     const out = new Map<number, Span>();
     const ignorable = ignorable_ranges(xml, from, to);
     let pos = from;
@@ -599,7 +627,7 @@ function scan_cells(xml: string, from: number, to: number): Map<number, Span> {
         if (tag_end === -1 || tag_end >= to) break;
         const open_tag = xml.slice(start, tag_end + 1);
         const r = /\br="([A-Z]+)(\d+)"/.exec(open_tag);
-        const col = r ? letter_to_index(r[1]) : null;
+        const col = r && Number(r[2]) - 1 === row ? letter_to_index(r[1]) : null;
         if (is_self_closing(xml, start, tag_end)) {
             if (col !== null) out.set(col, { start, end: tag_end + 1, inner_start: tag_end + 1, inner_end: tag_end + 1, open_tag });
             pos = tag_end + 1;
@@ -1051,7 +1079,7 @@ export function apply_cell_edits(
             continue;
         }
 
-        const cells = scan_cells(xml, row_span.inner_start, row_span.end);
+        const cells = scan_cells(xml, row_span.inner_start, row_span.end, row);
         const inserts: Array<{ col: number; text: string }> = [];
 
         for (const e of row_edits) {

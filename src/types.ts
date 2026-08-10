@@ -1057,27 +1057,27 @@ export function reconcile_pending_edit_sheets(
     // index 0 first, so `Inventory` found it occupied and fell to the loser branch.
     // The session followed `Inventory` to index 0 and found a parked foreign draft
     // there, its own real one displaced and invisible.
+    const displaced: Array<{ slot: WorksheetPendingEdits; index: number }> = [];
     pending.forEach((slot, index) => {
         if (!slot?.sheetName) return;
         const moved_to = index_of_name.get(slot.sheetName);
         if (moved_to === undefined) return;
         while (next.length <= moved_to) next.push(undefined);
         if (claimant.get(moved_to) !== index || next[moved_to] !== undefined) {
-            // A loser keeps its own index when that is free, so a reconciliation
-            // that changes nothing else moves nothing. Its draft stays attached to
-            // a worksheet that may not be its own — visible and dismissable, which
-            // is the recoverable direction to be wrong in.
-            while (next.length <= index) next.push(undefined);
-            let landing = next[index] === undefined ? index : next.indexOf(undefined);
-            if (landing === -1) landing = next.length;
-            next[landing] = slot;
-            if (landing !== index) changed = true;
+            // A duplicate-tag loser has no entitlement either, so it waits with the
+            // parked ones rather than taking a free index now. Placing it here let
+            // it settle on an index a *winner* processed later had a right to: two
+            // `Inventory` slots at 0 and 1 with sheets ['Inventory', 'Costs'] put
+            // the loser on 1, and the `Costs` draft — entitled to 1 — was displaced
+            // and invisible to the worksheet it belonged to.
+            displaced.push({ slot, index });
             return;
         }
         if (moved_to !== index) changed = true;
         next[moved_to] = slot;
     });
-    // Parked slots last, into whatever the resolving ones left free.
+    // Everything with no claim on an index goes last, into whatever the entitled
+    // slots left free: the duplicate-tag losers above, then the parked ones.
     pending.forEach((slot, index) => {
         if (!slot?.sheetName) return;
         if (index_of_name.get(slot.sheetName) !== undefined) return;
@@ -1094,12 +1094,19 @@ export function reconcile_pending_edit_sheets(
         // dismissable, which is the recoverable direction to be wrong in. A
         // genuinely deleted sheet leaves a draft the user can discard; a renamed one
         // leaves the work intact.
-        while (next.length <= index) next.push(undefined);
-        let parked = next[index] === undefined ? index : next.indexOf(undefined);
-        if (parked === -1) parked = next.length;
-        next[parked] = slot;
-        if (parked !== index) changed = true;
+        displaced.push({ slot, index });
     });
+    // Each keeps its own index when that is still free, so a reconciliation that
+    // changes nothing else moves nothing. Otherwise it takes the first free one.
+    // Either way its draft stays attached to a worksheet that may not be its own —
+    // visible and dismissable, which is the recoverable direction to be wrong in.
+    for (const { slot, index } of displaced) {
+        while (next.length <= index) next.push(undefined);
+        let landing = next[index] === undefined ? index : next.indexOf(undefined);
+        if (landing === -1) landing = next.length;
+        next[landing] = slot;
+        if (landing !== index) changed = true;
+    }
     if (!changed) return pending;
     while (next.length > 0 && next[next.length - 1] === undefined) next.pop();
     return next.length === 0 ? undefined : next;
