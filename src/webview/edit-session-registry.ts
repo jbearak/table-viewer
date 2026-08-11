@@ -72,10 +72,11 @@ export function create_edit_session_registry(
             return created;
         },
         adopt_session: () => {
+            // Unconditional: the store's adopt_session is a bare stamp
+            // assignment with no notification, so there is nothing to save by
+            // skipping a store already on the current session.
             const session_id = current_session_id();
             for (const store of stores.values()) {
-                const stamp = store.identity();
-                if (stamp && stamp.session_id === session_id) continue;
                 store.adopt_session(session_id);
             }
         },
