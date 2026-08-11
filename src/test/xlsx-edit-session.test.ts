@@ -78,7 +78,7 @@ function latest_snapshot(panel: { __messages: unknown[] }) {
     )) as { snapshot: { identity: unknown } };
     return message.snapshot as unknown as {
         identity: unknown;
-        capabilities: { csvEditSessionId?: string; csvEditSheetIndex?: number };
+        capabilities: { csvEditSessionId?: string };
         state?: PerFileState;
     };
 }
@@ -315,23 +315,8 @@ describe('xlsx edit sessions', () => {
         });
         const panel = await open_ready_xlsx(file_path, state);
 
-        // Opening the file rehydrates the draft's session on sheet 0, so sheet 1 is
-        // refused until it is released \u2014 a session cannot move worksheets.
-        await panel.__receive({ type: 'requestEditSession', requestId: 'a', sheetIndex: 1 });
-        expect(latest_edit_session(panel)).toMatchObject({
-            granted: false,
-            sheetIndex: 0,
-        });
-        // The rehydrated session's id reaches the webview through the snapshot,
-        // which is also how the real webview learns it holds one it never asked for.
-        await panel.__receive({
-            type: 'releaseEditSession',
-            editSessionId: latest_snapshot(panel).capabilities.csvEditSessionId!,
-        });
-        await wait_for_observable(
-            () => latest_snapshot(panel).capabilities.csvEditSessionId === undefined,
-        );
-
+        // Opening the file rehydrates the draft's workbook-scoped session, and a
+        // request for sheet 1 is that same session \u2014 granted, on the sheet asked.
         await panel.__receive({ type: 'requestEditSession', requestId: 'b', sheetIndex: 1 });
         const session = latest_edit_session(panel)!;
         expect(session.granted).toBe(true);
@@ -358,19 +343,19 @@ describe('xlsx edit sessions', () => {
     });
 
     it('follows its worksheet when the workbook is reordered underneath it', async () => {
-        // The session names a sheet by *position*, and an external reorder makes
+        // A save names a sheet by *position*, and an external reorder makes
         // that position somebody else's worksheet. Saving through the stale index
         // would splice this sheet's edits into the other one and produce a
-        // perfectly valid, wrong workbook.
+        // perfectly valid, wrong workbook. The workbook-scoped session survives
+        // the reorder; the save posted against the reloaded snapshot names the
+        // sheet's new index and lands on the right rows.
         const panel = await open_ready_xlsx(file_path);
         await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
         const session = latest_edit_session(panel)!.editSessionId!;
 
         bytes = swap_sheet_order(bytes);
         await vscode_mock.__getActiveWatchers()[0].__fireChange();
-        await wait_for_observable(
-            () => latest_snapshot(panel).capabilities.csvEditSheetIndex === 0,
-        );
+        await wait_for_observable(() => sheet_names(panel)[0] === 'Inventory');
 
         // "Inventory" is slot 0 now, and the session went with it: the save the
         // webview posts against the reloaded snapshot lands on Inventory's rows.
@@ -441,13 +426,12 @@ describe('xlsx edit sessions', () => {
         });
         const panel = await open_ready_xlsx(file_path, state);
         const session = latest_snapshot(panel).capabilities.csvEditSessionId!;
-        expect(latest_snapshot(panel).capabilities.csvEditSheetIndex).toBe(1);
+        expect(latest_snapshot(panel).state?.pendingEdits?.[1]?.cells)
+            .toEqual({ '1:0': { value: 'Draft', base: 'Widget' } });
 
         bytes = swap_sheet_order(bytes);
         await vscode_mock.__getActiveWatchers()[0].__fireChange();
-        await wait_for_observable(
-            () => latest_snapshot(panel).capabilities.csvEditSheetIndex === 0,
-        );
+        await wait_for_observable(() => sheet_names(panel)[0] === 'Inventory');
 
         await panel.__receive({
             type: 'saveCsv',
@@ -483,7 +467,11 @@ describe('xlsx edit sessions', () => {
             ],
         });
         const panel = await open_ready_xlsx(file_path, state);
-        expect(latest_snapshot(panel).capabilities.csvEditSheetIndex).toBe(1);
+        // The projection shows the winning slot at Inventory's own index and
+        // withholds the displaced duplicate.
+        expect(latest_snapshot(panel).state?.pendingEdits?.[1]?.cells)
+            .toEqual({ '1:0': { value: 'Draft', base: 'Widget' } });
+        expect(latest_snapshot(panel).state?.pendingEdits?.[0]).toBeUndefined();
 
         const session = latest_snapshot(panel).capabilities.csvEditSessionId!;
         await panel.__receive({
@@ -516,25 +504,33 @@ describe('xlsx edit sessions', () => {
             ],
         });
         const panel = await open_ready_xlsx(file_path, state);
-        expect(latest_snapshot(panel).capabilities.csvEditSheetIndex).toBe(1);
+        expect(latest_snapshot(panel).state?.pendingEdits?.[1]?.cells)
+            .toEqual({ '1:0': { value: 'Draft', base: 'Widget' } });
 
         bytes = swap_sheet_order(bytes);
         await vscode_mock.__getActiveWatchers()[0].__fireChange();
-        await wait_for_observable(
-            () => latest_snapshot(panel).capabilities.csvEditSheetIndex === 0,
-        );
-
         // Inventory is slot 0 now, and the draft moved with it.
-        const projected = latest_snapshot(panel).state?.pendingEdits;
-        expect(projected?.[0]?.cells).toEqual({ '1:0': { value: 'Draft', base: 'Widget' } });
+        await wait_for_observable(() => (
+            sheet_names(panel)[0] === 'Inventory'
+            && JSON.stringify(
+                latest_snapshot(panel).state?.pendingEdits?.[0]?.cells ?? null,
+            ).includes('Draft')
+        ));
     });
 
-    it('gives up the session when its worksheet is gone from the workbook', async () => {
-        // Not a relocation: there is no honest index to move the session to, so it
-        // must not silently land on whatever sheet now holds that position.
-        const panel = await open_ready_xlsx(file_path);
-        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
-        const session = latest_edit_session(panel)!.editSessionId!;
+    it('gives up the session when every sheet its edits name is gone', async () => {
+        // The session's only durable work names a worksheet the reloaded workbook
+        // no longer has. Nothing is left for the session to represent — the draft
+        // parks rather than landing on whatever sheet inherited its position — so
+        // the session is released and its id stops buying saves.
+        const state = versioned_state_store({
+            pendingEdits: [
+                undefined,
+                { sheetName: 'Inventory', cells: { '1:0': { value: 'Draft', base: 'Widget' } } },
+            ],
+        });
+        const panel = await open_ready_xlsx(file_path, state);
+        const session = latest_snapshot(panel).capabilities.csvEditSessionId!;
 
         bytes = drop_second_sheet(bytes);
         await vscode_mock.__getActiveWatchers()[0].__fireChange();
@@ -556,6 +552,9 @@ describe('xlsx edit sessions', () => {
         await wait_for_observable(() => save_results(panel).length > 0);
         expect(save_results(panel).at(-1)).toMatchObject({ success: false });
         expect((await parse_xlsx(bytes)).data.sheets[0].rows[1][0]?.raw).toBe('Alice');
+        // The parked draft survived the release, durable and recoverable.
+        expect(JSON.stringify(state.get_state(file_path).pendingEdits ?? null))
+            .toContain('Draft');
     });
 
     it('clears a failed save\u2019s durable edits after its worksheet moves', async () => {
@@ -590,9 +589,7 @@ describe('xlsx edit sessions', () => {
 
         bytes = swap_sheet_order(bytes);
         await vscode_mock.__getActiveWatchers()[0].__fireChange();
-        await wait_for_observable(
-            () => latest_snapshot(panel).capabilities.csvEditSheetIndex === 0,
-        );
+        await wait_for_observable(() => sheet_names(panel)[0] === 'Inventory');
 
         await panel.__receive({
             type: 'releaseEditSession',
@@ -658,13 +655,13 @@ describe('xlsx edit sessions', () => {
         await wait_for_observable(() => save_results(panel).length > before);
     });
 
-    it('clears the discarded worksheet\u2019s slot after a reorder, not the neighbour\u2019s', async () => {
+    it('clears every live slot after a reorder when a discard is retried', async () => {
         // The discard's durable clear fails, leaving the cleanup `uncertain`; the
-        // retry runs whenever editing is next requested, which may be long after an
-        // external reorder. Durable slots are reconciled by name on the way into
-        // that retry, so clearing by the captured *position* deleted People's
-        // unsaved draft and left Inventory's behind — the exact inverse of what the
-        // user asked for, and unrelated work lost silently.
+        // retry runs whenever editing is next requested, which may be long after
+        // an external reorder. The session covers the whole workbook, so the
+        // discard the user confirmed covers every sheet it was showing — and
+        // the retry must find those slots by name after the reorder, not clear
+        // by stale positions.
         const state = versioned_state_store({
             pendingEdits: [
                 { sheetName: 'People', cells: { '1:0': { value: 'Draft', base: 'Alice' } } },
@@ -672,15 +669,6 @@ describe('xlsx edit sessions', () => {
             ],
         });
         const panel = await open_ready_xlsx(file_path, state);
-        // The draft on sheet 0 rehydrates a session there; release it so the
-        // discard below is about Inventory.
-        await panel.__receive({
-            type: 'releaseEditSession',
-            editSessionId: latest_snapshot(panel).capabilities.csvEditSessionId!,
-        });
-        await wait_for_observable(
-            () => latest_snapshot(panel).capabilities.csvEditSessionId === undefined,
-        );
         await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
         const session = latest_edit_session(panel)!.editSessionId!;
 
@@ -707,7 +695,8 @@ describe('xlsx edit sessions', () => {
         await wait_for_observable(() => !JSON.stringify(
             state.get_state(file_path).pendingEdits ?? null,
         ).includes('Gadget'));
-        expect(JSON.stringify(state.get_state(file_path).pendingEdits)).toContain('Draft');
+        expect(JSON.stringify(state.get_state(file_path).pendingEdits ?? null))
+            .not.toContain('Draft');
     });
 
     it('clears a disposed panel’s failed save by name, not by its old index', async () => {
@@ -1156,13 +1145,13 @@ describe('xlsx edit sessions', () => {
         expect(durable()).toContain('Draft');
     });
 
-    it('keeps a displaced draft when a session with no durable map is discarded', async () => {
-        // The discarded worksheet never published a durable map, so it has no slot
-        // of its own and `slot_index_tagged` falls back to the captured index — which
-        // a displaced same-named draft legitimately occupies, since reconciliation
-        // seats only one of two same-named slots at their sheet's own index. The
-        // clear emptied that position by number, deleting an unsaved draft that no
-        // message asked to discard.
+    it('keeps a displaced same-named draft when the session is discarded', async () => {
+        // Reconciliation seats only one of two same-named slots at their sheet's
+        // own index; the loser sits displaced at another sheet's position and is
+        // never projected into any snapshot. The workbook-wide discard clears
+        // what the session was showing — the live slot — and must not reach the
+        // displaced draft the user never saw, since no message asked to discard
+        // it.
         const state = versioned_state_store({
             pendingEdits: [
                 { sheetName: 'Inventory', cells: { '1:0': { value: 'Mallory', base: 'Widget' } } },
@@ -1182,7 +1171,7 @@ describe('xlsx edit sessions', () => {
 
         const durable = JSON.stringify(state.get_state(file_path).pendingEdits ?? []);
         expect(durable, 'Mallory').toContain('Mallory');
-        expect(durable, 'Draft').toContain('Draft');
+        expect(durable, 'Draft').not.toContain('Draft');
     });
 
     it('keeps a durable draft when its worksheet is renamed externally', async () => {
@@ -1233,7 +1222,7 @@ describe('xlsx edit sessions', () => {
         });
         const panel = await open_ready_xlsx(file_path, state);
         const snapshot = latest_snapshot(panel);
-        expect(snapshot.capabilities.csvEditSheetIndex).toBe(1);
+        expect(snapshot.capabilities.csvEditSessionId).toBeDefined();
         const projected = JSON.stringify(snapshot.state?.pendingEdits ?? null);
         expect(projected).toContain('Real');
         // And the parked draft is still not projected anywhere — it has no worksheet.
@@ -1266,11 +1255,11 @@ describe('xlsx edit sessions', () => {
         await vscode_mock.__getActiveWatchers()[0].__fireChange();
         await wait_for_observable(() => (
             sheet_names(panel)[0] === 'Inventory'
-            && latest_snapshot(panel).capabilities.csvEditSheetIndex === 0
+            && JSON.stringify(latest_snapshot(panel).state?.pendingEdits ?? null)
+                .includes('Real')
         ));
 
         const projected = JSON.stringify(latest_snapshot(panel).state?.pendingEdits ?? null);
-        expect(projected).toContain('Real');
         expect(projected).not.toContain('Parked');
     });
 

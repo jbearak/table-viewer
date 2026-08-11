@@ -3772,7 +3772,6 @@ describe('edit mode save exit', () => {
                     csvEditable: true,
                     csvEditingSupported: true,
                     csvEditSessionId: 'file-a-session',
-                    csvEditSheetIndex: 1,
                 },
             },
         ));
@@ -3788,7 +3787,6 @@ describe('edit mode save exit', () => {
                     csvEditable: true,
                     csvEditingSupported: true,
                     csvEditSessionId: 'file-b-session',
-                    csvEditSheetIndex: 0,
                 },
             },
         ));
@@ -3822,7 +3820,6 @@ describe('edit mode save exit', () => {
                     csvEditable: true,
                     csvEditingSupported: true,
                     csvEditSessionId: 'moving-session',
-                    csvEditSheetIndex: 1,
                 },
             },
         ));
@@ -3844,7 +3841,6 @@ describe('edit mode save exit', () => {
                     csvEditable: true,
                     csvEditingSupported: true,
                     csvEditSessionId: 'moving-session',
-                    csvEditSheetIndex: 0,
                 },
             },
         ));
@@ -3882,7 +3878,6 @@ describe('edit mode save exit', () => {
                     csvEditable: true,
                     csvEditingSupported: true,
                     csvEditSessionId: 'session-before',
-                    csvEditSheetIndex: 1,
                 },
             },
         ));
@@ -3906,7 +3901,6 @@ describe('edit mode save exit', () => {
                     csvEditable: true,
                     csvEditingSupported: true,
                     csvEditSessionId: 'session-after',
-                    csvEditSheetIndex: 0,
                 },
             },
         ));
@@ -4180,7 +4174,6 @@ describe('edit mode save exit', () => {
                     csvEditable: true,
                     csvEditingSupported: true,
                     csvEditSessionId: 'adopted-session',
-                    csvEditSheetIndex: 1,
                 },
             },
         ));

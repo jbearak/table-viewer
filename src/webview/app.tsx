@@ -1299,15 +1299,14 @@ export function App(): React.JSX.Element {
                     }
                     const snapshot_edit_session_id =
                         snapshot.capabilities.csvEditSessionId;
-                    // The sheet the *host's* session holds, which is the key space
-                    // its restored edits are in. A snapshot can arrive before any
-                    // grant this panel asked for (adoption, reload, a restored
-                    // window), so the ref's own value is not authoritative here.
+                    // The sheet whose restored edits the snapshot carries, which
+                    // is the key space to hydrate. The session is workbook-scoped,
+                    // so no capability names a sheet; the durable slots do. A
+                    // snapshot can arrive before any grant this panel asked for
+                    // (adoption, reload, a restored window), so the ref's own
+                    // value is not authoritative here.
                     const snapshot_edit_sheet_index =
-                        snapshot.capabilities.csvEditSheetIndex
-                        // No session to name it: the durable slot does. A reload or a
-                        // restored window arrives this way, with edits and no owner.
-                        ?? sheet_index_with_pending_edits(
+                        sheet_index_with_pending_edits(
                             snapshot.presentation === 'refresh'
                                 ? refresh_authoritative_state?.pendingEdits
                                 : initial_normalized_state?.pendingEdits,

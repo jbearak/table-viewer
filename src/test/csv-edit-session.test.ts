@@ -8124,6 +8124,24 @@ describe('CSV edit sessions', () => {
         });
     });
 
+    it('clears a legacy untagged durable slot on discard', async () => {
+        // A slot migrated from the flat pre-worksheet format has no sheetName
+        // tag; the discard must still recognise it as the session's own — an
+        // untagged slot is single-sheet CSV by construction, always shown.
+        const file_path = '/tmp/legacy-discard.csv';
+        const state = state_store({
+            pendingEdits: [{ cells: { '0:0': { value: 'draft', base: 'a' } } }],
+        });
+        const panel = open_csv_table(uri(file_path), state.store);
+        await panel.__receive({ type: 'ready' });
+        const session = latest_snapshot(panel).capabilities.csvEditSessionId!;
+        expect(session).toBeDefined();
+
+        await panel.__receive({ type: 'discardEditSession', editSessionId: session } as never);
+
+        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+    });
+
     it('clears pending edits and releases ownership atomically on discard', async () => {
         const file_path = '/tmp/session.csv';
         const file_uri = uri(file_path);
