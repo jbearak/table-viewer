@@ -1898,6 +1898,7 @@ describe('write_xlsx_cell_edits', () => {
             // the time the second failed.
             const raw = with_calc_chain(with_formula_at_b2(readFileSync(SAMPLE)));
             const before_types = text_part(raw, '/[Content_Types].xml');
+            const before_rels = text_part(raw, '/xl/_rels/workbook.xml.rels');
             // Armed only once the calc chain removal is underway, so both reference
             // parts stay readable for the reads the edit itself needs. Which of the
             // two is hit second is deliberately *not* hard-coded: the failure has to
@@ -1908,6 +1909,7 @@ describe('write_xlsx_cell_edits', () => {
             const actual_find = CFB.find;
             let removing = false;
             let first: string | null = null;
+            let injected = false;
             const spy = vi.spyOn(CFB, 'find').mockImplementation(((
                 file: never,
                 path: string,
@@ -1917,7 +1919,10 @@ describe('write_xlsx_cell_edits', () => {
                     // Repeat visits to the part already reached are let through, so
                     // the removal gets as far as committing that one edit.
                     if (first === null) first = path;
-                    if (path !== first) throw new Error('unreadable part');
+                    if (path !== first) {
+                        injected = true;
+                        throw new Error('unreadable part');
+                    }
                 }
                 return actual_find.call(CFB, file, path);
             }) as typeof CFB.find);
@@ -1931,11 +1936,19 @@ describe('write_xlsx_cell_edits', () => {
                 spy.mockRestore();
             }
 
+            // The failure really was injected. Without this the test would go on
+            // passing if the edit stopped dropping a formula: no removal, nothing
+            // thrown, and a package that is whole for the uninteresting reason.
+            expect(injected).toBe(true);
+            // The edit landed. The whole point of swallowing the failure is that
+            // the user keeps their change; a `remove_part` that gave up by
+            // discarding the edited package would satisfy every check below.
+            expect(text_part(out, '/xl/worksheets/sheet3.xml')).toContain('<v>42</v>');
             // And nothing was half-removed: the part, its content type and its
             // relationship are all exactly as they were.
             expect(part(out, '/xl/calcChain.xml')).not.toBeNull();
             expect(text_part(out, '/[Content_Types].xml')).toBe(before_types);
-            expect(text_part(out, '/xl/_rels/workbook.xml.rels')).toContain('calcChain.xml');
+            expect(text_part(out, '/xl/_rels/workbook.xml.rels')).toBe(before_rels);
         });
     });
 
