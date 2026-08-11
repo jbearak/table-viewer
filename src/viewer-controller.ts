@@ -3636,7 +3636,10 @@ export function attach_viewer(
                     index: number,
                 ) => slot !== undefined && (
                     slot.sheetName === undefined
-                    || (!!source && sheet_index_named(slot.sheetName, names) === index)
+                    // `names` is the updater's captured list — empty for a
+                    // disposed panel, where nothing tagged resolves and every
+                    // tagged slot rightly survives.
+                    || sheet_index_named(slot.sheetName, names) === index
                 );
                 const retained = current.pendingEdits.map(
                     (slot, index) => (shown(slot, index) ? undefined : slot),

@@ -72,13 +72,10 @@ export interface EditSessionIdentity {
      *  `restored_edits !== undefined` with no session), compared with ===,
      *  never treated as a wildcard.
      *
-     *  Sheet index is deliberately *not* part of the identity: `csv_editable` is
-     *  CSV-only and CSV is single-sheet, which is also why `initial_edits` is a
-     *  flat map (see the comment at app.tsx's `initial_edits` declaration).
-     *  `active_sheet_index` is part of GridShell's key, so a sheet switch
-     *  remounts and, before this store existed, re-seeded the map from the prop;
-     *  with the store the map survives that switch instead — unreachable for
-     *  CSV, and the alternative (dropping edits on a switch) would be worse. */
+     *  Sheet index is deliberately *not* part of the identity: the sheet split
+     *  lives outside the store, in the registry's `Map<sheet_index, store>`,
+     *  so a store never spans more than one worksheet and its keys stay in one
+     *  sheet's `row:col` space. */
     readonly session_id: string | undefined;
 }
 

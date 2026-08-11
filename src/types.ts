@@ -870,9 +870,9 @@ export interface WorksheetPendingEdits {
 
 /**
  * One worksheet's pending cell edits, keyed `"<canonical source row>:<source
- * column>"`. This is the unit the edit session and the save lifecycle work in —
- * both are worksheet-scoped — so functions there take this rather than the
- * whole-workbook leaf.
+ * column>"`. The session is workbook-scoped but every map, save operation and
+ * grid works one worksheet at a time, so functions there take this rather
+ * than the whole-workbook leaf.
  */
 export type SheetPendingEditCells = Record<string, string | CsvDirtyEntry>;
 
@@ -899,13 +899,13 @@ export function pending_edits_for_sheet(
 }
 
 /**
- * The worksheet a restored edit map belongs to, when nothing else names it.
+ * The first worksheet holding restored edits, when nothing else names one.
  *
  * A snapshot that carries edits but no live session — a reload, a restored
- * window — still says which sheet they are for, because the slot's index *is* the
- * sheet. Only one sheet can hold edits at a time (a session is worksheet-scoped
- * and there is one at a time), so the first occupied slot is the whole answer;
- * `undefined` means there is nothing to attribute.
+ * window — still says which sheets they are for, because the slot's index *is*
+ * the sheet. The session is workbook-scoped, so several slots can be occupied
+ * at once; this picks the first as the default edit pointer, and the caller
+ * hydrates the rest per slot. `undefined` means there is nothing to attribute.
  */
 export function sheet_index_with_pending_edits(
     pending: PerFileState['pendingEdits'],

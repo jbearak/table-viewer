@@ -390,11 +390,12 @@ export function App(): React.JSX.Element {
     const [csv_edit_session_id, set_csv_edit_session_id_state] = useState<string>();
     const csv_edit_session_id_ref = useRef<string>();
     /**
-     * The worksheet the held edit session belongs to. Editing is worksheet-scoped,
-     * so the dirty map, the save operation and the hydration reads all live in one
-     * sheet's key space; this names which. Set from the grant the host echoes back
-     * rather than from the active tab, so a sheet switch mid-session cannot
-     * silently retarget an in-flight save.
+     * The edit *pointer*: the worksheet the workbook-scoped session is
+     * currently editing on screen. The dirty maps live per sheet in the
+     * registry; this names the one the mounted grid, the save operation and
+     * the default hydration reads work in. Set from the grant the host echoes
+     * back rather than from the active tab, so a sheet switch mid-session
+     * cannot silently retarget an in-flight save.
      */
     const edit_session_sheet_index_ref = useRef<number>(0);
     // The same value as a rendered one. The ref is what callbacks read
@@ -415,11 +416,10 @@ export function App(): React.JSX.Element {
     // generation-keyed GridShell remounts that a transform or refresh snapshot
     // forces.
     //
-    // A registry rather than a single store because editing is widening to the
+    // A registry rather than a single store because the session covers the
     // whole workbook (#154): each sheet keeps its own map in its own `row:col`
     // key space, which is what lets the store and the `use_editing` hook stay
-    // sheet-agnostic. Only one sheet holds a session today, so exactly one of
-    // these is ever non-empty; the shape is what changes here, not the behaviour.
+    // sheet-agnostic.
     // Reads the session id ref rather than holding a copy: the ref is the one
     // authoritative value, it moves synchronously in set_csv_edit_session_id,
     // and a store built after that move is stamped from it at creation — so
@@ -447,14 +447,14 @@ export function App(): React.JSX.Element {
         set_edit_mode_state(next);
     }, []);
     /**
-     * Edit mode as *this tab* sees it. A session belongs to one worksheet, so
-     * switching tabs mid-session must not show the grid another sheet's dirty map
-     * in a key space it does not share, nor light the Edit button as if this sheet
-     * were the one being edited.
+     * Edit mode as *this tab* sees it. The session covers the whole workbook,
+     * but the grid edits where the pointer is: a tab the pointer does not name
+     * renders read-only (its Edit button re-enters the session there), and
+     * must not light up as if it were the sheet being edited.
      */
     const edit_mode_on_active_sheet =
         edit_mode && active_sheet_index === edit_session_sheet_index;
-    /** A session is open, on some other worksheet. */
+    /** The session's edit pointer names some other worksheet. */
     const editing_another_sheet =
         edit_mode && active_sheet_index !== edit_session_sheet_index;
     const [edit_session_pending, set_edit_session_pending] = useState(false);
@@ -523,9 +523,9 @@ export function App(): React.JSX.Element {
     const [highlight_request_pending, set_highlight_request_pending] = useState(false);
     const [highlight_status, set_highlight_status] = useState('');
     // Pending edits restored from per-file state, fed to GridShell on (re)mount so
-    // unsaved work survives a webview reload. Flat, not worksheet-indexed like the
-    // durable leaf: a session owns exactly one worksheet, so this map is always
-    // that sheet's. Keys are source-keyed — see the
+    // unsaved work survives a webview reload. Flat, not worksheet-indexed like
+    // the durable leaf: always the pointer sheet's map — other sheets hydrate
+    // straight into their registry stores. Keys are source-keyed — see the
     // `pendingEdits` declaration in types.ts for why existing maps are
     // reinterpreted as source-keyed rather than migrated.
     const [initial_edits, set_initial_edits] = useState<
@@ -629,12 +629,11 @@ export function App(): React.JSX.Element {
     const save_projection_ref = useRef<CsvSaveProjection>(
         INITIAL_CSV_SAVE_PROJECTION,
     );
-    // One sheet's live dirty cells — the sheet this renderer holds a session for.
-    // Editing is worksheet-scoped, so everything from here down works in a single
-    // sheet's key space; the whole-workbook leaf is assembled only at the durable
-    // boundary, where the host writes it into the owning sheet's slot.
+    // The pointer sheet's live dirty cells, mirrored from the mounted grid's
+    // reports. Other sheets' maps live only in their registry stores; the
+    // durable leaf keeps one slot per sheet, written by the host.
     const latest_live_edits_ref = useRef<SheetPendingEditCells | undefined>(undefined);
-    /** The store for the worksheet the session belongs to. */
+    /** The store for the worksheet the edit pointer names. */
     const edit_session_store = useCallback((): EditSessionStore => (
         edit_session_registry_ref.current!.for_sheet(
             edit_session_sheet_index_ref.current,
@@ -1379,13 +1378,14 @@ export function App(): React.JSX.Element {
                     } else {
                         const previous_names = meta_ref.current?.sheets
                             .map((sheet) => sheet.name) ?? [];
-                        const next_names = snapshot.meta.sheets
-                            .map((sheet) => sheet.name);
+                        const next_index_by_name = new Map(
+                            snapshot.meta.sheets.map((sheet, index) => [sheet.name, index]),
+                        );
                         edit_session_registry_ref.current!.remap((previous_index) => {
                             const name = previous_names[previous_index];
-                            if (name === undefined) return undefined;
-                            const next_index = next_names.indexOf(name);
-                            return next_index === -1 ? undefined : next_index;
+                            return name === undefined
+                                ? undefined
+                                : next_index_by_name.get(name);
                         });
                     }
                     edit_session_sheet_index_ref.current = snapshot_edit_sheet_index;
