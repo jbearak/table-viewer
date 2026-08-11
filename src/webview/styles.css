@@ -798,6 +798,28 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     margin-left: auto;
 }
 
+/*
+ * Separates the workbook-scoped actions from the worksheet-scoped ones. The
+ * breathing room is on top of the row's 6px gap, so the rule reads as a boundary
+ * rather than as one more crowded item.
+ *
+ * That room is padding rather than margin, and the background is clipped to the
+ * content box so only the 1px rule paints. `use_toolbar_wrap` measures children
+ * by `scrollWidth`, which counts padding but not margin — as a margin these 4px
+ * were spent but never measured, so the toolbar stayed unwrapped a few pixels
+ * past the point it should have and scrolled the action strip instead.
+ */
+.toolbar-actions-divider {
+    flex: 0 0 auto;
+    align-self: stretch;
+    box-sizing: content-box;
+    width: 1px;
+    min-height: 1.25em;
+    padding: 0 2px;
+    background: var(--vscode-panel-border, #444);
+    background-clip: content-box;
+}
+
 .toolbar.is-wrapped {
     flex-wrap: wrap;
 }

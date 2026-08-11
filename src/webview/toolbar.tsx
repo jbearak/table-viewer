@@ -62,6 +62,18 @@ export interface ToolbarProps {
     edit_disabled_reason?: string;
 }
 
+/**
+ * The keys of a rendered action group, joined — a single dependency value that
+ * changes whenever the group's membership does, not merely its size.
+ */
+function react_element_keys(elements: readonly React.ReactNode[]): string {
+    return elements
+        .map((element) =>
+            React.isValidElement(element) ? String(element.key) : '',
+        )
+        .join(',');
+}
+
 export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Toolbar(
     props,
     focus_ref,
@@ -87,6 +99,101 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
         },
         focus_columns: () => columns_ref.current?.focus() ?? false,
     }), []);
+    // Actions that change something about the whole workbook. Membership here is
+    // what puts a button left of the divider; see the action row below.
+    const workbook_actions = [
+        props.show_formatting_button && (
+            <ToolbarButton
+                key="formatting"
+                label="Formatting"
+                active={props.show_formatting}
+                tooltip_text={props.show_formatting
+                    ? 'Show raw cell values.'
+                    : 'Show formatted cell values.'}
+                onClick={props.on_toggle_formatting}
+            />
+        ),
+        props.show_vertical_tabs_button && (
+            <ToolbarButton
+                key="vertical-tabs"
+                label="Vertical Tabs"
+                active={props.vertical_tabs}
+                tooltip_text={props.vertical_tabs
+                    ? 'Move sheet tabs above the table.'
+                    : 'Move sheet tabs to the left of the table.'}
+                onClick={props.on_toggle_tab_orientation}
+            />
+        ),
+    ].filter(Boolean);
+
+    // Actions that change something about the active worksheet only. Columns and
+    // Auto-fit are unconditional, so this group never empties — which is why the
+    // divider below only has to ask about the workbook group.
+    //
+    // Edit is here because that is what it currently is: the host holds one edit
+    // session, owned by one worksheet, and every other sheet reports "Finish
+    // editing the other worksheet first" while it is open. #154 wants it moved to
+    // the workbook group, and it moves when that is made true of the session —
+    // putting it there first would only relabel the confusion the grouping exists
+    // to remove.
+    const worksheet_actions = [
+        props.show_edit_button && (
+            <ToolbarButton
+                key="edit"
+                label="Edit"
+                active={props.edit_mode}
+                tooltip_text={props.edit_disabled
+                    ? (props.edit_disabled_reason ?? 'Editing is unavailable.')
+                    : props.edit_mode
+                    ? 'Exit edit mode.'
+                    : 'Enter edit mode to modify cell values.'}
+                onClick={props.on_toggle_edit_mode}
+                extra_class={props.is_dirty ? 'has-unsaved' : undefined}
+                disabled={props.edit_disabled}
+            />
+        ),
+        props.show_excel_header_button && (
+            <ToolbarButton
+                key="excel-header"
+                label="First Row as Header"
+                active={props.excel_header_active}
+                tooltip_text={props.excel_header_disabled
+                    ? (props.excel_header_disabled_reason
+                        ?? 'First-row headers are unavailable.')
+                    : props.excel_header_active
+                    ? props.excel_header_automatic
+                        ? 'Automatically using the first row as column names. Click to show it as data.'
+                        : 'Show the header row as data.'
+                    : 'Use the first non-hidden row as column names.'}
+                onClick={props.on_toggle_excel_header}
+                disabled={props.excel_header_disabled}
+                focusable_when_disabled
+            />
+        ),
+        <ColumnVisibilityControl
+            key="columns"
+            ref={columns_ref}
+            {...props.column_visibility}
+        />,
+        <ToolbarButton
+            key="auto-fit"
+            label="Auto-fit Columns"
+            active={props.auto_fit_active}
+            tooltip_text={props.auto_fit_disabled
+                ? (props.auto_fit_disabled_reason ?? 'Auto-fit is unavailable.')
+                : props.auto_fit_active
+                ? 'Restore original column widths.'
+                : 'Auto-fit all columns to their content.'}
+            onClick={props.on_toggle_auto_fit}
+            disabled={props.auto_fit_disabled}
+        />,
+    ].filter(Boolean);
+
+    // Each group's membership as one value, so the wrap deps below can compare
+    // identity and not merely how many there are.
+    const workbook_action_keys = react_element_keys(workbook_actions);
+    const worksheet_action_keys = react_element_keys(worksheet_actions);
+
     const wrapped = use_toolbar_wrap(
         { toolbar: toolbar_ref, lead: lead_ref, chips: chips_ref, actions: actions_ref },
         [
@@ -101,12 +208,20 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
             props.highlight?.active_color,
             props.highlight?.selection_available,
             props.highlight?.pending,
-            props.show_formatting_button,
-            props.show_excel_header_button,
+            // Which actions each group renders, rather than the individual `show_*`
+            // flags: an action added to a group is then measured without anyone
+            // having to remember to list it here too.
+            //
+            // Keys rather than counts. A count misses a swap — one action appearing
+            // as another in the same group disappears leaves the length alone while
+            // the widths differ, so the row would keep a wrapped state measured
+            // against buttons that are no longer there.
+            workbook_action_keys,
+            worksheet_action_keys,
+            // Not membership but width: these change a button's label-driven size
+            // without changing how many buttons there are.
             props.excel_header_active,
             props.excel_header_disabled,
-            props.show_vertical_tabs_button,
-            props.show_edit_button,
         ],
     );
     const controls_disabled = !!(props.transform_disabled || props.transform_pending);
@@ -187,73 +302,33 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                     </span>
                 )}
             </div>
+            {/*
+              * Two groups: what an action changes for the whole workbook, then what
+              * it changes for this worksheet alone. The order used to interleave the
+              * two, which read as arbitrary (#154).
+              *
+              * Built as two arrays rather than as one JSX sequence so that group
+              * membership is stated once. The divider follows from whether the
+              * workbook group is empty, so adding an action to a group cannot leave
+              * the rule behind — the failure that condition would hide is a narrow
+              * one, visible only when the new action is the *only* workbook action
+              * on screen.
+              *
+              * Still flat children of one row: `use_toolbar_wrap` measures the
+              * direct children here and adds one action gap between each, and
+              * `.toolbar-actions > :first-child` carries the right-alignment.
+              * Nesting either group in a wrapper would break both.
+              */}
             <div ref={actions_ref} className="toolbar-actions">
-                {props.show_edit_button && (
-                    <ToolbarButton
-                        label="Edit"
-                        active={props.edit_mode}
-                        tooltip_text={props.edit_disabled
-                            ? (props.edit_disabled_reason ?? 'Editing is unavailable.')
-                            : props.edit_mode
-                            ? 'Exit edit mode.'
-                            : 'Enter edit mode to modify cell values.'}
-                        onClick={props.on_toggle_edit_mode}
-                        extra_class={props.is_dirty ? 'has-unsaved' : undefined}
-                        disabled={props.edit_disabled}
+                {workbook_actions}
+                {workbook_actions.length > 0 && (
+                    <div
+                        className="toolbar-actions-divider"
+                        role="separator"
+                        aria-orientation="vertical"
                     />
                 )}
-                {props.show_excel_header_button && (
-                    <ToolbarButton
-                        label="First Row as Header"
-                        active={props.excel_header_active}
-                        tooltip_text={props.excel_header_disabled
-                            ? (props.excel_header_disabled_reason
-                                ?? 'First-row headers are unavailable.')
-                            : props.excel_header_active
-                            ? props.excel_header_automatic
-                                ? 'Automatically using the first row as column names. Click to show it as data.'
-                                : 'Show the header row as data.'
-                            : 'Use the first non-hidden row as column names.'}
-                        onClick={props.on_toggle_excel_header}
-                        disabled={props.excel_header_disabled}
-                        focusable_when_disabled
-                    />
-                )}
-                {props.show_formatting_button && (
-                    <ToolbarButton
-                        label="Formatting"
-                        active={props.show_formatting}
-                        tooltip_text={props.show_formatting
-                            ? 'Show raw cell values.'
-                            : 'Show formatted cell values.'}
-                        onClick={props.on_toggle_formatting}
-                    />
-                )}
-                <ColumnVisibilityControl
-                    ref={columns_ref}
-                    {...props.column_visibility}
-                />
-                <ToolbarButton
-                    label="Auto-fit Columns"
-                    active={props.auto_fit_active}
-                    tooltip_text={props.auto_fit_disabled
-                        ? (props.auto_fit_disabled_reason ?? 'Auto-fit is unavailable.')
-                        : props.auto_fit_active
-                        ? 'Restore original column widths.'
-                        : 'Auto-fit all columns to their content.'}
-                    onClick={props.on_toggle_auto_fit}
-                    disabled={props.auto_fit_disabled}
-                />
-                {props.show_vertical_tabs_button && (
-                    <ToolbarButton
-                        label="Vertical Tabs"
-                        active={props.vertical_tabs}
-                        tooltip_text={props.vertical_tabs
-                            ? 'Move sheet tabs above the table.'
-                            : 'Move sheet tabs to the left of the table.'}
-                        onClick={props.on_toggle_tab_orientation}
-                    />
-                )}
+                {worksheet_actions}
             </div>
         </div>
     );
