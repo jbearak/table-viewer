@@ -1,6 +1,6 @@
 # VS Code extension setup and 10-minute try-out
 
-The Table Viewer extension opens Excel workbooks inside VS Code and remembers how you like to look at them. Sorting, filters, hidden columns, column widths, highlights, the active sheet, and other viewing choices are stored separately from the workbook. The Excel file itself is not changed.
+The Table Viewer extension opens Excel workbooks inside VS Code and remembers how you like to look at them. Sorting, filters, hidden columns, column widths, highlights, the active sheet, and other viewing choices are stored in Table Viewer's own storage rather than in the file, so opening a file never changes it. The contents of a cell — the text or numbers inside it — change only when you enter edit mode, change a cell, and save.
 
 You do not need to write code or already use VS Code. VS Code can simply be the app that hosts Table Viewer.
 
@@ -86,11 +86,12 @@ You can repeat the replacement while keeping the file open—handy when a script
 
 ## 6. A few useful details
 
-- Excel workbooks are read-only in Table Viewer. The extension does not write your sorts, filters, widths, hidden columns, or highlights into them.
+- Modern `.xlsx` workbooks have an optional edit mode; legacy `.xls` workbooks are read-only. Edit mode changes only the contents of cells, and only once you save. The extension never writes your sorts, filters, widths, hidden columns, or highlights into either format.
+- Edit mode also doubles as a place for annotations that outlive a new version of the file. Until you save them, your changes stay as pending edits in the extension's storage, so they come back with the file the same way your highlights and layout do.
 - View choices are remembered per file and worksheet in VS Code's local extension storage.
 - Sorts and filters follow column names, so Table Viewer may discard them if a revised workbook no longer has a compatible column structure.
 - Highlights are positional annotations. They will reappear when temporarily missing rows, columns, or worksheets return, so you do not lose that time and effort.
-- CSV and TSV files open directly in Table Viewer by default and, unlike Excel workbooks, have an optional edit mode. To edit one as plain text, select **Open in Text Editor** in the editor title bar, or right-click its tab and choose **Reopen Editor With… → Text Editor**.
+- CSV and TSV files also open directly in Table Viewer with an optional edit mode. To edit one as plain text, select **Open in Text Editor** in the editor title bar, or right-click its tab and choose **Reopen Editor With… → Text Editor**.
 
 ## Troubleshooting
 

@@ -39,7 +39,9 @@ Use whichever route feels most familiar:
 > [!NOTE]
 > `.xlsx`, `.xls`, `.csv`, and `.tsv` files all open directly in Table Viewer by default.
 >
-> The Excel formats have the richest viewing support: multiple worksheets, merged cells, number and date formatting, and bold or italic text. They are read-only. CSV and TSV files are single unformatted tables that you can edit. You can also reopen them in VS Code's text editor and use Table Viewer's synchronized side-by-side preview.
+> Table Viewer shows an Excel workbook's worksheets, merged cells, number and date formats, and bold or italic text. `.csv` and `.tsv` files are single unformatted tables; in exchange, you can reopen one in VS Code's text editor and use Table Viewer's synchronized side-by-side preview.
+>
+> `.xlsx`, `.csv`, and `.tsv` files are editable. Legacy `.xls` workbooks are read-only.
 
 VS Code remembers open files when you close and reopen it. A file may therefore still be waiting in its tab the next time you start the app.
 

@@ -152,9 +152,9 @@ The display name in the markup is hardcoded, because `app.name` is the package n
 
 `notices_file_path` (`desktop/main/notices-path.ts`) resolves the bundled `THIRD_PARTY_NOTICES.txt`, which lives in two different places: `dist/desktop/` in a dev run, and `Contents/Resources/` in a packaged app (electron-builder excludes it from `files` and ships it via `extraResources`). It only exists once `desktop/collect-licenses.mjs` has run, which `npm run desktop:dev` now does.
 
-## CSV and TSV editing
+## Editing `.xlsx`, `.csv`, and `.tsv` files
 
-CSV and TSV files support the same editing workflow as the VS Code extension. Click **Edit** to change cell values; `Cmd/Ctrl+S` saves back to the opened file, and leaving edit mode with changes offers Save, Discard, or Cancel. Desktop state is stored separately from the VS Code extension, as described above.
+Modern Excel (`.xlsx`), `.csv`, and `.tsv` files support the same editing workflow as the VS Code extension; legacy Excel (`.xls`) files are read-only. Click **Edit** to change cell values; `Cmd/Ctrl+S` saves back to the opened file, and leaving edit mode with changes offers Save, Discard, or Cancel. Desktop state is stored separately from the VS Code extension, as described above.
 
 Unsaved edits are durable: the shared controller persists `pendingEdits` per file in the state store and hands them back when the file is reopened, so closing a window does not lose a draft — it comes back where you left it (hot-exit semantics, the same as the VS Code extension). Closing therefore does not prompt.
 

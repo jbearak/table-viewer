@@ -1,6 +1,8 @@
 # Table Viewer
 
-A fast viewer for Excel (`.xlsx`, `.xls`) files and viewer/editor for CSV and TSV files, built for *reading* tables — reviewing, exploring, and annotating them — rather than authoring spreadsheets. Available as a standalone desktop app and a VS Code extension, with persistent layouts, view-only sorting and filtering, and auto-refresh.
+A fast viewer/editor for Excel (`.xlsx`), `.csv`, and `.tsv` files, with read-only support for legacy Excel (`.xls`) workbooks. It is built for reviewing, exploring, and annotating tables. Available as a standalone desktop app and a VS Code extension.
+
+What you do while reviewing a table — sorting, filtering, hiding columns, resizing, highlighting cells — is stored alongside the file rather than inside it, so the file on disk is untouched and your sorts, filters, and highlights are still there the next time you open it, even if the file was regenerated in the meantime. Table Viewer also reloads on its own when the file changes on disk. Cell contents change only when you enter edit mode and save.
 
 Follow the [setup and 10-minute try-out guide](docs/setup-guide.md) to choose the standalone app or VS Code extension, install it, try two sample workbooks, and see Table Viewer preserve a saved view when a file is replaced.
 
@@ -16,7 +18,7 @@ When I make tables, I make them in code — R, Stata, Python — and refine them
 - **Many-sheet workbooks are painful**: when tabs overflow Excel's bottom bar you can't even scroll — you click left/right buttons to expose tabs. Table Viewer's sheet tabs scroll, and can be laid out vertically.
 - **Remote files must be downloaded first.** As a VS Code extension, Table Viewer works the same over SSH as locally, and uses your editor's theme and font.
 
-The flip side is that Table Viewer is deliberately *not* a spreadsheet editor. You can't create files or sheets, add cells beyond the file's existing bounds, or change formatting — Excel workbooks are strictly read-only, and CSV/TSV editing is limited to the cells the file already has. That constraint is the point: you can hand it any output file and explore it freely, knowing the file will only change if you explicitly edit and save it.
+The flip side is that Table Viewer is deliberately *not* a full spreadsheet editor. You can't create files or sheets, add cells beyond the file's existing bounds, or change formatting. Editing `.xlsx`, CSV, and TSV files is limited to the cells the file already has; legacy `.xls` workbooks are read-only. That constraint is the point: you can hand it any output file and explore it freely, knowing the file will only change if you explicitly edit and save it.
 
 ## Features
 
@@ -73,9 +75,9 @@ The flip side is that Table Viewer is deliberately *not* a spreadsheet editor. Y
 - Sorting and filtering use raw cell values rather than formatted display text
 - Empty values sort last in both directions
 - When a sorted, filtered, or column-hidden sheet contains merged cells, the view temporarily shows them unmerged. Only the original top-left cell contains the merged value; covered cells remain empty. Restoring the natural rows and all columns restores the exact merge layout.
-- Sorting, filtering, and row-hiding work alongside CSV/TSV edit mode in both directions: you can sort or filter while editing, and you can start editing a sheet that is already sorted or filtered. Either way the displayed order stays put while you edit, so rows stay where you left them, and the view reflects your new values once you save and the file reloads. While one tab is editing a file, it is the tab that can change that file's view; another tab showing the same file can change it again once the edit session ends. They are unavailable in synchronized preview panes, which always show rows in source order. Column visibility remains available in every mode
+- Sorting, filtering, and row-hiding work alongside edit mode in both directions: you can sort or filter while editing, and you can start editing a sheet that is already sorted or filtered. Either way the displayed order stays put while you edit, so rows stay where you left them, and the view reflects your new values once you save and the file reloads. While one tab is editing a file, it is the tab that can change that file's view; another tab showing the same file can change it again once the edit session ends. They are unavailable in synchronized preview panes, which always show rows in source order. Column visibility remains available in every mode
 
-**Editing (CSV/TSV only)**
+**Editing (`.xlsx`, CSV, and TSV)**
 - Click the **Edit** button in the toolbar to enter edit mode
 - Double-click a cell, press **Enter**, or choose **Edit cell** from the right-click menu to edit its value
 - **Enter** confirms and moves to the cell below; **Tab** moves right
@@ -90,7 +92,7 @@ The flip side is that Table Viewer is deliberately *not* a spreadsheet editor. Y
 
 ## Usage
 
-**Excel files** open automatically in Table Viewer when you open an `.xlsx` or `.xls` file. When the first row strongly resembles column names, it is promoted automatically. Use the per-sheet **First Row as Header** toolbar toggle to override the detected choice; enabling it promotes the first non-hidden row.
+**Excel files** open automatically in Table Viewer when you open an `.xlsx` or `.xls` file. Modern `.xlsx` workbooks are editable; legacy `.xls` workbooks are read-only. When the first row strongly resembles column names, it is promoted automatically. Use the per-sheet **First Row as Header** toolbar toggle to override the detected choice; enabling it promotes the first non-hidden row.
 
 To choose a different header row, right-click its row number and select **Use row as header**. Table Viewer hides the rows above it, preserves any hidden rows below it, and promotes the chosen row to column names in one step. The action is available only when no sort or enabled filter is changing the displayed row order. Header choices and hidden rows are remembered for that file and worksheet.
 
@@ -101,7 +103,7 @@ To choose a different header row, right-click its row number and select **Use ro
 
 ## Default editor behavior
 
-Table Viewer registers as the default editor for Excel (`.xlsx`, `.xls`), CSV, and TSV files. Excel workbooks are read-only; CSV and TSV tables are editable. If another viewer is registered for one of these formats, VS Code may ask which editor you'd like to use.
+Table Viewer registers as the default editor for Excel (`.xlsx`, `.xls`), CSV, and TSV files. `.xlsx`, CSV, and TSV files are editable; legacy `.xls` workbooks are read-only. If another viewer is registered for one of these formats, VS Code may ask which editor you'd like to use.
 
 To open a CSV/TSV file as plain text, use **Open in Text Editor** in the table editor's title bar, or right-click its tab and choose **Reopen Editor With… → Text Editor**. To change the default for a file type, choose **Configure Default Editor** from the same editor picker.
 
@@ -135,10 +137,6 @@ the [latest release](https://github.com/jbearak/table-viewer/releases/latest).
 Windows builds are unsigned, so SmartScreen displays its first-run warning; see
 the [desktop setup guide](docs/setup-guide-desktop-app.md) for installation and
 checksum-verification instructions.
-
-**In scope for v1:** opening `.xlsx`/`.xls`/`.csv`/`.tsv` files (dialog, command line, Finder "Open with…"), one window per open file, auto-refresh, layout persistence, sort/filter/hide, Excel header controls, CSV edit/save with conflict handling, cell highlights, the formatting toggle, per-window zoom, appearance and color-theme selection, and font/tab-orientation preferences.
-
-**Deferred:** auto-update, and shared view state between VS Code and the desktop app (each keeps its own state store for now; the on-disk schema is shared so this can land later).
 
 ## Development
 
