@@ -54,6 +54,23 @@ export interface EditSessionRegistry {
     for_sheet(sheet_index: number): EditSessionStore;
     /** Re-stamp every existing store onto the current session. */
     adopt_session(): void;
+    /**
+     * Drop every store except one sheet's.
+     *
+     * Today at most one sheet holds edits, and this is where that invariant is
+     * enforced: the single store used to be *replaced* wholesale at every
+     * hydration boundary, so nothing stale could outlive one. A registry keeps
+     * stores instead, which without this let two kinds of stale content
+     * survive an install — another document's edits after an initial snapshot
+     * replaced the file, and a reordered sheet's edits still sitting at its
+     * old index after the session's sheet moved. Both painted one sheet's
+     * dirty cells on another.
+     *
+     * The kept store is deliberately not touched, not even re-created: its
+     * object identity is what `install` notifies through and what the
+     * hydration boundary reads its outgoing stamp from.
+     */
+    retain_only(sheet_index: number): void;
 }
 
 export function create_edit_session_registry(
@@ -70,6 +87,11 @@ export function create_edit_session_registry(
             });
             stores.set(sheet_index, created);
             return created;
+        },
+        retain_only: (sheet_index) => {
+            for (const key of [...stores.keys()]) {
+                if (key !== sheet_index) stores.delete(key);
+            }
         },
         adopt_session: () => {
             // Unconditional: the store's adopt_session is a bare stamp

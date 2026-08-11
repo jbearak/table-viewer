@@ -66,6 +66,32 @@ describe('edit session registry', () => {
         expect(registry.for_sheet(1).identity()).toEqual({ session_id: 'new' });
     });
 
+    it('retain_only drops every other store and keeps the named one intact', () => {
+        const { registry } = make_session_ref('s');
+        const kept = registry.for_sheet(1);
+        kept.commit('s', '0:0', { value: 'kept', base: 'a' });
+        registry.for_sheet(0).commit('s', '0:0', { value: 'stale', base: 'b' });
+        registry.for_sheet(2).commit('s', '0:0', { value: 'stale', base: 'c' });
+
+        registry.retain_only(1);
+
+        // The kept store keeps its identity — install notifies through it.
+        expect(registry.for_sheet(1)).toBe(kept);
+        expect(kept.get('0:0')).toEqual({ value: 'kept', base: 'a' });
+        // The dropped sheets get fresh, empty stores on next use.
+        expect(registry.for_sheet(0).size()).toBe(0);
+        expect(registry.for_sheet(2).size()).toBe(0);
+    });
+
+    it('retain_only of a sheet with no store empties the registry', () => {
+        const { registry } = make_session_ref('s');
+        registry.for_sheet(0).commit('s', '0:0', { value: 'stale', base: 'a' });
+
+        registry.retain_only(3);
+
+        expect(registry.for_sheet(0).size()).toBe(0);
+    });
+
     it('adopt_session re-stamps every existing store, including clean ones', () => {
         const { ref, registry } = make_session_ref('old');
         const dirty = registry.for_sheet(0);
