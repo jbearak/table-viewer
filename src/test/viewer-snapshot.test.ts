@@ -14,6 +14,8 @@ import {
     type RetainedSnapshotCommandResult,
     type WorkbookSnapshotIdentity,
 } from '../viewer-snapshot';
+import { sheet_edits } from './pending-edits-helper';
+import type { PerFileState } from '../types';
 
 describe('workbook snapshot builder', () => {
     it('keeps commit and observed source inputs mutually exclusive', () => {
@@ -118,11 +120,11 @@ describe('workbook snapshot builder', () => {
             }],
         };
         const state: {
-            pendingEdits: Record<string, string>;
+            pendingEdits: PerFileState['pendingEdits'];
             excelFirstRowHeaders: Record<string, 'on' | 'off'>;
             rowHeights: (Record<number, number> | undefined)[];
         } = {
-            pendingEdits: { '0:0': 'Ada' },
+            pendingEdits: sheet_edits({ '0:0': 'Ada' }),
             excelFirstRowHeaders: { People: 'on' },
             // Present in durable state and asserted *absent* from the delivery below.
             // `NormalizedPerFileState` omits the field: the webview renders from
@@ -199,7 +201,7 @@ describe('workbook snapshot builder', () => {
         meta.sheets[0].name = 'Mutated';
         meta.sheets[0].merges[0].endCol = 99;
         meta.sheets[0].columnNames![0] = 'Changed';
-        state.pendingEdits['0:0'] = 'Grace';
+        state.pendingEdits![0]!.cells['0:0'] = 'Grace';
         state.excelFirstRowHeaders.People = 'off';
         configuration.previewMode = true;
         capabilities.csvEditable = true;
@@ -223,7 +225,7 @@ describe('workbook snapshot builder', () => {
             transforms: [undefined],
             columnVisibility: [undefined],
             cellHighlights: undefined,
-            pendingEdits: { '0:0': 'Ada' },
+            pendingEdits: sheet_edits({ '0:0': 'Ada' }),
             excelFirstRowHeaders: { People: 'on' },
         });
         expect(snapshot.configuration.previewMode).toBe(false);

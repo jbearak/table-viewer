@@ -6,6 +6,7 @@ import {
 } from '../layout-state-patch';
 import type { PerFileState } from '../types';
 import type { NormalizedPerFileState } from '../viewer-snapshot';
+import { sheet_cells, sheet_edits } from './pending-edits-helper';
 
 function normalized(
     overrides: Partial<NormalizedPerFileState> = {},
@@ -30,7 +31,7 @@ describe('layout state patches', () => {
             // produce no entry at all, not an empty one.
             columnWidths: [{ 10: 110, 2: 102 }, { 0: 90 }, { 4: 24 }],
             scrollPosition: [{ top: 1, left: 2 }],
-            pendingEdits: { '0:0': 'draft' },
+            pendingEdits: sheet_edits({ '0:0': 'draft' }),
             excelFirstRowHeaders: { Sheet1: 'on' },
         });
         const incoming = normalized({
@@ -38,7 +39,7 @@ describe('layout state patches', () => {
             scrollPosition: [{ top: 5, left: 6 }],
             activeSheetIndex: 1,
             tabOrientation: 'vertical',
-            pendingEdits: { '0:0': 'stale' },
+            pendingEdits: sheet_edits({ '0:0': 'stale' }),
             excelFirstRowHeaders: { Sheet1: 'off' },
         });
 
@@ -104,7 +105,7 @@ describe('layout state patches', () => {
         const latest: PerFileState = {
             columnWidths: [{ 0: 100, 1: 150 }, { 0: 240 }],
             rowHeights: [{ 0: 20 }, { 1: 41 }],
-            pendingEdits: { '0:0': 'peer' },
+            pendingEdits: sheet_edits({ '0:0': 'peer' }),
             excelFirstRowHeaders: { Sheet1: 'off' },
             cellHighlights: {
                 sourceDigest: 'latest-digest',
@@ -123,7 +124,7 @@ describe('layout state patches', () => {
         ]);
         // Untouched by the patch, and the trailing sheet the panel never saw survives.
         expect(merged.rowHeights).toBe(latest.rowHeights);
-        expect(merged.pendingEdits).toEqual({ '0:0': 'peer' });
+        expect(sheet_cells(merged.pendingEdits)).toEqual({ '0:0': 'peer' });
         expect(merged.excelFirstRowHeaders).toEqual({ Sheet1: 'off' });
         expect(merged.cellHighlights).toBe(latest.cellHighlights);
     });

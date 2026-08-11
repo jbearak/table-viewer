@@ -31,6 +31,7 @@ import {
     stage_authority,
     with_in_memory_authority_transactions,
 } from '../state-authority';
+import { sheet_edits } from './pending-edits-helper';
 
 function empty_authority(): DurableFileAuthority {
     return {
@@ -2778,7 +2779,7 @@ describe('file coordinator identity', () => {
         const initial = {
             [path]: {
                 rowHeights: [{ 1: 31 }],
-                pendingEdits: { '0:0': { value: 'next', base: 'old' } },
+                pendingEdits: sheet_edits({ '0:0': { value: 'next', base: 'old' } }),
             },
         };
         const mapped = mapped_state_store(initial);
@@ -2816,7 +2817,7 @@ describe('file coordinator identity', () => {
         expect(receipts).toHaveLength(2);
         expect(mapped.value(path)).toMatchObject({
             rowHeights: [{ 1: 31 }],
-            pendingEdits: { '0:0': { value: 'next', base: 'old' } },
+            pendingEdits: sheet_edits({ '0:0': { value: 'next', base: 'old' } }),
             cellHighlights: {
                 sourceDigest: 'digest-a',
                 sheets: [{ cells: { '0:1': 'green', '1:1': 'green' } }],
@@ -2940,7 +2941,7 @@ describe('file coordinator identity', () => {
         const mapped = mapped_state_store({
             [path]: {
                 rowHeights: [{ 0: 31 }],
-                pendingEdits: { '0:0': { value: 'next', base: 'old' } },
+                pendingEdits: sheet_edits({ '0:0': { value: 'next', base: 'old' } }),
                 cellHighlights: {
                     sourceDigest: 'stored-digest',
                     sheets: [{
@@ -2977,7 +2978,7 @@ describe('file coordinator identity', () => {
         });
         expect(mapped.value(path)).toMatchObject({
             rowHeights: [{ 0: 31 }],
-            pendingEdits: { '0:0': { value: 'next', base: 'old' } },
+            pendingEdits: sheet_edits({ '0:0': { value: 'next', base: 'old' } }),
         });
         expect((mapped.value(path) as any).cellHighlights).toBeUndefined();
 

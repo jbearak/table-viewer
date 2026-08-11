@@ -14,10 +14,20 @@
 //     `pendingEditsChanged` once it is in edit mode with a session.
 //
 // Pure module (no electron import) so it is unit-testable.
-import type { HostMessage, WebviewMessage } from '../../src/types';
+import type { HostMessage, PerFileState, WebviewMessage } from '../../src/types';
 
 function has_edits(edits: object | null | undefined): boolean {
     return !!edits && Object.keys(edits).length > 0;
+}
+
+/**
+ * Any worksheet holding a draft. The durable leaf is worksheet-scoped — an array
+ * of slots, each sheet's own — and a cleared slot stays in place as a hole until
+ * the trailing ones are trimmed, so its own length says nothing about whether a
+ * draft survives. The window's dot is workbook-wide: one dirty sheet marks it.
+ */
+function has_sheet_edits(pending: PerFileState['pendingEdits']): boolean {
+    return !!pending && pending.some((slot) => has_edits(slot?.cells));
 }
 
 /**
@@ -28,9 +38,9 @@ export function dirty_from_host_message(message: HostMessage): boolean | undefin
     switch (message.type) {
         case 'editSessionResult':
             // A refused request neither grants a session nor carries a draft.
-            return message.granted ? has_edits(message.pendingEdits) : undefined;
+            return message.granted ? sheet_local_dirty(message.pendingEdits) : undefined;
         case 'workbookSnapshot':
-            return has_edits(message.snapshot.state.pendingEdits);
+            return has_sheet_edits(message.snapshot.state.pendingEdits);
         default:
             return undefined;
     }
@@ -38,5 +48,22 @@ export function dirty_from_host_message(message: HostMessage): boolean | undefin
 
 /** Dirty state implied by a webview → host message, or `undefined` if none. */
 export function dirty_from_webview_message(message: WebviewMessage): boolean | undefined {
-    return message.type === 'pendingEditsChanged' ? has_edits(message.edits) : undefined;
+    return message.type === 'pendingEditsChanged'
+        ? sheet_local_dirty(message.edits)
+        : undefined;
+}
+
+/**
+ * What one worksheet's map can say about a workbook-wide indicator.
+ *
+ * Edits in it prove the workbook is dirty. An empty one proves only that *this*
+ * worksheet is clean, and editing is worksheet-scoped, so a sibling sheet can be
+ * holding a draft the message never mentions — a grant on a clean sheet 1, or the
+ * post that clears sheet 1 after saving it, would otherwise take the dot off a
+ * window whose sheet 0 still has unsaved work in it.
+ *
+ * Only `workbookSnapshot` sees every worksheet, so only it can answer `false`.
+ */
+function sheet_local_dirty(edits: object | null | undefined): boolean | undefined {
+    return has_edits(edits) ? true : undefined;
 }

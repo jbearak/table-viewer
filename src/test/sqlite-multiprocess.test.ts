@@ -13,6 +13,7 @@ import {
     build_sqlite_process_worker,
     SqliteChildProcess,
 } from './helpers/sqlite-child-process';
+import { sheet_edits } from './pending-edits-helper';
 
 let suiteDirectory: string;
 let testDirectory: string;
@@ -450,7 +451,7 @@ describe('SQLite real multi-process behavior', () => {
     });
 
     it('never evicts pending-edit rows during multi-process quota churn', async () => {
-        await seed('/pending.csv', { pendingEdits: { '0:0': 'recoverable' } });
+        await seed('/pending.csv', { pendingEdits: sheet_edits({ '0:0': 'recoverable' }) });
         const first = await spawn({ maxStoredFiles: 1 });
         const second = await spawn({ maxStoredFiles: 1 });
         for (let index = 0; index < 8; index += 1) {
@@ -464,7 +465,7 @@ describe('SQLite real multi-process behavior', () => {
 
         await expect(first.request('read', { path: '/pending.csv' })).resolves.toMatchObject({
             revision: 1,
-            state: { pendingEdits: { '0:0': 'recoverable' } },
+            state: { pendingEdits: sheet_edits({ '0:0': 'recoverable' }) },
         });
         const direct = inspectionDatabase();
         expect(direct.prepare(`SELECT has_pending_edits FROM entries

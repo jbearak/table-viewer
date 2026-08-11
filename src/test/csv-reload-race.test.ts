@@ -1,6 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as vscode from 'vscode';
-import { attach_viewer, build_csv_source, csv_table_profile } from '../viewer-controller';
+import {
+    attach_viewer,
+    build_csv_source,
+    csv_table_profile,
+    plan_csv_save,
+    type ViewerProfile,
+} from '../viewer-controller';
 import { dispose_csv_preview, show_csv_preview } from '../csv-preview';
 import { CsvDataSource } from '../data-source/csv-source';
 import type { DataSource } from '../data-source/interface';
@@ -11,6 +17,7 @@ import * as vscode_mock from './mocks/vscode';
 import { fake_viewer_host } from './mocks/host-ports';
 import { with_in_memory_authority_transactions } from '../state-authority';
 import type { WorkbookSnapshotIdentity } from '../viewer-snapshot';
+import { sheet_cells, sheet_edits } from './pending-edits-helper';
 
 /**
  * Drive the CSV-table lifecycle through the shared controller, mirroring the
@@ -469,7 +476,7 @@ describe('CSV reload races', () => {
     it('delivers the latest durable panel state after physical finalization', async () => {
         const file_path = '/tmp/receipt-state.csv';
         const versioned = versioned_state_store({
-            pendingEdits: { '0:0': 'committed' },
+            pendingEdits: sheet_edits({ '0:0': 'committed' }),
         });
         const base = with_in_memory_authority_transactions(versioned.store);
         const store: AuthorityFileStateStore = {
@@ -480,7 +487,7 @@ describe('CSV reload races', () => {
                     await versioned.store.compare_and_set(
                         path,
                         finalized.snapshot.revision,
-                        { pendingEdits: { '0:0': 'later' } },
+                        { pendingEdits: sheet_edits({ '0:0': 'later' }) },
                     );
                 }
                 return finalized;
@@ -494,9 +501,9 @@ describe('CSV reload races', () => {
         await panel.__receive({ type: 'ready' });
 
         expect(initial_snapshots(panel)[0]).toMatchObject({
-            state: { pendingEdits: { '0:0': 'later' } },
+            state: { pendingEdits: sheet_edits({ '0:0': 'later' }) },
         });
-        expect(versioned.get_state(file_path).pendingEdits).toEqual({ '0:0': 'later' });
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual({ '0:0': 'later' });
     });
 
     it('adopts a candidate reconciled from an exact committed finalization', async () => {
@@ -1581,6 +1588,7 @@ describe('CSV reload races', () => {
         vscode_mock.__setReadFileImplementation(async () => bytes);
         const panel = open_csv_table(uri(file_path), state_store(), {
             editing: true,
+            plan_save: plan_csv_save,
             async build_source(raw, path) {
                 builds += 1;
                 return build_csv_source(raw, path);
@@ -1615,6 +1623,7 @@ describe('CSV reload races', () => {
         const shared_store = state_store();
         const owner = open_csv_table(uri(file_path), shared_store, {
             editing: true,
+            plan_save: plan_csv_save,
             async build_source(raw, path) {
                 owner_builds += 1;
                 return build_csv_source(raw, path);
@@ -1659,7 +1668,7 @@ describe('CSV reload races', () => {
         const owner = open_csv_table(uri(file_path));
         let builds = 0;
         const peer_started = deferred<void>();
-        const peer_profile = {
+        const peer_profile: ViewerProfile = {
             editing: false,
             async build_source(raw: Uint8Array, path: string) {
                 builds += 1;
@@ -1696,8 +1705,9 @@ describe('CSV reload races', () => {
             bytes = new Uint8Array(content);
         });
         const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
-        const profile = {
+        const profile: ViewerProfile = {
             editing: true,
+            plan_save: plan_csv_save,
             async build_source(raw: Uint8Array, path: string) {
                 builds += 1;
                 if (builds > 1) throw new Error('owner parser failed');
@@ -1771,8 +1781,9 @@ describe('CSV reload races', () => {
         vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
             bytes = new Uint8Array(content);
         });
-        const profile = {
+        const profile: ViewerProfile = {
             editing: true,
+            plan_save: plan_csv_save,
             async build_source(raw: Uint8Array, path: string) {
                 builds += 1;
                 if (builds === 2) {
@@ -1815,7 +1826,7 @@ describe('CSV reload races', () => {
     it('finishes durable cleanup when disposal makes panel.webview throw', async () => {
         const file_path = '/tmp/save-disposal.csv';
         const pendingEdits = { '0:0': { value: 'saved', base: 'a' } };
-        const versioned = versioned_state_store({ pendingEdits });
+        const versioned = versioned_state_store({ pendingEdits: sheet_edits(pendingEdits) });
         const store = with_in_memory_authority_transactions(versioned.store);
         let bytes = enc.encode('h\na\n');
         vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
@@ -1851,7 +1862,7 @@ describe('CSV reload races', () => {
         expect(panel.__messages.filter((message: any) => message?.type === 'saveResult'))
             .toEqual([]);
         await vi.waitFor(() => {
-            expect(versioned.get_state(file_path).pendingEdits).toBeUndefined();
+            expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toBeUndefined();
         });
     });
 
@@ -2040,14 +2051,15 @@ describe('CSV reload races', () => {
         let peer_builds = 0;
         vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
         vscode_mock.__setReadFileImplementation(async () => bytes);
-        const owner_profile = {
+        const owner_profile: ViewerProfile = {
             editing: true,
+            plan_save: plan_csv_save,
             async build_source(raw: Uint8Array, path: string) {
                 owner_builds += 1;
                 return build_csv_source(raw, path);
             },
         };
-        const peer_profile = {
+        const peer_profile: ViewerProfile = {
             editing: false,
             async build_source(raw: Uint8Array, path: string) {
                 peer_builds += 1;

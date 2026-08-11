@@ -2,8 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { compare_authority } from './authority-order';
 import {
     decode_stored_per_file_state,
+    has_any_pending_edits,
     type PerFileState,
     type StoredPerFileState,
+    stringify_stored_per_file_state,
 } from './types';
 
 const STATE_FORMAT = 'tableViewer.fileState.v1';
@@ -370,8 +372,10 @@ function decode_stage(value: unknown): PersistedAuthorityStage {
 }
 
 export function state_has_pending_edits(state: StoredPerFileState): boolean {
-    const pending = (state as PerFileState).pendingEdits;
-    return !!pending && Object.keys(pending).length > 0;
+    // Not `Object.keys(...).length`: the worksheet-scoped leaf is a positional
+    // array whose empty slots are holes, so `[undefined]` has length 1 while
+    // holding nothing. Ask whether any *slot* has cells.
+    return has_any_pending_edits((state as PerFileState).pendingEdits);
 }
 
 function max_timestamp(existing: number | undefined, captured: number): number {
@@ -528,7 +532,7 @@ function complete_from_entry(
     return {
         entry: {
             ...metadata_from_entry(path, entry, recencyOrder),
-            stateJson: JSON.stringify(entry.state),
+            stateJson: stringify_stored_per_file_state(entry.state),
         },
         stages: Object.values(entry.stages ?? {}).map((stage) => structuredClone(stage)),
     };
@@ -779,7 +783,7 @@ function write_complete(
     tx.write_entry({
         entry: {
             ...value.entry,
-            stateJson: JSON.stringify(state),
+            stateJson: stringify_stored_per_file_state(state),
             hasPendingEdits: state_has_pending_edits(state),
             authorityStageCount: value.stages.length,
             ...(value.stages.length === 0 ? {} : {
@@ -848,7 +852,7 @@ function serialized_states_equal(left: StoredPerFileState, right: StoredPerFileS
 
 function pending_json(state: StoredPerFileState): string | undefined {
     const pending = (state as PerFileState).pendingEdits;
-    return pending && Object.keys(pending).length > 0 ? JSON.stringify(pending) : undefined;
+    return has_any_pending_edits(pending) ? JSON.stringify(pending) : undefined;
 }
 
 function authorities_exactly_equal(left: DurableFileAuthority, right: DurableFileAuthority): boolean {
@@ -1027,7 +1031,7 @@ function copy_in_transaction(
             ...source.entry,
             path: destinationPath,
             stateRevision: revision,
-            stateJson: JSON.stringify(state),
+            stateJson: stringify_stored_per_file_state(state),
             hasPendingEdits: state_has_pending_edits(state),
             recencyOrder: tx.allocate_recency_order(),
             updatedAtMs: capturedAt,
@@ -1082,7 +1086,7 @@ export function create_keyed_authority_store(
         compare_and_set(filePath, expectedRevision, state, validate, basis) {
             // Proposal capture and structural validation happen before queue admission.
             const proposed = decode_stored_per_file_state(state);
-            const proposedJson = JSON.stringify(proposed);
+            const proposedJson = stringify_stored_per_file_state(proposed);
             const capturedAt = Date.now();
             return writeTransaction('compareAndSet', (tx) => {
                 const currentEntry = tx.read_entry(filePath);
@@ -1244,7 +1248,7 @@ export function create_keyed_authority_store(
                 (complete as { entry: PersistedKeyedStateEntry }).entry = {
                     ...complete.entry,
                     stateRevision: revision,
-                    stateJson: JSON.stringify(nextState),
+                    stateJson: stringify_stored_per_file_state(nextState),
                     hasPendingEdits: state_has_pending_edits(nextState),
                     authority: nextAuthority,
                     recencyOrder: tx.allocate_recency_order(),

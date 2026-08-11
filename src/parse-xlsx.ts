@@ -20,13 +20,28 @@ import type { WorkbookData, SheetData, CellData, MergeRange } from './types';
 
 // --- XML Helpers ---
 
-function decode_xml(s: string): string {
+/** Expand the five predefined XML entities and numeric character references.
+ *  Exported for `xlsx-package`, which reads `formatCode` attributes that mean
+ *  nothing until they are decoded.
+ *
+ *  Numeric references belong here because a writer may emit any character that
+ *  way — `Id="R1&#54;f42588"` is the same relationship id as `Id="R16f42588"`,
+ *  and comparing the raw text made them different strings. `&amp;` is expanded
+ *  last so `&amp;#60;`, which *means* the six characters `&#60;`, is not
+ *  re-decoded into `<`. */
+export function decode_xml(s: string): string {
     if (s.indexOf('&') === -1) return s;
     return s
         .replace(/&lt;/g, '<')
         .replace(/&gt;/g, '>')
         .replace(/&quot;/g, '"')
         .replace(/&apos;/g, "'")
+        .replace(/&#(?:x([0-9a-fA-F]+)|(\d+));/g, (whole, hex: string | undefined, dec: string | undefined) => {
+            const code = hex !== undefined ? parseInt(hex, 16) : Number(dec);
+            return Number.isFinite(code) && code >= 0 && code <= 0x10ffff
+                ? String.fromCodePoint(code)
+                : whole;
+        })
         .replace(/&amp;/g, '&');
 }
 
@@ -37,7 +52,7 @@ function get_attr(tag: string, attr: string): string | null {
 }
 
 /** Find the index of '>' that closes an opening tag, skipping '>' inside quoted attribute values. Returns -1 if not found. */
-function find_tag_end(xml: string, start: number): number {
+export function find_tag_end(xml: string, start: number): number {
     let in_quote: string | null = null;
     for (let i = start; i < xml.length; i++) {
         const ch = xml[i];
@@ -53,12 +68,12 @@ function find_tag_end(xml: string, start: number): number {
 }
 
 /** Check whether the character after a tag-name match is a valid tag delimiter. */
-function is_tag_boundary(ch: string | undefined): boolean {
+export function is_tag_boundary(ch: string | undefined): boolean {
     return ch === '>' || ch === ' ' || ch === '/' || ch === '\t' || ch === '\n' || ch === '\r';
 }
 
 /** Check whether the region between start and tag_end represents a self-closing tag (handles `<tag/>` and `<tag />`). */
-function is_self_closing(xml: string, start: number, tag_end: number): boolean {
+export function is_self_closing(xml: string, start: number, tag_end: number): boolean {
     for (let i = tag_end - 1; i > start; i--) {
         const ch = xml[i];
         if (ch === '/') return true;
@@ -138,6 +153,34 @@ function get_entry_text(cfb_file: ReturnType<typeof CFB.read>, path: string): st
 
 // --- Workbook Parsing ---
 
+/**
+ * A relationship `Target` resolved to a package path, without a leading slash.
+ *
+ * `.` and `..` segments are legal in a relative URI reference and mean what they do
+ * anywhere else, so `./worksheets/sheet1.xml` names the same part as
+ * `worksheets/sheet1.xml`. Concatenating without resolving them produced
+ * `xl/./worksheets/sheet1.xml`, which matches no entry in the package — the reader
+ * then displayed that worksheet as empty, and the save failed outright on a file
+ * Excel opens perfectly well.
+ *
+ * Shared with the writer rather than duplicated there, which is how the two came to
+ * disagree: the writer resolved the dot segment and the reader did not, so a save
+ * would have spliced into a worksheet the user was shown as blank.
+ */
+export function resolve_part_path(target: string): string {
+    const absolute = target.startsWith('/');
+    const segments = (absolute ? target.slice(1) : `xl/${target}`).split('/');
+    const out: string[] = [];
+    for (const segment of segments) {
+        if (segment === '.' || segment === '') continue;
+        // A `..` that would climb above the package root has nowhere to go; dropping
+        // it keeps the path inside the package rather than inventing a parent.
+        if (segment === '..') { out.pop(); continue; }
+        out.push(segment);
+    }
+    return out.join('/');
+}
+
 function parse_sheet_rels(cfb_file: ReturnType<typeof CFB.read>): Map<string, string> {
     const map = new Map<string, string>();
     const xml = get_entry_text(cfb_file, '/xl/_rels/workbook.xml.rels');
@@ -149,13 +192,38 @@ function parse_sheet_rels(cfb_file: ReturnType<typeof CFB.read>): Map<string, st
         const id = get_attr(open_tag, 'Id');
         const target = get_attr(open_tag, 'Target');
         if (id && target) {
-            // Targets are relative to xl/
-            const resolved = target.startsWith('/') ? target.slice(1) : `xl/${target}`;
-            map.set(id, resolved);
+            map.set(id, resolve_part_path(target));
         }
     });
 
     return map;
+}
+
+/**
+ * Worksheet part paths in the order this reader numbers the sheets — `xl/…`, no
+ * leading slash — for the writer to resolve a sheet index against.
+ *
+ * Exported so the two sides cannot disagree. The writer had its own enumeration,
+ * written to the same intent but not the same code, and every difference between
+ * them was an edit written into a worksheet other than the one the user was
+ * looking at. Two found that way: the writer read both quote styles where
+ * `get_attr` reads only `"…"`, so a legally single-quoted `name` gave the two a
+ * different sheet count; and the writer skipped `<sheet>` tags inside comments
+ * where `iter_elements` counts them. Neither disagreement is a bug in the writer's
+ * half — it is the more nearly correct one — but "correct" is not the requirement
+ * here. Indexing identically is, and sharing one enumeration is the only way to
+ * have it hold for the next difference nobody thought of.
+ */
+export function worksheet_part_paths(buffer: Uint8Array): string[] {
+    const cfb_file = CFB.read(buffer, { type: 'buffer' });
+    const rels = parse_sheet_rels(cfb_file);
+    const workbook_xml = get_entry_text(cfb_file, '/xl/workbook.xml');
+    if (!workbook_xml) return [];
+    // `parse_xlsx` drops a sheet whose relationship does not resolve *before*
+    // numbering the rest, so the filter belongs here too — see its own loop.
+    return parse_workbook_xml(workbook_xml).sheets
+        .map((sheet) => rels.get(sheet.rId))
+        .filter((path): path is string => path !== undefined);
 }
 
 function parse_shared_strings(xml: string): string[] {
@@ -177,7 +245,20 @@ function parse_shared_strings(xml: string): string[] {
     return sst;
 }
 
-function parse_styles(xml: string): { fonts: FontEntry[]; xfs: XfEntry[]; format_map: Map<number, string> } {
+/**
+ * `xl/styles.xml` as this reader understands it.
+ *
+ * Exported for the writer, which used to parse the same part itself — quote-aware
+ * and comment-aware where this scan is neither — and every difference between the
+ * two was a cell stored under a format only one side agreed about. A commented-out
+ * `<numFmt numFmtId="164" …/>` shadowing the live entry, or a legally
+ * single-quoted `numFmtId='164'`, made a style a date here and a number there, so
+ * a typed `2024-01-15` went in as the serial `45306` and that is what the grid
+ * then showed. Being right about XML is not the requirement; agreeing with the
+ * side that renders the result is, and one parse is the only way to have that
+ * hold for the next difference nobody thought of.
+ */
+export function parse_styles(xml: string): { fonts: FontEntry[]; xfs: XfEntry[]; format_map: Map<number, string> } {
     const fonts: FontEntry[] = [];
     const xfs: XfEntry[] = [];
     const format_map = new Map<number, string>();
@@ -222,7 +303,16 @@ function parse_styles(xml: string): { fonts: FontEntry[]; xfs: XfEntry[]; format
     return { fonts, xfs, format_map };
 }
 
-function parse_workbook_xml(xml: string): { sheets: Array<{ name: string; rId: string }>; datemode: DateMode } {
+/**
+ * `xl/workbook.xml` as this reader understands it: the sheet list, in the order
+ * this reader numbers them, and the date epoch.
+ *
+ * Exported alongside {@link parse_styles} and for the same reason. The writer's
+ * own `workbookPr` scan skipped comments, so a commented `date1904="1"` left the
+ * writer on the 1900 epoch while the reader used 1904 — and the two are 1462 days
+ * apart, so a saved `2024-01-15` read back as `2028-01-16`.
+ */
+export function parse_workbook_xml(xml: string): { sheets: Array<{ name: string; rId: string }>; datemode: DateMode } {
     const sheets: Array<{ name: string; rId: string }> = [];
 
     iter_elements(xml, 'sheet', (open_tag) => {

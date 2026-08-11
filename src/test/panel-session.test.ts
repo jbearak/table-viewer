@@ -16,6 +16,8 @@ import type {
     WorkbookSnapshot,
     WorkbookSnapshotIdentity,
 } from '../viewer-snapshot';
+import { sheet_cells, sheet_edits } from './pending-edits-helper';
+import type { PerFileState } from '../types';
 
 type SnapshotMessage = Extract<HostMessage, { type: 'workbookSnapshot' }>;
 
@@ -1233,8 +1235,8 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
 
     it('isolates the immutable snapshot from later input mutation', async () => {
         const source = adoption();
-        const mutable_state = source.stateSnapshot.state as { pendingEdits?: Record<string, string> };
-        mutable_state.pendingEdits = { '0:0': 'Ada' };
+        const mutable_state = source.stateSnapshot.state as PerFileState;
+        mutable_state.pendingEdits = sheet_edits({ '0:0': 'Ada' });
         const mutable_meta = source.core.meta;
         const projection = {
             configuration: {
@@ -1251,24 +1253,24 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
         const { session, posted } = make_session();
         session.replace_adoption(mutable);
         mutable_meta.sheets[0].name = 'Changed before ready';
-        mutable_state.pendingEdits['0:0'] = 'Grace';
+        mutable_state.pendingEdits![0]!.cells['0:0'] = 'Grace';
         projection.configuration.previewMode = true;
         projection.capabilities.csvEditable = true;
         session.ready();
         await settle();
         const delivered = snapshot(posted);
         expect(delivered.meta.sheets[0].name).toBe('Sheet1');
-        expect(delivered.state.pendingEdits).toEqual({ '0:0': 'Ada' });
+        expect(sheet_cells(delivered.state.pendingEdits)).toEqual({ '0:0': 'Ada' });
         expect(delivered.configuration.previewMode).toBe(false);
         expect(delivered.capabilities.csvEditable).toBe(false);
         expect(Object.isFrozen(delivered.meta.sheets[0])).toBe(true);
 
         mutable_meta.sheets[0].name = 'Changed before restart';
-        mutable_state.pendingEdits['0:0'] = 'Katherine';
+        mutable_state.pendingEdits![0]!.cells['0:0'] = 'Katherine';
         session.ready();
         await settle();
         const restarted = snapshot(posted);
         expect(restarted.meta.sheets[0].name).toBe('Sheet1');
-        expect(restarted.state.pendingEdits).toEqual({ '0:0': 'Ada' });
+        expect(sheet_cells(restarted.state.pendingEdits)).toEqual({ '0:0': 'Ada' });
     });
 });

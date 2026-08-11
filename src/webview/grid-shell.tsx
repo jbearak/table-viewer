@@ -292,8 +292,7 @@ export interface GridShellProps {
     merges: MergeRange[];
     preview_mode?: boolean;
     // Editing (Phase E). edit_mode is App-controlled (toolbar toggle); editing is
-    // only possible when csv_editable. CSV sheets have no merges, so edits only
-    // ever touch the plain-cell path.
+    // only possible when csv_editable.
     edit_mode?: boolean;
     csv_editable?: boolean;
     edit_session_id?: string;

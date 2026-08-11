@@ -10,6 +10,7 @@ import type {
 import {
     MAX_PERSISTED_HIDDEN_ROWS,
     is_range_filter_operator,
+    reconcile_pending_edit_sheets,
     sheet_name_from_transform_schema,
 } from '../types';
 export { MAX_PERSISTED_HIDDEN_ROWS } from '../types';
@@ -55,7 +56,8 @@ export function normalize_per_file_state(
         ),
         tabOrientation: state.tabOrientation ?? null,
         pendingEdits: normalize_pending_edits(
-            'pendingEdits' in state ? (state as PerFileState).pendingEdits : undefined
+            'pendingEdits' in state ? (state as PerFileState).pendingEdits : undefined,
+            sheet_names,
         ),
         transforms: normalize_transforms(
             'transforms' in state ? (state as PerFileState).transforms : undefined,
@@ -270,7 +272,46 @@ function normalize_active_sheet_index(
     return 0;
 }
 
+/**
+ * Normalize the worksheet-scoped pending-edit leaf.
+ *
+ * Two jobs, in order. First the per-sheet cell maps are sanitized as before.
+ * Then slots are reconciled against the workbook as loaded: a slot recording a
+ * `sheetName` that no longer sits at its index describes a worksheet that moved,
+ * and honouring it by position would apply one sheet's draft to another, keyed
+ * to rows that mean something else there. Those slots are dropped — see
+ * `reconcile_pending_edit_sheets`.
+ */
 function normalize_pending_edits(
+    value: unknown,
+    sheet_names: readonly string[],
+): PerFileState['pendingEdits'] {
+    // A legacy flat map reaching here (state that never passed through
+    // `decode_stored_per_file_state`) is one CSV's edits: single-sheet by
+    // construction, so it belongs in slot 0.
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+        const cells = normalize_pending_edit_cells(value);
+        return cells ? [{ cells }] : undefined;
+    }
+    if (!Array.isArray(value)) return undefined;
+
+    const slots = value.map((slot) => {
+        if (!slot || typeof slot !== 'object' || Array.isArray(slot)) return undefined;
+        const record = slot as { sheetName?: unknown; cells?: unknown };
+        const cells = normalize_pending_edit_cells(record.cells);
+        if (!cells) return undefined;
+        return typeof record.sheetName === 'string'
+            ? { sheetName: record.sheetName, cells }
+            : { cells };
+    });
+    while (slots.length > 0 && slots[slots.length - 1] === undefined) slots.pop();
+    return reconcile_pending_edit_sheets(
+        slots.length === 0 ? undefined : slots,
+        sheet_names,
+    );
+}
+
+function normalize_pending_edit_cells(
     value: unknown
 ): Record<string, string | { value: string; base: string }> | undefined {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {

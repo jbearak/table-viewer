@@ -16,6 +16,7 @@ import { MAX_PERSISTED_ROW_HEIGHTS } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
 import type { WorkbookSnapshot } from '../viewer-snapshot';
 import type { EditSessionStore } from '../webview/edit-session-store';
+import { sheet_cells, sheet_edits } from './pending-edits-helper';
 
 const grid_shell_mock = vi.hoisted(() => ({
     is_dirty: false,
@@ -512,6 +513,13 @@ function get_button(label: string): HTMLButtonElement {
     return button as HTMLButtonElement;
 }
 
+async function click_sheet_tab(name: string) {
+    const tab = Array.from(document.querySelectorAll<HTMLButtonElement>('.sheet-tab'))
+        .find((button) => button.textContent === name);
+    expect(tab).toBeDefined();
+    await act(async () => tab!.click());
+}
+
 async function click_button(label: string) {
     await act(async () => {
         get_button(label).click();
@@ -967,7 +975,9 @@ describe('workbook snapshot hydration', () => {
                 scrollPosition: [],
                 activeSheetIndex: 1,
                 tabOrientation: 'vertical',
-                pendingEdits: { '0:0': { value: 'new', base: 'old' } },
+                // On the active sheet: editing is worksheet-scoped, so the grid only
+                // shows a restored map while the tab holding it is the one on screen.
+                pendingEdits: sheet_edits({ '0:0': { value: 'new', base: 'old' } }, 1),
                 transforms: [],
                 columnVisibility: [],
             },
@@ -1171,7 +1181,7 @@ describe('workbook snapshot hydration', () => {
             state: {
                 columnWidths: [], scrollPosition: [],
                 activeSheetIndex: 0, tabOrientation: null,
-                pendingEdits: authoritative,
+                pendingEdits: sheet_edits(authoritative),
                 transforms: [undefined],
                 columnVisibility: [undefined],
             },
@@ -3572,6 +3582,406 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-mount-id')).toBe(first_mount_id);
     });
 
+    it('shows edit mode only on the worksheet whose session the host granted', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                },
+            })
+        );
+        // Edit the second worksheet, then walk back to the first one.
+        await click_sheet_tab('Inventory');
+        await click_button('Edit');
+        const pendingEdits = { '0:0': { value: 'Gadget', base: 'Widget' } };
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'inventory-session',
+            sheetIndex: 1,
+            pendingEdits,
+        });
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+
+        await click_sheet_tab('People');
+        // Sheet 0 is not the sheet being edited, so it neither renders as editable
+        // nor offers an Edit button that would retarget the held session.
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        // And it must not be handed the other sheet's dirty map. Read-only is not
+        // enough on its own: the grid paints a dirty value and its tint whenever an
+        // edit exists for the key, edit mode or not, so sheet 1's '0:0' would show
+        // up as sheet 0's own edited cell — a value the user never typed here, in a
+        // worksheet they cannot even edit.
+        expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
+        expect(grid_stub().getAttribute('data-initial-edits')).toBe('null');
+        expect(get_button('Edit').getAttribute('aria-disabled')).toBe('true');
+        post_message.mockClear();
+        await click_button('Edit');
+        expect(post_message).not.toHaveBeenCalledWith(expect.objectContaining({
+            type: 'requestEditSession',
+        }));
+
+        // Returning to the edited sheet finds the session exactly as it was.
+        await click_sheet_tab('Inventory');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-initial-edits')).toBe(
+            JSON.stringify(pendingEdits)
+        );
+    });
+
+    it('holds the worksheet tabs while a save dialog is open', async () => {
+        // The dialog asks about one worksheet, and the answer is applied against the
+        // *active* sheet's store. Switching tabs while it was open pointed the answer
+        // at the wrong worksheet: the new sheet's store has no session, so it reports
+        // nothing to save, and a "Save" choice took the exit path — releasing the
+        // session without ever posting the save. The user asked to save and the edits
+        // were dropped.
+        grid_shell_mock.is_dirty = true;
+        grid_shell_mock.has_uncommitted_changes = true;
+        grid_shell_mock.request_save.mockReturnValue(true);
+
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await click_sheet_tab('Inventory');
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'inventory-session',
+            sheetIndex: 1,
+            pendingEdits: { '0:0': { value: 'Gadget', base: 'Widget' } },
+        });
+
+        post_message.mockClear();
+        await click_button('Edit');
+        expect(post_message).toHaveBeenCalledWith(
+            expect.objectContaining({ type: 'showSaveDialog' })
+        );
+
+        // The tab click is refused while the question is on screen.
+        await click_sheet_tab('People');
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+
+        // So "Save" still reaches the worksheet the dialog was about.
+        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        expect(grid_shell_mock.request_save).toHaveBeenCalledTimes(1);
+        expect(post_message).not.toHaveBeenCalledWith(
+            expect.objectContaining({ type: 'releaseEditSession' })
+        );
+    });
+
+    it('folds an open editor into the store before switching worksheets', async () => {
+        // Worksheet editing made this reachable: the grid is keyed by the active
+        // sheet, so clicking another tab unmounts the one holding the open overlay.
+        // Glide's editor is portalled outside that tree and its cleanup only
+        // releases the captured row — the typed text is gone unless it is folded
+        // into App's store first, exactly as the transform and refresh remounts do.
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'people-session',
+            sheetIndex: 0,
+        });
+        // Stand in for the real overlay fold, as the transform and refresh remount
+        // tests do. Only the owning sheet is handed the store, so this writes on
+        // the way *out* of People and is a no-op on the way back in.
+        grid_shell_mock.commit_live_edit.mockImplementation(() => {
+            (grid_shell_mock.latest_props?.edit_session as EditSessionStore | undefined)
+                ?.commit('people-session', '0:0', { value: 'typed', base: 'Alice' });
+        });
+
+        await click_sheet_tab('Inventory');
+        expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledTimes(1);
+
+        await click_sheet_tab('People');
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!))
+            .toEqual({ '0:0': { value: 'typed', base: 'Alice' } });
+    });
+
+    it('withholds an in-flight save from a grid mounted on another worksheet', async () => {
+        // The session and its initial edits are already withheld from a sheet that
+        // does not own them, but the save projection was not — and a grid with no
+        // hoisted store builds its own from exactly that, so People's pending value
+        // and dirty tint appeared on Inventory at the same coordinates, in a sheet
+        // the user cannot even edit.
+        await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'people-session',
+            sheetIndex: 0,
+        });
+        await dispatch_host_message({
+            type: 'saveOperationStarted',
+            lifecycle: {
+                revision: 1,
+                state: 'active',
+                operation: {
+                    editSessionId: 'people-session',
+                    sheetIndex: 0,
+                    saveRequestId: 'save-1',
+                    edits: { '0:0': 'Alicia' },
+                    dirtyEdits: { '0:0': { value: 'Alicia', base: 'Alice' } },
+                },
+            },
+        });
+
+        await click_sheet_tab('Inventory');
+        expect(grid_shell_mock.latest_props?.save_operation).toBeUndefined();
+        expect(grid_shell_mock.latest_props?.save_lifecycle).toBeUndefined();
+    });
+
+    it('keeps the save fence while a non-owning worksheet is on screen', async () => {
+        // `save_in_flight_ref` is document-scoped, but a grid on a sheet that does
+        // not own the session is deliberately handed no lifecycle and so reports
+        // `save_in_flight: false`. Letting it write that through cleared the fence,
+        // and the close/reload flush then published a pending-edit sequence the
+        // host ignores while a save is active — advertised, never acknowledged,
+        // and quitting waited on it until the barrier timed out.
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'people-session',
+            sheetIndex: 0,
+        });
+        await dispatch_host_message({
+            type: 'saveOperationStarted',
+            lifecycle: {
+                revision: 1,
+                state: 'active',
+                operation: {
+                    editSessionId: 'people-session',
+                    sheetIndex: 0,
+                    saveRequestId: 'save-1',
+                    edits: { '0:0': 'Alicia' },
+                    dirtyEdits: { '0:0': { value: 'Alicia', base: 'Alice' } },
+                },
+            },
+        });
+        // The owning grid saw the save and reported it; the mock reports whatever
+        // this flag says, as the real GridShell reports its own derived state.
+        grid_shell_mock.save_in_flight = true;
+        await act(async () => {
+            grid_shell_mock.on_editing_change?.({
+                is_dirty: true,
+                has_live_uncommitted: false,
+                save_in_flight: true,
+                edits: { '0:0': { value: 'Alicia', base: 'Alice' } },
+                conflicted: [],
+            });
+        });
+
+        // Switching sheets mounts a grid that was handed no lifecycle, so it
+        // reports `save_in_flight: false` — truthfully, about a save it cannot see.
+        grid_shell_mock.save_in_flight = false;
+        await click_sheet_tab('Inventory');
+
+        post_message.mockClear();
+        await dispatch_host_message({
+            type: 'requestPendingEditsFlush',
+            requestId: 'flush-1',
+        });
+        // The reply itself is the observable result, so wait for *it* rather than
+        // for a tick that happens to be long enough on this machine.
+        let flush: { highestProducedSequence?: number } | undefined;
+        for (let attempt = 0; attempt < 100 && !flush; attempt += 1) {
+            await act(async () => { await Promise.resolve(); });
+            flush = post_message.mock.calls
+                .map(([message]) => message)
+                .find((message) => message?.type === 'pendingEditsFlush');
+        }
+        // Fenced: the flush reports the sequence already produced rather than
+        // publishing a new one that could never be acknowledged.
+        expect(flush).toBeDefined();
+        expect(flush?.highestProducedSequence).toBe(0);
+        expect(
+            post_message.mock.calls.some(
+                ([message]) => message?.type === 'pendingEditsChanged',
+            ),
+        ).toBe(false);
+    });
+
+    it('disables transform affordances on a non-owning sheet while a save runs', async () => {
+        // The grid on a worksheet that does not own the session is handed no
+        // lifecycle, so it truthfully reports `save_in_flight: false` about a save
+        // it cannot see. Deriving the affordance from that report re-enabled sort
+        // and filter while `transform_request_blocked` — reading the
+        // document-scoped fence — went on refusing them: the click posted no
+        // `setTransform` and gave no feedback.
+        await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'people-session',
+            sheetIndex: 0,
+        });
+        await dispatch_host_message({
+            type: 'saveOperationStarted',
+            lifecycle: {
+                revision: 1,
+                state: 'active',
+                operation: {
+                    editSessionId: 'people-session',
+                    sheetIndex: 0,
+                    saveRequestId: 'save-1',
+                    edits: { '0:0': 'Alicia' },
+                    dirtyEdits: { '0:0': { value: 'Alicia', base: 'Alice' } },
+                },
+            },
+        });
+        grid_shell_mock.save_in_flight = true;
+        await act(async () => {
+            grid_shell_mock.on_editing_change?.({
+                is_dirty: true,
+                has_live_uncommitted: false,
+                save_in_flight: true,
+                edits: { '0:0': { value: 'Alicia', base: 'Alice' } },
+                conflicted: [],
+            });
+        });
+
+        grid_shell_mock.save_in_flight = false;
+        await click_sheet_tab('Inventory');
+
+        expect(grid_shell_mock.latest_props?.transform_sections).toBe(false);
+    });
+
+    it('lifts the save fence when the save settles while another worksheet is on screen', async () => {
+        // The other half of the fence above. Refusing the non-owning grid's report
+        // is right while the save is running, but a *failed* save keeps the
+        // worksheet session — so nothing changes `editing_another_sheet`, no owning
+        // grid is mounted to report the terminal state, and the fence stayed up
+        // until the user happened to visit the owning sheet again. Meanwhile every
+        // transform was silently refused and the close flush published nothing.
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'people-session',
+            sheetIndex: 0,
+        });
+        const operation = {
+            editSessionId: 'people-session',
+            sheetIndex: 0,
+            saveRequestId: 'save-1',
+            edits: { '0:0': 'Alicia' },
+            dirtyEdits: { '0:0': { value: 'Alicia', base: 'Alice' } },
+        };
+        await dispatch_host_message({
+            type: 'saveOperationStarted',
+            lifecycle: { revision: 1, state: 'active', operation },
+        });
+        grid_shell_mock.save_in_flight = true;
+        await act(async () => {
+            grid_shell_mock.on_editing_change?.({
+                is_dirty: true,
+                has_live_uncommitted: false,
+                save_in_flight: true,
+                edits: { '0:0': { value: 'Alicia', base: 'Alice' } },
+                conflicted: [],
+            });
+        });
+
+        grid_shell_mock.save_in_flight = false;
+        await click_sheet_tab('Inventory');
+
+        // The save fails while the user is still on Inventory.
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: { revision: 2, state: 'failed', operation },
+        });
+
+        post_message.mockClear();
+        await dispatch_host_message({
+            type: 'requestPendingEditsFlush',
+            requestId: 'flush-2',
+        });
+        // The reply itself is the observable result, so wait for *it* rather than
+        // for a tick that happens to be long enough on this machine.
+        const posted = (type: string) => post_message.mock.calls
+            .map(([message]) => message)
+            .find((message) => message?.type === type);
+        let flush: { highestProducedSequence?: number } | undefined;
+        for (let attempt = 0; attempt < 100 && !flush; attempt += 1) {
+            await act(async () => { await Promise.resolve(); });
+            flush = posted('pendingEditsFlush');
+        }
+        expect(flush).toBeDefined();
+        // No save is in flight any more, so the flush publishes the restored edits
+        // instead of advertising a sequence the host will never acknowledge.
+        expect(flush?.highestProducedSequence).toBeGreaterThan(0);
+    });
+
+    it('adopts the worksheet the host names for a session it did not request', async () => {
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['People', 'Inventory'], false),
+            {
+                state: {
+                    columnWidths: [], scrollPosition: [],
+                    activeSheetIndex: 1, tabOrientation: null,
+                    pendingEdits: sheet_edits(
+                        { '0:0': { value: 'Gadget', base: 'Widget' } },
+                        1,
+                    ),
+                    transforms: [], columnVisibility: [],
+                },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'adopted-session',
+                    csvEditSheetIndex: 1,
+                },
+            },
+        ));
+
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        await click_sheet_tab('People');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+    });
+
     it('restores a clean owned edit session after receiver recreation', async () => {
         await render_app();
         await dispatch_host_message(initial_snapshot_message(
@@ -3700,6 +4110,7 @@ describe('edit mode save exit', () => {
         post_message.mockClear();
         const operation: CsvSaveOperation = {
             editSessionId: 'test-edit-session',
+            sheetIndex: 0,
             saveRequestId: 'save:matching',
             edits: { '0:0': 'draft' },
             dirtyEdits: { '0:0': { value: 'draft', base: 'a' } },
@@ -3821,6 +4232,7 @@ describe('edit mode save exit', () => {
         grid_shell_mock.has_uncommitted_changes = true;
         const previous: CsvSaveOperation = {
             editSessionId: 'session-delayed-idle',
+            sheetIndex: 0,
             saveRequestId: 'failed-r2',
             edits: { '0:0': 'old' },
             dirtyEdits: { '0:0': { value: 'old', base: 'old-base' } },
@@ -3847,7 +4259,7 @@ describe('edit mode save exit', () => {
         expect(proposed.saveRequestId).toEqual(expect.any(String));
 
         await dispatch_host_message(refresh_snapshot_message(meta, {
-            state: { pendingEdits: proposed.dirtyEdits },
+            state: { pendingEdits: sheet_edits(proposed.dirtyEdits) },
             capabilities: {
                 csvEditable: true,
                 csvEditingSupported: true,
@@ -3914,6 +4326,7 @@ describe('edit mode save exit', () => {
     it('rehydrates an exact failed operation even when durable pending state is absent', async () => {
         const operation: CsvSaveOperation = {
             editSessionId: 'failed-session',
+            sheetIndex: 0,
             saveRequestId: 'failed-before-acceptance',
             edits: { '0:0': 'overlay' },
             dirtyEdits: {
@@ -3948,6 +4361,7 @@ describe('edit mode save exit', () => {
         const newer = { '0:0': { value: 'newer', base: 'new-base' } };
         const failed: CsvSaveOperation = {
             editSessionId: 'old-session',
+            sheetIndex: 0,
             saveRequestId: 'old-failure',
             edits: { '0:0': 'old' },
             dirtyEdits: { '0:0': { value: 'old', base: 'old-base' } },
@@ -3956,7 +4370,7 @@ describe('edit mode save exit', () => {
         await dispatch_host_message(initial_snapshot_message(
             make_meta(['Sheet1'], false),
             {
-                state: { pendingEdits: newer },
+                state: { pendingEdits: sheet_edits(newer) },
                 capabilities: {
                     csvEditable: true,
                     csvEditingSupported: true,
@@ -3977,6 +4391,7 @@ describe('edit mode save exit', () => {
     it('tombstones stale pending edits for a succeeded current session', async () => {
         const succeeded: CsvSaveOperation = {
             editSessionId: 'saved-session',
+            sheetIndex: 0,
             saveRequestId: 'saved-operation',
             edits: { '0:0': 'saved' },
             dirtyEdits: { '0:0': { value: 'saved', base: 'base' } },
@@ -3985,7 +4400,7 @@ describe('edit mode save exit', () => {
         await dispatch_host_message(initial_snapshot_message(
             make_meta(['Sheet1'], false),
             {
-                state: { pendingEdits: succeeded.dirtyEdits },
+                state: { pendingEdits: sheet_edits(succeeded.dirtyEdits) },
                 capabilities: {
                     csvEditable: true,
                     csvEditingSupported: true,
@@ -4006,6 +4421,7 @@ describe('edit mode save exit', () => {
     it('keeps saved entries cleared across reliable success, remount, and edit reacquisition', async () => {
         const operation: CsvSaveOperation = {
             editSessionId: 'saved-session',
+            sheetIndex: 0,
             saveRequestId: 'saved-operation',
             edits: { '0:0': 'saved' },
             dirtyEdits: { '0:0': { value: 'saved', base: 'base' } },
@@ -4022,7 +4438,7 @@ describe('edit mode save exit', () => {
         await dispatch_host_message(initial_snapshot_message(
             make_meta(['Sheet1'], false),
             {
-                state: { pendingEdits: operation.dirtyEdits },
+                state: { pendingEdits: sheet_edits(operation.dirtyEdits) },
                 capabilities: {
                     csvEditable: false,
                     csvEditingSupported: true,
@@ -4069,6 +4485,7 @@ describe('edit mode save exit', () => {
         const newer = { '0:0': { value: 'newer', base: 'new-base' } };
         const succeeded: CsvSaveOperation = {
             editSessionId: 'old-session',
+            sheetIndex: 0,
             saveRequestId: 'old-success',
             edits: { '0:0': 'old' },
             dirtyEdits: { '0:0': { value: 'old', base: 'old-base' } },
@@ -4077,7 +4494,7 @@ describe('edit mode save exit', () => {
         await dispatch_host_message(initial_snapshot_message(
             make_meta(['Sheet1'], false),
             {
-                state: { pendingEdits: newer },
+                state: { pendingEdits: sheet_edits(newer) },
                 capabilities: {
                     csvEditable: true,
                     csvEditingSupported: true,
@@ -4291,7 +4708,7 @@ describe('edit mode save exit', () => {
                     csvEditable: true,
                     csvEditingSupported: true,
                 },
-                state: { pendingEdits: { '0:0': { value: 'restored', base: 'base' } } },
+                state: { pendingEdits: sheet_edits({ '0:0': { value: 'restored', base: 'base' } }) },
                 generation: 2,
             })
         );
@@ -4345,7 +4762,7 @@ describe('edit mode save exit', () => {
                     csvEditingSupported: true,
                     csvEditSessionId: 'test-edit-session',
                 },
-                state: { pendingEdits: restored },
+                state: { pendingEdits: sheet_edits(restored) },
             }),
         );
         const store = grid_shell_mock.latest_props?.edit_session as EditSessionStore;
@@ -4364,6 +4781,7 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
                     saveRequestId: 'rehydration:1',
                     edits: { '4:1': 'edited' },
                     dirtyEdits: restored,
@@ -4399,6 +4817,7 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
                     saveRequestId: 'save-1',
                     edits: { '4:1': 'edited' },
                     dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
@@ -4444,6 +4863,7 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
                     saveRequestId: 'save-2',
                     edits: { '7:0': 'orphan', '7:2': 'orphan too' },
                     dirtyEdits: {
@@ -4491,6 +4911,7 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
                     saveRequestId: 'save-3',
                     edits: { '4:1': 'edited', '0:0': 'fine' },
                     dirtyEdits: {
@@ -4545,6 +4966,7 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
                     saveRequestId: 'save-4',
                     edits: { '4:1': 'edited', '9:3': 'local' },
                     dirtyEdits: {
@@ -4589,6 +5011,7 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
                     saveRequestId: 'save-4',
                     edits: { '4:1': 'edited', '0:0': 'fine' },
                     dirtyEdits: {
@@ -4647,6 +5070,7 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
                     saveRequestId: 'save-5',
                     edits: { '4:1': 'edited' },
                     dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
@@ -4704,6 +5128,7 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
                     saveRequestId: 'save-6',
                     edits: { '4:1': 'edited' },
                     dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
@@ -4763,6 +5188,7 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
                     saveRequestId: 'save-10',
                     edits: { '4:1': 'edited' },
                     dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
@@ -4784,7 +5210,7 @@ describe('edit mode save exit', () => {
             generation: 3,
             sourceGeneration: 3,
             state: {
-                pendingEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                pendingEdits: sheet_edits({ '4:1': { value: 'edited', base: 'stale' } }),
             },
             capabilities: {
                 csvEditable: true,
@@ -4829,6 +5255,7 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
                     saveRequestId: 'save-7',
                     edits: { '4:1': 'edited' },
                     dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
@@ -4852,6 +5279,7 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
                     saveRequestId: 'save-8',
                     edits: { '4:1': 'edited' },
                     dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
@@ -4891,6 +5319,7 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
                     saveRequestId: 'save-9',
                     edits: { '4:1': 'edited' },
                     dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
@@ -6086,7 +6515,7 @@ describe('edit session store hydration', () => {
         await dispatch_host_message(refresh_snapshot_message(meta, {
             generation: 1,
             sourceGeneration: 1,
-            state: { pendingEdits },
+            state: { pendingEdits: sheet_edits(pendingEdits) },
             capabilities: {
                 csvEditable: true,
                 csvEditingSupported: true,
@@ -6554,7 +6983,7 @@ describe('snapshots arriving during an in-flight transform', () => {
                 sourceGeneration: 1,
                 reason: 'other',
                 capabilities: CSV_CAPABILITIES,
-                state: { pendingEdits: { '0:0': { value: 'first', base: 'a' } } },
+                state: { pendingEdits: sheet_edits({ '0:0': { value: 'first', base: 'a' } }) },
             },
         ));
         // A second confirmed edit, typed while the compute is still outstanding.
@@ -8178,6 +8607,7 @@ describe('stale-view banner', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
                     saveRequestId: 'save-shrunk',
                     edits: { '7:1': 'orphan' },
                     dirtyEdits: removed,
@@ -8387,7 +8817,7 @@ describe('stale-view banner', () => {
         };
         const durable = (rules: SheetTransformState | undefined) => ({
             capabilities,
-            state: { transforms: [rules], pendingEdits: edits },
+            state: { transforms: [rules], pendingEdits: sheet_edits(edits) },
         });
 
         await install_durable(
@@ -8473,7 +8903,7 @@ describe('stale-view banner', () => {
                         }],
                         schema: '["Sheet1",1,null]',
                     }],
-                    pendingEdits: dirty('0:0'),
+                    pendingEdits: sheet_edits(dirty('0:0')),
                 },
             },
         ));
@@ -8558,7 +8988,7 @@ describe('stale-view banner', () => {
                         filters: [],
                         schema: '["Sheet1",1,null]',
                     }],
-                    pendingEdits: dirty('0:0'),
+                    pendingEdits: sheet_edits(dirty('0:0')),
                 },
             },
         ));
@@ -8592,7 +9022,7 @@ describe('stale-view banner', () => {
                             filters: [],
                             schema: '["Sheet1",1,null]',
                         }],
-                        pendingEdits: dirty('0:0'),
+                        pendingEdits: sheet_edits(dirty('0:0')),
                     },
                 },
             ));
@@ -8653,7 +9083,7 @@ describe('stale-view banner', () => {
                     hiddenRows: [1],
                     schema: '["Sheet1",2,null]',
                 }],
-                pendingEdits: edits,
+                pendingEdits: sheet_edits(edits),
             },
         }));
         await dispatch_host_message(transform_installed_message(

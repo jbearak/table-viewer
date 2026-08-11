@@ -10,10 +10,14 @@ import {
 } from '../sqlite-file-state-errors';
 import {
     initialize_sqlite_file_state_schema,
+    SQLITE_FILE_STATE_V1_TABLE_SQL,
     type SqliteDesktopFileStateIdentity,
     type SqliteVscodeFileStateIdentity,
 } from '../sqlite-file-state-schema';
 import { validate_sqlite_file_state_database } from '../sqlite-file-state-validation';
+import { type StoredPerFileState, stringify_stored_per_file_state } from '../types';
+import { sheet_edits } from './pending-edits-helper';
+import { V0_8_ENTRIES_TABLE_SQL } from './v0-8-entries-fixture';
 
 let tempDirectory: string;
 let databases: DatabaseSync[];
@@ -102,7 +106,11 @@ function insertEntry(
         .run(
             entryPath,
             revision,
-            JSON.stringify(state),
+            // The production serializer, not a bare stringify: it wraps the
+            // `pendingEdits` list so the column stays a JSON object, which is what
+            // the shipped `entries` CHECK requires. Hand-rolling the JSON here
+            // would test a row no writer can produce.
+            stringify_stored_per_file_state(state as StoredPerFileState),
             options.hasPending ? 1 : 0,
             recency,
             `recovery-entry-${recency}`,
@@ -173,7 +181,7 @@ describe('SQLite file-state structural validation', () => {
 
     it('requires the pending bit to match the decoded nonempty pending map', () => {
         const database = createDatabase();
-        insertEntry(database, { pendingEdits: {} }, { hasPending: true });
+        insertEntry(database, { pendingEdits: sheet_edits({}) }, { hasPending: true });
 
         expectValidationCategory(database, 'malformed-state');
     });
@@ -181,7 +189,7 @@ describe('SQLite file-state structural validation', () => {
     it('requires remote pending rows to carry recovery evidence', () => {
         const database = createDatabase();
         insertEntry(database, {
-            pendingEdits: { '0:0': { value: 'changed', base: 'original' } },
+            pendingEdits: sheet_edits({ '0:0': { value: 'changed', base: 'original' } }),
         }, { hasPending: true });
 
         try {
@@ -194,6 +202,52 @@ describe('SQLite file-state structural validation', () => {
             expect(error).toBeInstanceOf(SqliteFileStateError);
             expect((error as SqliteFileStateError).category).toBe('malformed-state');
         }
+    });
+
+    // An installed database is never rebuilt: `migrate_sqlite_file_state_schema`
+    // returns early once `user_version` already matches, and the only path that
+    // creates tables initializes a *fresh* candidate. So every byte of the shipped
+    // `entries` DDL is permanent for existing users, and a worksheet-scoped draft
+    // has to fit through the CHECK v0.8.0 installed on their disk — which is why
+    // the leaf persists wrapped as an object instead of as a bare array.
+    describe('compatibility with the v0.8.0 entries table', () => {
+        it('still defines entries exactly as v0.8.0 shipped it', () => {
+            const normalize = (sql: string): string => sql
+                .replace(/--[^\n]*/g, ' ')
+                .replace(/\s+/g, ' ')
+                .replace(/\s*([(),])\s*/g, '$1')
+                .trim();
+
+            // Normalized, because `normalize_sql` is what validation compares and
+            // it drops comments — so an explanatory comment is allowed to differ
+            // and nothing else is.
+            expect(normalize(SQLITE_FILE_STATE_V1_TABLE_SQL.entries))
+                .toBe(normalize(V0_8_ENTRIES_TABLE_SQL));
+        });
+
+        it('accepts a worksheet-scoped pending-edits write into that table', () => {
+            const database = new DatabaseSync(
+                path.join(tempDirectory, `v080-${counter++}.sqlite3`),
+                { enableDoubleQuotedStringLiterals: false },
+            );
+            databases.push(database);
+            database.exec(V0_8_ENTRIES_TABLE_SQL);
+
+            const json = stringify_stored_per_file_state({
+                pendingEdits: sheet_edits({ '0:0': { value: 'changed', base: 'original' } }, 1, 'Sheet2'),
+            } as StoredPerFileState);
+
+            expect(() => {
+                database.prepare(`INSERT INTO entries (
+                    path, state_revision, state_json, has_pending_edits,
+                    authority_commit_sequence, authority_revision, physical_revision,
+                    projection_revision, physical_digest, recency_order, updated_at_ms,
+                    touched_at_ms, recovery_entry_id, recovery_record_id,
+                    copy_id, copy_source_path, copy_source_revision
+                ) VALUES (?, 1, ?, 1, 0, 0, 0, 0, NULL, 1, NULL, NULL, 'recovery', NULL, NULL, NULL, NULL)`)
+                    .run('file:///book.xlsx', json);
+            }).not.toThrow();
+        });
     });
 
     it('rejects revision and recency counters behind durable rows', () => {

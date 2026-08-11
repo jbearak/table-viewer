@@ -75,6 +75,13 @@ export interface WorkbookSnapshotCapabilities {
     readonly csvEditable: boolean;
     readonly csvEditingSupported: boolean;
     readonly csvEditSessionId?: string;
+    /**
+     * The worksheet the held edit session belongs to. Present exactly when
+     * `csvEditSessionId` is: editing is worksheet-scoped, so a panel adopting a
+     * snapshot has to be told which sheet's key space the session's edits are in
+     * rather than assume the sheet it happens to be showing.
+     */
+    readonly csvEditSheetIndex?: number;
     /** Monotonic host projection for the complete panel save lifecycle. */
     readonly csvSaveLifecycle: CsvSaveLifecycle;
 }
