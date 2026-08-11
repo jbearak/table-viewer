@@ -411,6 +411,19 @@ export function App(): React.JSX.Element {
     const active_sheet_index_ref = useRef(0);
     active_sheet_index_ref.current = active_sheet_index;
     const renderer_publication_fenced_session_ref = useRef<string>();
+    // The dirty maps, one per worksheet, owned here so they survive the
+    // generation-keyed GridShell remounts that a transform or refresh snapshot
+    // forces.
+    //
+    // A registry rather than a single store because editing is widening to the
+    // whole workbook (#154): each sheet keeps its own map in its own `row:col`
+    // key space, which is what lets the store and the `use_editing` hook stay
+    // sheet-agnostic. Only one sheet holds a session today, so exactly one of
+    // these is ever non-empty; the shape is what changes here, not the behaviour.
+    const edit_session_registry_ref = useRef<EditSessionRegistry | null>(null);
+    if (edit_session_registry_ref.current === null) {
+        edit_session_registry_ref.current = create_edit_session_registry();
+    }
     const set_csv_edit_session_id = useCallback((next: string | undefined) => {
         const previous = csv_edit_session_id_ref.current;
         if (next && next !== previous) {
@@ -418,6 +431,11 @@ export function App(): React.JSX.Element {
         }
         if (previous && previous !== next) pending_edit_durability.retire(previous);
         csv_edit_session_id_ref.current = next;
+        // Moved together with the ref so a store built between this move and the
+        // commit is already fenced against the outgoing session's writers.
+        // Existing stores keep their stamp until the adopt_session layout effect
+        // at commit — see that effect for why the lag is load-bearing.
+        edit_session_registry_ref.current!.set_session(next);
         set_csv_edit_session_id_state(next);
     }, []);
     const [edit_mode, set_edit_mode_state] = useState(false);
@@ -614,32 +632,10 @@ export function App(): React.JSX.Element {
     // sheet's key space; the whole-workbook leaf is assembled only at the durable
     // boundary, where the host writes it into the owning sheet's slot.
     const latest_live_edits_ref = useRef<SheetPendingEditCells | undefined>(undefined);
-    // The dirty maps, one per worksheet, owned here so they survive the
-    // generation-keyed GridShell remounts that a transform or refresh snapshot
-    // forces.
-    //
-    // A registry rather than a single store because editing is widening to the
-    // whole workbook (#154): each sheet keeps its own map in its own `row:col`
-    // key space, which is what lets the store and the `use_editing` hook stay
-    // sheet-agnostic. Only one sheet holds a session today, so exactly one of
-    // these is ever non-empty; the shape is what changes here, not the behaviour.
-    const edit_session_registry_ref = useRef<EditSessionRegistry | null>(null);
-    if (edit_session_registry_ref.current === null) {
-        edit_session_registry_ref.current = create_edit_session_registry();
-    }
-    /**
-     * The store for the worksheet the session belongs to.
-     *
-     * Stores are stamped at construction rather than left unstamped: an unstamped
-     * store accepts a write from any writer, which would make the session fence's
-     * soundness depend on the `adopt_session` layout effect having already run.
-     * There is no session before the first grant, and `undefined` is compared
-     * with === and is a real value here, never a wildcard.
-     */
+    /** The store for the worksheet the session belongs to. */
     const edit_session_store = useCallback((): EditSessionStore => (
         edit_session_registry_ref.current!.for_sheet(
             edit_session_sheet_index_ref.current,
-            csv_edit_session_id_ref.current,
         )
     ), []);
     const meta_ref = useRef<WorkbookMeta | null>(null);
@@ -3061,8 +3057,11 @@ export function App(): React.JSX.Element {
     useLayoutEffect(() => {
         // Every store, not just the owning sheet's: a store the session never
         // wrote to still carries the stamp it was built with, and leaving it on a
-        // retired session would fence off the first write it does receive.
-        edit_session_registry_ref.current!.adopt_session(csv_edit_session_id);
+        // retired session would fence off the first write it does receive. The
+        // registry already learned the new id when the ref moved (set_session);
+        // this is the commit-time half, re-stamping the stores that existed
+        // before the move.
+        edit_session_registry_ref.current!.adopt_session();
     }, [csv_edit_session_id]);
 
     // GridShell reports editing status up so the toolbar dirty dot, pending-edit
@@ -3858,7 +3857,6 @@ export function App(): React.JSX.Element {
             // finds its edits intact.
             edit_session={edit_session_registry_ref.current!.for_sheet(
                 active_sheet_index,
-                csv_edit_session_id,
             )}
             host_rejected_keys={live_rejected_keys}
             on_editing_change={handle_editing_change}

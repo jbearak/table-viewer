@@ -4,35 +4,38 @@ import { create_edit_session_registry } from '../webview/edit-session-registry';
 describe('edit session registry', () => {
     it('returns the same store for the same sheet across calls', () => {
         const registry = create_edit_session_registry();
+        registry.set_session('session');
 
-        const first = registry.for_sheet(0, 'session');
+        const first = registry.for_sheet(0);
         first.commit('session', '0:0', { value: 'typed', base: 'A' });
 
         // Memoization is the hoisting guarantee: if a re-render (or a
         // generation-keyed remount) got a fresh store, the edits would be gone.
-        expect(registry.for_sheet(0, 'session')).toBe(first);
-        expect(registry.for_sheet(0, 'session').get('0:0'))
+        expect(registry.for_sheet(0)).toBe(first);
+        expect(registry.for_sheet(0).get('0:0'))
             .toEqual({ value: 'typed', base: 'A' });
     });
 
     it('gives each sheet its own store and key space', () => {
         const registry = create_edit_session_registry();
+        registry.set_session('s');
 
-        registry.for_sheet(0, 's').commit('s', '0:0', { value: 'people', base: 'A' });
-        registry.for_sheet(1, 's').commit('s', '0:0', { value: 'stock', base: 'B' });
+        registry.for_sheet(0).commit('s', '0:0', { value: 'people', base: 'A' });
+        registry.for_sheet(1).commit('s', '0:0', { value: 'stock', base: 'B' });
 
         // Same `row:col` key, different sheets — the whole point of the registry
         // is that these never alias.
-        expect(registry.for_sheet(0, 's').get('0:0'))
+        expect(registry.for_sheet(0).get('0:0'))
             .toEqual({ value: 'people', base: 'A' });
-        expect(registry.for_sheet(1, 's').get('0:0'))
+        expect(registry.for_sheet(1).get('0:0'))
             .toEqual({ value: 'stock', base: 'B' });
     });
 
     it('stamps a store with the session it was created under', () => {
         const registry = create_edit_session_registry();
+        registry.set_session('live-session');
 
-        const store = registry.for_sheet(2, 'live-session');
+        const store = registry.for_sheet(2);
 
         expect(store.identity()).toEqual({ session_id: 'live-session' });
         // The stamp is a write fence, so it must hold from the first render on.
@@ -40,37 +43,32 @@ describe('edit session registry', () => {
         expect(store.size()).toBe(0);
     });
 
-    it('lists entries and dirty sheets in ascending sheet order', () => {
+    it('set_session moves the stamp for new stores only', () => {
         const registry = create_edit_session_registry();
+        registry.set_session('old');
+        const before = registry.for_sheet(0);
 
-        // Visit out of order — a save must not depend on visit order.
-        registry.for_sheet(3, 's').commit('s', '0:0', { value: 'x', base: 'a' });
-        registry.for_sheet(0, 's');
-        registry.for_sheet(1, 's').commit('s', '2:2', { value: 'y', base: 'b' });
+        registry.set_session('new');
 
-        expect(registry.entries().map(([sheet_index]) => sheet_index))
-            .toEqual([0, 1, 3]);
-        // Sheet 0 exists but is clean, so it is not dirty.
-        expect(registry.dirty_sheets()).toEqual([1, 3]);
+        // The existing store keeps its stamp until adopt_session: until the
+        // render under the new id commits, the on-screen grid is still the old
+        // session's, and its unmount-time folds must still land.
+        expect(before.identity()).toEqual({ session_id: 'old' });
+        before.commit('old', '0:0', { value: 'late fold', base: 'a' });
+        expect(before.size()).toBe(1);
+        // A store built after the move is fenced onto the new session at once.
+        expect(registry.for_sheet(1).identity()).toEqual({ session_id: 'new' });
     });
 
-    it('sums dirty cells across every sheet', () => {
+    it('adopt_session re-stamps every existing store, including clean ones', () => {
         const registry = create_edit_session_registry();
+        registry.set_session('old');
+        const dirty = registry.for_sheet(0);
+        dirty.commit('old', '0:0', { value: 'x', base: 'a' });
+        const clean = registry.for_sheet(1);
 
-        registry.for_sheet(0, 's').commit('s', '0:0', { value: 'x', base: 'a' });
-        registry.for_sheet(0, 's').commit('s', '1:1', { value: 'y', base: 'b' });
-        registry.for_sheet(2, 's').commit('s', '0:0', { value: 'z', base: 'c' });
-
-        expect(registry.size()).toBe(3);
-    });
-
-    it('adopt_session re-stamps every store, including clean ones', () => {
-        const registry = create_edit_session_registry();
-
-        registry.for_sheet(0, 'old').commit('old', '0:0', { value: 'x', base: 'a' });
-        const clean = registry.for_sheet(1, 'old');
-
-        registry.adopt_session('new');
+        registry.set_session('new');
+        registry.adopt_session();
 
         // The clean store matters most: it was never written to under the old
         // session, but leaving it stamped 'old' would fence off the first write
@@ -79,30 +77,6 @@ describe('edit session registry', () => {
         clean.commit('new', '0:0', { value: 'now writable', base: 'b' });
         expect(clean.size()).toBe(1);
         // And the dirty store's edits survive the re-stamp.
-        expect(registry.for_sheet(0, 'new').get('0:0'))
-            .toEqual({ value: 'x', base: 'a' });
-    });
-
-    it('reset drops every store so the next for_sheet builds fresh', () => {
-        const registry = create_edit_session_registry();
-
-        const before = registry.for_sheet(0, 'old');
-        before.commit('old', '0:0', { value: 'x', base: 'a' });
-
-        registry.reset();
-
-        expect(registry.peek(0)).toBeUndefined();
-        expect(registry.size()).toBe(0);
-        const after = registry.for_sheet(0, 'new');
-        expect(after).not.toBe(before);
-        expect(after.size()).toBe(0);
-        expect(after.identity()).toEqual({ session_id: 'new' });
-    });
-
-    it('peek does not create a store', () => {
-        const registry = create_edit_session_registry();
-
-        expect(registry.peek(5)).toBeUndefined();
-        expect(registry.entries()).toEqual([]);
+        expect(dirty.get('0:0')).toEqual({ value: 'x', base: 'a' });
     });
 });

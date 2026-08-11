@@ -20,8 +20,20 @@
  * session, not the grid generation, so it has to survive the generation-keyed
  * `GridShell` remounts that a transform or refresh snapshot forces. Retaining a
  * sheet's store after its edits are gone costs an empty map and keeps the
- * hoisting guarantee simple; {@link EditSessionRegistry.reset} is the one way
- * they go away.
+ * hoisting guarantee simple.
+ *
+ * The registry also owns which session its stores are stamped under, in two
+ * deliberately separate steps that reproduce the single store's timing:
+ *
+ *  - {@link EditSessionRegistry.set_session} moves the identity *new* stores
+ *    are created with, and is called synchronously wherever the session id ref
+ *    moves — so a store built between that move and the commit is already
+ *    fenced against the outgoing session's writers.
+ *  - {@link EditSessionRegistry.adopt_session} re-stamps the *existing* stores,
+ *    and runs from a layout effect at commit. The lag is the point: until the
+ *    render under the new id commits, the on-screen grid is still the old
+ *    session's, and its unmount-time folds are legitimate late writes that an
+ *    eager re-stamp would silently drop.
  */
 
 import {
@@ -31,66 +43,47 @@ import {
 
 export interface EditSessionRegistry {
     /**
+     * Move the session identity that new stores are stamped with.
+     *
+     * Identity only — existing stores keep their stamp until
+     * {@link adopt_session}, for the reason given in the module comment.
+     */
+    set_session(session_id: string | undefined): void;
+    /**
      * The store for one worksheet, created on first use.
      *
-     * Created stamped with `session_id` for the same reason the single store was:
-     * an unstamped store accepts a write from any writer, so leaving the stamp to
-     * a later effect would make the session fence's soundness depend on that
-     * effect having already run. A store created mid-session is stamped with that
-     * session from its first render.
+     * Created stamped with the current session for the same reason the single
+     * store was: an unstamped store accepts a write from any writer, so leaving
+     * the stamp to a later effect would make the session fence's soundness
+     * depend on that effect having already run. A store created mid-session is
+     * stamped with that session from its first render.
      */
-    for_sheet(sheet_index: number, session_id: string | undefined): EditSessionStore;
-    /** The store for one worksheet if it has ever been asked for, else undefined. */
-    peek(sheet_index: number): EditSessionStore | undefined;
-    /** Every store that exists, by sheet index, ascending. */
-    entries(): readonly (readonly [number, EditSessionStore])[];
-    /** Sheets holding at least one dirty cell, ascending. */
-    dirty_sheets(): readonly number[];
-    /** Total dirty cells across every sheet. */
-    size(): number;
-    /** Re-stamp every store that is not already on `session_id`. */
-    adopt_session(session_id: string | undefined): void;
-    /** Drop every store. The next `for_sheet` builds a fresh one. */
-    reset(): void;
+    for_sheet(sheet_index: number): EditSessionStore;
+    /** Re-stamp every existing store onto the current session. */
+    adopt_session(): void;
 }
 
 export function create_edit_session_registry(): EditSessionRegistry {
     const stores = new Map<number, EditSessionStore>();
-
-    // Ascending rather than in insertion order: a save writes several sheets and
-    // the durable leaf is a positional array, so every consumer that walks these
-    // wants them in sheet order. Sorting here keeps that from being restated —
-    // and, for a save, keeps the order it writes sheets in independent of the
-    // order the user happened to visit them.
-    const sheets_ascending = (): number[] => [...stores.keys()].sort((a, b) => a - b);
+    let session_id: string | undefined;
 
     return {
-        for_sheet: (sheet_index, session_id) => {
+        set_session: (next) => {
+            session_id = next;
+        },
+        for_sheet: (sheet_index) => {
             const existing = stores.get(sheet_index);
             if (existing) return existing;
             const created = create_edit_session_store({ session_id });
             stores.set(sheet_index, created);
             return created;
         },
-        peek: (sheet_index) => stores.get(sheet_index),
-        entries: () => sheets_ascending().map(
-            (sheet_index) => [sheet_index, stores.get(sheet_index)!] as const,
-        ),
-        dirty_sheets: () => sheets_ascending().filter(
-            (sheet_index) => stores.get(sheet_index)!.size() > 0,
-        ),
-        size: () => {
-            let total = 0;
-            for (const store of stores.values()) total += store.size();
-            return total;
-        },
-        adopt_session: (session_id) => {
+        adopt_session: () => {
             for (const store of stores.values()) {
                 const stamp = store.identity();
                 if (stamp && stamp.session_id === session_id) continue;
                 store.adopt_session(session_id);
             }
         },
-        reset: () => stores.clear(),
     };
 }
