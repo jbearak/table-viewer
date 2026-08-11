@@ -55,29 +55,35 @@ export interface EditSessionRegistry {
     /** Re-stamp every existing store onto the current session. */
     adopt_session(): void;
     /**
-     * The session sheet pointer moved: carry its store to the new index and
-     * drop every other store.
+     * The workbook's sheets moved: carry every store to where its sheet went.
      *
-     * This is the registry reproducing the single store it replaced. That
-     * store was handed to whichever sheet the session pointer named, so when
-     * a workbook edit outside this viewer reordered sheets, the edits
-     * followed the pointer to the sheet's new index — and because it was
-     * *replaced* wholesale at every hydration boundary, nothing stale could
-     * outlive one. A registry that merely keeps stores by index broke both
-     * halves: a reordered sheet's edits stayed at its old index (painting
-     * them on whatever sheet now sits there), and another document's stores
-     * survived an initial snapshot that replaced the file. Moving the
-     * pointer's store and dropping the rest restores both, including on the
-     * paths where no install follows — a refresh can advance the session id,
-     * which makes the install conditional on it skip.
+     * The session is workbook-scoped, so any sheet's store may hold edits —
+     * not just the one the edit pointer names. An external reorder moves the
+     * sheets under all of them at once, and a store left at its old index
+     * would paint its edits onto whatever worksheet now sits there. The
+     * caller resolves old index → new index (by sheet name, against the
+     * snapshot that reported the move); a sheet that resolves nowhere was
+     * deleted, and its store goes with it — the durable slot, not this
+     * in-memory map, is what survives a deletion-shaped rename.
      *
-     * The carried store is deliberately not re-created: its object identity
-     * is what `install` notifies through and what the hydration boundary
-     * reads its outgoing stamp from. When the pointer did not move this is
-     * just the drop of every other store, which the file-replacement case
-     * needs even at an unchanged index.
+     * Stores are moved, never re-created: a store's object identity is what
+     * `install` notifies through and what the hydration boundary reads its
+     * outgoing stamp from.
      */
-    retarget(previous_sheet_index: number, next_sheet_index: number): void;
+    remap(next_index_of: (previous_index: number) => number | undefined): void;
+    /**
+     * A different document replaced this one: drop every store. An initial
+     * snapshot owns the complete pending-edit projection, so any store that
+     * survived it would be another file's edits waiting to leak through an
+     * index collision.
+     */
+    replace_document(): void;
+    /**
+     * Empty every store's map, keeping the stores. A discard ends the
+     * workbook-scoped session, so every sheet's local edits go at once — the
+     * mounted grid's clear reaches only the sheet on screen.
+     */
+    clear_all(session_id: string | undefined): void;
 }
 
 export function create_edit_session_registry(
@@ -95,10 +101,20 @@ export function create_edit_session_registry(
             stores.set(sheet_index, created);
             return created;
         },
-        retarget: (previous_sheet_index, next_sheet_index) => {
-            const session_store = stores.get(previous_sheet_index);
+        remap: (next_index_of) => {
+            const moved = new Map<number, EditSessionStore>();
+            for (const [previous_index, store] of stores) {
+                const next_index = next_index_of(previous_index);
+                if (next_index !== undefined) moved.set(next_index, store);
+            }
             stores.clear();
-            if (session_store) stores.set(next_sheet_index, session_store);
+            for (const [index, store] of moved) stores.set(index, store);
+        },
+        replace_document: () => {
+            stores.clear();
+        },
+        clear_all: (session_id) => {
+            for (const store of stores.values()) store.clear(session_id);
         },
         adopt_session: () => {
             // Unconditional: the store's adopt_session is a bare stamp

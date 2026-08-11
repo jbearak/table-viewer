@@ -16,7 +16,7 @@ import { MAX_PERSISTED_ROW_HEIGHTS } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
 import type { WorkbookSnapshot } from '../viewer-snapshot';
 import type { EditSessionStore } from '../webview/edit-session-store';
-import { sheet_cells, sheet_edits } from './pending-edits-helper';
+import { sheet_edits } from './pending-edits-helper';
 
 const grid_shell_mock = vi.hoisted(() => ({
     is_dirty: false,
@@ -3544,6 +3544,46 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
     });
 
+    it('a discard empties every worksheet’s store, not just the mounted one', async () => {
+        // The session covers the whole workbook and the host clears every live
+        // durable slot; a store left full locally would repaint edits the user
+        // just discarded the next time its sheet is opened.
+        grid_shell_mock.has_uncommitted_changes = true;
+
+        const { post_message } = await render_app();
+        const people = { '0:0': { value: 'Bob', base: 'Alice' } };
+        const inventory = { '0:0': { value: 'Gadget', base: 'Widget' } };
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                state: {
+                    pendingEdits: [
+                        { sheetName: 'People', cells: people },
+                        { sheetName: 'Inventory', cells: inventory },
+                    ],
+                },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'restored-session',
+                },
+            })
+        );
+        expect(grid_stub().getAttribute('data-store-edits')).toBe(
+            JSON.stringify(people)
+        );
+
+        post_message.mockClear();
+        await click_button('Edit');
+        await dispatch_host_message({ type: 'saveDialogResult', choice: 'discard' });
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'discardEditSession',
+        }));
+
+        expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
+        await click_sheet_tab('Inventory');
+        expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
+    });
+
     it('enters edit mode with pending edits returned by the host session grant', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(
@@ -3582,7 +3622,7 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-mount-id')).toBe(first_mount_id);
     });
 
-    it('shows edit mode only on the worksheet whose session the host granted', async () => {
+    it('continues the workbook session when Edit is pressed on another worksheet', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(
             initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
@@ -3599,36 +3639,136 @@ describe('edit mode save exit', () => {
         await dispatch_host_message({
             type: 'editSessionResult',
             granted: true,
-            editSessionId: 'inventory-session',
+            editSessionId: 'workbook-session',
             sheetIndex: 1,
             pendingEdits,
         });
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
 
         await click_sheet_tab('People');
-        // Sheet 0 is not the sheet being edited, so it neither renders as editable
-        // nor offers an Edit button that would retarget the held session.
+        // The pointer names Inventory, so People renders read-only until its own
+        // grant lands — but it must not be handed the other sheet's dirty map.
+        // Read-only is not enough on its own: the grid paints a dirty value and
+        // its tint whenever an edit exists for the key, edit mode or not, so
+        // sheet 1's '0:0' would show up as sheet 0's own edited cell.
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
-        // And it must not be handed the other sheet's dirty map. Read-only is not
-        // enough on its own: the grid paints a dirty value and its tint whenever an
-        // edit exists for the key, edit mode or not, so sheet 1's '0:0' would show
-        // up as sheet 0's own edited cell — a value the user never typed here, in a
-        // worksheet they cannot even edit.
         expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
         expect(grid_stub().getAttribute('data-initial-edits')).toBe('null');
-        expect(get_button('Edit').getAttribute('aria-disabled')).toBe('true');
+        // The session covers the whole workbook, so Edit here is an *entry*:
+        // enabled, and pressing it asks the host for this sheet's own grant of
+        // the same session rather than being refused.
+        expect(get_button('Edit').getAttribute('aria-disabled')).not.toBe('true');
         post_message.mockClear();
         await click_button('Edit');
-        expect(post_message).not.toHaveBeenCalledWith(expect.objectContaining({
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
             type: 'requestEditSession',
+            sheetIndex: 0,
         }));
-
-        // Returning to the edited sheet finds the session exactly as it was.
-        await click_sheet_tab('Inventory');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'workbook-session',
+            sheetIndex: 0,
+        });
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
-        expect(grid_stub().getAttribute('data-initial-edits')).toBe(
+
+        // Returning to the first edited sheet finds its edits exactly as they
+        // were — the pointer moved, the session and Inventory's store did not.
+        await click_sheet_tab('Inventory');
+        expect(grid_stub().getAttribute('data-store-edits')).toBe(
             JSON.stringify(pendingEdits)
+        );
+    });
+
+    it('moves every worksheet’s store to where its sheet went on a reorder', async () => {
+        // An external reorder moves the sheets under all of the stores at once.
+        // A store left at its old index would paint its edits onto whatever
+        // worksheet now sits there — for every sheet holding edits, not just
+        // the one the edit pointer names.
+        await render_app();
+        const people = { '0:0': { value: 'Bob', base: 'Alice' } };
+        const inventory = { '0:0': { value: 'Gadget', base: 'Widget' } };
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                state: {
+                    pendingEdits: [
+                        { sheetName: 'People', cells: people },
+                        { sheetName: 'Inventory', cells: inventory },
+                    ],
+                },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'restored-session',
+                },
+            })
+        );
+        expect(grid_stub().getAttribute('data-store-edits')).toBe(
+            JSON.stringify(people)
+        );
+
+        // The workbook reorders externally; the refresh advances the session id,
+        // which is exactly the path where no install follows the move.
+        await dispatch_host_message(
+            refresh_snapshot_message(make_meta(['Inventory', 'People'], false), {
+                state: {
+                    pendingEdits: [
+                        { sheetName: 'Inventory', cells: inventory },
+                        { sheetName: 'People', cells: people },
+                    ],
+                },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'advanced-session',
+                },
+            })
+        );
+
+        // The active tab kept its index, so it now shows Inventory — and must
+        // paint Inventory's edits, not People's.
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+        expect(grid_stub().getAttribute('data-store-edits')).toBe(
+            JSON.stringify(inventory)
+        );
+        await click_sheet_tab('People');
+        expect(grid_stub().getAttribute('data-store-edits')).toBe(
+            JSON.stringify(people)
+        );
+    });
+
+    it('hydrates every worksheet’s restored edits into its own store', async () => {
+        // The session covers the whole workbook, so a reload can restore drafts
+        // on several sheets at once. Each slot must land in its own sheet's
+        // store — hydrating only the pointer sheet's left the others' edits
+        // invisible until a save or discard surprised the user with them.
+        await render_app();
+        const people = { '0:0': { value: 'Bob', base: 'Alice' } };
+        const inventory = { '0:0': { value: 'Gadget', base: 'Widget' } };
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                state: {
+                    pendingEdits: [
+                        { sheetName: 'People', cells: people },
+                        { sheetName: 'Inventory', cells: inventory },
+                    ],
+                },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'restored-session',
+                },
+            })
+        );
+
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+        expect(grid_stub().getAttribute('data-store-edits')).toBe(
+            JSON.stringify(people)
+        );
+        await click_sheet_tab('Inventory');
+        expect(grid_stub().getAttribute('data-store-edits')).toBe(
+            JSON.stringify(inventory)
         );
     });
 
@@ -3683,7 +3823,7 @@ describe('edit mode save exit', () => {
         // Glide's editor is portalled outside that tree and its cleanup only
         // releases the captured row — the typed text is gone unless it is folded
         // into App's store first, exactly as the transform and refresh remounts do.
-        const { post_message } = await render_app();
+        await render_app();
         await dispatch_host_message(
             initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
