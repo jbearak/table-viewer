@@ -1,6 +1,8 @@
 # Table Viewer
 
-A fast viewer/editor for Excel (`.xlsx`), CSV, and TSV files, with read-only support for legacy Excel (`.xls`) workbooks. It is built for *reading* tables — reviewing, exploring, and annotating them — rather than authoring spreadsheets. Available as a standalone desktop app and a VS Code extension, with persistent layouts, view-only sorting and filtering, and auto-refresh.
+A fast viewer/editor for Excel (`.xlsx`), `.csv`, and `.tsv` files, with read-only support for legacy Excel (`.xls`) workbooks. It is built for reviewing, exploring, and annotating tables. Available as a standalone desktop app and a VS Code extension.
+
+Everything you do to arrange a table — sorting, filtering, hiding columns, resizing, highlighting cells — is stored alongside the file rather than inside it, so the file on disk is untouched and your arrangement is still there the next time you open it, even if the file was regenerated in the meantime. Table Viewer also reloads on its own when the file changes on disk. Cell contents change only when you enter edit mode and save.
 
 Follow the [setup and 10-minute try-out guide](docs/setup-guide.md) to choose the standalone app or VS Code extension, install it, try two sample workbooks, and see Table Viewer preserve a saved view when a file is replaced.
 
@@ -135,10 +137,6 @@ the [latest release](https://github.com/jbearak/table-viewer/releases/latest).
 Windows builds are unsigned, so SmartScreen displays its first-run warning; see
 the [desktop setup guide](docs/setup-guide-desktop-app.md) for installation and
 checksum-verification instructions.
-
-**In scope for v1:** opening `.xlsx`/`.xls`/`.csv`/`.tsv` files (dialog, command line, Finder "Open with…"), one window per open file, auto-refresh, layout persistence, sort/filter/hide, Excel header controls, `.xlsx`/CSV/TSV edit and save with conflict handling, cell highlights, the formatting toggle, per-window zoom, appearance and color-theme selection, and font/tab-orientation preferences.
-
-**Deferred:** auto-update, and shared view state between VS Code and the desktop app (each keeps its own state store for now; the on-disk schema is shared so this can land later).
 
 ## Development
 

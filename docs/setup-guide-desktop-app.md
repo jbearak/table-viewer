@@ -1,6 +1,6 @@
 # Desktop app setup and 10-minute try-out
 
-The standalone Table Viewer app opens Excel (`.xlsx` or `.xls`) workbooks as well as comma-separated (`.csv`) and tab-delimited (`.tsv`) files, without VS Code, and remembers how you like to look at them. Sorting, filters, hidden columns, column widths, highlights, the active sheet, and other viewing choices are stored separately from the workbook. Those viewing choices never change the Excel file; cell edits are written only when you explicitly edit and save an `.xlsx` workbook.
+The standalone Table Viewer app opens Excel (`.xlsx` or `.xls`) workbooks as well as comma-separated (`.csv`) and tab-delimited (`.tsv`) files, and remembers how you like to look at them. Sorting, filters, hidden columns, column widths, highlights, the active sheet, and other viewing choices are stored in Table Viewer's own database rather than in the file, so opening a file never changes it. The contents of a cell — the text or numbers inside it — change only when you enter edit mode, change a cell, and save.
 
 You can simply read through the guide—the screenshots show the main flow. If you would like to try it yourself, install Table Viewer and download these two small, cheerful workbooks so you can experiment:
 
@@ -48,7 +48,7 @@ The workbook has a welcome sheet followed by fruit, vegetable, coffee, berry, ci
 
 ## 3. Try the main viewing tools
 
-Table Viewer never writes viewing choices such as sorts, filters, widths, or highlights to an Excel workbook. Nothing below changes the `.xlsx` file unless you enter edit mode, change a cell, and save it. Feel free to poke around.
+Nothing in this section touches the `.xlsx` file. Sorts, filters, hidden columns, column widths, and highlights are never written into a workbook, even after you have used edit mode — they live in Table Viewer's own database, keyed to the file. That is what lets them survive a new version of the file: regenerate the table from a script, or drop in the copy a colleague sent you, and your arrangement and highlights are still there. Feel free to poke around.
 
 1. Click **Vertical Tabs** to move the worksheet tabs between the top and left side. With this many sheets, the left side is usually easier to scan.
 2. Click **Auto-fit Columns**, or drag a column border. Double-clicking a column border fits that column to its contents.
@@ -90,7 +90,8 @@ You can repeat the replacement while keeping the file open—handy when a script
 
 ## 5. A few useful details
 
-- Modern `.xlsx` workbooks have an optional edit mode; legacy `.xls` workbooks are read-only. The app never writes your sorts, filters, widths, hidden columns, or highlights into either format.
+- Modern `.xlsx` workbooks have an optional edit mode; legacy `.xls` workbooks are read-only. Edit mode changes only the contents of cells, and only once you save. The app never writes your sorts, filters, widths, hidden columns, or highlights into either format.
+- Edit mode also doubles as a place for annotations that outlive a new version of the file. Until you save them, your changes stay as pending edits in Table Viewer's database, so they come back with the file the same way your highlights and layout do.
 - View choices are remembered per file and worksheet in the app's local storage. The desktop app and VS Code extension do not currently share saved views.
 - Each open file gets its own window. Opening a file that is already open focuses its existing window.
 - Sorts and filters follow column names, so Table Viewer may discard them if a revised workbook no longer has a compatible column structure.
