@@ -93,6 +93,27 @@ describe('toolbar toggle colors', () => {
             /\.toggle\.active:not\(\.has-unsaved\):not\(\[aria-disabled="true"\]\):hover\s*\{[^}]*--vscode-button-hoverBackground[^}]*\}/,
         );
     });
+
+    it('spaces the scope divider with padding so wrap measurement counts it', () => {
+        // `intrinsic_width_px` measures children by `scrollWidth`, which counts
+        // padding but not margin. Spacing the rule with margin spent width the
+        // wrap calculation never saw, so the toolbar stayed unwrapped a few pixels
+        // past the point it should have and scrolled the action strip instead.
+        // Asserted against the stylesheet because jsdom computes no layout.
+        const css = readFileSync(
+            resolve(process.cwd(), 'src/webview/styles.css'),
+            'utf8',
+        );
+
+        const rule = /\.toolbar-actions-divider\s*\{([^}]*)\}/.exec(css)?.[1];
+        expect(rule).toBeDefined();
+        expect(rule).toMatch(/padding:\s*0\s+2px/);
+        expect(rule).not.toMatch(/(^|[^-])margin/);
+        // The padding would otherwise paint as part of the rule, widening a 1px
+        // line to 5px.
+        expect(rule).toMatch(/background-clip:\s*content-box/);
+        expect(rule).toMatch(/box-sizing:\s*content-box/);
+    });
 });
 
 function cleanup() {
@@ -203,10 +224,12 @@ describe('Toolbar', () => {
         });
 
         expect(get_action_labels(container)).toEqual([
-            'Edit',
             'Formatting',
             'Vertical Tabs',
             '|',
+            // Edit is worksheet-scoped today: one session, owned by one sheet. It
+            // joins the workbook group when that stops being true.
+            'Edit',
             'First Row as Header',
             'Columns',
             'Auto-fit Columns',
@@ -225,7 +248,6 @@ describe('Toolbar', () => {
         // A single-sheet CSV with no formatting: nothing sits left of the rule, so
         // a rule there would be a stray leading line.
         const { container } = render_toolbar({
-            show_edit_button: false,
             show_formatting_button: false,
             show_vertical_tabs_button: false,
         });
@@ -237,7 +259,6 @@ describe('Toolbar', () => {
 
     it('keeps the divider when only one workbook-scoped action is shown', () => {
         const { container } = render_toolbar({
-            show_edit_button: false,
             show_formatting_button: false,
             show_vertical_tabs_button: true,
         });
@@ -249,8 +270,10 @@ describe('Toolbar', () => {
     it('divides the two groups for every combination of optional actions', () => {
         // The divider follows from whether the workbook group rendered anything, so
         // it must sit at exactly the group boundary in all eight combinations —
-        // including the three where only one workbook action is visible, which a
-        // hand-written condition is most likely to get wrong.
+        // including the two where only one workbook action is visible, which a
+        // hand-written condition is most likely to get wrong. `show_edit_button`
+        // varies too: it belongs to the worksheet group, so it must never move the
+        // rule.
         for (const show_edit_button of [false, true]) {
             for (const show_formatting_button of [false, true]) {
                 for (const show_vertical_tabs_button of [false, true]) {
@@ -262,7 +285,6 @@ describe('Toolbar', () => {
                     });
                     const labels = get_action_labels(container);
                     const workbook_count = [
-                        show_edit_button,
                         show_formatting_button,
                         show_vertical_tabs_button,
                     ].filter(Boolean).length;
@@ -275,6 +297,7 @@ describe('Toolbar', () => {
                         expect(labels.filter((label) => label === '|')).toHaveLength(1);
                         expect(labels.indexOf('|')).toBe(workbook_count);
                         expect(labels.slice(workbook_count + 1)).toEqual([
+                            ...(show_edit_button ? ['Edit'] : []),
                             'First Row as Header',
                             'Columns',
                             'Auto-fit Columns',
@@ -752,6 +775,69 @@ describe('Toolbar', () => {
             Object.defineProperty(HTMLElement.prototype, 'clientWidth', client_width);
         } else {
             Reflect.deleteProperty(HTMLElement.prototype, 'clientWidth');
+        }
+    });
+
+    it('remeasures wrapping when one group action is swapped for another', () => {
+        // A swap inside one group — Formatting going as Vertical Tabs arrives — is
+        // the case a membership *count* cannot see: the group still renders one
+        // action, so a length-keyed dependency never changes and the row keeps a
+        // wrapped state measured against a button that is no longer there.
+        const scroll_width = Object.getOwnPropertyDescriptor(
+            HTMLElement.prototype,
+            'scrollWidth',
+        );
+        const client_width = Object.getOwnPropertyDescriptor(
+            HTMLElement.prototype,
+            'clientWidth',
+        );
+        Object.defineProperty(HTMLElement.prototype, 'scrollWidth', {
+            configurable: true,
+            get(this: HTMLElement) {
+                if (this.classList.contains('toolbar-item')) {
+                    return this.textContent === 'Vertical Tabs' ? 600 : 100;
+                }
+                return 0;
+            },
+        });
+        Object.defineProperty(HTMLElement.prototype, 'clientWidth', {
+            configurable: true,
+            get(this: HTMLElement) {
+                return this.classList.contains('toolbar') ? 500 : 0;
+            },
+        });
+        try {
+            const rendered = render_toolbar({
+                // A chip is required for wrapping to be considered at all.
+                transform_pending: true,
+                transform_progress: 'Short',
+                show_formatting_button: true,
+                show_vertical_tabs_button: false,
+            });
+            expect(rendered.container.querySelector('.toolbar')?.classList.contains('is-wrapped'))
+                .toBe(false);
+
+            rendered.rerender({
+                transform_pending: true,
+                transform_progress: 'Short',
+                show_formatting_button: false,
+                show_vertical_tabs_button: true,
+            });
+            expect(get_action_labels(rendered.container))
+                .toEqual(['Vertical Tabs', '|', 'Columns', 'Auto-fit Columns']);
+            expect(rendered.container.querySelector('.toolbar')?.classList.contains('is-wrapped'))
+                .toBe(true);
+        } finally {
+            if (scroll_width) {
+                Object.defineProperty(HTMLElement.prototype, 'scrollWidth', scroll_width);
+            } else {
+                Reflect.deleteProperty(HTMLElement.prototype, 'scrollWidth');
+            }
+            if (client_width) {
+                Object.defineProperty(HTMLElement.prototype, 'clientWidth', client_width);
+            } else {
+                Reflect.deleteProperty(HTMLElement.prototype, 'clientWidth');
+            }
         }
     });
 

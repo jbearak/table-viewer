@@ -62,6 +62,18 @@ export interface ToolbarProps {
     edit_disabled_reason?: string;
 }
 
+/**
+ * The keys of a rendered action group, joined — a single dependency value that
+ * changes whenever the group's membership does, not merely its size.
+ */
+function react_element_keys(elements: readonly React.ReactNode[]): string {
+    return elements
+        .map((element) =>
+            React.isValidElement(element) ? String(element.key) : '',
+        )
+        .join(',');
+}
+
 export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Toolbar(
     props,
     focus_ref,
@@ -90,21 +102,6 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
     // Actions that change something about the whole workbook. Membership here is
     // what puts a button left of the divider; see the action row below.
     const workbook_actions = [
-        props.show_edit_button && (
-            <ToolbarButton
-                key="edit"
-                label="Edit"
-                active={props.edit_mode}
-                tooltip_text={props.edit_disabled
-                    ? (props.edit_disabled_reason ?? 'Editing is unavailable.')
-                    : props.edit_mode
-                    ? 'Exit edit mode.'
-                    : 'Enter edit mode to modify cell values.'}
-                onClick={props.on_toggle_edit_mode}
-                extra_class={props.is_dirty ? 'has-unsaved' : undefined}
-                disabled={props.edit_disabled}
-            />
-        ),
         props.show_formatting_button && (
             <ToolbarButton
                 key="formatting"
@@ -132,7 +129,29 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
     // Actions that change something about the active worksheet only. Columns and
     // Auto-fit are unconditional, so this group never empties — which is why the
     // divider below only has to ask about the workbook group.
+    //
+    // Edit is here because that is what it currently is: the host holds one edit
+    // session, owned by one worksheet, and every other sheet reports "Finish
+    // editing the other worksheet first" while it is open. #154 wants it moved to
+    // the workbook group, and it moves when that is made true of the session —
+    // putting it there first would only relabel the confusion the grouping exists
+    // to remove.
     const worksheet_actions = [
+        props.show_edit_button && (
+            <ToolbarButton
+                key="edit"
+                label="Edit"
+                active={props.edit_mode}
+                tooltip_text={props.edit_disabled
+                    ? (props.edit_disabled_reason ?? 'Editing is unavailable.')
+                    : props.edit_mode
+                    ? 'Exit edit mode.'
+                    : 'Enter edit mode to modify cell values.'}
+                onClick={props.on_toggle_edit_mode}
+                extra_class={props.is_dirty ? 'has-unsaved' : undefined}
+                disabled={props.edit_disabled}
+            />
+        ),
         props.show_excel_header_button && (
             <ToolbarButton
                 key="excel-header"
@@ -170,6 +189,11 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
         />,
     ].filter(Boolean);
 
+    // Each group's membership as one value, so the wrap deps below can compare
+    // identity and not merely how many there are.
+    const workbook_action_keys = react_element_keys(workbook_actions);
+    const worksheet_action_keys = react_element_keys(worksheet_actions);
+
     const wrapped = use_toolbar_wrap(
         { toolbar: toolbar_ref, lead: lead_ref, chips: chips_ref, actions: actions_ref },
         [
@@ -184,12 +208,16 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
             props.highlight?.active_color,
             props.highlight?.selection_available,
             props.highlight?.pending,
-            // How many actions each group renders, rather than the individual
-            // `show_*` flags: an action added to a group is then measured without
-            // anyone having to remember to list it here too. The divider's own
-            // appearance follows from the first of these, so it needs no dep.
-            workbook_actions.length,
-            worksheet_actions.length,
+            // Which actions each group renders, rather than the individual `show_*`
+            // flags: an action added to a group is then measured without anyone
+            // having to remember to list it here too.
+            //
+            // Keys rather than counts. A count misses a swap — one action appearing
+            // as another in the same group disappears leaves the length alone while
+            // the widths differ, so the row would keep a wrapped state measured
+            // against buttons that are no longer there.
+            workbook_action_keys,
+            worksheet_action_keys,
             // Not membership but width: these change a button's label-driven size
             // without changing how many buttons there are.
             props.excel_header_active,
