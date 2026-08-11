@@ -81,10 +81,11 @@ import {
     resolve_csv_save_hydration,
     type CsvSaveProjection,
 } from './csv-save-lifecycle';
+import { type EditSessionStore } from './edit-session-store';
 import {
-    create_edit_session_store,
-    type EditSessionStore,
-} from './edit-session-store';
+    create_edit_session_registry,
+    type EditSessionRegistry,
+} from './edit-session-registry';
 import { column_letter } from './grid-model';
 import {
     clamp_row_height,
@@ -410,6 +411,26 @@ export function App(): React.JSX.Element {
     const active_sheet_index_ref = useRef(0);
     active_sheet_index_ref.current = active_sheet_index;
     const renderer_publication_fenced_session_ref = useRef<string>();
+    // The dirty maps, one per worksheet, owned here so they survive the
+    // generation-keyed GridShell remounts that a transform or refresh snapshot
+    // forces.
+    //
+    // A registry rather than a single store because editing is widening to the
+    // whole workbook (#154): each sheet keeps its own map in its own `row:col`
+    // key space, which is what lets the store and the `use_editing` hook stay
+    // sheet-agnostic. Only one sheet holds a session today, so exactly one of
+    // these is ever non-empty; the shape is what changes here, not the behaviour.
+    // Reads the session id ref rather than holding a copy: the ref is the one
+    // authoritative value, it moves synchronously in set_csv_edit_session_id,
+    // and a store built after that move is stamped from it at creation — so
+    // new stores are fenced against the outgoing session's writers with
+    // nothing to keep in lockstep.
+    const edit_session_registry_ref = useRef<EditSessionRegistry | null>(null);
+    if (edit_session_registry_ref.current === null) {
+        edit_session_registry_ref.current = create_edit_session_registry(
+            () => csv_edit_session_id_ref.current,
+        );
+    }
     const set_csv_edit_session_id = useCallback((next: string | undefined) => {
         const previous = csv_edit_session_id_ref.current;
         if (next && next !== previous) {
@@ -613,18 +634,12 @@ export function App(): React.JSX.Element {
     // sheet's key space; the whole-workbook leaf is assembled only at the durable
     // boundary, where the host writes it into the owning sheet's slot.
     const latest_live_edits_ref = useRef<SheetPendingEditCells | undefined>(undefined);
-    // The dirty map itself, owned here so it survives the generation-keyed
-    // GridShell remounts that a transform or refresh snapshot forces.
-    const edit_session_ref = useRef<EditSessionStore | null>(null);
-    if (edit_session_ref.current === null) {
-        // Stamped with an explicit undefined session rather than left unstamped:
-        // an unstamped store accepts a write from any writer, which would make
-        // the fence's soundness depend on the adopt_session layout effect having
-        // already run. Stamping at construction makes it hold from the first
-        // render. There is no session yet, and `undefined` is compared with ===
-        // and is a real value here, never a wildcard.
-        edit_session_ref.current = create_edit_session_store({ session_id: undefined });
-    }
+    /** The store for the worksheet the session belongs to. */
+    const edit_session_store = useCallback((): EditSessionStore => (
+        edit_session_registry_ref.current!.for_sheet(
+            edit_session_sheet_index_ref.current,
+        )
+    ), []);
     const meta_ref = useRef<WorkbookMeta | null>(null);
     const pending_transform_request_ids_ref = useRef<(string | undefined)[]>([]);
     const pending_transform_states_ref = useRef<(SheetTransformState | undefined)[]>([]);
@@ -698,7 +713,7 @@ export function App(): React.JSX.Element {
         await new Promise<void>((resolve) => queueMicrotask(resolve));
 
         const durability = pending_edit_durability.snapshot(edit_session_id);
-        const snapshot = edit_session_ref.current!.snapshot();
+        const snapshot = edit_session_store().snapshot();
         const publication_fenced = renderer_publication_fenced_session_ref.current
             === edit_session_id;
         const highest_produced_sequence = save_in_flight_ref.current || publication_fenced
@@ -855,8 +870,9 @@ export function App(): React.JSX.Element {
         latest_live_edits_ref.current = edits;
         set_initial_edits(edits ? { ...edits } : undefined);
         // Read the outgoing stamp before install overwrites it.
-        const previous_identity = edit_session_ref.current!.identity();
-        edit_session_ref.current!.install({ session_id }, edits);
+        const store = edit_session_store();
+        const previous_identity = store.identity();
+        store.install({ session_id }, edits);
         // An acknowledgement is about a specific set of dirty cells, so it expires
         // when the *session* it belonged to does — not on every crossing of this
         // boundary. Crossing it is not by itself evidence of a new dirty map: the
@@ -1294,6 +1310,20 @@ export function App(): React.JSX.Element {
                                 : initial_normalized_state?.pendingEdits,
                         )
                         ?? edit_session_sheet_index_ref.current;
+                    // Reconcile the registry at the pointer move itself, not in
+                    // install_edit_session: a refresh that advances the session
+                    // id makes `refresh_editing_current_session` false and skips
+                    // the install entirely, and that is exactly a path where the
+                    // sheet may have moved. The session sheet's store follows
+                    // its sheet to the new index; every other store is stale by
+                    // definition once this snapshot's complete pending-edit
+                    // projection applies — the initial branch installs over the
+                    // carried store below, so a replaced document cannot leak
+                    // the old file's edits through it.
+                    edit_session_registry_ref.current!.retarget(
+                        edit_session_sheet_index_ref.current,
+                        snapshot_edit_sheet_index,
+                    );
                     edit_session_sheet_index_ref.current = snapshot_edit_sheet_index;
                     set_edit_session_sheet_index(snapshot_edit_sheet_index);
                     const refresh_editing_current_session =
@@ -2882,6 +2912,16 @@ export function App(): React.JSX.Element {
                     // granted.
                     // A grant that names no sheet is a single-sheet source's, whose
                     // only sheet is 0.
+                    //
+                    // The pointer move reconciles the registry, as the snapshot
+                    // path's move does: the grant owns the complete pending-edit
+                    // projection, so a store any other sheet still holds is
+                    // stale by definition, and the install below only replaces
+                    // the granted sheet's.
+                    edit_session_registry_ref.current!.retarget(
+                        edit_session_sheet_index_ref.current,
+                        msg.sheetIndex ?? 0,
+                    );
                     edit_session_sheet_index_ref.current = msg.sheetIndex ?? 0;
                     set_edit_session_sheet_index(msg.sheetIndex ?? 0);
                     // The grant owns the complete pending-edit projection, including
@@ -3041,10 +3081,12 @@ export function App(): React.JSX.Element {
     // child passive effect, so the stamp is always level before the child writes;
     // none of GridShell's own layout effects touch the store.
     useLayoutEffect(() => {
-        const store = edit_session_ref.current!;
-        const stamp = store.identity();
-        if (stamp && stamp.session_id === csv_edit_session_id) return;
-        store.adopt_session(csv_edit_session_id);
+        // Every store, not just the owning sheet's: a store the session never
+        // wrote to still carries the stamp it was built with, and leaving it on a
+        // retired session would fence off the first write it does receive. New
+        // stores already read the moved session id ref at creation; this is the
+        // commit-time half, re-stamping the stores that existed before the move.
+        edit_session_registry_ref.current!.adopt_session();
     }, [csv_edit_session_id]);
 
     // GridShell reports editing status up so the toolbar dirty dot, pending-edit
@@ -3827,19 +3869,20 @@ export function App(): React.JSX.Element {
             save_lifecycle={editing_another_sheet ? undefined : save_lifecycle}
             on_save_request={begin_save_operation}
             initial_edits={editing_another_sheet ? undefined : initial_edits}
-            // Withheld while a session is open on a *different* worksheet. Making
-            // this sheet read-only is not enough on its own: the grid paints a dirty
-            // value and its tint whenever the store holds that key, edit mode or
-            // not, and the key space is per-worksheet — so the other sheet's `0:0`
-            // would render here as this sheet's own edited cell, in a worksheet the
-            // user cannot even edit.
+            // This sheet's own store, so what the grid paints is always in the key
+            // space it is painting into. The old single store had to be *withheld*
+            // here whenever the session belonged to another worksheet — the grid
+            // paints a dirty value and its tint whenever the store holds that key,
+            // edit mode or not, so the other sheet's `0:0` rendered here as this
+            // sheet's own edited cell. A per-sheet store cannot express that
+            // confusion: a sheet with no edits of its own has an empty map, which
+            // is exactly what the withholding was trying to achieve.
             //
-            // Keyed on `editing_another_sheet` rather than on edit mode being on:
-            // a store whose session just ended still legitimately paints its dirty
-            // map on the sheet it belongs to, which is how a finished save leaves
-            // the grid. The store itself stays above the grid generation either way,
-            // so returning to the owning sheet finds the session intact.
-            edit_session={editing_another_sheet ? undefined : edit_session_ref.current}
+            // The store stays above the grid generation, so returning to a sheet
+            // finds its edits intact.
+            edit_session={edit_session_registry_ref.current!.for_sheet(
+                active_sheet_index,
+            )}
             host_rejected_keys={live_rejected_keys}
             on_editing_change={handle_editing_change}
             editing_ref={editing_ref}

@@ -3697,8 +3697,9 @@ describe('edit mode save exit', () => {
             sheetIndex: 0,
         });
         // Stand in for the real overlay fold, as the transform and refresh remount
-        // tests do. Only the owning sheet is handed the store, so this writes on
-        // the way *out* of People and is a no-op on the way back in.
+        // tests do. Every sheet is handed its own store, so this writes into
+        // People's on the way out and into Inventory's on the way back — distinct
+        // maps, which is what the isolation test below pins.
         grid_shell_mock.commit_live_edit.mockImplementation(() => {
             (grid_shell_mock.latest_props?.edit_session as EditSessionStore | undefined)
                 ?.commit('people-session', '0:0', { value: 'typed', base: 'Alice' });
@@ -3711,6 +3712,214 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
         expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!))
             .toEqual({ '0:0': { value: 'typed', base: 'Alice' } });
+    });
+
+    it("keeps one worksheet's dirty cells out of another's store", async () => {
+        // Every sheet gets its own store from the registry, so the isolation the
+        // old "withhold the store from non-owning sheets" mechanism provided must
+        // now come from the stores being distinct maps. If the registry ever
+        // handed sheets a shared store, People's `0:0` would paint at Inventory's
+        // `0:0` — the cross-sheet bleed #154's widening must not reintroduce.
+        await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'people-session',
+            sheetIndex: 0,
+        });
+        await act(async () => {
+            (grid_shell_mock.latest_props?.edit_session as EditSessionStore)
+                .commit('people-session', '0:0', { value: 'typed', base: 'Alice' });
+        });
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!))
+            .toEqual({ '0:0': { value: 'typed', base: 'Alice' } });
+
+        await click_sheet_tab('Inventory');
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!)).toEqual({});
+
+        await click_sheet_tab('People');
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!))
+            .toEqual({ '0:0': { value: 'typed', base: 'Alice' } });
+    });
+
+    it("drops the old file's stores when an initial snapshot replaces the document", async () => {
+        // The single store was replaced wholesale at every hydration boundary,
+        // so nothing stale could outlive one. The registry keeps stores, which
+        // let file A's dirty sheet-1 store survive an initial snapshot for
+        // file B whose session lives on sheet 0 — and B's sheet 1 then painted
+        // A's edited value and dirty tint at the same coordinates.
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['People', 'Inventory'], false),
+            {
+                state: {
+                    columnWidths: [], scrollPosition: [],
+                    activeSheetIndex: 1, tabOrientation: null,
+                    pendingEdits: sheet_edits(
+                        { '0:0': { value: 'Gadget', base: 'Widget' } },
+                        1,
+                    ),
+                    transforms: [], columnVisibility: [],
+                },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'file-a-session',
+                    csvEditSheetIndex: 1,
+                },
+            },
+        ));
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!))
+            .toEqual({ '0:0': { value: 'Gadget', base: 'Widget' } });
+
+        // The same webview is retargeted at another file: a fresh initial
+        // snapshot whose restored session is on sheet 0, with no edits.
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Summary', 'Detail'], false),
+            {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'file-b-session',
+                    csvEditSheetIndex: 0,
+                },
+            },
+        ));
+
+        await click_sheet_tab('Detail');
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!)).toEqual({});
+    });
+
+    it("drops a moved session sheet's store at its old index", async () => {
+        // A workbook edit outside this viewer can reorder sheets; the host
+        // re-grants with the session's new index and re-sends the complete
+        // pending-edit projection. Hydration installs into the new index's
+        // store, but the old index's store — same edits, wrong sheet — kept
+        // its contents, so whatever sheet now occupies the old index painted
+        // the session sheet's dirty cells as its own.
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['People', 'Inventory'], false),
+            {
+                state: {
+                    columnWidths: [], scrollPosition: [],
+                    activeSheetIndex: 1, tabOrientation: null,
+                    pendingEdits: sheet_edits(
+                        { '0:0': { value: 'Gadget', base: 'Widget' } },
+                        1,
+                    ),
+                    transforms: [], columnVisibility: [],
+                },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'moving-session',
+                    csvEditSheetIndex: 1,
+                },
+            },
+        ));
+
+        // Inventory moved to index 0; its edits moved with it.
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Inventory', 'People'], false),
+            {
+                state: {
+                    columnWidths: [], scrollPosition: [],
+                    activeSheetIndex: 0, tabOrientation: null,
+                    pendingEdits: sheet_edits(
+                        { '0:0': { value: 'Gadget', base: 'Widget' } },
+                        0,
+                    ),
+                    transforms: [], columnVisibility: [],
+                },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'moving-session',
+                    csvEditSheetIndex: 0,
+                },
+            },
+        ));
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!))
+            .toEqual({ '0:0': { value: 'Gadget', base: 'Widget' } });
+
+        // People now sits at the session's old index and must not inherit the
+        // store that was left there.
+        await click_sheet_tab('People');
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!)).toEqual({});
+    });
+
+    it('carries the session store through a refresh that moves the sheet and the id', async () => {
+        // A refresh can advance the session id and move the session's sheet in
+        // the same delivery. The id change makes refresh_editing_current_session
+        // false, so no install runs — the registry reconciliation has to happen
+        // at the pointer move itself, or the edits are stranded at the old
+        // index: the moved sheet comes up empty and the sheet now at the old
+        // index paints them as its own.
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['People', 'Inventory'], false),
+            {
+                state: {
+                    columnWidths: [], scrollPosition: [],
+                    activeSheetIndex: 1, tabOrientation: null,
+                    pendingEdits: sheet_edits(
+                        { '0:0': { value: 'Gadget', base: 'Widget' } },
+                        1,
+                    ),
+                    transforms: [], columnVisibility: [],
+                },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'session-before',
+                    csvEditSheetIndex: 1,
+                },
+            },
+        ));
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!))
+            .toEqual({ '0:0': { value: 'Gadget', base: 'Widget' } });
+
+        // Inventory reordered to index 0; the host re-keys the session too.
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Inventory', 'People'], false),
+            {
+                state: {
+                    columnWidths: [], scrollPosition: [],
+                    activeSheetIndex: 0, tabOrientation: null,
+                    pendingEdits: sheet_edits(
+                        { '0:0': { value: 'Gadget', base: 'Widget' } },
+                        0,
+                    ),
+                    transforms: [], columnVisibility: [],
+                },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'session-after',
+                    csvEditSheetIndex: 0,
+                },
+            },
+        ));
+
+        // A refresh keeps the webview's own active tab — index 1, which the
+        // reorder makes People. The edits must not have stayed behind here...
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!)).toEqual({});
+        // ...they followed Inventory to its new index.
+        await click_sheet_tab('Inventory');
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!))
+            .toEqual({ '0:0': { value: 'Gadget', base: 'Widget' } });
     });
 
     it('withholds an in-flight save from a grid mounted on another worksheet', async () => {
