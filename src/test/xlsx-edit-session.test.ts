@@ -1,6 +1,6 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as vscode from 'vscode';
 import { attach_viewer, profile_for } from '../viewer-controller';
 import { with_in_memory_authority_transactions } from '../state-authority';
@@ -51,7 +51,11 @@ function open_xlsx(
 }
 
 function controller_of(panel: unknown) {
-    return (panel as { __controller: { dispose(): void; drain(): Promise<void> } }).__controller;
+    return (panel as { __controller: {
+        select_sheet(sheetName: string): Promise<boolean>;
+        dispose(): void;
+        drain(): Promise<void>;
+    } }).__controller;
 }
 
 async function wait_for_observable(predicate: () => boolean): Promise<void> {
@@ -168,6 +172,37 @@ describe('xlsx edit sessions', () => {
         // The writer is an OOXML package splice; .xls shares none of it, and the
         // profile must say so rather than failing inside a confirmed save.
         expect(profile_for('/tmp/legacy.xls').editing).toBe(false);
+    });
+
+    it('defers a requested worksheet until the save dialog is answered', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        let answer_dialog!: (choice: string | undefined) => void;
+        const answer = new Promise<string | undefined>((resolve) => {
+            answer_dialog = resolve;
+        });
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage')
+            .mockImplementation(() => answer);
+        const dialog = panel.__receive({
+            type: 'showSaveDialog',
+            requestId: 'save-dialog',
+            editSessionId: session,
+        });
+        await wait_for_observable(() => warning.mock.calls.length === 1);
+
+        const selection = controller_of(panel).select_sheet('Inventory');
+        expect(panel.__messages).not.toContainEqual({ type: 'selectSheet', sheetIndex: 1 });
+        answer_dialog(undefined);
+        await dialog;
+        await expect(selection).resolves.toBe(true);
+
+        expect(panel.__messages.flatMap((message) => {
+            if (typeof message !== 'object' || message === null || !('type' in message)) return [];
+            return message.type === 'saveDialogResult' || message.type === 'selectSheet'
+                ? [message.type]
+                : [];
+        })).toEqual(['saveDialogResult', 'selectSheet']);
     });
 
     it('writes an edit into the worksheet the session named, leaving the other alone', async () => {

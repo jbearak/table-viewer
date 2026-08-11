@@ -16,6 +16,7 @@ const manifest = JSON.parse(readFileSync(
     contributes?: {
         customEditors?: CustomEditorContribution[];
         commands?: Array<{ command?: unknown }>;
+        menus?: { commandPalette?: Array<{ command?: unknown; when?: unknown }> };
         configuration?: {
             properties?: Record<string, {
                 type?: unknown;
@@ -96,7 +97,12 @@ describe('extension runtime manifest', () => {
             'tableViewer.showCsvPreview',
             'tableViewer.openCsvTable',
             'tableViewer.openAsText',
+            'tableViewer.openWorkbookAtSheet',
         ]);
+        expect(manifest.contributes?.menus?.commandPalette).toContainEqual({
+            command: 'tableViewer.openWorkbookAtSheet',
+            when: 'false',
+        });
     });
 
     it('externalizes the host-provided SQLite runtime from the one bundle it builds', () => {
