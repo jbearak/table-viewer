@@ -320,25 +320,60 @@ export function write_xlsx_cell_edits(
  * All three, because a package that still points at a part it no longer contains
  * is exactly the corruption the removal was meant to avoid — `cfb_del` is a
  * container operation and knows nothing about OOXML's reference graph.
+ *
+ * All three or none, for the same reason: every partial removal is its own broken
+ * package, so the reference edits are computed before any is applied and a failure
+ * to compute them abandons the removal entirely.
  */
 function remove_part(cfb_file: ReturnType<typeof CFB.read>, part_path: string): void {
     if (!CFB.find(cfb_file, part_path)) return;
+    // Planned in full before anything is mutated, then committed in one go.
+    //
+    // Ordering alone cannot make this safe, because every order leaves *some*
+    // half-done package: delete first and the part is gone but still referenced;
+    // strip the override first and the part is still there, typed by the
+    // `<Default Extension="xml">` fallback rather than as a calc chain; strip the
+    // relationship first and it is an unreferenced orphan. Each of those is a
+    // package that says one thing and contains another, and the `catch` below would
+    // hide whichever one happened.
+    //
+    // Planning is what removes the middle: computing the two replacement texts
+    // touches nothing, so a throw there leaves the package exactly as it was, and
+    // the three writes that follow are assignments and a container delete with no
+    // parsing left to fail between them.
+    let planned: Array<() => void>;
     try {
-        // References first, container entry last. With the delete leading, a throw
-        // from either reference edit left the part gone but still pointed at -- a
-        // package advertising a file it does not contain, which is precisely the
-        // corruption this function exists to avoid, and the catch below then hid it.
-        // This order cannot produce that: either every step ran, or the part is
-        // still present and the package is internally consistent.
-        remove_content_type_override(cfb_file, part_path);
-        remove_workbook_relationship(cfb_file, part_path);
-        CFB.utils.cfb_del(cfb_file, part_path);
+        planned = plan_reference_removals(cfb_file, part_path);
     } catch {
-        // Swallowed on purpose, and now safely. calcChain is a pure recalculation
-        // cache: leaving it in place costs a stale chain Excel rebuilds, while
-        // failing the save costs the user the edit they asked to keep. The reordering
-        // above is what makes "leave it in place" the actual worst case.
+        // calcChain is a pure recalculation cache. Leaving it in place costs a
+        // stale chain Excel rebuilds on the next calculation; failing the save
+        // would cost the user the edit they asked to keep. So the plan is
+        // abandoned whole, and the package goes out untouched and consistent.
+        return;
     }
+    for (const commit of planned) commit();
+    CFB.utils.cfb_del(cfb_file, part_path);
+}
+
+/**
+ * Work out how to drop every reference to `part_path`, without changing anything.
+ *
+ * Returns one thunk per part that needs rewriting; each captures its already-built
+ * replacement text, so applying them cannot fail partway on a parse. A part with no
+ * reference to remove contributes no thunk.
+ */
+function plan_reference_removals(
+    cfb_file: ReturnType<typeof CFB.read>,
+    part_path: string,
+): Array<() => void> {
+    const commits: Array<() => void> = [];
+    const plan = (path: string, stripped: string | null): void => {
+        if (stripped === null) return;
+        commits.push(() => { write_part_text(cfb_file, path, stripped); });
+    };
+    plan('/[Content_Types].xml', content_type_override_removed(cfb_file, part_path));
+    plan('/xl/_rels/workbook.xml.rels', workbook_relationship_removed(cfb_file, part_path));
+    return commits;
 }
 
 /**
@@ -373,7 +408,11 @@ function remove_elements(xml: string, name: string, wanted: (tag: string) => boo
 }
 
 /**
- * Drop a part's `<Override>` from `[Content_Types].xml` after deleting the part.
+ * The text of `[Content_Types].xml` with a part's `<Override>` gone, or null when
+ * there is nothing to change (no such part file, or no override naming it).
+ *
+ * Computes only -- see `remove_part`, which needs every reference edit to be known
+ * good before any of them is applied.
  *
  * Located quote-aware, then removed by span. A `[^>]*` match cut the tag at a
  * legal `>` inside an earlier attribute value, so an `<Override>` carrying one
@@ -381,9 +420,12 @@ function remove_elements(xml: string, name: string, wanted: (tag: string) => boo
  * longer contains — exactly the inconsistency Excel offers to repair, and the one
  * this removal exists to prevent.
  */
-function remove_content_type_override(cfb_file: ReturnType<typeof CFB.read>, part_name: string): void {
+function content_type_override_removed(
+    cfb_file: ReturnType<typeof CFB.read>,
+    part_name: string,
+): string | null {
     const xml = read_part_text(cfb_file, '/[Content_Types].xml');
-    if (!xml) return;
+    if (!xml) return null;
     const stripped = remove_elements(
         xml,
         'Override',
@@ -392,21 +434,22 @@ function remove_content_type_override(cfb_file: ReturnType<typeof CFB.read>, par
         // part that is no longer in the package.
         (tag) => attr(tag, 'PartName') === part_name,
     );
-    if (stripped !== xml) write_part_text(cfb_file, '/[Content_Types].xml', stripped);
+    return stripped === xml ? null : stripped;
 }
 
 /**
- * Drop the workbook relationship targeting a deleted part.
+ * The text of `xl/_rels/workbook.xml.rels` with the relationship targeting a part
+ * gone, or null when there is nothing to change. Computes only, as above.
  *
  * Targets are matched after resolution, since the same part is spelled both
  * `calcChain.xml` (relative to `xl/`) and `/xl/calcChain.xml` in the wild.
  */
-function remove_workbook_relationship(
+function workbook_relationship_removed(
     cfb_file: ReturnType<typeof CFB.read>,
     part_path: string,
-): void {
+): string | null {
     const xml = read_part_text(cfb_file, '/xl/_rels/workbook.xml.rels');
-    if (!xml) return;
+    if (!xml) return null;
     const wanted = part_path.replace(/^\//, '');
     // See `remove_content_type_override`: same quote-aware location, and a
     // relationship left pointing at a deleted part is the other half of the same
@@ -417,5 +460,5 @@ function remove_workbook_relationship(
         const resolved = resolve_part_path(path);
         return resolved === wanted;
     });
-    if (stripped !== xml) write_part_text(cfb_file, '/xl/_rels/workbook.xml.rels', stripped);
+    return stripped === xml ? null : stripped;
 }

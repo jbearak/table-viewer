@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'fs';
 import CFB from 'cfb';
 import { write_xlsx_cell_edits } from '../xlsx-package';
@@ -1778,6 +1778,24 @@ describe('write_xlsx_cell_edits', () => {
             return out instanceof Uint8Array ? out : new Uint8Array(out as ArrayBufferLike);
         }
 
+        /**
+         * The sample with a formula in B2, so that an edit there drops one — which
+         * is what makes the calc chain stale and sends it through the removal.
+         */
+        function with_formula_at_b2(raw: Uint8Array): Uint8Array {
+            const base = CFB.read(raw, { type: 'buffer' });
+            const sheet = CFB.find(base, '/xl/worksheets/sheet3.xml')!;
+            const patched = Buffer.from(
+                Buffer.from(sheet.content as Uint8Array).toString('utf8')
+                    .replace(/<c r="B2"[^>]*(?:\/>|>[\s\S]*?<\/c>)/, '<c r="B2"><f>1+1</f><v>2</v></c>'),
+                'utf8',
+            );
+            sheet.content = patched;
+            sheet.size = patched.length;
+            const out = CFB.write(base, { type: 'buffer', fileType: 'zip', compression: true });
+            return out instanceof Uint8Array ? out : new Uint8Array(out as ArrayBufferLike);
+        }
+
         function text_part(bytes: Uint8Array, path: string): string {
             return part(bytes, path)?.toString('utf8') ?? '';
         }
@@ -1797,18 +1815,8 @@ describe('write_xlsx_cell_edits', () => {
         it.each(['tight', 'pretty'] as const)(
             'is detached completely when its references use %s paired empty elements',
             (spelling) => {
-            const base = CFB.read(readFileSync(SAMPLE), { type: 'buffer' });
-            const sheet = CFB.find(base, '/xl/worksheets/sheet3.xml')!;
-            const patched = Buffer.from(
-                Buffer.from(sheet.content as Uint8Array).toString('utf8')
-                    .replace(/<c r="B2"[^>]*(?:\/>|>[\s\S]*?<\/c>)/, '<c r="B2"><f>1+1</f><v>2</v></c>'),
-                'utf8',
-            );
-            sheet.content = patched;
-            sheet.size = patched.length;
-            const written = CFB.write(base, { type: 'buffer', fileType: 'zip', compression: true });
             const raw = with_calc_chain(
-                written instanceof Uint8Array ? written : new Uint8Array(written as ArrayBufferLike),
+                with_formula_at_b2(readFileSync(SAMPLE)),
                 spelling,
             );
 
@@ -1825,18 +1833,8 @@ describe('write_xlsx_cell_edits', () => {
             // formula makes it stale, and a stale chain is what Excel offers to
             // repair. Every reference has to go with it, or the package points at
             // a part it no longer contains.
-            const base = CFB.read(readFileSync(SAMPLE), { type: 'buffer' });
-            const sheet = CFB.find(base, '/xl/worksheets/sheet3.xml')!;
-            const patched = Buffer.from(
-                Buffer.from(sheet.content as Uint8Array).toString('utf8')
-                    .replace(/<c r="B2"[^>]*(?:\/>|>[\s\S]*?<\/c>)/, '<c r="B2"><f>1+1</f><v>2</v></c>'),
-                'utf8',
-            );
-            sheet.content = patched;
-            sheet.size = patched.length;
-            const written = CFB.write(base, { type: 'buffer', fileType: 'zip', compression: true });
             const raw = with_calc_chain(
-                written instanceof Uint8Array ? written : new Uint8Array(written as ArrayBufferLike),
+                with_formula_at_b2(readFileSync(SAMPLE)),
             );
             expect(text_part(raw, '/xl/worksheets/sheet3.xml')).toContain('<f>1+1</f>');
 
@@ -1853,18 +1851,8 @@ describe('write_xlsx_cell_edits', () => {
             // `indexOf` stopped at the commented one, so the element looked like it
             // had content, the removal declined to touch it, and the part was
             // deleted with both references still naming it.
-            const base = CFB.read(readFileSync(SAMPLE), { type: 'buffer' });
-            const sheet = CFB.find(base, '/xl/worksheets/sheet3.xml')!;
-            const patched = Buffer.from(
-                Buffer.from(sheet.content as Uint8Array).toString('utf8')
-                    .replace(/<c r="B2"[^>]*(?:\/>|>[\s\S]*?<\/c>)/, '<c r="B2"><f>1+1</f><v>2</v></c>'),
-                'utf8',
-            );
-            sheet.content = patched;
-            sheet.size = patched.length;
-            const written = CFB.write(base, { type: 'buffer', fileType: 'zip', compression: true });
             const raw = with_calc_chain(
-                written instanceof Uint8Array ? written : new Uint8Array(written as ArrayBufferLike),
+                with_formula_at_b2(readFileSync(SAMPLE)),
                 'commented',
             );
 
@@ -1882,18 +1870,8 @@ describe('write_xlsx_cell_edits', () => {
             // part was deleted while the content type and the relationship both went
             // on naming it — a dangling reference, which is the repair prompt this
             // removal exists to avoid.
-            const base = CFB.read(readFileSync(SAMPLE), { type: 'buffer' });
-            const sheet = CFB.find(base, '/xl/worksheets/sheet3.xml')!;
-            const patched = Buffer.from(
-                Buffer.from(sheet.content as Uint8Array).toString('utf8')
-                    .replace(/<c r="B2"[^>]*(?:\/>|>[\s\S]*?<\/c>)/, '<c r="B2"><f>1+1</f><v>2</v></c>'),
-                'utf8',
-            );
-            sheet.content = patched;
-            sheet.size = patched.length;
-            const written = CFB.write(base, { type: 'buffer', fileType: 'zip', compression: true });
             const raw = with_calc_chain(
-                written instanceof Uint8Array ? written : new Uint8Array(written as ArrayBufferLike),
+                with_formula_at_b2(readFileSync(SAMPLE)),
                 false,
                 'note="1 > 0" ',
             );
@@ -1903,6 +1881,61 @@ describe('write_xlsx_cell_edits', () => {
             expect(part(out, '/xl/calcChain.xml')).toBeNull();
             expect(text_part(out, '/[Content_Types].xml')).not.toContain('/xl/calcChain.xml');
             expect(text_part(out, '/xl/_rels/workbook.xml.rels')).not.toContain('calcChain.xml');
+        });
+
+        it('leaves the package whole when a reference edit cannot be computed', () => {
+            // The removal is all-or-nothing, and this is the "none" half. Every
+            // *partial* removal is its own broken package: the part gone but still
+            // referenced, or still present with no content type (typed by the
+            // `<Default Extension="xml">` fallback instead of as a calc chain), or
+            // present and unreferenced. So the reference edits are computed before
+            // any is applied, and a failure to compute abandons the whole removal
+            // rather than committing the half that worked.
+            //
+            // Injected on the *second* reference part, so a content type that
+            // strips cleanly is followed by a rels part that throws: with the edits
+            // applied as they were computed, the first would already be written by
+            // the time the second failed.
+            const raw = with_calc_chain(with_formula_at_b2(readFileSync(SAMPLE)));
+            const before_types = text_part(raw, '/[Content_Types].xml');
+            // Armed only once the calc chain removal is underway, so both reference
+            // parts stay readable for the reads the edit itself needs. Which of the
+            // two is hit second is deliberately *not* hard-coded: the failure has to
+            // land after one reference edit has been computed, and naming a path
+            // would quietly stop doing that the day the two are reordered — leaving
+            // a test that passes because nothing was injected at all.
+            const REFERENCE_PARTS = ['/[Content_Types].xml', '/xl/_rels/workbook.xml.rels'];
+            const actual_find = CFB.find;
+            let removing = false;
+            let first: string | null = null;
+            const spy = vi.spyOn(CFB, 'find').mockImplementation(((
+                file: never,
+                path: string,
+            ) => {
+                if (path === '/xl/calcChain.xml') removing = true;
+                if (removing && REFERENCE_PARTS.includes(path)) {
+                    // Repeat visits to the part already reached are let through, so
+                    // the removal gets as far as committing that one edit.
+                    if (first === null) first = path;
+                    if (path !== first) throw new Error('unreadable part');
+                }
+                return actual_find.call(CFB, file, path);
+            }) as typeof CFB.find);
+
+            // The edit itself still succeeds — a stale calc chain is a cache Excel
+            // rebuilds, and failing the save would cost the user the edit instead.
+            let out: Uint8Array;
+            try {
+                out = write_xlsx_cell_edits(raw, 2, [{ row: 1, col: 1, value: '42' }]);
+            } finally {
+                spy.mockRestore();
+            }
+
+            // And nothing was half-removed: the part, its content type and its
+            // relationship are all exactly as they were.
+            expect(part(out, '/xl/calcChain.xml')).not.toBeNull();
+            expect(text_part(out, '/[Content_Types].xml')).toBe(before_types);
+            expect(text_part(out, '/xl/_rels/workbook.xml.rels')).toContain('calcChain.xml');
         });
     });
 
