@@ -137,13 +137,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         register('tableViewer.openWorkbookAtSheet', async (value: unknown) => {
             const args = open_workbook_at_sheet_arguments(value);
             const uri = vscode.Uri.parse(args.uri, true);
-            const found = await viewers!.openWorkbookAtSheet(uri, args.sheetName);
-            if (!found) {
-                void vscode.window.showWarningMessage(
-                    `Worksheet "${args.sheetName}" was not found.`,
-                );
+            try {
+                const found = await viewers!.openWorkbookAtSheet(uri, args.sheetName);
+                if (!found) {
+                    void vscode.window.showWarningMessage(
+                        `Worksheet "${args.sheetName}" was not found.`,
+                    );
+                }
+                return found;
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                void vscode.window.showErrorMessage(message);
+                throw error;
             }
-            return found;
         });
         context.subscriptions.push(...disposables);
         active_runtime = { viewers, disposables, database };

@@ -19,6 +19,7 @@ const seams = vi.hoisted(() => ({
     throwPreviewDrain: false,
     throwDatabaseClose: false,
     openSheetResult: true,
+    openSheetError: undefined as Error | undefined,
     openSheetArgs: undefined as { uri: unknown; sheetName: string } | undefined,
 }));
 
@@ -38,6 +39,7 @@ vi.mock('../custom-editor', () => ({
             },
             async openWorkbookAtSheet(uri: unknown, sheetName: string) {
                 seams.openSheetArgs = { uri, sheetName };
+                if (seams.openSheetError) throw seams.openSheetError;
                 return seams.openSheetResult;
             },
         };
@@ -110,6 +112,7 @@ beforeEach(async () => {
     seams.throwPreviewDrain = false;
     seams.throwDatabaseClose = false;
     seams.openSheetResult = true;
+    seams.openSheetError = undefined;
     seams.openSheetArgs = undefined;
 });
 
@@ -174,6 +177,19 @@ describe('VS Code activation', () => {
             args,
         )).resolves.toBe(false);
         expect(warning).toHaveBeenCalledWith('Worksheet "Table A1" was not found.');
+    });
+
+    it('reports a workbook open failure and preserves the command rejection', async () => {
+        await activate(context());
+        const error = new Error('workbook could not be opened');
+        seams.openSheetError = error;
+        const show_error = vi.spyOn(vscode_mock.window, 'showErrorMessage');
+
+        await expect(vscode_mock.commands.executeCommand(
+            'tableViewer.openWorkbookAtSheet',
+            { uri: 'file:///workbooks/book.xlsx', sheetName: 'Table A1' },
+        )).rejects.toBe(error);
+        expect(show_error).toHaveBeenCalledWith('workbook could not be opened');
     });
 
     it('rejects malformed workbook-at-worksheet command arguments', async () => {
