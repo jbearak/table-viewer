@@ -1,10 +1,19 @@
 import { describe, expect, it } from 'vitest';
 import { create_edit_session_registry } from '../webview/edit-session-registry';
 
+// Stands in for App's session id ref: one mutable authoritative value the
+// registry reads through the injected getter, exactly as production does.
+function make_session_ref(initial?: string) {
+    const ref = { current: initial as string | undefined };
+    return {
+        ref,
+        registry: create_edit_session_registry(() => ref.current),
+    };
+}
+
 describe('edit session registry', () => {
     it('returns the same store for the same sheet across calls', () => {
-        const registry = create_edit_session_registry();
-        registry.set_session('session');
+        const { registry } = make_session_ref('session');
 
         const first = registry.for_sheet(0);
         first.commit('session', '0:0', { value: 'typed', base: 'A' });
@@ -17,8 +26,7 @@ describe('edit session registry', () => {
     });
 
     it('gives each sheet its own store and key space', () => {
-        const registry = create_edit_session_registry();
-        registry.set_session('s');
+        const { registry } = make_session_ref('s');
 
         registry.for_sheet(0).commit('s', '0:0', { value: 'people', base: 'A' });
         registry.for_sheet(1).commit('s', '0:0', { value: 'stock', base: 'B' });
@@ -31,9 +39,8 @@ describe('edit session registry', () => {
             .toEqual({ value: 'stock', base: 'B' });
     });
 
-    it('stamps a store with the session it was created under', () => {
-        const registry = create_edit_session_registry();
-        registry.set_session('live-session');
+    it('stamps a store with the session current at its creation', () => {
+        const { registry } = make_session_ref('live-session');
 
         const store = registry.for_sheet(2);
 
@@ -43,12 +50,11 @@ describe('edit session registry', () => {
         expect(store.size()).toBe(0);
     });
 
-    it('set_session moves the stamp for new stores only', () => {
-        const registry = create_edit_session_registry();
-        registry.set_session('old');
+    it('a session move re-stamps new stores only, until adopt_session', () => {
+        const { ref, registry } = make_session_ref('old');
         const before = registry.for_sheet(0);
 
-        registry.set_session('new');
+        ref.current = 'new';
 
         // The existing store keeps its stamp until adopt_session: until the
         // render under the new id commits, the on-screen grid is still the old
@@ -61,13 +67,12 @@ describe('edit session registry', () => {
     });
 
     it('adopt_session re-stamps every existing store, including clean ones', () => {
-        const registry = create_edit_session_registry();
-        registry.set_session('old');
+        const { ref, registry } = make_session_ref('old');
         const dirty = registry.for_sheet(0);
         dirty.commit('old', '0:0', { value: 'x', base: 'a' });
         const clean = registry.for_sheet(1);
 
-        registry.set_session('new');
+        ref.current = 'new';
         registry.adopt_session();
 
         // The clean store matters most: it was never written to under the old

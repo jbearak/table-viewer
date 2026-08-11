@@ -420,9 +420,16 @@ export function App(): React.JSX.Element {
     // key space, which is what lets the store and the `use_editing` hook stay
     // sheet-agnostic. Only one sheet holds a session today, so exactly one of
     // these is ever non-empty; the shape is what changes here, not the behaviour.
+    // Reads the session id ref rather than holding a copy: the ref is the one
+    // authoritative value, it moves synchronously in set_csv_edit_session_id,
+    // and a store built after that move is stamped from it at creation — so
+    // new stores are fenced against the outgoing session's writers with
+    // nothing to keep in lockstep.
     const edit_session_registry_ref = useRef<EditSessionRegistry | null>(null);
     if (edit_session_registry_ref.current === null) {
-        edit_session_registry_ref.current = create_edit_session_registry();
+        edit_session_registry_ref.current = create_edit_session_registry(
+            () => csv_edit_session_id_ref.current,
+        );
     }
     const set_csv_edit_session_id = useCallback((next: string | undefined) => {
         const previous = csv_edit_session_id_ref.current;
@@ -431,11 +438,6 @@ export function App(): React.JSX.Element {
         }
         if (previous && previous !== next) pending_edit_durability.retire(previous);
         csv_edit_session_id_ref.current = next;
-        // Moved together with the ref so a store built between this move and the
-        // commit is already fenced against the outgoing session's writers.
-        // Existing stores keep their stamp until the adopt_session layout effect
-        // at commit — see that effect for why the lag is load-bearing.
-        edit_session_registry_ref.current!.set_session(next);
         set_csv_edit_session_id_state(next);
     }, []);
     const [edit_mode, set_edit_mode_state] = useState(false);
@@ -3057,10 +3059,9 @@ export function App(): React.JSX.Element {
     useLayoutEffect(() => {
         // Every store, not just the owning sheet's: a store the session never
         // wrote to still carries the stamp it was built with, and leaving it on a
-        // retired session would fence off the first write it does receive. The
-        // registry already learned the new id when the ref moved (set_session);
-        // this is the commit-time half, re-stamping the stores that existed
-        // before the move.
+        // retired session would fence off the first write it does receive. New
+        // stores already read the moved session id ref at creation; this is the
+        // commit-time half, re-stamping the stores that existed before the move.
         edit_session_registry_ref.current!.adopt_session();
     }, [csv_edit_session_id]);
 
