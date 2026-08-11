@@ -3697,8 +3697,9 @@ describe('edit mode save exit', () => {
             sheetIndex: 0,
         });
         // Stand in for the real overlay fold, as the transform and refresh remount
-        // tests do. Only the owning sheet is handed the store, so this writes on
-        // the way *out* of People and is a no-op on the way back in.
+        // tests do. Every sheet is handed its own store, so this writes into
+        // People's on the way out and into Inventory's on the way back — distinct
+        // maps, which is what the isolation test below pins.
         grid_shell_mock.commit_live_edit.mockImplementation(() => {
             (grid_shell_mock.latest_props?.edit_session as EditSessionStore | undefined)
                 ?.commit('people-session', '0:0', { value: 'typed', base: 'Alice' });
@@ -3709,6 +3710,41 @@ describe('edit mode save exit', () => {
 
         await click_sheet_tab('People');
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!))
+            .toEqual({ '0:0': { value: 'typed', base: 'Alice' } });
+    });
+
+    it("keeps one worksheet's dirty cells out of another's store", async () => {
+        // Every sheet gets its own store from the registry, so the isolation the
+        // old "withhold the store from non-owning sheets" mechanism provided must
+        // now come from the stores being distinct maps. If the registry ever
+        // handed sheets a shared store, People's `0:0` would paint at Inventory's
+        // `0:0` — the cross-sheet bleed #154's widening must not reintroduce.
+        await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'people-session',
+            sheetIndex: 0,
+        });
+        await act(async () => {
+            (grid_shell_mock.latest_props?.edit_session as EditSessionStore)
+                .commit('people-session', '0:0', { value: 'typed', base: 'Alice' });
+        });
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!))
+            .toEqual({ '0:0': { value: 'typed', base: 'Alice' } });
+
+        await click_sheet_tab('Inventory');
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!)).toEqual({});
+
+        await click_sheet_tab('People');
         expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!))
             .toEqual({ '0:0': { value: 'typed', base: 'Alice' } });
     });
