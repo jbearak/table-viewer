@@ -799,8 +799,18 @@ export function GridShell({
             return pending_edit_durability.snapshot(edit_session_id)
                 .highestProducedSequence;
         }
-        return pending_edit_durability.publish(edit_session_id, edits, force);
-    }, [edit_session_id]);
+        // This shell's own sheet, index and name both: the session is
+        // workbook-scoped, so the post names the slot it is a complete map of,
+        // and the name lets the host follow the sheet through a reorder that
+        // lands while the write is queued.
+        return pending_edit_durability.publish(
+            edit_session_id,
+            edits,
+            sheet_index,
+            sheet_meta.name,
+            force,
+        );
+    }, [edit_session_id, sheet_index, sheet_meta.name]);
 
     // Persist a complete dirty map under a renderer-monotonic sequence. The host
     // acknowledges only after the corresponding state-store write resolves.

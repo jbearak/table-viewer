@@ -110,17 +110,17 @@ describe('host-bridge', () => {
         const { pending_edit_durability } = await import('../webview/host-bridge');
         const first = pending_edit_durability.publish('session:1', {
             '0:0': { value: 'b', base: 'a' },
-        });
+        }, 0, 'People');
         const duplicate = pending_edit_durability.publish('session:1', {
             '0:0': { value: 'b', base: 'a' },
-        });
+        }, 0, 'People');
         const snapshots: unknown[] = [];
         const unsubscribe = pending_edit_durability.subscribe(
             'session:1',
             (snapshot) => snapshots.push(snapshot),
         );
         unsubscribe();
-        const second = pending_edit_durability.publish('session:1', null);
+        const second = pending_edit_durability.publish('session:1', null, 0, 'People');
         pending_edit_durability.acknowledge('session:1', first);
 
         expect([first, duplicate, second]).toEqual([1, 1, 2]);
@@ -135,7 +135,38 @@ describe('host-bridge', () => {
         });
 
         pending_edit_durability.retire('session:1');
-        expect(pending_edit_durability.publish('session:1', null)).toBe(1);
+        expect(pending_edit_durability.publish('session:1', null, 0, 'People'))
+            .toBe(1);
+    });
+
+    it('dedupes pending-edit payloads per sheet, not per session', async () => {
+        const injected = { postMessage: vi.fn() };
+        (globalThis as { __tableViewerHostBridge?: unknown })
+            .__tableViewerHostBridge = injected;
+
+        const { pending_edit_durability } = await import('../webview/host-bridge');
+        const edits = { '0:0': { value: 'b', base: 'a' } };
+        const on_people = pending_edit_durability.publish(
+            'session:1', edits, 0, 'People');
+        // A byte-identical map on another sheet is a distinct slot's content
+        // and must reach the host — the host stores each sheet separately.
+        const on_stock = pending_edit_durability.publish(
+            'session:1', edits, 1, 'Stock');
+
+        expect([on_people, on_stock]).toEqual([1, 2]);
+        expect(injected.postMessage).toHaveBeenCalledTimes(2);
+        expect(injected.postMessage).toHaveBeenLastCalledWith({
+            type: 'pendingEditsChanged',
+            editSessionId: 'session:1',
+            edits,
+            sequence: 2,
+            sheetIndex: 1,
+            sheetName: 'Stock',
+        });
+        // But re-posting the same map on the same sheet still dedupes.
+        expect(pending_edit_durability.publish('session:1', edits, 1, 'Stock'))
+            .toBe(2);
+        expect(injected.postMessage).toHaveBeenCalledTimes(2);
     });
 
     it('prefers an injected global bridge over acquireVsCodeApi', async () => {

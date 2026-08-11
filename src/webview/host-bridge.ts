@@ -47,7 +47,9 @@ export interface PendingEditDurabilitySnapshot {
 interface PendingEditSessionChannel {
     nextSequence: number;
     highestAcknowledgedSequence: number;
-    lastPayload?: string;
+    // Dedupe per sheet: two sheets with byte-identical maps are distinct
+    // slots' content and must not suppress each other's posts.
+    lastPayloadBySheet: Map<number, string>;
     listeners: Set<(snapshot: PendingEditDurabilitySnapshot) => void>;
 }
 
@@ -59,6 +61,7 @@ function pending_edit_channel(session_id: string): PendingEditSessionChannel {
         channel = {
             nextSequence: 1,
             highestAcknowledgedSequence: 0,
+            lastPayloadBySheet: new Map(),
             listeners: new Set(),
         };
         pending_edit_channels.set(session_id, channel);
@@ -106,18 +109,24 @@ export const pending_edit_durability = {
     publish(
         editSessionId: string,
         edits: Record<string, { value: string; base: string }> | null,
+        sheetIndex: number,
+        sheetName: string | undefined,
         force = false,
     ): number {
         const channel = pending_edit_channel(editSessionId);
         const payload = JSON.stringify(edits);
-        if (!force && channel.lastPayload === payload) return channel.nextSequence - 1;
+        if (!force && channel.lastPayloadBySheet.get(sheetIndex) === payload) {
+            return channel.nextSequence - 1;
+        }
         const sequence = channel.nextSequence++;
-        channel.lastPayload = payload;
+        channel.lastPayloadBySheet.set(sheetIndex, payload);
         host_bridge.postMessage({
             type: 'pendingEditsChanged',
             editSessionId,
             edits,
             sequence,
+            sheetIndex,
+            ...(sheetName !== undefined ? { sheetName } : {}),
         });
         notify_pending_edit_channel(channel);
         return sequence;

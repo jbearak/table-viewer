@@ -1298,7 +1298,15 @@ export type WebviewMessage =
     | { type: 'discardEditSession'; editSessionId: string }
     | { type: 'saveCsv'; operation: CsvSaveOperationRequest }
     | { type: 'showSaveDialog'; editSessionId: string; requestId: string }
-    | { type: 'pendingEditsChanged'; edits: Record<string, { value: string; base: string }> | null; editSessionId: string; sequence: number }
+    // `sheetIndex`/`sheetName` say which worksheet's slot this complete map is
+    // for. A workbook-scoped session (#154) can hold edits on several sheets, so
+    // the host can no longer infer the slot from the session — the post has to
+    // name it. Optional on the wire like every other sheet field: a single-sheet
+    // source means sheet 0, and the name is absent exactly when the source has
+    // no sheet names to reorder (the CSV shape). The host validates the pair and
+    // resolves the *name* at write time, so a post queued across an external
+    // reorder still lands in the worksheet the user actually edited.
+    | { type: 'pendingEditsChanged'; edits: Record<string, { value: string; base: string }> | null; editSessionId: string; sequence: number; sheetIndex?: number; sheetName?: string }
     /** Renderer close/reload barrier response; zero means no map was produced. */
     | { type: 'pendingEditsFlush'; requestId: string; editSessionId?: string; highestProducedSequence: number }
     /** The renderer could not establish the requested close/reload barrier. */

@@ -716,11 +716,14 @@ export function App(): React.JSX.Element {
         const snapshot = edit_session_store().snapshot();
         const publication_fenced = renderer_publication_fenced_session_ref.current
             === edit_session_id;
+        const edit_sheet_index = edit_session_sheet_index_ref.current;
         const highest_produced_sequence = save_in_flight_ref.current || publication_fenced
             ? durability.highestProducedSequence
             : pending_edit_durability.publish(
                 edit_session_id,
                 snapshot.size > 0 ? Object.fromEntries(snapshot) : null,
+                edit_sheet_index,
+                meta_ref.current?.sheets[edit_sheet_index]?.name,
                 durability.highestAcknowledgedSequence
                     < durability.highestProducedSequence,
             );
