@@ -798,6 +798,20 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     margin-left: auto;
 }
 
+/*
+ * Separates the workbook-scoped actions from the worksheet-scoped ones. The
+ * margin is on top of the row's 6px gap, so the rule reads as a boundary rather
+ * than as one more crowded item.
+ */
+.toolbar-actions-divider {
+    flex: 0 0 auto;
+    align-self: stretch;
+    width: 1px;
+    min-height: 1.25em;
+    margin: 0 2px;
+    background: var(--vscode-panel-border, #444);
+}
+
 .toolbar.is-wrapped {
     flex-wrap: wrap;
 }

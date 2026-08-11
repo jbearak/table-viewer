@@ -124,6 +124,21 @@ function get_tooltip(): HTMLElement | null {
     return document.querySelector('[role="tooltip"]');
 }
 
+/**
+ * The action row in order, with the scope divider read as `'|'`.
+ *
+ * Including the divider is the point: what the grouping asserts is which side of
+ * the rule each button falls on, not merely their relative order.
+ */
+function get_action_labels(container: HTMLElement): (string | null)[] {
+    return Array.from(
+        container.querySelectorAll<HTMLElement>(
+            '.toolbar-actions button, .toolbar-actions-divider',
+        ),
+        (node) => node.classList.contains('toolbar-actions-divider') ? '|' : node.textContent,
+    );
+}
+
 function make_rect({
     left = 0,
     top = 0,
@@ -181,24 +196,94 @@ describe('Toolbar', () => {
         expect(on_unhide_all).toHaveBeenCalledOnce();
     });
 
-    it('orders actions from content editing through table and tab layout', () => {
+    it('orders actions workbook scope first, then worksheet scope', () => {
         const { container } = render_toolbar({
             show_edit_button: true,
             show_excel_header_button: true,
         });
 
-        const labels = Array.from(
-            container.querySelectorAll<HTMLButtonElement>('.toolbar-actions button'),
-            (button) => button.textContent,
-        );
-        expect(labels).toEqual([
+        expect(get_action_labels(container)).toEqual([
             'Edit',
-            'First Row as Header',
             'Formatting',
+            'Vertical Tabs',
+            '|',
+            'First Row as Header',
             'Columns',
             'Auto-fit Columns',
-            'Vertical Tabs',
         ]);
+    });
+
+    it('marks the divider as a vertical separator', () => {
+        const { container } = render_toolbar({ show_edit_button: true });
+
+        const divider = container.querySelector('.toolbar-actions-divider');
+        expect(divider?.getAttribute('role')).toBe('separator');
+        expect(divider?.getAttribute('aria-orientation')).toBe('vertical');
+    });
+
+    it('omits the divider when no workbook-scoped action is shown', () => {
+        // A single-sheet CSV with no formatting: nothing sits left of the rule, so
+        // a rule there would be a stray leading line.
+        const { container } = render_toolbar({
+            show_edit_button: false,
+            show_formatting_button: false,
+            show_vertical_tabs_button: false,
+        });
+
+        expect(container.querySelector('.toolbar-actions-divider')).toBeNull();
+        expect(container.querySelector('.toolbar-actions')?.firstElementChild?.textContent)
+            .toBe('Columns');
+    });
+
+    it('keeps the divider when only one workbook-scoped action is shown', () => {
+        const { container } = render_toolbar({
+            show_edit_button: false,
+            show_formatting_button: false,
+            show_vertical_tabs_button: true,
+        });
+
+        expect(get_action_labels(container))
+            .toEqual(['Vertical Tabs', '|', 'Columns', 'Auto-fit Columns']);
+    });
+
+    it('divides the two groups for every combination of optional actions', () => {
+        // The divider follows from whether the workbook group rendered anything, so
+        // it must sit at exactly the group boundary in all eight combinations —
+        // including the three where only one workbook action is visible, which a
+        // hand-written condition is most likely to get wrong.
+        for (const show_edit_button of [false, true]) {
+            for (const show_formatting_button of [false, true]) {
+                for (const show_vertical_tabs_button of [false, true]) {
+                    const { container } = render_toolbar({
+                        show_edit_button,
+                        show_formatting_button,
+                        show_vertical_tabs_button,
+                        show_excel_header_button: true,
+                    });
+                    const labels = get_action_labels(container);
+                    const workbook_count = [
+                        show_edit_button,
+                        show_formatting_button,
+                        show_vertical_tabs_button,
+                    ].filter(Boolean).length;
+
+                    if (workbook_count === 0) {
+                        expect(labels).not.toContain('|');
+                    } else {
+                        // One rule, at the boundary: every workbook action before it
+                        // and every worksheet action after it.
+                        expect(labels.filter((label) => label === '|')).toHaveLength(1);
+                        expect(labels.indexOf('|')).toBe(workbook_count);
+                        expect(labels.slice(workbook_count + 1)).toEqual([
+                            'First Row as Header',
+                            'Columns',
+                            'Auto-fit Columns',
+                        ]);
+                    }
+                    cleanup();
+                }
+            }
+        }
     });
 
     it('does not show the Sort/filter raw-values pill when idle', () => {
