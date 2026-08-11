@@ -1940,10 +1940,16 @@ describe('write_xlsx_cell_edits', () => {
             // passing if the edit stopped dropping a formula: no removal, nothing
             // thrown, and a package that is whole for the uninteresting reason.
             expect(injected).toBe(true);
-            // The edit landed. The whole point of swallowing the failure is that
-            // the user keeps their change; a `remove_part` that gave up by
-            // discarding the edited package would satisfy every check below.
-            expect(text_part(out, '/xl/worksheets/sheet3.xml')).toContain('<v>42</v>');
+            // The edit landed, in the cell it was addressed to. The whole point of
+            // swallowing the failure is that the user keeps their change, so a
+            // `remove_part` that gave up by discarding the edited package would
+            // satisfy every check below. Pinned to B2 rather than looked for
+            // anywhere in the sheet, since a coordinate that routed 42 into some
+            // other cell would still drop B2's formula and still read as "the edit
+            // landed".
+            expect(/<c r="B2"(?![^>]*\/>)[^>]*>(?:(?!<\/c>)[\s\S])*<v>42<\/v>/.test(
+                text_part(out, '/xl/worksheets/sheet3.xml'),
+            )).toBe(true);
             // And nothing was half-removed: the part, its content type and its
             // relationship are all exactly as they were.
             expect(part(out, '/xl/calcChain.xml')).not.toBeNull();

@@ -451,7 +451,7 @@ function workbook_relationship_removed(
     const xml = read_part_text(cfb_file, '/xl/_rels/workbook.xml.rels');
     if (!xml) return null;
     const wanted = part_path.replace(/^\//, '');
-    // See `remove_content_type_override`: same quote-aware location, and a
+    // See `content_type_override_removed`: same quote-aware location, and a
     // relationship left pointing at a deleted part is the other half of the same
     // broken package.
     const stripped = remove_elements(xml, 'Relationship', (tag) => {
