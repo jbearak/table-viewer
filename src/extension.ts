@@ -21,6 +21,29 @@ interface ActiveExtensionRuntime {
     readonly database: OpenedVscodeStateDatabase;
 }
 
+interface OpenWorkbookAtSheetArguments {
+    readonly uri: string;
+    readonly sheetName: string;
+}
+
+function open_workbook_at_sheet_arguments(value: unknown): OpenWorkbookAtSheetArguments {
+    if (
+        typeof value !== 'object'
+        || value === null
+        || !('uri' in value)
+        || typeof value.uri !== 'string'
+        || value.uri.length === 0
+        || !('sheetName' in value)
+        || typeof value.sheetName !== 'string'
+        || value.sheetName.length === 0
+    ) {
+        throw new TypeError(
+            'tableViewer.openWorkbookAtSheet requires { uri: string, sheetName: string }.',
+        );
+    }
+    return { uri: value.uri, sheetName: value.sheetName };
+}
+
 let active_runtime: ActiveExtensionRuntime | undefined;
 let active_teardown: Promise<void> | undefined;
 
@@ -89,10 +112,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // push(a, b, c) evaluates every argument before the array is touched, so
         // a failure registering the second command would leak the first past the
         // rollback below.
-        const register = (
-            command: string,
-            handler: (uri?: vscode.Uri) => void,
-        ): void => {
+        const register = (command: string, handler: (...args: any[]) => unknown): void => {
             disposables.push(vscode.commands.registerCommand(command, handler));
         };
         const preview_in = (column: number) => (uri?: vscode.Uri) => {
@@ -114,6 +134,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             () => vscode.window.activeTextEditor?.document.uri,
         ));
         register('tableViewer.openAsText', open_with('default', active_custom_tab_uri));
+        register('tableViewer.openWorkbookAtSheet', async (value: unknown) => {
+            const args = open_workbook_at_sheet_arguments(value);
+            const uri = vscode.Uri.parse(args.uri, true);
+            const found = await viewers!.openWorkbookAtSheet(uri, args.sheetName);
+            if (!found) {
+                void vscode.window.showWarningMessage(
+                    `Worksheet "${args.sheetName}" was not found.`,
+                );
+            }
+            return found;
+        });
         context.subscriptions.push(...disposables);
         active_runtime = { viewers, disposables, database };
     } catch (error) {

@@ -65,9 +65,19 @@
         "command": "tableViewer.openAsText",
         "title": "Table Viewer: Open in Text Editor",
         "icon": "$(go-to-file)"
+      },
+      {
+        "command": "tableViewer.openWorkbookAtSheet",
+        "title": "Table Viewer: Open Workbook at Worksheet"
       }
     ],
     "menus": {
+      "commandPalette": [
+        {
+          "command": "tableViewer.openWorkbookAtSheet",
+          "when": "false"
+        }
+      ],
       "editor/title": [
         {
           "command": "tableViewer.showCsvPreviewToSide",

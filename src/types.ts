@@ -1191,6 +1191,8 @@ export type TerminalCsvSaveLifecycle = Extract<
 /** Messages from extension host to webview. */
 export type HostMessage =
     | { type: 'fontChanged'; fontFamily: string | null; fontSize: number | null }
+    /** Select a worksheet after the renderer has acknowledged its workbook snapshot. */
+    | { type: 'selectSheet'; sheetIndex: number }
     // Desktop only: the native Edit menu consumes Cmd/Ctrl+C and Cmd/Ctrl+A
     // before the page sees them, so it forwards the intent instead.
     | { type: 'editCommand'; command: 'copy' | 'selectAll' }

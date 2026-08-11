@@ -33,6 +33,122 @@ afterEach(() => {
 });
 
 describe('register_table_viewer', () => {
+    function xlsx_fixture(): { uri: vscode.Uri; bytes: Buffer } {
+        const fixture = path.join(__dirname, 'fixtures', 'basic.xlsx');
+        return {
+            uri: vscode_mock.Uri.file('/workbooks/basic.xlsx') as unknown as vscode.Uri,
+            bytes: fs.readFileSync(fixture),
+        };
+    }
+
+    function excel_provider() {
+        const registered = vscode_mock.__getCustomEditorRegistrations()
+            .find((candidate) => candidate.viewType === 'tableViewer.excelViewer');
+        return registered?.provider as {
+            openCustomDocument(candidate: vscode.Uri): Promise<vscode.CustomDocument>;
+            resolveCustomEditor(
+                document: vscode.CustomDocument,
+                panel: vscode.WebviewPanel,
+            ): Promise<void>;
+        };
+    }
+
+    async function dispose_registration(
+        registration: ReturnType<typeof register_table_viewer>,
+        panel: ReturnType<typeof vscode_mock.__getPanels>[number],
+    ): Promise<void> {
+        registration.dispose();
+        await vi.waitFor(() => expect(panel.__messages.some((message) => (
+            typeof message === 'object' && message !== null
+            && 'type' in message && message.type === 'requestPendingEditsFlush'
+        ))).toBe(true));
+        const request = [...panel.__messages].reverse().find((message) => (
+            typeof message === 'object' && message !== null
+            && 'type' in message && message.type === 'requestPendingEditsFlush'
+        )) as { requestId: string };
+        await panel.__receive({
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            highestProducedSequence: 0,
+        });
+        await registration.drain();
+    }
+
+    async function acknowledge_latest_snapshot(
+        panel: ReturnType<typeof vscode_mock.__getPanels>[number],
+    ): Promise<void> {
+        await vi.waitFor(() => expect(panel.__messages.some((message) => (
+            typeof message === 'object' && message !== null
+            && 'type' in message && message.type === 'workbookSnapshot'
+        ))).toBe(true));
+        const delivery = [...panel.__messages].reverse().find((message) => (
+            typeof message === 'object' && message !== null
+            && 'type' in message && message.type === 'workbookSnapshot'
+        )) as { snapshot: { identity: unknown } };
+        await panel.__receive({
+            type: 'snapshotApplied',
+            identity: delivery.snapshot.identity,
+            disposition: 'applied',
+        });
+    }
+
+    it('reveals an existing workbook and selects a named worksheet after its snapshot', async () => {
+        const { uri, bytes } = xlsx_fixture();
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.length, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        const registration = register_table_viewer(context(), state_store());
+        const provider = excel_provider();
+        const panel = vscode_mock.window.createWebviewPanel(
+            'tableViewer.excelViewer',
+            'basic.xlsx',
+        ) as unknown as vscode.WebviewPanel;
+        const reveal = vi.spyOn(panel, 'reveal');
+        const document = await provider.openCustomDocument(uri);
+        await provider.resolveCustomEditor(document, panel);
+        const mock_panel = vscode_mock.__getPanels()[0];
+        mock_panel.__autoAckSnapshots = false;
+        await mock_panel.__receive({ type: 'ready' });
+        await acknowledge_latest_snapshot(mock_panel);
+
+        await expect(registration.openWorkbookAtSheet(uri, 'Inventory')).resolves.toBe(true);
+
+        expect(reveal).toHaveBeenCalledOnce();
+        expect(mock_panel.__messages).toContainEqual({ type: 'selectSheet', sheetIndex: 1 });
+        await expect(registration.openWorkbookAtSheet(uri, 'Not Here')).resolves.toBe(false);
+        await dispose_registration(registration, mock_panel);
+    });
+
+    it('opens cold before selecting and reports a missing worksheet without closing it', async () => {
+        const { uri, bytes } = xlsx_fixture();
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.length, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        const registration = register_table_viewer(context(), state_store());
+        const provider = excel_provider();
+        vscode_mock.__setCommand('vscode.openWith', async (target: unknown, view_type: unknown) => {
+            expect(target).toBe(uri);
+            expect(view_type).toBe('tableViewer.excelViewer');
+            const panel = vscode_mock.window.createWebviewPanel(
+                'tableViewer.excelViewer',
+                'basic.xlsx',
+            ) as unknown as vscode.WebviewPanel;
+            const document = await provider.openCustomDocument(uri);
+            await provider.resolveCustomEditor(document, panel);
+            const mock_panel = vscode_mock.__getPanels()[0];
+            mock_panel.__autoAckSnapshots = false;
+            await mock_panel.__receive({ type: 'ready' });
+            await acknowledge_latest_snapshot(mock_panel);
+        });
+
+        await expect(registration.openWorkbookAtSheet(uri, 'Not Here')).resolves.toBe(false);
+        expect(vscode_mock.__getPanels()).toHaveLength(1);
+        await expect(registration.openWorkbookAtSheet(uri, 'Inventory')).resolves.toBe(true);
+        expect(vscode_mock.__getPanels()[0].__messages).toContainEqual({
+            type: 'selectSheet',
+            sheetIndex: 1,
+        });
+        await dispose_registration(registration, vscode_mock.__getPanels()[0]);
+    });
+
     it('keeps multi-viewer support for both Excel and CSV custom editors', () => {
         register_table_viewer(context(), state_store());
 

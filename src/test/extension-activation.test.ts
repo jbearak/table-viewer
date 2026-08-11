@@ -18,6 +18,8 @@ const seams = vi.hoisted(() => ({
     throwPreviewDispose: false,
     throwPreviewDrain: false,
     throwDatabaseClose: false,
+    openSheetResult: true,
+    openSheetArgs: undefined as { uri: unknown; sheetName: string } | undefined,
 }));
 
 vi.mock('../custom-editor', () => ({
@@ -33,6 +35,10 @@ vi.mock('../custom-editor', () => ({
             async drain() {
                 seams.events.push('drain:viewers');
                 if (seams.throwViewerDrain) throw new Error('viewer drain failed');
+            },
+            async openWorkbookAtSheet(uri: unknown, sheetName: string) {
+                seams.openSheetArgs = { uri, sheetName };
+                return seams.openSheetResult;
             },
         };
     },
@@ -103,6 +109,8 @@ beforeEach(async () => {
     seams.throwPreviewDispose = false;
     seams.throwPreviewDrain = false;
     seams.throwDatabaseClose = false;
+    seams.openSheetResult = true;
+    seams.openSheetArgs = undefined;
 });
 
 afterEach(async () => {
@@ -129,6 +137,7 @@ describe('VS Code activation', () => {
             'tableViewer.showCsvPreview',
             'tableViewer.openCsvTable',
             'tableViewer.openAsText',
+            'tableViewer.openWorkbookAtSheet',
         ]);
     });
 
@@ -142,6 +151,41 @@ describe('VS Code activation', () => {
         ]) {
             expect(vscode_mock.__getRegisteredCommands()).not.toContain(retired);
         }
+    });
+
+    it('opens a workbook at a worksheet and warns when the worksheet is absent', async () => {
+        await activate(context());
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const args = { uri: 'file:///workbooks/book.xlsx', sheetName: 'Table A1' };
+
+        await expect(vscode_mock.commands.executeCommand(
+            'tableViewer.openWorkbookAtSheet',
+            args,
+        )).resolves.toBe(true);
+        expect(seams.openSheetArgs).toMatchObject({
+            uri: expect.objectContaining({ scheme: 'file', path: '/workbooks/book.xlsx' }),
+            sheetName: 'Table A1',
+        });
+        expect(warning).not.toHaveBeenCalled();
+
+        seams.openSheetResult = false;
+        await expect(vscode_mock.commands.executeCommand(
+            'tableViewer.openWorkbookAtSheet',
+            args,
+        )).resolves.toBe(false);
+        expect(warning).toHaveBeenCalledWith('Worksheet "Table A1" was not found.');
+    });
+
+    it('rejects malformed workbook-at-worksheet command arguments', async () => {
+        await activate(context());
+
+        await expect(vscode_mock.commands.executeCommand(
+            'tableViewer.openWorkbookAtSheet',
+            { uri: 'file:///workbooks/book.xlsx' },
+        )).rejects.toThrow(
+            'requires { uri: string, sheetName: string }',
+        );
+        expect(seams.openSheetArgs).toBeUndefined();
     });
 
     it('clamps a hand-edited maxStoredFiles setting at both bounds', async () => {

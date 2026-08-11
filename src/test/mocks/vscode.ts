@@ -81,6 +81,21 @@ function make_uri(components: UriComponents): UriLike {
 }
 
 export const Uri = {
+    parse(value: string, strict = false): UriLike {
+        const match = /^([A-Za-z][A-Za-z0-9+.-]*):(?:\/\/([^/]*))?([^?#]*)(?:\?([^#]*))?(?:#(.*))?$/u
+            .exec(value);
+        if (!match) {
+            if (strict) throw new Error(`Invalid URI: ${value}`);
+            return Uri.file(value);
+        }
+        return make_uri({
+            scheme: match[1],
+            authority: match[2] ?? '',
+            path: match[3] || '/',
+            query: match[4] ?? '',
+            fragment: match[5] ?? '',
+        });
+    },
     joinPath(base: UriLike, ...segments: string[]): UriLike {
         const joined = [base.path.replace(/\/$/, ''), ...segments].join('/');
         if (typeof base.with === 'function') return base.with({ path: joined });
