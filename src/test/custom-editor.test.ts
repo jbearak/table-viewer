@@ -114,6 +114,8 @@ describe('register_table_viewer', () => {
 
         expect(reveal).toHaveBeenCalledOnce();
         expect(mock_panel.__messages).toContainEqual({ type: 'selectSheet', sheetIndex: 1 });
+        await expect(registration.openWorkbookAtSheet(uri, '2')).resolves.toBe(true);
+        expect(mock_panel.__messages).toContainEqual({ type: 'selectSheet', sheetIndex: 1 });
         await expect(registration.openWorkbookAtSheet(uri, 'Not Here')).resolves.toBe(false);
         await dispose_registration(registration, mock_panel);
     });

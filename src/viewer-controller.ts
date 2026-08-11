@@ -836,9 +836,11 @@ export function attach_viewer(
     function flush_sheet_selections(): void {
         if (disposed || !renderer_ready || !renderer_has_snapshot || !source) return;
         for (const request of [...pending_sheet_selections]) {
-            const sheet_index = source.meta().sheets.findIndex(
-                (sheet) => sheet.name === request.sheetName,
-            );
+            const sheets = source.meta().sheets;
+            const numeric_selector = Number(request.sheetName);
+            const sheet_index = Number.isInteger(numeric_selector) && numeric_selector >= 1
+                ? numeric_selector <= sheets.length ? numeric_selector - 1 : -1
+                : sheets.findIndex((sheet) => sheet.name === request.sheetName);
             if (sheet_index === -1) {
                 pending_sheet_selections.delete(request);
                 request.resolve(false);
