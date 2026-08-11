@@ -39,7 +39,7 @@ Use whichever route feels most familiar:
 > [!NOTE]
 > `.xlsx`, `.xls`, `.csv`, and `.tsv` files all open directly in Table Viewer by default.
 >
-> An Excel workbook may hold several worksheets, merged cells, number and date formats, and bold or italic text, all of which appear in the grid. `.csv` and `.tsv` files are single unformatted tables; in exchange, you can reopen one in VS Code's text editor and use Table Viewer's synchronized side-by-side preview.
+> Table Viewer shows an Excel workbook's worksheets, merged cells, number and date formats, and bold or italic text. `.csv` and `.tsv` files are single unformatted tables; in exchange, you can reopen one in VS Code's text editor and use Table Viewer's synchronized side-by-side preview.
 >
 > `.xlsx`, `.csv`, and `.tsv` files are editable. Legacy `.xls` workbooks are read-only.
 
