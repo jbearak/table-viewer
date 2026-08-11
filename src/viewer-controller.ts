@@ -710,7 +710,6 @@ export function attach_viewer(
     let highest_acknowledged_edit_sequence = 0;
     const pending_edit_admissions = new Set<symbol>();
     let renderer_ready = false;
-    let renderer_has_snapshot = false;
     const pending_sheet_selections = new Set<{
         readonly sheetName: string;
         readonly resolve: (found: boolean) => void;
@@ -834,13 +833,22 @@ export function attach_viewer(
     }
 
     function flush_sheet_selections(): void {
-        if (disposed || !renderer_ready || !renderer_has_snapshot || !source) return;
+        if (
+            disposed
+            || !renderer_ready
+            || !session.acknowledged_current()
+            || !source
+            || active_save_dialog_request
+        ) return;
         for (const request of [...pending_sheet_selections]) {
             const sheets = source.meta().sheets;
-            const numeric_selector = Number(request.sheetName);
-            const sheet_index = Number.isInteger(numeric_selector) && numeric_selector >= 1
-                ? numeric_selector <= sheets.length ? numeric_selector - 1 : -1
-                : sheets.findIndex((sheet) => sheet.name === request.sheetName);
+            let sheet_index = sheet_index_named(request.sheetName) ?? -1;
+            if (sheet_index === -1 && /^[1-9]\d*$/.test(request.sheetName)) {
+                const ordinal = Number(request.sheetName);
+                if (Number.isSafeInteger(ordinal) && ordinal <= sheets.length) {
+                    sheet_index = ordinal - 1;
+                }
+            }
             if (sheet_index === -1) {
                 pending_sheet_selections.delete(request);
                 request.resolve(false);
@@ -868,8 +876,6 @@ export function attach_viewer(
         onNeedsResyncSource: () => { void refresh_panel_source(true); },
         onCurrentAdoptionAcknowledged: (adoption) => {
             if (disposed || session.current_adoption() !== adoption) return;
-            renderer_has_snapshot = true;
-            flush_sheet_selections();
             const rehydration_rejection = pending_rehydration_rejections.get(adoption);
             pending_rehydration_rejections.delete(adoption);
             if (
@@ -3439,7 +3445,6 @@ export function attach_viewer(
                     }
                     // Until this adoption's snapshot is acknowledged, the renderer
                     // still indexes sheets using the preceding workbook projection.
-                    renderer_has_snapshot = false;
                     core = installed;
                     source = next;
                     source_authority = committed.receipt.resultingBasis;
@@ -3566,7 +3571,6 @@ export function attach_viewer(
                                 }, { deliver: false });
                             }
                             const material = core.snapshot_material();
-                            renderer_has_snapshot = false;
                             session.replace_adoption({
                                 source: 'commitReceipt',
                                 canonicalFileId: file_key,
@@ -4756,7 +4760,6 @@ export function attach_viewer(
                     ));
                 }
                 renderer_ready = true;
-                renderer_has_snapshot = false;
                 renderer_protocol_epoch += 1;
                 const begun = session.begin_ready();
                 // This must happen before the first await: an older receiver's
@@ -4997,6 +5000,7 @@ export function attach_viewer(
             }
             case 'snapshotApplied':
                 session.handle_snapshot_applied(msg.identity, msg.disposition);
+                if (session.acknowledged_current()) flush_sheet_selections();
                 return;
             case 'stateChanged': {
                 const expected_authority = source_authority.authorityRevision;
@@ -6189,12 +6193,13 @@ export function attach_viewer(
                     || !edit_message_is_current(request.editSessionId)
                 ) return;
                 active_save_dialog_request = undefined;
-                void post_to_receiver({
+                await post_to_receiver({
                     type: 'saveDialogResult',
                     requestId: request.requestId,
                     editSessionId: request.editSessionId,
                     choice,
                 }, request.receiverEpoch);
+                flush_sheet_selections();
                 return;
             }
             default:
@@ -6310,7 +6315,6 @@ export function attach_viewer(
             if (disposed) return;
             disposed = true;
             renderer_ready = false;
-            renderer_has_snapshot = false;
             for (const request of pending_sheet_selections) {
                 request.reject(new Error(
                     'Viewer controller was disposed before the worksheet could be selected.',

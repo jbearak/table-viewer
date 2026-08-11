@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { attach_viewer, profile_for, type ViewerController } from './viewer-controller';
+import { create_resource_identity } from './resource-identity';
 import type { AuthorityFileStateStore } from './state';
 import { build_vscode_webview_html, vscode_viewer_host } from './vscode-host-ports';
 import { generate_nonce } from './webview-html';
@@ -18,11 +19,7 @@ export class TableViewerEditorProvider
     readonly #controllers = new Set<ViewerController>();
     readonly #panels = new Map<ViewerController, vscode.WebviewPanel>();
     readonly #resources = new Map<ViewerController, string>();
-    readonly #pending_sheet_opens = new Map<string, Set<{
-        readonly sheetName: string;
-        readonly resolve: (found: boolean) => void;
-        readonly reject: (error: Error) => void;
-    }>>();
+    readonly #workbook_opens = new Map<string, Promise<void>>();
     readonly #drains = new Set<Promise<void>>();
     #close_barrier: Promise<void> | undefined;
     #close_barrier_settled = false;
@@ -48,14 +45,6 @@ export class TableViewerEditorProvider
 
     dispose_viewers(): void {
         this.stop_edit_admission();
-        for (const pending of this.#pending_sheet_opens.values()) {
-            for (const request of pending) {
-                request.reject(new Error(
-                    'Table Viewer was disposed before the workbook could be opened.',
-                ));
-            }
-        }
-        this.#pending_sheet_opens.clear();
         if (this.#close_barrier && !this.#close_barrier_settled) return;
         this.#close_barrier_settled = false;
         const attempt = (async () => {
@@ -94,43 +83,37 @@ export class TableViewerEditorProvider
         return new TableViewerDocument(uri);
     }
 
-    async openWorkbookAtSheet(uri: vscode.Uri, sheet_name: string): Promise<boolean> {
-        const resource = uri.toString();
+    #controller_for(resource: string): ViewerController | undefined {
         const matches = [...this.#controllers].filter(
             (controller) => this.#resources.get(controller) === resource,
         );
-        const existing = matches.find((controller) => this.#panels.get(controller)?.active)
-            ?? matches[0];
-        if (existing) {
-            this.#panels.get(existing)?.reveal();
-            return existing.select_sheet(sheet_name);
-        }
+        return matches.find((controller) => this.#panels.get(controller)?.active) ?? matches[0];
+    }
 
-        let resolve_selection!: (found: boolean) => void;
-        let reject_selection!: (error: Error) => void;
-        const promise = new Promise<boolean>((resolve, reject) => {
-            resolve_selection = resolve;
-            reject_selection = reject;
-        });
-        const request = {
-            sheetName: sheet_name,
-            resolve: resolve_selection,
-            reject: reject_selection,
-        };
-        let pending = this.#pending_sheet_opens.get(resource);
-        if (!pending) {
-            pending = new Set();
-            this.#pending_sheet_opens.set(resource, pending);
+    async openWorkbookAtSheet(uri: vscode.Uri, sheet_name: string): Promise<boolean> {
+        const resource = create_resource_identity(uri).key;
+        let controller = this.#controller_for(resource);
+        if (!controller) {
+            let opening = this.#workbook_opens.get(resource);
+            if (!opening) {
+                opening = Promise.resolve(
+                    vscode.commands.executeCommand('vscode.openWith', uri, EXCEL_VIEW_TYPE),
+                ).then(() => {});
+                this.#workbook_opens.set(resource, opening);
+                void opening.finally(() => {
+                    if (this.#workbook_opens.get(resource) === opening) {
+                        this.#workbook_opens.delete(resource);
+                    }
+                }).catch(() => {});
+            }
+            await opening;
+            controller = this.#controller_for(resource);
+            if (!controller) {
+                throw new Error('Table Viewer did not open the requested workbook.');
+            }
         }
-        pending.add(request);
-        try {
-            await vscode.commands.executeCommand('vscode.openWith', uri, EXCEL_VIEW_TYPE);
-        } catch (error) {
-            pending.delete(request);
-            if (pending.size === 0) this.#pending_sheet_opens.delete(resource);
-            request.reject(error instanceof Error ? error : new Error(String(error)));
-        }
-        return promise;
+        this.#panels.get(controller)?.reveal();
+        return controller.select_sheet(sheet_name);
     }
 
     async resolveCustomEditor(
@@ -155,18 +138,7 @@ export class TableViewerEditorProvider
         );
         this.#controllers.add(controller);
         this.#panels.set(controller, webview_panel);
-        const resource = document.uri.toString();
-        this.#resources.set(controller, resource);
-        const pending = this.#pending_sheet_opens.get(resource);
-        if (pending) {
-            this.#pending_sheet_opens.delete(resource);
-            for (const request of pending) {
-                void controller.select_sheet(request.sheetName).then(
-                    request.resolve,
-                    request.reject,
-                );
-            }
-        }
+        this.#resources.set(controller, create_resource_identity(document.uri).key);
         webview_panel.onDidDispose(() => this.#dispose_controller(controller));
     }
 }

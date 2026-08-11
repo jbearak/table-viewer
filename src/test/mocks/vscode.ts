@@ -155,6 +155,7 @@ type ConfigurationChangeHandler = (
 
 interface MockWebviewPanel {
     title: string;
+    active: boolean;
     webview: {
         html: string;
         asWebviewUri(uri: UriLike): UriLike;
@@ -215,6 +216,7 @@ function make_panel(title: string): MockWebviewPanel {
     const pending_edit_sequences = new Map<string, number>();
     const panel: MockWebviewPanel = {
         title,
+        active: false,
         webview: {
             html: '',
             asWebviewUri(uri: UriLike): UriLike {
