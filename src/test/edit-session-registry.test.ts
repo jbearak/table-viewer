@@ -66,14 +66,14 @@ describe('edit session registry', () => {
         expect(registry.for_sheet(1).identity()).toEqual({ session_id: 'new' });
     });
 
-    it('retain_only drops every other store and keeps the named one intact', () => {
+    it('retarget in place drops every other store and keeps the pointer store', () => {
         const { registry } = make_session_ref('s');
         const kept = registry.for_sheet(1);
         kept.commit('s', '0:0', { value: 'kept', base: 'a' });
         registry.for_sheet(0).commit('s', '0:0', { value: 'stale', base: 'b' });
         registry.for_sheet(2).commit('s', '0:0', { value: 'stale', base: 'c' });
 
-        registry.retain_only(1);
+        registry.retarget(1, 1);
 
         // The kept store keeps its identity — install notifies through it.
         expect(registry.for_sheet(1)).toBe(kept);
@@ -83,11 +83,29 @@ describe('edit session registry', () => {
         expect(registry.for_sheet(2).size()).toBe(0);
     });
 
-    it('retain_only of a sheet with no store empties the registry', () => {
+    it('retarget carries the pointer store to its new index', () => {
+        const { registry } = make_session_ref('s');
+        const session_store = registry.for_sheet(1);
+        session_store.commit('s', '0:0', { value: 'moving', base: 'a' });
+
+        // The session's sheet was reordered from index 1 to index 0.
+        registry.retarget(1, 0);
+
+        // Same store object at the new index, edits intact — a reorder with no
+        // install behind it (a refresh that advances the session id skips the
+        // install) must not lose the user's unsaved edits.
+        expect(registry.for_sheet(0)).toBe(session_store);
+        expect(registry.for_sheet(0).get('0:0'))
+            .toEqual({ value: 'moving', base: 'a' });
+        // And nothing stale remains at the old index.
+        expect(registry.for_sheet(1).size()).toBe(0);
+    });
+
+    it('retarget from a sheet with no store empties the registry', () => {
         const { registry } = make_session_ref('s');
         registry.for_sheet(0).commit('s', '0:0', { value: 'stale', base: 'a' });
 
-        registry.retain_only(3);
+        registry.retarget(3, 3);
 
         expect(registry.for_sheet(0).size()).toBe(0);
     });

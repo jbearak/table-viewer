@@ -869,18 +869,6 @@ export function App(): React.JSX.Element {
     ) => {
         latest_live_edits_ref.current = edits;
         set_initial_edits(edits ? { ...edits } : undefined);
-        // What arrives here is the *complete* pending-edit projection, so any
-        // other sheet's store is stale by definition. The single store enforced
-        // that by being replaced wholesale at every crossing; the registry has
-        // to say it explicitly, or a store from before the crossing survives it
-        // — another document's edits after an initial snapshot replaces the
-        // file, or a reordered sheet's edits still sitting at its old index —
-        // and paints that sheet's dirty cells on whatever sheet now holds the
-        // index. Before the store read, so a session sheet that moved drops its
-        // old index's store rather than keeping both.
-        edit_session_registry_ref.current!.retain_only(
-            edit_session_sheet_index_ref.current,
-        );
         // Read the outgoing stamp before install overwrites it.
         const store = edit_session_store();
         const previous_identity = store.identity();
@@ -1322,6 +1310,20 @@ export function App(): React.JSX.Element {
                                 : initial_normalized_state?.pendingEdits,
                         )
                         ?? edit_session_sheet_index_ref.current;
+                    // Reconcile the registry at the pointer move itself, not in
+                    // install_edit_session: a refresh that advances the session
+                    // id makes `refresh_editing_current_session` false and skips
+                    // the install entirely, and that is exactly a path where the
+                    // sheet may have moved. The session sheet's store follows
+                    // its sheet to the new index; every other store is stale by
+                    // definition once this snapshot's complete pending-edit
+                    // projection applies — the initial branch installs over the
+                    // carried store below, so a replaced document cannot leak
+                    // the old file's edits through it.
+                    edit_session_registry_ref.current!.retarget(
+                        edit_session_sheet_index_ref.current,
+                        snapshot_edit_sheet_index,
+                    );
                     edit_session_sheet_index_ref.current = snapshot_edit_sheet_index;
                     set_edit_session_sheet_index(snapshot_edit_sheet_index);
                     const refresh_editing_current_session =
@@ -2910,6 +2912,16 @@ export function App(): React.JSX.Element {
                     // granted.
                     // A grant that names no sheet is a single-sheet source's, whose
                     // only sheet is 0.
+                    //
+                    // The pointer move reconciles the registry, as the snapshot
+                    // path's move does: the grant owns the complete pending-edit
+                    // projection, so a store any other sheet still holds is
+                    // stale by definition, and the install below only replaces
+                    // the granted sheet's.
+                    edit_session_registry_ref.current!.retarget(
+                        edit_session_sheet_index_ref.current,
+                        msg.sheetIndex ?? 0,
+                    );
                     edit_session_sheet_index_ref.current = msg.sheetIndex ?? 0;
                     set_edit_session_sheet_index(msg.sheetIndex ?? 0);
                     // The grant owns the complete pending-edit projection, including

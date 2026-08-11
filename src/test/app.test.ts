@@ -3858,6 +3858,70 @@ describe('edit mode save exit', () => {
         expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!)).toEqual({});
     });
 
+    it('carries the session store through a refresh that moves the sheet and the id', async () => {
+        // A refresh can advance the session id and move the session's sheet in
+        // the same delivery. The id change makes refresh_editing_current_session
+        // false, so no install runs — the registry reconciliation has to happen
+        // at the pointer move itself, or the edits are stranded at the old
+        // index: the moved sheet comes up empty and the sheet now at the old
+        // index paints them as its own.
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['People', 'Inventory'], false),
+            {
+                state: {
+                    columnWidths: [], scrollPosition: [],
+                    activeSheetIndex: 1, tabOrientation: null,
+                    pendingEdits: sheet_edits(
+                        { '0:0': { value: 'Gadget', base: 'Widget' } },
+                        1,
+                    ),
+                    transforms: [], columnVisibility: [],
+                },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'session-before',
+                    csvEditSheetIndex: 1,
+                },
+            },
+        ));
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!))
+            .toEqual({ '0:0': { value: 'Gadget', base: 'Widget' } });
+
+        // Inventory reordered to index 0; the host re-keys the session too.
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Inventory', 'People'], false),
+            {
+                state: {
+                    columnWidths: [], scrollPosition: [],
+                    activeSheetIndex: 0, tabOrientation: null,
+                    pendingEdits: sheet_edits(
+                        { '0:0': { value: 'Gadget', base: 'Widget' } },
+                        0,
+                    ),
+                    transforms: [], columnVisibility: [],
+                },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'session-after',
+                    csvEditSheetIndex: 0,
+                },
+            },
+        ));
+
+        // A refresh keeps the webview's own active tab — index 1, which the
+        // reorder makes People. The edits must not have stayed behind here...
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!)).toEqual({});
+        // ...they followed Inventory to its new index.
+        await click_sheet_tab('Inventory');
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!))
+            .toEqual({ '0:0': { value: 'Gadget', base: 'Widget' } });
+    });
+
     it('withholds an in-flight save from a grid mounted on another worksheet', async () => {
         // The session and its initial edits are already withheld from a sheet that
         // does not own them, but the save projection was not — and a grid with no

@@ -55,22 +55,29 @@ export interface EditSessionRegistry {
     /** Re-stamp every existing store onto the current session. */
     adopt_session(): void;
     /**
-     * Drop every store except one sheet's.
+     * The session sheet pointer moved: carry its store to the new index and
+     * drop every other store.
      *
-     * Today at most one sheet holds edits, and this is where that invariant is
-     * enforced: the single store used to be *replaced* wholesale at every
-     * hydration boundary, so nothing stale could outlive one. A registry keeps
-     * stores instead, which without this let two kinds of stale content
-     * survive an install — another document's edits after an initial snapshot
-     * replaced the file, and a reordered sheet's edits still sitting at its
-     * old index after the session's sheet moved. Both painted one sheet's
-     * dirty cells on another.
+     * This is the registry reproducing the single store it replaced. That
+     * store was handed to whichever sheet the session pointer named, so when
+     * a workbook edit outside this viewer reordered sheets, the edits
+     * followed the pointer to the sheet's new index — and because it was
+     * *replaced* wholesale at every hydration boundary, nothing stale could
+     * outlive one. A registry that merely keeps stores by index broke both
+     * halves: a reordered sheet's edits stayed at its old index (painting
+     * them on whatever sheet now sits there), and another document's stores
+     * survived an initial snapshot that replaced the file. Moving the
+     * pointer's store and dropping the rest restores both, including on the
+     * paths where no install follows — a refresh can advance the session id,
+     * which makes the install conditional on it skip.
      *
-     * The kept store is deliberately not touched, not even re-created: its
-     * object identity is what `install` notifies through and what the
-     * hydration boundary reads its outgoing stamp from.
+     * The carried store is deliberately not re-created: its object identity
+     * is what `install` notifies through and what the hydration boundary
+     * reads its outgoing stamp from. When the pointer did not move this is
+     * just the drop of every other store, which the file-replacement case
+     * needs even at an unchanged index.
      */
-    retain_only(sheet_index: number): void;
+    retarget(previous_sheet_index: number, next_sheet_index: number): void;
 }
 
 export function create_edit_session_registry(
@@ -88,10 +95,10 @@ export function create_edit_session_registry(
             stores.set(sheet_index, created);
             return created;
         },
-        retain_only: (sheet_index) => {
-            for (const key of [...stores.keys()]) {
-                if (key !== sheet_index) stores.delete(key);
-            }
+        retarget: (previous_sheet_index, next_sheet_index) => {
+            const session_store = stores.get(previous_sheet_index);
+            stores.clear();
+            if (session_store) stores.set(next_sheet_index, session_store);
         },
         adopt_session: () => {
             // Unconditional: the store's adopt_session is a bare stamp
