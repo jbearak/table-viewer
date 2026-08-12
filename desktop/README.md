@@ -88,6 +88,16 @@ The app honors `TABLE_VIEWER_USER_DATA_DIR` to relocate `userData` (settings, st
   or synchronized between the two.
 - Preferences: `userData/settings.json`, edited via the Preferences window (**Cmd+,**).
 
+**Stored File State…** (the app menu on macOS, **File** elsewhere) opens a
+window listing what that database holds — one row per remembered file, with its
+size, when it was last used, and whether it has unsaved edits or is open right
+now — and lets the user delete entries individually or in bulk, reclaiming the
+disk space with a `VACUUM`. It is a sandboxed renderer like Preferences and
+About, but the page itself is the shared `src/state-inspector/ui.ts`, which the
+VS Code command renders too; only the transport differs. The rules that decide
+what may be deleted live in `src/sqlite-file-state-maintenance.ts`, deliberately
+not in the renderer — see [docs/development.md](../docs/development.md#inspecting-and-trimming-stored-state).
+
 The app declines a *location* whose reachable directory handle rejects fsync,
 and says so before creating anything. It no longer declines a whole platform: on
 Windows the default Node primitive is attempted, so future runtime support is

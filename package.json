@@ -69,6 +69,10 @@
       {
         "command": "tableViewer.openWorkbookAtSheet",
         "title": "Table Viewer: Open Workbook at Worksheet"
+      },
+      {
+        "command": "tableViewer.manageStoredFileState",
+        "title": "Table Viewer: Manage Stored File State"
       }
     ],
     "menus": {
@@ -194,7 +198,7 @@
     "typecheck": "tsc -p . --noEmit",
     "typecheck:integration": "tsc -p tsconfig.integration.json --noEmit",
     "typecheck:all": "npm run typecheck && npm run typecheck:desktop && npm run typecheck:integration",
-    "pretest:integration": "npm run bundle && npm run bundle:webview && npm run compile:integration",
+    "pretest:integration": "npm run bundle && npm run bundle:webview && npm run bundle:state-inspector && npm run compile:integration",
     "test:integration": "vscode-test",
     "test:integration:minimum": "npm run pretest:integration && vscode-test --label minimum",
     "test:integration:current": "npm run pretest:integration && vscode-test --label current",
@@ -204,9 +208,10 @@
     "probe:sqlite:runtimes": "npm run probe:sqlite:host && npm run probe:sqlite:electron && npm run test:integration",
     "probe:windows:durability": "npm run desktop:ensure-electron && npm run bundle:desktop && electron dist/runtime-probes/windows-durability-probe.js",
     "gate:sqlite:recovery": "npm run desktop:ensure-electron && npm run bundle:desktop && electron dist/runtime-probes/packaged-recovery-gate.js",
-    "vscode:prepublish": "npm run bundle && npm run bundle:webview",
+    "vscode:prepublish": "npm run bundle && npm run bundle:webview && npm run bundle:state-inspector",
     "bundle": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --external:node:sqlite --platform=node --format=cjs --target=es2022 --minify",
     "bundle:webview": "esbuild src/webview/index.tsx --bundle --outdir=dist/webview --platform=browser --format=iife --target=es2022 --loader:.css=css --minify",
+    "bundle:state-inspector": "esbuild src/state-inspector/vscode-entry.ts --bundle --outfile=dist/webview/state-inspector.js --platform=browser --format=iife --target=es2022 --minify",
     "bundle:desktop": "node desktop/build.mjs",
     "typecheck:desktop": "tsc -p desktop",
     "desktop:dev": "npm run desktop:prepackage && electron dist/desktop/main.js",

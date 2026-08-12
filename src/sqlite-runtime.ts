@@ -99,6 +99,9 @@ export interface SqliteWriteTransactionContext extends SqliteReadTransactionCont
     mark_changed(): void;
 }
 
+/** Whether a vacuum rewrote the file, or was left for a later attempt. */
+export type SqliteVacuumOutcome = 'vacuumed' | 'deferred';
+
 export interface SqliteRuntimeHandle {
     readonly runtime_key: object;
     readonly canonical_path: string;
@@ -111,6 +114,8 @@ export interface SqliteRuntimeHandle {
         kind: string,
         body: (tx: SqliteWriteTransactionContext) => Promise<T>,
     ): Promise<T>;
+    /** Rewrite the file to reclaim space freed by deletes. Never runs in a transaction. */
+    vacuum(): Promise<SqliteVacuumOutcome>;
     close(): Promise<void>;
 }
 
@@ -912,6 +917,52 @@ function async_write_transaction<T>(
     });
 }
 
+/**
+ * Compact the database file, reclaiming pages that deleted rows left behind.
+ *
+ * Deleting rows only marks their pages free inside the file; the file itself
+ * never shrinks until it is rewritten. VACUUM is that rewrite, so a trim that
+ * is meant to give disk space back has to end here.
+ *
+ * Three properties make this safe to sit beside the transaction primitives:
+ * it goes through the same `enqueue` chain, so it can never overlap a
+ * transaction on this connection; it issues no BEGIN, because SQLite refuses
+ * to vacuum inside one; and it leaves the writer-session marker alone, because
+ * rewriting the file is not a semantic mutation of `entries` and must not be
+ * mistaken for one by the ambiguous-commit reconciler.
+ *
+ * Another OS process holding the file is an ordinary outcome, not a failure:
+ * the pages stay free and are reclaimed by whichever vacuum next gets the
+ * lock, so contention reports 'deferred' rather than throwing.
+ */
+function vacuum(runtime: RuntimeState): Promise<SqliteVacuumOutcome> {
+    return enqueue(runtime, async () => {
+        const database = runtime.opened?.database;
+        if (!database) throw runtime.fault ?? new Error('SQLite runtime connection is unavailable.');
+        try {
+            database.exec('VACUUM');
+        } catch (error) {
+            const categorized = safe_error(error, 'vacuum');
+            if (categorized.category === 'contention') return 'deferred';
+            throw categorized;
+        }
+        // VACUUM preserves application_id, user_version, and the delete journal
+        // mode, so the fences a reopen would check must still hold. Proving that
+        // here means a rewrite that somehow lost them surfaces now, against the
+        // connection that did it, rather than as an unopenable database later.
+        try {
+            assert_database_fences(runtime, database);
+            assert_connection_policy(database, 0);
+        } catch (error) {
+            const fault = safe_error(error, 'vacuum-fences');
+            runtime.fault = fault;
+            runtime.admitting = false;
+            throw fault;
+        }
+        return 'vacuumed';
+    });
+}
+
 async function cleanup_final_reference(runtime: RuntimeState): Promise<void> {
     const database = runtime.opened?.database;
     if (!database || runtime.fault) return;
@@ -1025,6 +1076,14 @@ export async function open_sqlite_runtime(
             try {
                 assertHandleOpen();
                 return async_write_transaction(runtime, kind, body);
+            } catch (error) {
+                return Promise.reject(error);
+            }
+        },
+        vacuum() {
+            try {
+                assertHandleOpen();
+                return vacuum(runtime);
             } catch (error) {
                 return Promise.reject(error);
             }

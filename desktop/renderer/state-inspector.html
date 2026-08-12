@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<!-- Inline styles are allowed because the shared UI module installs its own
+     stylesheet at mount, which is what keeps this window and the VS Code panel
+     looking identical. Scripts stay restricted to this bundle. -->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self';">
+<title>Stored File State</title>
+</head>
+<body>
+<div id="root"></div>
+<script src="state-inspector.js"></script>
+</body>
+</html>

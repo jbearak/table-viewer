@@ -141,6 +141,7 @@ describe('VS Code activation', () => {
             'tableViewer.openCsvTable',
             'tableViewer.openAsText',
             'tableViewer.openWorkbookAtSheet',
+            'tableViewer.manageStoredFileState',
         ]);
     });
 

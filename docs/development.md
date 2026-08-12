@@ -58,6 +58,44 @@ the database path and the underlying cause, and suggesting the two things that
 help: close other windows using it, or move the file aside to start fresh.
 Nothing in that directory is modified, deleted, or set aside automatically.
 
+## Inspecting and trimming stored state
+
+Both products expose the contents of that database to the user: the desktop app
+under **Stored File State…** (in the app menu on macOS, the File menu elsewhere),
+and the extension as the **Table Viewer: Manage Stored File State** command. Both
+open the same interface — one entry per remembered file, with its size, when it
+was last used, and whether it has unsaved edits or is open right now — and both
+run the same code, `src/state-inspector/ui.ts`, bundled once per host.
+
+Entries can be deleted individually or in bulk: not opened in N days, file no
+longer on disk, or everything. Three rules apply to every route, and all of them
+live in `src/sqlite-file-state-maintenance.ts` rather than in the UI:
+
+- Leased and staged entries are never deleted. A lease means a window holds the
+  entry; a stage means a commit is in flight. No confirmation overrides this,
+  matching what automatic eviction has always done.
+- An entry with unsaved edits is deletable only when the caller names that exact
+  path as confirmed, which is what the second confirmation dialog collects. Since
+  the gate is decided by the resolved target set rather than by which button was
+  pressed, a bulk action cannot skip a warning a hand-picked one would show.
+- Lease, stage, and unsaved-edit status is re-read inside the deleting
+  transaction. A preview is a snapshot, and an entry that became busy in the
+  meantime is skipped and reported rather than destroyed.
+
+Deleting rows does not shrink the file: SQLite marks the freed pages reusable and
+keeps them. A trim that removed anything therefore ends with a `VACUUM`, which
+rewrites the file compactly. That needs an exclusive lock, so another process
+holding the database makes it report `deferred` — the rows are still gone, and
+the space returns with the next vacuum that gets the lock. `VACUUM` preserves
+`application_id`, `user_version`, and the delete journal mode, so the fences
+every open validates survive it; `src/test/sqlite-runtime.test.ts` covers that
+directly, because getting it wrong would cost far more than the reclaimed space.
+
+The "file no longer on disk" rule skips provider-backed keys. Not every entry is
+keyed by a filesystem path — virtual providers and untitled buffers use synthetic
+`tableViewer.resource.v1:` keys (`src/resource-identity.ts`), which no `stat`
+could ever find, so testing them would nominate every one of them for deletion.
+
 ## `scripts/setup.sh`
 
 A maintainer convenience script: it does a full local install of both front ends from a working tree, so you can use your own build the way an end user would. It is not part of CI or the release pipeline — releases go through the GitHub Actions workflows in `.github/workflows/`, kicked off by [`scripts/bump-version.sh`](#scriptsbump-versionsh).

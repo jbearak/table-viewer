@@ -14,6 +14,10 @@ import {
     type OpenedVscodeStateDatabase,
 } from './vscode-state-database';
 import { DEFAULT_MAX_STORED_FILES } from './state';
+import {
+    dispose_state_inspector_panel,
+    show_state_inspector_panel,
+} from './state-inspector/vscode-panel';
 
 interface ActiveExtensionRuntime {
     readonly viewers: TableViewerRegistration;
@@ -108,6 +112,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     try {
         viewers = register_table_viewer(context, database.store);
         disposables.push({ dispose: dispose_csv_preview });
+        disposables.push({ dispose: dispose_state_inspector_panel });
         // Each registration is pushed as soon as it exists. A single
         // push(a, b, c) evaluates every argument before the array is touched, so
         // a failure registering the second command would leak the first past the
@@ -150,6 +155,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 void vscode.window.showErrorMessage(message);
                 throw error;
             }
+        });
+        register('tableViewer.manageStoredFileState', () => {
+            show_state_inspector_panel({
+                extensionUri: context.extensionUri,
+                maintenance: database.maintenance,
+                databasePath: database.databasePath,
+            });
         });
         context.subscriptions.push(...disposables);
         active_runtime = { viewers, disposables, database };

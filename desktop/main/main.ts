@@ -40,12 +40,15 @@ import {
     type DesktopWindowRequest,
 } from './desktop-lifecycle';
 import {
+    desktop_state_database_path,
     desktop_state_diagnostics_directory,
     desktop_state_error_log_line,
     desktop_state_failure_log_line,
     open_desktop_state_database,
     preserve_desktop_state_database,
 } from './desktop-state-database';
+import { create_state_inspector_handler } from '../../src/state-inspector/host-handler';
+import type { StateInspectorRequest } from '../../src/state-inspector/protocol';
 import {
     create_state_recovery_flow,
     state_recovery_button_layout,
@@ -85,6 +88,7 @@ import {
     CHANNEL_PREFS_SET,
     CHANNEL_PREFS_SET_SYNC,
     CHANNEL_SETTINGS_CHANGED,
+    CHANNEL_STATE_INSPECTOR_REQUEST,
     CHANNEL_THEME_CHANGED,
     CHANNEL_WELCOME_OPEN_FILES,
     CHANNEL_WELCOME_OPEN_PREFERENCES,
@@ -132,11 +136,13 @@ const VIEWER_PRELOAD = path.join(DESKTOP_DIST_DIR, 'viewer-preload.js');
 const WELCOME_PRELOAD = path.join(DESKTOP_DIST_DIR, 'welcome-preload.js');
 const PREFS_PRELOAD = path.join(DESKTOP_DIST_DIR, 'prefs-preload.js');
 const ABOUT_PRELOAD = path.join(DESKTOP_DIST_DIR, 'about-preload.js');
+const STATE_INSPECTOR_PRELOAD = path.join(DESKTOP_DIST_DIR, 'state-inspector-preload.js');
 
 let config_store: DesktopConfigStore;
 let viewer_windows: ViewerWindowManager | undefined;
 let prefs_window: BrowserWindow | undefined;
 let about_window: BrowserWindow | undefined;
+let state_inspector_window: BrowserWindow | undefined;
 /** Open launcher windows; tracked so opening a file can replace the one it was
  *  launched from (a viewer window that opens a file keeps its own file). */
 const welcome_windows = new Set<BrowserWindow>();
@@ -443,6 +449,36 @@ function show_about_window(): void {
     void about_window.loadFile(path.join(DESKTOP_DIST_DIR, 'about.html'));
 }
 
+/** Browse and trim what Table Viewer has remembered about opened files.
+ *  Singleton, like Preferences, and resizable because it lists file paths. */
+function show_state_inspector_window(): void {
+    if (state_inspector_window && !state_inspector_window.isDestroyed()) {
+        state_inspector_window.focus();
+        return;
+    }
+    // Nothing to inspect until the store is open, and the menu item is enabled
+    // before then; opening an inspector over no database would show an error
+    // where the honest answer is "not yet".
+    if (!state_backend.published) return;
+    state_inspector_window = new BrowserWindow({
+        width: 820,
+        height: 560,
+        minWidth: 520,
+        minHeight: 320,
+        title: 'Stored File State',
+        backgroundColor: window_background_color(current_theme_id()),
+        webPreferences: {
+            preload: STATE_INSPECTOR_PRELOAD,
+            contextIsolation: true,
+            nodeIntegration: false,
+        },
+    });
+    state_inspector_window.once('closed', () => {
+        state_inspector_window = undefined;
+    });
+    void state_inspector_window.loadFile(path.join(DESKTOP_DIST_DIR, 'state-inspector.html'));
+}
+
 /**
  * Copy / Select All. In a viewer window the file's own view decides what they
  * mean (its focused text field, else the grid). In any other window — the
@@ -496,6 +532,10 @@ function build_menu(): void {
                         accelerator: 'CmdOrCtrl+,',
                         click: () => show_preferences_window(),
                     },
+                    {
+                        label: 'Stored File State…',
+                        click: () => show_state_inspector_window(),
+                    },
                     { type: 'separator' as const },
                     { role: 'services' as const },
                     { type: 'separator' as const },
@@ -542,6 +582,10 @@ function build_menu(): void {
                             label: 'Preferences…',
                             accelerator: 'CmdOrCtrl+,',
                             click: () => show_preferences_window(),
+                        },
+                        {
+                            label: 'Stored File State…',
+                            click: () => show_state_inspector_window(),
                         },
                         { type: 'separator' as const },
                         { role: 'quit' as const },
@@ -680,6 +724,20 @@ function register_ipc(): void {
     // `app.name` is the package name (`table-viewer`) outside a packaged build,
     // and the version is the build-time constant rather than `app.getVersion()`
     // for the reason documented on __APP_VERSION__.
+    // Built per request rather than once at startup: the store is not open when
+    // the IPC handlers are registered, and rebuilding costs nothing next to the
+    // database work each request does anyway.
+    ipcMain.handle(CHANNEL_STATE_INSPECTOR_REQUEST, async (_event, request: unknown) => {
+        const opened = state_backend.published;
+        if (!opened) {
+            return { kind: 'error', message: 'The state database is not open.' };
+        }
+        const handler = create_state_inspector_handler({
+            maintenance: opened.maintenance,
+            databasePath: desktop_state_database_path(app.getPath('userData')),
+        });
+        return handler(request as StateInspectorRequest);
+    });
     ipcMain.on(CHANNEL_ABOUT_GET_INFO, (event) => {
         event.returnValue = { version: __APP_VERSION__ };
     });
@@ -716,7 +774,12 @@ function broadcast_theme(): void {
     const payload = theme_payload(current_theme_id());
     const background = window_background_color(payload.themeId);
     viewer_windows?.apply_theme(payload);
-    for (const window of [...welcome_windows, prefs_window, about_window]) {
+    for (const window of [
+        ...welcome_windows,
+        prefs_window,
+        about_window,
+        state_inspector_window,
+    ]) {
         if (window && !window.isDestroyed()) window.setBackgroundColor(background);
     }
     for (const window of BrowserWindow.getAllWindows()) {
@@ -731,7 +794,7 @@ function apply_theme_source(theme: ThemeSetting): void {
     nativeTheme.themeSource = theme;
 }
 
-/** Keep the app chrome (welcome, Preferences, and About windows) on the
+/** Keep the app chrome (welcome, Preferences, About, and Stored File State windows) on the
  *  configured font, matching how the extension's font settings style its entire
  *  UI, and keep every window's palette in step with the appearance preference
  *  and the two per-mode theme slots.

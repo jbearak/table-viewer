@@ -697,3 +697,54 @@ export function create_sqlite_file_state_write_repository(
         delete_lease: (leaseId) => repository.delete_lease(leaseId),
     };
 }
+
+/** One `entries` row as the maintenance inspector sees it. */
+export interface SqliteFileStateInspectionRow {
+    readonly path: string;
+    /** Bytes of stored state, as SQLite measures the payload itself. */
+    readonly sizeBytes: number;
+    readonly hasPendingEdits: boolean;
+    readonly isLeased: boolean;
+    readonly hasAuthorityStages: boolean;
+    readonly updatedAtMs?: number;
+    readonly touchedAtMs?: number;
+}
+
+/**
+ * Scan every entry for the maintenance inspector.
+ *
+ * This deliberately does not go through `scan_entry_metadata`, and deliberately
+ * does not decode `state_json`. The repository's usual discipline is to parse
+ * and re-validate every row it hands out, because those rows flow back into the
+ * write path where a malformed payload would corrupt real state. Nothing here
+ * does: the caller receives a size SQLite computed and a handful of flags, and
+ * a row it cannot decode is exactly a row worth showing the user so they can
+ * delete it. Parsing here would turn "you have one unreadable entry" into "your
+ * whole inspector throws", which is the opposite of what this feature is for.
+ *
+ * Size is `length(CAST(... AS BLOB))` rather than `length(...)`: on a TEXT
+ * column the latter counts characters, so any non-ASCII payload would be
+ * reported smaller than the bytes it actually occupies.
+ */
+export function scan_sqlite_file_state_inspection(
+    tx: SqliteReadTransactionContext,
+): readonly SqliteFileStateInspectionRow[] {
+    return tx.prepare(`SELECT e.path, e.has_pending_edits, e.updated_at_ms, e.touched_at_ms,
+        length(CAST(e.state_json AS BLOB)) AS size_bytes,
+        EXISTS(SELECT 1 FROM entry_leases l WHERE l.current_entry_path = e.path) AS is_leased,
+        EXISTS(SELECT 1 FROM authority_stages s WHERE s.entry_path = e.path) AS has_stages
+        FROM entries e ORDER BY e.path`).all()
+        .map((row) => {
+            const updatedAtMs = optional_integer(tx, row.updated_at_ms, 'updated at');
+            const touchedAtMs = optional_integer(tx, row.touched_at_ms, 'touched at');
+            return {
+                path: text(row.path),
+                sizeBytes: integer(tx, row.size_bytes, 'entry size', 0, Number.MAX_SAFE_INTEGER),
+                hasPendingEdits: integer(tx, row.has_pending_edits, 'pending flag', 0, 1) === 1,
+                isLeased: integer(tx, row.is_leased, 'lease flag', 0, 1) === 1,
+                hasAuthorityStages: integer(tx, row.has_stages, 'stage flag', 0, 1) === 1,
+                ...(updatedAtMs === undefined ? {} : { updatedAtMs }),
+                ...(touchedAtMs === undefined ? {} : { touchedAtMs }),
+            };
+        });
+}
