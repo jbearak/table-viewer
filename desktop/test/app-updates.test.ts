@@ -116,6 +116,20 @@ describe('desktop app updates', () => {
         });
     });
 
+    it('ignores a stale download answer after a newer manual check starts', async () => {
+        const value = fixture();
+        const old_offer = deferred<boolean>();
+        vi.mocked(value.dialogs.offer_download).mockReturnValueOnce(old_offer.promise);
+        value.updates.check_automatically();
+        value.listeners.available({ version: '2.0.0' });
+        value.listeners.error();
+        value.updates.check_manually();
+        old_offer.resolve(false);
+        await vi.waitFor(() => expect(value.engine.check_for_updates).toHaveBeenCalledTimes(2));
+        value.listeners.unavailable();
+        expect(value.dialogs.show_up_to_date).toHaveBeenCalledOnce();
+    });
+
     it('downloads only after consent and requests a normal quit after restart consent', async () => {
         const value = fixture();
         vi.mocked(value.dialogs.offer_download).mockResolvedValue(true);
@@ -128,6 +142,23 @@ describe('desktop app updates', () => {
         expect(value.engine.quit_and_install).not.toHaveBeenCalled();
         expect(value.updates.install_if_requested()).toBe(true);
         expect(value.engine.quit_and_install).toHaveBeenCalledOnce();
+        expect(value.updates.install_if_requested()).toBe(false);
+    });
+
+    it('keeps a failed installation request available for retry', async () => {
+        const value = fixture();
+        vi.mocked(value.dialogs.offer_download).mockResolvedValue(true);
+        vi.mocked(value.dialogs.offer_restart).mockResolvedValue(true);
+        vi.mocked(value.engine.quit_and_install)
+            .mockImplementationOnce(() => { throw new Error('installer unavailable'); });
+        value.updates.check_manually();
+        value.listeners.available({ version: '2.0.0' });
+        await vi.waitFor(() => expect(value.engine.download_update).toHaveBeenCalledOnce());
+        value.listeners.downloaded({ version: '2.0.0' });
+        await vi.waitFor(() => expect(value.request_quit).toHaveBeenCalledOnce());
+        expect(value.updates.install_if_requested()).toBe(false);
+        expect(value.updates.install_if_requested()).toBe(true);
+        expect(value.engine.quit_and_install).toHaveBeenCalledTimes(2);
         expect(value.updates.install_if_requested()).toBe(false);
     });
 

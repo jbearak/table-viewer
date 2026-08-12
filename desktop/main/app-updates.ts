@@ -99,16 +99,17 @@ export function create_app_update_coordinator(
         offering_download = true;
         const generation = ++prompt_generation;
         void dialogs.offer_download(info.version).then((accepted) => {
+            if (generation !== prompt_generation) return;
             offering_download = false;
-            if (!accepted || generation !== prompt_generation || downloading) {
+            if (!accepted || downloading) {
                 check_source = undefined;
                 return;
             }
             downloading = true;
             void engine.download_update().catch(() => finish_error());
         }).catch(() => {
-            offering_download = false;
             if (generation !== prompt_generation) return;
+            offering_download = false;
             check_source = undefined;
         });
     });
@@ -137,8 +138,12 @@ export function create_app_update_coordinator(
         check_manually: () => run_check('manual'),
         install_if_requested: () => {
             if (!install_requested) return false;
+            try {
+                engine.quit_and_install();
+            } catch {
+                return false;
+            }
             install_requested = false;
-            engine.quit_and_install();
             return true;
         },
     };
