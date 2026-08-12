@@ -66,48 +66,146 @@ describe('edit session registry', () => {
         expect(registry.for_sheet(1).identity()).toEqual({ session_id: 'new' });
     });
 
-    it('retarget in place drops every other store and keeps the pointer store', () => {
+    it('reconcile_sheets carries every store to where its sheet went, dropping unretained deletions', () => {
         const { registry } = make_session_ref('s');
-        const kept = registry.for_sheet(1);
-        kept.commit('s', '0:0', { value: 'kept', base: 'a' });
-        registry.for_sheet(0).commit('s', '0:0', { value: 'stale', base: 'b' });
-        registry.for_sheet(2).commit('s', '0:0', { value: 'stale', base: 'c' });
+        const people = registry.for_sheet(0);
+        people.commit('s', '0:0', { value: 'people', base: 'a' });
+        const stock = registry.for_sheet(1);
+        stock.commit('s', '0:0', { value: 'stock', base: 'b' });
+        registry.for_sheet(2).commit('s', '0:0', { value: 'gone', base: 'c' });
 
-        registry.retarget(1, 1);
+        // A reorder swapped sheets 0 and 1 and deleted sheet 2.
+        registry.reconcile_sheets(
+            [
+                { name: 'People', worksheetId: '1' },
+                { name: 'Stock', worksheetId: '2' },
+                { name: 'Gone', worksheetId: '3' },
+            ],
+            [
+                { name: 'Stock', worksheetId: '2' },
+                { name: 'People', worksheetId: '1' },
+            ],
+            () => false,
+        );
 
-        // The kept store keeps its identity — install notifies through it.
-        expect(registry.for_sheet(1)).toBe(kept);
-        expect(kept.get('0:0')).toEqual({ value: 'kept', base: 'a' });
-        // The dropped sheets get fresh, empty stores on next use.
-        expect(registry.for_sheet(0).size()).toBe(0);
+        // Same store objects at their new indices, edits intact — the session is
+        // workbook-scoped, so *every* sheet's edits must follow their sheet, not
+        // just the pointer sheet's. Object identity survives the move: install
+        // notifies through it.
+        expect(registry.for_sheet(1)).toBe(people);
+        expect(registry.for_sheet(1).get('0:0'))
+            .toEqual({ value: 'people', base: 'a' });
+        expect(registry.for_sheet(0)).toBe(stock);
+        expect(registry.for_sheet(0).get('0:0'))
+            .toEqual({ value: 'stock', base: 'b' });
+        // The deleted sheet's store went with it.
         expect(registry.for_sheet(2).size()).toBe(0);
     });
 
-    it('retarget carries the pointer store to its new index', () => {
+    it('retains and republishes live stores that follow a worksheet reorder', () => {
         const { registry } = make_session_ref('s');
-        const session_store = registry.for_sheet(1);
-        session_store.commit('s', '0:0', { value: 'moving', base: 'a' });
+        const people = registry.for_sheet(0);
+        people.commit('s', '0:0', { value: 'draft', base: 'a' });
 
-        // The session's sheet was reordered from index 1 to index 0.
-        registry.retarget(1, 0);
+        const result = registry.reconcile_sheets(
+            [
+                { name: 'People', worksheetId: '1' },
+                { name: 'Stock', worksheetId: '2' },
+            ],
+            [
+                { name: 'Stock', worksheetId: '2' },
+                { name: 'People', worksheetId: '1' },
+            ],
+            (_target, store) => store.size() > 0,
+        );
 
-        // Same store object at the new index, edits intact — a reorder with no
-        // install behind it (a refresh that advances the session id skips the
-        // install) must not lose the user's unsaved edits.
-        expect(registry.for_sheet(0)).toBe(session_store);
-        expect(registry.for_sheet(0).get('0:0'))
-            .toEqual({ value: 'moving', base: 'a' });
-        // And nothing stale remains at the old index.
+        expect(registry.for_sheet(1)).toBe(people);
+        expect(result.locallyRetainedIndices).toEqual(new Set([1]));
+        expect(result.retryPublications).toEqual([{
+            target: { sheetIndex: 1, sheetName: 'People', worksheetId: '1' },
+            store: people,
+        }]);
+    });
+
+    it('uses the shared first-match policy when worksheet IDs collide', () => {
+        const { registry } = make_session_ref('s');
+        const store = registry.for_sheet(0);
+        store.commit('s', '0:0', { value: 'draft', base: 'a' });
+
+        registry.reconcile_sheets(
+            [{ name: 'Original', worksheetId: 'duplicate' }],
+            [
+                { name: 'First', worksheetId: 'duplicate' },
+                { name: 'Second', worksheetId: 'duplicate' },
+            ],
+            () => true,
+        );
+
+        expect(registry.for_sheet(0)).toBe(store);
+        expect(registry.for_sheet(1)).not.toBe(store);
+    });
+
+    it('parks rather than drops a store that collides with a reattached store', () => {
+        const { registry } = make_session_ref('s');
+        const parked = registry.for_sheet(0);
+        parked.commit('s', '0:0', { value: 'old', base: 'a' });
+        registry.reconcile_sheets([{ name: 'Data' }], [], () => true);
+
+        const live = registry.for_sheet(0);
+        live.commit('s', '0:0', { value: 'new', base: 'a' });
+        registry.reconcile_sheets(
+            [{ name: 'Data' }],
+            [{ name: 'Data' }],
+            () => true,
+        );
+
+        const publications = [...registry.publication_entries([{ name: 'Data' }])];
+        expect(publications).toHaveLength(2);
+        expect(publications.map(({ store }) => store)).toContain(parked);
+        expect(publications.map(({ store }) => store)).toContain(live);
+        expect(publications.filter(({ parked }) => parked)).toHaveLength(1);
+    });
+
+    it('replace_document drops every store', () => {
+        const { registry } = make_session_ref('s');
+        registry.for_sheet(0).commit('s', '0:0', { value: 'old file', base: 'a' });
+        registry.for_sheet(1).commit('s', '0:0', { value: 'old file', base: 'b' });
+
+        registry.replace_document();
+
+        // A different document replaced this one; a surviving store would be
+        // another file's edits waiting to leak through an index collision.
+        expect(registry.for_sheet(0).size()).toBe(0);
         expect(registry.for_sheet(1).size()).toBe(0);
     });
 
-    it('retarget from a sheet with no store empties the registry', () => {
+    it('clear_all empties every store but keeps their identities', () => {
         const { registry } = make_session_ref('s');
-        registry.for_sheet(0).commit('s', '0:0', { value: 'stale', base: 'a' });
+        const first = registry.for_sheet(0);
+        first.commit('s', '0:0', { value: 'x', base: 'a' });
+        const second = registry.for_sheet(1);
+        second.commit('s', '0:0', { value: 'y', base: 'b' });
 
-        registry.retarget(3, 3);
+        registry.clear_all('s');
 
-        expect(registry.for_sheet(0).size()).toBe(0);
+        // A discard ends the workbook-scoped session: every sheet's local edits
+        // go at once, but the store objects survive — mounted grids subscribe
+        // through them.
+        expect(registry.for_sheet(0)).toBe(first);
+        expect(registry.for_sheet(1)).toBe(second);
+        expect(first.size()).toBe(0);
+        expect(second.size()).toBe(0);
+    });
+
+    it('clear_all respects the session fence', () => {
+        const { registry } = make_session_ref('s');
+        const store = registry.for_sheet(0);
+        store.commit('s', '0:0', { value: 'x', base: 'a' });
+
+        registry.clear_all('someone-else');
+
+        // A clear from a stale writer is dropped by each store's own fence.
+        expect(store.size()).toBe(1);
     });
 
     it('adopt_session re-stamps every existing store, including clean ones', () => {

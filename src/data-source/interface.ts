@@ -46,6 +46,8 @@ export interface ExcelFirstRowHeaderMeta {
 
 export interface SheetMeta {
     name: string;
+    /** Stable format-neutral worksheet identity when the source exposes one. */
+    worksheetId?: string;
     /** Rows exposed by this DataSource after logical projections such as headers. */
     rowCount: number;
     /** Size of the stable canonical row space in the underlying physical source. */

@@ -252,6 +252,11 @@ describe('paginated protocol message shapes', () => {
             editSessionId: 'edit:1',
             sequence: 7,
             edits: { '0:0': { value: 'next', base: 'old' } },
+            // The worksheet the map belongs to; optional so a webview from
+            // before worksheet editing still type-checks (its posts mean
+            // sheet 0, the only sheet a single-sheet source has).
+            sheetIndex: 1,
+            sheetName: 'People',
         };
         const acknowledged: HostMessage = {
             type: 'pendingEditsAcknowledged',

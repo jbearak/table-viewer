@@ -15,6 +15,7 @@ import type { MergeRange } from '../types';
 
 interface SheetEntry {
     name: string;
+    worksheetId?: string;
     rowCount: number;
     columnCount: number;
     merges: MergeRange[];
@@ -35,6 +36,7 @@ export class XlsxDataSource implements DataSource {
             hasFormatting,
             sheets: sheets.map((s) => ({
                 name: s.name,
+                worksheetId: s.worksheetId,
                 rowCount: s.rowCount,
                 sourceRowCount: s.rowCount,
                 columnCount: s.columnCount,
@@ -56,6 +58,7 @@ export class XlsxDataSource implements DataSource {
             s.fill(b);
             return {
                 name: s.name,
+                worksheetId: s.worksheetId,
                 rowCount: s.rowCount,
                 columnCount: s.columnCount,
                 merges: s.merges,

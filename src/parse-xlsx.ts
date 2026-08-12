@@ -312,17 +312,50 @@ export function parse_styles(xml: string): { fonts: FontEntry[]; xfs: XfEntry[];
  * writer on the 1900 epoch while the reader used 1904 — and the two are 1462 days
  * apart, so a saved `2024-01-15` read back as `2028-01-16`.
  */
-export function parse_workbook_xml(xml: string): { sheets: Array<{ name: string; rId: string }>; datemode: DateMode } {
-    const sheets: Array<{ name: string; rId: string }> = [];
+interface WorkbookSheetEntry {
+    name: string;
+    rId: string;
+    worksheetId?: string;
+}
+
+export function parse_workbook_xml(xml: string): {
+    sheets: WorkbookSheetEntry[];
+    datemode: DateMode;
+} {
+    const sheets: WorkbookSheetEntry[] = [];
 
     iter_elements(xml, 'sheet', (open_tag) => {
         const name = get_attr(open_tag, 'name');
+        // OOXML sheetId is stable for a worksheet within this workbook, including
+        // rename and reorder, but is workbook-local. The edit session therefore
+        // assumes continuity of the file at this path; a wholesale replacement by
+        // an unrelated workbook that reuses the same sheetId has no persistent OOXML
+        // workbook namespace available to distinguish it safely.
+        const worksheetId = get_attr(open_tag, 'sheetId') ?? undefined;
         // The relationship ID can be r:id or r:Id — try both
         const rId = get_attr(open_tag, 'r:id') ?? get_attr(open_tag, 'r:Id') ?? '';
         if (name) {
-            sheets.push({ name, rId });
+            sheets.push({ name, rId, worksheetId });
         }
     });
+
+    // A malformed workbook can reuse sheetId. Such an ID cannot identify either
+    // worksheet, so remove it from every colliding entry and let the established
+    // name fallback keep their edit stores and durable slots distinct.
+    const worksheet_id_counts = new Map<string, number>();
+    for (const { worksheetId } of sheets) {
+        if (worksheetId === undefined) continue;
+        worksheet_id_counts.set(
+            worksheetId,
+            (worksheet_id_counts.get(worksheetId) ?? 0) + 1,
+        );
+    }
+    for (const sheet of sheets) {
+        if (
+            sheet.worksheetId !== undefined
+            && (worksheet_id_counts.get(sheet.worksheetId) ?? 0) > 1
+        ) delete sheet.worksheetId;
+    }
 
     // Detect 1904 date system
     let datemode: DateMode = 0;
@@ -580,7 +613,7 @@ function col_letter_to_index(letters: string): number {
  */
 interface OpenedXlsxWorkbook {
     cfb_file: ReturnType<typeof CFB.read>;
-    sheet_entries: Array<{ name: string; rId: string }>;
+    sheet_entries: WorkbookSheetEntry[];
     rels: Map<string, string>;
     sst: string[];
     fonts: FontEntry[];
@@ -637,7 +670,14 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookDa
         const ws_xml = get_entry_text(cfb_file, `/${sheet_path}`);
         if (!ws_xml) {
             // Empty or missing sheet
-            sheets.push({ name: entry.name, rows: [], merges: [], columnCount: 0, rowCount: 0 });
+            sheets.push({
+                name: entry.name,
+                worksheetId: entry.worksheetId,
+                rows: [],
+                merges: [],
+                columnCount: 0,
+                rowCount: 0,
+            });
             continue;
         }
 
@@ -648,6 +688,7 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookDa
 
         sheets.push({
             name: entry.name,
+            worksheetId: entry.worksheetId,
             rows: densify(working),
             merges: working.merges,
             columnCount: working.col_count,
@@ -678,13 +719,20 @@ export async function parse_xlsx_streaming(buffer: Uint8Array): Promise<Streamin
 
         const ws_xml = get_entry_text(cfb_file, `/${sheet_path}`);
         if (!ws_xml) {
-            sheets.push({ name: entry.name, rowCount: 0, columnCount: 0, merges: [], fill: () => {} });
+            sheets.push({
+                name: entry.name,
+                worksheetId: entry.worksheetId,
+                rowCount: 0,
+                columnCount: 0,
+                merges: [],
+                fill: () => {},
+            });
             continue;
         }
 
         const working = parse_worksheet_core(ws_xml, sst, xfs, fonts, format_map, datemode, budget);
         workings.push(working);
-        sheets.push(make_streaming_sheet(entry.name, working, working.merges));
+        sheets.push(make_streaming_sheet(entry.name, working, working.merges, entry.worksheetId));
     }
 
     return { sheets, hasFormatting: working_has_formatting(workings), warnings: [] };

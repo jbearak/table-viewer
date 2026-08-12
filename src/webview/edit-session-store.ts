@@ -72,13 +72,10 @@ export interface EditSessionIdentity {
      *  `restored_edits !== undefined` with no session), compared with ===,
      *  never treated as a wildcard.
      *
-     *  Sheet index is deliberately *not* part of the identity: `csv_editable` is
-     *  CSV-only and CSV is single-sheet, which is also why `initial_edits` is a
-     *  flat map (see the comment at app.tsx's `initial_edits` declaration).
-     *  `active_sheet_index` is part of GridShell's key, so a sheet switch
-     *  remounts and, before this store existed, re-seeded the map from the prop;
-     *  with the store the map survives that switch instead — unreachable for
-     *  CSV, and the alternative (dropping edits on a switch) would be worse. */
+     *  Sheet index is deliberately *not* part of the identity: the sheet split
+     *  lives outside the store, in the registry's `Map<sheet_index, store>`,
+     *  so a store never spans more than one worksheet and its keys stay in one
+     *  sheet's `row:col` space. */
     readonly session_id: string | undefined;
 }
 
@@ -105,6 +102,9 @@ export interface EditSessionStore {
      * (see {@link create_edit_session_store}).
      */
     install(identity: EditSessionIdentity, edits?: Record<string, string | DirtyEntry>): void;
+    /** Reconcile an authoritative same-session refresh without notifying when its
+     * map is already equal to the store's current contents. */
+    reconcile(identity: EditSessionIdentity, edits?: Record<string, string | DirtyEntry>): void;
     /**
      * Re-stamp the session without touching contents, the pending-base flag, or
      * any listener. The stamp guards against a *stale writer* — a hook mounted
@@ -112,8 +112,8 @@ export interface EditSessionStore {
      * against a lagging stamp. The host advances `csvEditSessionId` on every
      * applied snapshot while an install happens only for the current session, so
      * the id can legitimately move with no install behind it; attributing the
-     * retained map to the newly adopted session is exactly what the unchanged
-     * `initial_edits` prop used to do by re-seeding across that transition.
+     * retained map to the newly adopted session is what preserves dirty state
+     * across that transition without re-installing the store.
      */
     adopt_session(session_id: string | undefined): void;
 
@@ -332,6 +332,11 @@ export function create_edit_session_store(
             // the kind of boundary where a silent install would be a very quiet
             // bug. The guard exists for the hot paths; this isn't one.
             set_entries(next.entries, next.pending_base, true);
+        },
+        reconcile: (next_identity, next_edits) => {
+            stamp = next_identity;
+            const next = normalize(next_edits);
+            set_entries(next.entries, next.pending_base);
         },
         adopt_session: (session_id) => {
             stamp = { session_id };

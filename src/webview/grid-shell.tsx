@@ -98,6 +98,7 @@ import {
 import {
     csv_save_operations_equal,
     resolve_csv_save_hydration,
+    save_operation_targets_sheet,
 } from './csv-save-lifecycle';
 import {
     canvas_font,
@@ -201,6 +202,8 @@ export interface EditingHandle {
     stop_edit_admission(): void;
     /** Snapshot the current Glide overlay into the source-keyed dirty map. */
     commit_live_edit(): void;
+    /** Commit the overlay and synchronously publish this worksheet's complete map. */
+    flush_live_edit(): void;
     /** True when there are committed edits or an open editor with changes. */
     has_uncommitted_changes(): boolean;
 }
@@ -592,6 +595,9 @@ export function GridShell({
             resolve_csv_save_hydration(
                 { authoritative: save_lifecycle, operation: save_operation },
                 edit_session_id,
+                sheet_index,
+                sheet_meta.name,
+                sheet_meta.worksheetId,
                 initial_edits,
             ),
         );
@@ -706,15 +712,20 @@ export function GridShell({
         applied_save_lifecycle_revision_ref.current = lifecycle.revision;
         if (lifecycle.state === 'active') {
             const operation = lifecycle.operation;
-            if (operation.editSessionId !== edit_session_id) return;
+            if (
+                operation.editSessionId !== edit_session_id
+                || !save_operation_targets_sheet(
+                    operation,
+                    sheet_index,
+                    sheet_meta.name,
+                    sheet_meta.worksheetId,
+                )
+            ) return;
             const locked = save_operation_ref.current;
             if (locked && !csv_save_operations_equal(locked, operation)) return;
             save_operation_ref.current = operation;
             saved_edits_ref.current = { ...operation.edits };
-            const exact: CsvDirtyMap = Object.fromEntries(
-                Object.entries(operation.dirtyEdits),
-            );
-            replace_dirty(exact);
+            replace_dirty(operation.dirtyEdits);
             save_in_flight_ref.current = true;
             set_save_in_flight(true);
             return;
@@ -735,6 +746,9 @@ export function GridShell({
         const restore = (resolve_csv_save_hydration(
             { authoritative: lifecycle },
             edit_session_id,
+            sheet_index,
+            sheet_meta.name,
+            sheet_meta.worksheetId,
             Object.fromEntries(store.snapshot()),
         ) ?? {}) as CsvDirtyMap;
         replace_dirty(restore);
@@ -742,7 +756,14 @@ export function GridShell({
         saved_edits_ref.current = {};
         save_in_flight_ref.current = false;
         set_save_in_flight(false);
-    }, [edit_session_id, replace_dirty, store]);
+    }, [
+        edit_session_id,
+        replace_dirty,
+        sheet_index,
+        sheet_meta.name,
+        sheet_meta.worksheetId,
+        store,
+    ]);
 
     useEffect(() => {
         apply_save_lifecycle(save_lifecycle);
@@ -799,8 +820,19 @@ export function GridShell({
             return pending_edit_durability.snapshot(edit_session_id)
                 .highestProducedSequence;
         }
-        return pending_edit_durability.publish(edit_session_id, edits, force);
-    }, [edit_session_id]);
+        // This shell's own sheet, index and name both: the session is
+        // workbook-scoped, so the post names the slot it is a complete map of,
+        // and the name lets the host follow the sheet through a reorder that
+        // lands while the write is queued.
+        return pending_edit_durability.publish(
+            edit_session_id,
+            edits,
+            sheet_index,
+            sheet_meta.name,
+            force,
+            sheet_meta.worksheetId,
+        );
+    }, [edit_session_id, sheet_index, sheet_meta.name, sheet_meta.worksheetId]);
 
     // Persist a complete dirty map under a renderer-monotonic sequence. The host
     // acknowledges only after the corresponding state-store write resolves.
@@ -1360,6 +1392,14 @@ export function GridShell({
         save_in_flight_ref,
     ]);
 
+    const flush_live_edit = useCallback((): void => {
+        commit_live_edit();
+        const snapshot = store.snapshot();
+        post_pending_edits(
+            snapshot.size > 0 ? Object.fromEntries(snapshot) : null,
+        );
+    }, [commit_live_edit, post_pending_edits, store]);
+
     const has_uncommitted_changes = useCallback((): boolean => {
         if (store.size() > 0) return true;
         const live = read_live_edit();
@@ -1410,6 +1450,7 @@ export function GridShell({
                 set_close_barrier_active(true);
             },
             commit_live_edit,
+            flush_live_edit,
             has_uncommitted_changes,
         };
         return () => {
@@ -1422,6 +1463,7 @@ export function GridShell({
         guarded_discard_conflicted,
         guarded_discard_keys,
         commit_live_edit,
+        flush_live_edit,
         has_uncommitted_changes,
     ]);
 
