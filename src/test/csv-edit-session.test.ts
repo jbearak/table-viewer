@@ -1936,32 +1936,47 @@ describe('CSV edit sessions', () => {
         await panel.__receive({ type: 'requestEditSession', requestId: 'edit' });
         const edit_session_id = latest_edit_session_message(panel)!.editSessionId!;
 
+        const legacy_operation = {
+            editSessionId: edit_session_id,
+            saveRequestId: 'legacy-save',
+            sheetIndex: 0,
+            sheetName: 'Sheet1',
+            edits: { '0:0': 'next' },
+            dirtyEdits: { '0:0': { value: 'next', base: 'a' } },
+        };
         await panel.__receive({
             type: 'saveCsv',
-            operation: {
-                editSessionId: edit_session_id,
-                saveRequestId: 'legacy-save',
-                edits: { '0:0': 'next' },
-                dirtyEdits: { '0:0': { value: 'next', base: 'a' } },
-            },
+            operation: legacy_operation,
         } as never);
 
         expect(written).toHaveLength(1);
         expect(new TextDecoder().decode(written[0])).toBe('h\nnext\n');
-        expect(panel.__messages).toContainEqual(expect.objectContaining({
-            type: 'saveResult',
-            success: true,
-            lifecycle: expect.objectContaining({
-                operation: expect.objectContaining({
-                    saveRequestId: 'legacy-save',
-                    worksheets: [expect.objectContaining({
-                        sheetIndex: 0,
-                        sheetName: 'Sheet1',
-                        edits: { '0:0': 'next' },
-                    })],
-                }),
-            }),
-        }));
+        const lifecycle_operations = panel.__messages
+            .filter((message: any) => (
+                message?.type === 'saveOperationStarted'
+                || message?.type === 'saveResult'
+            ))
+            .map((message: any) => message.lifecycle.operation);
+        expect(lifecycle_operations).toHaveLength(2);
+        for (const operation of lifecycle_operations) {
+            expect(operation).toMatchObject({
+                ...legacy_operation,
+                worksheets: [{
+                    sheetIndex: 0,
+                    sheetName: 'Sheet1',
+                    edits: legacy_operation.edits,
+                    dirtyEdits: legacy_operation.dirtyEdits,
+                }],
+            });
+            expect({
+                editSessionId: operation.editSessionId,
+                saveRequestId: operation.saveRequestId,
+                sheetIndex: operation.sheetIndex,
+                sheetName: operation.sheetName,
+                edits: operation.edits,
+                dirtyEdits: operation.dirtyEdits,
+            }).toEqual(legacy_operation);
+        }
     });
 
     it('refuses a save whose base never matched the file, before writing any bytes', async () => {

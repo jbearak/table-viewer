@@ -359,7 +359,7 @@ interface PanelLoadRequest {
 }
 
 interface CsvSaveHostOperation {
-    /** Exact renderer operation used for lifecycle correlation. */
+    /** Exact normalized operation used for host lifecycle ownership. */
     readonly identity: CsvSaveOperation;
     /** Host-resolved worksheet targets, in the operation's deterministic order. */
     readonly durableTargets: readonly WorksheetTarget[];
@@ -4387,10 +4387,30 @@ export function attach_viewer(
                 dirtyEdits: Object.freeze(dirty_edits),
             });
         });
-        return Object.freeze({
+        const workbook_operation = {
             editSessionId: input.editSessionId,
             saveRequestId: input.saveRequestId,
             worksheets: Object.freeze(worksheets),
+        };
+        if ('worksheets' in input && Array.isArray(input.worksheets)) {
+            return Object.freeze(workbook_operation);
+        }
+        // Old renderers compare the flat fields they proposed and ignore unknown
+        // fields; current renderers compare `worksheets` and ignore these aliases.
+        // One hybrid identity therefore settles both generations through every
+        // lifecycle channel, including snapshots, without weakening either reducer.
+        const worksheet = worksheets[0];
+        return Object.freeze({
+            ...workbook_operation,
+            sheetIndex: worksheet.sheetIndex,
+            ...(worksheet.sheetName !== undefined
+                ? { sheetName: worksheet.sheetName }
+                : {}),
+            ...(worksheet.worksheetId !== undefined
+                ? { worksheetId: worksheet.worksheetId }
+                : {}),
+            edits: worksheet.edits,
+            dirtyEdits: worksheet.dirtyEdits,
         });
     }
 

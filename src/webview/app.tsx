@@ -3161,15 +3161,19 @@ export function App(): React.JSX.Element {
                 // 'cancel' → stay in edit mode, keep edits.
             } else if (msg.type === 'saveResult') {
                 const operation = save_projection_ref.current.operation;
+                const transition = apply_save_lifecycle(msg.lifecycle);
+                // Lifecycle revision is the ordering authority for the whole result,
+                // not just its projection. A stale terminal must not clear or replace
+                // the verdict installed by a later accepted result.
+                if (!transition.changed) return;
                 const matching = !operation
                     || csv_save_operations_equal(operation, msg.lifecycle.operation);
-                // Every save result supersedes the previous one, including a success
-                // and including a rejection that named different keys. Clearing here,
-                // before the adoption block below re-records one, is what makes a
+                // Every accepted save result supersedes the previous one, including a
+                // success and including a rejection that named different keys. Clearing
+                // here, before the adoption block below re-records one, is what makes a
                 // *successful* save drop the banner: adoption only ever sets, so
                 // without this a rejection would survive until the session ended.
                 clear_save_verdict();
-                apply_save_lifecycle(msg.lifecycle);
                 if (matching) {
                     pending_exit_ref.current = false;
                 }

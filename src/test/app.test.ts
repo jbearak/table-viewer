@@ -6933,6 +6933,71 @@ describe('edit mode save exit', () => {
             .toEqual([]);
     });
 
+    it.each([
+        ['without a rejection', undefined],
+        ['with a different rejection', {
+            reason: 'baseMismatch' as const,
+            worksheetOperationIndex: 0,
+            keys: ['0:0'],
+        }],
+    ])('ignores a stale save result %s', async (_label, stale_rejection) => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 910,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-current',
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: { '4:1': 'edited' },
+                        dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                    }],
+                },
+            },
+            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['4:1'] },
+        });
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 909,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-stale',
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: { '0:0': 'other' },
+                        dirtyEdits: { '0:0': { value: 'other', base: 'base' } },
+                    }],
+                },
+            },
+            ...(stale_rejection ? { rejection: stale_rejection } : {}),
+        });
+
+        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
+            .toEqual(['4:1']);
+    });
+
     it('lets Keep All dismiss a host rejection', async () => {
         // Keep All was a no-op for a host rejection: `show_host_rejection`
         // short-circuited ahead of the dismissal check, so the button recorded a
