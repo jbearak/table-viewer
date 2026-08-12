@@ -774,6 +774,65 @@ describe('Toolbar scope menus', () => {
         ]);
     });
 
+    it('hides another button\'s tooltip when a menu opens', () => {
+        // The tooltip and the menu belong to different controls, so a per-button
+        // guard misses this: hovering Formatting then opening Header Row's menu left
+        // the Formatting tooltip sitting underneath it.
+        render_toolbar({
+            auto_fit_scope_menu: scope_menu(),
+            show_edit_button: true,
+        });
+
+        dispatch_mouse_event(get_button('Edit'), 'mouseover');
+        expect(get_tooltip()?.textContent).toBe('Enter edit mode to modify cell values.');
+
+        open_caret();
+        expect(get_tooltip()).toBeNull();
+    });
+
+    it('anchors the menu to the left edge of the control, not the chevron', () => {
+        const rect_spy = vi
+            .spyOn(HTMLElement.prototype, 'getBoundingClientRect')
+            .mockImplementation(function (this: HTMLElement) {
+                if (this.classList.contains('toolbar-split')) {
+                    return make_rect({ left: 100, top: 0, width: 140, height: 26 });
+                }
+                if (this.classList.contains('toolbar-split-caret')) {
+                    return make_rect({ left: 216, top: 0, width: 24, height: 26 });
+                }
+                return make_rect({});
+            });
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+        open_caret();
+
+        // The chevron is the narrow right-hand slice; anchoring there threw the menu
+        // out past the button that owns it.
+        const menu = document.querySelector<HTMLElement>('[role="menu"]');
+        expect(menu?.style.left).toBe('100px');
+        rect_spy.mockRestore();
+    });
+
+    it('opens only one menu at a time', () => {
+        render_toolbar({
+            auto_fit_scope_menu: scope_menu(),
+            formatting_scope_menu: {
+                aria_label: 'Formatting scope',
+                items: [{ label: 'Show raw values on all 3 sheets', on_click: vi.fn() }],
+            },
+        });
+
+        const carets = Array.from(
+            document.querySelectorAll<HTMLButtonElement>('.toolbar-split-caret'),
+        );
+        act(() => carets[0].click());
+        act(() => carets[1].click());
+        expect(document.querySelectorAll('[role="menu"]')).toHaveLength(1);
+        expect(menu_labels()).toEqual([
+            'Auto-fit columns on all 3 sheets',
+            'Restore original widths on all 3 sheets',
+        ]);
+    });
+
     it('does not stack the tooltip on top of the menu it opened', () => {
         render_toolbar({ auto_fit_scope_menu: scope_menu() });
 

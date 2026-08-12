@@ -3,6 +3,7 @@ import React, {
     useId,
     useImperativeHandle,
     useLayoutEffect,
+    useMemo,
     useRef,
     useState,
 } from 'react';
@@ -43,6 +44,21 @@ export interface ToolbarScopeMenu {
     aria_label: string;
 }
 
+/**
+ * Which scope menu is open, shared across the whole action row.
+ *
+ * Held here rather than per button for two reasons. A tooltip is suppressed while
+ * *any* menu is open, not merely its own button's — otherwise a tooltip left hovering
+ * over Formatting stays on screen underneath the menu Header Row just opened, and
+ * clicking a caret does not always take focus off the previous one, so the stale
+ * tooltip can outlive the hover that created it. And with one source of truth, two
+ * menus cannot be open at once.
+ */
+const ScopeMenuContext = React.createContext<{
+    open: { key: string; x: number; y: number } | null;
+    set_open: (next: { key: string; x: number; y: number } | null) => void;
+} | null>(null);
+
 export interface ToolbarProps {
     show_formatting: boolean;
     on_toggle_formatting: () => void;
@@ -79,6 +95,12 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
     const toolbar_ref = useRef<HTMLDivElement>(null);
     const columns_ref = useRef<ColumnVisibilityFocusHandle>(null);
     const actions_ref = useRef<HTMLDivElement>(null);
+    const [open_scope_menu, set_open_scope_menu] =
+        useState<{ key: string; x: number; y: number } | null>(null);
+    const scope_menu_context = useMemo(
+        () => ({ open: open_scope_menu, set_open: set_open_scope_menu }),
+        [open_scope_menu],
+    );
     useImperativeHandle(focus_ref, () => ({
         focus: () => {
             const toolbar = toolbar_ref.current;
@@ -115,6 +137,7 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                     ? 'Show raw cell values on this sheet.'
                     : 'Show formatted cell values on this sheet.'}
                 onClick={props.on_toggle_formatting}
+                menu_key="formatting"
                 scope_menu={props.formatting_scope_menu}
             />
         ),
@@ -146,6 +169,7 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                 onClick={props.on_toggle_excel_header}
                 disabled={props.excel_header_disabled}
                 focusable_when_disabled
+                menu_key="excel-header"
                 scope_menu={props.excel_header_scope_menu}
             />
         ),
@@ -165,6 +189,7 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                 : 'Auto-fit all columns to their content on this sheet.'}
             onClick={props.on_toggle_auto_fit}
             disabled={props.auto_fit_disabled}
+            menu_key="auto-fit"
             scope_menu={props.auto_fit_scope_menu}
         />,
     ].filter(Boolean);
@@ -204,6 +229,7 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
               * carries the right-alignment, so nesting either group in a wrapper
               * would break it.
               */}
+            <ScopeMenuContext.Provider value={scope_menu_context}>
             <div ref={actions_ref} className="toolbar-actions">
                 {workbook_actions}
                 {workbook_actions.length > 0 && (
@@ -215,6 +241,7 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                 )}
                 {worksheet_actions}
             </div>
+            </ScopeMenuContext.Provider>
         </div>
     );
 });
@@ -227,6 +254,7 @@ function ToolbarButton({
     extra_class,
     disabled = false,
     focusable_when_disabled = false,
+    menu_key,
     scope_menu,
 }: {
     label: string;
@@ -236,31 +264,46 @@ function ToolbarButton({
     extra_class?: string;
     disabled?: boolean;
     focusable_when_disabled?: boolean;
+    menu_key?: string;
     scope_menu?: ToolbarScopeMenu;
 }): React.JSX.Element {
     const [is_hovered, set_is_hovered] = useState(false);
     const [is_focused, set_is_focused] = useState(false);
     const [tooltip_style, set_tooltip_style] = useState<React.CSSProperties>();
-    const [menu_coords, set_menu_coords] = useState<{ x: number; y: number } | null>(null);
+    const scope_context = React.useContext(ScopeMenuContext);
     const tooltip_id = useId();
     const button_ref = useRef<HTMLButtonElement>(null);
     const caret_ref = useRef<HTMLButtonElement>(null);
+    const split_ref = useRef<HTMLSpanElement>(null);
     const tooltip_ref = useRef<HTMLDivElement>(null);
-    const menu_open = menu_coords !== null;
-    // The tooltip would otherwise sit on top of the menu it just opened.
-    const show_tooltip = (is_hovered || is_focused) && !menu_open;
+    const menu_open = scope_context?.open?.key === menu_key && menu_key !== undefined;
+    // Suppressed while *any* scope menu is open, not merely this button's: a tooltip
+    // left hovering over one control would otherwise sit under the menu another just
+    // opened, and clicking a caret does not reliably blur the previous one.
+    const show_tooltip = (is_hovered || is_focused) && !scope_context?.open;
     const native_disabled = disabled && !focusable_when_disabled;
 
-    const open_menu = (anchor: HTMLElement | null) => {
-        if (!scope_menu || !anchor) return;
+    /**
+     * Anchor the menu to the left edge of the whole control, not to the chevron.
+     *
+     * The chevron is the narrow right-hand slice, so anchoring there threw the menu
+     * out to the right of the button that owns it and left it looking attached to
+     * whatever sat next along the row. Right-click uses the same anchor rather than
+     * the pointer, so the menu appears in one predictable place either way.
+     */
+    const open_menu = () => {
+        if (!scope_menu || !menu_key) return;
+        const anchor = split_ref.current ?? button_ref.current;
+        if (!anchor) return;
         const rect = anchor.getBoundingClientRect();
-        set_menu_coords({ x: rect.left, y: rect.bottom + 4 });
+        scope_context?.set_open({ key: menu_key, x: rect.left, y: rect.bottom + 4 });
     };
+    const close_menu = () => scope_context?.set_open(null);
     const menu_items: MenuItem[] = (scope_menu?.items ?? []).map((item) => ({
         label: item.label,
         disabled: item.disabled,
         on_click: () => {
-            set_menu_coords(null);
+            close_menu();
             item.on_click();
         },
     }));
@@ -319,13 +362,15 @@ function ToolbarButton({
                 ? (event) => {
                     event.preventDefault();
                     event.stopPropagation();
-                    set_menu_coords({ x: event.clientX, y: event.clientY });
+                    open_menu();
                 }
                 : undefined}
         >
-            <span className={scope_menu
-                ? `toolbar-split ${active ? 'active' : ''}`.trim()
-                : undefined}
+            <span
+                ref={split_ref}
+                className={scope_menu
+                    ? `toolbar-split ${active ? 'active' : ''}`.trim()
+                    : undefined}
             >
                 <button
                     ref={button_ref}
@@ -358,8 +403,8 @@ function ToolbarButton({
                             aria-expanded={menu_open}
                             onClick={() => {
                                 set_is_hovered(false);
-                                if (menu_open) return set_menu_coords(null);
-                                open_menu(caret_ref.current);
+                                if (menu_open) return close_menu();
+                                open_menu();
                             }}
                         >
                             <svg
@@ -378,13 +423,13 @@ function ToolbarButton({
                     </>
                 )}
             </span>
-            {menu_coords && (
+            {menu_open && (
                 <ContextMenu
-                    x={menu_coords.x}
-                    y={menu_coords.y}
+                    x={scope_context!.open!.x}
+                    y={scope_context!.open!.y}
                     items={menu_items}
                     aria_label={scope_menu!.aria_label}
-                    on_dismiss={() => set_menu_coords(null)}
+                    on_dismiss={close_menu}
                     restore_focus={() => caret_ref.current?.focus()}
                 />
             )}
