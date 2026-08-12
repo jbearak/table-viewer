@@ -99,7 +99,6 @@ export interface EditSessionRegistry {
         target: WorksheetTarget;
         edits: Readonly<Record<string, string>>;
         dirtyEdits: CsvDirtyMap;
-        parked: boolean;
     }[];
     /**
      * A different document replaced this one: drop every store. An initial
@@ -268,8 +267,11 @@ export function create_edit_session_registry(
                 left.target.sheetIndex - right.target.sheetIndex
                 || Number(left.parked) - Number(right.parked)
                 || left.order - right.order);
-            return Object.freeze(collected.map(({ order: _order, ...entry }) =>
-                Object.freeze(entry)));
+            return Object.freeze(collected.map(({
+                order: _order,
+                parked: _parked,
+                ...entry
+            }) => Object.freeze(entry)));
         },
         replace_document: () => {
             stores.clear();

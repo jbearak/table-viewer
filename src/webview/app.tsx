@@ -17,6 +17,7 @@ import {
     transform_schema_for_sheet,
     with_pending_edits_for_sheet,
     worksheet_target_index,
+    worksheet_target_lookup,
     type CellHighlightColor,
     type CellHighlightMutation,
     type CellHighlightSelection,
@@ -953,12 +954,12 @@ export function App(): React.JSX.Element {
         }
 
         const current_session_id = csv_edit_session_id_ref.current;
-        const operation_sheet_indices = (operation: CsvSaveOperation) => operation.worksheets
-            .map((worksheet) => worksheet_target_index(
-                meta_ref.current?.sheets ?? [],
-                worksheet,
-            ))
-            .filter((index): index is number => index !== undefined);
+        const operation_sheet_indices = (operation: CsvSaveOperation) => {
+            const sheet_index_for = worksheet_target_lookup(meta_ref.current?.sheets ?? []);
+            return operation.worksheets
+                .map(sheet_index_for)
+                .filter((index): index is number => index !== undefined);
+        };
         const hydrate_and_install = (operation: CsvSaveOperation) => {
             for (const sheet_index of operation_sheet_indices(operation)) {
                 const entries = edit_session_registry_ref.current!

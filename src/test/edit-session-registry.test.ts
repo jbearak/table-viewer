@@ -191,19 +191,16 @@ describe('edit session registry', () => {
                 target: { sheetIndex: 0, sheetName: 'Live Zero', worksheetId: 'live-0' },
                 edits: { '1:1': 'live zero' },
                 dirtyEdits: { '1:1': { value: 'live zero', base: 'live old' } },
-                parked: false,
             },
             {
                 target: { sheetIndex: 0, sheetName: 'Zero' },
                 edits: { '0:0': 'parked zero' },
                 dirtyEdits: { '0:0': { value: 'parked zero', base: 'old zero' } },
-                parked: true,
             },
             {
                 target: { sheetIndex: 2, sheetName: 'Two' },
                 edits: { '2:0': 'parked two' },
                 dirtyEdits: { '2:0': { value: 'parked two', base: 'old two' } },
-                parked: true,
             },
         ]);
         expect(Object.isFrozen(collected)).toBe(true);
