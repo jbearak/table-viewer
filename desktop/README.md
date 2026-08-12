@@ -34,7 +34,7 @@ npm run desktop:package:dir   # unpacked .app only (faster, for local checks)
 
 Both pass `-c.mac.identity=null`, so they never need a certificate. Gatekeeper will warn on first launch of an unsigned app (right-click → Open, or `xattr -dr com.apple.quarantine "Table Viewer.app"`).
 
-`npm run desktop:package:release` is the same build *without* those overrides: it signs if a Developer ID certificate is available. CI uses it, and signs + notarizes once the Apple secrets are set — see [docs/homebrew-tap.md](../docs/homebrew-tap.md#signing).
+`npm run desktop:package:release` is the same build *without* those overrides. CI requires a Developer ID certificate for official releases and notarizes when all notarytool credentials are set — see [docs/homebrew-tap.md](../docs/homebrew-tap.md#signing).
 
 ## Packaging (Windows)
 

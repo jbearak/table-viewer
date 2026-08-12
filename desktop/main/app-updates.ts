@@ -42,12 +42,13 @@ export function create_app_update_coordinator(
     let offering_download = false;
     let downloading = false;
     let downloaded_version: string | undefined;
+    let offering_restart = false;
     let install_requested = false;
     let prompt_generation = 0;
 
     const run_check = (source: UpdateCheckSource): void => {
         if (downloaded_version) {
-            if (source === 'manual') void offer_restart(downloaded_version);
+            if (source === 'manual' && !offering_restart) void offer_restart(downloaded_version);
             return;
         }
         if (offering_download || downloading) {
@@ -66,9 +67,10 @@ export function create_app_update_coordinator(
     };
 
     const finish_error = (): void => {
-        if (!checking && !downloading) return;
+        if (!checking && !offering_download && !downloading) return;
         const show = check_source === 'manual';
         checking = false;
+        offering_download = false;
         downloading = false;
         check_source = undefined;
         prompt_generation += 1;
@@ -76,12 +78,15 @@ export function create_app_update_coordinator(
     };
 
     const offer_restart = async (version: string): Promise<void> => {
+        offering_restart = true;
         const generation = ++prompt_generation;
         let accepted = false;
         try {
             accepted = await dialogs.offer_restart(version);
         } catch {
             return;
+        } finally {
+            if (generation === prompt_generation) offering_restart = false;
         }
         if (!accepted || generation !== prompt_generation) return;
         install_requested = true;
@@ -102,8 +107,8 @@ export function create_app_update_coordinator(
             downloading = true;
             void engine.download_update().catch(() => finish_error());
         }).catch(() => {
-            if (generation !== prompt_generation) return;
             offering_download = false;
+            if (generation !== prompt_generation) return;
             check_source = undefined;
         });
     });
