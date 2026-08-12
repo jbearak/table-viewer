@@ -91,7 +91,7 @@ The app honors `TABLE_VIEWER_USER_DATA_DIR` to relocate `userData` (settings, st
 **Stored File State…** (the app menu on macOS, **File** elsewhere) opens a
 window listing what that database holds — one row per remembered file, with its
 size, when it was last used, and whether it has unsaved edits or is open right
-now — and lets the user delete entries individually or in bulk, reclaiming the
+now — and lets the user clear entries by selection or by rule, reclaiming the
 disk space with a `VACUUM`. It is a sandboxed renderer like Preferences and
 About, but the page itself is the shared `src/state-inspector/ui.ts`, which the
 VS Code command renders too; only the transport differs. The rules that decide

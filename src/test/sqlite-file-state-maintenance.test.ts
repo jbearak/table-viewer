@@ -51,6 +51,15 @@ async function write(
     expect(result.type).toBe('committed');
 }
 
+/** Preview over every stored path, as the listing's select-all checkbox does. */
+async function preview_all(store: OpenedSqliteFileStateStore) {
+    const inventory = await store.maintenance.inspect();
+    return store.maintenance.preview({
+        kind: 'paths',
+        paths: inventory.entries.map((entry) => entry.path),
+    });
+}
+
 async function seed(
     store: OpenedSqliteFileStateStore,
     filePath: string,
@@ -183,7 +192,7 @@ describe('stored file state trimming', () => {
         await seed(store, '/files/open.csv');
         await store.store.lease_entry!('/files/open.csv', (file_path) => file_path);
 
-        const preview = await store.maintenance.preview({ kind: 'all' });
+        const preview = await preview_all(store);
         expect(preview.targets).toEqual([]);
         expect(preview.protectedPaths).toEqual(['/files/open.csv']);
 
@@ -216,7 +225,7 @@ describe('unsaved edits', () => {
         await seed(store, '/files/plain.csv');
         await seedPendingEdit(store, '/files/unsaved.csv');
 
-        const preview = await store.maintenance.preview({ kind: 'all' });
+        const preview = await preview_all(store);
 
         expect(preview.pendingEditPaths).toEqual(['/files/unsaved.csv']);
         expect(preview.targets).toHaveLength(2);
@@ -255,7 +264,7 @@ describe('unsaved edits', () => {
         await seed(store, '/files/race.csv');
 
         // Preview sees a plain entry, so nothing needs confirming.
-        const preview = await store.maintenance.preview({ kind: 'all' });
+        const preview = await preview_all(store);
         expect(preview.pendingEditPaths).toEqual([]);
 
         // The user starts editing before they press delete.
@@ -314,6 +323,25 @@ describe('bulk selections', () => {
         expect(preview.targets).toEqual([]);
     });
 
+    it('reports on each entry whether its file is still there', async () => {
+        const present = path.join(tempDirectory, 'present.csv');
+        await fs.promises.writeFile(present, 'a,b\n');
+        const store = await openStore();
+        await seed(store, present);
+        await seed(store, path.join(tempDirectory, 'deleted.csv'));
+        await seed(store, 'tableViewer.resource.v1:untitled Untitled-1');
+
+        const inventory = await store.maintenance.inspect();
+        const missing = Object.fromEntries(
+            inventory.entries.map((entry) => [entry.path, entry.isMissing]),
+        );
+
+        expect(missing[present]).toBe(false);
+        expect(missing[path.join(tempDirectory, 'deleted.csv')]).toBe(true);
+        // A provider key names no file, so it can never be missing.
+        expect(missing['tableViewer.resource.v1:untitled Untitled-1']).toBe(false);
+    });
+
     it('selects entries whose files are gone from disk', async () => {
         const present = path.join(tempDirectory, 'present.csv');
         await fs.promises.writeFile(present, 'a,b\n');
@@ -346,7 +374,7 @@ describe('bulk selections', () => {
         await seed(store, '/files/a.csv');
         await seed(store, '/files/b.csv');
 
-        const preview = await store.maintenance.preview({ kind: 'all' });
+        const preview = await preview_all(store);
         const result = await store.maintenance.trim({
             paths: preview.targets.map((entry) => entry.path),
             confirmedPendingEditPaths: preview.pendingEditPaths,

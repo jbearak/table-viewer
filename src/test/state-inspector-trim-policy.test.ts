@@ -13,7 +13,7 @@ import type {
 
 function preview(overrides: Partial<StateInspectorPreview> = {}): StateInspectorPreview {
     return {
-        selection: { kind: 'all' },
+        selection: { kind: 'paths', paths: ['/files/a.csv'] },
         targetPaths: ['/files/a.csv'],
         totalSizeBytes: 2048,
         pendingEditPaths: [],
@@ -40,9 +40,10 @@ describe('formatting sizes', () => {
 
 describe('describing a selection', () => {
     it('says what each bulk action covers', () => {
-        expect(describe_selection({ kind: 'all' })).toBe('every stored entry');
+        expect(describe_selection({ kind: 'paths', paths: [] }))
+            .toBe('the selected entries');
         expect(describe_selection({ kind: 'missingOnDisk' }))
-            .toBe('entries whose files are gone from disk');
+            .toBe('entries whose files are no longer on disk');
         expect(describe_selection({ kind: 'olderThanDays', days: 1 }))
             .toBe('entries not opened in 1 day');
         expect(describe_selection({ kind: 'olderThanDays', days: 30 }))
@@ -57,9 +58,9 @@ describe('the first confirmation', () => {
             totalSizeBytes: 4096,
         }))!;
 
-        expect(confirmation.title).toBe('Delete stored state for 2 files?');
+        expect(confirmation.title).toBe('Clear stored state for 2 files?');
         expect(confirmation.message).toContain('4.0 KB');
-        expect(confirmation.message).toContain('The files themselves are not touched');
+        expect(confirmation.message).toContain('not deleted, moved, or changed');
         expect(confirmation.destructive).toBe(false);
     });
 
@@ -97,7 +98,7 @@ describe('the unsaved-edits confirmation', () => {
         // hand-picked selection or from "clear everything".
         const pendingEditPaths = ['/unsaved.csv'];
         const bulk = pending_edit_confirmation(
-            preview({ selection: { kind: 'all' }, pendingEditPaths }),
+            preview({ selection: { kind: 'missingOnDisk' }, pendingEditPaths }),
         );
         const manual = pending_edit_confirmation(preview({
             selection: { kind: 'paths', paths: pendingEditPaths },
@@ -119,7 +120,7 @@ describe('reporting the outcome', () => {
 
     it('reports what was deleted and what came back', () => {
         expect(trim_outcome_message(base))
-            .toBe('Deleted stored state for 3 files. Reclaimed 4.0 KB of disk space.');
+            .toBe('Cleared stored state for 3 files. Reclaimed 4.0 KB of disk space.');
     });
 
     it('treats a busy vacuum as a delay rather than a failure', () => {
@@ -129,8 +130,8 @@ describe('reporting the outcome', () => {
 
     it('explains an empty result by what protected it', () => {
         expect(trim_outcome_message({ ...base, deletedCount: 0, skippedProtectedCount: 2 }))
-            .toBe('Nothing was deleted — every matching entry is currently open.');
-        expect(trim_outcome_message({ ...base, deletedCount: 0 })).toBe('Nothing was deleted.');
+            .toBe('Nothing was cleared — every matching entry is currently open.');
+        expect(trim_outcome_message({ ...base, deletedCount: 0 })).toBe('Nothing was cleared.');
     });
 
     it('accounts for entries it had to keep', () => {

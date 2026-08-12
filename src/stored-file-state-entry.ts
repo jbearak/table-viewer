@@ -18,6 +18,14 @@ export interface StoredFileStateEntry {
     readonly hasPendingEdits: boolean;
     /** Held by an open window, or by a session that has not released it. */
     readonly isLeased: boolean;
+    /**
+     * The file this entry remembers is gone from disk.
+     *
+     * Undefined when it was not checked — the listing pays for a stat per entry,
+     * so the selectors that do not need the answer do not ask. Always false for
+     * a provider-backed key, which names no file that could go missing.
+     */
+    readonly isMissing?: boolean;
     readonly updatedAtMs?: number;
     readonly touchedAtMs?: number;
 }

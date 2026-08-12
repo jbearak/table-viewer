@@ -31,6 +31,12 @@ header {
 }
 h1 { margin: 0 0 4px; font-size: 1.15em; font-weight: 600; }
 .summary { color: var(--vscode-descriptionForeground, #717171); }
+.explanation {
+  margin: 6px 0 8px;
+  max-width: 78ch;
+  line-height: 1.45;
+  color: var(--vscode-descriptionForeground, #717171);
+}
 .database-path {
   margin-top: 6px;
   font-family: var(--vscode-editor-font-family, monospace);
@@ -39,13 +45,18 @@ h1 { margin: 0 0 4px; font-size: 1.15em; font-weight: 600; }
   word-break: break-all;
 }
 
+.toolbars {
+  border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+}
 .toolbar {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: var(--inspector-gap);
   padding: 12px 20px;
-  border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+}
+.toolbar.view-controls {
+  padding-top: 0;
 }
 .toolbar .spacer { flex: 1 1 auto; }
 .filter-input { min-width: 180px; flex: 0 1 260px; }
@@ -123,6 +134,11 @@ tr.protected td.path { opacity: 0.75; }
 }
 .badge.unsaved { color: var(--vscode-editorWarning-foreground, #bf8803); }
 .badge.open { color: var(--vscode-descriptionForeground, #717171); }
+/* The informational hue, not the error one: a file the user moved or deleted
+   themselves is the ordinary reason to clear an entry, not a fault. Red would
+   also compete with the destructive buttons. This token is themed (it maps to
+   each palette's info role), which a literal colour would not be. */
+.badge.absent { color: var(--vscode-charts-blue, #3060c0); }
 
 .empty, .status {
   padding: 24px 20px;
@@ -139,6 +155,9 @@ tr.protected td.path { opacity: 0.75; }
 .scrim {
   position: fixed;
   inset: 0;
+  /* Above the sticky table header, which has a z-index of its own and would
+     otherwise paint over a confirmation asking about deleting unsaved work. */
+  z-index: 10;
   background: rgba(0, 0, 0, 0.45);
   display: flex;
   align-items: center;

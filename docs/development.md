@@ -67,9 +67,19 @@ open the same interface — one entry per remembered file, with its size, when i
 was last used, and whether it has unsaved edits or is open right now — and both
 run the same code, `src/state-inspector/ui.ts`, bundled once per host.
 
-Entries can be deleted individually or in bulk: not opened in N days, file no
-longer on disk, or everything. Three rules apply to every route, and all of them
-live in `src/sqlite-file-state-maintenance.ts` rather than in the UI:
+Entries are cleared by selection — the header checkbox selects everything the
+current filter shows — or by one of two rules: not opened in N days, or no longer
+on disk. There is deliberately no "clear everything" button: selecting all and
+clearing says the same thing while respecting the filter and showing the user
+every row they are about to act on.
+
+The word throughout the interface is *clear*, never *delete*, and a standing
+paragraph at the top of the window says that clearing never touches the file on
+disk. Both exist because "delete" next to a list of filenames reads as though it
+were the files that were going.
+
+Three rules apply to every route, and all of them live in
+`src/sqlite-file-state-maintenance.ts` rather than in the UI:
 
 - Leased and staged entries are never deleted. A lease means a window holds the
   entry; a stage means a commit is in flight. No confirmation overrides this,
@@ -91,10 +101,18 @@ the space returns with the next vacuum that gets the lock. `VACUUM` preserves
 every open validates survive it; `src/test/sqlite-runtime.test.ts` covers that
 directly, because getting it wrong would cost far more than the reclaimed space.
 
-The "file no longer on disk" rule skips provider-backed keys. Not every entry is
-keyed by a filesystem path — virtual providers and untitled buffers use synthetic
+The listing marks an entry whose file is gone with a "Not on disk" badge, so the
+bulk rule acts on something the user can already see rather than on an invisible
+criterion. That check skips provider-backed keys: not every entry is keyed by a
+filesystem path — virtual providers and untitled buffers use synthetic
 `tableViewer.resource.v1:` keys (`src/resource-identity.ts`), which no `stat`
-could ever find, so testing them would nominate every one of them for deletion.
+could ever find, so testing them would report every one of them as missing and
+nominate it for clearing.
+
+Colour is spent where it means something. No toolbar button is styled
+destructive, because none of them clear anything on click — every one opens a
+confirmation first. Red is reserved for the second confirmation, the unsaved-edits
+step, which is the only action that cannot be undone.
 
 ## `scripts/setup.sh`
 

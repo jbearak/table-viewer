@@ -46,11 +46,15 @@ export interface StoredFileStateInventory {
     readonly databaseSizeBytes: number;
 }
 
+/**
+ * No "everything" case: the listing's select-all checkbox plus a paths trim
+ * already expresses it, and it does so better — it respects the active filter,
+ * and the user can see every row they are about to clear.
+ */
 export type StoredFileStateTrimSelection =
     | { readonly kind: 'paths'; readonly paths: readonly string[] }
     | { readonly kind: 'olderThanDays'; readonly days: number }
-    | { readonly kind: 'missingOnDisk' }
-    | { readonly kind: 'all' };
+    | { readonly kind: 'missingOnDisk' };
 
 /** What a selection resolves to, before anything is deleted. */
 export interface StoredFileStateTrimPreview {
@@ -124,13 +128,22 @@ export function create_sqlite_file_state_maintenance(
             }
         });
 
-    async function read_entries(): Promise<readonly StoredFileStateEntry[]> {
+    /**
+     * Every entry, optionally annotated with whether its file still exists.
+     *
+     * The disk check costs one stat per entry, so it is asked for only where the
+     * answer is used: the listing, which shows it, and the missing-files
+     * selector, which acts on it. Clearing everything has no use for it.
+     */
+    async function read_entries(
+        checkDisk = false,
+    ): Promise<readonly StoredFileStateEntry[]> {
         const rows = await handle.read_transaction(scan_sqlite_file_state_inspection);
         // `hasAuthorityStages` is intentionally dropped here: an in-flight commit
         // is an internal detail with no meaning to someone reading a list of
         // their files. It still protects the row at deletion time, where it is
         // re-read from the database anyway.
-        return rows.map((row) => ({
+        const entries = rows.map((row) => ({
             path: row.path,
             sizeBytes: row.sizeBytes,
             hasPendingEdits: row.hasPendingEdits,
@@ -138,15 +151,21 @@ export function create_sqlite_file_state_maintenance(
             ...(row.updatedAtMs === undefined ? {} : { updatedAtMs: row.updatedAtMs }),
             ...(row.touchedAtMs === undefined ? {} : { touchedAtMs: row.touchedAtMs }),
         }));
+        if (!checkDisk) return entries;
+        // Not every key is a filesystem path. Virtual providers and untitled
+        // buffers are stored under synthetic keys that no stat could ever find,
+        // so asking about them would report every one of them as missing.
+        const missing = await Promise.all(entries.map(async (entry) => (
+            is_provider_state_key(entry.path) ? false : !await file_exists(entry.path)
+        )));
+        return entries.map((entry, index) => ({ ...entry, isMissing: missing[index] }));
     }
 
-    async function select(
+    function select(
         entries: readonly StoredFileStateEntry[],
         selection: StoredFileStateTrimSelection,
-    ): Promise<readonly StoredFileStateEntry[]> {
+    ): readonly StoredFileStateEntry[] {
         switch (selection.kind) {
-            case 'all':
-                return entries;
             case 'paths': {
                 const wanted = new Set(selection.paths);
                 return entries.filter((entry) => wanted.has(entry.path));
@@ -155,31 +174,27 @@ export function create_sqlite_file_state_maintenance(
                 const cutoff = now() - Math.max(0, selection.days) * MS_PER_DAY;
                 return entries.filter((entry) => is_older_than(entry, cutoff));
             }
-            case 'missingOnDisk': {
-                // Not every key is a filesystem path. Virtual providers and
-                // untitled buffers are stored under synthetic keys that no stat
-                // could ever find, so testing them here would nominate every one
-                // of them for deletion.
-                const candidates = entries.filter((entry) => !is_provider_state_key(entry.path));
-                const present = await Promise.all(
-                    candidates.map((entry) => file_exists(entry.path)),
-                );
-                return candidates.filter((_, index) => !present[index]);
-            }
+            case 'missingOnDisk':
+                // The same flag the listing shows, so what the user was told is
+                // missing is exactly what this selects.
+                return entries.filter((entry) => entry.isMissing === true);
         }
     }
 
     return {
         async inspect() {
             const [entries, databaseSizeBytes] = await Promise.all([
-                read_entries(),
+                read_entries(true),
                 database_size(),
             ]);
             return { entries, totalEntryCount: entries.length, databaseSizeBytes };
         },
 
         async preview(selection) {
-            const matched = await select(await read_entries(), selection);
+            const matched = select(
+                await read_entries(selection.kind === 'missingOnDisk'),
+                selection,
+            );
             const targets = matched.filter((entry) => !entry.isLeased);
             return {
                 targets,

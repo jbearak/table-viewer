@@ -93,38 +93,52 @@ export function mount_state_inspector(
 
     const header = element('header');
     const heading = element('h1', undefined, 'Stored File State');
+    // Standing text, not just dialog copy. The buttons below say "Clear", and
+    // someone reading them cold has no way to know whether that reaches their
+    // spreadsheets — so the answer is on screen before they press anything.
+    const explanation = element(
+        'p',
+        'explanation',
+        'Table Viewer remembers how you were viewing each file: sorts, filters, '
+        + 'column widths, scroll positions, and any unsaved edits. This window '
+        + 'shows that record and lets you prune it. Clearing an entry never '
+        + 'deletes, moves, or changes the file on disk.',
+    );
     const summary = element('p', 'summary', 'Loading…');
     const databasePath = element('p', 'database-path');
-    header.append(heading, summary, databasePath);
+    header.append(heading, explanation, summary, databasePath);
 
-    const toolbar = element('div', 'toolbar');
+    const toolbar = element('div', 'toolbars');
     const filterInput = element('input', 'filter-input');
     filterInput.type = 'text';
     filterInput.placeholder = 'Filter by path';
     filterInput.setAttribute('aria-label', 'Filter by path');
 
-    const deleteSelected = element('button', 'danger', 'Delete Selected');
+    // No toolbar button is styled destructive, including this one. None of them
+    // clear anything on click — every one opens a confirmation first. Red is
+    // reserved for the point of no return, which is the unsaved-edits step in
+    // that dialog; spending it on three doorways would leave nothing to mark the
+    // one action that actually cannot be undone.
+    const clearSelected = element('button', undefined, 'Clear Selected');
     const daysInput = element('input');
     daysInput.type = 'number';
     daysInput.min = '1';
     daysInput.value = '90';
     daysInput.setAttribute('aria-label', 'Days since last opened');
     const trimOldLabel = element('label');
-    const trimOld = element('button', undefined, 'Delete Older Than');
+    const trimOld = element('button', undefined, 'Clear Older Than');
     trimOldLabel.append(trimOld, daysInput, element('span', undefined, 'days'));
-    const trimMissing = element('button', undefined, 'Delete Missing Files');
-    const clearAll = element('button', 'danger', 'Clear Everything');
+    const trimMissing = element('button', undefined, 'Clear Files Not on Disk');
     const refresh = element('button', undefined, 'Refresh');
 
-    toolbar.append(
-        filterInput,
-        deleteSelected,
-        trimOldLabel,
-        trimMissing,
-        clearAll,
-        element('span', 'spacer'),
-        refresh,
-    );
+    // Two rows, because these are two different kinds of control: the top row
+    // changes what is stored, the bottom row only changes what you are looking
+    // at. Mixing them put a harmless text field between two clearing actions.
+    const actions = element('div', 'toolbar actions');
+    actions.append(clearSelected, trimOldLabel, trimMissing);
+    const viewControls = element('div', 'toolbar view-controls');
+    viewControls.append(filterInput, element('span', 'spacer'), refresh);
+    toolbar.append(actions, viewControls);
 
     const tableScroll = element('div', 'table-scroll');
     const statusBar = element('div', 'status-bar');
@@ -160,10 +174,10 @@ export function mount_state_inspector(
 
     function set_busy(busy: boolean): void {
         state.busy = busy;
-        for (const button of [deleteSelected, trimOld, trimMissing, clearAll, refresh]) {
+        for (const button of [clearSelected, trimOld, trimMissing, refresh]) {
             button.disabled = busy;
         }
-        if (!busy) deleteSelected.disabled = state.selected.size === 0;
+        if (!busy) clearSelected.disabled = state.selected.size === 0;
     }
 
     function render_header(): void {
@@ -250,7 +264,7 @@ export function mount_state_inspector(
             checkbox.addEventListener('change', () => {
                 if (checkbox.checked) state.selected.add(entry.path);
                 else state.selected.delete(entry.path);
-                deleteSelected.disabled = state.selected.size === 0;
+                clearSelected.disabled = state.selected.size === 0;
                 const shown = visible_entries().filter((candidate) => !candidate.isLeased);
                 selectAll.checked = shown.length > 0
                     && shown.every((candidate) => state.selected.has(candidate.path));
@@ -263,6 +277,13 @@ export function mount_state_inspector(
                 status.append(element('span', 'badge unsaved', 'Unsaved edits'));
             }
             if (entry.isLeased) status.append(element('span', 'badge open', 'Open'));
+            // Named on the row, so the bulk action acts on something the user
+            // can already see rather than on an invisible criterion. "Not on
+            // disk" rather than "missing" because that is exactly what was
+            // checked — a stat that found nothing — and it does not imply Table
+            // Viewer lost anything or that the file was deleted rather than
+            // moved or on an unmounted volume.
+            if (entry.isMissing) status.append(element('span', 'badge absent', 'Not on disk'));
 
             row.append(
                 checkCell,
@@ -281,7 +302,7 @@ export function mount_state_inspector(
     function render(): void {
         render_header();
         render_table();
-        deleteSelected.disabled = state.busy || state.selected.size === 0;
+        clearSelected.disabled = state.busy || state.selected.size === 0;
     }
 
     /** Show one confirmation and resolve to whether it was accepted. */
@@ -416,7 +437,7 @@ export function mount_state_inspector(
         state.filter = filterInput.value;
         render_table();
     });
-    deleteSelected.addEventListener('click', () => {
+    clearSelected.addEventListener('click', () => {
         void run_trim({ kind: 'paths', paths: [...state.selected] });
     });
     trimOld.addEventListener('click', () => {
@@ -429,9 +450,6 @@ export function mount_state_inspector(
     });
     trimMissing.addEventListener('click', () => {
         void run_trim({ kind: 'missingOnDisk' });
-    });
-    clearAll.addEventListener('click', () => {
-        void run_trim({ kind: 'all' });
     });
     refresh.addEventListener('click', () => {
         set_busy(true);

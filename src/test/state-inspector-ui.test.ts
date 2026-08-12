@@ -111,6 +111,14 @@ function dialog(root: HTMLElement): HTMLElement {
     return found as HTMLElement;
 }
 
+/** Tick the header checkbox, then clear — the route that replaced a
+ *  "clear everything" button, and the only way to act on every row. */
+async function clearAll(root: HTMLElement): Promise<void> {
+    const selectAll = root.querySelector<HTMLInputElement>('thead input')!;
+    await click(selectAll);
+    await click(button(root, 'Clear Selected'));
+}
+
 async function click(target: HTMLElement): Promise<void> {
     target.click();
     await settle();
@@ -171,8 +179,8 @@ describe('deleting a selection', () => {
         const harness = await mount();
         await selectPlain(harness.root);
 
-        await click(button(harness.root, 'Delete Selected'));
-        expect(dialog(harness.root).textContent).toContain('Delete stored state for 1 file?');
+        await click(button(harness.root, 'Clear Selected'));
+        expect(dialog(harness.root).textContent).toContain('Clear stored state for 1 file?');
 
         await click(button(dialog(harness.root), 'Cancel'));
 
@@ -184,8 +192,8 @@ describe('deleting a selection', () => {
         const harness = await mount();
         await selectPlain(harness.root);
 
-        await click(button(harness.root, 'Delete Selected'));
-        await click(button(dialog(harness.root), 'Delete'));
+        await click(button(harness.root, 'Clear Selected'));
+        await click(button(dialog(harness.root), 'Clear'));
 
         expect(harness.trimmed()).toMatchObject({
             kind: 'trim',
@@ -202,8 +210,8 @@ describe('the unsaved-edits gate', () => {
     it('names the affected files in a second confirmation', async () => {
         const harness = await mount();
 
-        await click(button(harness.root, 'Clear Everything'));
-        await click(button(dialog(harness.root), 'Delete'));
+        await clearAll(harness.root);
+        await click(button(dialog(harness.root), 'Clear'));
 
         const second = dialog(harness.root);
         expect(second.textContent).toContain('Discard unsaved changes to 1 file?');
@@ -213,8 +221,8 @@ describe('the unsaved-edits gate', () => {
     it('deletes nothing when the second confirmation is refused', async () => {
         const harness = await mount();
 
-        await click(button(harness.root, 'Clear Everything'));
-        await click(button(dialog(harness.root), 'Delete'));
+        await clearAll(harness.root);
+        await click(button(dialog(harness.root), 'Clear'));
         await click(button(dialog(harness.root), 'Cancel'));
 
         expect(harness.trimmed()).toBeUndefined();
@@ -224,9 +232,9 @@ describe('the unsaved-edits gate', () => {
     it('passes the confirmed paths through only after that second yes', async () => {
         const harness = await mount();
 
-        await click(button(harness.root, 'Clear Everything'));
-        await click(button(dialog(harness.root), 'Delete'));
-        await click(button(dialog(harness.root), 'Discard Edits and Delete'));
+        await clearAll(harness.root);
+        await click(button(dialog(harness.root), 'Clear'));
+        await click(button(dialog(harness.root), 'Discard Edits and Clear'));
 
         expect(harness.trimmed()).toMatchObject({
             confirmedPendingEditPaths: ['/files/unsaved.csv'],
@@ -235,24 +243,31 @@ describe('the unsaved-edits gate', () => {
 
     it('applies the same gate to a bulk action as to a hand-picked one', async () => {
         // The gate is decided by what the selection resolved to, so every route
-        // to a delete has to pass through it.
-        for (const label of ['Clear Everything', 'Delete Missing Files']) {
-            document.body.replaceChildren();
-            const harness = await mount();
+        // to a clear has to pass through it.
+        const harness = await mount();
 
-            await click(button(harness.root, label));
-            await click(button(dialog(harness.root), 'Delete'));
+        // Hand-picked: tick only the unsaved row.
+        const unsaved = rows(harness.root)
+            .find((row) => row.querySelector('.path')?.textContent === '/files/unsaved.csv')!;
+        await click(unsaved.querySelector<HTMLInputElement>('input')!);
+        await click(button(harness.root, 'Clear Selected'));
+        await click(button(dialog(harness.root), 'Clear'));
+        expect(dialog(harness.root).textContent)
+            .toContain('Discard unsaved changes to 1 file?');
+        await click(button(dialog(harness.root), 'Cancel'));
 
-            expect(dialog(harness.root).textContent)
-                .toContain('Discard unsaved changes to 1 file?');
-        }
+        // Bulk: every row at once, via the header checkbox.
+        await clearAll(harness.root);
+        await click(button(dialog(harness.root), 'Clear'));
+        expect(dialog(harness.root).textContent)
+            .toContain('Discard unsaved changes to 1 file?');
     });
 
     it('never shows the second step when no target holds unsaved work', async () => {
         const harness = await mount([ENTRIES[0]]);
 
-        await click(button(harness.root, 'Clear Everything'));
-        await click(button(dialog(harness.root), 'Delete'));
+        await clearAll(harness.root);
+        await click(button(dialog(harness.root), 'Clear'));
 
         expect(harness.root.querySelector('.dialog')).toBeNull();
         expect(harness.trimmed()).toMatchObject({ confirmedPendingEditPaths: [] });
@@ -261,7 +276,7 @@ describe('the unsaved-edits gate', () => {
     it('cancels on Escape rather than deleting', async () => {
         const harness = await mount();
 
-        await click(button(harness.root, 'Clear Everything'));
+        await clearAll(harness.root);
         document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
         await settle();
 
@@ -272,9 +287,17 @@ describe('the unsaved-edits gate', () => {
 
 describe('when every match is in use', () => {
     it('says so instead of opening an empty confirmation', async () => {
-        const harness = await mount([ENTRIES[2]]);
+        // Reachable through a bulk rule, which can match a row the user could
+        // not have ticked by hand: an open entry is never selectable.
+        const harness = await mount([{
+            path: '/open-and-gone.csv',
+            sizeBytes: 100,
+            hasPendingEdits: false,
+            isLeased: true,
+            isMissing: true,
+        }]);
 
-        await click(button(harness.root, 'Clear Everything'));
+        await click(button(harness.root, 'Clear Files Not on Disk'));
 
         expect(harness.root.querySelector('.dialog')).toBeNull();
         expect(harness.root.querySelector('.status-bar')?.textContent)
@@ -297,5 +320,49 @@ describe('host failures', () => {
         const status = root.querySelector('.status-bar')!;
         expect(status.textContent).toBe('database is locked');
         expect(status.classList.contains('error')).toBe(true);
+    });
+});
+
+describe('dialog stacking', () => {
+    it('paints the confirmation above the sticky table header', async () => {
+        // The header is sticky with a z-index of its own. A scrim that does not
+        // out-rank it leaves the confirmation half-hidden behind the column
+        // titles — which is worst exactly when the dialog is the unsaved-edits
+        // warning the user most needs to read.
+        const harness = await mount();
+        await clearAll(harness.root);
+
+        const header = harness.root.querySelector('th')!;
+        const scrim = harness.root.querySelector('.scrim')!;
+        const layer = (node: Element): number => Number(getComputedStyle(node).zIndex || '0');
+
+        expect(getComputedStyle(header).position).toBe('sticky');
+        expect(layer(scrim)).toBeGreaterThan(layer(header));
+    });
+});
+
+describe('missing files', () => {
+    it('names a missing file on its own row, not only in the bulk action', async () => {
+        // Without this the "Clear Missing Files" button asks the user to trust a
+        // criterion they cannot see anywhere in the list.
+        const harness = await mount([
+            { path: '/gone.csv', sizeBytes: 100, hasPendingEdits: false, isLeased: false, isMissing: true },
+            { path: '/here.csv', sizeBytes: 100, hasPendingEdits: false, isLeased: false, isMissing: false },
+        ]);
+
+        const rowFor = (path: string) => rows(harness.root)
+            .find((row) => row.querySelector('.path')?.textContent === path)!;
+
+        expect(rowFor('/gone.csv').textContent).toContain('Not on disk');
+        expect(rowFor('/here.csv').textContent).not.toContain('Not on disk');
+    });
+});
+
+describe('the standing explanation', () => {
+    it('says the files on disk are untouched, before any button is pressed', async () => {
+        const { root } = await mount();
+
+        const explanation = root.querySelector('.explanation')!.textContent!;
+        expect(explanation).toContain('never deletes, moves, or changes the file on disk');
     });
 });

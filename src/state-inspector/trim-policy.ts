@@ -50,9 +50,7 @@ export function describe_selection(selection: StoredFileStateTrimSelection): str
         case 'olderThanDays':
             return `entries not opened in ${plural(selection.days, 'day')}`;
         case 'missingOnDisk':
-            return 'entries whose files are gone from disk';
-        case 'all':
-            return 'every stored entry';
+            return 'entries whose files are no longer on disk';
     }
 }
 
@@ -65,11 +63,12 @@ export function describe_selection(selection: StoredFileStateTrimSelection): str
 export function trim_confirmation(preview: StateInspectorPreview): TrimConfirmation | undefined {
     if (preview.targetPaths.length === 0) return undefined;
     const parts = [
-        `This deletes the stored view state for ${
+        `This clears the stored view state for ${
             plural(preview.targetPaths.length, 'file')
         }, freeing about ${format_bytes(preview.totalSizeBytes)}.`,
-        'The files themselves are not touched — only the sorts, filters, column'
-            + ' widths, and scroll positions Table Viewer remembers for them.',
+        'The files on disk are not deleted, moved, or changed — this only prunes'
+            + ' what Table Viewer remembers about them: sorts, filters, column'
+            + ' widths, and scroll positions.',
     ];
     if (preview.protectedPaths.length > 0) {
         // Say this up front. Reporting it only afterwards reads as a failure,
@@ -81,9 +80,9 @@ export function trim_confirmation(preview: StateInspectorPreview): TrimConfirmat
         );
     }
     return {
-        title: `Delete stored state for ${plural(preview.targetPaths.length, 'file')}?`,
+        title: `Clear stored state for ${plural(preview.targetPaths.length, 'file')}?`,
         message: parts.join('\n\n'),
-        confirmLabel: 'Delete',
+        confirmLabel: 'Clear',
         affectedFiles: [],
         destructive: false,
     };
@@ -108,11 +107,11 @@ export function pending_edit_confirmation(
             `${
                 affected.length === 1 ? 'This file has' : 'These files have'
             } edits that were never saved back to disk. Table Viewer is holding the only copy.`,
-            'Deleting the stored state discards those edits permanently. This cannot be undone.',
+            'Clearing the stored state discards those edits permanently. This cannot be undone.',
         ].join('\n\n'),
         confirmLabel: affected.length === 1
-            ? 'Discard Edits and Delete'
-            : 'Discard All Edits and Delete',
+            ? 'Discard Edits and Clear'
+            : 'Discard All Edits and Clear',
         affectedFiles: affected,
         destructive: true,
     };
@@ -122,10 +121,10 @@ export function pending_edit_confirmation(
 export function trim_outcome_message(summary: StateInspectorTrimSummary): string {
     if (summary.deletedCount === 0) {
         return summary.skippedProtectedCount > 0
-            ? 'Nothing was deleted — every matching entry is currently open.'
-            : 'Nothing was deleted.';
+            ? 'Nothing was cleared — every matching entry is currently open.'
+            : 'Nothing was cleared.';
     }
-    const parts = [`Deleted stored state for ${plural(summary.deletedCount, 'file')}.`];
+    const parts = [`Cleared stored state for ${plural(summary.deletedCount, 'file')}.`];
     if (summary.vacuum === 'vacuumed' && summary.reclaimedBytes > 0) {
         parts.push(`Reclaimed ${format_bytes(summary.reclaimedBytes)} of disk space.`);
     } else if (summary.vacuum === 'deferred') {
