@@ -291,6 +291,32 @@ describe('paginated protocol message shapes', () => {
         });
     });
 
+    it('addresses save rejections by worksheet operation ordinal', () => {
+        const msg: HostMessage = {
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 2,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'edit:1',
+                    saveRequestId: 'save:1',
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: { '0:0': 'next' },
+                        dirtyEdits: { '0:0': { value: 'next', base: 'old' } },
+                    }],
+                },
+            },
+            rejection: {
+                reason: 'baseMismatch',
+                worksheetOperationIndex: 0,
+                keys: ['0:0'],
+            },
+        };
+        expect(msg.rejection?.worksheetOperationIndex).toBe(0);
+    });
+
     it('WebviewMessage carries a showWarning variant with a message', () => {
         const msg: WebviewMessage = {
             type: 'showWarning',

@@ -48,10 +48,24 @@ import {
     create_edit_session_store,
     type EditSessionStore,
 } from './edit-session-store';
-import {
-    collect_exact_dirty_edits,
-    collect_save_edits,
-} from './csv-save-model';
+import { collect_save_payload } from './csv-save-model';
+
+export interface EditSessionSaveWorksheet {
+    target: WorksheetTarget;
+    edits: Readonly<Record<string, string>>;
+    dirtyEdits: CsvDirtyMap;
+}
+
+export type EditSessionSavePreflight =
+    | {
+        status: 'ready';
+        worksheets: readonly EditSessionSaveWorksheet[];
+    }
+    | {
+        status: 'blocked';
+        reason: 'unresolvedBases' | 'parkedEdits';
+        targets: readonly WorksheetTarget[];
+    };
 
 export interface EditSessionRegistry {
     /**
@@ -92,14 +106,13 @@ export interface EditSessionRegistry {
     /** Whether any live or parked worksheet store contains dirty entries. */
     has_dirty_entries(): boolean;
     /**
-     * Immutable snapshots of every dirty live and parked worksheet, ordered by
-     * worksheet index. Parked collisions retain their insertion order.
+     * Preflight an all-or-nothing workbook save. Every dirty live worksheet is
+     * assembled once; any unresolved base or dirty parked store blocks the whole
+     * operation rather than silently producing a partial save.
      */
-    collect_dirty_worksheets(sheets: readonly WorksheetIdentityInput[]): readonly {
-        target: WorksheetTarget;
-        edits: Readonly<Record<string, string>>;
-        dirtyEdits: CsvDirtyMap;
-    }[];
+    collect_dirty_worksheets(
+        sheets: readonly WorksheetIdentityInput[],
+    ): EditSessionSavePreflight;
     /**
      * A different document replaced this one: drop every store. An initial
      * snapshot owns the complete pending-edit projection, so any store that
@@ -229,49 +242,54 @@ export function create_edit_session_registry(
             return false;
         },
         collect_dirty_worksheets: (sheets) => {
-            const collected: Array<{
-                target: WorksheetTarget;
-                edits: Readonly<Record<string, string>>;
-                dirtyEdits: CsvDirtyMap;
-                parked: boolean;
-                order: number;
-            }> = [];
-            let order = 0;
-            const collect = (
-                target: WorksheetTarget,
-                store: EditSessionStore,
-                is_parked: boolean,
-            ): void => {
-                const snapshot = store.snapshot();
-                if (snapshot.size === 0) return;
-                const dirty_edits = collect_exact_dirty_edits(snapshot, null);
-                if (!dirty_edits) return;
-                collected.push({
-                    target: Object.freeze({ ...target }),
-                    edits: Object.freeze(collect_save_edits(snapshot, null)),
-                    dirtyEdits: dirty_edits,
-                    parked: is_parked,
-                    order: order++,
-                });
-            };
+            const worksheets: EditSessionSaveWorksheet[] = [];
+            const unresolved_targets: WorksheetTarget[] = [];
+            const parked_targets: WorksheetTarget[] = [];
 
             for (const [sheet_index, store] of stores) {
                 const sheet = sheets[sheet_index];
                 if (!sheet) continue;
-                collect(target_for_sheet(sheet_index, sheet), store, false);
+                const snapshot = store.snapshot();
+                if (snapshot.size === 0) continue;
+                const target = Object.freeze(
+                    target_for_sheet(sheet_index, sheet),
+                );
+                const payload = collect_save_payload(snapshot, null);
+                if (payload.status === 'blocked') {
+                    unresolved_targets.push(target);
+                    continue;
+                }
+                worksheets.push(Object.freeze({
+                    target,
+                    edits: payload.edits,
+                    dirtyEdits: payload.dirtyEdits,
+                }));
             }
             for (const { target, store } of parked.values()) {
-                collect(target, store, true);
+                if (store.size() === 0) continue;
+                parked_targets.push(Object.freeze({ ...target }));
             }
-            collected.sort((left, right) =>
-                left.target.sheetIndex - right.target.sheetIndex
-                || Number(left.parked) - Number(right.parked)
-                || left.order - right.order);
-            return Object.freeze(collected.map(({
-                order: _order,
-                parked: _parked,
-                ...entry
-            }) => Object.freeze(entry)));
+
+            if (parked_targets.length > 0) {
+                return Object.freeze({
+                    status: 'blocked',
+                    reason: 'parkedEdits',
+                    targets: Object.freeze(parked_targets),
+                });
+            }
+            if (unresolved_targets.length > 0) {
+                return Object.freeze({
+                    status: 'blocked',
+                    reason: 'unresolvedBases',
+                    targets: Object.freeze(unresolved_targets),
+                });
+            }
+            worksheets.sort((left, right) =>
+                left.target.sheetIndex - right.target.sheetIndex);
+            return Object.freeze({
+                status: 'ready',
+                worksheets: Object.freeze(worksheets),
+            });
         },
         replace_document: () => {
             stores.clear();

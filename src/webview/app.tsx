@@ -36,7 +36,6 @@ import {
     type SheetViewRecord,
     type TransformIntent,
     type ViewBasis,
-    type WorksheetTarget,
 } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
 import {
@@ -405,15 +404,6 @@ export function App(): React.JSX.Element {
     // synchronously; this is what the toolbar and grid re-render against, so the
     // Edit button and the editable grid follow the session from sheet to sheet.
     const [edit_session_sheet_index, set_edit_session_sheet_index] = useState(0);
-    /**
-     * The active sheet, readable from the long-lived host-message handler.
-     *
-     * That handler does not re-close over `active_sheet_index`, and a dialog answer
-     * has to know whether the store it is about to act on is still the session's —
-     * see the `saveDialogResult` branch.
-     */
-    const active_sheet_index_ref = useRef(0);
-    active_sheet_index_ref.current = active_sheet_index;
     const renderer_publication_fenced_session_ref = useRef<string>();
     // The dirty maps, one per worksheet, owned here so they survive the
     // generation-keyed GridShell remounts that a transform or refresh snapshot
@@ -615,10 +605,7 @@ export function App(): React.JSX.Element {
     const pending_save_dialog_ref = useRef<{
         requestId: string;
         editSessionId: string;
-        target: WorksheetTarget;
-        multipleDirtySheets: boolean;
     } | null>(null);
-    const pending_dialog_save_target_ref = useRef<WorksheetTarget | null>(null);
     const save_projection_ref = useRef<CsvSaveProjection>(
         INITIAL_CSV_SAVE_PROJECTION,
     );
@@ -809,7 +796,6 @@ export function App(): React.JSX.Element {
         renderer_publication_fenced_session_ref.current = edit_session_id;
         editing_ref.current?.stop_edit_admission();
         pending_save_dialog_ref.current = null;
-        pending_dialog_save_target_ref.current = null;
     }, []);
 
     const release_edit_session = useCallback(() => {
@@ -849,10 +835,19 @@ export function App(): React.JSX.Element {
     const begin_save_operation = useCallback((): CsvSaveOperation | undefined => {
         if (!csv_edit_session_id || save_projection_ref.current.operation) return undefined;
         const sheets = meta_ref.current?.sheets ?? [];
-        const collected = edit_session_registry_ref.current!
+        const preflight = edit_session_registry_ref.current!
             .collect_dirty_worksheets(sheets);
-        if (collected.length === 0) return undefined;
-        const worksheets = collected.map(({ target, edits, dirtyEdits }) =>
+        if (preflight.status === 'blocked') {
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: preflight.reason === 'unresolvedBases'
+                    ? 'Load every edited row before saving so its conflict base can be verified.'
+                    : 'A worksheet containing unsaved edits was removed. Restore it or discard its edits before saving.',
+            });
+            return undefined;
+        }
+        if (preflight.worksheets.length === 0) return undefined;
+        const worksheets = preflight.worksheets.map(({ target, edits, dirtyEdits }) =>
             Object.freeze<CsvSaveWorksheetOperation>({
                 ...target,
                 edits,
@@ -1535,7 +1530,6 @@ export function App(): React.JSX.Element {
                         set_edit_session_pending(false);
                         pending_edit_request_ref.current = null;
                         pending_save_dialog_ref.current = null;
-                        pending_dialog_save_target_ref.current = null;
                     }
                     set_source_epoch((n) => n + 1);
                     // What the rows *are* changes with a new source, a new view
@@ -2767,7 +2761,6 @@ export function App(): React.JSX.Element {
         editing_ref.current?.commit_live_edit();
         if (edit_session_registry_ref.current!.has_dirty_entries()) {
             if (!csv_edit_session_id || pending_save_dialog_ref.current) return;
-            const target_sheet = meta?.sheets[active_sheet_index];
             const request = {
                 requestId: [
                     'dialog',
@@ -2775,16 +2768,6 @@ export function App(): React.JSX.Element {
                     ++dialog_request_seq_ref.current,
                 ].join(':'),
                 editSessionId: csv_edit_session_id,
-                target: {
-                    sheetIndex: active_sheet_index,
-                    ...(target_sheet?.name !== undefined
-                        ? { sheetName: target_sheet.name }
-                        : {}),
-                    ...(target_sheet?.worksheetId !== undefined
-                        ? { worksheetId: target_sheet.worksheetId }
-                        : {}),
-                },
-                multipleDirtySheets: false,
             };
             pending_save_dialog_ref.current = request;
             host_bridge.postMessage({
@@ -3176,7 +3159,6 @@ export function App(): React.JSX.Element {
                         leave_edit_mode();
                     }
                 } else if (msg.choice === 'discard') {
-                    pending_dialog_save_target_ref.current = null;
                     editing_ref.current?.clear_dirty();
                     discard_edit_session();
                 }
@@ -3205,11 +3187,9 @@ export function App(): React.JSX.Element {
                     && msg.lifecycle.operation.editSessionId
                         === csv_edit_session_id_ref.current
                 ) {
-                    const submitted_worksheet = msg.lifecycle.operation.worksheets.find(
-                        (worksheet) => msg.rejection!.keys.every(
-                            (key) => worksheet.dirtyEdits[key] !== undefined,
-                        ),
-                    );
+                    const submitted_worksheet = msg.lifecycle.operation.worksheets[
+                        msg.rejection.worksheetOperationIndex
+                    ];
                     if (!submitted_worksheet) return;
                     const submitted = submitted_worksheet.dirtyEdits;
                     set_save_rejection({

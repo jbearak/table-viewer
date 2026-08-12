@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
     collect_exact_dirty_edits,
     collect_save_edits,
+    collect_save_payload,
 } from '../webview/csv-save-model';
 
 const dirty = (entries: Record<string, string>) =>
@@ -44,6 +45,42 @@ describe('collect_save_edits', () => {
             original: 'orig',
         });
         expect(out).toEqual({});
+    });
+});
+
+describe('collect_save_payload', () => {
+    it('assembles value and exact-base payloads together with live folding', () => {
+        const payload = collect_save_payload(new Map([
+            ['0:0', { value: 'committed', base: 'committed-base' }],
+            ['1:1', { value: 'reverted committed', base: 'overlay-base' }],
+        ]), {
+            key: '1:1',
+            value: 'overlay-base',
+            original: 'overlay-base',
+        });
+
+        expect(payload).toEqual({
+            status: 'ready',
+            edits: { '0:0': 'committed' },
+            dirtyEdits: {
+                '0:0': { value: 'committed', base: 'committed-base' },
+            },
+        });
+        expect(Object.isFrozen(payload)).toBe(true);
+        if (payload.status !== 'ready') throw new Error('expected ready');
+        expect(Object.isFrozen(payload.edits)).toBe(true);
+        expect(Object.isFrozen(payload.dirtyEdits)).toBe(true);
+        expect(Object.isFrozen(payload.dirtyEdits['0:0'])).toBe(true);
+    });
+
+    it('returns a discriminated refusal without a partial payload', () => {
+        expect(collect_save_payload(new Map([
+            ['0:0', { value: 'ready', base: 'old' }],
+            ['1:0', { value: 'pending', base: '', base_pending: true }],
+        ]), null)).toEqual({
+            status: 'blocked',
+            reason: 'unresolvedBases',
+        });
     });
 });
 

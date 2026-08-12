@@ -1787,7 +1787,7 @@ describe('CSV edit sessions', () => {
                     })],
                 }),
             }),
-            rejection: { reason: 'baseMismatch', keys: ['0:0'] },
+            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['0:0'] },
         });
         expect(sheet_cells(state.get_state('/tmp/rehydrated-mismatch.csv').pendingEdits))
             .toEqual(pendingEdits);
@@ -1809,7 +1809,7 @@ describe('CSV edit sessions', () => {
         expect(panel.__messages).toContainEqual(expect.objectContaining({
             type: 'saveResult',
             success: false,
-            rejection: { reason: 'rowsRemoved', keys: ['3:0'] },
+            rejection: { reason: 'rowsRemoved', worksheetOperationIndex: 0, keys: ['3:0'] },
         }));
     });
 
@@ -1855,7 +1855,7 @@ describe('CSV edit sessions', () => {
         ))).toBe(true);
         expect(panel.__messages).toContainEqual(expect.objectContaining({
             type: 'saveResult',
-            rejection: { reason: 'baseMismatch', keys: ['0:0', '500:0'] },
+            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['0:0', '500:0'] },
         }));
     });
 
@@ -1966,7 +1966,7 @@ describe('CSV edit sessions', () => {
             }),
             // Only the drifted key: the honest edit stays saveable once the user
             // resolves this one.
-            rejection: { reason: 'baseMismatch', keys: ['0:0'] },
+            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['0:0'] },
         });
     });
 
@@ -2002,7 +2002,7 @@ describe('CSV edit sessions', () => {
         expect(panel.__messages).toContainEqual(expect.objectContaining({
             type: 'saveResult',
             success: false,
-            rejection: { reason: 'rowsRemoved', keys: ['3:0'] },
+            rejection: { reason: 'rowsRemoved', worksheetOperationIndex: 0, keys: ['3:0'] },
         }));
     });
 
@@ -7788,7 +7788,7 @@ describe('CSV edit sessions', () => {
             expect(panel.__messages).toContainEqual(expect.objectContaining({
                 type: 'saveResult',
                 success: false,
-                rejection: { reason: 'baseMismatch', keys: ['2:0'] },
+                rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['2:0'] },
             }));
             expect(warning).toHaveBeenCalled();
         });

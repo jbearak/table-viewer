@@ -1257,6 +1257,8 @@ export type CsvDirtyMap = Readonly<Record<string, CsvDirtyEntry>>;
  *  one ordering. */
 export interface CsvSaveRejection {
     readonly reason: 'baseMismatch' | 'rowsRemoved';
+    /** Ordinal of the rejected worksheet in lifecycle.operation.worksheets. */
+    readonly worksheetOperationIndex: number;
     readonly keys: readonly string[];
 }
 

@@ -157,6 +157,7 @@ async function render_grid(
             conflicted: readonly string[];
         }) => void;
         generation?: number;
+        on_save_request?: () => CsvSaveOperation | undefined;
     } = {},
 ) {
     vi.resetModules();
@@ -766,6 +767,51 @@ describe('GridShell CSV save', () => {
         expect(Object.fromEntries(store.snapshot())).toEqual(own);
         expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('own draft');
         expect(await request_save(editing_ref)).toBe(true);
+    });
+
+    it('accepts a valid workbook save that contains only a sibling worksheet', async () => {
+        const operation: CsvSaveOperation = {
+            editSessionId: 'session-1',
+            saveRequestId: 'sibling-only-save',
+            worksheets: [{
+                sheetIndex: 1,
+                sheetName: 'Sheet2',
+                edits: { '0:0': 'sibling draft' },
+                dirtyEdits: { '0:0': { value: 'sibling draft', base: 'sibling base' } },
+            }],
+        };
+        const on_save_request = vi.fn(() => operation);
+        const { editing_ref } = await render_grid(undefined, { on_save_request });
+
+        expect(await request_save(editing_ref)).toBe(true);
+        expect(on_save_request).toHaveBeenCalledOnce();
+    });
+
+    it('does not install a local save lock for a sibling-only workbook save', async () => {
+        let request = 0;
+        const on_save_request = vi.fn((): CsvSaveOperation => ({
+            editSessionId: 'session-1',
+            saveRequestId: `sibling-only-save-${++request}`,
+            worksheets: [{
+                sheetIndex: 1,
+                sheetName: 'Sheet2',
+                edits: { '0:0': 'sibling draft' },
+                dirtyEdits: { '0:0': { value: 'sibling draft', base: 'sibling base' } },
+            }],
+        }));
+        const store = create_edit_session_store({ session_id: 'session-1' }, {
+            '0:0': { value: 'own draft', base: 'base' },
+        });
+        const { editing_ref } = await render_grid(undefined, {
+            edit_session: store,
+            on_save_request,
+        });
+
+        expect(await request_save(editing_ref)).toBe(true);
+        await edit_cell('newer own draft');
+        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('newer own draft');
+        expect(await request_save(editing_ref)).toBe(true);
+        expect(on_save_request).toHaveBeenCalledTimes(2);
     });
 
     it('blocks a revert while the save is in flight', async () => {

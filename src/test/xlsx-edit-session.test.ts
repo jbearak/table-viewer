@@ -369,7 +369,7 @@ describe('xlsx edit sessions', () => {
 
         expect(save_results(panel).at(-1)).toMatchObject({
             success: false,
-            rejection: { reason: 'baseMismatch' },
+            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 1 },
         });
         expect(bytes).toBe(untouched);
         const after = await parse_xlsx(bytes);
@@ -534,7 +534,7 @@ describe('xlsx edit sessions', () => {
 
         expect(save_results(panel).at(-1)).toMatchObject({
             success: false,
-            rejection: { reason: 'baseMismatch' },
+            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0 },
         });
         expect(bytes).toBe(untouched);
     });

@@ -1244,20 +1244,21 @@ export function GridShell({
             }
         }
         const operation = on_save_request();
-        const worksheet = worksheet_payload(operation);
         if (
             !operation
-            || !worksheet
             || operation.editSessionId !== edit_session_id
             || operation.saveRequestId.length === 0
         ) return false;
-        save_operation_ref.current = operation;
-        saved_edits_ref.current = { ...worksheet.edits };
-        save_in_flight_ref.current = true;
-        set_save_in_flight(true);
-        set_live_uncommitted(false);
-        if (document.activeElement instanceof HTMLElement) {
-            document.activeElement.blur();
+        const worksheet = worksheet_payload(operation);
+        if (worksheet) {
+            save_operation_ref.current = operation;
+            saved_edits_ref.current = { ...worksheet.edits };
+            save_in_flight_ref.current = true;
+            set_save_in_flight(true);
+            set_live_uncommitted(false);
+            if (document.activeElement instanceof HTMLElement) {
+                document.activeElement.blur();
+            }
         }
         return true;
     }, [

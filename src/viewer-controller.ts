@@ -2585,8 +2585,8 @@ export function attach_viewer(
         return {
             dirtyEdits: dirty_edits,
             rejection: validation.type === 'removedRows'
-                ? { reason: 'rowsRemoved', keys: validation.keys }
-                : { reason: 'baseMismatch', keys: validation.keys },
+                ? { reason: 'rowsRemoved', worksheetOperationIndex: 0, keys: validation.keys }
+                : { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: validation.keys },
         };
     }
 
@@ -4578,8 +4578,8 @@ export function attach_viewer(
                 : { type: 'baseMismatch' as const, keys: Object.keys(worksheet.dirtyEdits) };
             if (validation.type === 'valid') continue;
             rejection = validation.type === 'removedRows'
-                ? { reason: 'rowsRemoved', keys: validation.keys }
-                : { reason: 'baseMismatch', keys: validation.keys };
+                ? { reason: 'rowsRemoved', worksheetOperationIndex: index, keys: validation.keys }
+                : { reason: 'baseMismatch', worksheetOperationIndex: index, keys: validation.keys };
             break;
         }
         if (rejection) {

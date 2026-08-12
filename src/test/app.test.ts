@@ -6264,7 +6264,7 @@ describe('edit mode save exit', () => {
                     }],
                 },
             },
-            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['4:1'] },
         });
 
         expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!)).toEqual({
@@ -6302,7 +6302,7 @@ describe('edit mode save exit', () => {
                     }],
                 },
             },
-            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['4:1'] },
         });
 
         // The real shell restores the submitted dirty map on a failed lifecycle and
@@ -6353,7 +6353,7 @@ describe('edit mode save exit', () => {
                     }],
                 },
             },
-            rejection: { reason: 'rowsRemoved', keys: ['7:0', '7:2'] },
+            rejection: { reason: 'rowsRemoved', worksheetOperationIndex: 0, keys: ['7:0', '7:2'] },
         });
 
         // The real shell restores the submitted dirty map on a failed lifecycle and
@@ -6403,7 +6403,7 @@ describe('edit mode save exit', () => {
                     }],
                 },
             },
-            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['4:1'] },
         });
 
         // The real shell restores the submitted dirty map on a failed lifecycle and
@@ -6426,10 +6426,65 @@ describe('edit mode save exit', () => {
         expect(grid_shell_mock.discard_keys).toHaveBeenCalledWith(['4:1']);
     });
 
-    it('scopes host save rejections to their worksheet', async () => {
+    it('scopes same-key host save rejections by worksheet operation ordinal', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(
             initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await enter_edit_mode(post_message);
+        const people_edits = { '4:1': { value: 'Bob', base: 'Alice' } };
+        const inventory_edits = { '4:1': { value: 'Gadget', base: 'stale' } };
+        await report_grid_editing(true, true, [], people_edits);
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 904,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-sheet-scope',
+                    worksheets: [
+                        {
+                            sheetIndex: 0,
+                            sheetName: 'People',
+                            edits: { '4:1': 'Bob' },
+                            dirtyEdits: people_edits,
+                        },
+                        {
+                            sheetIndex: 1,
+                            sheetName: 'Inventory',
+                            edits: { '4:1': 'Gadget' },
+                            dirtyEdits: inventory_edits,
+                        },
+                    ],
+                },
+            },
+            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 1, keys: ['4:1'] },
+        });
+        await report_grid_editing(true, true, [], people_edits);
+        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
+            .toEqual([]);
+        expect(document.querySelector('.conflict-banner')).toBeNull();
+
+        await click_sheet_tab('Inventory');
+        await report_grid_editing(true, true, ['4:1'], inventory_edits);
+        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
+            .toEqual(['4:1']);
+        expect(document.querySelector('.conflict-banner')).not.toBeNull();
+
+        await click_sheet_tab('People');
+        await report_grid_editing(true, true, [], people_edits);
+        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
+            .toEqual([]);
+    });
+
+    it('ignores a rejection whose worksheet operation ordinal is out of bounds', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
                 capabilities: { csvEditable: true, csvEditingSupported: true },
             })
         );
@@ -6440,35 +6495,25 @@ describe('edit mode save exit', () => {
             type: 'saveResult',
             success: false,
             lifecycle: {
-                revision: 904,
+                revision: 905,
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
-                    saveRequestId: 'save-sheet-scope',
+                    saveRequestId: 'save-invalid-ordinal',
                     worksheets: [{
                         sheetIndex: 0,
-                        sheetName: 'People',
                         edits: { '4:1': 'edited' },
                         dirtyEdits: edits,
                     }],
                 },
             },
-            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 1, keys: ['4:1'] },
         });
-        await report_grid_editing(true, true, ['4:1'], edits);
-        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
-            .toEqual(['4:1']);
-
-        await click_sheet_tab('Inventory');
         await report_grid_editing(true, true, [], edits);
+
+        expect(document.querySelector('.conflict-banner')).toBeNull();
         expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
             .toEqual([]);
-        expect(document.querySelector('.conflict-banner')).toBeNull();
-
-        await click_sheet_tab('People');
-        await report_grid_editing(true, true, ['4:1'], edits);
-        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
-            .toEqual(['4:1']);
     });
 
     it('clears host-named and derived conflicts in one press', async () => {
@@ -6505,7 +6550,7 @@ describe('edit mode save exit', () => {
                     }],
                 },
             },
-            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['4:1'] },
         });
         await report_grid_editing(true, true, ['4:1', '9:3'], {
             '4:1': { value: 'edited', base: 'stale' },
@@ -6552,7 +6597,7 @@ describe('edit mode save exit', () => {
                     }],
                 },
             },
-            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['4:1'] },
         });
 
         // The real shell restores the submitted dirty map on a failed lifecycle and
@@ -6610,7 +6655,7 @@ describe('edit mode save exit', () => {
                     }],
                 },
             },
-            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['4:1'] },
         });
         await report_grid_editing(true, true, [], {
             '4:1': { value: 'edited', base: 'stale' },
@@ -6670,7 +6715,7 @@ describe('edit mode save exit', () => {
                     }],
                 },
             },
-            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['4:1'] },
         });
         await report_grid_editing(true, true, [], {
             '4:1': { value: 'edited', base: 'stale' },
@@ -6732,7 +6777,7 @@ describe('edit mode save exit', () => {
                     }],
                 },
             },
-            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['4:1'] },
         });
         await report_grid_editing(true, true, [], {
             '4:1': { value: 'edited', base: 'stale' },
@@ -6801,7 +6846,7 @@ describe('edit mode save exit', () => {
                     }],
                 },
             },
-            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['4:1'] },
         });
         await report_grid_editing(true, true, [], {
             '4:1': { value: 'edited', base: 'stale' },
@@ -6869,7 +6914,7 @@ describe('edit mode save exit', () => {
                     }],
                 },
             },
-            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['4:1'] },
         });
         await report_grid_editing(true, true, [], {
             '4:1': { value: 'edited', base: 'stale' },
@@ -10165,7 +10210,7 @@ describe('stale-view banner', () => {
                     }],
                 },
             },
-            rejection: { reason: 'rowsRemoved', keys: ['7:1'] },
+            rejection: { reason: 'rowsRemoved', worksheetOperationIndex: 0, keys: ['7:1'] },
         });
         await report_grid_editing(true, true, [], removed);
 
