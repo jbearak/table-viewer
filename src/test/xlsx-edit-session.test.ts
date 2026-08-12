@@ -134,7 +134,11 @@ function latest_edit_session(panel: { __messages: unknown[] }) {
 
 function save_results(panel: { __messages: unknown[] }) {
     return panel.__messages.filter(
-        (message): message is { type: string; success: boolean } => (
+        (message): message is {
+            type: string;
+            success: boolean;
+            lifecycle: { operation: import('../types').CsvSaveOperation };
+        } => (
             typeof message === 'object'
             && message !== null
             && (message as { type?: unknown }).type === 'saveResult'
@@ -214,10 +218,12 @@ describe('xlsx edit sessions', () => {
                 type: 'saveCsv',
                 operation: {
                     editSessionId: session,
-                    sheetIndex: sheet_index,
                     saveRequestId: `invalid-sheet-${index}`,
-                    edits: { '1:0': 'Alicia' },
-                    dirtyEdits: { '1:0': { value: 'Alicia', base: 'Alice' } },
+                    worksheets: [{
+                        sheetIndex: sheet_index,
+                        edits: { '1:0': 'Alicia' },
+                        dirtyEdits: { '1:0': { value: 'Alicia', base: 'Alice' } },
+                    }],
                 },
             });
             await wait_for_observable(() => save_results(panel).length > result_count);
@@ -271,12 +277,14 @@ describe('xlsx edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session,
-                sheetIndex: 1,
-                sheetName: 'Inventory',
-                worksheetId: '2',
                 saveRequestId: 'save-1',
-                edits: { '1:0': 'Gadget' },
-                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                worksheets: [{
+                    sheetIndex: 1,
+                    sheetName: 'Inventory',
+                    worksheetId: '2',
+                    edits: { '1:0': 'Gadget' },
+                    dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                }],
             },
         });
         await wait_for_observable(() => save_results(panel).length > 0);
@@ -289,6 +297,86 @@ describe('xlsx edit sessions', () => {
         expect(after.data.sheets[0].rows[1][0]?.raw).toBe(people_before);
     });
 
+    it('writes and clears several worksheets as one atomic workbook save', async () => {
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                saveRequestId: 'save-workbook',
+                worksheets: [
+                    {
+                        sheetIndex: 0,
+                        sheetName: 'People',
+                        worksheetId: '1',
+                        edits: { '1:0': 'Alicia' },
+                        dirtyEdits: { '1:0': { value: 'Alicia', base: 'Alice' } },
+                    },
+                    {
+                        sheetIndex: 1,
+                        sheetName: 'Inventory',
+                        worksheetId: '2',
+                        edits: { '1:0': 'Gadget' },
+                        dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                    },
+                ],
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+
+        const after = await parse_xlsx(bytes);
+        expect(after.data.sheets[0].rows[1][0]?.raw).toBe('Alicia');
+        expect(after.data.sheets[1].rows[1][0]?.raw).toBe('Gadget');
+        await controller_of(panel).drain();
+        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
+    });
+
+    it('validates every worksheet before writing any workbook bytes', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const untouched = bytes;
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                saveRequestId: 'conflicted-workbook',
+                worksheets: [
+                    {
+                        sheetIndex: 0,
+                        sheetName: 'People',
+                        worksheetId: '1',
+                        edits: { '1:0': 'Alicia' },
+                        dirtyEdits: { '1:0': { value: 'Alicia', base: 'Alice' } },
+                    },
+                    {
+                        sheetIndex: 1,
+                        sheetName: 'Inventory',
+                        worksheetId: '2',
+                        edits: { '1:0': 'Gadget' },
+                        dirtyEdits: { '1:0': { value: 'Gadget', base: 'wrong' } },
+                    },
+                ],
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({
+            success: false,
+            rejection: { reason: 'baseMismatch' },
+        });
+        expect(bytes).toBe(untouched);
+        const after = await parse_xlsx(bytes);
+        expect(after.data.sheets[0].rows[1][0]?.raw).toBe('Alice');
+        expect(after.data.sheets[1].rows[1][0]?.raw).toBe('Widget');
+    });
+
     it('rejects an identity-less save for a multi-sheet workbook', async () => {
         const { panel, plan_save } = await open_with_plan_spy();
         await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
@@ -298,10 +386,12 @@ describe('xlsx edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session,
-                sheetIndex: 1,
                 saveRequestId: 'identity-less',
-                edits: { '1:0': 'Gadget' },
-                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                worksheets: [{
+                    sheetIndex: 1,
+                    edits: { '1:0': 'Gadget' },
+                    dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                }],
             },
         });
         await wait_for_observable(() => save_results(panel).length > 0);
@@ -350,12 +440,14 @@ describe('xlsx edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session,
-                sheetIndex: 0,
-                sheetName: 'People',
-                worksheetId: '1',
                 saveRequestId: 'save-1',
-                edits: { '1:0': 'Gadget' },
-                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                worksheets: [{
+                    sheetIndex: 0,
+                    sheetName: 'People',
+                    worksheetId: '1',
+                    edits: { '1:0': 'Gadget' },
+                    dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                }],
             },
         });
         await wait_for_observable(() => save_results(panel).length > 0);
@@ -399,12 +491,14 @@ describe('xlsx edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session,
-                sheetIndex: 1,
-                sheetName: 'Inventory',
-                worksheetId: '2',
                 saveRequestId: 'save-1',
-                edits: { '1:0': 'Gadget' },
-                dirtyEdits: { '1:0': { value: 'Gadget', base } },
+                worksheets: [{
+                    sheetIndex: 1,
+                    sheetName: 'Inventory',
+                    worksheetId: '2',
+                    edits: { '1:0': 'Gadget' },
+                    dirtyEdits: { '1:0': { value: 'Gadget', base } },
+                }],
             },
         });
         await wait_for_observable(() => save_results(panel).length > 0);
@@ -426,12 +520,14 @@ describe('xlsx edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session,
-                sheetIndex: 1,
-                sheetName: 'Inventory',
-                worksheetId: '2',
                 saveRequestId: 'save-1',
-                edits: { '1:0': 'Gadget' },
-                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Something else' } },
+                worksheets: [{
+                    sheetIndex: 1,
+                    sheetName: 'Inventory',
+                    worksheetId: '2',
+                    edits: { '1:0': 'Gadget' },
+                    dirtyEdits: { '1:0': { value: 'Gadget', base: 'Something else' } },
+                }],
             },
         });
         await wait_for_observable(() => save_results(panel).length > 0);
@@ -467,12 +563,14 @@ describe('xlsx edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session.editSessionId!,
-                sheetIndex: 1,
-                sheetName: 'Inventory',
-                worksheetId: '2',
                 saveRequestId: 'save-1',
-                edits: { '1:0': 'Gadget' },
-                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                worksheets: [{
+                    sheetIndex: 1,
+                    sheetName: 'Inventory',
+                    worksheetId: '2',
+                    edits: { '1:0': 'Gadget' },
+                    dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                }],
             },
         });
         await wait_for_observable(() => save_results(panel).length > 0);
@@ -539,12 +637,14 @@ describe('xlsx edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session,
-                sheetIndex: 1,
-                sheetName: 'Inventory',
-                worksheetId: '2',
                 saveRequestId: 'save-inventory',
-                edits: { '1:0': 'Gadget' },
-                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                worksheets: [{
+                    sheetIndex: 1,
+                    sheetName: 'Inventory',
+                    worksheetId: '2',
+                    edits: { '1:0': 'Gadget' },
+                    dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                }],
             },
         });
         await wait_for_observable(() => writing);
@@ -606,12 +706,14 @@ describe('xlsx edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session,
-                sheetIndex: 0,
-                sheetName: 'Inventory',
-                worksheetId: '2',
                 saveRequestId: 'save-1',
-                edits: { '1:0': 'Gadget' },
-                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                worksheets: [{
+                    sheetIndex: 0,
+                    sheetName: 'Inventory',
+                    worksheetId: '2',
+                    edits: { '1:0': 'Gadget' },
+                    dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                }],
             },
         });
         await wait_for_observable(() => save_results(panel).length > 0);
@@ -637,11 +739,13 @@ describe('xlsx edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session,
-                sheetIndex: 1,
-                sheetName: 'Inventory',
                 saveRequestId: 'stale-sheet-index',
-                edits: { '1:0': 'Gadget' },
-                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                worksheets: [{
+                    sheetIndex: 1,
+                    sheetName: 'Inventory',
+                    edits: { '1:0': 'Gadget' },
+                    dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                }],
             },
         });
         await wait_for_observable(() => save_results(panel).length > 0);
@@ -709,12 +813,14 @@ describe('xlsx edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session,
-                sheetIndex: 0,
-                sheetName: 'Inventory',
-                worksheetId: '2',
                 saveRequestId: 'save-1',
-                edits: { '1:0': 'Gadget' },
-                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                worksheets: [{
+                    sheetIndex: 0,
+                    sheetName: 'Inventory',
+                    worksheetId: '2',
+                    edits: { '1:0': 'Gadget' },
+                    dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                }],
             },
         });
         await wait_for_observable(() => save_results(panel).length > 0);
@@ -752,12 +858,14 @@ describe('xlsx edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session,
-                sheetIndex: 1,
-                sheetName: 'Inventory',
-                worksheetId: '2',
                 saveRequestId: 'save-1',
-                edits: { '1:0': 'Gadget' },
-                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                worksheets: [{
+                    sheetIndex: 1,
+                    sheetName: 'Inventory',
+                    worksheetId: '2',
+                    edits: { '1:0': 'Gadget' },
+                    dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                }],
             },
         });
         await wait_for_observable(() => save_results(panel).length > 0);
@@ -923,12 +1031,14 @@ describe('xlsx edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session,
-                sheetIndex: 0,
-                sheetName: 'People',
-                worksheetId: '1',
                 saveRequestId: 'save-1',
-                edits: { '1:0': 'Gadget' },
-                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Alice' } },
+                worksheets: [{
+                    sheetIndex: 0,
+                    sheetName: 'People',
+                    worksheetId: '1',
+                    edits: { '1:0': 'Gadget' },
+                    dirtyEdits: { '1:0': { value: 'Gadget', base: 'Alice' } },
+                }],
             },
         });
         await wait_for_observable(() => save_results(panel).length > 0);
@@ -1106,12 +1216,14 @@ describe('xlsx edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session,
-                sheetIndex: 1,
-                sheetName: 'Inventory',
-                worksheetId: '2',
                 saveRequestId: 'save-inventory',
-                edits: { '1:0': 'Gadget' },
-                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                worksheets: [{
+                    sheetIndex: 1,
+                    sheetName: 'Inventory',
+                    worksheetId: '2',
+                    edits: { '1:0': 'Gadget' },
+                    dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                }],
             },
         });
         await wait_for_observable(() => save_results(panel).length > 0);
@@ -1159,11 +1271,13 @@ describe('xlsx edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session,
-                sheetIndex: 1,
-                sheetName: 'Inventory',
                 saveRequestId: 'save-1',
-                edits: { '1:0': 'Gadget' },
-                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                worksheets: [{
+                    sheetIndex: 1,
+                    sheetName: 'Inventory',
+                    edits: { '1:0': 'Gadget' },
+                    dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                }],
             },
         });
         await wait_for_observable(() => save_results(panel).length > 0);
@@ -1171,14 +1285,11 @@ describe('xlsx edit sessions', () => {
             typeof message === 'object'
             && message !== null
             && (message as { type?: unknown }).type === 'saveOperationStarted'
-        )) as { lifecycle: { operation: { worksheetId?: string } } };
-        const failed = save_results(panel).at(-1) as unknown as {
-            success: boolean;
-            lifecycle: { operation: { worksheetId?: string } };
-        };
-        expect(started.lifecycle.operation.worksheetId).toBeUndefined();
+        )) as { lifecycle: { operation: import('../types').CsvSaveOperation } };
+        const failed = save_results(panel).at(-1)!;
+        expect(started.lifecycle.operation.worksheets[0].worksheetId).toBeUndefined();
         expect(failed).toMatchObject({ success: false });
-        expect(failed.lifecycle.operation.worksheetId).toBeUndefined();
+        expect(failed.lifecycle.operation.worksheets[0].worksheetId).toBeUndefined();
         expect(state.get_state(file_path).pendingEdits?.[1]).toEqual({
             sheetName: 'Inventory',
             worksheetId: '2',
@@ -1214,11 +1325,13 @@ describe('xlsx edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session,
-                sheetIndex: 1,
-                sheetName: 'Inventory',
                 saveRequestId: 'name-only-success',
-                edits: { '1:0': 'Gadget' },
-                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                worksheets: [{
+                    sheetIndex: 1,
+                    sheetName: 'Inventory',
+                    edits: { '1:0': 'Gadget' },
+                    dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                }],
             },
         });
         await wait_for_observable(() => save_results(panel).length > 0);
@@ -1255,12 +1368,14 @@ describe('xlsx edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session,
-                sheetIndex: 1,
-                sheetName: 'Inventory',
-                worksheetId: '2',
                 saveRequestId: 'save-1',
-                edits: { '1:0': 'Gadget' },
-                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                worksheets: [{
+                    sheetIndex: 1,
+                    sheetName: 'Inventory',
+                    worksheetId: '2',
+                    edits: { '1:0': 'Gadget' },
+                    dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                }],
             },
         });
         await wait_for_observable(() => save_results(panel).length > 0);
@@ -1272,12 +1387,14 @@ describe('xlsx edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: latest_snapshot(panel).capabilities.csvEditSessionId ?? session,
-                sheetIndex: 0,
-                sheetName: 'Inventory',
-                worksheetId: '2',
                 saveRequestId: 'save-2',
-                edits: { '1:0': 'Gadget' },
-                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                worksheets: [{
+                    sheetIndex: 0,
+                    sheetName: 'Inventory',
+                    worksheetId: '2',
+                    edits: { '1:0': 'Gadget' },
+                    dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                }],
             },
         });
         await wait_for_observable(() => save_results(panel).length > before);
@@ -1354,12 +1471,14 @@ describe('xlsx edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session,
-                sheetIndex: 1,
-                sheetName: 'Inventory',
-                worksheetId: '2',
                 saveRequestId: 'save-1',
-                edits: { '1:0': 'Gadget' },
-                dirtyEdits: failed,
+                worksheets: [{
+                    sheetIndex: 1,
+                    sheetName: 'Inventory',
+                    worksheetId: '2',
+                    edits: { '1:0': 'Gadget' },
+                    dirtyEdits: failed,
+                }],
             },
         });
         await wait_for_observable(() => save_results(panel).length > 0);
@@ -1415,12 +1534,14 @@ describe('xlsx edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session,
-                sheetIndex: 1,
-                sheetName: 'Inventory',
-                worksheetId: '2',
                 saveRequestId: 'save-1',
-                edits: { '1:0': 'Gadget' },
-                dirtyEdits: failed,
+                worksheets: [{
+                    sheetIndex: 1,
+                    sheetName: 'Inventory',
+                    worksheetId: '2',
+                    edits: { '1:0': 'Gadget' },
+                    dirtyEdits: failed,
+                }],
             },
         });
         await wait_for_observable(() => save_results(panel).length > 0);
@@ -1481,12 +1602,14 @@ describe('xlsx edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session,
-                sheetIndex: 1,
-                sheetName: 'Inventory',
-                worksheetId: '2',
                 saveRequestId: 'save-1',
-                edits: { '1:0': 'Gadget' },
-                dirtyEdits: saved,
+                worksheets: [{
+                    sheetIndex: 1,
+                    sheetName: 'Inventory',
+                    worksheetId: '2',
+                    edits: { '1:0': 'Gadget' },
+                    dirtyEdits: saved,
+                }],
             },
         });
         await wait_for_observable(() => writing);
@@ -1547,12 +1670,14 @@ describe('xlsx edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session,
-                sheetIndex: 1,
-                sheetName: 'Inventory',
-                worksheetId: '2',
                 saveRequestId: 'save-1',
-                edits: { '1:0': 'Gadget' },
-                dirtyEdits: failed,
+                worksheets: [{
+                    sheetIndex: 1,
+                    sheetName: 'Inventory',
+                    worksheetId: '2',
+                    edits: { '1:0': 'Gadget' },
+                    dirtyEdits: failed,
+                }],
             },
         });
         await wait_for_observable(() => save_results(panel).length > 0);
@@ -1636,12 +1761,14 @@ describe('xlsx edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session,
-                sheetIndex: 1,
-                sheetName: 'Inventory',
-                worksheetId: '2',
                 saveRequestId: 'save-1',
-                edits: { '1:0': 'Gadget', '2:0': 'Shared' },
-                dirtyEdits: failed,
+                worksheets: [{
+                    sheetIndex: 1,
+                    sheetName: 'Inventory',
+                    worksheetId: '2',
+                    edits: { '1:0': 'Gadget', '2:0': 'Shared' },
+                    dirtyEdits: failed,
+                }],
             },
         });
         await wait_for_observable(() => save_results(panel).length > 0);
@@ -1705,12 +1832,14 @@ describe('xlsx edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session,
-                sheetIndex: 1,
-                sheetName: 'Inventory',
-                worksheetId: '2',
                 saveRequestId: 'save-1',
-                edits: { '1:0': 'Gadget' },
-                dirtyEdits: failed,
+                worksheets: [{
+                    sheetIndex: 1,
+                    sheetName: 'Inventory',
+                    worksheetId: '2',
+                    edits: { '1:0': 'Gadget' },
+                    dirtyEdits: failed,
+                }],
             },
         });
         await wait_for_observable(() => save_results(panel).length > 0);
@@ -2080,12 +2209,14 @@ describe('xlsx edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session,
-                sheetIndex: 1,
-                sheetName: 'Inventory',
-                worksheetId: '2',
                 saveRequestId: 'save-1',
-                edits: { '1:0': 'Gadget' },
-                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                worksheets: [{
+                    sheetIndex: 1,
+                    sheetName: 'Inventory',
+                    worksheetId: '2',
+                    edits: { '1:0': 'Gadget' },
+                    dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                }],
             },
         });
         await wait_for_observable(() => save_results(panel).length > 0);
