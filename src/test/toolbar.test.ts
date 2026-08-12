@@ -14,21 +14,12 @@ let container: HTMLDivElement | null = null;
 
 function render_toolbar(props?: Partial<React.ComponentProps<typeof Toolbar>>) {
     const on_toggle_formatting = vi.fn();
-    const on_toggle_tab_orientation = vi.fn();
 
     container = document.createElement('div');
     document.body.appendChild(container);
     root = createRoot(container);
 
     const merged_props: React.ComponentProps<typeof Toolbar> = {
-        transform: { sort: [], filters: [] },
-        transform_disabled: false,
-        transform_pending: false,
-        column_names: ['Name', 'Value'],
-        merges_flattened: false,
-        on_transform_change: vi.fn(),
-        on_edit_filter: vi.fn(),
-        on_cancel_transform: vi.fn(),
         show_formatting: true,
         on_toggle_formatting,
         show_formatting_button: true,
@@ -37,9 +28,6 @@ function render_toolbar(props?: Partial<React.ComponentProps<typeof Toolbar>>) {
         excel_header_automatic: false,
         excel_header_pending: false,
         on_toggle_excel_header: vi.fn(),
-        vertical_tabs: false,
-        on_toggle_tab_orientation,
-        show_vertical_tabs_button: true,
         column_visibility: {
             column_count: 2,
             get_column_name: (source_index) => ['Name', 'Value'][source_index] ?? '',
@@ -67,7 +55,6 @@ function render_toolbar(props?: Partial<React.ComponentProps<typeof Toolbar>>) {
     return {
         container,
         on_toggle_formatting,
-        on_toggle_tab_orientation,
         rerender(next_props?: Partial<React.ComponentProps<typeof Toolbar>>) {
             act(() => {
                 root!.render(React.createElement(Toolbar, {
@@ -94,12 +81,11 @@ describe('toolbar toggle colors', () => {
         );
     });
 
-    it('spaces the scope divider with padding so wrap measurement counts it', () => {
-        // `intrinsic_width_px` measures children by `scrollWidth`, which counts
-        // padding but not margin. Spacing the rule with margin spent width the
-        // wrap calculation never saw, so the toolbar stayed unwrapped a few pixels
-        // past the point it should have and scrolled the action strip instead.
-        // Asserted against the stylesheet because jsdom computes no layout.
+    it('paints the scope divider as a 1px rule despite its spacing', () => {
+        // The rule carries breathing room on top of the action row's gap so it reads
+        // as a boundary rather than one more crowded item. That room is padding, so
+        // without clipping the background to the content box the 1px line would paint
+        // 5px wide. Asserted against the stylesheet because jsdom computes no layout.
         const css = readFileSync(
             resolve(process.cwd(), 'src/webview/styles.css'),
             'utf8',
@@ -108,9 +94,6 @@ describe('toolbar toggle colors', () => {
         const rule = /\.toolbar-actions-divider\s*\{([^}]*)\}/.exec(css)?.[1];
         expect(rule).toBeDefined();
         expect(rule).toMatch(/padding:\s*0\s+2px/);
-        expect(rule).not.toMatch(/(^|[^-])margin/);
-        // The padding would otherwise paint as part of the rule, widening a 1px
-        // line to 5px.
         expect(rule).toMatch(/background-clip:\s*content-box/);
         expect(rule).toMatch(/box-sizing:\s*content-box/);
     });
@@ -202,21 +185,6 @@ describe('Toolbar', () => {
         expect(event.defaultPrevented).toBe(true);
     });
 
-    it('shows hidden row count and invokes Unhide all', () => {
-        const on_unhide_all = vi.fn();
-        const { container, rerender } = render_toolbar({
-            hidden_rows: { count: 0, pending: false, on_unhide_all },
-        });
-        expect(container.textContent).not.toContain('hidden row');
-
-        rerender({
-            hidden_rows: { count: 2, pending: false, on_unhide_all },
-        });
-        expect(container.textContent).toContain('2 hidden rows');
-        dispatch_mouse_event(get_button('Unhide all'), 'click');
-        expect(on_unhide_all).toHaveBeenCalledOnce();
-    });
-
     it('orders actions workbook scope first, then worksheet scope', () => {
         const { container } = render_toolbar({
             show_edit_button: true,
@@ -226,9 +194,8 @@ describe('Toolbar', () => {
         expect(get_action_labels(container)).toEqual([
             'Edit',
             'Formatting',
-            'Vertical Tabs',
             '|',
-            'First Row as Header',
+            'Header Row',
             'Columns',
             'Auto-fit Columns',
         ]);
@@ -247,7 +214,6 @@ describe('Toolbar', () => {
         // a rule there would be a stray leading line.
         const { container } = render_toolbar({
             show_formatting_button: false,
-            show_vertical_tabs_button: false,
         });
 
         expect(container.querySelector('.toolbar-actions-divider')).toBeNull();
@@ -256,175 +222,124 @@ describe('Toolbar', () => {
     });
 
     it('keeps the divider when only one workbook-scoped action is shown', () => {
+        // The expected state now that tab orientation moved to the sheet tabs (#154):
+        // Edit is usually alone on the workbook side, and the rule still belongs there.
         const { container } = render_toolbar({
             show_formatting_button: false,
-            show_vertical_tabs_button: true,
+            show_edit_button: true,
         });
 
         expect(get_action_labels(container))
-            .toEqual(['Vertical Tabs', '|', 'Columns', 'Auto-fit Columns']);
+            .toEqual(['Edit', '|', 'Columns', 'Auto-fit Columns']);
     });
 
     it('divides the two groups for every combination of optional actions', () => {
         // The divider follows from whether the workbook group rendered anything, so
-        // it must sit at exactly the group boundary in all eight combinations —
+        // it must sit at exactly the group boundary in all four combinations —
         // including the two where only one workbook action is visible, which a
-        // hand-written condition is most likely to get wrong. Edit varies too and
-        // now belongs to the workbook group, including when it is the only action
-        // before the rule.
+        // hand-written condition is most likely to get wrong.
         for (const show_edit_button of [false, true]) {
             for (const show_formatting_button of [false, true]) {
-                for (const show_vertical_tabs_button of [false, true]) {
-                    const { container } = render_toolbar({
-                        show_edit_button,
-                        show_formatting_button,
-                        show_vertical_tabs_button,
-                        show_excel_header_button: true,
-                    });
-                    const labels = get_action_labels(container);
-                    const workbook_count = [
-                        show_edit_button,
-                        show_formatting_button,
-                        show_vertical_tabs_button,
-                    ].filter(Boolean).length;
+                const { container } = render_toolbar({
+                    show_edit_button,
+                    show_formatting_button,
+                    show_excel_header_button: true,
+                });
+                const labels = get_action_labels(container);
+                const workbook_count = [
+                    show_edit_button,
+                    show_formatting_button,
+                ].filter(Boolean).length;
 
-                    if (workbook_count === 0) {
-                        expect(labels).not.toContain('|');
-                    } else {
-                        // One rule, at the boundary: every workbook action before it
-                        // and every worksheet action after it.
-                        expect(labels.filter((label) => label === '|')).toHaveLength(1);
-                        expect(labels.indexOf('|')).toBe(workbook_count);
-                        expect(labels.slice(0, workbook_count)).toEqual([
-                            ...(show_edit_button ? ['Edit'] : []),
-                            ...(show_formatting_button ? ['Formatting'] : []),
-                            ...(show_vertical_tabs_button ? ['Vertical Tabs'] : []),
-                        ]);
-                        expect(labels.slice(workbook_count + 1)).toEqual([
-                            'First Row as Header',
-                            'Columns',
-                            'Auto-fit Columns',
-                        ]);
-                    }
-                    cleanup();
+                if (workbook_count === 0) {
+                    expect(labels).not.toContain('|');
+                } else {
+                    // One rule, at the boundary: every workbook action before it
+                    // and every worksheet action after it.
+                    expect(labels.filter((label) => label === '|')).toHaveLength(1);
+                    expect(labels.indexOf('|')).toBe(workbook_count);
+                    expect(labels.slice(0, workbook_count)).toEqual([
+                        ...(show_edit_button ? ['Edit'] : []),
+                        ...(show_formatting_button ? ['Formatting'] : []),
+                    ]);
+                    expect(labels.slice(workbook_count + 1)).toEqual([
+                        'Header Row',
+                        'Columns',
+                        'Auto-fit Columns',
+                    ]);
                 }
+                cleanup();
             }
         }
     });
 
-    it('does not show the Sort/filter raw-values pill when idle', () => {
-        const { container } = render_toolbar({
-            transform: { sort: [], filters: [] },
-        });
+    it('holds no view state: sort, filter, and progress live in the state strip', () => {
+        // The toolbar is actions only since #154. Nothing here should render a chip
+        // or a progress badge regardless of what the sheet's transform is doing.
+        const { container } = render_toolbar();
+
         expect(container.querySelector('.sort-strip')).toBeNull();
         expect(container.querySelector('.filter-strip')).toBeNull();
-        expect(container.querySelector('.toolbar-transform-semantics')).toBeNull();
-        expect(container.querySelector('[role="note"]')).toBeNull();
-        expect(container.querySelector('[role="toolbar"]')?.getAttribute('aria-describedby'))
-            .toBeNull();
-        expect(container.textContent).not.toContain('Sort/filter: raw values');
-        expect(container.textContent).not.toContain(
-            'Sorting and filtering use raw cell values, not formatted display text.',
-        );
-    });
-
-    it('does not include removed raw-value chrome in chip-width wrapping', () => {
-        const scroll_width = Object.getOwnPropertyDescriptor(
-            HTMLElement.prototype,
-            'scrollWidth',
-        );
-        const client_width = Object.getOwnPropertyDescriptor(
-            HTMLElement.prototype,
-            'clientWidth',
-        );
-        Object.defineProperty(HTMLElement.prototype, 'scrollWidth', {
-            configurable: true,
-            get(this: HTMLElement) {
-                if (this.classList.contains('toolbar-item')) return 50;
-                return 0;
-            },
-        });
-        Object.defineProperty(HTMLElement.prototype, 'clientWidth', {
-            configurable: true,
-            get(this: HTMLElement) {
-                return this.classList.contains('toolbar') ? 400 : 0;
-            },
-        });
-        try {
-            const { container } = render_toolbar({
-                transform: { sort: [], filters: [] },
-            });
-            expect(container.querySelector('.toolbar-transform-semantics')).toBeNull();
-            expect(container.querySelector('.toolbar')?.classList.contains('is-wrapped'))
-                .toBe(false);
-        } finally {
-            if (scroll_width) {
-                Object.defineProperty(HTMLElement.prototype, 'scrollWidth', scroll_width);
-            } else {
-                Reflect.deleteProperty(HTMLElement.prototype, 'scrollWidth');
-            }
-            if (client_width) {
-                Object.defineProperty(HTMLElement.prototype, 'clientWidth', client_width);
-            } else {
-                Reflect.deleteProperty(HTMLElement.prototype, 'clientWidth');
-            }
-        }
+        expect(container.querySelector('.state-strip')).toBeNull();
+        expect(container.querySelector('.toolbar-progress')).toBeNull();
+        expect(container.textContent).not.toContain('hidden row');
+        expect(container.textContent).not.toContain('Merged cells shown unmerged');
     });
 
     it('keeps the existing button labels and removes native title tooltips', () => {
         render_toolbar();
 
         const formatting = get_button('Formatting');
-        const vertical_tabs = get_button('Vertical Tabs');
+        const auto_fit = get_button('Auto-fit Columns');
 
         expect(formatting.textContent).toBe('Formatting');
-        expect(vertical_tabs.textContent).toBe('Vertical Tabs');
+        expect(auto_fit.textContent).toBe('Auto-fit Columns');
         expect(formatting.getAttribute('title')).toBeNull();
-        expect(vertical_tabs.getAttribute('title')).toBeNull();
+        expect(auto_fit.getAttribute('title')).toBeNull();
     });
 
     it('shows state-aware tooltip text on hover and hides it on mouseout', () => {
         render_toolbar({
             show_formatting: true,
-            vertical_tabs: false,
+            auto_fit_active: false,
         });
 
         const formatting = get_button('Formatting');
         dispatch_mouse_event(formatting, 'mouseover');
-        expect(get_tooltip()?.textContent).toBe('Show raw cell values.');
+        expect(get_tooltip()?.textContent).toBe('Show raw cell values on this sheet.');
         dispatch_mouse_event(formatting, 'mouseout');
         expect(get_tooltip()).toBeNull();
 
-        const vertical_tabs = get_button('Vertical Tabs');
-        dispatch_mouse_event(vertical_tabs, 'mouseover');
-        expect(get_tooltip()?.textContent).toBe('Move sheet tabs to the left of the table.');
-        dispatch_mouse_event(vertical_tabs, 'mouseout');
+        const auto_fit = get_button('Auto-fit Columns');
+        dispatch_mouse_event(auto_fit, 'mouseover');
+        expect(get_tooltip()?.textContent).toBe('Auto-fit all columns to their content on this sheet.');
+        dispatch_mouse_event(auto_fit, 'mouseout');
         expect(get_tooltip()).toBeNull();
     });
 
     it('shows state-aware tooltip text on focus and hides it on blur', () => {
         render_toolbar({
             show_formatting: false,
-            vertical_tabs: true,
+            auto_fit_active: true,
         });
 
         const formatting = get_button('Formatting');
         act(() => {
             formatting.focus();
         });
-        expect(get_tooltip()?.textContent).toBe('Show formatted cell values.');
+        expect(get_tooltip()?.textContent).toBe('Show formatted cell values on this sheet.');
         act(() => {
             formatting.blur();
         });
         expect(get_tooltip()).toBeNull();
 
-        const vertical_tabs = get_button('Vertical Tabs');
+        const auto_fit = get_button('Auto-fit Columns');
         act(() => {
-            vertical_tabs.focus();
+            auto_fit.focus();
         });
-        expect(get_tooltip()?.textContent).toBe('Move sheet tabs above the table.');
+        expect(get_tooltip()?.textContent).toBe('Restore original column widths on this sheet.');
         act(() => {
-            vertical_tabs.blur();
+            auto_fit.blur();
         });
         expect(get_tooltip()).toBeNull();
     });
@@ -438,7 +353,7 @@ describe('Toolbar', () => {
         });
         dispatch_mouse_event(formatting, 'mouseover');
         dispatch_mouse_event(formatting, 'mouseout');
-        expect(get_tooltip()?.textContent).toBe('Show raw cell values.');
+        expect(get_tooltip()?.textContent).toBe('Show raw cell values on this sheet.');
 
         act(() => {
             formatting.blur();
@@ -455,7 +370,7 @@ describe('Toolbar', () => {
             on_toggle_excel_header,
         });
 
-        const button = get_button('First Row as Header');
+        const button = get_button('Header Row');
         expect(button.classList.contains('active')).toBe(true);
         expect(button.getAttribute('aria-pressed')).toBe('true');
         dispatch_mouse_event(button, 'mouseover');
@@ -477,7 +392,7 @@ describe('Toolbar', () => {
             on_toggle_excel_header,
         });
 
-        const button = get_button('First Row as Header');
+        const button = get_button('Header Row');
         act(() => button.focus());
         expect(document.activeElement).toBe(button);
         expect(button.disabled).toBe(false);
@@ -498,7 +413,7 @@ describe('Toolbar', () => {
             excel_header_disabled_reason: 'Clear sorting and filters first.',
         });
 
-        const button = get_button('First Row as Header');
+        const button = get_button('Header Row');
         expect(button.disabled).toBe(false);
         expect(button.getAttribute('aria-disabled')).toBe('true');
         const wrapper = button.closest<HTMLElement>('.toolbar-item')!;
@@ -559,7 +474,7 @@ describe('Toolbar', () => {
         expect(auto_fit.classList.contains('active')).toBe(true);
 
         dispatch_mouse_event(auto_fit, 'mouseover');
-        expect(get_tooltip()?.textContent).toBe('Restore original column widths.');
+        expect(get_tooltip()?.textContent).toBe('Restore original column widths on this sheet.');
     });
 
     it('shows correct tooltip when auto-fit is inactive', () => {
@@ -571,7 +486,7 @@ describe('Toolbar', () => {
         const auto_fit = get_button('Auto-fit Columns');
         dispatch_mouse_event(auto_fit, 'mouseover');
         expect(get_tooltip()?.textContent).toBe(
-            'Auto-fit all columns to their content.'
+            'Auto-fit all columns to their content on this sheet.'
         );
     });
 
@@ -611,315 +526,6 @@ describe('Toolbar', () => {
             formatting.click();
         });
         expect(get_tooltip()).toBeNull();
-    });
-
-    it('composes hidden-column transform chips, progress, cancel, and actions', () => {
-        const on_cancel_transform = vi.fn();
-        const { container } = render_toolbar({
-            column_names: ['Visible', 'Hidden active'],
-            transform: {
-                sort: [{ colIndex: 1, direction: 'asc' }],
-                filters: [{
-                    id: 'f',
-                    colIndex: 1,
-                    operator: 'equals',
-                    value: '0',
-                    caseSensitive: false,
-                    enabled: false,
-                }],
-            },
-            transform_pending: true,
-            transform_progress: 'Applying saved…',
-            merges_flattened: true,
-            on_cancel_transform,
-        });
-        expect(container.textContent).not.toMatch(/\d+ of \d+ rows/);
-        expect(container.textContent).toContain('Hidden active');
-        expect(container.textContent).toContain('Applying saved…');
-        expect(container.textContent).toContain('Merged cells shown unmerged');
-        expect(get_button('Formatting')).toBeDefined();
-        expect(get_button('Cancel')).toBeDefined();
-        act(() => get_button('Cancel').click());
-        expect(on_cancel_transform).toHaveBeenCalledOnce();
-        expect((container.querySelector('.sort-chip') as HTMLButtonElement).disabled).toBe(false);
-        expect(container.querySelector('.sort-chip')?.getAttribute('aria-disabled')).toBe('true');
-        expect((container.querySelector('.filter-chip-body') as HTMLButtonElement).disabled).toBe(false);
-        expect(container.querySelector('.filter-chip-body')?.getAttribute('aria-disabled')).toBe('true');
-    });
-
-    it('keeps sort, filter, merge notice, and actions reachable in a narrow wrap', () => {
-        const scroll_width = Object.getOwnPropertyDescriptor(
-            HTMLElement.prototype,
-            'scrollWidth',
-        );
-        const client_width = Object.getOwnPropertyDescriptor(
-            HTMLElement.prototype,
-            'clientWidth',
-        );
-        Object.defineProperty(HTMLElement.prototype, 'scrollWidth', {
-            configurable: true,
-            get(this: HTMLElement) {
-                if (this.classList.contains('sort-strip')) return 210;
-                if (this.classList.contains('filter-strip')) return 240;
-                if (this.classList.contains('toolbar-merge-notice')) return 360;
-                if (this.classList.contains('toolbar-item')) return 90;
-                return 0;
-            },
-        });
-        Object.defineProperty(HTMLElement.prototype, 'clientWidth', {
-            configurable: true,
-            get(this: HTMLElement) {
-                return this.classList.contains('toolbar') ? 420 : 0;
-            },
-        });
-        const style = document.createElement('style');
-        style.textContent = readFileSync(
-            resolve(process.cwd(), 'src/webview/styles.css'),
-            'utf8',
-        );
-        document.head.appendChild(style);
-        try {
-            const { container } = render_toolbar({
-                transform: {
-                    sort: [{ colIndex: 0, direction: 'asc' }],
-                    filters: [{
-                        id: 'f', colIndex: 1, operator: 'contains', value: 'needle',
-                        caseSensitive: false, enabled: true,
-                    }],
-                },
-                merges_flattened: true,
-            });
-            const toolbar = container.querySelector('.toolbar') as HTMLElement;
-            const chips = container.querySelector('.toolbar-chips') as HTMLElement;
-            const sort = container.querySelector('.sort-strip') as HTMLElement;
-            const filter = container.querySelector('.filter-strip') as HTMLElement;
-            const notice = container.querySelector('.toolbar-merge-notice') as HTMLElement;
-            const actions = container.querySelector('.toolbar-actions') as HTMLElement;
-
-            expect(toolbar.classList.contains('is-wrapped')).toBe(true);
-            expect(container.querySelector('.toolbar-transform-semantics')).toBeNull();
-            expect(getComputedStyle(chips).flexWrap).toBe('wrap');
-            expect(getComputedStyle(chips).overflow).toBe('visible');
-            expect(getComputedStyle(sort).flexShrink).toBe('1');
-            expect(getComputedStyle(filter).flexShrink).toBe('1');
-            expect(getComputedStyle(sort).minWidth).not.toBe('0px');
-            expect(getComputedStyle(filter).minWidth).not.toBe('0px');
-            expect(getComputedStyle(notice).flexShrink).toBe('1');
-            expect(getComputedStyle(notice).whiteSpace).toBe('normal');
-            expect(getComputedStyle(notice).overflowWrap).toBe('anywhere');
-            expect(getComputedStyle(actions).maxWidth).toBe('100%');
-            expect(getComputedStyle(actions).overflowX).toBe('auto');
-            expect(getComputedStyle(actions.firstElementChild as HTMLElement).marginLeft)
-                .toBe('auto');
-            expect(getComputedStyle(actions).justifyContent).toBe('');
-            expect(container.querySelector('.sort-chip')).not.toBeNull();
-            expect(container.querySelector('.filter-chip-body')).not.toBeNull();
-            expect(get_button('Formatting')).toBeDefined();
-            expect(get_button('Auto-fit Columns')).toBeDefined();
-        } finally {
-            style.remove();
-            if (scroll_width) {
-                Object.defineProperty(HTMLElement.prototype, 'scrollWidth', scroll_width);
-            } else {
-                Reflect.deleteProperty(HTMLElement.prototype, 'scrollWidth');
-            }
-            if (client_width) {
-                Object.defineProperty(HTMLElement.prototype, 'clientWidth', client_width);
-            } else {
-                Reflect.deleteProperty(HTMLElement.prototype, 'clientWidth');
-            }
-        }
-    });
-
-    it('remeasures wrapping when pending progress text changes', () => {
-        const scroll_width = Object.getOwnPropertyDescriptor(
-            HTMLElement.prototype,
-            'scrollWidth',
-        );
-        const client_width = Object.getOwnPropertyDescriptor(
-            HTMLElement.prototype,
-            'clientWidth',
-        );
-        Object.defineProperty(HTMLElement.prototype, 'scrollWidth', {
-            configurable: true,
-            get(this: HTMLElement) {
-                if (this.classList.contains('toolbar-progress')) {
-                    return this.textContent?.includes('A much longer pending progress label')
-                        ? 700
-                        : 100;
-                }
-                return 0;
-            },
-        });
-        Object.defineProperty(HTMLElement.prototype, 'clientWidth', {
-            configurable: true,
-            get(this: HTMLElement) {
-                return this.classList.contains('toolbar') ? 500 : 0;
-            },
-        });
-        const rendered = render_toolbar({
-            transform_pending: true,
-            transform_progress: 'Short',
-        });
-        expect(rendered.container.querySelector('.toolbar')?.classList.contains('is-wrapped'))
-            .toBe(false);
-        rendered.rerender({
-            transform_pending: true,
-            transform_progress: 'A much longer pending progress label',
-        });
-        expect(rendered.container.querySelector('.toolbar')?.classList.contains('is-wrapped'))
-            .toBe(true);
-        if (scroll_width) {
-            Object.defineProperty(HTMLElement.prototype, 'scrollWidth', scroll_width);
-        } else {
-            Reflect.deleteProperty(HTMLElement.prototype, 'scrollWidth');
-        }
-        if (client_width) {
-            Object.defineProperty(HTMLElement.prototype, 'clientWidth', client_width);
-        } else {
-            Reflect.deleteProperty(HTMLElement.prototype, 'clientWidth');
-        }
-    });
-
-    it('remeasures wrapping when one group action is swapped for another', () => {
-        // A swap inside one group — Formatting going as Vertical Tabs arrives — is
-        // the case a membership *count* cannot see: the group still renders one
-        // action, so a length-keyed dependency never changes and the row keeps a
-        // wrapped state measured against a button that is no longer there.
-        const scroll_width = Object.getOwnPropertyDescriptor(
-            HTMLElement.prototype,
-            'scrollWidth',
-        );
-        const client_width = Object.getOwnPropertyDescriptor(
-            HTMLElement.prototype,
-            'clientWidth',
-        );
-        Object.defineProperty(HTMLElement.prototype, 'scrollWidth', {
-            configurable: true,
-            get(this: HTMLElement) {
-                if (this.classList.contains('toolbar-item')) {
-                    return this.textContent === 'Vertical Tabs' ? 600 : 100;
-                }
-                return 0;
-            },
-        });
-        Object.defineProperty(HTMLElement.prototype, 'clientWidth', {
-            configurable: true,
-            get(this: HTMLElement) {
-                return this.classList.contains('toolbar') ? 500 : 0;
-            },
-        });
-        try {
-            const rendered = render_toolbar({
-                // A chip is required for wrapping to be considered at all.
-                transform_pending: true,
-                transform_progress: 'Short',
-                show_formatting_button: true,
-                show_vertical_tabs_button: false,
-            });
-            expect(rendered.container.querySelector('.toolbar')?.classList.contains('is-wrapped'))
-                .toBe(false);
-
-            rendered.rerender({
-                transform_pending: true,
-                transform_progress: 'Short',
-                show_formatting_button: false,
-                show_vertical_tabs_button: true,
-            });
-            expect(get_action_labels(rendered.container))
-                .toEqual(['Vertical Tabs', '|', 'Columns', 'Auto-fit Columns']);
-            expect(rendered.container.querySelector('.toolbar')?.classList.contains('is-wrapped'))
-                .toBe(true);
-        } finally {
-            if (scroll_width) {
-                Object.defineProperty(HTMLElement.prototype, 'scrollWidth', scroll_width);
-            } else {
-                Reflect.deleteProperty(HTMLElement.prototype, 'scrollWidth');
-            }
-            if (client_width) {
-                Object.defineProperty(HTMLElement.prototype, 'clientWidth', client_width);
-            } else {
-                Reflect.deleteProperty(HTMLElement.prototype, 'clientWidth');
-            }
-        }
-    });
-
-    it('keeps Highlight on the first toolbar row when sort and filter chips wrap', () => {
-        const scroll_width = Object.getOwnPropertyDescriptor(
-            HTMLElement.prototype,
-            'scrollWidth',
-        );
-        const client_width = Object.getOwnPropertyDescriptor(
-            HTMLElement.prototype,
-            'clientWidth',
-        );
-        Object.defineProperty(HTMLElement.prototype, 'scrollWidth', {
-            configurable: true,
-            get(this: HTMLElement) {
-                if (this.classList.contains('sort-strip')) return 210;
-                if (this.classList.contains('filter-strip')) return 240;
-                if (this.classList.contains('toolbar-item')) return 90;
-                return 0;
-            },
-        });
-        Object.defineProperty(HTMLElement.prototype, 'clientWidth', {
-            configurable: true,
-            get(this: HTMLElement) {
-                return this.classList.contains('toolbar') ? 420 : 0;
-            },
-        });
-        const style = document.createElement('style');
-        style.textContent = readFileSync(
-            resolve(process.cwd(), 'src/webview/styles.css'),
-            'utf8',
-        );
-        document.head.appendChild(style);
-        try {
-            const { container } = render_toolbar({
-                transform: {
-                    sort: [{ colIndex: 0, direction: 'asc' }],
-                    filters: [{
-                        id: 'f', colIndex: 1, operator: 'contains', value: 'needle',
-                        caseSensitive: false, enabled: true,
-                    }],
-                },
-                highlight: {
-                    active_color: 'yellow',
-                    on_color_change: vi.fn(),
-                    on_apply: vi.fn(),
-                    on_clear: vi.fn(),
-                    on_clear_all: vi.fn(),
-                    selection_available: true,
-                    pending: false,
-                    status: '',
-                },
-            });
-            const toolbar = container.querySelector('.toolbar') as HTMLElement;
-            const chips = container.querySelector('.toolbar-chips') as HTMLElement;
-            const highlight = container.querySelector('.highlight-trigger') as HTMLElement;
-
-            expect(toolbar.classList.contains('is-wrapped')).toBe(true);
-            // Only .toolbar-chips is pushed onto the second row, so Highlight must
-            // live outside it to stay put when a sort or filter appears.
-            expect(getComputedStyle(chips).flexBasis).toBe('100%');
-            expect(chips.contains(highlight)).toBe(false);
-            expect(highlight.closest('.toolbar-lead')).not.toBeNull();
-            expect(getComputedStyle(
-                highlight.closest('.toolbar-lead') as HTMLElement,
-            ).flexBasis).not.toBe('100%');
-        } finally {
-            style.remove();
-            if (scroll_width) {
-                Object.defineProperty(HTMLElement.prototype, 'scrollWidth', scroll_width);
-            } else {
-                Reflect.deleteProperty(HTMLElement.prototype, 'scrollWidth');
-            }
-            if (client_width) {
-                Object.defineProperty(HTMLElement.prototype, 'clientWidth', client_width);
-            } else {
-                Reflect.deleteProperty(HTMLElement.prototype, 'clientWidth');
-            }
-        }
     });
 
     it('repositions a visible tooltip when a captured ancestor scroll moves its button', () => {
@@ -1018,7 +624,7 @@ describe('Toolbar', () => {
             .mockImplementation(function (this: HTMLElement) {
                 if (
                     this instanceof HTMLButtonElement &&
-                    this.textContent === 'Vertical Tabs'
+                    this.textContent === 'Auto-fit Columns'
                 ) {
                     return make_rect({
                         left: 4,
@@ -1042,8 +648,8 @@ describe('Toolbar', () => {
 
         render_toolbar();
 
-        const vertical_tabs = get_button('Vertical Tabs');
-        dispatch_mouse_event(vertical_tabs, 'mouseover');
+        const auto_fit = get_button('Auto-fit Columns');
+        dispatch_mouse_event(auto_fit, 'mouseover');
 
         const tooltip = get_tooltip();
         expect(tooltip).not.toBeNull();
@@ -1058,5 +664,369 @@ describe('Toolbar', () => {
             configurable: true,
             value: original_inner_width,
         });
+    });
+});
+
+describe('Toolbar scope menus', () => {
+    const scope_menu = (overrides?: Partial<{ disabled: boolean }>) => ({
+        aria_label: 'Auto-fit scope',
+        items: [
+            { label: 'Auto-fit columns on all 3 sheets', on_click: vi.fn() },
+            {
+                label: 'Restore original widths on all 3 sheets',
+                on_click: vi.fn(),
+                disabled: overrides?.disabled ?? false,
+            },
+        ],
+    });
+
+    function open_caret(): HTMLButtonElement {
+        const caret = document.querySelector<HTMLButtonElement>('.toolbar-split-caret');
+        expect(caret).not.toBeNull();
+        act(() => caret!.click());
+        return caret!;
+    }
+
+    function menu_labels(): (string | null)[] {
+        return Array.from(
+            document.querySelectorAll('[role="menuitem"]'),
+            (item) => item.textContent,
+        );
+    }
+
+    it('renders a plain button when there is no scope menu', () => {
+        // A single-sheet workbook: the chevron could only restate the button.
+        const { container } = render_toolbar();
+
+        expect(container.querySelector('.toolbar-split')).toBeNull();
+        expect(container.querySelector('.toolbar-split-caret')).toBeNull();
+    });
+
+    it('opens the all-sheets actions from the chevron', () => {
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+
+        const caret = open_caret();
+        expect(menu_labels()).toEqual([
+            'Auto-fit columns on all 3 sheets',
+            'Restore original widths on all 3 sheets',
+        ]);
+        expect(caret.getAttribute('aria-expanded')).toBe('true');
+        expect(caret.getAttribute('aria-haspopup')).toBe('menu');
+    });
+
+    it('names every item with both its action and its scope', () => {
+        // A bare "Restore original widths" under an "…all 3 sheets" item reads as
+        // ambiguous: the reader cannot tell whether the omission means this sheet or
+        // the same scope as the line above.
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+        open_caret();
+
+        for (const label of menu_labels()) {
+            expect(label).toMatch(/all 3 sheets$/);
+        }
+    });
+
+    it('greys an item that would change nothing', () => {
+        render_toolbar({ auto_fit_scope_menu: scope_menu({ disabled: true }) });
+        open_caret();
+
+        const restore = Array.from(
+            document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
+        ).find((item) => item.textContent?.startsWith('Restore'));
+        expect(restore?.disabled).toBe(true);
+    });
+
+    it('runs the chosen action and closes', () => {
+        const menu = scope_menu();
+        render_toolbar({ auto_fit_scope_menu: menu });
+        open_caret();
+
+        const first = document.querySelector<HTMLButtonElement>('[role="menuitem"]');
+        act(() => first!.click());
+        expect(menu.items[0].on_click).toHaveBeenCalledOnce();
+        expect(document.querySelector('[role="menu"]')).toBeNull();
+    });
+
+    it('leaves the button itself meaning this sheet', () => {
+        const on_toggle_auto_fit = vi.fn();
+        const menu = scope_menu();
+        render_toolbar({ auto_fit_scope_menu: menu, on_toggle_auto_fit });
+
+        dispatch_mouse_event(get_button('Auto-fit Columns'), 'click');
+        expect(on_toggle_auto_fit).toHaveBeenCalledOnce();
+        expect(menu.items[0].on_click).not.toHaveBeenCalled();
+        expect(document.querySelector('[role="menu"]')).toBeNull();
+    });
+
+    it('opens the same menu on right-click, for people who reach for it', () => {
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+
+        const button = get_button('Auto-fit Columns');
+        const event = new MouseEvent('contextmenu', {
+            bubbles: true, cancelable: true, clientX: 20, clientY: 30,
+        });
+        act(() => button.dispatchEvent(event));
+        expect(event.defaultPrevented).toBe(true);
+        expect(menu_labels()).toEqual([
+            'Auto-fit columns on all 3 sheets',
+            'Restore original widths on all 3 sheets',
+        ]);
+    });
+
+    it('hides another button\'s tooltip when a menu opens', () => {
+        // The tooltip and the menu belong to different controls, so a per-button
+        // guard misses this: hovering Formatting then opening Header Row's menu left
+        // the Formatting tooltip sitting underneath it.
+        render_toolbar({
+            auto_fit_scope_menu: scope_menu(),
+            show_edit_button: true,
+        });
+
+        dispatch_mouse_event(get_button('Edit'), 'mouseover');
+        expect(get_tooltip()?.textContent).toBe('Enter edit mode to modify cell values.');
+
+        open_caret();
+        expect(get_tooltip()).toBeNull();
+    });
+
+    it('anchors the menu to the left edge of the control, not the chevron', () => {
+        const rect_spy = vi
+            .spyOn(HTMLElement.prototype, 'getBoundingClientRect')
+            .mockImplementation(function (this: HTMLElement) {
+                if (this.classList.contains('toolbar-split')) {
+                    return make_rect({ left: 100, top: 0, width: 140, height: 26 });
+                }
+                if (this.classList.contains('toolbar-split-caret')) {
+                    return make_rect({ left: 216, top: 0, width: 24, height: 26 });
+                }
+                return make_rect({});
+            });
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+        open_caret();
+
+        // The chevron is the narrow right-hand slice; anchoring there threw the menu
+        // out past the button that owns it.
+        const menu = document.querySelector<HTMLElement>('[role="menu"]');
+        expect(menu?.style.left).toBe('100px');
+        rect_spy.mockRestore();
+    });
+
+    it('opens only one menu at a time', () => {
+        render_toolbar({
+            auto_fit_scope_menu: scope_menu(),
+            formatting_scope_menu: {
+                aria_label: 'Formatting scope',
+                items: [{ label: 'Show raw values on all 3 sheets', on_click: vi.fn() }],
+            },
+        });
+
+        const carets = Array.from(
+            document.querySelectorAll<HTMLButtonElement>('.toolbar-split-caret'),
+        );
+        act(() => carets[0].click());
+        act(() => carets[1].click());
+        expect(document.querySelectorAll('[role="menu"]')).toHaveLength(1);
+        expect(menu_labels()).toEqual([
+            'Auto-fit columns on all 3 sheets',
+            'Restore original widths on all 3 sheets',
+        ]);
+    });
+
+    /**
+     * Let ContextMenu arm its document-level dismissal listener, which it registers a
+     * tick after mount. Without this the real mechanism is never live and a test can
+     * pass on nothing.
+     */
+    async function arm_dismissal() {
+        await act(async () => {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+        });
+    }
+
+    /**
+     * A full press of the chevron: pointerdown, then the click it produces, each
+     * committed separately so React re-renders between them as a browser would. Both
+     * in one `act` leaves the click handler reading the pre-dismissal render.
+     */
+    async function press_caret(caret: HTMLButtonElement) {
+        await act(async () => {
+            caret.dispatchEvent(new MouseEvent('pointerdown', {
+                bubbles: true, cancelable: true,
+            }));
+        });
+        await act(async () => {
+            caret.click();
+        });
+    }
+
+    it('closes an open menu when any toolbar button is pressed', async () => {
+        render_toolbar({ auto_fit_scope_menu: scope_menu(), show_edit_button: true });
+        open_caret();
+        await arm_dismissal();
+
+        await act(async () => get_button('Edit').dispatchEvent(
+            new MouseEvent('pointerdown', { bubbles: true, cancelable: true }),
+        ));
+        expect(document.querySelector('[role="menu"]')).toBeNull();
+    });
+
+    it('closes an open menu when the Columns trigger is pressed', async () => {
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+        open_caret();
+        await arm_dismissal();
+
+        await act(async () => get_button('Columns').dispatchEvent(
+            new MouseEvent('pointerdown', { bubbles: true, cancelable: true }),
+        ));
+        expect(document.querySelector('[role="menu"]')).toBeNull();
+    });
+
+    it('closes its own menu when the chevron is pressed again', async () => {
+        // ContextMenu dismisses on a document capture pointerdown, before anything on
+        // the chevron. Without the guard the click that follows saw no open menu and
+        // reopened it, so the chevron stuck open instead of toggling.
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+        const caret = open_caret();
+        await arm_dismissal();
+        expect(document.querySelector('[role="menu"]')).not.toBeNull();
+
+        await press_caret(caret);
+        expect(document.querySelector('[role="menu"]')).toBeNull();
+    });
+
+    it('reopens on the next chevron press, rather than eating it', async () => {
+        // The skip covers only the press that dismissed; a fresh press must open.
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+        const caret = open_caret();
+        await arm_dismissal();
+        await press_caret(caret);
+        expect(document.querySelector('[role="menu"]')).toBeNull();
+
+        await press_caret(caret);
+        expect(document.querySelector('[role="menu"]')).not.toBeNull();
+    });
+
+    it('opens after a press on the chevron that produced no click', async () => {
+        // Pressing and then dragging off releases elsewhere, so the chevron never
+        // sees a click to spend the "this press closed it" flag on. Left set, it was
+        // spent on the next press instead, and the chevron did nothing.
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+        const caret = open_caret();
+        await arm_dismissal();
+
+        await act(async () => {
+            caret.dispatchEvent(new MouseEvent('pointerdown', {
+                bubbles: true, cancelable: true,
+            }));
+        });
+        expect(document.querySelector('[role="menu"]')).toBeNull();
+
+        await press_caret(caret);
+        expect(document.querySelector('[role="menu"]')).not.toBeNull();
+    });
+
+    it('keeps a menu item clickable through the row-level dismissal', () => {
+        const menu = scope_menu();
+        render_toolbar({ auto_fit_scope_menu: menu });
+        open_caret();
+
+        const first = document.querySelector<HTMLButtonElement>('[role="menuitem"]')!;
+        act(() => first.dispatchEvent(
+            new MouseEvent('pointerdown', { bubbles: true, cancelable: true }),
+        ));
+        act(() => first.click());
+        expect(menu.items[0].on_click).toHaveBeenCalledOnce();
+    });
+
+    it('does not bring the tooltip back when the menu is dismissed from outside', async () => {
+        // The menu renders inside the control, so focus moving into it fires no blur
+        // and the pointer crossing it fires no mouseleave. Dismissing from elsewhere
+        // removed the menu with both flags stuck on, and the tooltip — suppressed
+        // only while the menu was open — popped back over a control the pointer had
+        // long since left.
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+
+        dispatch_mouse_event(get_button('Auto-fit Columns'), 'mouseover');
+        expect(get_tooltip()).not.toBeNull();
+        const caret = open_caret();
+        act(() => caret.focus());
+        expect(get_tooltip()).toBeNull();
+
+        // A click out in the grid: ContextMenu dismisses on an outside pointerdown
+        // and restores no focus, so nothing else clears the flags. Its listener is
+        // attached a tick after mount, so wait for that before dispatching.
+        await act(async () => {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+        });
+        await act(async () => {
+            document.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true }));
+        });
+        expect(document.querySelector('[role="menu"]')).toBeNull();
+        expect(get_tooltip()).toBeNull();
+    });
+
+    it('does not raise the tooltip after a menu item is clicked', async () => {
+        // ContextMenu restores focus to the chevron on activation, which is right for
+        // the keyboard and wrong for the mouse: the tooltip would appear over a
+        // control the user has just finished with.
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+        open_caret();
+
+        const first = document.querySelector<HTMLButtonElement>('[role="menuitem"]')!;
+        act(() => {
+            first.dispatchEvent(new MouseEvent('click', {
+                bubbles: true, cancelable: true, detail: 1,
+            }));
+        });
+        // The focus restore lands a tick later; the tooltip must not follow it.
+        await act(async () => {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+        });
+        expect(document.querySelector('[role="menu"]')).toBeNull();
+        expect(get_tooltip()).toBeNull();
+    });
+
+    it('shows the tooltip again once the pointer comes back', async () => {
+        // The suppression covers the interaction that just ended, not the control.
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+        open_caret();
+
+        const first = document.querySelector<HTMLButtonElement>('[role="menuitem"]')!;
+        act(() => {
+            first.dispatchEvent(new MouseEvent('click', {
+                bubbles: true, cancelable: true, detail: 1,
+            }));
+        });
+        await act(async () => {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+        });
+
+        dispatch_mouse_event(get_button('Auto-fit Columns'), 'mouseover');
+        expect(get_tooltip()).not.toBeNull();
+    });
+
+    it('keeps the tooltip for a keyboard activation, which restores focus visibly', () => {
+        // detail === 0 is a keyboard activation synthesised as a click; landing back
+        // on the chevron with its tooltip is the correct keyboard behaviour.
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+        const caret = open_caret();
+
+        const first = document.querySelector<HTMLButtonElement>('[role="menuitem"]')!;
+        act(() => {
+            first.dispatchEvent(new MouseEvent('click', {
+                bubbles: true, cancelable: true, detail: 0,
+            }));
+        });
+        act(() => caret.focus());
+        expect(get_tooltip()).not.toBeNull();
+    });
+
+    it('does not stack the tooltip on top of the menu it opened', () => {
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+
+        dispatch_mouse_event(get_button('Auto-fit Columns'), 'mouseover');
+        expect(get_tooltip()).not.toBeNull();
+        open_caret();
+        expect(get_tooltip()).toBeNull();
     });
 });

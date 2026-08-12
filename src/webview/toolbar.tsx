@@ -1,20 +1,19 @@
 import React, {
     forwardRef,
+    useEffect,
     useId,
     useImperativeHandle,
     useLayoutEffect,
+    useMemo,
     useRef,
     useState,
 } from 'react';
-import type { FilterEntry, SheetTransformState } from '../types';
 import {
     ColumnVisibilityControl,
     type ColumnVisibilityControlProps,
     type ColumnVisibilityFocusHandle,
 } from './column-visibility-control';
-import { FilterStrip } from './filter-strip';
-import { SortStrip } from './sort-strip';
-import { use_toolbar_wrap } from './use-toolbar-wrap';
+import { ContextMenu, type MenuItem } from './context-menu';
 import { HighlightControl, type HighlightControlProps } from './highlight-control';
 
 export interface ToolbarFocusHandle {
@@ -23,20 +22,49 @@ export interface ToolbarFocusHandle {
     focus_columns(): boolean;
 }
 
+/**
+ * The all-sheets actions behind a toggle's chevron.
+ *
+ * One rule holds across every control that has one: the button means this sheet, and
+ * the menu holds only all-sheets actions, each naming its action *and* its scope. A
+ * lone "Restore original widths" under an "…all 3 sheets" item is unreadable — the
+ * reader has to guess whether the omission means "this sheet" or "same as above". And
+ * because each of these buttons already toggles in both directions, "this sheet" needs
+ * no menu entry: pressing the button is that entry.
+ *
+ * Absent for a single-sheet workbook, where the chevron could only restate the button.
+ */
+export interface ToolbarScopeMenu {
+    items: readonly {
+        label: string;
+        on_click: () => void;
+        /** Greyed when the action would change nothing — every sheet is already there. */
+        disabled?: boolean;
+    }[];
+    /** Names the menu for assistive tech, e.g. "Auto-fit scope". */
+    aria_label: string;
+}
+
+/**
+ * Which scope menu is open, shared across the whole action row.
+ *
+ * Held here rather than per button for two reasons. A tooltip is suppressed while
+ * *any* menu is open, not merely its own button's — otherwise a tooltip left hovering
+ * over Formatting stays on screen underneath the menu Header Row just opened, and
+ * clicking a caret does not always take focus off the previous one, so the stale
+ * tooltip can outlive the hover that created it. And with one source of truth, two
+ * menus cannot be open at once.
+ */
+const ScopeMenuContext = React.createContext<{
+    open: { key: string; x: number; y: number } | null;
+    set_open: (next: { key: string; x: number; y: number } | null) => void;
+} | null>(null);
+
 export interface ToolbarProps {
-    transform: SheetTransformState;
-    transform_disabled: boolean;
-    transform_pending: boolean;
-    transform_progress?: string;
-    hidden_rows?: { count: number; pending: boolean; on_unhide_all: () => void };
-    column_names: readonly string[];
-    merges_flattened: boolean;
-    on_transform_change: (state: SheetTransformState) => void;
-    on_edit_filter: (entry: FilterEntry, trigger: HTMLElement) => void;
-    on_cancel_transform: () => void;
     show_formatting: boolean;
     on_toggle_formatting: () => void;
     show_formatting_button: boolean;
+    formatting_scope_menu?: ToolbarScopeMenu;
     show_excel_header_button: boolean;
     excel_header_active: boolean;
     excel_header_automatic: boolean;
@@ -45,15 +73,14 @@ export interface ToolbarProps {
     on_toggle_excel_header: () => void;
     excel_header_disabled?: boolean;
     excel_header_disabled_reason?: string;
-    vertical_tabs: boolean;
-    on_toggle_tab_orientation: () => void;
-    show_vertical_tabs_button: boolean;
+    excel_header_scope_menu?: ToolbarScopeMenu;
     column_visibility: ColumnVisibilityControlProps;
     highlight?: HighlightControlProps;
     auto_fit_active: boolean;
     on_toggle_auto_fit: () => void;
     auto_fit_disabled?: boolean;
     auto_fit_disabled_reason?: string;
+    auto_fit_scope_menu?: ToolbarScopeMenu;
     edit_mode: boolean;
     is_dirty: boolean;
     on_toggle_edit_mode: () => void;
@@ -62,34 +89,18 @@ export interface ToolbarProps {
     edit_disabled_reason?: string;
 }
 
-/**
- * The keys of a rendered action group, joined — a single dependency value that
- * changes whenever the group's membership does, not merely its size.
- */
-function react_element_keys(elements: readonly React.ReactNode[]): string {
-    return elements
-        .map((element) =>
-            React.isValidElement(element) ? String(element.key) : '',
-        )
-        .join(',');
-}
-
 export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Toolbar(
     props,
     focus_ref,
 ): React.JSX.Element {
-    const {
-        transform,
-        column_names,
-        on_transform_change,
-        on_edit_filter,
-        on_cancel_transform,
-    } = props;
     const toolbar_ref = useRef<HTMLDivElement>(null);
     const columns_ref = useRef<ColumnVisibilityFocusHandle>(null);
-    const lead_ref = useRef<HTMLDivElement>(null);
-    const chips_ref = useRef<HTMLDivElement>(null);
-    const actions_ref = useRef<HTMLDivElement>(null);
+    const [open_scope_menu, set_open_scope_menu] =
+        useState<{ key: string; x: number; y: number } | null>(null);
+    const scope_menu_context = useMemo(
+        () => ({ open: open_scope_menu, set_open: set_open_scope_menu }),
+        [open_scope_menu],
+    );
     useImperativeHandle(focus_ref, () => ({
         focus: () => {
             const toolbar = toolbar_ref.current;
@@ -123,20 +134,11 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                 label="Formatting"
                 active={props.show_formatting}
                 tooltip_text={props.show_formatting
-                    ? 'Show raw cell values.'
-                    : 'Show formatted cell values.'}
+                    ? 'Show raw cell values on this sheet.'
+                    : 'Show formatted cell values on this sheet.'}
                 onClick={props.on_toggle_formatting}
-            />
-        ),
-        props.show_vertical_tabs_button && (
-            <ToolbarButton
-                key="vertical-tabs"
-                label="Vertical Tabs"
-                active={props.vertical_tabs}
-                tooltip_text={props.vertical_tabs
-                    ? 'Move sheet tabs above the table.'
-                    : 'Move sheet tabs to the left of the table.'}
-                onClick={props.on_toggle_tab_orientation}
+                menu_key="formatting"
+                scope_menu={props.formatting_scope_menu}
             />
         ),
     ].filter(Boolean);
@@ -148,7 +150,13 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
         props.show_excel_header_button && (
             <ToolbarButton
                 key="excel-header"
-                label="First Row as Header"
+                // "Header Row", not "First Row as Header": it was the widest control
+                // in the row, and as a toggle the pressed state already supplies the
+                // "first row" half of the meaning. "Header" rather than "Names"
+                // because it is the word people arrive with — Excel, Power Query and
+                // pandas all use it — even though the code sets column *names*. The
+                // tooltip carries the precise wording (#154).
+                label="Header Row"
                 active={props.excel_header_active}
                 tooltip_text={props.excel_header_disabled
                     ? (props.excel_header_disabled_reason
@@ -156,11 +164,13 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                     : props.excel_header_active
                     ? props.excel_header_automatic
                         ? 'Automatically using the first row as column names. Click to show it as data.'
-                        : 'Show the header row as data.'
-                    : 'Use the first non-hidden row as column names.'}
+                        : 'Show the header row as data on this sheet.'
+                    : 'Use the first non-hidden row as column names on this sheet.'}
                 onClick={props.on_toggle_excel_header}
                 disabled={props.excel_header_disabled}
                 focusable_when_disabled
+                menu_key="excel-header"
+                scope_menu={props.excel_header_scope_menu}
             />
         ),
         <ColumnVisibilityControl
@@ -175,54 +185,19 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
             tooltip_text={props.auto_fit_disabled
                 ? (props.auto_fit_disabled_reason ?? 'Auto-fit is unavailable.')
                 : props.auto_fit_active
-                ? 'Restore original column widths.'
-                : 'Auto-fit all columns to their content.'}
+                ? 'Restore original column widths on this sheet.'
+                : 'Auto-fit all columns to their content on this sheet.'}
             onClick={props.on_toggle_auto_fit}
             disabled={props.auto_fit_disabled}
+            menu_key="auto-fit"
+            scope_menu={props.auto_fit_scope_menu}
         />,
     ].filter(Boolean);
-
-    // Each group's membership as one value, so the wrap deps below can compare
-    // identity and not merely how many there are.
-    const workbook_action_keys = react_element_keys(workbook_actions);
-    const worksheet_action_keys = react_element_keys(worksheet_actions);
-
-    const wrapped = use_toolbar_wrap(
-        { toolbar: toolbar_ref, lead: lead_ref, chips: chips_ref, actions: actions_ref },
-        [
-            transform.sort,
-            transform.filters,
-            props.hidden_rows?.count,
-            props.hidden_rows?.pending,
-            props.transform_pending,
-            props.transform_progress,
-            props.merges_flattened,
-            props.column_visibility.hidden_count,
-            props.highlight?.active_color,
-            props.highlight?.selection_available,
-            props.highlight?.pending,
-            // Which actions each group renders, rather than the individual `show_*`
-            // flags: an action added to a group is then measured without anyone
-            // having to remember to list it here too.
-            //
-            // Keys rather than counts. A count misses a swap — one action appearing
-            // as another in the same group disappears leaves the length alone while
-            // the widths differ, so the row would keep a wrapped state measured
-            // against buttons that are no longer there.
-            workbook_action_keys,
-            worksheet_action_keys,
-            // Not membership but width: these change a button's label-driven size
-            // without changing how many buttons there are.
-            props.excel_header_active,
-            props.excel_header_disabled,
-        ],
-    );
-    const controls_disabled = !!(props.transform_disabled || props.transform_pending);
 
     return (
         <div
             ref={toolbar_ref}
-            className={wrapped ? 'toolbar is-wrapped' : 'toolbar'}
+            className="toolbar"
             role="toolbar"
             tabIndex={-1}
             aria-label="Table controls"
@@ -232,69 +207,10 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                 {props.excel_header_status ?? ''}
             </span>
             {props.highlight && (
-                // Highlight is a control, not a chip: keep it out of the wrapping
-                // chip region so adding a sort or filter never shifts it to row two.
-                <div ref={lead_ref} className="toolbar-lead">
+                <div className="toolbar-lead">
                     <HighlightControl {...props.highlight} />
                 </div>
             )}
-            <div ref={chips_ref} className="toolbar-chips">
-                <SortStrip
-                    state={transform}
-                    column_names={column_names}
-                    disabled={controls_disabled}
-                    on_change={on_transform_change}
-                />
-                <FilterStrip
-                    state={transform}
-                    column_names={column_names}
-                    disabled={controls_disabled}
-                    on_change={on_transform_change}
-                    on_edit={on_edit_filter}
-                />
-                {(props.hidden_rows?.count ?? 0) > 0 && (
-                    <div className="filter-chip">
-                        <span className="filter-chip-body">
-                            {props.hidden_rows!.count} hidden row
-                            {props.hidden_rows!.count === 1 ? '' : 's'}
-                        </span>
-                        <button
-                            type="button"
-                            className="toolbar-cancel"
-                            onClick={props.hidden_rows!.on_unhide_all}
-                            disabled={props.hidden_rows!.pending || props.transform_disabled}
-                        >
-                            Unhide all
-                        </button>
-                    </div>
-                )}
-                {props.transform_pending && (
-                    <span className="toolbar-progress" role="status" aria-live="polite">
-                        {props.transform_progress ?? 'Applying sort & filters…'}
-                    </span>
-                )}
-                {props.transform_pending && (
-                    <button
-                        type="button"
-                        className="toolbar-cancel"
-                        onClick={on_cancel_transform}
-                        // A cancel is itself a transform request, so it belongs
-                        // behind the same gate: one the host would refuse would only
-                        // displace the request it is trying to cancel.
-                        disabled={props.transform_disabled}
-                    >
-                        Cancel
-                    </button>
-                )}
-                {props.merges_flattened && (
-                    <span
-                        className="toolbar-merge-notice"
-                        title="Merged values remain only in their original top-left cells."
-                    >
-                        Merged cells shown unmerged; only top-left cells contain values
-                    </span>
-                )}
-            </div>
             {/*
               * Two groups: what an action changes for the whole workbook, then what
               * it changes for this worksheet alone. The order used to interleave the
@@ -305,14 +221,16 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
               * workbook group is empty, so adding an action to a group cannot leave
               * the rule behind — the failure that condition would hide is a narrow
               * one, visible only when the new action is the *only* workbook action
-              * on screen.
+              * on screen. Edit alone on the workbook side is the expected state now
+              * that tab orientation moved to the sheet tabs (#154), and it still
+              * earns the rule: it changes what a keystroke does, not what is shown.
               *
-              * Still flat children of one row: `use_toolbar_wrap` measures the
-              * direct children here and adds one action gap between each, and
-              * `.toolbar-actions > :first-child` carries the right-alignment.
-              * Nesting either group in a wrapper would break both.
+              * Still flat children of one row: `.toolbar-actions > :first-child`
+              * carries the right-alignment, so nesting either group in a wrapper
+              * would break it.
               */}
-            <div ref={actions_ref} className="toolbar-actions">
+            <ScopeMenuContext.Provider value={scope_menu_context}>
+            <div className="toolbar-actions">
                 {workbook_actions}
                 {workbook_actions.length > 0 && (
                     <div
@@ -323,6 +241,7 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                 )}
                 {worksheet_actions}
             </div>
+            </ScopeMenuContext.Provider>
         </div>
     );
 });
@@ -335,6 +254,8 @@ function ToolbarButton({
     extra_class,
     disabled = false,
     focusable_when_disabled = false,
+    menu_key,
+    scope_menu,
 }: {
     label: string;
     active: boolean;
@@ -343,15 +264,119 @@ function ToolbarButton({
     extra_class?: string;
     disabled?: boolean;
     focusable_when_disabled?: boolean;
+    menu_key?: string;
+    scope_menu?: ToolbarScopeMenu;
 }): React.JSX.Element {
     const [is_hovered, set_is_hovered] = useState(false);
     const [is_focused, set_is_focused] = useState(false);
     const [tooltip_style, set_tooltip_style] = useState<React.CSSProperties>();
+    /*
+     * Set when a menu item was activated with the pointer.
+     *
+     * `ContextMenu` restores focus to the chevron after an activation, which is right
+     * for the keyboard — Enter on an item should land you back on the control you
+     * opened. But for a mouse click that restored focus is invisible to the user and
+     * would raise the tooltip over a control they have finished with. Cleared as soon
+     * as the pointer or the keyboard comes back, so the tooltip is only skipped for
+     * the interaction that just ended.
+     */
+    const [tooltip_suppressed, set_tooltip_suppressed] = useState(false);
+    const scope_context = React.useContext(ScopeMenuContext);
+    /*
+     * Whether the press that is closing the menu landed on this button's own chevron.
+     *
+     * `ContextMenu` dismisses from a document-level pointerdown, which lands before
+     * the click that press produces. Pressing an open menu's own chevron therefore
+     * closed it and then reopened it on the click, so the chevron stuck open instead
+     * of toggling.
+     *
+     * Watching where the press landed, rather than how recently one happened, is what
+     * keeps a genuine second press from being swallowed. The listener below merely
+     * records — it never acts, so its order against ContextMenu's own listener does
+     * not matter.
+     */
+    const pressed_own_caret_ref = useRef(false);
     const tooltip_id = useId();
     const button_ref = useRef<HTMLButtonElement>(null);
+    const caret_ref = useRef<HTMLButtonElement>(null);
+    const split_ref = useRef<HTMLSpanElement>(null);
     const tooltip_ref = useRef<HTMLDivElement>(null);
-    const show_tooltip = is_hovered || is_focused;
+    const menu_open = scope_context?.open?.key === menu_key && menu_key !== undefined;
+    // Read by the document listener below, which is registered once and so cannot
+    // close over the current render's value.
+    const menu_open_ref = useRef(menu_open);
+    menu_open_ref.current = menu_open;
+    // Suppressed while *any* scope menu is open, not merely this button's: a tooltip
+    // left hovering over one control would otherwise sit under the menu another just
+    // opened, and clicking a caret does not reliably blur the previous one.
+    const show_tooltip = (is_hovered || is_focused)
+        && !scope_context?.open
+        && !tooltip_suppressed;
     const native_disabled = disabled && !focusable_when_disabled;
+
+    /*
+     * Forget the hover and focus that were live while the menu was open.
+     *
+     * Opening the menu with the pointer leaves focus genuinely on the chevron, and
+     * dismissing by clicking out in the grid moves it nowhere — a canvas press takes
+     * no DOM focus. So the flag is not stale, it is true, and the tooltip suppressed
+     * only while the menu was open would spring back over a control the pointer left
+     * long ago.
+     *
+     * Safe for the keyboard path: Escape restores focus to the chevron on a later
+     * tick, which sets `is_focused` again and brings the tooltip back, as it should.
+     */
+    useEffect(() => {
+        if (menu_open) return;
+        set_is_hovered(false);
+        set_is_focused(false);
+    }, [menu_open]);
+
+    /*
+     * Registered whether or not the menu is open, so the flag is cleared by the next
+     * press as reliably as it is set by this one. Scoped to the open menu it would
+     * survive a press that produced no click — a drag off the chevron, or a
+     * right-click, which reopens the menu through the wrapper's own handler — and
+     * that stale `true` would then swallow a later, legitimate open.
+     */
+    useEffect(() => {
+        const record = (event: Event) => {
+            pressed_own_caret_ref.current = menu_open_ref.current
+                && (caret_ref.current?.contains(event.target as Node) ?? false);
+        };
+        document.addEventListener('pointerdown', record, true);
+        return () => document.removeEventListener('pointerdown', record, true);
+    }, []);
+
+    /**
+     * Anchor the menu to the left edge of the whole control, not to the chevron.
+     *
+     * The chevron is the narrow right-hand slice, so anchoring there threw the menu
+     * out to the right of the button that owns it and left it looking attached to
+     * whatever sat next along the row. Right-click uses the same anchor rather than
+     * the pointer, so the menu appears in one predictable place either way.
+     */
+    const open_menu = () => {
+        if (!scope_menu || !menu_key) return;
+        const anchor = split_ref.current ?? button_ref.current;
+        if (!anchor) return;
+        const rect = anchor.getBoundingClientRect();
+        scope_context?.set_open({ key: menu_key, x: rect.left, y: rect.bottom + 4 });
+    };
+    const close_menu = () => scope_context?.set_open(null);
+
+    const menu_items: MenuItem[] = (scope_menu?.items ?? []).map((item) => ({
+        label: item.label,
+        disabled: item.disabled,
+        on_click: (event) => {
+            close_menu();
+            // `detail` counts clicks: non-zero is a real press, zero is a keyboard
+            // activation synthesised as a click. The same idiom the button below uses
+            // to decide whether to blur itself.
+            if (event.detail > 0) set_tooltip_suppressed(true);
+            item.on_click();
+        },
+    }));
 
     useLayoutEffect(() => {
         if (!show_tooltip) return set_tooltip_style(undefined);
@@ -390,35 +415,97 @@ function ToolbarButton({
     }, [show_tooltip]);
 
     return (
-        <div
+        <>
+            <div
             className="toolbar-item"
             tabIndex={native_disabled ? 0 : undefined}
             role={native_disabled ? 'group' : undefined}
             aria-label={native_disabled ? label : undefined}
             aria-disabled={native_disabled || undefined}
             aria-describedby={native_disabled && show_tooltip ? tooltip_id : undefined}
-            onMouseEnter={() => set_is_hovered(true)}
+            onMouseEnter={() => {
+                set_is_hovered(true);
+                set_tooltip_suppressed(false);
+            }}
             onMouseLeave={() => set_is_hovered(false)}
             onFocus={() => set_is_focused(true)}
-            onBlur={() => set_is_focused(false)}
+            onBlur={() => {
+                set_is_focused(false);
+                set_tooltip_suppressed(false);
+            }}
+            // Right-click anywhere on the control opens the same menu as the chevron,
+            // for people who reach for right-click before they look for an affordance.
+            onContextMenu={scope_menu
+                ? (event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    open_menu();
+                }
+                : undefined}
         >
-            <button
-                ref={button_ref}
-                type="button"
-                className={`toggle ${active ? 'active' : ''} ${extra_class ?? ''}`.trim()}
-                disabled={native_disabled}
-                aria-disabled={disabled || undefined}
-                onClick={(event) => {
-                    if (disabled) return;
-                    set_is_hovered(false);
-                    if (event.detail > 0) button_ref.current?.blur();
-                    onClick();
-                }}
-                aria-describedby={!native_disabled && show_tooltip ? tooltip_id : undefined}
-                aria-pressed={active}
+            <span
+                ref={split_ref}
+                className={scope_menu
+                    ? `toolbar-split ${active ? 'active' : ''}`.trim()
+                    : undefined}
             >
-                {label}
-            </button>
+                <button
+                    ref={button_ref}
+                    type="button"
+                    className={`toggle ${active ? 'active' : ''} ${extra_class ?? ''}`.trim()}
+                    disabled={native_disabled}
+                    aria-disabled={disabled || undefined}
+                    onClick={(event) => {
+                        if (disabled) return;
+                        set_is_hovered(false);
+                        if (event.detail > 0) button_ref.current?.blur();
+                        onClick();
+                    }}
+                    aria-describedby={!native_disabled && show_tooltip ? tooltip_id : undefined}
+                    aria-pressed={active}
+                >
+                    {label}
+                </button>
+                {scope_menu && (
+                    <>
+                        <span className="toolbar-split-gap" aria-hidden="true" />
+                        <button
+                            ref={caret_ref}
+                            type="button"
+                            className={menu_open
+                                ? 'toolbar-split-caret open'
+                                : 'toolbar-split-caret'}
+                            aria-label={scope_menu.aria_label}
+                            aria-haspopup="menu"
+                            aria-expanded={menu_open}
+                            onClick={() => {
+                                set_is_hovered(false);
+                                if (menu_open) return close_menu();
+                                // This click's own press is what dismissed the menu:
+                                // it was a close, not an open.
+                                if (pressed_own_caret_ref.current) {
+                                    pressed_own_caret_ref.current = false;
+                                    return;
+                                }
+                                open_menu();
+                            }}
+                        >
+                            <svg
+                                width="9"
+                                height="9"
+                                viewBox="0 0 10 10"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="1.4"
+                                aria-hidden="true"
+                                focusable="false"
+                            >
+                                <path d="M2 4l3 3 3-3" />
+                            </svg>
+                        </button>
+                    </>
+                )}
+            </span>
             {show_tooltip && (
                 <div
                     id={tooltip_id}
@@ -430,6 +517,26 @@ function ToolbarButton({
                     {tooltip_text}
                 </div>
             )}
-        </div>
+            </div>
+            {/*
+              * Outside the hover-tracked wrapper, matching every other menu in this
+              * webview (sort-strip, filter-strip, column-context-menu). Nested inside
+              * it, focus moving into the menu fired no blur and the pointer crossing
+              * it fired no mouseleave, so dismissing from elsewhere left both flags
+              * stuck on and the tooltip sprang back over a control the pointer had
+              * left. The menu positions itself from viewport coordinates, so nothing
+              * depends on where it sits in the tree.
+              */}
+            {menu_open && (
+                <ContextMenu
+                    x={scope_context!.open!.x}
+                    y={scope_context!.open!.y}
+                    items={menu_items}
+                    aria_label={scope_menu!.aria_label}
+                    on_dismiss={close_menu}
+                    restore_focus={() => caret_ref.current?.focus()}
+                />
+            )}
+        </>
     );
 }

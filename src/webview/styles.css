@@ -120,6 +120,74 @@ body {
     outline-offset: 2px;
 }
 
+/*
+ * A toggle that also carries all-sheets actions: ( label | ⌄ ). The two halves read
+ * as one control with a seam, rather than as two buttons that happen to be adjacent
+ * — the border is on the wrapper and the inner `.toggle` gives its own up, so a
+ * single outline surrounds both and the seam is the 1px gap between them.
+ */
+.toolbar-split {
+    display: inline-flex;
+    align-items: stretch;
+    border: 1px solid var(--vscode-panel-border, #444);
+    border-radius: 3px;
+    overflow: hidden;
+}
+
+.toolbar-split.active {
+    border-color: var(--vscode-button-background, #0e639c);
+    background: var(--vscode-button-background, #0e639c);
+}
+
+.toolbar-split > .toggle {
+    border: 0;
+    border-radius: 0;
+}
+
+.toolbar-split-gap {
+    flex: 0 0 auto;
+    width: 1px;
+    margin: 3px 0;
+    background: var(--vscode-panel-border, #444);
+}
+
+.toolbar-split.active .toolbar-split-gap {
+    background: var(--vscode-button-foreground, #fff);
+    opacity: 0.45;
+}
+
+.toolbar-split-caret {
+    display: inline-flex;
+    align-items: center;
+    padding: 0 6px;
+    border: 0;
+    background: transparent;
+    color: var(--vscode-foreground, #ccc);
+    cursor: pointer;
+    opacity: 0.75;
+}
+
+.toolbar-split.active .toolbar-split-caret {
+    color: var(--vscode-button-foreground, #fff);
+}
+
+.toolbar-split-caret:hover,
+.toolbar-split-caret.open {
+    background: var(--vscode-list-hoverBackground, #2a2d2e);
+    opacity: 1;
+}
+
+.toolbar-split.active .toolbar-split-caret:hover,
+.toolbar-split.active .toolbar-split-caret.open {
+    background: var(--vscode-button-hoverBackground, #1177bb);
+}
+
+.toolbar-split-caret:focus-visible {
+    outline: 2px solid var(--vscode-focusBorder, #007acc);
+    outline-offset: -2px;
+    opacity: 1;
+}
+
 .column-visibility-anchor {
     flex: 0 0 auto;
 }
@@ -473,14 +541,74 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     text-align: left;
 }
 
+/* Tab orientation belongs to the strip, so its control sits at the end of the strip
+   rather than in the toolbar. Horizontally it is icon-only — the strip scrolls, and a
+   label here would compete with the tab names for the width they need; the accessible
+   name carries the meaning. Vertically the rail has width to spare, so it is shown. */
+.sheet-tabs-orientation {
+    display: inline-flex;
+    align-items: center;
+    flex: 0 0 auto;
+    gap: 6px;
+    padding: 0 9px;
+    border: 0;
+    background: transparent;
+    color: var(--vscode-foreground, #ccc);
+    cursor: pointer;
+    font-family: inherit;
+    font-size: var(--tv-font-size-md);
+    opacity: 0.6;
+}
+
+.sheet-tabs-orientation:hover {
+    background: var(--vscode-list-hoverBackground, #2a2d2e);
+    opacity: 1;
+}
+
+.sheet-tabs-orientation:focus-visible {
+    outline: 2px solid var(--vscode-focusBorder, #007acc);
+    outline-offset: -2px;
+    opacity: 1;
+}
+
+/* Pinned to the trailing edge so it never sits between tabs, and immune to the
+   strip's horizontal scroll of the tab list. */
+.sheet-tabs-horizontal .sheet-tabs-orientation {
+    position: sticky;
+    right: 0;
+    margin-left: auto;
+    border-left: 1px solid var(--vscode-panel-border, #444);
+    background: var(--vscode-editorGroupHeader-tabsBackground, #252526);
+}
+
+/* The trailing edge of the rail is its bottom, matching where the control sits on
+   the horizontal strip. Pushed down rather than left under the last tab, where its
+   matching height and padding made it read as one more sheet. */
+.sheet-tabs-vertical .sheet-tabs-orientation {
+    position: sticky;
+    bottom: 0;
+    margin-top: auto;
+    padding: 6px 14px;
+    border-top: 1px solid var(--vscode-panel-border, #444);
+    background: var(--vscode-editorGroupHeader-tabsBackground, #252526);
+    text-align: left;
+}
+
+/* Keeps the label from forcing the rail wider than its max. */
+.sheet-tabs-orientation-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
 .table-container {
     flex: 1;
     overflow: auto;
 }
 
-/* Wraps the Glide canvas and the transparent merge overlay; fills the
-   remaining flex space (column layout, or row layout with vertical tabs) and
-   anchors the absolutely-positioned overlay. */
+/* Wraps the Glide canvas and the transparent merge overlay; fills whatever
+   `.sheet-pane` has left after the state strip — a column layout in both tab
+   orientations — and anchors the absolutely-positioned overlay. */
 .grid-shell-root {
     position: relative;
     flex: 1;
@@ -765,21 +893,54 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     gap: 8px;
 }
 
-.toolbar-chips {
+/* The worksheet's own view state, below the sheet tabs and above the grid. It is
+   rendered only when something is non-default (see state-strip.tsx), so there is no
+   empty-state rule to write here — a clean sheet has no element at all. */
+.state-strip {
     display: flex;
     align-items: center;
-    flex: 1 1 auto;
+    flex: 0 0 auto;
     flex-wrap: wrap;
     gap: 8px;
     min-width: 0;
-    max-width: 100%;
-    overflow: visible;
+    padding: 5px 8px;
+    border-bottom: 1px solid var(--vscode-panel-border, #444);
+    background: var(--vscode-editorGroupHeader-tabsBackground, #252526);
 }
 
-/* With no sort, filter, or notice to show, the chip region would only contribute
-   a stray gap between the lead control and the actions. */
-.toolbar-chips:empty {
-    display: none;
+/* Holds the state strip and the grid: the region that belongs to the selected
+   worksheet. A flex column in both arrangements — as a child of `.viewer` when tabs
+   are horizontal, and as the second child of `.content-area`'s row when they are
+   vertical — so the strip sits under the tabs either way and `.grid-shell-root`
+   keeps taking the remaining space. */
+.sheet-pane {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+}
+
+/* The groups grew to fill the row they used to share with the toolbar buttons.
+   Given the whole width they stretch instead, which parks each group's clear button
+   an inch from the chips it clears. Here they hug their contents and wrap when they
+   run out of room. */
+.state-strip .sort-strip,
+.state-strip .filter-strip {
+    flex: 0 1 auto;
+    min-width: 0;
+}
+
+/* The 14ch/18ch caps were rationing width against the toolbar buttons the chips
+   used to sit beside. On a row of their own most real column names and filter
+   values fit whole, so the ellipsis is left for the genuinely long ones. */
+.state-strip .sort-chip-name {
+    max-width: 28ch;
+}
+
+.state-strip .filter-chip-body {
+    max-width: 40ch;
 }
 
 .toolbar-actions {
@@ -804,10 +965,8 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
  * rather than as one more crowded item.
  *
  * That room is padding rather than margin, and the background is clipped to the
- * content box so only the 1px rule paints. `use_toolbar_wrap` measures children
- * by `scrollWidth`, which counts padding but not margin — as a margin these 4px
- * were spent but never measured, so the toolbar stayed unwrapped a few pixels
- * past the point it should have and scrolled the action strip instead.
+ * content box so only the 1px rule paints — as a plain padded background the 1px
+ * line would render 5px wide.
  */
 .toolbar-actions-divider {
     flex: 0 0 auto;
@@ -818,15 +977,6 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     padding: 0 2px;
     background: var(--vscode-panel-border, #444);
     background-clip: content-box;
-}
-
-.toolbar.is-wrapped {
-    flex-wrap: wrap;
-}
-
-.toolbar.is-wrapped .toolbar-chips {
-    order: 1;
-    flex-basis: 100%;
 }
 
 .sort-strip,
@@ -982,7 +1132,7 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     color: var(--vscode-textLink-foreground, inherit);
 }
 
-.toolbar-merge-notice {
+.state-strip-merge-notice {
     flex: 1 1 18rem;
     min-width: min(100%, 12rem);
     max-width: 100%;
@@ -990,10 +1140,6 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     font-size: var(--tv-font-size-sm);
     overflow-wrap: anywhere;
     white-space: normal;
-}
-
-.toolbar.is-wrapped .toolbar-merge-notice {
-    flex-basis: 100%;
 }
 
 .filter-popover {
@@ -1318,6 +1464,3 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     opacity: 0.5;
 }
 
-.toolbar.is-wrapped .toolbar-actions {
-    flex: 1 1 0;
-}

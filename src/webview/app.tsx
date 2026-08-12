@@ -55,7 +55,8 @@ import {
     type FilterHistogramReady,
     type FilterHistogramStatus,
 } from './transform-ui-model';
-import { SheetTabs } from './sheet-tabs';
+import { SheetTabs, tab_orientation_label } from './sheet-tabs';
+import { StateStrip } from './state-strip';
 import { ContextMenu, type MenuItem } from './context-menu';
 import {
     pending_sheet_action_to_run,
@@ -322,6 +323,9 @@ export function transforms_semantically_equal(
         === JSON.stringify(semantic_filters(right.filters));
 }
 
+/** Shared so clearing an already-empty auto-fit queue is not a state change. */
+const EMPTY_PENDING_AUTO_FIT: ReadonlySet<number> = new Set<number>();
+
 /** Webview root for snapshot metadata plus paginated row delivery. */
 export function App(): React.JSX.Element {
     const [meta, set_meta] = useState<WorkbookMeta | null>(null);
@@ -332,7 +336,12 @@ export function App(): React.JSX.Element {
     // previous one's generation (both start at 1) and surface stale cached pages.
     const [load_epoch, set_load_epoch] = useState(0);
     const [active_sheet_index, set_active_sheet_index] = useState(0);
-    const [show_formatting, set_show_formatting] = useState(true);
+    // Per sheet, not per workbook (#154). Formatting is a view setting like the rest
+    // of the right-hand toolbar group, and reading one sheet raw while another stays
+    // formatted is a real thing to want. Sparse: an absent entry means the default,
+    // which is why every read goes through `?? true`.
+    const [show_formatting_by_sheet, set_show_formatting_by_sheet] =
+        useState<(boolean | undefined)[]>([]);
     const [vertical_tabs, set_vertical_tabs] = useState(false);
     const [column_widths, set_column_widths] = useState<
         (Record<number, number> | undefined)[]
@@ -476,7 +485,10 @@ export function App(): React.JSX.Element {
         origin: Exclude<TransformOrigin, 'restore'>;
     } | null>(null);
     const [sheet_context_menu, set_sheet_context_menu] = useState<{
-        sheet_index: number;
+        // Null for a right-click on the tab strip's own background rather than on a
+        // tab: the tab-orientation command applies to the strip, so it is offered
+        // there too, while the per-sheet actions have no sheet to act on.
+        sheet_index: number | null;
         x: number;
         y: number;
     } | null>(null);
@@ -1615,6 +1627,14 @@ export function App(): React.JSX.Element {
                         });
                         set_active_sheet_index(normalized.activeSheetIndex);
                         set_column_widths(normalized.columnWidths);
+                        set_show_formatting_by_sheet(normalized.showFormatting ?? []);
+                        // Work owed to the *previous* document. Both are queues of
+                        // bare sheet indices, so left standing they would be redeemed
+                        // against whatever sheet now sits at that index — fitting
+                        // columns and promoting header rows in a file the user never
+                        // asked it of, and persisting both.
+                        set_pending_auto_fit_sheets(EMPTY_PENDING_AUTO_FIT);
+                        set_excel_header_queue(null);
                         set_column_visibility(normalized.columnVisibility);
                         set_transforms(normalized.transforms);
                         const tab_orient = normalized.tabOrientation;
@@ -2601,6 +2621,10 @@ export function App(): React.JSX.Element {
         set_sheet_context_menu({ sheet_index, x, y });
     }, []);
 
+    const handle_strip_context_menu = useCallback((x: number, y: number) => {
+        set_sheet_context_menu({ sheet_index: null, x, y });
+    }, []);
+
     const run_sheet_action = useCallback((
         sheet_index: number,
         action: SheetAction,
@@ -2667,16 +2691,50 @@ export function App(): React.JSX.Element {
         else handle?.copy_selection();
     }, []);
 
+    /**
+     * The only writer, so the live array and the persisted copy cannot drift.
+     *
+     * Persisted per file: reloading the same file after an external edit keeps the
+     * choice, and opening a different file in this panel gets that file's own rather
+     * than inheriting this one's by sheet index (#154).
+     */
+    const update_show_formatting = useCallback(
+        (updater: (prev: readonly (boolean | undefined)[]) => (boolean | undefined)[]) => {
+            set_show_formatting_by_sheet((prev) => {
+                const next = updater(prev);
+                state_ref.current = { ...state_ref.current, showFormatting: [...next] };
+                persist_immediate();
+                return next;
+            });
+        },
+        [persist_immediate],
+    );
+
     const handle_toggle_formatting = useCallback(() => {
-        set_show_formatting((prev) => !prev);
-    }, []);
+        update_show_formatting((prev) => {
+            const next = [...prev];
+            next[active_sheet_index] = !(next[active_sheet_index] ?? true);
+            return next;
+        });
+    }, [active_sheet_index, update_show_formatting]);
+
+    /** Put every sheet into the same formatting state, for the chevron menu. */
+    const set_formatting_all_sheets = useCallback((formatted: boolean) => {
+        update_show_formatting(
+            () => new Array(meta?.sheets.length ?? 0).fill(formatted),
+        );
+    }, [meta, update_show_formatting]);
 
     const request_excel_header = useCallback((
         enabled: boolean,
         unhide_all = false,
         header_row?: number,
+        // The host keys the request by sheet, so an inactive sheet is addressable
+        // without switching to it — which is what lets "all sheets" run as a queue
+        // rather than as a tour of the workbook.
+        target_sheet_index = active_sheet_index,
     ) => {
-        const sheet = meta?.sheets[active_sheet_index];
+        const sheet = meta?.sheets[target_sheet_index];
         const header = sheet?.excelFirstRowHeader;
         if (!sheet || !header || pending_excel_header_ref.current) return;
         const request_id = `header:${excel_header_request_prefix_ref.current}:${
@@ -2695,7 +2753,7 @@ export function App(): React.JSX.Element {
         );
         host_bridge.postMessage({
             type: 'setExcelFirstRowHeader',
-            sheetIndex: active_sheet_index,
+            sheetIndex: target_sheet_index,
             sheetName: sheet.name,
             enabled,
             ...(unhide_all ? { unhideAll: true } : {}),
@@ -2711,6 +2769,39 @@ export function App(): React.JSX.Element {
         if (!header) return;
         request_excel_header(!(header.mode === 'on' || header.active));
     }, [active_sheet_index, meta, request_excel_header]);
+
+    /**
+     * Sheets still owed a header-row change, and the state to put them in.
+     *
+     * The host takes one of these at a time — `request_excel_header` refuses while a
+     * request is in flight — so "all sheets" is a queue drained by the effect below
+     * rather than a burst. Sheets already in the target state never enter it.
+     */
+    const [excel_header_queue, set_excel_header_queue] = useState<{
+        enabled: boolean;
+        sheets: readonly number[];
+    } | null>(null);
+
+    useEffect(() => {
+        if (!excel_header_queue || pending_excel_header !== null) return;
+        const [next_sheet, ...rest] = excel_header_queue.sheets;
+        if (next_sheet === undefined) return set_excel_header_queue(null);
+        set_excel_header_queue({ ...excel_header_queue, sheets: rest });
+        request_excel_header(excel_header_queue.enabled, false, undefined, next_sheet);
+    }, [excel_header_queue, pending_excel_header, request_excel_header]);
+
+    /** Queue every sheet that is not already in `enabled`, for the chevron menu. */
+    const set_excel_header_all_sheets = useCallback((enabled: boolean) => {
+        const sheets = (meta?.sheets ?? [])
+            .map((sheet, index) => ({ sheet, index }))
+            .filter(({ sheet }) => {
+                const header = sheet.excelFirstRowHeader;
+                if (!header) return false;
+                return (header.mode === 'on' || header.active) !== enabled;
+            })
+            .map(({ index }) => index);
+        if (sheets.length > 0) set_excel_header_queue({ enabled, sheets });
+    }, [meta]);
 
     const handle_promote_row_to_header = useCallback((display_row: number) => {
         request_excel_header(true, false, display_row);
@@ -3552,74 +3643,146 @@ export function App(): React.JSX.Element {
         [active_sheet_index]
     );
 
+    /**
+     * Fit the active sheet now, recording the widths it replaces.
+     *
+     * Reads the fit through `auto_fit_ref` rather than taking widths as an argument
+     * because only a *mounted* grid can measure, and all three callers — the button,
+     * the all-sheets action, and the deferred pass below — run against whichever grid
+     * is mounted at the time. Returns false when there was nothing to measure.
+     */
+    const apply_auto_fit_to_active_sheet = useCallback(() => {
+        const fitted = auto_fit_ref.current?.();
+        if (!fitted) return false;
+        const sheet_index = active_sheet_index;
+        const current_widths = column_widths[sheet_index];
+        set_auto_fit_snapshot((prev) => {
+            const next = [...prev];
+            // Only if this sheet has no snapshot yet. A second fit over an already
+            // fitted sheet must not overwrite the original widths with fitted ones,
+            // or "restore" would restore the fit.
+            if (next[sheet_index] === undefined) {
+                next[sheet_index] = current_widths ? { ...current_widths } : undefined;
+            }
+            auto_fit_snapshot_ref.current = next;
+            return next;
+        });
+        set_column_widths((prev) => {
+            const next = [...prev];
+            next[sheet_index] = { ...(next[sheet_index] ?? {}), ...fitted };
+            state_ref.current = { ...state_ref.current, columnWidths: [...next] };
+            persist_immediate();
+            return next;
+        });
+        set_auto_fit_active((prev) => {
+            const next = [...prev];
+            next[sheet_index] = true;
+            auto_fit_active_ref.current = next;
+            return next;
+        });
+        return true;
+    }, [active_sheet_index, column_widths, persist_immediate]);
+
+    /**
+     * Put the named sheets back on the widths their fit replaced.
+     *
+     * Serves both the button, which passes the active sheet alone, and the all-sheets
+     * menu item. Sheets that were never fitted are skipped rather than blanked, so
+     * passing every index is safe.
+     */
+    const restore_widths_for_sheets = useCallback((indices: readonly number[]) => {
+        const fitted = indices.filter((index) => auto_fit_active_ref.current[index]);
+        if (fitted.length === 0) return;
+        set_column_widths((prev) => {
+            const next = [...prev];
+            for (const index of fitted) next[index] = auto_fit_snapshot_ref.current[index];
+            state_ref.current = { ...state_ref.current, columnWidths: [...next] };
+            persist_immediate();
+            return next;
+        });
+        set_auto_fit_active((prev) => {
+            const next = [...prev];
+            for (const index of fitted) next[index] = false;
+            auto_fit_active_ref.current = next;
+            return next;
+        });
+        set_auto_fit_snapshot((prev) => {
+            const next = [...prev];
+            for (const index of fitted) next[index] = undefined;
+            auto_fit_snapshot_ref.current = next;
+            return next;
+        });
+    }, [persist_immediate]);
+
     const handle_toggle_auto_fit = useCallback(() => {
         if (auto_fit_active[active_sheet_index]) {
-            // Deactivate: restore snapshotted widths.
-            const snapshot = auto_fit_snapshot[active_sheet_index];
-            set_column_widths((prev) => {
-                const next = [...prev];
-                next[active_sheet_index] = snapshot;
-                state_ref.current = {
-                    ...state_ref.current,
-                    columnWidths: [...next],
-                };
-                persist_immediate();
-                return next;
-            });
-            set_auto_fit_active((prev) => {
-                const next = [...prev];
-                next[active_sheet_index] = false;
-                auto_fit_active_ref.current = next;
-                return next;
-            });
-            set_auto_fit_snapshot((prev) => {
-                const next = [...prev];
-                next[active_sheet_index] = undefined;
-                auto_fit_snapshot_ref.current = next;
-                return next;
-            });
+            restore_widths_for_sheets([active_sheet_index]);
         } else {
-            // Activate: measure the grid's loaded rows and apply the fitted
-            // widths, snapshotting the current widths so deactivation restores
-            // them. If nothing is loaded there's nothing to measure — leave off.
-            const fitted = auto_fit_ref.current?.();
-            if (!fitted) return;
-            const current_widths = column_widths[active_sheet_index];
-            set_auto_fit_snapshot((prev) => {
-                const next = [...prev];
-                next[active_sheet_index] = current_widths
-                    ? { ...current_widths }
-                    : undefined;
-                auto_fit_snapshot_ref.current = next;
-                return next;
-            });
-            set_column_widths((prev) => {
-                const next = [...prev];
-                next[active_sheet_index] = {
-                    ...(next[active_sheet_index] ?? {}),
-                    ...fitted,
-                };
-                state_ref.current = {
-                    ...state_ref.current,
-                    columnWidths: [...next],
-                };
-                persist_immediate();
-                return next;
-            });
-            set_auto_fit_active((prev) => {
-                const next = [...prev];
-                next[active_sheet_index] = true;
-                auto_fit_active_ref.current = next;
-                return next;
-            });
+            apply_auto_fit_to_active_sheet();
         }
     }, [
         active_sheet_index,
+        apply_auto_fit_to_active_sheet,
         auto_fit_active,
-        auto_fit_snapshot,
-        column_widths,
-        persist_immediate,
+        restore_widths_for_sheets,
     ]);
+
+    /**
+     * Sheets marked "auto-fit" that have not been measured yet.
+     *
+     * Fitting reads the mounted grid's *loaded* rows, so a sheet the user has never
+     * opened has nothing to measure — there is no width to compute without first
+     * mounting its grid and loading rows. Rather than flicker the whole workbook
+     * through the viewport to service one menu click, "auto-fit all sheets" marks
+     * them and each fits on arrival. That matches what auto-fit already promises on
+     * the active sheet, where it only ever measures what is loaded.
+     */
+    const [pending_auto_fit_sheets, set_pending_auto_fit_sheets] =
+        useState<ReadonlySet<number>>(EMPTY_PENDING_AUTO_FIT);
+
+    useEffect(() => {
+        if (!pending_auto_fit_sheets.has(active_sheet_index)) return;
+        if (!auto_fit_ref.current) return;
+        if (!apply_auto_fit_to_active_sheet()) return;
+        set_pending_auto_fit_sheets((prev) => {
+            if (!prev.has(active_sheet_index)) return prev;
+            const next = new Set(prev);
+            next.delete(active_sheet_index);
+            return next;
+        });
+    }, [
+        active_sheet_index,
+        apply_auto_fit_to_active_sheet,
+        // A newly mounted or remounted grid is what makes the fit possible, and
+        // neither identity is visible to this effect — the generation and load epoch
+        // are, and they change with it.
+        generation,
+        load_epoch,
+        pending_auto_fit_sheets,
+    ]);
+
+    const handle_auto_fit_all_sheets = useCallback(() => {
+        const sheet_count = meta?.sheets.length ?? 0;
+        // The active sheet joins the queue when it could not be measured — a grid
+        // with no rows loaded yet. Leaving it out on the grounds that it was "done
+        // now" would make the one sheet the user is looking at the only one the
+        // action skipped, with nothing left to retry it.
+        const fitted_active = apply_auto_fit_to_active_sheet();
+        set_pending_auto_fit_sheets(new Set(
+            Array.from({ length: sheet_count }, (_, index) => index)
+                .filter((index) => (index === active_sheet_index
+                    ? !fitted_active
+                    : !auto_fit_active_ref.current[index])),
+        ));
+    }, [active_sheet_index, apply_auto_fit_to_active_sheet, meta]);
+
+    /** Restore every sheet's pre-fit widths, and drop any fit still owed. */
+    const handle_restore_widths_all_sheets = useCallback(() => {
+        set_pending_auto_fit_sheets(EMPTY_PENDING_AUTO_FIT);
+        restore_widths_for_sheets(
+            Array.from({ length: meta?.sheets.length ?? 0 }, (_, index) => index),
+        );
+    }, [meta, restore_widths_for_sheets]);
 
     const current_sheet = meta?.sheets[active_sheet_index];
     const current_column_projection = useMemo(
@@ -3727,19 +3890,85 @@ export function App(): React.JSX.Element {
     }
 
     const sheet_names = meta.sheets.map((s) => s.name);
-    const sheet_context_menu_items: MenuItem[] = sheet_context_menu
-        ? [
+    const has_multiple_sheets = meta.sheets.length > 1;
+    // Scope menus exist only where "all sheets" means something. On a single-sheet
+    // workbook the chevron could only restate the button, so there is none — and
+    // Columns never gets one, because column visibility cannot sensibly cross sheets
+    // and a chevron there would teach the wrong rule (#154).
+    const all_sheets = `all ${meta.sheets.length} sheets`;
+    const sheet_indices = meta.sheets.map((_, index) => index);
+    const formatting_scope_menu = has_multiple_sheets
+        ? {
+            aria_label: 'Formatting scope',
+            items: [
+                {
+                    label: `Show formatted values on ${all_sheets}`,
+                    disabled: sheet_indices.every(
+                        (index) => (show_formatting_by_sheet[index] ?? true),
+                    ),
+                    on_click: () => set_formatting_all_sheets(true),
+                },
+                {
+                    label: `Show raw values on ${all_sheets}`,
+                    disabled: sheet_indices.every(
+                        (index) => !(show_formatting_by_sheet[index] ?? true),
+                    ),
+                    on_click: () => set_formatting_all_sheets(false),
+                },
+            ],
+        }
+        : undefined;
+    const header_capable_sheets = meta.sheets.filter(
+        (sheet) => sheet.excelFirstRowHeader !== undefined,
+    );
+    const excel_header_scope_menu = has_multiple_sheets && header_capable_sheets.length > 0
+        ? {
+            aria_label: 'Header row scope',
+            items: [
+                {
+                    label: `Use first row as header on ${all_sheets}`,
+                    disabled: header_capable_sheets.every((sheet) =>
+                        sheet.excelFirstRowHeader!.mode === 'on'
+                        || sheet.excelFirstRowHeader!.active),
+                    on_click: () => set_excel_header_all_sheets(true),
+                },
+                {
+                    label: `Show first row as data on ${all_sheets}`,
+                    disabled: header_capable_sheets.every((sheet) =>
+                        !(sheet.excelFirstRowHeader!.mode === 'on'
+                            || sheet.excelFirstRowHeader!.active)),
+                    on_click: () => set_excel_header_all_sheets(false),
+                },
+            ],
+        }
+        : undefined;
+    // The orientation command is offered on a tab and on empty strip space alike —
+    // as an accelerator for people who reach for right-click, never as the only
+    // route in. The button on the strip remains the discoverable one (#154).
+    const tab_orientation_item: MenuItem = {
+        label: tab_orientation_label(vertical_tabs),
+        on_click: () => {
+            set_sheet_context_menu(null);
+            handle_toggle_tab_orientation();
+        },
+    };
+    const menu_sheet_index = sheet_context_menu?.sheet_index ?? null;
+    const sheet_context_menu_items: MenuItem[] = !sheet_context_menu
+        ? []
+        : menu_sheet_index === null
+        ? [tab_orientation_item]
+        : [
             {
                 label: 'Copy sheet',
-                on_click: () => run_sheet_action(sheet_context_menu.sheet_index, 'copy_sheet'),
+                on_click: () => run_sheet_action(menu_sheet_index, 'copy_sheet'),
             },
             {
                 label: 'Select all',
-                on_click: () => run_sheet_action(sheet_context_menu.sheet_index, 'select_all'),
+                on_click: () => run_sheet_action(menu_sheet_index, 'select_all'),
             },
-        ]
-        : [];
-    const has_multiple_sheets = meta.sheets.length > 1;
+            { kind: 'separator' },
+            tab_orientation_item,
+        ];
     const effective_vertical_tabs = vertical_tabs && has_multiple_sheets;
     const current_transform = transforms[active_sheet_index] ?? EMPTY_TRANSFORM;
     // Synchronized preview panes are shown their rows in natural source order.
@@ -3774,6 +4003,7 @@ export function App(): React.JSX.Element {
         && (transform_active || has_hidden_columns);
     const transform_pending = pending_transforms[active_sheet_index] ?? false;
     const hidden_row_count = visible_transform.hiddenRows?.length ?? 0;
+    const show_formatting = show_formatting_by_sheet[active_sheet_index] ?? true;
     const excel_header = current_sheet.excelFirstRowHeader;
     const excel_header_candidate_available = current_sheet.columnCount > 0
         && hidden_row_count < current_sheet.sourceRowCount;
@@ -3803,6 +4033,32 @@ export function App(): React.JSX.Element {
     ].join(':');
     const no_visible_columns =
         current_column_projection.visible_to_source.length === 0;
+
+    const auto_fit_scope_menu = has_multiple_sheets
+        ? {
+            aria_label: 'Auto-fit scope',
+            items: [
+                {
+                    label: `Auto-fit columns on ${all_sheets}`,
+                    disabled: no_visible_columns
+                        || transform_pending
+                        || sheet_indices.every((index) => auto_fit_active[index]),
+                    on_click: handle_auto_fit_all_sheets,
+                },
+                {
+                    // Dead until something has been fitted — restoring widths nobody
+                    // changed is the definition of an action that does nothing. A fit
+                    // that is only *owed* counts: it will apply as each sheet is
+                    // opened, and calling it off is the one thing this item can do
+                    // that nothing else can.
+                    label: `Restore original widths on ${all_sheets}`,
+                    disabled: pending_auto_fit_sheets.size === 0
+                        && !sheet_indices.some((index) => auto_fit_active[index]),
+                    on_click: handle_restore_widths_all_sheets,
+                },
+            ],
+        }
+        : undefined;
 
     /**
      * The one reason set that hides or disables transform affordances, shared by
@@ -4061,10 +4317,12 @@ export function App(): React.JSX.Element {
         />
     );
 
-    return (
-        <div className={`viewer ${effective_vertical_tabs ? 'vertical-tabs' : ''}`}>
-            <Toolbar
-                ref={toolbar_focus_ref}
+    // Sort, filter, row hiding and the merge notice — worksheet state, so it sits
+    // with the worksheet's pane below the tabs rather than in the workbook chrome
+    // above them (#154). Renders nothing when the view is untransformed.
+    const sheet_pane = (
+        <div className="sheet-pane">
+            <StateStrip
                 transform={visible_transform}
                 transform_disabled={transform_ui_blocked}
                 transform_pending={transform_pending}
@@ -4083,13 +4341,26 @@ export function App(): React.JSX.Element {
                         entry.colIndex,
                         { left: rect.left, top: rect.bottom + 4 },
                         () => trigger.focus(),
+                        // Still 'toolbar': the origin discriminates a chip-opened
+                        // editor from a header-opened one, and the chips only
+                        // changed which row they live on.
                         'toolbar',
                     );
                 }}
                 on_cancel_transform={handle_cancel_transform}
+            />
+            {grid}
+        </div>
+    );
+
+    return (
+        <div className={`viewer ${effective_vertical_tabs ? 'vertical-tabs' : ''}`}>
+            <Toolbar
+                ref={toolbar_focus_ref}
                 show_formatting={show_formatting}
                 on_toggle_formatting={handle_toggle_formatting}
                 show_formatting_button={meta.hasFormatting}
+                formatting_scope_menu={formatting_scope_menu}
                 show_excel_header_button={excel_header !== undefined}
                 excel_header_active={excel_header?.mode === 'on'
                     || excel_header?.active === true}
@@ -4099,9 +4370,7 @@ export function App(): React.JSX.Element {
                 on_toggle_excel_header={handle_toggle_excel_header}
                 excel_header_disabled={excel_header_disabled}
                 excel_header_disabled_reason={excel_header_disabled_reason}
-                vertical_tabs={vertical_tabs}
-                on_toggle_tab_orientation={handle_toggle_tab_orientation}
-                show_vertical_tabs_button={has_multiple_sheets}
+                excel_header_scope_menu={excel_header_scope_menu}
                 highlight={{
                     active_color: active_highlight_color,
                     on_color_change: set_active_highlight_color,
@@ -4128,6 +4397,7 @@ export function App(): React.JSX.Element {
                 }}
                 auto_fit_active={auto_fit_active[active_sheet_index] ?? false}
                 on_toggle_auto_fit={handle_toggle_auto_fit}
+                auto_fit_scope_menu={auto_fit_scope_menu}
                 auto_fit_disabled={no_visible_columns || transform_pending}
                 auto_fit_disabled_reason={
                     no_visible_columns
@@ -4263,6 +4533,12 @@ export function App(): React.JSX.Element {
                     </div>
                 </div>
             )}
+            {/*
+              * The tabs come first in both arrangements and the pane follows, so the
+              * state strip is always below them: vertically the rail runs the full
+              * height and the strip is a header on the grid pane, which is what makes
+              * it read as belonging to the selected sheet rather than to the window.
+              */}
             {effective_vertical_tabs ? (
                 <div className="content-area">
                     <SheetTabs
@@ -4270,9 +4546,11 @@ export function App(): React.JSX.Element {
                         active_sheet_index={active_sheet_index}
                         on_select={handle_sheet_select}
                         on_context_menu={handle_sheet_context_menu}
+                        on_strip_context_menu={handle_strip_context_menu}
+                        on_toggle_orientation={handle_toggle_tab_orientation}
                         vertical={true}
                     />
-                    {grid}
+                    {sheet_pane}
                 </div>
             ) : (
                 <>
@@ -4281,24 +4559,29 @@ export function App(): React.JSX.Element {
                         active_sheet_index={active_sheet_index}
                         on_select={handle_sheet_select}
                         on_context_menu={handle_sheet_context_menu}
+                        on_strip_context_menu={handle_strip_context_menu}
+                        on_toggle_orientation={handle_toggle_tab_orientation}
                         vertical={false}
                     />
-                    {grid}
+                    {sheet_pane}
                 </>
             )}
             {sheet_context_menu && (
                 <ContextMenu
                     x={sheet_context_menu.x}
                     y={sheet_context_menu.y}
-                    aria_label={`Sheet actions for ${
-                        sheet_names[sheet_context_menu.sheet_index]
-                        ?? `Sheet ${sheet_context_menu.sheet_index + 1}`
-                    }`}
+                    aria_label={menu_sheet_index === null
+                        ? 'Sheet tab actions'
+                        : `Sheet actions for ${
+                            sheet_names[menu_sheet_index]
+                            ?? `Sheet ${menu_sheet_index + 1}`
+                        }`}
                     items={sheet_context_menu_items}
                     on_dismiss={() => set_sheet_context_menu(null)}
                     restore_focus={() => {
+                        if (menu_sheet_index === null) return;
                         document.querySelectorAll<HTMLElement>('.sheet-tab')
-                            .item(sheet_context_menu.sheet_index)?.focus();
+                            .item(menu_sheet_index)?.focus();
                     }}
                 />
             )}
