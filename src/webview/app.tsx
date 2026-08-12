@@ -55,7 +55,7 @@ import {
     type FilterHistogramReady,
     type FilterHistogramStatus,
 } from './transform-ui-model';
-import { SheetTabs } from './sheet-tabs';
+import { SheetTabs, tab_orientation_label } from './sheet-tabs';
 import { StateStrip } from './state-strip';
 import { ContextMenu, type MenuItem } from './context-menu';
 import {
@@ -3613,82 +3613,13 @@ export function App(): React.JSX.Element {
         [active_sheet_index]
     );
 
-    const handle_toggle_auto_fit = useCallback(() => {
-        if (auto_fit_active[active_sheet_index]) {
-            // Deactivate: restore snapshotted widths.
-            const snapshot = auto_fit_snapshot[active_sheet_index];
-            set_column_widths((prev) => {
-                const next = [...prev];
-                next[active_sheet_index] = snapshot;
-                state_ref.current = {
-                    ...state_ref.current,
-                    columnWidths: [...next],
-                };
-                persist_immediate();
-                return next;
-            });
-            set_auto_fit_active((prev) => {
-                const next = [...prev];
-                next[active_sheet_index] = false;
-                auto_fit_active_ref.current = next;
-                return next;
-            });
-            set_auto_fit_snapshot((prev) => {
-                const next = [...prev];
-                next[active_sheet_index] = undefined;
-                auto_fit_snapshot_ref.current = next;
-                return next;
-            });
-        } else {
-            // Activate: measure the grid's loaded rows and apply the fitted
-            // widths, snapshotting the current widths so deactivation restores
-            // them. If nothing is loaded there's nothing to measure — leave off.
-            const fitted = auto_fit_ref.current?.();
-            if (!fitted) return;
-            const current_widths = column_widths[active_sheet_index];
-            set_auto_fit_snapshot((prev) => {
-                const next = [...prev];
-                next[active_sheet_index] = current_widths
-                    ? { ...current_widths }
-                    : undefined;
-                auto_fit_snapshot_ref.current = next;
-                return next;
-            });
-            set_column_widths((prev) => {
-                const next = [...prev];
-                next[active_sheet_index] = {
-                    ...(next[active_sheet_index] ?? {}),
-                    ...fitted,
-                };
-                state_ref.current = {
-                    ...state_ref.current,
-                    columnWidths: [...next],
-                };
-                persist_immediate();
-                return next;
-            });
-            set_auto_fit_active((prev) => {
-                const next = [...prev];
-                next[active_sheet_index] = true;
-                auto_fit_active_ref.current = next;
-                return next;
-            });
-        }
-    }, [
-        active_sheet_index,
-        auto_fit_active,
-        auto_fit_snapshot,
-        column_widths,
-        persist_immediate,
-    ]);
-
     /**
      * Fit the active sheet now, recording the widths it replaces.
      *
-     * Shared by the button and by the deferred pass below, which is why it reads the
-     * fit through `auto_fit_ref` rather than taking the widths as an argument: only a
-     * *mounted* grid can measure, and both callers run against whichever grid is
-     * mounted at the time.
+     * Reads the fit through `auto_fit_ref` rather than taking widths as an argument
+     * because only a *mounted* grid can measure, and all three callers — the button,
+     * the all-sheets action, and the deferred pass below — run against whichever grid
+     * is mounted at the time. Returns false when there was nothing to measure.
      */
     const apply_auto_fit_to_active_sheet = useCallback(() => {
         const fitted = auto_fit_ref.current?.();
@@ -3721,6 +3652,50 @@ export function App(): React.JSX.Element {
         });
         return true;
     }, [active_sheet_index, column_widths, persist_immediate]);
+
+    /**
+     * Put the named sheets back on the widths their fit replaced.
+     *
+     * Serves both the button, which passes the active sheet alone, and the all-sheets
+     * menu item. Sheets that were never fitted are skipped rather than blanked, so
+     * passing every index is safe.
+     */
+    const restore_widths_for_sheets = useCallback((indices: readonly number[]) => {
+        const fitted = indices.filter((index) => auto_fit_active_ref.current[index]);
+        if (fitted.length === 0) return;
+        set_column_widths((prev) => {
+            const next = [...prev];
+            for (const index of fitted) next[index] = auto_fit_snapshot_ref.current[index];
+            state_ref.current = { ...state_ref.current, columnWidths: [...next] };
+            persist_immediate();
+            return next;
+        });
+        set_auto_fit_active((prev) => {
+            const next = [...prev];
+            for (const index of fitted) next[index] = false;
+            auto_fit_active_ref.current = next;
+            return next;
+        });
+        set_auto_fit_snapshot((prev) => {
+            const next = [...prev];
+            for (const index of fitted) next[index] = undefined;
+            auto_fit_snapshot_ref.current = next;
+            return next;
+        });
+    }, [persist_immediate]);
+
+    const handle_toggle_auto_fit = useCallback(() => {
+        if (auto_fit_active[active_sheet_index]) {
+            restore_widths_for_sheets([active_sheet_index]);
+        } else {
+            apply_auto_fit_to_active_sheet();
+        }
+    }, [
+        active_sheet_index,
+        apply_auto_fit_to_active_sheet,
+        auto_fit_active,
+        restore_widths_for_sheets,
+    ]);
 
     /**
      * Sheets marked "auto-fit" that have not been measured yet.
@@ -3769,26 +3744,10 @@ export function App(): React.JSX.Element {
     /** Restore every sheet's pre-fit widths, and drop any fit still owed. */
     const handle_restore_widths_all_sheets = useCallback(() => {
         set_pending_auto_fit_sheets(new Set());
-        set_column_widths((prev) => {
-            const next = [...prev];
-            auto_fit_snapshot_ref.current.forEach((snapshot, index) => {
-                if (auto_fit_active_ref.current[index]) next[index] = snapshot;
-            });
-            state_ref.current = { ...state_ref.current, columnWidths: [...next] };
-            persist_immediate();
-            return next;
-        });
-        set_auto_fit_snapshot(() => {
-            const next: (Record<number, number> | undefined)[] = [];
-            auto_fit_snapshot_ref.current = next;
-            return next;
-        });
-        set_auto_fit_active(() => {
-            const next: boolean[] = [];
-            auto_fit_active_ref.current = next;
-            return next;
-        });
-    }, [persist_immediate]);
+        restore_widths_for_sheets(
+            Array.from({ length: meta?.sheets.length ?? 0 }, (_, index) => index),
+        );
+    }, [meta, restore_widths_for_sheets]);
 
     const current_sheet = meta?.sheets[active_sheet_index];
     const current_column_projection = useMemo(
@@ -3952,9 +3911,7 @@ export function App(): React.JSX.Element {
     // as an accelerator for people who reach for right-click, never as the only
     // route in. The button on the strip remains the discoverable one (#164).
     const tab_orientation_item: MenuItem = {
-        label: vertical_tabs
-            ? 'Move sheet tabs above the table'
-            : 'Move sheet tabs to the left of the table',
+        label: tab_orientation_label(vertical_tabs),
         on_click: () => {
             set_sheet_context_menu(null);
             handle_toggle_tab_orientation();

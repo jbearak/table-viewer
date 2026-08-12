@@ -84,11 +84,10 @@ export function StateStrip(props: StateStripProps): React.JSX.Element | null {
                 </div>
             )}
             {props.transform_pending && (
+                <>
                 <span className="toolbar-progress" role="status" aria-live="polite">
                     {props.transform_progress ?? 'Applying sort & filters…'}
                 </span>
-            )}
-            {props.transform_pending && (
                 <button
                     type="button"
                     className="toolbar-cancel"
@@ -100,6 +99,7 @@ export function StateStrip(props: StateStripProps): React.JSX.Element | null {
                 >
                     Cancel
                 </button>
+                </>
             )}
             {props.merges_flattened && (
                 <span

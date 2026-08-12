@@ -95,7 +95,6 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
 ): React.JSX.Element {
     const toolbar_ref = useRef<HTMLDivElement>(null);
     const columns_ref = useRef<ColumnVisibilityFocusHandle>(null);
-    const actions_ref = useRef<HTMLDivElement>(null);
     const [open_scope_menu, set_open_scope_menu] =
         useState<{ key: string; x: number; y: number } | null>(null);
     const scope_menu_context = useMemo(
@@ -231,20 +230,7 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
               * would break it.
               */}
             <ScopeMenuContext.Provider value={scope_menu_context}>
-            <div
-                ref={actions_ref}
-                className="toolbar-actions"
-                // Pressing any control in the row dismisses an open menu, including
-                // the ones that know nothing about scope menus — Columns, Edit. Two
-                // exceptions: a press inside the menu is the menu being used, and a
-                // press on a chevron is its own toggle, which would otherwise close
-                // here and reopen on click.
-                onPointerDown={(event) => {
-                    const target = event.target as HTMLElement;
-                    if (target.closest('[role="menu"], .toolbar-split-caret')) return;
-                    set_open_scope_menu(null);
-                }}
-            >
+            <div className="toolbar-actions">
                 {workbook_actions}
                 {workbook_actions.length > 0 && (
                     <div
@@ -296,6 +282,20 @@ function ToolbarButton({
      */
     const [tooltip_suppressed, set_tooltip_suppressed] = useState(false);
     const scope_context = React.useContext(ScopeMenuContext);
+    /*
+     * Whether the press that is closing the menu landed on this button's own chevron.
+     *
+     * `ContextMenu` dismisses from a document-level pointerdown, which lands before
+     * the click that press produces. Pressing an open menu's own chevron therefore
+     * closed it and then reopened it on the click, so the chevron stuck open instead
+     * of toggling.
+     *
+     * Watching where the press landed, rather than how recently one happened, is what
+     * keeps a genuine second press from being swallowed. The listener is registered
+     * only while this menu is open, and merely records — it never acts, so its order
+     * against ContextMenu's own listener does not matter.
+     */
+    const pressed_own_caret_ref = useRef(false);
     const tooltip_id = useId();
     const button_ref = useRef<HTMLButtonElement>(null);
     const caret_ref = useRef<HTMLButtonElement>(null);
@@ -311,25 +311,31 @@ function ToolbarButton({
     const native_disabled = disabled && !focusable_when_disabled;
 
     /*
-     * Forget the hover and focus that were live when the menu opened.
+     * Forget the hover and focus that were live while the menu was open.
      *
-     * The menu renders inside this control's `.toolbar-item`, so focus moving into it
-     * never fires the wrapper's `onBlur`, and the pointer travelling over it never
-     * fires `onMouseLeave`. Dismissing by clicking elsewhere then removes the menu
-     * without either event ever arriving, leaving both flags stuck on — and the
-     * tooltip, suppressed only while the menu was open, would pop back over a control
-     * the pointer left long ago.
+     * Opening the menu with the pointer leaves focus genuinely on the chevron, and
+     * dismissing by clicking out in the grid moves it nowhere — a canvas press takes
+     * no DOM focus. So the flag is not stale, it is true, and the tooltip suppressed
+     * only while the menu was open would spring back over a control the pointer left
+     * long ago.
      *
      * Safe for the keyboard path: Escape restores focus to the chevron on a later
      * tick, which sets `is_focused` again and brings the tooltip back, as it should.
      */
-    const menu_was_open_ref = useRef(false);
     useEffect(() => {
-        if (menu_was_open_ref.current && !menu_open) {
-            set_is_hovered(false);
-            set_is_focused(false);
-        }
-        menu_was_open_ref.current = menu_open;
+        if (menu_open) return;
+        set_is_hovered(false);
+        set_is_focused(false);
+    }, [menu_open]);
+
+    useEffect(() => {
+        if (!menu_open) return;
+        const record = (event: Event) => {
+            pressed_own_caret_ref.current =
+                caret_ref.current?.contains(event.target as Node) ?? false;
+        };
+        document.addEventListener('pointerdown', record, true);
+        return () => document.removeEventListener('pointerdown', record, true);
     }, [menu_open]);
 
     /**
@@ -348,6 +354,7 @@ function ToolbarButton({
         scope_context?.set_open({ key: menu_key, x: rect.left, y: rect.bottom + 4 });
     };
     const close_menu = () => scope_context?.set_open(null);
+
     const menu_items: MenuItem[] = (scope_menu?.items ?? []).map((item) => ({
         label: item.label,
         disabled: item.disabled,
@@ -398,7 +405,8 @@ function ToolbarButton({
     }, [show_tooltip]);
 
     return (
-        <div
+        <>
+            <div
             className="toolbar-item"
             tabIndex={native_disabled ? 0 : undefined}
             role={native_disabled ? 'group' : undefined}
@@ -463,6 +471,12 @@ function ToolbarButton({
                             onClick={() => {
                                 set_is_hovered(false);
                                 if (menu_open) return close_menu();
+                                // This click's own press is what dismissed the menu:
+                                // it was a close, not an open.
+                                if (pressed_own_caret_ref.current) {
+                                    pressed_own_caret_ref.current = false;
+                                    return;
+                                }
                                 open_menu();
                             }}
                         >
@@ -482,16 +496,6 @@ function ToolbarButton({
                     </>
                 )}
             </span>
-            {menu_open && (
-                <ContextMenu
-                    x={scope_context!.open!.x}
-                    y={scope_context!.open!.y}
-                    items={menu_items}
-                    aria_label={scope_menu!.aria_label}
-                    on_dismiss={close_menu}
-                    restore_focus={() => caret_ref.current?.focus()}
-                />
-            )}
             {show_tooltip && (
                 <div
                     id={tooltip_id}
@@ -503,6 +507,26 @@ function ToolbarButton({
                     {tooltip_text}
                 </div>
             )}
-        </div>
+            </div>
+            {/*
+              * Outside the hover-tracked wrapper, matching every other menu in this
+              * webview (sort-strip, filter-strip, column-context-menu). Nested inside
+              * it, focus moving into the menu fired no blur and the pointer crossing
+              * it fired no mouseleave, so dismissing from elsewhere left both flags
+              * stuck on and the tooltip sprang back over a control the pointer had
+              * left. The menu positions itself from viewport coordinates, so nothing
+              * depends on where it sits in the tree.
+              */}
+            {menu_open && (
+                <ContextMenu
+                    x={scope_context!.open!.x}
+                    y={scope_context!.open!.y}
+                    items={menu_items}
+                    aria_label={scope_menu!.aria_label}
+                    on_dismiss={close_menu}
+                    restore_focus={() => caret_ref.current?.focus()}
+                />
+            )}
+        </>
     );
 }

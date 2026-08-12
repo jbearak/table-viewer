@@ -1,5 +1,16 @@
 import React from 'react';
 
+/**
+ * What pressing the orientation control does, named as the destination rather than
+ * the current state. Exported because the tab context menu in app.tsx offers the same
+ * command and the two must not drift.
+ */
+export function tab_orientation_label(vertical: boolean): string {
+    return vertical
+        ? 'Move sheet tabs above the table'
+        : 'Move sheet tabs to the left of the table';
+}
+
 export interface SheetTabsProps {
     sheets: string[];
     active_sheet_index: number;
@@ -68,12 +79,8 @@ export function SheetTabs({
                 type="button"
                 className="sheet-tabs-orientation"
                 onClick={on_toggle_orientation}
-                aria-label={vertical
-                    ? 'Move sheet tabs above the table'
-                    : 'Move sheet tabs to the left of the table'}
-                title={vertical
-                    ? 'Move sheet tabs above the table'
-                    : 'Move sheet tabs to the left of the table'}
+                aria-label={tab_orientation_label(vertical)}
+                title={tab_orientation_label(vertical)}
             >
                 <OrientationIcon vertical={vertical} />
                 {vertical && <span className="sheet-tabs-orientation-label">Tabs on top</span>}

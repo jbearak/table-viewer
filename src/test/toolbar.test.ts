@@ -281,7 +281,6 @@ describe('Toolbar', () => {
         expect(container.querySelector('.sort-strip')).toBeNull();
         expect(container.querySelector('.filter-strip')).toBeNull();
         expect(container.querySelector('.state-strip')).toBeNull();
-        expect(container.querySelector('.toolbar-chips')).toBeNull();
         expect(container.querySelector('.toolbar-progress')).toBeNull();
         expect(container.textContent).not.toContain('hidden row');
         expect(container.textContent).not.toContain('Merged cells shown unmerged');
@@ -833,41 +832,78 @@ describe('Toolbar scope menus', () => {
         ]);
     });
 
-    it('closes an open menu when any toolbar button is pressed', () => {
+    /**
+     * Let ContextMenu arm its document-level dismissal listener, which it registers a
+     * tick after mount. Without this the real mechanism is never live and a test can
+     * pass on nothing.
+     */
+    async function arm_dismissal() {
+        await act(async () => {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+        });
+    }
+
+    /**
+     * A full press of the chevron: pointerdown, then the click it produces, each
+     * committed separately so React re-renders between them as a browser would. Both
+     * in one `act` leaves the click handler reading the pre-dismissal render.
+     */
+    async function press_caret(caret: HTMLButtonElement) {
+        await act(async () => {
+            caret.dispatchEvent(new MouseEvent('pointerdown', {
+                bubbles: true, cancelable: true,
+            }));
+        });
+        await act(async () => {
+            caret.click();
+        });
+    }
+
+    it('closes an open menu when any toolbar button is pressed', async () => {
         render_toolbar({ auto_fit_scope_menu: scope_menu(), show_edit_button: true });
         open_caret();
-        expect(document.querySelector('[role="menu"]')).not.toBeNull();
+        await arm_dismissal();
 
-        act(() => get_button('Edit').dispatchEvent(
+        await act(async () => get_button('Edit').dispatchEvent(
             new MouseEvent('pointerdown', { bubbles: true, cancelable: true }),
         ));
         expect(document.querySelector('[role="menu"]')).toBeNull();
     });
 
-    it('closes an open menu when the Columns trigger is pressed', () => {
-        // Columns knows nothing about scope menus, so the dismissal has to live on
-        // the row rather than on the buttons that own the menus.
+    it('closes an open menu when the Columns trigger is pressed', async () => {
         render_toolbar({ auto_fit_scope_menu: scope_menu() });
         open_caret();
+        await arm_dismissal();
 
-        act(() => get_button('Columns').dispatchEvent(
+        await act(async () => get_button('Columns').dispatchEvent(
             new MouseEvent('pointerdown', { bubbles: true, cancelable: true }),
         ));
         expect(document.querySelector('[role="menu"]')).toBeNull();
     });
 
-    it('still toggles its own menu shut from the chevron', () => {
-        // The row-level dismissal must not swallow the chevron's own toggle: closing
-        // on pointerdown would let the click that follows reopen it every time.
+    it('closes its own menu when the chevron is pressed again', async () => {
+        // ContextMenu dismisses on a document capture pointerdown, before anything on
+        // the chevron. Without the guard the click that follows saw no open menu and
+        // reopened it, so the chevron stuck open instead of toggling.
         render_toolbar({ auto_fit_scope_menu: scope_menu() });
         const caret = open_caret();
+        await arm_dismissal();
         expect(document.querySelector('[role="menu"]')).not.toBeNull();
 
-        act(() => caret.dispatchEvent(
-            new MouseEvent('pointerdown', { bubbles: true, cancelable: true }),
-        ));
-        act(() => caret.click());
+        await press_caret(caret);
         expect(document.querySelector('[role="menu"]')).toBeNull();
+    });
+
+    it('reopens on the next chevron press, rather than eating it', async () => {
+        // The skip covers only the press that dismissed; a fresh press must open.
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+        const caret = open_caret();
+        await arm_dismissal();
+        await press_caret(caret);
+        expect(document.querySelector('[role="menu"]')).toBeNull();
+
+        await press_caret(caret);
+        expect(document.querySelector('[role="menu"]')).not.toBeNull();
     });
 
     it('keeps a menu item clickable through the row-level dismissal', () => {
