@@ -91,7 +91,7 @@
         },
         {
           "command": "tableViewer.openCsvTable",
-          "when": "resourceExtname =~ /\\.(csv|tsv|CSV|TSV)$/ && activeCustomEditorId != tableViewer.editor && activeCustomEditorId != tableViewer.excelViewer",
+          "when": "resourceExtname =~ /\\.(csv|tsv|CSV|TSV)$/ && activeCustomEditorId != tableViewer.editor",
           "group": "navigation"
         },
         {
@@ -103,39 +103,20 @@
     },
     "customEditors": [
       {
-        "viewType": "tableViewer.excelViewer",
-        "displayName": "Table Viewer",
-        "selector": [
-          {
-            "filenamePattern": "*.xlsx"
-          },
-          {
-            "filenamePattern": "*.XLSX"
-          },
-          {
-            "filenamePattern": "*.xls"
-          },
-          {
-            "filenamePattern": "*.XLS"
-          }
-        ],
-        "priority": "default"
-      },
-      {
         "viewType": "tableViewer.editor",
         "displayName": "Table Viewer",
         "selector": [
           {
-            "filenamePattern": "*.csv"
+            "filenamePattern": "*.[xX][lL][sS][xX]"
           },
           {
-            "filenamePattern": "*.CSV"
+            "filenamePattern": "*.[xX][lL][sS]"
           },
           {
-            "filenamePattern": "*.tsv"
+            "filenamePattern": "*.[cC][sS][vV]"
           },
           {
-            "filenamePattern": "*.TSV"
+            "filenamePattern": "*.[tT][sS][vV]"
           }
         ],
         "priority": "default"

@@ -43,20 +43,6 @@ function contribution(view_type: string): CustomEditorContribution {
     return matches[0];
 }
 
-function selector_patterns(editor: CustomEditorContribution): Set<unknown> {
-    return new Set(editor.selector?.map((selector) => selector.filenamePattern) ?? []);
-}
-
-function expect_required_selectors(
-    editor: CustomEditorContribution,
-    required_patterns: readonly string[],
-): void {
-    const patterns = selector_patterns(editor);
-    for (const pattern of required_patterns) {
-        expect(patterns.has(pattern)).toBe(true);
-    }
-}
-
 describe('extension runtime manifest', () => {
     it('pins the approved runtime floor and embedded desktop runtime', () => {
         expect(manifest.engines).toEqual({
@@ -131,25 +117,15 @@ describe('extension custom-editor manifest', () => {
         expect(new Set(view_types).size).toBe(view_types.length);
     });
 
-    it('keeps the Excel viewer default for its current selector set', () => {
-        const editor = contribution('tableViewer.excelViewer');
-        expect(editor.priority).toBe('default');
-        expect_required_selectors(editor, [
-            '*.xlsx',
-            '*.XLSX',
-            '*.xls',
-            '*.XLS',
-        ]);
-    });
-
-    it('makes the CSV and TSV viewer the default for each supported case', () => {
+    it('registers one default viewer for every supported format', () => {
         const editor = contribution('tableViewer.editor');
         expect(editor.priority).toBe('default');
-        expect_required_selectors(editor, [
-            '*.csv',
-            '*.CSV',
-            '*.tsv',
-            '*.TSV',
+        expect(editor.selector).toEqual([
+            { filenamePattern: '*.[xX][lL][sS][xX]' },
+            { filenamePattern: '*.[xX][lL][sS]' },
+            { filenamePattern: '*.[cC][sS][vV]' },
+            { filenamePattern: '*.[tT][sS][vV]' },
         ]);
+        expect(custom_editors).toHaveLength(1);
     });
 });

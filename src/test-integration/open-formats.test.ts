@@ -12,8 +12,7 @@ import {
 /**
  * Parity gate (host-observable half): every supported format opens through the
  * Glide renderer in the custom editor and lands the expected tab. CSV/TSV ride
- * the repurposed `tableViewer.editor` viewType (editable); XLSX/XLS ride
- * `tableViewer.excelViewer` (read-only). We assert the tab materialises — the
+ * the single `tableViewer.editor` viewType. We assert the tab materialises — the
  * pixel-level canvas check stays a human task.
  */
 describe('open supported formats', () => {
@@ -23,9 +22,8 @@ describe('open supported formats', () => {
 
     afterEach(async () => {
         await close_all_editors();
-        // Let the host tear both viewTypes down before the next case inspects them.
+        // Let the host tear the viewType down before the next case inspects it.
         await wait_for(() => has_custom_tab('tableViewer.editor') === false, 5000);
-        await wait_for(() => has_custom_tab('tableViewer.excelViewer') === false, 5000);
     });
 
     it('CSV opens in the table editor', async () => {
@@ -78,29 +76,29 @@ describe('open supported formats', () => {
         await vscode.commands.executeCommand(
             'vscode.openWith',
             fixture_uri('basic.xlsx'),
-            'tableViewer.excelViewer',
+            'tableViewer.editor',
         );
-        const opened = await wait_for(() => has_custom_tab('tableViewer.excelViewer'));
-        assert.ok(opened, 'expected a tableViewer.excelViewer custom tab for basic.xlsx');
+        const opened = await wait_for(() => has_custom_tab('tableViewer.editor'));
+        assert.ok(opened, 'expected a tableViewer.editor custom tab for basic.xlsx');
     });
 
     it('XLS opens in the Excel viewer', async () => {
         await vscode.commands.executeCommand(
             'vscode.openWith',
             fixture_uri('basic.xls'),
-            'tableViewer.excelViewer',
+            'tableViewer.editor',
         );
-        const opened = await wait_for(() => has_custom_tab('tableViewer.excelViewer'));
-        assert.ok(opened, 'expected a tableViewer.excelViewer custom tab for basic.xls');
+        const opened = await wait_for(() => has_custom_tab('tableViewer.editor'));
+        assert.ok(opened, 'expected a tableViewer.editor custom tab for basic.xls');
     });
 
     it('merged XLSX opens in the Excel viewer', async () => {
         await vscode.commands.executeCommand(
             'vscode.openWith',
             fixture_uri('merged.xlsx'),
-            'tableViewer.excelViewer',
+            'tableViewer.editor',
         );
-        const opened = await wait_for(() => has_custom_tab('tableViewer.excelViewer'));
-        assert.ok(opened, 'expected a tableViewer.excelViewer custom tab for merged.xlsx');
+        const opened = await wait_for(() => has_custom_tab('tableViewer.editor'));
+        assert.ok(opened, 'expected a tableViewer.editor custom tab for merged.xlsx');
     });
 });
