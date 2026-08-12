@@ -48,6 +48,10 @@ import {
     create_edit_session_store,
     type EditSessionStore,
 } from './edit-session-store';
+import {
+    collect_exact_dirty_edits,
+    collect_save_edits,
+} from './csv-save-model';
 
 export interface EditSessionRegistry {
     /**
@@ -241,19 +245,12 @@ export function create_edit_session_registry(
             ): void => {
                 const snapshot = store.snapshot();
                 if (snapshot.size === 0) return;
-                const edits: Record<string, string> = {};
-                const dirty_edits: Record<string, { value: string; base: string }> = {};
-                for (const [key, entry] of snapshot) {
-                    edits[key] = entry.value;
-                    dirty_edits[key] = Object.freeze({
-                        value: entry.value,
-                        base: entry.base,
-                    });
-                }
+                const dirty_edits = collect_exact_dirty_edits(snapshot, null);
+                if (!dirty_edits) return;
                 collected.push({
                     target: Object.freeze({ ...target }),
-                    edits: Object.freeze(edits),
-                    dirtyEdits: Object.freeze(dirty_edits),
+                    edits: Object.freeze(collect_save_edits(snapshot, null)),
+                    dirtyEdits: dirty_edits,
                     parked: is_parked,
                     order: order++,
                 });

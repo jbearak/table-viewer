@@ -32,10 +32,8 @@ import {
     type CellHighlightMutation,
     type CellHighlightSelection,
     type CsvDirtyMap,
-    worksheet_target_matches,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
-    type CsvSaveWorksheetOperation,
     type DisplayRowInterval,
     type MergeRange,
     type SheetCellHighlightState,
@@ -92,15 +90,11 @@ import {
     create_edit_session_store,
     type EditSessionStore,
 } from './edit-session-store';
-import {
-    collect_exact_dirty_edits,
-    collect_save_edits,
-    type LiveEdit,
-} from './csv-save-model';
+import type { LiveEdit } from './csv-save-model';
 import {
     csv_save_operations_equal,
     resolve_csv_save_hydration,
-    save_operation_targets_sheet,
+    save_operation_worksheet,
 } from './csv-save-lifecycle';
 import {
     canvas_font,
@@ -584,11 +578,12 @@ export function GridShell({
             ? lifecycle_operation
             : undefined;
     const worksheet_payload = useCallback((operation: CsvSaveOperation | undefined) =>
-        operation?.worksheets.find((worksheet) => worksheet_target_matches(worksheet, {
-            sheetIndex: sheet_index,
-            sheetName: sheet_meta.name,
-            worksheetId: sheet_meta.worksheetId,
-        })), [sheet_index, sheet_meta.name, sheet_meta.worksheetId]);
+        operation && save_operation_worksheet(
+            operation,
+            sheet_index,
+            sheet_meta.name,
+            sheet_meta.worksheetId,
+        ), [sheet_index, sheet_meta.name, sheet_meta.worksheetId]);
     const restored_worksheet = worksheet_payload(restored_save_operation);
     // Fallback for a consumer that doesn't hoist the session store (the shell's
     // own tests). Lazy so `resolve_csv_save_hydration` runs once at store
@@ -720,15 +715,7 @@ export function GridShell({
         applied_save_lifecycle_revision_ref.current = lifecycle.revision;
         if (lifecycle.state === 'active') {
             const operation = lifecycle.operation;
-            if (
-                operation.editSessionId !== edit_session_id
-                || !save_operation_targets_sheet(
-                    operation,
-                    sheet_index,
-                    sheet_meta.name,
-                    sheet_meta.worksheetId,
-                )
-            ) return;
+            if (operation.editSessionId !== edit_session_id) return;
             const locked = save_operation_ref.current;
             if (locked && !csv_save_operations_equal(locked, operation)) return;
             const worksheet = worksheet_payload(operation);

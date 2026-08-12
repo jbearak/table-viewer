@@ -114,7 +114,7 @@ export function propose_csv_save(
  * operation restores only that same session, while success tombstones stale
  * operation-owned state unless the host has already granted a different one.
  */
-function save_operation_worksheet(
+export function save_operation_worksheet(
     operation: CsvSaveOperation,
     sheet_index: number,
     sheet_name: string | undefined,

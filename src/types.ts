@@ -1275,11 +1275,7 @@ export interface CsvSaveOperation {
 }
 
 /** A workbook save as the webview posts it. */
-export interface CsvSaveOperationRequest {
-    readonly editSessionId: string;
-    readonly saveRequestId: string;
-    readonly worksheets: readonly CsvSaveWorksheetOperation[];
-}
+export type CsvSaveOperationRequest = CsvSaveOperation;
 
 export type CsvSaveLifecycle =
     | { readonly revision: number; readonly state: 'idle' }
