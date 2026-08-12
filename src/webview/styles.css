@@ -606,9 +606,9 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     overflow: auto;
 }
 
-/* Wraps the Glide canvas and the transparent merge overlay; fills the
-   remaining flex space (column layout, or row layout with vertical tabs) and
-   anchors the absolutely-positioned overlay. */
+/* Wraps the Glide canvas and the transparent merge overlay; fills whatever
+   `.sheet-pane` has left after the state strip — a column layout in both tab
+   orientations — and anchors the absolutely-positioned overlay. */
 .grid-shell-root {
     position: relative;
     flex: 1;

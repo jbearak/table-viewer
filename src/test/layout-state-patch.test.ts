@@ -319,17 +319,27 @@ describe('every persisted leaf is classified', () => {
     });
 
     it('gives every panel-owned leaf a patch leaf, and no host-owned one', () => {
-        const empty = derive_layout_state_patch(normalized(), normalized());
-        const patch_leaves = new Set(Object.keys(empty));
+        // Derived across a change in *every* panel-owned leaf, because the two
+        // single-valued ones are omitted from the patch when unchanged — asked of an
+        // empty derivation they would look unpatchable, and exempting them by name
+        // would mean the guard never covered them at all.
+        const patch = derive_layout_state_patch(
+            normalized(),
+            normalized({
+                columnWidths: [{ 0: 90 }],
+                scrollPosition: [{ top: 1, left: 2 }],
+                activeSheetIndex: 1,
+                tabOrientation: 'vertical',
+                showFormatting: [false],
+            }),
+        );
+        const patch_leaves = new Set(Object.keys(patch));
 
         for (const leaf of PANEL_OWNED) {
-            // activeSheetIndex and tabOrientation are single values, omitted from the
-            // patch entirely when unchanged rather than carried as an empty array.
-            const carried = patch_leaves.has(leaf)
-                || leaf === 'activeSheetIndex'
-                || leaf === 'tabOrientation';
-            expect(carried, `${leaf} is persisted but has no LayoutStatePatch leaf`)
-                .toBe(true);
+            expect(
+                patch_leaves.has(leaf),
+                `${leaf} is persisted but has no LayoutStatePatch leaf`,
+            ).toBe(true);
         }
         for (const leaf of HOST_OWNED) {
             expect(patch_leaves.has(leaf), `${leaf} is host-owned but patchable`)

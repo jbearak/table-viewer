@@ -291,9 +291,9 @@ function ToolbarButton({
      * of toggling.
      *
      * Watching where the press landed, rather than how recently one happened, is what
-     * keeps a genuine second press from being swallowed. The listener is registered
-     * only while this menu is open, and merely records — it never acts, so its order
-     * against ContextMenu's own listener does not matter.
+     * keeps a genuine second press from being swallowed. The listener below merely
+     * records — it never acts, so its order against ContextMenu's own listener does
+     * not matter.
      */
     const pressed_own_caret_ref = useRef(false);
     const tooltip_id = useId();
