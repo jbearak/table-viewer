@@ -169,8 +169,25 @@ function make_rect({
     } as DOMRect;
 }
 
+/**
+ * Put the shipped stylesheet behind the render, for the handful of assertions that
+ * turn on a resolved style rather than on markup. jsdom lays nothing out, but it does
+ * run the cascade, so `display` and `position` are answerable.
+ */
+function apply_webview_styles(): void {
+    const style = document.createElement('style');
+    style.dataset.webviewStyles = 'true';
+    style.textContent = readFileSync(
+        resolve(process.cwd(), 'src/webview/styles.css'),
+        'utf8',
+    );
+    document.head.appendChild(style);
+}
+
 afterEach(() => {
     cleanup();
+    document.head.querySelectorAll('style[data-webview-styles]')
+        .forEach((style) => style.remove());
 });
 
 describe('Toolbar', () => {
@@ -693,6 +710,33 @@ describe('Toolbar scope menus', () => {
             (item) => item.textContent,
         );
     }
+
+    it('adds no in-flow box to the action row when a menu opens', () => {
+        // The row is right-aligned and gap-spaced, so any child that generates a box
+        // widens it and slides every control left — by the 6px gap alone, even for a
+        // child of zero width. The menu is fixed-positioned, but its wrapper is not,
+        // so the wrapper has to generate no box at all. jsdom computes no layout, so
+        // this asserts the used `display`/`position` the stylesheet resolves to.
+        apply_webview_styles();
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+        const actions = document.querySelector('.toolbar-actions') as HTMLElement;
+        const before = new Set(Array.from(actions.children));
+
+        open_caret();
+
+        const added = Array.from(actions.children).filter((child) => !before.has(child));
+        expect(added.length).toBeGreaterThan(0);
+        for (const child of added) {
+            const style = getComputedStyle(child);
+            const out_of_flow = style.display === 'contents'
+                || style.position === 'fixed'
+                || style.position === 'absolute';
+            expect(
+                out_of_flow,
+                `${child.className} takes a slot in the action row`,
+            ).toBe(true);
+        }
+    });
 
     it('renders a plain button when there is no scope menu', () => {
         // A single-sheet workbook: the chevron could only restate the button.
