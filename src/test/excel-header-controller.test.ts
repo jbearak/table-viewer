@@ -183,7 +183,7 @@ function excel_profile(
 
 function open_excel(path: string, store: FileStateStore, profile: ViewerProfile) {
     const panel = vscode_mock.window.createWebviewPanel(
-        'tableViewer.excelViewer',
+        'tableViewer.editor',
         'excel',
     );
     const controller = attach_viewer(
