@@ -4047,9 +4047,13 @@ export function App(): React.JSX.Element {
                 },
                 {
                     // Dead until something has been fitted — restoring widths nobody
-                    // changed is the definition of an action that does nothing.
+                    // changed is the definition of an action that does nothing. A fit
+                    // that is only *owed* counts: it will apply as each sheet is
+                    // opened, and calling it off is the one thing this item can do
+                    // that nothing else can.
                     label: `Restore original widths on ${all_sheets}`,
-                    disabled: !sheet_indices.some((index) => auto_fit_active[index]),
+                    disabled: pending_auto_fit_sheets.size === 0
+                        && !sheet_indices.some((index) => auto_fit_active[index]),
                     on_click: handle_restore_widths_all_sheets,
                 },
             ],

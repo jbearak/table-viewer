@@ -3539,6 +3539,32 @@ describe('auto-fit state', () => {
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
     });
 
+    it('offers to call off a fit that is only owed', async () => {
+        // Nothing measurable on the active grid, so no sheet ends up fitted and every
+        // sheet is merely queued. Judged on `auto_fit_active` alone the restore item
+        // reads that as "nothing to undo" and greys out — leaving the queued fits with
+        // no way to cancel them before each lands.
+        grid_shell_mock.auto_fit_result = null;
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B'])));
+
+        await open_scope_menu('Auto-fit scope');
+        await click_menu_item('Auto-fit columns on all 2 sheets');
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
+
+        await open_scope_menu('Auto-fit scope');
+        const restore = Array.from(
+            document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
+        ).find((item) => item.textContent === 'Restore original widths on all 2 sheets');
+        expect(restore?.disabled).toBe(false);
+
+        // And taking it drops the queue: arriving at B fits nothing.
+        await click_menu_item('Restore original widths on all 2 sheets');
+        grid_shell_mock.auto_fit_result = { 0: 120 };
+        await click_sheet_tab('B');
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
+    });
+
     it('does not redeem a pending fit against a different workbook', async () => {
         // The queue holds bare sheet indices. Left standing across a load, sheet 1 of
         // the *new* file would be fitted on arrival without anyone asking.

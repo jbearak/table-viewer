@@ -4,7 +4,7 @@ import {
     derive_layout_state_patch,
     layout_state_patch_is_empty,
 } from '../layout-state-patch';
-import type { PerFileState } from '../types';
+import { decode_stored_per_file_state, type PerFileState } from '../types';
 import type { NormalizedPerFileState } from '../viewer-snapshot';
 import { sheet_cells, sheet_edits } from './pending-edits-helper';
 
@@ -252,6 +252,25 @@ describe('showFormatting layout leaf', () => {
         const incoming = normalized({ showFormatting: [false, undefined] });
 
         expect(derive_layout_state_patch(basis, incoming).showFormatting).toEqual([]);
+    });
+});
+
+describe('showFormatting decoding', () => {
+    it('reads a gap left by JSON as the default, and keeps a recorded false', () => {
+        // The webview writes the array sparsely, so a sheet nobody has touched has no
+        // entry — and JSON has no holes, so every gap comes back as `null`. Decoded
+        // to `undefined` rather than left as a third spelling of the default.
+        const decoded = decode_stored_per_file_state({
+            showFormatting: [null, false, true],
+        }) as PerFileState;
+
+        expect(decoded.showFormatting).toEqual([undefined, false, true]);
+        expect(decoded.showFormatting![0]).toBeUndefined();
+    });
+
+    it('rejects a non-boolean entry', () => {
+        expect(() => decode_stored_per_file_state({ showFormatting: ['on'] })).toThrow();
+        expect(() => decode_stored_per_file_state({ showFormatting: 5 })).toThrow();
     });
 });
 

@@ -848,7 +848,16 @@ export function decode_stored_per_file_state(value: unknown): StoredPerFileState
     if (state.transforms !== undefined) validate_transforms(state.transforms);
     if (state.columnVisibility !== undefined) validate_column_visibility(state.columnVisibility);
     if (state.cellHighlights !== undefined) validate_cell_highlights(state.cellHighlights);
-    if (state.showFormatting !== undefined) validate_show_formatting(state.showFormatting);
+    if (state.showFormatting !== undefined) {
+        validate_show_formatting(state.showFormatting);
+        // JSON has no holes. The webview writes this array sparsely — a sheet the
+        // user never touched has no entry — and every gap comes back as `null`.
+        // Canonicalized here so the decoded value matches its declared type, rather
+        // than leaving every reader to know that `null` is a third spelling of the
+        // default. `false` is a recorded choice and survives.
+        state.showFormatting = (state.showFormatting as readonly (boolean | null)[])
+            .map((entry) => entry ?? undefined);
+    }
 
     if (state.activeSheetIndex !== undefined && !is_non_negative_integer(state.activeSheetIndex)) {
         invalid_leaf('activeSheetIndex');
