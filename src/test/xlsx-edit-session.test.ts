@@ -456,6 +456,63 @@ describe('xlsx edit sessions', () => {
         ).includes('Draft'));
     });
 
+    it('persists a sibling worksheet clear while another worksheet saves', async () => {
+        const state = versioned_state_store({
+            pendingEdits: [{
+                sheetName: 'People',
+                worksheetId: '1',
+                cells: { '1:0': { value: 'Draft', base: 'Alice' } },
+            }],
+        });
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({
+            type: 'requestEditSession',
+            requestId: 'edit-inventory',
+            sheetIndex: 1,
+            sheetName: 'Inventory',
+            worksheetId: '2',
+        });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        let release_write: (() => void) | undefined;
+        let writing = false;
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            writing = true;
+            await new Promise<void>((done) => { release_write = done; });
+            bytes = new Uint8Array(content);
+        });
+        const save = panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                sheetIndex: 1,
+                sheetName: 'Inventory',
+                worksheetId: '2',
+                saveRequestId: 'save-inventory',
+                edits: { '1:0': 'Gadget' },
+                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+            },
+        });
+        await wait_for_observable(() => writing);
+
+        const publication = panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session,
+            sequence: 1,
+            sheetIndex: 0,
+            sheetName: 'People',
+            worksheetId: '1',
+            edits: null,
+        });
+        release_write!();
+        await Promise.all([save, publication]);
+        await controller_of(panel).drain();
+
+        expect(JSON.stringify(state.get_state(file_path).pendingEdits ?? null))
+            .not.toContain('Draft');
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+    });
+
     it('follows its worksheet when the workbook is reordered underneath it', async () => {
         // A save names a sheet by *position*, and an external reorder makes
         // that position somebody else's worksheet. Saving through the stale index

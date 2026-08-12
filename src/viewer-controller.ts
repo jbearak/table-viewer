@@ -77,6 +77,8 @@ import {
     worksheet_identity,
     worksheet_target_index,
     worksheet_target_key,
+    worksheet_target_lookup,
+    worksheet_target_matches,
     type ActiveCsvSaveLifecycle,
     type CsvDirtyMap,
     type CsvSaveLifecycle,
@@ -1380,11 +1382,12 @@ export function attach_viewer(
         sheets: readonly WorksheetIdentityInput[] = source?.meta().sheets ?? [],
     ): boolean {
         if (!slots) return true;
+        const target_index = worksheet_target_lookup(sheets);
         let parked = false;
         for (const [sheetIndex, slot] of slots.entries()) {
             if (!slot) continue;
             if (slot.worksheetId === undefined && slot.sheetName === undefined) return true;
-            if (worksheet_target_index(sheets, {
+            if (target_index({
                 sheetIndex,
                 sheetName: slot.sheetName,
                 worksheetId: slot.worksheetId,
@@ -6128,8 +6131,26 @@ export function attach_viewer(
                 }
                 return;
             case 'pendingEditsChanged': {
-                if (!profile.editing || active_save_operation) return;
+                if (!profile.editing) return;
                 if (!edit_message_is_current(msg.editSessionId)) return;
+                const message_target: WorksheetTarget = {
+                    sheetIndex: msg.sheetIndex ?? 0,
+                    sheetName: msg.sheetName,
+                    worksheetId: msg.worksheetId,
+                };
+                if (
+                    active_save_operation
+                    && (
+                        worksheet_target_matches(
+                            active_save_operation.durableTarget,
+                            message_target,
+                        )
+                        || worksheet_target_matches(
+                            message_target,
+                            active_save_operation.durableTarget,
+                        )
+                    )
+                ) return;
                 if (pending_edit_sequence_session_id !== msg.editSessionId) {
                     pending_edit_sequence_session_id = msg.editSessionId;
                     highest_pending_edit_sequence = 0;

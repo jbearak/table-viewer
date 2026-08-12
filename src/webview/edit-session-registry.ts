@@ -39,7 +39,7 @@
 
 import {
     worksheet_identity,
-    worksheet_target_index,
+    worksheet_target_lookup,
     type WorksheetIdentityInput,
     type WorksheetTarget,
 } from '../types';
@@ -145,8 +145,7 @@ export function create_edit_session_registry(
                 target: WorksheetTarget;
                 store: EditSessionStore;
             }> = [];
-            const next_index_for = (target: WorksheetTarget) =>
-                worksheet_target_index(next, target);
+            const next_index_for = worksheet_target_lookup(next);
 
             for (const [parked_store, entry] of parked) {
                 const next_index = next_index_for(entry.target);

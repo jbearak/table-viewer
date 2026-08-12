@@ -914,22 +914,32 @@ export function worksheet_target_matches(
             : target.sheetIndex === candidate.sheetIndex;
 }
 
+export function worksheet_target_lookup(
+    sheets: readonly WorksheetIdentityInput[],
+): (target: WorksheetTarget) => number | undefined {
+    const index_by_id = new Map<string, number>();
+    const index_by_name = new Map<string, number>();
+    sheets.forEach((input, index) => {
+        const sheet = worksheet_identity(input);
+        if (sheet.worksheetId !== undefined && !index_by_id.has(sheet.worksheetId)) {
+            index_by_id.set(sheet.worksheetId, index);
+        }
+        if (!index_by_name.has(sheet.name)) index_by_name.set(sheet.name, index);
+    });
+    return (target) => target.worksheetId !== undefined
+        ? index_by_id.get(target.worksheetId)
+        : target.sheetName !== undefined
+            ? index_by_name.get(target.sheetName)
+            : sheets[target.sheetIndex] === undefined
+                ? undefined
+                : target.sheetIndex;
+}
+
 export function worksheet_target_index(
     sheets: readonly WorksheetIdentityInput[],
     target: WorksheetTarget,
 ): number | undefined {
-    if (target.worksheetId !== undefined || target.sheetName !== undefined) {
-        const index = sheets.findIndex((sheet, sheetIndex) => {
-            const identity = worksheet_identity(sheet);
-            return worksheet_target_matches(target, {
-                sheetIndex,
-                sheetName: identity.name,
-                worksheetId: identity.worksheetId,
-            });
-        });
-        return index < 0 ? undefined : index;
-    }
-    return sheets[target.sheetIndex] === undefined ? undefined : target.sheetIndex;
+    return worksheet_target_lookup(sheets)(target);
 }
 
 /**
