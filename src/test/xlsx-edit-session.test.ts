@@ -377,6 +377,71 @@ describe('xlsx edit sessions', () => {
         expect(after.data.sheets[1].rows[1][0]?.raw).toBe('Widget');
     });
 
+    it('treats a non-array worksheets field as a legacy flat save', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                saveRequestId: 'legacy-with-malformed-worksheets',
+                sheetIndex: 1,
+                sheetName: 'Inventory',
+                worksheetId: '2',
+                edits: { '1:0': 'Gadget' },
+                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                worksheets: null,
+            },
+        } as never);
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+        const after = await parse_xlsx(bytes);
+        expect(after.data.sheets[1].rows[1][0]?.raw).toBe('Gadget');
+    });
+
+    it('rejects duplicate physical worksheets before planning', async () => {
+        const { panel, plan_save } = await open_with_plan_spy();
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                saveRequestId: 'duplicate-physical-sheet',
+                worksheets: [
+                    {
+                        sheetIndex: 1,
+                        worksheetId: '2',
+                        edits: { '1:0': 'Gadget' },
+                        dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                    },
+                    {
+                        sheetIndex: 1,
+                        sheetName: 'Inventory',
+                        edits: { '1:1': '25' },
+                        dirtyEdits: { '1:1': { value: '25', base: '10' } },
+                    },
+                ],
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({
+            success: false,
+            lifecycle: { state: 'failed' },
+        });
+        expect(plan_save).not.toHaveBeenCalled();
+        expect(panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'saveOperationStarted'
+        ))).toBe(false);
+    });
+
     it('rejects an identity-less save for a multi-sheet workbook', async () => {
         const { panel, plan_save } = await open_with_plan_spy();
         await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });

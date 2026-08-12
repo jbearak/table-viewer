@@ -3813,12 +3813,10 @@ export function App(): React.JSX.Element {
      * displayed order is not the user's to change (preview, an Excel header
      * change reshaping the rows underneath).
      */
-    // The save term is read from the authoritative lifecycle, not from the grid's
-    // report: a grid on a worksheet that does not own the session is handed no
-    // lifecycle and truthfully reports `save_in_flight: false` about a save it
-    // cannot see. Trusting it here re-enabled the sort and filter controls while
-    // `transform_request_blocked` — which reads the document-scoped fence — went on
-    // refusing them, so clicking one posted no `setTransform` and said nothing.
+    // The save term is read from the authoritative workbook lifecycle, not only
+    // from the mounted grid's report. The lifecycle is document-scoped, so these
+    // controls must remain fenced when any worksheet participates in the save,
+    // including a sibling-only operation the current grid does not hydrate.
     // These two have to name the same condition or the UI is lying about it.
     const transform_ui_blocked =
         save_lifecycle.state === 'active'
@@ -4028,27 +4026,11 @@ export function App(): React.JSX.Element {
             edit_mode={edit_mode_on_active_sheet}
             csv_editable={csv_editable}
             edit_session_id={csv_edit_session_id}
-            // Withheld alongside the session below, and for the same reason: a
-            // save in flight belongs to the worksheet that started it. A grid
-            // mounted on a different sheet has no hoisted store to use, so it
-            // builds its own from whatever save projection it is handed — and
-            // hydrating that from another sheet's operation painted that sheet's
-            // pending values and dirty tint here, at coordinates that mean
-            // something else, in a worksheet the user cannot even edit.
+            // Save lifecycle is workbook-scoped so it fences every grid; edit
+            // stores remain worksheet-scoped so cell keys never cross sheets.
             save_operation={save_operation}
             save_lifecycle={save_lifecycle}
             on_save_request={begin_save_operation}
-            // This sheet's own store, so what the grid paints is always in the key
-            // space it is painting into. The old single store had to be *withheld*
-            // here whenever the session belonged to another worksheet — the grid
-            // paints a dirty value and its tint whenever the store holds that key,
-            // edit mode or not, so the other sheet's `0:0` rendered here as this
-            // sheet's own edited cell. A per-sheet store cannot express that
-            // confusion: a sheet with no edits of its own has an empty map, which
-            // is exactly what the withholding was trying to achieve.
-            //
-            // The store stays above the grid generation, so returning to a sheet
-            // finds its edits intact.
             edit_session={edit_session_registry_ref.current!.for_sheet(
                 active_sheet_index,
             )}
