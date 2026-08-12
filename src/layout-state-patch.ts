@@ -43,6 +43,16 @@ export interface LayoutSheetPatch<T> {
 export interface LayoutStatePatch {
     readonly columnWidths: readonly LayoutNumericMapPatch[];
     readonly scrollPosition: readonly LayoutSheetPatch<ScrollPosition>[];
+    /**
+     * Per-sheet choice between formatted and raw cell values.
+     *
+     * A layout leaf, alongside `tabOrientation`: a view preference this panel owns
+     * outright, derived from nothing the host computes and needing no mapping the
+     * webview cannot do. That is what separates it from the host-owned four above —
+     * they are absent because the webview cannot be trusted to key them, not merely
+     * because they are large.
+     */
+    readonly showFormatting: readonly LayoutSheetPatch<boolean>[];
     readonly activeSheetIndex?: LayoutValueChange<number>;
     readonly tabOrientation?: LayoutValueChange<'horizontal' | 'vertical' | null>;
 }
@@ -104,6 +114,23 @@ function scroll_positions_equal(
     );
 }
 
+function derive_show_formatting_patches(
+    basis: readonly (boolean | undefined)[],
+    incoming: readonly (boolean | undefined)[],
+): LayoutSheetPatch<boolean>[] {
+    const patches: LayoutSheetPatch<boolean>[] = [];
+    const sheet_count = Math.max(basis.length, incoming.length);
+    for (let sheet_index = 0; sheet_index < sheet_count; sheet_index += 1) {
+        const before = basis[sheet_index];
+        const after = incoming[sheet_index];
+        if (before === after) continue;
+        patches.push(after === undefined
+            ? { sheetIndex: sheet_index, change: { type: 'delete' } }
+            : { sheetIndex: sheet_index, change: { type: 'set', value: after } });
+    }
+    return patches;
+}
+
 function derive_scroll_patches(
     basis: readonly (ScrollPosition | undefined)[],
     incoming: readonly (ScrollPosition | undefined)[],
@@ -138,6 +165,10 @@ export function derive_layout_state_patch(
             basis.scrollPosition,
             incoming.scrollPosition,
         ),
+        showFormatting: derive_show_formatting_patches(
+            basis.showFormatting ?? [],
+            incoming.showFormatting ?? [],
+        ),
         ...(basis.activeSheetIndex === incoming.activeSheetIndex
             ? {}
             : {
@@ -163,6 +194,7 @@ export function layout_state_patch_is_empty(
 ): boolean {
     return patch.columnWidths.length === 0
         && patch.scrollPosition.length === 0
+        && patch.showFormatting.length === 0
         && patch.activeSheetIndex === undefined
         && patch.tabOrientation === undefined;
 }
@@ -221,6 +253,22 @@ function apply_scroll_patches(
     return result;
 }
 
+function apply_show_formatting_patches(
+    current: (boolean | undefined)[] | undefined,
+    patches: readonly LayoutSheetPatch<boolean>[],
+): (boolean | undefined)[] | undefined {
+    let result = current;
+    for (const patch of patches) {
+        const existing = result?.[patch.sheetIndex];
+        const next = patch.change.type === 'delete' ? undefined : patch.change.value;
+        if (existing === next) continue;
+        const cloned = [...(result ?? [])];
+        cloned[patch.sheetIndex] = next;
+        result = cloned;
+    }
+    return result;
+}
+
 /** Apply a fixed panel intent to the latest durable state without replacing peers' leaves. */
 export function apply_layout_state_patch(
     current: Readonly<PerFileState>,
@@ -240,6 +288,13 @@ export function apply_layout_state_patch(
     );
     if (scroll_position !== current.scrollPosition) {
         result = { ...result, scrollPosition: scroll_position };
+    }
+    const show_formatting = apply_show_formatting_patches(
+        current.showFormatting,
+        patch.showFormatting,
+    );
+    if (show_formatting !== current.showFormatting) {
+        result = { ...result, showFormatting: show_formatting };
     }
     if (patch.activeSheetIndex !== undefined) {
         if (patch.activeSheetIndex.type === 'delete') {

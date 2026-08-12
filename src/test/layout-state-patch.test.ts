@@ -54,6 +54,7 @@ describe('layout state patches', () => {
                 sheetIndex: 0,
                 change: { type: 'set', value: { top: 5, left: 6 } },
             }],
+            showFormatting: [],
             activeSheetIndex: { type: 'set', value: 1 },
             tabOrientation: { type: 'set', value: 'vertical' },
         });
@@ -198,5 +199,132 @@ describe('layout state patches', () => {
         );
         const current = normalized({ activeSheetIndex: 1 });
         expect(apply_layout_state_patch(current, patch)).toBe(current);
+    });
+});
+
+describe('showFormatting layout leaf', () => {
+    it('derives and applies a per-sheet formatting change', () => {
+        // A webview-owned view preference, like tabOrientation. Without a leaf here
+        // the webview's `stateChanged` carried it and the host silently dropped it,
+        // so the choice never survived a quit.
+        const basis = normalized({ showFormatting: [] });
+        const incoming = normalized({ showFormatting: [undefined, false] });
+
+        const patch = derive_layout_state_patch(basis, incoming);
+        expect(patch.showFormatting).toEqual([
+            { sheetIndex: 1, change: { type: 'set', value: false } },
+        ]);
+        expect(layout_state_patch_is_empty(patch)).toBe(false);
+
+        const applied = apply_layout_state_patch({ columnWidths: [] }, patch);
+        expect(applied.showFormatting).toEqual([undefined, false]);
+    });
+
+    it('deletes a sheet slot that went back to the default', () => {
+        const basis = normalized({ showFormatting: [false] });
+        const incoming = normalized({ showFormatting: [] });
+
+        const patch = derive_layout_state_patch(basis, incoming);
+        expect(patch.showFormatting).toEqual([
+            { sheetIndex: 0, change: { type: 'delete' } },
+        ]);
+
+        const applied = apply_layout_state_patch({ showFormatting: [false] }, patch);
+        expect(applied.showFormatting).toEqual([undefined]);
+    });
+
+    it('leaves a peer panel\'s other sheets alone', () => {
+        // The point of a patch rather than a whole-state write: two panels on the
+        // same file must not clobber each other's sheets.
+        const basis = normalized({ showFormatting: [true, true] });
+        const incoming = normalized({ showFormatting: [true, false] });
+
+        const patch = derive_layout_state_patch(basis, incoming);
+        const applied = apply_layout_state_patch(
+            { showFormatting: [false, true, false] },
+            patch,
+        );
+        expect(applied.showFormatting).toEqual([false, false, false]);
+    });
+
+    it('reports an unchanged leaf as empty', () => {
+        const basis = normalized({ showFormatting: [false, undefined] });
+        const incoming = normalized({ showFormatting: [false, undefined] });
+
+        expect(derive_layout_state_patch(basis, incoming).showFormatting).toEqual([]);
+    });
+});
+
+describe('every persisted leaf is classified', () => {
+    /**
+     * `stateChanged` writes only what `LayoutStatePatch` names. A leaf the webview
+     * persists but the patch omits is dropped by the host in silence — no error, no
+     * warning, and the value simply never survives a quit. `showFormatting` shipped
+     * that way and only surfaced when someone reopened the app.
+     *
+     * So every `PerFileState` leaf has to be one of two things, and this test is
+     * where a new one is forced to say which:
+     *
+     * - **panel-owned** — written by the webview into `state_ref` and pushed with
+     *   `persist_immediate()`. Must have a `LayoutStatePatch` leaf, or it is lost.
+     * - **host-owned** — written by a dedicated message (`setTransform`,
+     *   `setColumnVisibility`, `setRowHeights`, the highlight commands). Must *not*
+     *   have a patch leaf, which is what stops a webview overwriting a map it cannot
+     *   correctly key.
+     *
+     * Adding a leaf to `PerFileState` without listing it here fails this test.
+     */
+    const PANEL_OWNED = [
+        'columnWidths',
+        'scrollPosition',
+        'activeSheetIndex',
+        'tabOrientation',
+        'showFormatting',
+    ] as const;
+    const HOST_OWNED = [
+        'rowHeights',
+        'transforms',
+        'columnVisibility',
+        'cellHighlights',
+        'pendingEdits',
+        'excelFirstRowHeaders',
+    ] as const;
+
+    it('classifies every leaf of a fully populated PerFileState', () => {
+        const populated: Required<PerFileState> = {
+            columnWidths: [],
+            rowHeights: [],
+            scrollPosition: [],
+            activeSheetIndex: 0,
+            tabOrientation: null,
+            pendingEdits: sheet_edits({}),
+            transforms: [],
+            columnVisibility: [],
+            cellHighlights: { sheets: [] },
+            showFormatting: [],
+            excelFirstRowHeaders: {},
+        };
+
+        expect(Object.keys(populated).sort())
+            .toEqual([...PANEL_OWNED, ...HOST_OWNED].sort());
+    });
+
+    it('gives every panel-owned leaf a patch leaf, and no host-owned one', () => {
+        const empty = derive_layout_state_patch(normalized(), normalized());
+        const patch_leaves = new Set(Object.keys(empty));
+
+        for (const leaf of PANEL_OWNED) {
+            // activeSheetIndex and tabOrientation are single values, omitted from the
+            // patch entirely when unchanged rather than carried as an empty array.
+            const carried = patch_leaves.has(leaf)
+                || leaf === 'activeSheetIndex'
+                || leaf === 'tabOrientation';
+            expect(carried, `${leaf} is persisted but has no LayoutStatePatch leaf`)
+                .toBe(true);
+        }
+        for (const leaf of HOST_OWNED) {
+            expect(patch_leaves.has(leaf), `${leaf} is host-owned but patchable`)
+                .toBe(false);
+        }
     });
 });
