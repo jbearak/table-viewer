@@ -742,7 +742,7 @@ describe('GridShell CSV save', () => {
         expect(post_message.mock.calls.at(-1)?.[0].operation.worksheets[0].dirtyEdits).toEqual(newer);
     });
 
-    it('ignores an active lifecycle for another sheet in the workbook session', async () => {
+    it('fences an active lifecycle for another sheet in the workbook session', async () => {
         const own = { '0:0': { value: 'own draft', base: 'base' } };
         const other: CsvSaveOperation = {
             editSessionId: 'session-1',
@@ -766,7 +766,7 @@ describe('GridShell CSV save', () => {
 
         expect(Object.fromEntries(store.snapshot())).toEqual(own);
         expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('own draft');
-        expect(await request_save(editing_ref)).toBe(true);
+        expect(await request_save(editing_ref)).toBe(false);
     });
 
     it('accepts a valid workbook save that contains only a sibling worksheet', async () => {
@@ -787,7 +787,7 @@ describe('GridShell CSV save', () => {
         expect(on_save_request).toHaveBeenCalledOnce();
     });
 
-    it('does not install a local save lock for a sibling-only workbook save', async () => {
+    it('installs a workbook save lock for a sibling-only operation', async () => {
         let request = 0;
         const on_save_request = vi.fn((): CsvSaveOperation => ({
             editSessionId: 'session-1',
@@ -809,9 +809,9 @@ describe('GridShell CSV save', () => {
 
         expect(await request_save(editing_ref)).toBe(true);
         await edit_cell('newer own draft');
-        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('newer own draft');
-        expect(await request_save(editing_ref)).toBe(true);
-        expect(on_save_request).toHaveBeenCalledTimes(2);
+        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('own draft');
+        expect(await request_save(editing_ref)).toBe(false);
+        expect(on_save_request).toHaveBeenCalledOnce();
     });
 
     it('blocks a revert while the save is in flight', async () => {

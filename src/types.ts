@@ -1276,8 +1276,18 @@ export interface CsvSaveOperation {
     readonly worksheets: readonly CsvSaveWorksheetOperation[];
 }
 
-/** A workbook save as the webview posts it. */
-export type CsvSaveOperationRequest = CsvSaveOperation;
+/** Legacy one-worksheet wire shape accepted from an already-open older webview. */
+export interface LegacyCsvSaveOperationRequest
+    extends Omit<WorksheetTarget, 'sheetIndex'> {
+    readonly editSessionId: string;
+    readonly saveRequestId: string;
+    readonly sheetIndex?: number;
+    readonly edits: Readonly<Record<string, string>>;
+    readonly dirtyEdits: CsvDirtyMap;
+}
+
+/** A workbook save as the webview posts it, including the prior one-sheet shape. */
+export type CsvSaveOperationRequest = CsvSaveOperation | LegacyCsvSaveOperationRequest;
 
 export type CsvSaveLifecycle =
     | { readonly revision: number; readonly state: 'idle' }

@@ -291,6 +291,33 @@ describe('paginated protocol message shapes', () => {
         });
     });
 
+    it('accepts both workbook and legacy one-worksheet save requests', () => {
+        const workbook: WebviewMessage = {
+            type: 'saveCsv',
+            operation: {
+                editSessionId: 'edit:1',
+                saveRequestId: 'save:1',
+                worksheets: [{
+                    sheetIndex: 1,
+                    sheetName: 'Inventory',
+                    edits: { '0:0': 'next' },
+                    dirtyEdits: { '0:0': { value: 'next', base: 'old' } },
+                }],
+            },
+        };
+        const legacy: WebviewMessage = {
+            type: 'saveCsv',
+            operation: {
+                editSessionId: 'edit:1',
+                saveRequestId: 'save:legacy',
+                edits: { '0:0': 'next' },
+                dirtyEdits: { '0:0': { value: 'next', base: 'old' } },
+            },
+        };
+        expect(workbook.type).toBe('saveCsv');
+        expect(legacy.type).toBe('saveCsv');
+    });
+
     it('addresses save rejections by worksheet operation ordinal', () => {
         const msg: HostMessage = {
             type: 'saveResult',

@@ -87,6 +87,7 @@ import {
     type CsvSaveWorksheetOperation,
     type CsvSaveRejection,
     type HostMessage,
+    type LegacyCsvSaveOperationRequest,
     type PerFileState,
     type SheetPendingEditCells,
     type SheetTransformState,
@@ -3837,39 +3838,12 @@ export function attach_viewer(
         const committed = await update_file_state((current, sheets) => {
             if (!current.pendingEdits) return current;
             if (scope.type === 'workbook') {
-                // A discard ends the workbook-scoped session, so every slot the
-                // session was showing goes at once: untagged slots (single-sheet
-                // CSV), and slots whose name resolves at their own index. What
-                // survives is exactly what the projection was withholding — a
-                // *parked* slot (tagged for a worksheet this workbook does not
-                // have) or a *displaced* one (its sheet is live but elsewhere,
-                // reconciliation seated a same-named winner there). Neither was
-                // shown to the user, so neither is theirs to discard; both stay
-                // durable and reappear with their worksheets.
-                const shown = (
-                    slot: WorksheetPendingEdits | undefined,
-                    index: number,
-                ) => {
-                    if (slot === undefined) return false;
-                    const identity = worksheet_identity(sheets[index] ?? '');
-                    return pending_edits_for_sheet(
-                        current.pendingEdits,
-                        index,
-                        identity.name,
-                        identity.worksheetId,
-                    ) === slot.cells;
-                };
-                const retained = current.pendingEdits.map(
-                    (slot, index) => (shown(slot, index) ? undefined : slot),
-                );
-                while (
-                    retained.length > 0 && retained[retained.length - 1] === undefined
-                ) retained.pop();
-                if (!retained.some(Boolean)) {
-                    const { pendingEdits: _drop, ...rest } = current;
-                    return rest;
-                }
-                return { ...current, pendingEdits: retained };
+                // The one workbook dialog discards the entire session, including
+                // parked drafts whose worksheets are temporarily absent. Keeping a
+                // durable slot after the renderer cleared its matching parked store
+                // would make discarded edits reappear when that worksheet returns.
+                const { pendingEdits: _drop, ...rest } = current;
+                return rest;
             }
             // Resolved inside the updater, because `current` has already been
             // reconciled against the adopted workbook: after a reorder the captured
@@ -4385,7 +4359,12 @@ export function attach_viewer(
     }
 
     function clone_save_operation(input: CsvSaveOperationRequest): CsvSaveOperation {
-        const worksheets = input.worksheets.map((worksheet) => {
+        const requested_worksheets: readonly CsvSaveWorksheetOperation[] = (
+            'worksheets' in input && Array.isArray(input.worksheets)
+        )
+            ? input.worksheets
+            : [input as LegacyCsvSaveOperationRequest];
+        const worksheets = requested_worksheets.map((worksheet) => {
             const dirty_edits = Object.fromEntries(
                 Object.entries(worksheet.dirtyEdits).map(([key, entry]) => [
                     key,

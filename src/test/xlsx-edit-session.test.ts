@@ -1970,13 +1970,10 @@ describe('xlsx edit sessions', () => {
         expect(durable()).toContain('Draft');
     });
 
-    it('keeps a displaced same-named draft when the session is discarded', async () => {
-        // Reconciliation seats only one of two same-named slots at their sheet's
-        // own index; the loser sits displaced at another sheet's position and is
-        // never projected into any snapshot. The workbook-wide discard clears
-        // what the session was showing — the live slot — and must not reach the
-        // displaced draft the user never saw, since no message asked to discard
-        // it.
+    it('clears displaced drafts when the workbook session is discarded', async () => {
+        // Discard is workbook-wide: the renderer clears live and parked stores, so
+        // the host must also clear every durable slot or a removed/displaced draft
+        // can reappear after the user explicitly discarded the session.
         const state = versioned_state_store({
             pendingEdits: [
                 { sheetName: 'Inventory', cells: { '1:0': { value: 'Mallory', base: 'Widget' } } },
@@ -1994,9 +1991,7 @@ describe('xlsx edit sessions', () => {
         await panel.__receive({ type: 'discardEditSession', editSessionId: session });
         await controller_of(panel).drain();
 
-        const durable = JSON.stringify(state.get_state(file_path).pendingEdits ?? []);
-        expect(durable, 'Mallory').toContain('Mallory');
-        expect(durable, 'Draft').not.toContain('Draft');
+        expect(state.get_state(file_path).pendingEdits).toBeUndefined();
     });
 
     it('keeps a durable draft when its worksheet is renamed externally', async () => {

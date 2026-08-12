@@ -14,7 +14,7 @@ import {
     parse_styles,
     parse_workbook_xml,
     resolve_part_path,
-    worksheet_part_paths,
+    worksheet_part_paths_from_package,
 } from './parse-xlsx';
 import type { XfEntry, DateMode } from './spreadsheet-format';
 
@@ -271,7 +271,7 @@ export function write_xlsx_workbook_cell_edits(
         throw new Error('Not a valid .xlsx file');
     }
 
-    const parts = worksheet_part_paths(raw);
+    const parts = worksheet_part_paths_from_package(cfb_file);
     const is_date_style = read_style_date_predicate(cfb_file);
     const datemode = read_datemode(cfb_file);
     let removed_formula = false;

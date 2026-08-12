@@ -1923,6 +1923,47 @@ describe('CSV edit sessions', () => {
             .toEqual(pendingEdits);
     });
 
+    it('normalizes a legacy one-worksheet save request', async () => {
+        const file_path = '/tmp/legacy-save-request.csv';
+        const versioned = state_store();
+        const written: Uint8Array[] = [];
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+        vscode_mock.__setWriteFileImplementation(async (_target, bytes) => {
+            written.push(bytes as Uint8Array);
+        });
+        const panel = open_csv_table(uri(file_path), versioned.store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit' });
+        const edit_session_id = latest_edit_session_message(panel)!.editSessionId!;
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: edit_session_id,
+                saveRequestId: 'legacy-save',
+                edits: { '0:0': 'next' },
+                dirtyEdits: { '0:0': { value: 'next', base: 'a' } },
+            },
+        } as never);
+
+        expect(written).toHaveLength(1);
+        expect(new TextDecoder().decode(written[0])).toBe('h\nnext\n');
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'saveResult',
+            success: true,
+            lifecycle: expect.objectContaining({
+                operation: expect.objectContaining({
+                    saveRequestId: 'legacy-save',
+                    worksheets: [expect.objectContaining({
+                        sheetIndex: 0,
+                        sheetName: 'Sheet1',
+                        edits: { '0:0': 'next' },
+                    })],
+                }),
+            }),
+        }));
+    });
+
     it('refuses a save whose base never matched the file, before writing any bytes', async () => {
         const file_path = '/tmp/base-mismatch-rejected.csv';
         const versioned = state_store();

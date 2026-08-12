@@ -90,7 +90,6 @@ import {
     create_edit_session_store,
     type EditSessionStore,
 } from './edit-session-store';
-import type { LiveEdit } from './csv-save-model';
 import {
     csv_save_operations_equal,
     resolve_csv_save_hydration,
@@ -110,6 +109,12 @@ import {
 } from './row-resize-overlay';
 import { row_boundary_hit } from './row-resize-model';
 import { read_overlay_editor_value } from './live-editor';
+
+interface LiveEdit {
+    key: string;
+    value: string;
+    original: string;
+}
 import {
     changed_highlight_keys,
     changed_tint_keys,
@@ -703,9 +708,8 @@ export function GridShell({
             || csv_save_operations_equal(save_operation_ref.current, save_operation)
         ) return;
         const worksheet = worksheet_payload(save_operation);
-        if (!worksheet) return;
         save_operation_ref.current = save_operation;
-        saved_edits_ref.current = { ...worksheet.edits };
+        saved_edits_ref.current = worksheet ? { ...worksheet.edits } : {};
         save_in_flight_ref.current = true;
         set_save_in_flight(true);
     }, [edit_session_id, save_operation, worksheet_payload]);
@@ -719,10 +723,9 @@ export function GridShell({
             const locked = save_operation_ref.current;
             if (locked && !csv_save_operations_equal(locked, operation)) return;
             const worksheet = worksheet_payload(operation);
-            if (!worksheet) return;
             save_operation_ref.current = operation;
-            saved_edits_ref.current = { ...worksheet.edits };
-            replace_dirty(worksheet.dirtyEdits);
+            saved_edits_ref.current = worksheet ? { ...worksheet.edits } : {};
+            if (worksheet) replace_dirty(worksheet.dirtyEdits);
             save_in_flight_ref.current = true;
             set_save_in_flight(true);
             return;
@@ -1250,15 +1253,13 @@ export function GridShell({
             || operation.saveRequestId.length === 0
         ) return false;
         const worksheet = worksheet_payload(operation);
-        if (worksheet) {
-            save_operation_ref.current = operation;
-            saved_edits_ref.current = { ...worksheet.edits };
-            save_in_flight_ref.current = true;
-            set_save_in_flight(true);
-            set_live_uncommitted(false);
-            if (document.activeElement instanceof HTMLElement) {
-                document.activeElement.blur();
-            }
+        save_operation_ref.current = operation;
+        saved_edits_ref.current = worksheet ? { ...worksheet.edits } : {};
+        save_in_flight_ref.current = true;
+        set_save_in_flight(true);
+        set_live_uncommitted(false);
+        if (document.activeElement instanceof HTMLElement) {
+            document.activeElement.blur();
         }
         return true;
     }, [

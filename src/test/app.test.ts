@@ -4420,6 +4420,7 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
         expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
+        expect(get_button('Edit').classList.contains('has-unsaved')).toBe(true);
 
         post_message.mockClear();
         await click_button('Edit');

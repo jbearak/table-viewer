@@ -254,7 +254,7 @@ export function create_edit_session_registry(
                 const target = Object.freeze(
                     target_for_sheet(sheet_index, sheet),
                 );
-                const payload = collect_save_payload(snapshot, null);
+                const payload = collect_save_payload(snapshot);
                 if (payload.status === 'blocked') {
                     unresolved_targets.push(target);
                     continue;

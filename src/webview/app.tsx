@@ -400,10 +400,6 @@ export function App(): React.JSX.Element {
      * cannot silently retarget an in-flight save.
      */
     const edit_session_sheet_index_ref = useRef<number>(0);
-    // The same value as a rendered one. The ref is what callbacks read
-    // synchronously; this is what the toolbar and grid re-render against, so the
-    // Edit button and the editable grid follow the session from sheet to sheet.
-    const [edit_session_sheet_index, set_edit_session_sheet_index] = useState(0);
     const renderer_publication_fenced_session_ref = useRef<string>();
     // The dirty maps, one per worksheet, owned here so they survive the
     // generation-keyed GridShell remounts that a transform or refresh snapshot
@@ -842,7 +838,7 @@ export function App(): React.JSX.Element {
                 type: 'showWarning',
                 message: preflight.reason === 'unresolvedBases'
                     ? 'Load every edited row before saving so its conflict base can be verified.'
-                    : 'A worksheet containing unsaved edits was removed. Restore it or discard its edits before saving.',
+                    : 'A worksheet containing unsaved edits was removed. Restore it or discard the workbook edit session before saving.',
             });
             return undefined;
         }
@@ -1426,7 +1422,6 @@ export function App(): React.JSX.Element {
                         ?? pending_edit_sheet_index
                         ?? fallback_sheet_index;
                     edit_session_sheet_index_ref.current = snapshot_edit_sheet_index;
-                    set_edit_session_sheet_index(snapshot_edit_sheet_index);
                     const refresh_editing_current_session =
                         snapshot.presentation === 'refresh'
                         && edit_mode_ref.current
@@ -2442,7 +2437,9 @@ export function App(): React.JSX.Element {
     // the stored transform uninstalled forever. Depending on the boolean and not
     // on `editing_status` is deliberate — the grid reports editing status on every
     // commit, so the object would re-run this on every keystroke.
-    const save_in_flight = editing_status?.save_in_flight === true;
+    const save_in_flight = save_lifecycle.state === 'active'
+        || save_operation !== undefined
+        || editing_status?.save_in_flight === true;
     // Counts observed movements of the conditions under which the host refuses a
     // transform and which this webview can actually see: another panel owning the
     // edit session projects `csvEditable: false` here and true again once it
@@ -3119,7 +3116,6 @@ export function App(): React.JSX.Element {
                     // every grant answers a request sent against the workbook
                     // the snapshot already reconciled the registry to.
                     edit_session_sheet_index_ref.current = msg.sheetIndex ?? 0;
-                    set_edit_session_sheet_index(msg.sheetIndex ?? 0);
                     // The grant owns the complete pending-edit projection, including
                     // authoritative absence. Always cross a hydration boundary so a
                     // previously mounted editing hook cannot retain another session.
@@ -4152,7 +4148,7 @@ export function App(): React.JSX.Element {
                         : 'Wait for sorting and filtering to finish.'
                 }
                 edit_mode={edit_mode_on_active_sheet}
-                is_dirty={editing_status?.is_dirty ?? false}
+                is_dirty={edit_session_registry_ref.current!.has_dirty_entries()}
                 on_toggle_edit_mode={handle_toggle_edit_mode}
                 show_edit_button={csv_editing_supported}
                 // `transform_active` is deliberately absent: an *installed* sort,
