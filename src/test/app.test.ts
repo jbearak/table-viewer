@@ -1417,7 +1417,7 @@ describe('formatting toggle', () => {
     it('keeps formatting per sheet, not per workbook', async () => {
         // Reading one sheet raw while another stays formatted is a real thing to
         // want, and it is what makes Formatting a sibling of the other view toggles
-        // rather than the odd one out (#164).
+        // rather than the odd one out (#154).
         await render_app();
         await dispatch_host_message(initial_snapshot_message(make_meta(['First', 'Second'])));
 

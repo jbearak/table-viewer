@@ -336,7 +336,7 @@ export function App(): React.JSX.Element {
     // previous one's generation (both start at 1) and surface stale cached pages.
     const [load_epoch, set_load_epoch] = useState(0);
     const [active_sheet_index, set_active_sheet_index] = useState(0);
-    // Per sheet, not per workbook (#164). Formatting is a view setting like the rest
+    // Per sheet, not per workbook (#154). Formatting is a view setting like the rest
     // of the right-hand toolbar group, and reading one sheet raw while another stays
     // formatted is a real thing to want. Sparse: an absent entry means the default,
     // which is why every read goes through `?? true`.
@@ -2696,7 +2696,7 @@ export function App(): React.JSX.Element {
      *
      * Persisted per file: reloading the same file after an external edit keeps the
      * choice, and opening a different file in this panel gets that file's own rather
-     * than inheriting this one's by sheet index (#164).
+     * than inheriting this one's by sheet index (#154).
      */
     const update_show_formatting = useCallback(
         (updater: (prev: readonly (boolean | undefined)[]) => (boolean | undefined)[]) => {
@@ -3894,7 +3894,7 @@ export function App(): React.JSX.Element {
     // Scope menus exist only where "all sheets" means something. On a single-sheet
     // workbook the chevron could only restate the button, so there is none — and
     // Columns never gets one, because column visibility cannot sensibly cross sheets
-    // and a chevron there would teach the wrong rule (#164).
+    // and a chevron there would teach the wrong rule (#154).
     const all_sheets = `all ${meta.sheets.length} sheets`;
     const sheet_indices = meta.sheets.map((_, index) => index);
     const formatting_scope_menu = has_multiple_sheets
@@ -3944,7 +3944,7 @@ export function App(): React.JSX.Element {
         : undefined;
     // The orientation command is offered on a tab and on empty strip space alike —
     // as an accelerator for people who reach for right-click, never as the only
-    // route in. The button on the strip remains the discoverable one (#164).
+    // route in. The button on the strip remains the discoverable one (#154).
     const tab_orientation_item: MenuItem = {
         label: tab_orientation_label(vertical_tabs),
         on_click: () => {
@@ -4315,7 +4315,7 @@ export function App(): React.JSX.Element {
 
     // Sort, filter, row hiding and the merge notice — worksheet state, so it sits
     // with the worksheet's pane below the tabs rather than in the workbook chrome
-    // above them (#164). Renders nothing when the view is untransformed.
+    // above them (#154). Renders nothing when the view is untransformed.
     const sheet_pane = (
         <div className="sheet-pane">
             <StateStrip

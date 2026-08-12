@@ -21,7 +21,7 @@ export interface StateStripProps {
  * filters, the row-hiding count, transform progress, and the merge notice.
  *
  * This is state, not controls, which is why it is a band of its own below the sheet
- * tabs rather than a region of the toolbar (#164). Two consequences worth keeping:
+ * tabs rather than a region of the toolbar (#154). Two consequences worth keeping:
  *
  * - It renders below the tabs because sort and filter are *worksheet* state. Above
  *   them it would sit in the workbook's chrome and contradict itself on every tab

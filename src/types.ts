@@ -556,7 +556,7 @@ export interface PerFileState {
      * Sparse: an absent entry means formatted, which is the default and by far the
      * common case, so a workbook nobody has touched stores nothing. Per sheet rather
      * than per workbook because reading one sheet raw while another stays formatted
-     * is a real thing to want (#164).
+     * is a real thing to want (#154).
      */
     showFormatting?: (boolean | undefined)[];
 }

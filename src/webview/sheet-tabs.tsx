@@ -65,7 +65,7 @@ export function SheetTabs({
             ))}
             {/*
               * Tab orientation is a property of this strip, so the control that
-              * changes it lives here rather than in the toolbar (#164). It is
+              * changes it lives here rather than in the toolbar (#154). It is
               * rendered under the same condition as the tabs themselves — more than
               * one sheet — so it can never be a button with nothing to act on.
               *

@@ -222,7 +222,7 @@ describe('Toolbar', () => {
     });
 
     it('keeps the divider when only one workbook-scoped action is shown', () => {
-        // The expected state now that tab orientation moved to the sheet tabs (#164):
+        // The expected state now that tab orientation moved to the sheet tabs (#154):
         // Edit is usually alone on the workbook side, and the rule still belongs there.
         const { container } = render_toolbar({
             show_formatting_button: false,
@@ -274,7 +274,7 @@ describe('Toolbar', () => {
     });
 
     it('holds no view state: sort, filter, and progress live in the state strip', () => {
-        // The toolbar is actions only since #164. Nothing here should render a chip
+        // The toolbar is actions only since #154. Nothing here should render a chip
         // or a progress badge regardless of what the sheet's transform is doing.
         const { container } = render_toolbar();
 

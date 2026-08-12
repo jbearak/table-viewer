@@ -155,7 +155,7 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                 // "first row" half of the meaning. "Header" rather than "Names"
                 // because it is the word people arrive with — Excel, Power Query and
                 // pandas all use it — even though the code sets column *names*. The
-                // tooltip carries the precise wording (#164).
+                // tooltip carries the precise wording (#154).
                 label="Header Row"
                 active={props.excel_header_active}
                 tooltip_text={props.excel_header_disabled
@@ -222,7 +222,7 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
               * the rule behind — the failure that condition would hide is a narrow
               * one, visible only when the new action is the *only* workbook action
               * on screen. Edit alone on the workbook side is the expected state now
-              * that tab orientation moved to the sheet tabs (#164), and it still
+              * that tab orientation moved to the sheet tabs (#154), and it still
               * earns the rule: it changes what a keystroke does, not what is shown.
               *
               * Still flat children of one row: `.toolbar-actions > :first-child`
