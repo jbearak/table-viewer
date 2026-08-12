@@ -60,7 +60,7 @@ The config lives in `desktop/electron-builder.yml`:
 - The app bundle contains only the esbuild outputs (`dist/desktop`, `dist/webview`) plus `package.json` — no `node_modules`.
 - `artifactName` names the dmg/zip `table-viewer-<version>-<arch>` rather than after `productName`, which has a space — those filenames are part of the download URL the Homebrew cask pins.
 - License notices for the GPL-3.0 app are shipped in the packaged app's resources directory (`Contents/Resources` on macOS, `resources/` on Windows): `LICENSE.txt` (Table Viewer), `THIRD_PARTY_NOTICES.txt` (generated from the production npm dependency closure by `desktop/collect-licenses.mjs`), `LICENSE.electron.txt`, and `LICENSES.chromium.html`. The `afterPack` hook (`desktop/after-pack.mjs`) asserts all four are present and non-empty in the packaged app, because a missing `extraResources` source is only a *warning* in electron-builder — a half-installed `node_modules/electron` otherwise yields a normal-looking dmg or installer with the Electron/Chromium attributions silently absent.
-- Desktop preparation runs Electron's proxy-aware, idempotent installer before bundling, retrying transient download failures up to three times. This repairs an install whose binary download was skipped or interrupted; a complete extraction is left untouched.
+- Desktop preparation runs Electron's proxy-aware, idempotent installer before bundling, retrying transient download failures up to three times. CI also caches the verified artifact by OS, architecture, and dependency lock. This repairs an install whose binary download was skipped or interrupted; a complete extraction is left untouched.
 
 ## Smoke test
 

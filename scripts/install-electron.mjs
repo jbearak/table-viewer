@@ -14,6 +14,17 @@ function describe_failure(result) {
     return `exit code ${result.status ?? 'unknown'}`;
 }
 
+export function electron_installer_environment(
+    environment = process.env,
+    platform = process.platform,
+) {
+    return {
+        ...environment,
+        ELECTRON_GET_USE_PROXY: environment.ELECTRON_GET_USE_PROXY
+            ?? (platform === 'win32' ? 'true' : ''),
+    };
+}
+
 /**
  * Run Electron's idempotent installer with bounded retries. Electron 43 defers
  * its binary download until first use, but the lazy path tries only once. A
@@ -24,12 +35,10 @@ export function install_electron({
     attempts = DEFAULT_ATTEMPTS,
     run_installer = () => spawnSync(process.execPath, [electron_installer], {
         stdio: 'inherit',
-        env: {
-            ...process.env,
-            // @electron/get does not honor HTTP(S)_PROXY unless explicitly
-            // enabled. Keep an explicit caller choice, including an empty value.
-            ELECTRON_GET_USE_PROXY: process.env.ELECTRON_GET_USE_PROXY ?? 'true',
-        },
+        // @electron/get does not honor HTTP(S)_PROXY unless explicitly enabled.
+        // Keep an explicit caller choice, including an empty value. Hosted
+        // Windows runners need proxy mode; direct Linux/macOS runners do not.
+        env: electron_installer_environment(),
     }),
     log = console,
 } = {}) {

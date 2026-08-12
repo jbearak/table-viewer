@@ -87,6 +87,13 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Restore Electron download cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/AppData/Local/electron/Cache
+          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: electron-${{ runner.os }}-${{ runner.arch }}-
+
       - name: Install Electron (retry transient downloads)
         run: npm run desktop:ensure-electron
 
@@ -318,6 +325,13 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Restore Electron download cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/Library/Caches/electron
+          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: electron-${{ runner.os }}-${{ runner.arch }}-
+
       # Signing and notarization activate themselves once the Apple credentials
       # exist as `release` environment secrets; until then the job produces the
       # same unsigned dmg a local `npm run desktop:package` does, and the cask
@@ -449,6 +463,13 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Restore Electron download cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/AppData/Local/electron/Cache
+          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: electron-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Package desktop app (unsigned)
         run: npm run desktop:package:win

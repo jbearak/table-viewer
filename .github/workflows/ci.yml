@@ -35,6 +35,13 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Restore Electron download cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/electron
+          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: electron-${{ runner.os }}-${{ runner.arch }}-
+
       - name: Install Electron (retry transient downloads)
         run: npm run desktop:ensure-electron
 
@@ -120,6 +127,13 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Restore Electron download cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/Library/Caches/electron
+          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: electron-${{ runner.os }}-${{ runner.arch }}-
+
       - name: Install Electron (retry transient downloads)
         run: npm run desktop:ensure-electron
 
@@ -150,6 +164,13 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Restore Electron download cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/AppData/Local/electron/Cache
+          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: electron-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Install Electron (retry transient downloads)
         run: npm run desktop:ensure-electron
@@ -240,6 +261,13 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Restore Electron download cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/AppData/Local/electron/Cache
+          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: electron-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Install Electron (retry transient downloads)
         run: npm run desktop:ensure-electron

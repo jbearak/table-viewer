@@ -13,12 +13,40 @@ type InstallOptions = {
 };
 
 let install_electron: (options?: InstallOptions) => void;
+let electron_installer_environment: (
+    environment?: NodeJS.ProcessEnv,
+    platform?: NodeJS.Platform,
+) => NodeJS.ProcessEnv;
 
 beforeAll(async () => {
     // The installer is an untyped executable .mjs file, so keep its specifier
     // indirect rather than asking the TypeScript project to resolve declarations.
     const installer_specifier = '../../scripts/install-electron.mjs';
-    ({ install_electron } = await import(installer_specifier));
+    ({ install_electron, electron_installer_environment } = await import(installer_specifier));
+});
+
+describe('Electron installer environment', () => {
+    it('enables Electron proxy support on Windows hosted runners', () => {
+        expect(electron_installer_environment({}, 'win32')).toEqual({
+            ELECTRON_GET_USE_PROXY: 'true',
+        });
+    });
+
+    it('leaves direct Unix downloads out of proxy mode', () => {
+        expect(electron_installer_environment({}, 'linux')).toEqual({
+            ELECTRON_GET_USE_PROXY: '',
+        });
+        expect(electron_installer_environment({}, 'darwin')).toEqual({
+            ELECTRON_GET_USE_PROXY: '',
+        });
+    });
+
+    it('preserves an explicit proxy choice on every platform', () => {
+        expect(electron_installer_environment({ ELECTRON_GET_USE_PROXY: 'yes' }, 'linux'))
+            .toMatchObject({ ELECTRON_GET_USE_PROXY: 'yes' });
+        expect(electron_installer_environment({ ELECTRON_GET_USE_PROXY: '' }, 'win32'))
+            .toMatchObject({ ELECTRON_GET_USE_PROXY: '' });
+    });
 });
 
 describe('Electron installer retry wrapper', () => {

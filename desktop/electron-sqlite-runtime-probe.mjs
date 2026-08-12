@@ -177,8 +177,8 @@ async function main() {
         // under xvfb even though the synchronous SQLite probe has completed.
         await app.whenReady();
         const result = run_sqlite_api_probe('electron-main');
-        if (result.electron !== '43.2.0') {
-            throw new Error(`expected Electron 43.2.0, received ${result.electron}`);
+        if (result.electron !== '43.4.0') {
+            throw new Error(`expected Electron 43.4.0, received ${result.electron}`);
         }
         const v1 = await probe_v1_database();
         write_output(process.stdout, `${JSON.stringify({ ...result, v1 })}\n`);
