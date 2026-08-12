@@ -906,6 +906,25 @@ describe('Toolbar scope menus', () => {
         expect(document.querySelector('[role="menu"]')).not.toBeNull();
     });
 
+    it('opens after a press on the chevron that produced no click', async () => {
+        // Pressing and then dragging off releases elsewhere, so the chevron never
+        // sees a click to spend the "this press closed it" flag on. Left set, it was
+        // spent on the next press instead, and the chevron did nothing.
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+        const caret = open_caret();
+        await arm_dismissal();
+
+        await act(async () => {
+            caret.dispatchEvent(new MouseEvent('pointerdown', {
+                bubbles: true, cancelable: true,
+            }));
+        });
+        expect(document.querySelector('[role="menu"]')).toBeNull();
+
+        await press_caret(caret);
+        expect(document.querySelector('[role="menu"]')).not.toBeNull();
+    });
+
     it('keeps a menu item clickable through the row-level dismissal', () => {
         const menu = scope_menu();
         render_toolbar({ auto_fit_scope_menu: menu });

@@ -302,6 +302,10 @@ function ToolbarButton({
     const split_ref = useRef<HTMLSpanElement>(null);
     const tooltip_ref = useRef<HTMLDivElement>(null);
     const menu_open = scope_context?.open?.key === menu_key && menu_key !== undefined;
+    // Read by the document listener below, which is registered once and so cannot
+    // close over the current render's value.
+    const menu_open_ref = useRef(menu_open);
+    menu_open_ref.current = menu_open;
     // Suppressed while *any* scope menu is open, not merely this button's: a tooltip
     // left hovering over one control would otherwise sit under the menu another just
     // opened, and clicking a caret does not reliably blur the previous one.
@@ -328,15 +332,21 @@ function ToolbarButton({
         set_is_focused(false);
     }, [menu_open]);
 
+    /*
+     * Registered whether or not the menu is open, so the flag is cleared by the next
+     * press as reliably as it is set by this one. Scoped to the open menu it would
+     * survive a press that produced no click — a drag off the chevron, or a
+     * right-click, which reopens the menu through the wrapper's own handler — and
+     * that stale `true` would then swallow a later, legitimate open.
+     */
     useEffect(() => {
-        if (!menu_open) return;
         const record = (event: Event) => {
-            pressed_own_caret_ref.current =
-                caret_ref.current?.contains(event.target as Node) ?? false;
+            pressed_own_caret_ref.current = menu_open_ref.current
+                && (caret_ref.current?.contains(event.target as Node) ?? false);
         };
         document.addEventListener('pointerdown', record, true);
         return () => document.removeEventListener('pointerdown', record, true);
-    }, [menu_open]);
+    }, []);
 
     /**
      * Anchor the menu to the left edge of the whole control, not to the chevron.

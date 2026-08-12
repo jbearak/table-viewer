@@ -323,6 +323,9 @@ export function transforms_semantically_equal(
         === JSON.stringify(semantic_filters(right.filters));
 }
 
+/** Shared so clearing an already-empty auto-fit queue is not a state change. */
+const EMPTY_PENDING_AUTO_FIT: ReadonlySet<number> = new Set<number>();
+
 /** Webview root for snapshot metadata plus paginated row delivery. */
 export function App(): React.JSX.Element {
     const [meta, set_meta] = useState<WorkbookMeta | null>(null);
@@ -1625,6 +1628,13 @@ export function App(): React.JSX.Element {
                         set_active_sheet_index(normalized.activeSheetIndex);
                         set_column_widths(normalized.columnWidths);
                         set_show_formatting_by_sheet(normalized.showFormatting ?? []);
+                        // Work owed to the *previous* document. Both are queues of
+                        // bare sheet indices, so left standing they would be redeemed
+                        // against whatever sheet now sits at that index — fitting
+                        // columns and promoting header rows in a file the user never
+                        // asked it of, and persisting both.
+                        set_pending_auto_fit_sheets(EMPTY_PENDING_AUTO_FIT);
+                        set_excel_header_queue(null);
                         set_column_visibility(normalized.columnVisibility);
                         set_transforms(normalized.transforms);
                         const tab_orient = normalized.tabOrientation;
@@ -3728,7 +3738,7 @@ export function App(): React.JSX.Element {
      * the active sheet, where it only ever measures what is loaded.
      */
     const [pending_auto_fit_sheets, set_pending_auto_fit_sheets] =
-        useState<ReadonlySet<number>>(() => new Set());
+        useState<ReadonlySet<number>>(EMPTY_PENDING_AUTO_FIT);
 
     useEffect(() => {
         if (!pending_auto_fit_sheets.has(active_sheet_index)) return;
@@ -3753,17 +3763,22 @@ export function App(): React.JSX.Element {
 
     const handle_auto_fit_all_sheets = useCallback(() => {
         const sheet_count = meta?.sheets.length ?? 0;
-        apply_auto_fit_to_active_sheet();
+        // The active sheet joins the queue when it could not be measured — a grid
+        // with no rows loaded yet. Leaving it out on the grounds that it was "done
+        // now" would make the one sheet the user is looking at the only one the
+        // action skipped, with nothing left to retry it.
+        const fitted_active = apply_auto_fit_to_active_sheet();
         set_pending_auto_fit_sheets(new Set(
             Array.from({ length: sheet_count }, (_, index) => index)
-                .filter((index) => index !== active_sheet_index
-                    && !auto_fit_active_ref.current[index]),
+                .filter((index) => (index === active_sheet_index
+                    ? !fitted_active
+                    : !auto_fit_active_ref.current[index])),
         ));
     }, [active_sheet_index, apply_auto_fit_to_active_sheet, meta]);
 
     /** Restore every sheet's pre-fit widths, and drop any fit still owed. */
     const handle_restore_widths_all_sheets = useCallback(() => {
-        set_pending_auto_fit_sheets(new Set());
+        set_pending_auto_fit_sheets(EMPTY_PENDING_AUTO_FIT);
         restore_widths_for_sheets(
             Array.from({ length: meta?.sheets.length ?? 0 }, (_, index) => index),
         );

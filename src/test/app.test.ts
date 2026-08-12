@@ -1564,6 +1564,45 @@ describe('Excel first-row header toggle', () => {
         expect(header_requests().map((request) => request.sheetIndex)).toEqual([0]);
     });
 
+    it('drops the queue rather than draining it into a different workbook', async () => {
+        // Queue entries are bare sheet indices, and the load clears the in-flight
+        // request that was holding the drain back. Left standing, the rest of the
+        // queue would promote header rows in a file nobody asked it of.
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            workbook_snapshot_message(excel_meta_multi([false, false, false]), {
+                identity: {
+                    deliveryId: 1,
+                    authority: { fileId: 'file:A', revision: 1 },
+                    stateRevision: 1,
+                    sourceBasis: { physicalRevision: 1, projectionRevision: 0 },
+                },
+            }),
+        );
+
+        await open_scope_menu('Header row scope');
+        await click_menu_item('Use first row as header on all 3 sheets');
+
+        const header_requests = () => post_message.mock.calls
+            .map((call) => call[0] as { type: string })
+            .filter((message) => message.type === 'setExcelFirstRowHeader');
+        expect(header_requests()).toHaveLength(1);
+
+        // A different file drops the in-flight request, which is the only thing that
+        // was holding the rest of the queue back.
+        await dispatch_host_message(
+            workbook_snapshot_message(excel_meta_multi([false, false, false]), {
+                identity: {
+                    deliveryId: 2,
+                    authority: { fileId: 'file:B', revision: 1 },
+                    stateRevision: 1,
+                    sourceBasis: { physicalRevision: 1, projectionRevision: 0 },
+                },
+            }),
+        );
+        expect(header_requests()).toHaveLength(1);
+    });
+
     it('leaves the all-sheets items dead when every sheet is already there', async () => {
         await render_app();
         await dispatch_host_message(
@@ -3484,6 +3523,41 @@ describe('auto-fit state', () => {
 
         await click_button('Auto-fit Columns');
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
+    });
+
+    it('fits the sheets it could not measure when each is opened', async () => {
+        // Fitting reads the mounted grid's loaded rows, so a sheet nobody has opened
+        // has nothing to measure; "all sheets" marks it and it fits on arrival.
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B'])));
+
+        await open_scope_menu('Auto-fit scope');
+        await click_menu_item('Auto-fit columns on all 2 sheets');
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
+
+        await click_sheet_tab('B');
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
+    });
+
+    it('does not redeem a pending fit against a different workbook', async () => {
+        // The queue holds bare sheet indices. Left standing across a load, sheet 1 of
+        // the *new* file would be fitted on arrival without anyone asking.
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B'])));
+
+        await open_scope_menu('Auto-fit scope');
+        await click_menu_item('Auto-fit columns on all 2 sheets');
+
+        await dispatch_host_message(workbook_snapshot_message(make_meta(['C', 'D']), {
+            identity: {
+                deliveryId: 2,
+                authority: { fileId: 'file:other', revision: 1 },
+                stateRevision: 1,
+                sourceBasis: { physicalRevision: 1, projectionRevision: 0 },
+            },
+        }));
+        await click_sheet_tab('D');
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
     });
 
     it('clears auto-fit state on live reload', async () => {
