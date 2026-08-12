@@ -697,6 +697,31 @@ describe('GridShell CSV save', () => {
         expect(post_message.mock.calls.at(-1)?.[0].operation.dirtyEdits).toEqual(newer);
     });
 
+    it('ignores an active lifecycle for another sheet in the workbook session', async () => {
+        const own = { '0:0': { value: 'own draft', base: 'base' } };
+        const other: CsvSaveOperation = {
+            editSessionId: 'session-1',
+            sheetIndex: 1,
+            sheetName: 'Sheet2',
+            saveRequestId: 'other-sheet-save',
+            edits: { '0:0': 'other draft' },
+            dirtyEdits: { '0:0': { value: 'other draft', base: 'other base' } },
+        };
+        const store = create_edit_session_store({ session_id: 'session-1' }, own);
+        const { editing_ref } = await render_grid(undefined, { edit_session: store });
+
+        await act(async () => {
+            window.dispatchEvent(new MessageEvent('message', { data: {
+                type: 'saveOperationStarted',
+                lifecycle: { revision: 1, state: 'active', operation: other },
+            } }));
+        });
+
+        expect(Object.fromEntries(store.snapshot())).toEqual(own);
+        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('own draft');
+        expect(await request_save(editing_ref)).toBe(true);
+    });
+
     it('blocks a revert while the save is in flight', async () => {
         const { post_message, editing_ref } = await render_grid();
 
@@ -782,6 +807,49 @@ describe('GridShell edits across a generation bump', () => {
         expect(store.snapshot().get('0:0')).toEqual({
             value: 'typed but not closed',
             base: 'base',
+        });
+    });
+
+    it('flushes an open editor to pending-edit durability before returning', async () => {
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        const { post_message, editing_ref } = await render_grid(undefined, {
+            edit_session: store,
+            generation: 1,
+        });
+        const clip = document.createElement('div');
+        clip.className = 'gdg-clip-region';
+        const input = document.createElement('input');
+        input.value = 'typed but not closed';
+        clip.appendChild(input);
+        document.body.appendChild(clip);
+        await act(async () => {
+            grid_mock.props!.onGridSelectionChange!({
+                columns: {},
+                rows: {},
+                current: {
+                    cell: [0, 0],
+                    range: { x: 0, y: 0, width: 1, height: 1 },
+                    rangeStack: [],
+                },
+            });
+        });
+        post_message.mockClear();
+
+        editing_ref.current!.flush_live_edit();
+
+        expect(store.snapshot().get('0:0')).toEqual({
+            value: 'typed but not closed',
+            base: 'base',
+        });
+        expect(post_message).toHaveBeenCalledWith({
+            type: 'pendingEditsChanged',
+            editSessionId: 'session-1',
+            edits: {
+                '0:0': { value: 'typed but not closed', base: 'base' },
+            },
+            sequence: expect.any(Number),
+            sheetIndex: 0,
+            sheetName: 'Sheet1',
         });
     });
 

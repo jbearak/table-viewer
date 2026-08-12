@@ -818,7 +818,7 @@ export function acquire_file_coordinator(
                 if ('selection' in command) {
                     const current = normalize_host_state(
                         state_snapshot.state,
-                        command.meta.sheets.map((sheet) => sheet.name),
+                        command.meta.sheets,
                     );
                     const plan = plan_cell_highlight_mutation(command, {
                         current: current.cellHighlights,
@@ -1083,7 +1083,6 @@ export function acquire_file_coordinator(
                     && attachment.operation_is_current(token)
                     && physical_basis_is_current()
                 );
-                const names = command.planningInput.sheets.map((sheet) => sheet.name);
                 let conflicts = 0;
                 const retry_or_reject = (): ExcelHeaderCommitResult | undefined => {
                     if (conflicts >= 3) {
@@ -1139,7 +1138,10 @@ export function acquire_file_coordinator(
                         return { type: 'rejected', error: 'The worksheet changed before the header setting could be saved.' };
                     }
                     const plan = plan_excel_override_state(
-                        normalize_host_state(state_snapshot.state, names),
+                        normalize_host_state(
+                            state_snapshot.state,
+                            command.planningInput.sheets,
+                        ),
                         command.planningInput,
                         command.sheetIndex,
                         command.sheetName,

@@ -10,6 +10,7 @@ import type {
     SheetColumnVisibilityState,
     SheetTransformState,
     StoredPerFileState,
+    WorksheetIdentity,
 } from './types';
 import {
     MAX_PERSISTED_HIDDEN_ROWS,
@@ -37,9 +38,9 @@ export interface ExcelOverrideStatePlan {
 /** Pure legacy/current state normalization shared by every planning retry. */
 export function normalize_host_state(
     stored: StoredPerFileState,
-    sheet_names: string[],
+    sheets: readonly WorksheetIdentity[],
 ): PerFileState {
-    return normalize_complete_per_file_state(stored, sheet_names);
+    return normalize_complete_per_file_state(stored, sheets);
 }
 
 export function effective_excel_header_map(

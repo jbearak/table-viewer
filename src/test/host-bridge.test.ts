@@ -1,5 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+async function setup_pending_edit_durability() {
+    const injected = { postMessage: vi.fn() };
+    (globalThis as { __tableViewerHostBridge?: unknown })
+        .__tableViewerHostBridge = injected;
+    const { pending_edit_durability } = await import('../webview/host-bridge');
+    return { injected, pending_edit_durability };
+}
+
 describe('host-bridge', () => {
     beforeEach(() => {
         vi.resetModules();
@@ -102,36 +110,22 @@ describe('host-bridge', () => {
         expect(first.postMessage).not.toHaveBeenCalled();
     });
 
-    it('keeps monotonic pending-edit sequences across subscribers', async () => {
-        const injected = { postMessage: vi.fn() };
-        (globalThis as { __tableViewerHostBridge?: unknown })
-            .__tableViewerHostBridge = injected;
-
-        const { pending_edit_durability } = await import('../webview/host-bridge');
+    it('keeps monotonic pending-edit sequences across acknowledgements', async () => {
+        const { injected, pending_edit_durability } =
+            await setup_pending_edit_durability();
         const first = pending_edit_durability.publish('session:1', {
             '0:0': { value: 'b', base: 'a' },
         }, 0, 'People');
         const duplicate = pending_edit_durability.publish('session:1', {
             '0:0': { value: 'b', base: 'a' },
         }, 0, 'People');
-        const snapshots: unknown[] = [];
-        const unsubscribe = pending_edit_durability.subscribe(
-            'session:1',
-            (snapshot) => snapshots.push(snapshot),
-        );
-        unsubscribe();
         const second = pending_edit_durability.publish('session:1', null, 0, 'People');
         pending_edit_durability.acknowledge('session:1', first);
 
         expect([first, duplicate, second]).toEqual([1, 1, 2]);
         expect(injected.postMessage).toHaveBeenCalledTimes(2);
-        expect(snapshots).toEqual([{
-            highestProducedSequence: 1,
-            highestAcknowledgedSequence: 0,
-        }]);
         expect(pending_edit_durability.snapshot('session:1')).toEqual({
             highestProducedSequence: 2,
-            highestAcknowledgedSequence: 1,
         });
 
         pending_edit_durability.retire('session:1');
@@ -140,20 +134,13 @@ describe('host-bridge', () => {
     });
 
     it('dedupes pending-edit payloads per sheet, not per session', async () => {
-        const injected = { postMessage: vi.fn() };
-        (globalThis as { __tableViewerHostBridge?: unknown })
-            .__tableViewerHostBridge = injected;
-
-        const { pending_edit_durability } = await import('../webview/host-bridge');
+        const { injected, pending_edit_durability } =
+            await setup_pending_edit_durability();
         const edits = { '0:0': { value: 'b', base: 'a' } };
-        const on_people = pending_edit_durability.publish(
-            'session:1', edits, 0, 'People');
+        pending_edit_durability.publish('session:1', edits, 0, 'People');
         // A byte-identical map on another sheet is a distinct slot's content
         // and must reach the host — the host stores each sheet separately.
-        const on_stock = pending_edit_durability.publish(
-            'session:1', edits, 1, 'Stock');
-
-        expect([on_people, on_stock]).toEqual([1, 2]);
+        pending_edit_durability.publish('session:1', edits, 1, 'Stock');
         expect(injected.postMessage).toHaveBeenCalledTimes(2);
         expect(injected.postMessage).toHaveBeenLastCalledWith({
             type: 'pendingEditsChanged',
@@ -167,6 +154,86 @@ describe('host-bridge', () => {
         expect(pending_edit_durability.publish('session:1', edits, 1, 'Stock'))
             .toBe(2);
         expect(injected.postMessage).toHaveBeenCalledTimes(2);
+    });
+
+    it('retries an unacknowledged payload at its sheet’s new index', async () => {
+        const { injected, pending_edit_durability } =
+            await setup_pending_edit_durability();
+        const edits = { '0:0': { value: 'b', base: 'a' } };
+        pending_edit_durability.publish('session:1', edits, 0, 'People');
+        // The host can reject the old index/name pair without acknowledging it.
+        // When the refresh remounts People at index 1, the identical full map
+        // must go through again with corrected coordinates.
+        expect(pending_edit_durability.publish('session:1', edits, 1, 'People'))
+            .toBe(2);
+        expect(injected.postMessage).toHaveBeenCalledTimes(2);
+        expect(injected.postMessage).toHaveBeenLastCalledWith(expect.objectContaining({
+            sequence: 2,
+            sheetIndex: 1,
+            sheetName: 'People',
+        }));
+    });
+
+    it('dedupes an acknowledged payload by sheet name across a reorder', async () => {
+        const { injected, pending_edit_durability } =
+            await setup_pending_edit_durability();
+        const edits = { '0:0': { value: 'b', base: 'a' } };
+        const sequence = pending_edit_durability.publish(
+            'session:1', edits, 0, 'People');
+        pending_edit_durability.acknowledge('session:1', sequence);
+
+        expect(pending_edit_durability.publish('session:1', edits, 1, 'People'))
+            .toBe(1);
+        expect(injected.postMessage).toHaveBeenCalledTimes(1);
+        // The sheet now at index 0 still has an independent dedupe identity.
+        expect(pending_edit_durability.publish('session:1', edits, 0, 'Stock'))
+            .toBe(2);
+        expect(injected.postMessage).toHaveBeenCalledTimes(2);
+    });
+
+    it('dedupes by worksheet ID across rename and reorder', async () => {
+        const { injected, pending_edit_durability } =
+            await setup_pending_edit_durability();
+        const edits = { '0:0': { value: 'b', base: 'a' } };
+        const sequence = pending_edit_durability.publish(
+            'session:id-rename', edits, 0, 'Before', false, '7');
+        pending_edit_durability.acknowledge('session:id-rename', sequence);
+
+        expect(pending_edit_durability.publish(
+            'session:id-rename', edits, 2, 'After', false, '7')).toBe(1);
+        expect(injected.postMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not dedupe different worksheet IDs that share a name', async () => {
+        const { injected, pending_edit_durability } =
+            await setup_pending_edit_durability();
+        const edits = { '0:0': { value: 'b', base: 'a' } };
+        expect(pending_edit_durability.publish(
+            'session:id-replaced', edits, 0, 'Data', false, 'old')).toBe(1);
+        expect(pending_edit_durability.publish(
+            'session:id-replaced', edits, 0, 'Data', false, 'new')).toBe(2);
+        expect(injected.postMessage).toHaveBeenCalledTimes(2);
+    });
+
+    it('tracks acknowledgement against each sheet’s latest publication', async () => {
+        const { pending_edit_durability } = await setup_pending_edit_durability();
+        const people = pending_edit_durability.publish(
+            'session:1', { '0:0': { value: 'P', base: 'p' } }, 0, 'People');
+        const inventory = pending_edit_durability.publish(
+            'session:1', { '0:0': { value: 'I', base: 'i' } }, 1, 'Inventory');
+        pending_edit_durability.acknowledge('session:1', inventory);
+
+        expect(pending_edit_durability.has_unacknowledged_payload(
+            'session:1', 0, 'People')).toBe(true);
+        expect(pending_edit_durability.has_unacknowledged_payload(
+            'session:1', 1, 'Inventory')).toBe(false);
+
+        const people_newer = pending_edit_durability.publish(
+            'session:1', { '0:0': { value: 'P2', base: 'p' } }, 0, 'People');
+        pending_edit_durability.acknowledge('session:1', people);
+        expect(people_newer).toBe(3);
+        expect(pending_edit_durability.has_unacknowledged_payload(
+            'session:1', 0, 'People')).toBe(true);
     });
 
     it('prefers an injected global bridge over acquireVsCodeApi', async () => {

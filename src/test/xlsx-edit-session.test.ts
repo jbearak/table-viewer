@@ -1,15 +1,16 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as vscode from 'vscode';
 import { attach_viewer, profile_for } from '../viewer-controller';
 import { with_in_memory_authority_transactions } from '../state-authority';
 import { versioned_state_store } from './helpers/versioned-state-store';
 import CFB from 'cfb';
-import type { PerFileState } from '../types';
+import type { PerFileState, SheetPendingEditCells } from '../types';
 import { parse_xlsx } from '../parse-xlsx';
 import * as vscode_mock from './mocks/vscode';
 import { fake_viewer_host } from './mocks/host-ports';
+import { sheet_cells } from './pending-edits-helper';
 
 /**
  * The whole xlsx edit path, from the Edit button to the bytes on disk.
@@ -34,13 +35,14 @@ function uri(file_path: string): vscode.Uri {
 function open_xlsx(
     file_path: string,
     state = versioned_state_store({}),
+    profile: ReturnType<typeof profile_for> = profile_for(file_path),
 ) {
     const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
     const controller = attach_viewer(
         panel as unknown as Parameters<typeof attach_viewer>[0],
         uri(file_path),
         with_in_memory_authority_transactions(state.store),
-        profile_for(file_path),
+        profile,
         fake_viewer_host,
     );
     panel.onDidDispose(() => controller.dispose());
@@ -79,6 +81,7 @@ function latest_snapshot(panel: { __messages: unknown[] }) {
     return message.snapshot as unknown as {
         identity: unknown;
         capabilities: { csvEditSessionId?: string };
+        meta: { sheets: { name: string; worksheetId?: string }[] };
         state?: PerFileState;
     };
 }
@@ -88,8 +91,9 @@ function latest_snapshot(panel: { __messages: unknown[] }) {
 async function open_ready_xlsx(
     file_path: string,
     state?: ReturnType<typeof versioned_state_store>,
+    profile?: ReturnType<typeof profile_for>,
 ) {
-    const panel = open_xlsx(file_path, state);
+    const panel = open_xlsx(file_path, state, profile);
     await panel.__receive({ type: 'ready' });
     // The source build is async, so the first snapshot arrives some turns after
     // `ready` resolves. Polled, never counted: a fixed number of turns that passes
@@ -105,12 +109,7 @@ async function open_ready_xlsx(
 
 /** Worksheet names in the most recent delivered snapshot. */
 function sheet_names(panel: { __messages: unknown[] }): string[] {
-    const message = [...panel.__messages].reverse().find((candidate) => (
-        typeof candidate === 'object'
-        && candidate !== null
-        && (candidate as { type?: unknown }).type === 'workbookSnapshot'
-    )) as { snapshot: { meta?: { sheets?: { name: string }[] } } } | undefined;
-    return (message?.snapshot.meta?.sheets ?? []).map((sheet) => sheet.name);
+    return latest_snapshot(panel).meta.sheets.map((sheet) => sheet.name);
 }
 
 function latest_edit_session(panel: { __messages: unknown[] }) {
@@ -120,6 +119,7 @@ function latest_edit_session(panel: { __messages: unknown[] }) {
             granted: boolean;
             editSessionId?: string;
             sheetIndex?: number;
+            pendingEdits?: SheetPendingEditCells;
         } => (
             typeof message === 'object'
             && message !== null
@@ -136,6 +136,23 @@ function save_results(panel: { __messages: unknown[] }) {
             && (message as { type?: unknown }).type === 'saveResult'
         ),
     );
+}
+
+async function worksheet_loss_flush_request(
+    panel: { __messages: unknown[] },
+): Promise<{ requestId: string }> {
+    let request: { requestId: string } | undefined;
+    await wait_for_observable(() => {
+        request = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'requestPendingEditsFlush'
+            && String((message as { requestId?: unknown }).requestId)
+                .startsWith('worksheet-loss:')
+        )) as { requestId: string } | undefined;
+        return request !== undefined;
+    });
+    return request!;
 }
 
 describe('xlsx edit sessions', () => {
@@ -159,6 +176,17 @@ describe('xlsx edit sessions', () => {
         });
     });
 
+    async function open_with_plan_spy() {
+        const base_profile = profile_for(file_path);
+        if (!base_profile.editing) throw new Error('XLSX profile must be editable.');
+        const plan_save = vi.fn(base_profile.plan_save);
+        const panel = await open_ready_xlsx(file_path, undefined, {
+            ...base_profile,
+            plan_save,
+        });
+        return { panel, plan_save };
+    }
+
     it('grants an edit session on .xlsx and refuses one on .xls', async () => {
         const xlsx = open_xlsx(file_path);
         await xlsx.__receive({ type: 'ready' });
@@ -168,6 +196,32 @@ describe('xlsx edit sessions', () => {
         // The writer is an OOXML package splice; .xls shares none of it, and the
         // profile must say so rather than failing inside a confirmed save.
         expect(profile_for('/tmp/legacy.xls').editing).toBe(false);
+    });
+
+    it('refuses non-integer save sheet indices before planning', async () => {
+        const { panel, plan_save } = await open_with_plan_spy();
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const before = bytes;
+
+        for (const [index, sheet_index] of [Number.NaN, 0.5].entries()) {
+            const result_count = save_results(panel).length;
+            await panel.__receive({
+                type: 'saveCsv',
+                operation: {
+                    editSessionId: session,
+                    sheetIndex: sheet_index,
+                    saveRequestId: `invalid-sheet-${index}`,
+                    edits: { '1:0': 'Alicia' },
+                    dirtyEdits: { '1:0': { value: 'Alicia', base: 'Alice' } },
+                },
+            });
+            await wait_for_observable(() => save_results(panel).length > result_count);
+            expect(save_results(panel).at(-1)).toMatchObject({ success: false });
+        }
+
+        expect(plan_save).not.toHaveBeenCalled();
+        expect(bytes).toEqual(before);
     });
 
     it('writes an edit into the worksheet the session named, leaving the other alone', async () => {
@@ -183,6 +237,8 @@ describe('xlsx edit sessions', () => {
             operation: {
                 editSessionId: session,
                 sheetIndex: 1,
+                sheetName: 'Inventory',
+                worksheetId: '2',
                 saveRequestId: 'save-1',
                 edits: { '1:0': 'Gadget' },
                 dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
@@ -198,10 +254,52 @@ describe('xlsx edit sessions', () => {
         expect(after.data.sheets[0].rows[1][0]?.raw).toBe(people_before);
     });
 
+    it('rejects an identity-less save for a multi-sheet workbook', async () => {
+        const { panel, plan_save } = await open_with_plan_spy();
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                sheetIndex: 1,
+                saveRequestId: 'identity-less',
+                edits: { '1:0': 'Gadget' },
+                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: false });
+        expect(plan_save).not.toHaveBeenCalled();
+    });
+
     it('refuses a session on a worksheet the workbook does not have', async () => {
         const panel = await open_ready_xlsx(file_path);
         await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 9 });
         expect(latest_edit_session(panel)?.granted).toBe(false);
+    });
+
+    it('refuses a queued edit request whose stamped worksheet left its index', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        bytes = swap_sheet_order(bytes);
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await wait_for_observable(() => sheet_names(panel)[0] === 'Inventory');
+
+        await panel.__receive({
+            type: 'requestEditSession',
+            requestId: 'stale-index',
+            sheetIndex: 1,
+            sheetName: 'Inventory',
+            worksheetId: '2',
+        });
+
+        expect(latest_edit_session(panel)).toMatchObject({
+            requestId: 'stale-index',
+            granted: false,
+            sheetIndex: 1,
+        });
     });
 
     it('refuses a save naming a worksheet the session does not hold', async () => {
@@ -218,6 +316,8 @@ describe('xlsx edit sessions', () => {
             operation: {
                 editSessionId: session,
                 sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
                 saveRequestId: 'save-1',
                 edits: { '1:0': 'Gadget' },
                 dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
@@ -265,6 +365,8 @@ describe('xlsx edit sessions', () => {
             operation: {
                 editSessionId: session,
                 sheetIndex: 1,
+                sheetName: 'Inventory',
+                worksheetId: '2',
                 saveRequestId: 'save-1',
                 edits: { '1:0': 'Gadget' },
                 dirtyEdits: { '1:0': { value: 'Gadget', base } },
@@ -290,6 +392,8 @@ describe('xlsx edit sessions', () => {
             operation: {
                 editSessionId: session,
                 sheetIndex: 1,
+                sheetName: 'Inventory',
+                worksheetId: '2',
                 saveRequestId: 'save-1',
                 edits: { '1:0': 'Gadget' },
                 dirtyEdits: { '1:0': { value: 'Gadget', base: 'Something else' } },
@@ -308,9 +412,12 @@ describe('xlsx edit sessions', () => {
         // A draft on sheet 0 that outlived its session \u2014 the shape a closed panel
         // or a previous window leaves behind. Saving sheet 1 must not touch it: the
         // single-sheet code dropped the whole leaf, which is exactly this bug.
+        // The base matches the fixture ('Alice'), so the rehydrated draft
+        // validates cleanly \u2014 both at open and when the surviving slot
+        // re-projects after the sibling sheet's save.
         const state = versioned_state_store({
             pendingEdits: [
-                { sheetName: 'People', cells: { '1:0': { value: 'Draft', base: 'Ada' } } },
+                { sheetName: 'People', cells: { '1:0': { value: 'Draft', base: 'Alice' } } },
             ],
         });
         const panel = await open_ready_xlsx(file_path, state);
@@ -326,20 +433,27 @@ describe('xlsx edit sessions', () => {
             operation: {
                 editSessionId: session.editSessionId!,
                 sheetIndex: 1,
+                sheetName: 'Inventory',
+                worksheetId: '2',
                 saveRequestId: 'save-1',
                 edits: { '1:0': 'Gadget' },
                 dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
             },
         });
-        // The saved sheet's durable slot is cleared after the write reports, so
-        // that clear — not the save result — is the observable this waits on.
-        await wait_for_observable(
-            () => state.get_state(file_path).pendingEdits?.[1] === undefined,
-        );
-
+        await wait_for_observable(() => save_results(panel).length > 0);
         expect(save_results(panel).at(-1)).toMatchObject({ success: true });
-        expect(state.get_state(file_path).pendingEdits?.[0]?.cells)
-            .toEqual({ '1:0': { value: 'Draft', base: 'Ada' } });
+        await controller_of(panel).drain();
+        expect(state.get_state(file_path).pendingEdits?.[1]).toBeUndefined();
+        expect(sheet_cells(state.get_state(file_path).pendingEdits, 0))
+            .toEqual({ '1:0': { value: 'Draft', base: 'Alice' } });
+        // And the draft still reaches the panel. The clear's snapshot carries the
+        // surviving slot at the very revision the clear completed, so recording
+        // that revision as \u201ceverything at or below is cleared\u201d would
+        // strip the sibling draft from every projection from here on \u2014
+        // durable on disk, invisible in the grid.
+        await wait_for_observable(() => JSON.stringify(
+            sheet_cells(latest_snapshot(panel).state?.pendingEdits, 0) ?? null,
+        ).includes('Draft'));
     });
 
     it('follows its worksheet when the workbook is reordered underneath it', async () => {
@@ -364,6 +478,8 @@ describe('xlsx edit sessions', () => {
             operation: {
                 editSessionId: session,
                 sheetIndex: 0,
+                sheetName: 'Inventory',
+                worksheetId: '2',
                 saveRequestId: 'save-1',
                 edits: { '1:0': 'Gadget' },
                 dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
@@ -377,6 +493,33 @@ describe('xlsx edit sessions', () => {
         const people = after.data.sheets.find((sheet) => sheet.name === 'People')!;
         expect(inventory.rows[1][0]?.raw).toBe('Gadget');
         expect(people.rows[1][0]?.raw).toBe('Alice');
+    });
+
+    it('rejects a save whose posted worksheet name moved away from its index', async () => {
+        const { panel, plan_save } = await open_with_plan_spy();
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        bytes = swap_sheet_order(bytes);
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await wait_for_observable(() => sheet_names(panel)[0] === 'Inventory');
+        const before = bytes;
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                sheetIndex: 1,
+                sheetName: 'Inventory',
+                saveRequestId: 'stale-sheet-index',
+                edits: { '1:0': 'Gadget' },
+                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: false });
+        expect(plan_save).not.toHaveBeenCalled();
+        expect(bytes).toEqual(before);
     });
 
     it('refuses an edit request whose worksheet moves out from under it', async () => {
@@ -426,7 +569,7 @@ describe('xlsx edit sessions', () => {
         });
         const panel = await open_ready_xlsx(file_path, state);
         const session = latest_snapshot(panel).capabilities.csvEditSessionId!;
-        expect(latest_snapshot(panel).state?.pendingEdits?.[1]?.cells)
+        expect(sheet_cells(latest_snapshot(panel).state?.pendingEdits, 1))
             .toEqual({ '1:0': { value: 'Draft', base: 'Widget' } });
 
         bytes = swap_sheet_order(bytes);
@@ -438,6 +581,8 @@ describe('xlsx edit sessions', () => {
             operation: {
                 editSessionId: session,
                 sheetIndex: 0,
+                sheetName: 'Inventory',
+                worksheetId: '2',
                 saveRequestId: 'save-1',
                 edits: { '1:0': 'Gadget' },
                 dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
@@ -469,7 +614,7 @@ describe('xlsx edit sessions', () => {
         const panel = await open_ready_xlsx(file_path, state);
         // The projection shows the winning slot at Inventory's own index and
         // withholds the displaced duplicate.
-        expect(latest_snapshot(panel).state?.pendingEdits?.[1]?.cells)
+        expect(sheet_cells(latest_snapshot(panel).state?.pendingEdits, 1))
             .toEqual({ '1:0': { value: 'Draft', base: 'Widget' } });
         expect(latest_snapshot(panel).state?.pendingEdits?.[0]).toBeUndefined();
 
@@ -479,6 +624,8 @@ describe('xlsx edit sessions', () => {
             operation: {
                 editSessionId: session,
                 sheetIndex: 1,
+                sheetName: 'Inventory',
+                worksheetId: '2',
                 saveRequestId: 'save-1',
                 edits: { '1:0': 'Gadget' },
                 dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
@@ -504,29 +651,117 @@ describe('xlsx edit sessions', () => {
             ],
         });
         const panel = await open_ready_xlsx(file_path, state);
-        expect(latest_snapshot(panel).state?.pendingEdits?.[1]?.cells)
+        expect(sheet_cells(latest_snapshot(panel).state?.pendingEdits, 1))
             .toEqual({ '1:0': { value: 'Draft', base: 'Widget' } });
 
         bytes = swap_sheet_order(bytes);
         await vscode_mock.__getActiveWatchers()[0].__fireChange();
         // Inventory is slot 0 now, and the draft moved with it.
-        await wait_for_observable(() => (
-            sheet_names(panel)[0] === 'Inventory'
-            && JSON.stringify(
-                latest_snapshot(panel).state?.pendingEdits?.[0]?.cells ?? null,
-            ).includes('Draft')
-        ));
+        await wait_for_observable(() => {
+            const entry = sheet_cells(
+                latest_snapshot(panel).state?.pendingEdits,
+                0,
+            )?.['1:0'];
+            return sheet_names(panel)[0] === 'Inventory'
+                && (typeof entry === 'string' ? entry : entry?.value) === 'Draft';
+        });
     });
 
-    it('gives up the session when every sheet its edits name is gone', async () => {
+    it('grants the requested sheet its relocated draft after a reorder', async () => {
+        // The installed source already has the new workbook order, while the
+        // durable read made by the request still carries slots written in the old
+        // order. This is the real authority boundary: state is positional on disk
+        // and can lag workbook bytes until a write reconciles it. Taking index 0
+        // directly would therefore return no draft for Inventory.
+        const state = versioned_state_store({});
+        let expose_old_order_slots = false;
+        const read = state.store.read.bind(state.store);
+        state.store.read = async (target: string) => {
+            const snapshot = await read(target);
+            return expose_old_order_slots
+                ? {
+                    ...snapshot,
+                    state: {
+                        pendingEdits: [
+                            undefined,
+                            {
+                                sheetName: 'Inventory',
+                                cells: { '1:0': { value: 'Draft', base: 'Widget' } },
+                            },
+                        ],
+                    },
+                }
+                : snapshot;
+        };
+        bytes = swap_sheet_order(bytes);
+        const panel = await open_ready_xlsx(file_path, state);
+        expect(sheet_names(panel)).toEqual(['Inventory', 'People']);
+
+        expose_old_order_slots = true;
+        await panel.__receive({
+            type: 'requestEditSession',
+            requestId: 'reordered-inventory',
+            sheetIndex: 0,
+        });
+
+        expect(latest_edit_session(panel)).toMatchObject({
+            granted: true,
+            sheetIndex: 0,
+            pendingEdits: {
+                '1:0': { value: 'Draft', base: 'Widget' },
+            },
+        });
+    });
+
+    it('admits a pending-edit post by sheet name after a reorder', async () => {
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({
+            type: 'requestEditSession',
+            requestId: 'inventory',
+            sheetIndex: 1,
+        });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        bytes = swap_sheet_order(bytes);
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await wait_for_observable(() => sheet_names(panel)[0] === 'Inventory');
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session,
+            sequence: 1,
+            // Inventory moved to index 0 while this full-map post was queued.
+            sheetIndex: 1,
+            sheetName: 'Inventory',
+            edits: { '1:0': { value: 'Draft', base: 'Widget' } },
+        });
+        await controller_of(panel).drain();
+
+        expect(state.get_state(file_path).pendingEdits?.[0]).toEqual({
+            sheetName: 'Inventory',
+            worksheetId: '2',
+            cells: { '1:0': { value: 'Draft', base: 'Widget' } },
+        });
+        expect(panel.__messages).toContainEqual({
+            type: 'pendingEditsAcknowledged',
+            editSessionId: session,
+            sequence: 1,
+        });
+    });
+
+    it('flushes the live editor before releasing a session whose edited sheets are gone', async () => {
         // The session's only durable work names a worksheet the reloaded workbook
-        // no longer has. Nothing is left for the session to represent — the draft
-        // parks rather than landing on whatever sheet inherited its position — so
-        // the session is released and its id stops buying saves.
+        // no longer has. The replacement snapshot must reach the renderer before
+        // release fences its final publication, or the newer live overlay is lost
+        // and only this older committed draft survives.
         const state = versioned_state_store({
             pendingEdits: [
                 undefined,
-                { sheetName: 'Inventory', cells: { '1:0': { value: 'Draft', base: 'Widget' } } },
+                {
+                    sheetName: 'Inventory',
+                    worksheetId: '2',
+                    cells: { '1:0': { value: 'Draft', base: 'Widget' } },
+                },
             ],
         });
         const panel = await open_ready_xlsx(file_path, state);
@@ -534,6 +769,22 @@ describe('xlsx edit sessions', () => {
 
         bytes = drop_second_sheet(bytes);
         await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        const flush_request = await worksheet_loss_flush_request(panel);
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session,
+            sequence: 1,
+            sheetIndex: 1,
+            sheetName: 'Inventory',
+            worksheetId: '2',
+            edits: { '1:0': { value: 'Half typed', base: 'Widget' } },
+        });
+        await panel.__receive({
+            type: 'pendingEditsFlush',
+            requestId: flush_request!.requestId,
+            editSessionId: session,
+            highestProducedSequence: 1,
+        });
         await wait_for_observable(
             () => latest_snapshot(panel).capabilities.csvEditSessionId === undefined,
         );
@@ -544,6 +795,8 @@ describe('xlsx edit sessions', () => {
             operation: {
                 editSessionId: session,
                 sheetIndex: 0,
+                sheetName: 'People',
+                worksheetId: '1',
                 saveRequestId: 'save-1',
                 edits: { '1:0': 'Gadget' },
                 dirtyEdits: { '1:0': { value: 'Gadget', base: 'Alice' } },
@@ -552,12 +805,213 @@ describe('xlsx edit sessions', () => {
         await wait_for_observable(() => save_results(panel).length > 0);
         expect(save_results(panel).at(-1)).toMatchObject({ success: false });
         expect((await parse_xlsx(bytes)).data.sheets[0].rows[1][0]?.raw).toBe('Alice');
-        // The parked draft survived the release, durable and recoverable.
-        expect(JSON.stringify(state.get_state(file_path).pendingEdits ?? null))
-            .toContain('Draft');
+        // The renderer's final live value survived the release in the parked slot.
+        const parked = JSON.stringify(state.get_state(file_path).pendingEdits ?? null);
+        expect(parked).toContain('Half typed');
+        expect(parked).not.toContain('Draft');
     });
 
-    it('clears a failed save\u2019s durable edits after its worksheet moves', async () => {
+    it('flushes and releases a live-only session after its edited worksheet disappears', async () => {
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({
+            type: 'requestEditSession',
+            requestId: 'edit-inventory',
+            sheetIndex: 1,
+            sheetName: 'Inventory',
+            worksheetId: '2',
+        });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        bytes = drop_second_sheet(bytes);
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        const flush_request = await worksheet_loss_flush_request(panel);
+        await panel.__receive({
+            type: 'pendingEditsFlush',
+            requestId: flush_request!.requestId,
+            editSessionId: session,
+            highestProducedSequence: 0,
+        });
+
+        await wait_for_observable(
+            () => latest_snapshot(panel).capabilities.csvEditSessionId === undefined,
+        );
+    });
+
+    it('releases when the current clean target disappears despite an older visited sheet', async () => {
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({
+            type: 'requestEditSession',
+            requestId: 'edit-people',
+            sheetIndex: 0,
+            sheetName: 'People',
+            worksheetId: '1',
+        });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        await panel.__receive({
+            type: 'requestEditSession',
+            requestId: 'edit-inventory',
+            sheetIndex: 1,
+            sheetName: 'Inventory',
+            worksheetId: '2',
+        });
+
+        bytes = drop_second_sheet(bytes);
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        const flush_request = await worksheet_loss_flush_request(panel);
+        await panel.__receive({
+            type: 'pendingEditsFlush',
+            requestId: flush_request.requestId,
+            editSessionId: session,
+            highestProducedSequence: 0,
+        });
+
+        await wait_for_observable(
+            () => latest_snapshot(panel).capabilities.csvEditSessionId === undefined,
+        );
+    });
+
+    it('keeps a worksheet-loss session retargeted before its flush completes', async () => {
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({
+            type: 'requestEditSession',
+            requestId: 'edit-inventory',
+            sheetIndex: 1,
+            sheetName: 'Inventory',
+            worksheetId: '2',
+        });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        bytes = drop_second_sheet(bytes);
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        const flush_request = await worksheet_loss_flush_request(panel);
+        await panel.__receive({
+            type: 'requestEditSession',
+            requestId: 'retarget-people',
+            sheetIndex: 0,
+            sheetName: 'People',
+            worksheetId: '1',
+        });
+        expect(latest_edit_session(panel)).toMatchObject({
+            granted: true,
+            editSessionId: session,
+            sheetIndex: 0,
+        });
+        await panel.__receive({
+            type: 'pendingEditsFlush',
+            requestId: flush_request.requestId,
+            editSessionId: session,
+            highestProducedSequence: 0,
+        });
+        await controller_of(panel).drain();
+
+        expect(latest_snapshot(panel).capabilities.csvEditSessionId).toBe(session);
+    });
+
+    it('keeps the session when a volatile target disappears but a durable target survives', async () => {
+        const state = versioned_state_store({
+            pendingEdits: [
+                undefined,
+                {
+                    sheetName: 'Inventory',
+                    worksheetId: '2',
+                    cells: { '1:0': { value: 'Draft', base: 'Widget' } },
+                },
+            ],
+        });
+        const panel = await open_ready_xlsx(file_path, state);
+        const session = latest_snapshot(panel).capabilities.csvEditSessionId!;
+        await panel.__receive({
+            type: 'requestEditSession',
+            requestId: 'observe-people',
+            sheetIndex: 0,
+            sheetName: 'People',
+            worksheetId: '1',
+        });
+
+        bytes = drop_first_sheet(bytes);
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await wait_for_observable(() => sheet_names(panel)[0] === 'Inventory');
+        await controller_of(panel).drain();
+
+        expect(latest_snapshot(panel).capabilities.csvEditSessionId).toBe(session);
+        expect(panel.__messages.some((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'requestPendingEditsFlush'
+            && String((message as { requestId?: unknown }).requestId)
+                .startsWith('worksheet-loss:')
+        ))).toBe(false);
+        expect(sheet_cells(latest_snapshot(panel).state?.pendingEdits, 0))
+            .toEqual({ '1:0': { value: 'Draft', base: 'Widget' } });
+    });
+
+    it('preserves deleted-sheet failed-save cleanup when a surviving sheet posts', async () => {
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({
+            type: 'requestEditSession',
+            requestId: 'edit-inventory',
+            sheetIndex: 1,
+            sheetName: 'Inventory',
+            worksheetId: '2',
+        });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session,
+            sequence: 1,
+            sheetIndex: 0,
+            sheetName: 'People',
+            worksheetId: '1',
+            edits: { '1:0': { value: 'Bob', base: 'Alice' } },
+        });
+        await controller_of(panel).drain();
+
+        vscode_mock.__setWriteFileImplementation(async () => {
+            throw new Error('disk is full');
+        });
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                sheetIndex: 1,
+                sheetName: 'Inventory',
+                worksheetId: '2',
+                saveRequestId: 'save-inventory',
+                edits: { '1:0': 'Gadget' },
+                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+        expect(save_results(panel).at(-1)).toMatchObject({ success: false });
+
+        bytes = drop_second_sheet(bytes);
+        await vscode_mock.__getActiveWatchers()[0].__fireChange();
+        await wait_for_observable(() => sheet_names(panel).length === 1);
+        expect(latest_snapshot(panel).capabilities.csvEditSessionId).toBe(session);
+
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session,
+            sequence: 2,
+            sheetIndex: 0,
+            sheetName: 'People',
+            worksheetId: '1',
+            edits: { '1:0': { value: 'Bobby', base: 'Alice' } },
+        });
+        await controller_of(panel).drain();
+        await panel.__receive({ type: 'releaseEditSession', editSessionId: session });
+        await controller_of(panel).drain();
+
+        const pending = JSON.stringify(state.get_state(file_path).pendingEdits ?? null);
+        expect(pending).toContain('Bobby');
+        expect(pending).not.toContain('Gadget');
+    });
+
+    it('clears a failed name-only save\u2019s ID-tagged edits after its worksheet moves', async () => {
         // The save accepts its edits into Inventory's slot and then fails at the
         // write, leaving a tombstone whose cleanup runs when the session is
         // released. A reorder in between moves the slot: durable state is
@@ -577,15 +1031,30 @@ describe('xlsx edit sessions', () => {
             operation: {
                 editSessionId: session,
                 sheetIndex: 1,
+                sheetName: 'Inventory',
                 saveRequestId: 'save-1',
                 edits: { '1:0': 'Gadget' },
                 dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
             },
         });
         await wait_for_observable(() => save_results(panel).length > 0);
-        expect(save_results(panel).at(-1)).toMatchObject({ success: false });
-        expect(state.get_state(file_path).pendingEdits?.[1]?.cells)
-            .toEqual({ '1:0': { value: 'Gadget', base: 'Widget' } });
+        const started = panel.__messages.find((message) => (
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'saveOperationStarted'
+        )) as { lifecycle: { operation: { worksheetId?: string } } };
+        const failed = save_results(panel).at(-1) as unknown as {
+            success: boolean;
+            lifecycle: { operation: { worksheetId?: string } };
+        };
+        expect(started.lifecycle.operation.worksheetId).toBeUndefined();
+        expect(failed).toMatchObject({ success: false });
+        expect(failed.lifecycle.operation.worksheetId).toBeUndefined();
+        expect(state.get_state(file_path).pendingEdits?.[1]).toEqual({
+            sheetName: 'Inventory',
+            worksheetId: '2',
+            cells: { '1:0': { value: 'Gadget', base: 'Widget' } },
+        });
 
         bytes = swap_sheet_order(bytes);
         await vscode_mock.__getActiveWatchers()[0].__fireChange();
@@ -604,6 +1073,32 @@ describe('xlsx edit sessions', () => {
         await wait_for_observable(() => !JSON.stringify(
             state.get_state(file_path).pendingEdits ?? null,
         ).includes('Gadget'));
+    });
+
+    it('clears a successful name-only save from its ID-tagged durable slot', async () => {
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                sheetIndex: 1,
+                sheetName: 'Inventory',
+                saveRequestId: 'name-only-success',
+                edits: { '1:0': 'Gadget' },
+                dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+        await controller_of(panel).drain();
+
+        expect(JSON.stringify(state.get_state(file_path).pendingEdits ?? null))
+            .not.toContain('Gadget');
+        expect((await parse_xlsx(bytes)).data.sheets[1].rows[1][0]?.raw).toBe('Gadget');
     });
 
     it('fails a save whose worksheet is reordered away mid-flight', async () => {
@@ -632,6 +1127,8 @@ describe('xlsx edit sessions', () => {
             operation: {
                 editSessionId: session,
                 sheetIndex: 1,
+                sheetName: 'Inventory',
+                worksheetId: '2',
                 saveRequestId: 'save-1',
                 edits: { '1:0': 'Gadget' },
                 dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
@@ -647,6 +1144,8 @@ describe('xlsx edit sessions', () => {
             operation: {
                 editSessionId: latest_snapshot(panel).capabilities.csvEditSessionId ?? session,
                 sheetIndex: 0,
+                sheetName: 'Inventory',
+                worksheetId: '2',
                 saveRequestId: 'save-2',
                 edits: { '1:0': 'Gadget' },
                 dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
@@ -727,6 +1226,8 @@ describe('xlsx edit sessions', () => {
             operation: {
                 editSessionId: session,
                 sheetIndex: 1,
+                sheetName: 'Inventory',
+                worksheetId: '2',
                 saveRequestId: 'save-1',
                 edits: { '1:0': 'Gadget' },
                 dirtyEdits: failed,
@@ -786,6 +1287,8 @@ describe('xlsx edit sessions', () => {
             operation: {
                 editSessionId: session,
                 sheetIndex: 1,
+                sheetName: 'Inventory',
+                worksheetId: '2',
                 saveRequestId: 'save-1',
                 edits: { '1:0': 'Gadget' },
                 dirtyEdits: failed,
@@ -850,6 +1353,8 @@ describe('xlsx edit sessions', () => {
             operation: {
                 editSessionId: session,
                 sheetIndex: 1,
+                sheetName: 'Inventory',
+                worksheetId: '2',
                 saveRequestId: 'save-1',
                 edits: { '1:0': 'Gadget' },
                 dirtyEdits: saved,
@@ -914,6 +1419,8 @@ describe('xlsx edit sessions', () => {
             operation: {
                 editSessionId: session,
                 sheetIndex: 1,
+                sheetName: 'Inventory',
+                worksheetId: '2',
                 saveRequestId: 'save-1',
                 edits: { '1:0': 'Gadget' },
                 dirtyEdits: failed,
@@ -1001,6 +1508,8 @@ describe('xlsx edit sessions', () => {
             operation: {
                 editSessionId: session,
                 sheetIndex: 1,
+                sheetName: 'Inventory',
+                worksheetId: '2',
                 saveRequestId: 'save-1',
                 edits: { '1:0': 'Gadget', '2:0': 'Shared' },
                 dirtyEdits: failed,
@@ -1068,6 +1577,8 @@ describe('xlsx edit sessions', () => {
             operation: {
                 editSessionId: session,
                 sheetIndex: 1,
+                sheetName: 'Inventory',
+                worksheetId: '2',
                 saveRequestId: 'save-1',
                 edits: { '1:0': 'Gadget' },
                 dirtyEdits: failed,
@@ -1107,6 +1618,60 @@ describe('xlsx edit sessions', () => {
     });
 
 
+    it('rejects pending-edit posts without complete sheet identity for XLSX', async () => {
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const identities = [
+            {},
+            { sheetIndex: 0 },
+            { sheetName: 'People' },
+        ];
+
+        for (let index = 0; index < identities.length; index += 1) {
+            const sequence = index + 1;
+            const value = `rejected-${sequence}`;
+            await panel.__receive({
+                type: 'pendingEditsChanged',
+                editSessionId: session,
+                sequence,
+                edits: { '0:0': { value, base: 'Alice' } },
+                ...identities[index],
+            });
+            await controller_of(panel).drain();
+
+            expect(JSON.stringify(state.get_state(file_path).pendingEdits ?? null))
+                .not.toContain(value);
+            expect(panel.__messages).not.toContainEqual({
+                type: 'pendingEditsAcknowledged',
+                editSessionId: session,
+                sequence,
+            });
+        }
+
+        // Rejected higher sequences do not poison the watermark: the first valid
+        // publication is still admitted and acknowledged at sequence one.
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session,
+            sequence: 1,
+            sheetIndex: 0,
+            sheetName: 'People',
+            edits: { '0:0': { value: 'accepted', base: 'Alice' } },
+        });
+        await controller_of(panel).drain();
+        expect(state.get_state(file_path).pendingEdits?.[0]).toMatchObject({
+            sheetName: 'People',
+            cells: { '0:0': { value: 'accepted', base: 'Alice' } },
+        });
+        expect(panel.__messages).toContainEqual({
+            type: 'pendingEditsAcknowledged',
+            editSessionId: session,
+            sequence: 1,
+        });
+    });
+
     it('keeps a displaced duplicate-tag draft when the sheet at its index is written', async () => {
         // Reconciliation seats only one of two same-named slots at their sheet's
         // own index; the other sits wherever a free position happens to be. That
@@ -1134,6 +1699,8 @@ describe('xlsx edit sessions', () => {
             type: 'pendingEditsChanged',
             editSessionId: session,
             sequence: 1,
+            sheetIndex: 0,
+            sheetName: 'People',
             edits: { '0:0': { value: 'Bob', base: 'Alice' } },
         });
         await controller_of(panel).drain();
@@ -1182,22 +1749,19 @@ describe('xlsx edit sessions', () => {
         const state = versioned_state_store({
             pendingEdits: [
                 undefined,
-                { sheetName: 'Inventory', cells: { '1:0': { value: 'Draft', base: 'Widget' } } },
+                {
+                    sheetName: 'Inventory',
+                    worksheetId: '2',
+                    cells: { '1:0': { value: 'Draft', base: 'Widget' } },
+                },
             ],
         });
         const panel = await open_ready_xlsx(file_path, state);
         expect(sheet_names(panel)).toContain('Inventory');
 
         // Rename Inventory -> Stock in the workbook part, on disk, behind our back.
-        const file = CFB.read(bytes, { type: 'buffer' });
-        const wb = CFB.find(file, '/xl/workbook.xml')!;
-        const text = Buffer.from(wb.content as Uint8Array).toString('utf8')
-            .replace('name="Inventory"', 'name="Stock"');
-        const patched = Buffer.from(text, 'utf8');
-        wb.content = patched;
-        wb.size = patched.length;
-        const w = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
-        bytes = w instanceof Uint8Array ? w : new Uint8Array(w as ArrayBufferLike);
+        bytes = rewrite_workbook_xml(bytes, (xml) =>
+            xml.replace('name="Inventory"', 'name="Stock"'));
 
         await vscode_mock.__getWatchers()[0].__fireChange();
         await wait_for_observable(() => sheet_names(panel).includes('Stock'));
@@ -1205,6 +1769,93 @@ describe('xlsx edit sessions', () => {
 
         const durable = JSON.stringify(state.get_state(file_path).pendingEdits ?? null);
         expect(durable, 'durable draft').toContain('Draft');
+        const stock_index = sheet_names(panel).indexOf('Stock');
+        expect(sheet_cells(
+            latest_snapshot(panel).state?.pendingEdits,
+            stock_index,
+        )).toEqual({ '1:0': { value: 'Draft', base: 'Widget' } });
+    });
+
+    it('does not give a recreated same-name worksheet an old ID draft', async () => {
+        const state = versioned_state_store({
+            pendingEdits: [{
+                sheetName: 'People',
+                worksheetId: '1',
+                cells: { '1:0': { value: 'Draft', base: 'Alice' } },
+            }],
+        });
+        bytes = rewrite_workbook_xml(bytes, (xml) => {
+            const rewritten = xml.replace(
+                /(<sheet\b(?=[^>]*\bname="People")[^>]*\bsheetId=")1("[^>]*>)/,
+                (_match, prefix: string, suffix: string) => `${prefix}99${suffix}`,
+            );
+            expect(rewritten).toMatch(
+                /<sheet\b(?=[^>]*\bname="People")[^>]*\bsheetId="99"/,
+            );
+            return rewritten;
+        });
+
+        const panel = await open_ready_xlsx(file_path, state);
+        expect(latest_snapshot(panel).capabilities.csvEditSessionId).toBeUndefined();
+        expect(JSON.stringify(latest_snapshot(panel).state?.pendingEdits ?? null))
+            .not.toContain('Draft');
+        expect(JSON.stringify(state.get_state(file_path).pendingEdits ?? null))
+            .toContain('Draft');
+    });
+
+    it('parks an outgoing old-ID flush after same-name replacement', async () => {
+        const state = versioned_state_store({});
+        const panel = await open_ready_xlsx(file_path, state);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        bytes = rewrite_workbook_xml(bytes, (xml) => xml.replace(
+            /(<sheet\b(?=[^>]*\bname="People")[^>]*\bsheetId=")1("[^>]*>)/,
+            (_match, prefix: string, suffix: string) => `${prefix}99${suffix}`,
+        ));
+
+        await vscode_mock.__getWatchers()[0].__fireChange();
+        await wait_for_observable(() => (
+            latest_snapshot(panel).capabilities.csvEditSessionId === session
+            && latest_snapshot(panel).meta.sheets[0]?.worksheetId === '99'
+        ));
+
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session,
+            sequence: 1,
+            sheetIndex: 0,
+            sheetName: 'People',
+            worksheetId: '99',
+            edits: { '0:0': { value: 'current draft', base: 'Alice' } },
+        });
+        await panel.__receive({
+            type: 'pendingEditsChanged',
+            editSessionId: session,
+            sequence: 2,
+            sheetIndex: 0,
+            sheetName: 'People',
+            worksheetId: '1',
+            edits: { '1:0': { value: 'half-typed old draft', base: 'Alice' } },
+        });
+        await controller_of(panel).drain();
+
+        const pending = state.get_state(file_path).pendingEdits ?? [];
+        expect(pending.find((slot) => slot?.worksheetId === '99')).toEqual({
+            sheetName: 'People',
+            worksheetId: '99',
+            cells: { '0:0': { value: 'current draft', base: 'Alice' } },
+        });
+        expect(pending.find((slot) => slot?.worksheetId === '1')).toEqual({
+            sheetName: 'People',
+            worksheetId: '1',
+            cells: { '1:0': { value: 'half-typed old draft', base: 'Alice' } },
+        });
+        expect(panel.__messages).toContainEqual({
+            type: 'pendingEditsAcknowledged',
+            editSessionId: session,
+            sequence: 2,
+        });
     });
 
     it('rehydrates a live draft sitting behind a parked one', async () => {
@@ -1301,6 +1952,8 @@ describe('xlsx edit sessions', () => {
             operation: {
                 editSessionId: session,
                 sheetIndex: 1,
+                sheetName: 'Inventory',
+                worksheetId: '2',
                 saveRequestId: 'save-1',
                 edits: { '1:0': 'Gadget' },
                 dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
@@ -1313,6 +1966,22 @@ describe('xlsx edit sessions', () => {
     });
 });
 
+function rewrite_workbook_xml(
+    zip: Uint8Array,
+    transform: (xml: string) => string,
+): Uint8Array {
+    const file = CFB.read(zip, { type: 'buffer' });
+    const entry = CFB.find(file, '/xl/workbook.xml')!;
+    const rewritten = Buffer.from(
+        transform(Buffer.from(entry.content as Uint8Array).toString('utf8')),
+        'utf8',
+    );
+    entry.content = rewritten;
+    entry.size = rewritten.length;
+    const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+    return written instanceof Uint8Array ? written : new Uint8Array(written as ArrayBufferLike);
+}
+
 /**
  * Swap the two `<sheet>` entries in the workbook part.
  *
@@ -1321,33 +1990,29 @@ describe('xlsx edit sessions', () => {
  * 1 now name each other's sheet.
  */
 function swap_sheet_order(zip: Uint8Array): Uint8Array {
-    const file = CFB.read(zip, { type: 'buffer' });
-    const entry = CFB.find(file, '/xl/workbook.xml')!;
-    const xml = Buffer.from(entry.content as Uint8Array).toString('utf8');
-    const sheets = [...xml.matchAll(/<sheet\b[^>]*\/>/g)].map((m) => m[0]);
-    expect(sheets).toHaveLength(2);
-    const swapped = Buffer.from(
-        xml.replace(sheets[0] + sheets[1], sheets[1] + sheets[0]),
-        'utf8',
-    );
-    entry.content = swapped;
-    entry.size = swapped.length;
-    const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
-    return written instanceof Uint8Array ? written : new Uint8Array(written as ArrayBufferLike);
+    return rewrite_workbook_xml(zip, (xml) => {
+        const sheets = [...xml.matchAll(/<sheet\b[^>]*\/>/g)].map((m) => m[0]);
+        expect(sheets).toHaveLength(2);
+        return xml.replace(sheets[0] + sheets[1], sheets[1] + sheets[0]);
+    });
+}
+
+/** Drop the first `<sheet>` entry, as deleting that worksheet elsewhere would. */
+function drop_first_sheet(zip: Uint8Array): Uint8Array {
+    return rewrite_workbook_xml(zip, (xml) => {
+        const sheets = [...xml.matchAll(/<sheet\b[^>]*\/>/g)].map((m) => m[0]);
+        expect(sheets).toHaveLength(2);
+        return xml.replace(sheets[0], '');
+    });
 }
 
 /** Drop the second `<sheet>` entry, as deleting that worksheet elsewhere would. */
 function drop_second_sheet(zip: Uint8Array): Uint8Array {
-    const file = CFB.read(zip, { type: 'buffer' });
-    const entry = CFB.find(file, '/xl/workbook.xml')!;
-    const xml = Buffer.from(entry.content as Uint8Array).toString('utf8');
-    const sheets = [...xml.matchAll(/<sheet\b[^>]*\/>/g)].map((m) => m[0]);
-    expect(sheets).toHaveLength(2);
-    const trimmed = Buffer.from(xml.replace(sheets[1], ''), 'utf8');
-    entry.content = trimmed;
-    entry.size = trimmed.length;
-    const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
-    return written instanceof Uint8Array ? written : new Uint8Array(written as ArrayBufferLike);
+    return rewrite_workbook_xml(zip, (xml) => {
+        const sheets = [...xml.matchAll(/<sheet\b[^>]*\/>/g)].map((m) => m[0]);
+        expect(sheets).toHaveLength(2);
+        return xml.replace(sheets[1], '');
+    });
 }
 
 function read_part(zip: Uint8Array, part: string): Buffer | null {

@@ -543,6 +543,56 @@ describe('CSV edit sessions', () => {
         await controller.drain();
     });
 
+    it('rejects a correlated renderer flush failure without waiting for timeout', async () => {
+        const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
+        const timers = new Map<symbol, () => void>();
+        const controller = attach_viewer(
+            panel as unknown as Parameters<typeof attach_viewer>[0],
+            uri('/tmp/failed-flush.csv'),
+            with_in_memory_authority_transactions(state_store().store),
+            csv_table_profile(),
+            fake_viewer_host,
+            {
+                scheduler: {
+                    setTimeout(callback) {
+                        const handle = Symbol('timer');
+                        timers.set(handle, callback);
+                        return handle;
+                    },
+                    clearTimeout(handle) {
+                        timers.delete(handle as symbol);
+                    },
+                },
+            },
+        );
+        await panel.__receive({ type: 'ready' });
+
+        const flush = controller.flush_pending_edits();
+        await wait_for_observable(() => panel.__messages.some((message) => (
+            typeof message === 'object' && message !== null
+            && 'type' in message && message.type === 'requestPendingEditsFlush'
+        )));
+        const request = panel.__messages.find((message) => (
+            typeof message === 'object' && message !== null
+            && 'type' in message && message.type === 'requestPendingEditsFlush'
+        )) as { requestId: string };
+        await panel.__receive({
+            type: 'pendingEditsFlushFailed',
+            requestId: 'unrelated',
+        });
+        expect(timers.size).toBe(1);
+        await panel.__receive({
+            type: 'pendingEditsFlushFailed',
+            requestId: request.requestId,
+        });
+
+        await expect(flush).rejects.toThrow('could not complete');
+        expect(timers.size).toBe(0);
+
+        controller.dispose();
+        await controller.drain();
+    });
+
     it('drains an admitted overlay projection before disposal releases the session', async () => {
         const versioned = state_store();
         const write_started = deferred();
@@ -1901,7 +1951,10 @@ describe('CSV edit sessions', () => {
         expect(panel.__messages).toContainEqual({
             type: 'saveResult',
             success: false,
-            lifecycle: expect.objectContaining({ state: 'failed', operation }),
+            lifecycle: expect.objectContaining({
+                state: 'failed',
+                operation: { ...operation, sheetName: 'Sheet1' },
+            }),
             // Only the drifted key: the honest edit stays saveable once the user
             // resolves this one.
             rejection: { reason: 'baseMismatch', keys: ['0:0'] },
@@ -2150,7 +2203,7 @@ describe('CSV edit sessions', () => {
             success: false,
             lifecycle: expect.objectContaining({
                 state: 'failed',
-                operation,
+                operation: { ...operation, sheetName: 'Sheet1' },
             }),
         }));
 
@@ -8130,7 +8183,7 @@ describe('CSV edit sessions', () => {
         // untagged slot is single-sheet CSV by construction, always shown.
         const file_path = '/tmp/legacy-discard.csv';
         const state = state_store({
-            pendingEdits: [{ cells: { '0:0': { value: 'draft', base: 'a' } } }],
+            pendingEdits: sheet_edits({ '0:0': { value: 'draft', base: 'a' } }),
         });
         const panel = open_csv_table(uri(file_path), state.store);
         await panel.__receive({ type: 'ready' });

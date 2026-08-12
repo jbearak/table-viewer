@@ -42,6 +42,7 @@ class StubSource implements DataSource {
         private readonly merges: MergeRange[] = [],
         private readonly name = 'Sheet1',
         private readonly source_rows?: readonly number[],
+        private readonly worksheet_id?: string,
     ) {}
 
     meta(): WorkbookMeta {
@@ -49,6 +50,7 @@ class StubSource implements DataSource {
             hasFormatting: this.rows.flat().some((value) => value?.bold),
             sheets: [{
                 name: this.name,
+                worksheetId: this.worksheet_id,
                 rowCount: this.rows.length,
                 sourceRowCount: this.source_rows === undefined
                     ? this.rows.length
@@ -438,11 +440,12 @@ describe('ExcelHeaderDataSource', () => {
             [cell('Generated today'), null],
             [cell('Name'), cell('Age')],
             [cell('Alice'), cell(30)],
-        ]));
+        ], [], 'Sheet1', undefined, '7'));
 
         const input = ds.planning_input_for_header_source('Sheet1', 2)!;
 
         expect(input.sheets[0]).toMatchObject({
+            worksheetId: '7',
             manualHeaderRow: 2,
             manualHeaderSourceRow: 2,
             manualColumnNames: ['Name', 'Age'],

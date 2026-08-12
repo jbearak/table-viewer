@@ -6,12 +6,14 @@ import type {
     SheetTransformState,
     SortKey,
     StoredPerFileState,
+    WorksheetIdentityInput,
 } from '../types';
 import {
     MAX_PERSISTED_HIDDEN_ROWS,
     is_range_filter_operator,
     reconcile_pending_edit_sheets,
     sheet_name_from_transform_schema,
+    worksheet_identity,
 } from '../types';
 export { MAX_PERSISTED_HIDDEN_ROWS } from '../types';
 import { sanitize_column_visibility_state } from './column-projection';
@@ -33,11 +35,12 @@ export function clamp_sheet_index(
 
 export function normalize_per_file_state(
     state: StoredPerFileState,
-    sheet_names: string[]
+    sheets: readonly WorksheetIdentityInput[],
 ): PerFileState {
+    const sheet_names = sheets.map((sheet) => worksheet_identity(sheet).name);
     const active_sheet_index = normalize_active_sheet_index(
         state,
-        sheet_names
+        sheet_names,
     );
 
     return {
@@ -57,7 +60,7 @@ export function normalize_per_file_state(
         tabOrientation: state.tabOrientation ?? null,
         pendingEdits: normalize_pending_edits(
             'pendingEdits' in state ? (state as PerFileState).pendingEdits : undefined,
-            sheet_names,
+            sheets,
         ),
         transforms: normalize_transforms(
             'transforms' in state ? (state as PerFileState).transforms : undefined,
@@ -284,7 +287,7 @@ function normalize_active_sheet_index(
  */
 function normalize_pending_edits(
     value: unknown,
-    sheet_names: readonly string[],
+    sheets: readonly WorksheetIdentityInput[],
 ): PerFileState['pendingEdits'] {
     // A legacy flat map reaching here (state that never passed through
     // `decode_stored_per_file_state`) is one CSV's edits: single-sheet by
@@ -297,17 +300,27 @@ function normalize_pending_edits(
 
     const slots = value.map((slot) => {
         if (!slot || typeof slot !== 'object' || Array.isArray(slot)) return undefined;
-        const record = slot as { sheetName?: unknown; cells?: unknown };
+        const record = slot as {
+            sheetName?: unknown;
+            worksheetId?: unknown;
+            cells?: unknown;
+        };
         const cells = normalize_pending_edit_cells(record.cells);
         if (!cells) return undefined;
-        return typeof record.sheetName === 'string'
-            ? { sheetName: record.sheetName, cells }
-            : { cells };
+        return {
+            ...(typeof record.sheetName === 'string'
+                ? { sheetName: record.sheetName }
+                : {}),
+            ...(typeof record.worksheetId === 'string'
+                ? { worksheetId: record.worksheetId }
+                : {}),
+            cells,
+        };
     });
     while (slots.length > 0 && slots[slots.length - 1] === undefined) slots.pop();
     return reconcile_pending_edit_sheets(
         slots.length === 0 ? undefined : slots,
-        sheet_names,
+        sheets,
     );
 }
 

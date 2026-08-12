@@ -2,7 +2,11 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import CFB from 'cfb';
-import { parse_xlsx } from '../parse-xlsx';
+import {
+    parse_workbook_xml,
+    parse_xlsx,
+    parse_xlsx_streaming,
+} from '../parse-xlsx';
 
 const FIXTURES = path.join(__dirname, 'fixtures');
 
@@ -62,6 +66,37 @@ function build_test_xlsx(sheet_xml: string, opts?: { styles_xml?: string; sst_xm
 }
 
 describe('parse_xlsx', () => {
+    it('exposes the OOXML sheetId as worksheet identity', async () => {
+        const sheet = `<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1"/><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>x</t></is></c></row></sheetData>
+</worksheet>`;
+        const bytes = build_test_xlsx(sheet);
+        const { data } = await parse_xlsx(bytes);
+        const streaming = await parse_xlsx_streaming(bytes);
+
+        expect(data.sheets[0].worksheetId).toBe('1');
+        expect(streaming.sheets[0].worksheetId).toBe('1');
+    });
+
+    it('drops colliding OOXML sheet IDs so names remain distinct identities', () => {
+        const workbook = `<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="First" sheetId="1" r:id="rId1"/>
+    <sheet name="Second" sheetId="1" r:id="rId2"/>
+    <sheet name="Third" sheetId="3" r:id="rId3"/>
+  </sheets>
+</workbook>`;
+
+        expect(parse_workbook_xml(workbook).sheets).toEqual([
+            { name: 'First', rId: 'rId1' },
+            { name: 'Second', rId: 'rId2' },
+            { name: 'Third', rId: 'rId3', worksheetId: '3' },
+        ]);
+    });
+
     describe('bold formatting from Excel-style XML', () => {
         it('detects bold cells using shared strings with s attribute', async () => {
             // Mimics real Excel output: cells reference shared strings AND have style index

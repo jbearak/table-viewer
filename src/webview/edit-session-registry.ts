@@ -38,6 +38,12 @@
  */
 
 import {
+    worksheet_identity,
+    worksheet_target_index,
+    type WorksheetIdentityInput,
+    type WorksheetTarget,
+} from '../types';
+import {
     create_edit_session_store,
     type EditSessionStore,
 } from './edit-session-store';
@@ -55,22 +61,29 @@ export interface EditSessionRegistry {
     /** Re-stamp every existing store onto the current session. */
     adopt_session(): void;
     /**
-     * The workbook's sheets moved: carry every store to where its sheet went.
-     *
-     * The session is workbook-scoped, so any sheet's store may hold edits —
-     * not just the one the edit pointer names. An external reorder moves the
-     * sheets under all of them at once, and a store left at its old index
-     * would paint its edits onto whatever worksheet now sits there. The
-     * caller resolves old index → new index (by sheet name, against the
-     * snapshot that reported the move); a sheet that resolves nowhere was
-     * deleted, and its store goes with it — the durable slot, not this
-     * in-memory map, is what survives a deletion-shaped rename.
-     *
-     * Stores are moved, never re-created: a store's object identity is what
-     * `install` notifies through and what the hydration boundary reads its
-     * outgoing stamp from.
+     * Follow live stores through a workbook change and retain selected removed
+     * stores as parked session state. Returned stores are reattached by stable
+     * worksheet identity and reported as locally authoritative for hydration.
      */
-    remap(next_index_of: (previous_index: number) => number | undefined): void;
+    reconcile_sheets(
+        previous: readonly WorksheetIdentityInput[],
+        next: readonly WorksheetIdentityInput[],
+        retain_removed: (target: WorksheetTarget, store: EditSessionStore) => boolean,
+    ): {
+        readonly locallyRetainedIndices: ReadonlySet<number>;
+        readonly retryPublications: readonly {
+            target: WorksheetTarget;
+            store: EditSessionStore;
+        }[];
+    };
+    /** Drop detached stores when their session ends without replacing live stores. */
+    retire_parked(): void;
+    /** Every live and parked store with the target used for publication. */
+    publication_entries(sheets: readonly WorksheetIdentityInput[]): IterableIterator<{
+        target: WorksheetTarget;
+        store: EditSessionStore;
+        parked: boolean;
+    }>;
     /**
      * A different document replaced this one: drop every store. An initial
      * snapshot owns the complete pending-edit projection, so any store that
@@ -84,12 +97,36 @@ export interface EditSessionRegistry {
      * mounted grid's clear reaches only the sheet on screen.
      */
     clear_all(session_id: string | undefined): void;
+    /**
+     * Every store the registry holds, with the sheet index each sits at. The
+     * close-flush boundary walks these: the session is workbook-scoped, so any
+     * sheet's store may hold unpublished edits, not just the pointer sheet's.
+     */
+    entries(): IterableIterator<[number, EditSessionStore]>;
+}
+
+function target_for_sheet(
+    sheetIndex: number,
+    sheet: WorksheetIdentityInput,
+): WorksheetTarget {
+    const identity = worksheet_identity(sheet);
+    return {
+        sheetIndex,
+        sheetName: identity.name,
+        ...(identity.worksheetId !== undefined
+            ? { worksheetId: identity.worksheetId }
+            : {}),
+    };
 }
 
 export function create_edit_session_registry(
     current_session_id: () => string | undefined,
 ): EditSessionRegistry {
-    const stores = new Map<number, EditSessionStore>();
+    let stores = new Map<number, EditSessionStore>();
+    const parked = new Map<EditSessionStore, {
+        target: WorksheetTarget;
+        store: EditSessionStore;
+    }>();
 
     return {
         for_sheet: (sheet_index) => {
@@ -101,29 +138,88 @@ export function create_edit_session_registry(
             stores.set(sheet_index, created);
             return created;
         },
-        remap: (next_index_of) => {
+        reconcile_sheets: (previous, next, retain_removed) => {
             const moved = new Map<number, EditSessionStore>();
-            for (const [previous_index, store] of stores) {
-                const next_index = next_index_of(previous_index);
-                if (next_index !== undefined) moved.set(next_index, store);
+            const locally_retained_indices = new Set<number>();
+            const retry_publications: Array<{
+                target: WorksheetTarget;
+                store: EditSessionStore;
+            }> = [];
+            const next_index_for = (target: WorksheetTarget) =>
+                worksheet_target_index(next, target);
+
+            for (const [parked_store, entry] of parked) {
+                const next_index = next_index_for(entry.target);
+                if (next_index === undefined || moved.has(next_index)) {
+                    retry_publications.push(entry);
+                    continue;
+                }
+                parked.delete(parked_store);
+                moved.set(next_index, entry.store);
+                locally_retained_indices.add(next_index);
+                retry_publications.push({
+                    target: target_for_sheet(next_index, next[next_index]),
+                    store: entry.store,
+                });
             }
-            stores.clear();
-            for (const [index, store] of moved) stores.set(index, store);
+            for (const [previous_index, store] of stores) {
+                const previous_sheet = previous[previous_index];
+                if (!previous_sheet) continue;
+                const target = target_for_sheet(previous_index, previous_sheet);
+                const next_index = next_index_for(target);
+                if (next_index !== undefined && !moved.has(next_index)) {
+                    moved.set(next_index, store);
+                    if (retain_removed(target, store)) {
+                        locally_retained_indices.add(next_index);
+                        retry_publications.push({
+                            target: target_for_sheet(next_index, next[next_index]),
+                            store,
+                        });
+                    }
+                    continue;
+                }
+                if (!retain_removed(target, store)) continue;
+                const entry = { target, store };
+                parked.set(store, entry);
+                retry_publications.push(entry);
+            }
+            stores = moved;
+            return {
+                locallyRetainedIndices: locally_retained_indices,
+                retryPublications: retry_publications,
+            };
+        },
+        retire_parked: () => {
+            parked.clear();
+        },
+        publication_entries: function* (sheets) {
+            for (const [sheet_index, store] of stores) {
+                const sheet = sheets[sheet_index];
+                if (!sheet) continue;
+                yield {
+                    target: target_for_sheet(sheet_index, sheet),
+                    store,
+                    parked: false,
+                };
+            }
+            for (const entry of parked.values()) yield { ...entry, parked: true };
         },
         replace_document: () => {
             stores.clear();
+            parked.clear();
         },
         clear_all: (session_id) => {
             for (const store of stores.values()) store.clear(session_id);
+            for (const { store } of parked.values()) store.clear(session_id);
         },
+        entries: () => stores.entries(),
         adopt_session: () => {
             // Unconditional: the store's adopt_session is a bare stamp
             // assignment with no notification, so there is nothing to save by
             // skipping a store already on the current session.
             const session_id = current_session_id();
-            for (const store of stores.values()) {
-                store.adopt_session(session_id);
-            }
+            for (const store of stores.values()) store.adopt_session(session_id);
+            for (const { store } of parked.values()) store.adopt_session(session_id);
         },
     };
 }

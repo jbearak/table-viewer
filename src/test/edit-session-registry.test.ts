@@ -66,7 +66,7 @@ describe('edit session registry', () => {
         expect(registry.for_sheet(1).identity()).toEqual({ session_id: 'new' });
     });
 
-    it('remap carries every store to where its sheet went, dropping deletions', () => {
+    it('reconcile_sheets carries every store to where its sheet went, dropping unretained deletions', () => {
         const { registry } = make_session_ref('s');
         const people = registry.for_sheet(0);
         people.commit('s', '0:0', { value: 'people', base: 'a' });
@@ -75,7 +75,18 @@ describe('edit session registry', () => {
         registry.for_sheet(2).commit('s', '0:0', { value: 'gone', base: 'c' });
 
         // A reorder swapped sheets 0 and 1 and deleted sheet 2.
-        registry.remap((index) => (index === 0 ? 1 : index === 1 ? 0 : undefined));
+        registry.reconcile_sheets(
+            [
+                { name: 'People', worksheetId: '1' },
+                { name: 'Stock', worksheetId: '2' },
+                { name: 'Gone', worksheetId: '3' },
+            ],
+            [
+                { name: 'Stock', worksheetId: '2' },
+                { name: 'People', worksheetId: '1' },
+            ],
+            () => false,
+        );
 
         // Same store objects at their new indices, edits intact — the session is
         // workbook-scoped, so *every* sheet's edits must follow their sheet, not
@@ -89,6 +100,70 @@ describe('edit session registry', () => {
             .toEqual({ value: 'stock', base: 'b' });
         // The deleted sheet's store went with it.
         expect(registry.for_sheet(2).size()).toBe(0);
+    });
+
+    it('retains and republishes live stores that follow a worksheet reorder', () => {
+        const { registry } = make_session_ref('s');
+        const people = registry.for_sheet(0);
+        people.commit('s', '0:0', { value: 'draft', base: 'a' });
+
+        const result = registry.reconcile_sheets(
+            [
+                { name: 'People', worksheetId: '1' },
+                { name: 'Stock', worksheetId: '2' },
+            ],
+            [
+                { name: 'Stock', worksheetId: '2' },
+                { name: 'People', worksheetId: '1' },
+            ],
+            (_target, store) => store.size() > 0,
+        );
+
+        expect(registry.for_sheet(1)).toBe(people);
+        expect(result.locallyRetainedIndices).toEqual(new Set([1]));
+        expect(result.retryPublications).toEqual([{
+            target: { sheetIndex: 1, sheetName: 'People', worksheetId: '1' },
+            store: people,
+        }]);
+    });
+
+    it('uses the shared first-match policy when worksheet IDs collide', () => {
+        const { registry } = make_session_ref('s');
+        const store = registry.for_sheet(0);
+        store.commit('s', '0:0', { value: 'draft', base: 'a' });
+
+        registry.reconcile_sheets(
+            [{ name: 'Original', worksheetId: 'duplicate' }],
+            [
+                { name: 'First', worksheetId: 'duplicate' },
+                { name: 'Second', worksheetId: 'duplicate' },
+            ],
+            () => true,
+        );
+
+        expect(registry.for_sheet(0)).toBe(store);
+        expect(registry.for_sheet(1)).not.toBe(store);
+    });
+
+    it('parks rather than drops a store that collides with a reattached store', () => {
+        const { registry } = make_session_ref('s');
+        const parked = registry.for_sheet(0);
+        parked.commit('s', '0:0', { value: 'old', base: 'a' });
+        registry.reconcile_sheets([{ name: 'Data' }], [], () => true);
+
+        const live = registry.for_sheet(0);
+        live.commit('s', '0:0', { value: 'new', base: 'a' });
+        registry.reconcile_sheets(
+            [{ name: 'Data' }],
+            [{ name: 'Data' }],
+            () => true,
+        );
+
+        const publications = [...registry.publication_entries([{ name: 'Data' }])];
+        expect(publications).toHaveLength(2);
+        expect(publications.map(({ store }) => store)).toContain(parked);
+        expect(publications.map(({ store }) => store)).toContain(live);
+        expect(publications.filter(({ parked }) => parked)).toHaveLength(1);
     });
 
     it('replace_document drops every store', () => {

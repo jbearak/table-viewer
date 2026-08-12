@@ -15,6 +15,7 @@ import {
     type PerFileState,
     type ScrollPosition,
     type StoredPerFileState,
+    type WorksheetIdentityInput,
 } from './types';
 import { sanitize_column_visibility_state } from './webview/column-projection';
 import {
@@ -368,9 +369,9 @@ export function classify_snapshot(
 /** Normalize legacy/current state while retaining host-owned Excel fields. */
 export function normalize_complete_per_file_state(
     stored: StoredPerFileState,
-    sheet_names: string[],
+    sheets: readonly WorksheetIdentityInput[],
 ): PerFileState {
-    const normalized = normalize_per_file_state(stored, sheet_names);
+    const normalized = normalize_per_file_state(stored, sheets);
     if ('excelFirstRowHeaders' in stored) {
         normalized.excelFirstRowHeaders = sanitize_excel_header_overrides(
             stored.excelFirstRowHeaders,
@@ -403,13 +404,13 @@ export function normalize_complete_per_file_state(
 /** Fill every layout/view field required by the snapshot wire shape. */
 export function complete_normalized_per_file_state(
     stored: StoredPerFileState,
-    sheet_names: string[],
+    sheets: readonly WorksheetIdentityInput[],
 ): NormalizedPerFileState {
     // Dropped, not completed — see `NormalizedPerFileState`. Destructured away rather than
     // simply left out of the literal, because the spread below would otherwise carry the
     // normalizer's copy straight through.
     const { rowHeights: _drop_row_heights, ...normalized } =
-        normalize_complete_per_file_state(stored, sheet_names);
+        normalize_complete_per_file_state(stored, sheets);
     return {
         ...normalized,
         columnWidths: normalized.columnWidths ?? [],
@@ -427,10 +428,7 @@ export function normalize_workbook_snapshot_state(
     meta: WorkbookMeta,
     expected_digest?: string | null,
 ): NormalizedPerFileState {
-    const normalized = complete_normalized_per_file_state(
-        stored,
-        meta.sheets.map((sheet) => sheet.name),
-    );
+    const normalized = complete_normalized_per_file_state(stored, meta.sheets);
     const transforms = meta.sheets.map((sheet, index) =>
         sanitize_transform_state(
             normalized.transforms?.[index],

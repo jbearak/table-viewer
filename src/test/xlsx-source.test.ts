@@ -16,6 +16,11 @@ describe('XlsxDataSource', () => {
         expect(m.sheets.length).toBeGreaterThan(0);
         expect(m.sheets[0].rowCount).toBeGreaterThan(0);
         expect(m.sheets[0].columnCount).toBeGreaterThan(0);
+        expect(m.sheets[0].worksheetId).toBe('1');
+
+        const decorated = new ExcelHeaderDataSource(ds);
+        expect(decorated.meta().sheets.map((sheet) => sheet.worksheetId))
+            .toEqual(m.sheets.map((sheet) => sheet.worksheetId));
     });
     it('read_rows matches parse_xlsx cell values for the same window', async () => {
         const buf = load('basic.xlsx');

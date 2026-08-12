@@ -30,6 +30,7 @@ const grid_shell_mock = vi.hoisted(() => ({
     discard_conflicted: vi.fn(),
     discard_keys: vi.fn((_keys: readonly string[]) => {}),
     commit_live_edit: vi.fn(),
+    flush_live_edit: vi.fn(),
     stop_edit_admission: vi.fn(),
     focus_grid: vi.fn(),
     select_all: vi.fn(),
@@ -93,7 +94,6 @@ vi.mock('../webview/grid-shell', () => ({
             edits: Readonly<Record<string, string>>;
             dirtyEdits: Readonly<Record<string, { value: string; base: string }>>;
         } | undefined;
-        initial_edits?: Record<string, string | { value: string; base: string }>;
         edit_session?: EditSessionStore;
         host_rejected_keys?: readonly string[];
         on_editing_change?: (status: { is_dirty: boolean; has_live_uncommitted: boolean; save_in_flight: boolean; edits: Record<string, { value: string; base: string }>; conflicted: string[] }) => void;
@@ -105,6 +105,7 @@ vi.mock('../webview/grid-shell', () => ({
                 discard_keys: (keys: readonly string[]) => void;
                 stop_edit_admission: () => void;
                 commit_live_edit: () => void;
+                flush_live_edit: () => void;
                 has_uncommitted_changes: () => boolean;
             } | null;
         };
@@ -231,13 +232,15 @@ vi.mock('../webview/grid-shell', () => ({
                 }).acquireVsCodeApi().postMessage({
                     type: 'pendingEditsChanged',
                     editSessionId: props.edit_session_id,
-                    edits: props.initial_edits ?? null,
+                    edits: store_edits.size > 0
+                        ? Object.fromEntries(store_edits)
+                        : null,
                 });
             }
             return () => {
                 grid_shell_mock.on_editing_change = null;
             };
-        }, [props.initial_edits, props.on_editing_change]);
+        }, [props.on_editing_change, store_edits]);
         if (props.editing_ref) {
             props.editing_ref.current = {
                 request_save: () => {
@@ -255,6 +258,7 @@ vi.mock('../webview/grid-shell', () => ({
                 discard_keys: grid_shell_mock.discard_keys,
                 stop_edit_admission: grid_shell_mock.stop_edit_admission,
                 commit_live_edit: grid_shell_mock.commit_live_edit,
+                flush_live_edit: grid_shell_mock.flush_live_edit,
                 has_uncommitted_changes: () => grid_shell_mock.has_uncommitted_changes,
             };
         }
@@ -274,7 +278,6 @@ vi.mock('../webview/grid-shell', () => ({
                 'data-preview': String(props.preview_mode ?? false),
                 'data-edit-mode': String(props.edit_mode ?? false),
                 'data-host-rejected-keys': JSON.stringify(props.host_rejected_keys ?? []),
-                'data-initial-edits': JSON.stringify(props.initial_edits ?? null),
                 'data-store-edits': JSON.stringify(Object.fromEntries(store_edits)),
                 'data-mount-id': String(mount_id.current),
                 'data-projection': JSON.stringify(props.column_projection.visible_to_source),
@@ -474,6 +477,8 @@ async function dispatch_host_message(input: HostMessage | Record<string, unknown
     ) {
         const operation = grid_shell_mock.latest_props?.save_operation as {
             editSessionId: string;
+            sheetIndex: number;
+            sheetName?: string;
             saveRequestId: string;
             edits: Record<string, string>;
             dirtyEdits: Record<string, { value: string; base: string }>;
@@ -481,6 +486,10 @@ async function dispatch_host_message(input: HostMessage | Record<string, unknown
         const terminal_operation = {
             editSessionId: msg.editSessionId ?? operation?.editSessionId
                 ?? 'test-edit-session',
+            sheetIndex: operation?.sheetIndex ?? 0,
+            ...(operation?.sheetName !== undefined
+                ? { sheetName: operation.sheetName }
+                : {}),
             saveRequestId: msg.saveRequestId ?? operation?.saveRequestId
                 ?? 'legacy-save-request',
             edits: operation?.edits ?? { '0:0': 'dirty' },
@@ -715,6 +724,16 @@ function grid_stub(): HTMLDivElement {
     return stub as HTMLDivElement;
 }
 
+function latest_store_edits(): Record<
+    string,
+    { value: string; base: string; base_pending?: boolean }
+> {
+    const store = grid_shell_mock.latest_props?.edit_session as
+        | EditSessionStore
+        | undefined;
+    return store ? Object.fromEntries(store.snapshot()) : {};
+}
+
 type SnapshotExtra = Omit<Partial<WorkbookSnapshot>,
     'identity' | 'state' | 'configuration' | 'capabilities'> & {
         identity?: Partial<WorkbookSnapshot['identity']>;
@@ -848,6 +867,7 @@ function cleanup() {
     grid_shell_mock.discard_conflicted.mockReset();
     grid_shell_mock.discard_keys.mockReset();
     grid_shell_mock.commit_live_edit.mockReset();
+    grid_shell_mock.flush_live_edit.mockReset();
     grid_shell_mock.stop_edit_admission.mockReset();
     grid_shell_mock.focus_grid.mockReset();
     grid_shell_mock.select_all.mockReset();
@@ -996,7 +1016,7 @@ describe('workbook snapshot hydration', () => {
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
         expect(grid_stub().getAttribute('data-preview')).toBe('true');
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
-        expect(JSON.parse(grid_stub().getAttribute('data-initial-edits')!))
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!))
             .toEqual({ '0:0': { value: 'new', base: 'old' } });
         expect(get_button('Vertical Tabs').getAttribute('aria-pressed')).toBe('true');
         expect(post_message.mock.calls.map((call) => call[0])).toContainEqual({
@@ -1187,7 +1207,7 @@ describe('workbook snapshot hydration', () => {
             },
         }));
 
-        expect(JSON.parse(grid_stub().getAttribute('data-initial-edits')!))
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!))
             .toEqual(authoritative);
         const pending_messages = post_message.mock.calls.map((call) => call[0])
             .filter((item) => item.type === 'pendingEditsChanged');
@@ -3609,9 +3629,6 @@ describe('edit mode save exit', () => {
         });
 
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
-        expect(grid_stub().getAttribute('data-initial-edits')).toBe(
-            JSON.stringify(pendingEdits)
-        );
         expect(grid_stub().getAttribute('data-store-edits')).toBe(
             JSON.stringify(pendingEdits)
         );
@@ -3654,7 +3671,6 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
         expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
-        expect(grid_stub().getAttribute('data-initial-edits')).toBe('null');
         // The session covers the whole workbook, so Edit here is an *entry*:
         // enabled, and pressing it asks the host for this sheet's own grant of
         // the same session rather than being refused.
@@ -3678,6 +3694,41 @@ describe('edit mode save exit', () => {
         await click_sheet_tab('Inventory');
         expect(grid_stub().getAttribute('data-store-edits')).toBe(
             JSON.stringify(pendingEdits)
+        );
+    });
+
+    it('retains the workbook session when a sibling entry request is refused', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                },
+            })
+        );
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'workbook-session',
+            sheetIndex: 0,
+        });
+        await click_sheet_tab('Inventory');
+        post_message.mockClear();
+        await click_button('Edit');
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'requestEditSession',
+            sheetIndex: 1,
+        }));
+
+        await dispatch_host_message({ type: 'editSessionResult', granted: false });
+        await click_sheet_tab('People');
+
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_shell_mock.latest_props?.edit_session_id).toBe('workbook-session');
+        expect(post_message).not.toHaveBeenCalledWith(
+            expect.objectContaining({ type: 'releaseEditSession' })
         );
     });
 
@@ -3738,6 +3789,416 @@ describe('edit mode save exit', () => {
         );
     });
 
+    it('keeps and republishes an unacknowledged live store through a reorder', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'restored-session',
+                },
+            })
+        );
+        const people_store = grid_shell_mock.latest_props!
+            .edit_session as EditSessionStore;
+        await act(async () => people_store.commit('restored-session', '0:0', {
+            value: 'Newest',
+            base: 'Alice',
+        }));
+        await dispatch_host_message({
+            type: 'requestPendingEditsFlush',
+            requestId: 'before-reorder',
+        });
+        await vi.waitUntil(() => post_message.mock.calls.some(
+            ([message]) => message?.type === 'pendingEditsFlush',
+        ));
+        post_message.mockClear();
+
+        await dispatch_host_message(
+            refresh_snapshot_message(make_meta(['Inventory', 'People'], false), {
+                state: {
+                    pendingEdits: [
+                        undefined,
+                        {
+                            sheetName: 'People',
+                            cells: { '0:0': { value: 'Older', base: 'Alice' } },
+                        },
+                    ],
+                },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'restored-session',
+                },
+            })
+        );
+
+        await click_sheet_tab('People');
+        expect(grid_shell_mock.latest_props!.edit_session).toBe(people_store);
+        expect(grid_stub().getAttribute('data-store-edits')).toBe(JSON.stringify({
+            '0:0': { value: 'Newest', base: 'Alice' },
+        }));
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'pendingEditsChanged',
+            editSessionId: 'restored-session',
+            sheetIndex: 1,
+            sheetName: 'People',
+            edits: { '0:0': { value: 'Newest', base: 'Alice' } },
+        }));
+    });
+
+    it('keeps and republishes an unacknowledged store through a same-layout refresh', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'restored-session',
+                },
+            })
+        );
+        const people_store = grid_shell_mock.latest_props!
+            .edit_session as EditSessionStore;
+        await act(async () => people_store.commit('restored-session', '0:0', {
+            value: 'Newest',
+            base: 'Alice',
+        }));
+        await dispatch_host_message({
+            type: 'requestPendingEditsFlush',
+            requestId: 'before-refresh',
+        });
+        await vi.waitUntil(() => post_message.mock.calls.some(
+            ([message]) => message?.type === 'pendingEditsFlush',
+        ));
+        post_message.mockClear();
+
+        await dispatch_host_message(
+            refresh_snapshot_message(make_meta(['People'], false), {
+                state: {
+                    pendingEdits: [{
+                        sheetName: 'People',
+                        cells: { '0:0': { value: 'Older', base: 'Alice' } },
+                    }],
+                },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'restored-session',
+                },
+            })
+        );
+
+        expect(grid_shell_mock.latest_props!.edit_session).toBe(people_store);
+        expect(grid_stub().getAttribute('data-store-edits')).toBe(JSON.stringify({
+            '0:0': { value: 'Newest', base: 'Alice' },
+        }));
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'pendingEditsChanged',
+            editSessionId: 'restored-session',
+            sheetIndex: 0,
+            sheetName: 'People',
+            edits: { '0:0': { value: 'Newest', base: 'Alice' } },
+        }));
+    });
+
+    it('folds the active editor before a deletion-shaped rename drops its store', async () => {
+        await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'session-before',
+                },
+            })
+        );
+        const people_store = grid_shell_mock.latest_props!
+            .edit_session as EditSessionStore;
+        grid_shell_mock.flush_live_edit.mockImplementation(() => {
+            people_store.commit('session-before', '0:0', {
+                value: 'half-typed',
+                base: 'Alice',
+            });
+        });
+
+        await dispatch_host_message(
+            refresh_snapshot_message(make_meta(['Renamed'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'session-after',
+                },
+            })
+        );
+
+        expect(grid_shell_mock.flush_live_edit).toHaveBeenCalledTimes(1);
+        expect(Object.fromEntries(people_store.snapshot())).toEqual({
+            '0:0': { value: 'half-typed', base: 'Alice' },
+        });
+        expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
+    });
+
+    it('flushes the active editor before a same-name replacement drops its ID store', async () => {
+        await render_app();
+        const before = make_meta(['Data'], false);
+        before.sheets[0].worksheetId = 'old';
+        await dispatch_host_message(
+            initial_snapshot_message(before, {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'session-before',
+                },
+            }),
+        );
+        const old_store = grid_shell_mock.latest_props!.edit_session as EditSessionStore;
+        grid_shell_mock.flush_live_edit.mockImplementation(() => {
+            old_store.commit('session-before', '0:0', {
+                value: 'half-typed',
+                base: 'before',
+            });
+        });
+
+        const replacement = make_meta(['Data'], false);
+        replacement.sheets[0].worksheetId = 'new';
+        await dispatch_host_message(
+            refresh_snapshot_message(replacement, {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'session-after',
+                },
+            }),
+        );
+
+        expect(grid_shell_mock.flush_live_edit).toHaveBeenCalledTimes(1);
+        expect(Object.fromEntries(old_store.snapshot())).toEqual({
+            '0:0': { value: 'half-typed', base: 'before' },
+        });
+        expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
+    });
+
+    it('re-publishes a removed worksheet store against the refreshed authority', async () => {
+        const { post_message } = await render_app();
+        const before = make_meta(['People', 'Inventory'], false);
+        before.sheets[0].worksheetId = '1';
+        before.sheets[1].worksheetId = '2';
+        await dispatch_host_message(initial_snapshot_message(before, {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'workbook-session',
+            },
+        }));
+        await click_sheet_tab('Inventory');
+        const inventory_store = grid_shell_mock.latest_props!
+            .edit_session as EditSessionStore;
+        await act(async () => {
+            inventory_store.commit('workbook-session', '0:0', {
+                value: 'Gadget',
+                base: 'Widget',
+            });
+        });
+        await click_sheet_tab('People');
+        post_message.mockClear();
+
+        const after = make_meta(['People'], false);
+        after.sheets[0].worksheetId = '1';
+        await dispatch_host_message(refresh_snapshot_message(after, {
+            state: { pendingEdits: [] },
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'workbook-session',
+            },
+        }));
+
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'pendingEditsChanged',
+            editSessionId: 'workbook-session',
+            sheetIndex: 1,
+            sheetName: 'Inventory',
+            worksheetId: '2',
+            edits: { '0:0': { value: 'Gadget', base: 'Widget' } },
+        }));
+    });
+
+    it('reattaches a returned worksheet store instead of flushing a stale parked copy', async () => {
+        const { post_message } = await render_app();
+        const before = make_meta(['People', 'Inventory'], false);
+        before.sheets[0].worksheetId = '1';
+        before.sheets[1].worksheetId = '2';
+        await dispatch_host_message(initial_snapshot_message(before, {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'workbook-session',
+            },
+        }));
+        await click_sheet_tab('Inventory');
+        const inventory_store = grid_shell_mock.latest_props!
+            .edit_session as EditSessionStore;
+        await act(async () => inventory_store.commit('workbook-session', '0:0', {
+            value: 'Gadget',
+            base: 'Widget',
+        }));
+
+        const removed = make_meta(['People'], false);
+        removed.sheets[0].worksheetId = '1';
+        await dispatch_host_message(refresh_snapshot_message(removed, {
+            state: { pendingEdits: [] },
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'workbook-session',
+            },
+        }));
+        await dispatch_host_message(refresh_snapshot_message(before, {
+            state: {
+                pendingEdits: [
+                    undefined,
+                    {
+                        sheetName: 'Inventory',
+                        worksheetId: '2',
+                        cells: { '0:0': { value: 'Gadget', base: 'Widget' } },
+                    },
+                ],
+            },
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'workbook-session',
+            },
+        }));
+        await click_sheet_tab('Inventory');
+        expect(grid_shell_mock.latest_props!.edit_session).toBe(inventory_store);
+        await act(async () => inventory_store.commit('workbook-session', '0:0', {
+            value: 'Newest',
+            base: 'Widget',
+        }));
+
+        post_message.mockClear();
+        await dispatch_host_message({
+            type: 'requestPendingEditsFlush',
+            requestId: 'flush-returned',
+        });
+        await vi.waitUntil(() => post_message.mock.calls.some(
+            ([message]) => message?.type === 'pendingEditsFlush',
+        ));
+
+        const inventory_publications = post_message.mock.calls
+            .map(([message]) => message)
+            .filter((message) => message?.type === 'pendingEditsChanged'
+                && message.worksheetId === '2');
+        expect(inventory_publications).toHaveLength(1);
+        expect(inventory_publications[0].edits).toEqual({
+            '0:0': { value: 'Newest', base: 'Widget' },
+        });
+    });
+
+    it('re-publishes a removed worksheet store after its last edit was cleared', async () => {
+        const { post_message } = await render_app();
+        const before = make_meta(['People', 'Inventory'], false);
+        before.sheets[0].worksheetId = '1';
+        before.sheets[1].worksheetId = '2';
+        await dispatch_host_message(initial_snapshot_message(before, {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'workbook-session',
+            },
+        }));
+        await click_sheet_tab('Inventory');
+        const inventory_store = grid_shell_mock.latest_props!
+            .edit_session as EditSessionStore;
+        await act(async () => inventory_store.commit('workbook-session', '0:0', {
+            value: 'Gadget',
+            base: 'Widget',
+        }));
+        await dispatch_host_message({
+            type: 'requestPendingEditsFlush',
+            requestId: 'publish-before-clear',
+        });
+        await vi.waitUntil(() => post_message.mock.calls.some(
+            ([message]) => message?.type === 'pendingEditsFlush',
+        ));
+        await act(async () => inventory_store.clear('workbook-session'));
+        post_message.mockClear();
+
+        const removed = make_meta(['People'], false);
+        removed.sheets[0].worksheetId = '1';
+        await dispatch_host_message(refresh_snapshot_message(removed, {
+            state: {
+                pendingEdits: [
+                    undefined,
+                    {
+                        sheetName: 'Inventory',
+                        worksheetId: '2',
+                        cells: { '0:0': { value: 'Gadget', base: 'Widget' } },
+                    },
+                ],
+            },
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'workbook-session',
+            },
+        }));
+
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'pendingEditsChanged',
+            editSessionId: 'workbook-session',
+            sheetIndex: 1,
+            sheetName: 'Inventory',
+            worksheetId: '2',
+            edits: null,
+        }));
+    });
+
+    it('remounts an open editor across a same-generation reorder', async () => {
+        await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'session-before',
+                },
+            })
+        );
+        const people_store = grid_shell_mock.latest_props!
+            .edit_session as EditSessionStore;
+        const people_mount = grid_stub().getAttribute('data-mount-id');
+        grid_shell_mock.flush_live_edit.mockImplementation(() => {
+            people_store.commit('session-before', '0:0', {
+                value: 'half-typed',
+                base: 'Alice',
+            });
+        });
+
+        await dispatch_host_message(
+            refresh_snapshot_message(make_meta(['Inventory', 'People'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'session-after',
+                },
+            })
+        );
+
+        expect(grid_shell_mock.flush_live_edit).toHaveBeenCalledTimes(1);
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+        expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
+        expect(grid_stub().getAttribute('data-mount-id')).not.toBe(people_mount);
+        await click_sheet_tab('People');
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+        expect(grid_stub().getAttribute('data-store-edits')).toBe(JSON.stringify({
+            '0:0': { value: 'half-typed', base: 'Alice' },
+        }));
+    });
+
     it('hydrates every worksheet’s restored edits into its own store', async () => {
         // The session covers the whole workbook, so a reload can restore drafts
         // on several sheets at once. Each slot must land in its own sheet's
@@ -3770,6 +4231,538 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-store-edits')).toBe(
             JSON.stringify(inventory)
         );
+    });
+
+    it('restores a sibling store when its parked draft returns on refresh', async () => {
+        const people = { '0:0': { value: 'Bob', base: 'Alice' } };
+        const inventory = { '0:0': { value: 'Gadget', base: 'Widget' } };
+        await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                state: {
+                    pendingEdits: [
+                        { sheetName: 'People', cells: people },
+                        { sheetName: 'Inventory', cells: inventory },
+                    ],
+                },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'restored-session',
+                },
+            })
+        );
+
+        // Inventory disappears, so remapping drops its in-memory store while the
+        // host keeps the named durable slot parked.
+        await dispatch_host_message(
+            refresh_snapshot_message(make_meta(['People'], false), {
+                state: { pendingEdits: [{ sheetName: 'People', cells: people }] },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'restored-session',
+                },
+            })
+        );
+        // The worksheet returns and the authoritative projection carries its
+        // parked draft again. Refresh hydration must recreate the sibling store.
+        await dispatch_host_message(
+            refresh_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                state: {
+                    pendingEdits: [
+                        { sheetName: 'People', cells: people },
+                        { sheetName: 'Inventory', cells: inventory },
+                    ],
+                },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'restored-session',
+                },
+            })
+        );
+
+        await click_sheet_tab('Inventory');
+        expect(grid_stub().getAttribute('data-store-edits')).toBe(
+            JSON.stringify(inventory)
+        );
+    });
+
+    it('does not hydrate a sibling store from another worksheet\u2019s active save', async () => {
+        const people = { '0:0': { value: 'Bob', base: 'Alice' } };
+        const inventory = { '0:0': { value: 'Gadget', base: 'Widget' } };
+        await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                state: {
+                    pendingEdits: [
+                        { sheetName: 'People', cells: people },
+                        { sheetName: 'Inventory', cells: inventory },
+                    ],
+                },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'restored-session',
+                },
+            })
+        );
+
+        await dispatch_host_message(
+            refresh_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                state: {
+                    pendingEdits: [
+                        { sheetName: 'People', cells: people },
+                        { sheetName: 'Inventory', cells: inventory },
+                    ],
+                },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'restored-session',
+                    csvSaveLifecycle: {
+                        revision: 1,
+                        state: 'active',
+                        operation: {
+                            editSessionId: 'restored-session',
+                            sheetIndex: 0,
+                            sheetName: 'People',
+                            saveRequestId: 'people-save',
+                            edits: { '0:0': 'Bob' },
+                            dirtyEdits: people,
+                        },
+                    },
+                },
+            })
+        );
+
+        await click_sheet_tab('Inventory');
+        expect(grid_stub().getAttribute('data-store-edits')).toBe(
+            JSON.stringify(inventory)
+        );
+    });
+
+    it('keeps the edit pointer on its sheet through a sibling slot\u2019s refresh', async () => {
+        // A refresh of the session this panel already holds must not retarget
+        // the pointer to whichever slot happens to be dirty first \u2014 the user
+        // chose their sheet, and a sibling's durable write is not a reason to
+        // yank the session off it.
+        await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await click_sheet_tab('Inventory');
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'workbook-session',
+            sheetIndex: 1,
+        });
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+
+        // A sibling sheet's slot commits durably \u2014 slot 0 is now the first
+        // dirty one \u2014 and the same session refreshes.
+        await dispatch_host_message(
+            refresh_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                state: {
+                    pendingEdits: [
+                        {
+                            sheetName: 'People',
+                            cells: { '0:0': { value: 'Bob', base: 'Alice' } },
+                        },
+                    ],
+                },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'workbook-session',
+                },
+            })
+        );
+
+        // Still editing Inventory: the pointer stayed put.
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+    });
+
+    it('does not transfer a deleted clean pointer grant to its replacement index', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory', 'Archive'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await click_sheet_tab('Inventory');
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'workbook-session',
+            sheetIndex: 1,
+        });
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+
+        await dispatch_host_message(
+            refresh_snapshot_message(make_meta(['People', 'Archive'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'workbook-session',
+                },
+            })
+        );
+
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        post_message.mockClear();
+        await click_button('Edit');
+        expect(post_message).toHaveBeenCalledTimes(1);
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'requestEditSession',
+            sheetIndex: 1,
+        }));
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+    });
+
+    it('shows the save dialog when only another worksheet\u2019s store is dirty', async () => {
+        // Exiting ends the workbook-scoped session for every sheet, so unsaved
+        // work on a sheet other than the one on screen must raise the same
+        // Save/Discard/Cancel question \u2014 the mounted grid only answers for
+        // the visible sheet.
+        grid_shell_mock.has_uncommitted_changes = false;
+
+        const { post_message } = await render_app();
+        const inventory = { '0:0': { value: 'Gadget', base: 'Widget' } };
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                state: {
+                    pendingEdits: sheet_edits(inventory, 0, 'Inventory'),
+                },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'restored-session',
+                },
+            })
+        );
+        // The pointer adopted Inventory (the dirty slot); walk it back to People
+        // so the mounted grid \u2014 clean \u2014 is not the sheet holding the work.
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'restored-session',
+            sheetIndex: 0,
+        });
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
+
+        post_message.mockClear();
+        await click_button('Edit');
+        expect(post_message).toHaveBeenCalledWith(
+            expect.objectContaining({ type: 'showSaveDialog' })
+        );
+    });
+
+    it('saves the dirty sibling chosen from a clean pointer sheet', async () => {
+        grid_shell_mock.has_uncommitted_changes = false;
+        grid_shell_mock.request_save.mockReturnValue(true);
+        const { post_message } = await render_app();
+        const inventory = { '0:0': { value: 'Gadget', base: 'Widget' } };
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                state: { pendingEdits: sheet_edits(inventory, 0, 'Inventory') },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'restored-session',
+                },
+            })
+        );
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'restored-session',
+            sheetIndex: 0,
+        });
+
+        await click_button('Edit');
+        const dialog = post_message.mock.calls
+            .map(([message]) => message)
+            .find((message) => message?.type === 'showSaveDialog');
+        post_message.mockClear();
+        await dispatch_host_message({
+            type: 'saveDialogResult',
+            requestId: dialog.requestId,
+            editSessionId: dialog.editSessionId,
+            choice: 'save',
+        });
+
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+        expect(grid_shell_mock.request_save).toHaveBeenCalledTimes(1);
+        expect(grid_shell_mock.latest_props?.save_operation).toMatchObject({
+            editSessionId: 'restored-session',
+            sheetIndex: 1,
+            sheetName: 'Inventory',
+        });
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'stateChanged',
+            state: expect.objectContaining({ activeSheetIndex: 1 }),
+        }));
+        expect(post_message).not.toHaveBeenCalledWith(
+            expect.objectContaining({ type: 'releaseEditSession' })
+        );
+    });
+
+    it('follows the dirty worksheet identity while its save dialog is open', async () => {
+        grid_shell_mock.has_uncommitted_changes = false;
+        grid_shell_mock.request_save.mockReturnValue(true);
+        const { post_message } = await render_app();
+        const before = make_meta(['People', 'Inventory'], false);
+        before.sheets[0].worksheetId = '1';
+        before.sheets[1].worksheetId = '2';
+        const inventory = { '0:0': { value: 'Gadget', base: 'Widget' } };
+        await dispatch_host_message(initial_snapshot_message(before, {
+            state: {
+                pendingEdits: [undefined, {
+                    sheetName: 'Inventory',
+                    worksheetId: '2',
+                    cells: inventory,
+                }],
+            },
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'restored-session',
+            },
+        }));
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'restored-session',
+            sheetIndex: 0,
+        });
+        await click_button('Edit');
+        const dialog = post_message.mock.calls
+            .map(([message]) => message)
+            .find((message) => message?.type === 'showSaveDialog');
+
+        const after = make_meta(['Inventory', 'People'], false);
+        after.sheets[0].worksheetId = '2';
+        after.sheets[1].worksheetId = '1';
+        await dispatch_host_message(refresh_snapshot_message(after, {
+            state: {
+                pendingEdits: [{
+                    sheetName: 'Inventory',
+                    worksheetId: '2',
+                    cells: inventory,
+                }],
+            },
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'restored-session',
+            },
+        }));
+        post_message.mockClear();
+        await dispatch_host_message({
+            type: 'saveDialogResult',
+            requestId: dialog.requestId,
+            editSessionId: dialog.editSessionId,
+            choice: 'save',
+        });
+
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+        expect(grid_shell_mock.latest_props?.save_operation).toMatchObject({
+            editSessionId: 'restored-session',
+            sheetIndex: 0,
+            sheetName: 'Inventory',
+            worksheetId: '2',
+        });
+    });
+
+    it('does not present one worksheet save as saving multiple dirty worksheets', async () => {
+        grid_shell_mock.has_uncommitted_changes = true;
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                state: {
+                    pendingEdits: [
+                        {
+                            sheetName: 'People',
+                            cells: { '0:0': { value: 'Bob', base: 'Alice' } },
+                        },
+                        {
+                            sheetName: 'Inventory',
+                            cells: { '0:0': { value: 'Gadget', base: 'Widget' } },
+                        },
+                    ],
+                },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'restored-session',
+                },
+            })
+        );
+
+        await click_button('Edit');
+        const dialog = post_message.mock.calls
+            .map(([message]) => message)
+            .find((message) => message?.type === 'showSaveDialog');
+        post_message.mockClear();
+        await dispatch_host_message({
+            type: 'saveDialogResult',
+            requestId: dialog.requestId,
+            editSessionId: dialog.editSessionId,
+            choice: 'save',
+        });
+
+        expect(grid_shell_mock.request_save).not.toHaveBeenCalled();
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'showWarning',
+            message: expect.stringContaining('More than one worksheet'),
+        }));
+        expect(post_message).not.toHaveBeenCalledWith(
+            expect.objectContaining({ type: 'releaseEditSession' })
+        );
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+    });
+
+    it('publishes every worksheet\u2019s store at the close flush', async () => {
+        // The close/reload boundary is the last chance for unacknowledged local
+        // edits to reach the host. The session is workbook-scoped, so a store on
+        // a sheet the pointer left behind is exactly as much unsaved work as the
+        // pointer sheet's \u2014 flushing only the pointer's dropped the rest.
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                state: {
+                    pendingEdits: [
+                        {
+                            sheetName: 'People',
+                            cells: { '0:0': { value: 'Bob', base: 'Alice' } },
+                        },
+                        {
+                            sheetName: 'Inventory',
+                            cells: { '0:0': { value: 'Gadget', base: 'Widget' } },
+                        },
+                    ],
+                },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'restored-session',
+                },
+            })
+        );
+
+        post_message.mockClear();
+        await dispatch_host_message({
+            type: 'requestPendingEditsFlush',
+            requestId: 'flush-all',
+        });
+        const posted_types = (type: string) => post_message.mock.calls
+            .map(([message]) => message)
+            .filter((message) => message?.type === type);
+        // The reply itself is the observable result, so wait for *it* rather
+        // than for a tick that happens to be long enough on this machine.
+        await vi.waitUntil(() => posted_types('pendingEditsFlush').length > 0);
+        expect(posted_types('pendingEditsFlush')).toHaveLength(1);
+        const published = posted_types('pendingEditsChanged') as {
+            sheetName?: string;
+            edits: unknown;
+        }[];
+        expect(published.map((message) => message.sheetName).sort())
+            .toEqual(['Inventory', 'People']);
+        expect(published.every((message) => message.edits !== null)).toBe(true);
+    });
+
+    it('skips pristine worksheet stores at the close flush', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'clean-session',
+                },
+            })
+        );
+        await click_sheet_tab('Inventory');
+
+        post_message.mockClear();
+        await dispatch_host_message({
+            type: 'requestPendingEditsFlush',
+            requestId: 'flush-pristine',
+        });
+        const posted = (type: string) => post_message.mock.calls
+            .map(([message]) => message)
+            .filter((message) => message?.type === type);
+        await vi.waitUntil(() => posted('pendingEditsFlush').length > 0);
+
+        expect(posted('pendingEditsFlush')).toHaveLength(1);
+        expect(posted('pendingEditsChanged')).toHaveLength(0);
+    });
+
+    it('forces only worksheet payloads whose latest post is unacknowledged', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                state: {
+                    pendingEdits: [
+                        {
+                            sheetName: 'People',
+                            cells: { '0:0': { value: 'Bob', base: 'Alice' } },
+                        },
+                        {
+                            sheetName: 'Inventory',
+                            cells: { '0:0': { value: 'Gadget', base: 'Widget' } },
+                        },
+                    ],
+                },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'restored-session',
+                },
+            })
+        );
+
+        post_message.mockClear();
+        await dispatch_host_message({
+            type: 'requestPendingEditsFlush',
+            requestId: 'first-flush',
+        });
+        const posted = () => post_message.mock.calls
+            .map(([message]) => message)
+            .filter((message) => message?.type === 'pendingEditsChanged');
+        await vi.waitUntil(() => posted().length >= 2);
+        expect(posted()).toHaveLength(2);
+        const people = posted().find((message) => message.sheetName === 'People');
+        await dispatch_host_message({
+            type: 'pendingEditsAcknowledged',
+            editSessionId: 'restored-session',
+            sequence: people.sequence,
+        });
+
+        post_message.mockClear();
+        await dispatch_host_message({
+            type: 'requestPendingEditsFlush',
+            requestId: 'second-flush',
+        });
+        await vi.waitUntil(() => post_message.mock.calls.some(
+            ([message]) => message?.type === 'pendingEditsFlush',
+        ));
+        expect(posted()).toHaveLength(1);
+        expect(posted()[0]).toMatchObject({ sheetName: 'Inventory' });
     });
 
     it('holds the worksheet tabs while a save dialog is open', async () => {
@@ -3852,6 +4845,40 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
         expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!))
             .toEqual({ '0:0': { value: 'typed', base: 'Alice' } });
+    });
+
+    it('keeps an identified worksheet mounted across a same-generation rename', async () => {
+        await render_app();
+        const before = make_meta(['Before'], false);
+        before.sheets[0].worksheetId = '7';
+        await dispatch_host_message(initial_snapshot_message(before, {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'rename-session',
+            },
+        }));
+        const before_mount = grid_stub().getAttribute('data-mount-id');
+        grid_shell_mock.commit_live_edit.mockClear();
+        grid_shell_mock.flush_live_edit.mockClear();
+
+        const after = make_meta(['After'], false);
+        after.sheets[0].worksheetId = '7';
+        await dispatch_host_message(refresh_snapshot_message(after, {
+            generation: 1,
+            sourceGeneration: 1,
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'rename-session',
+            },
+        }));
+
+        expect(grid_stub().getAttribute('data-mount-id')).toBe(before_mount);
+        expect((grid_shell_mock.latest_props?.sheet_meta as { name: string }).name)
+            .toBe('After');
+        expect(grid_shell_mock.commit_live_edit).not.toHaveBeenCalled();
+        expect(grid_shell_mock.flush_live_edit).not.toHaveBeenCalled();
     });
 
     it("keeps one worksheet's dirty cells out of another's store", async () => {
@@ -4146,6 +5173,7 @@ describe('edit mode save exit', () => {
         // reports `save_in_flight: false` — truthfully, about a save it cannot see.
         grid_shell_mock.save_in_flight = false;
         await click_sheet_tab('Inventory');
+        expect(get_button('Edit').getAttribute('aria-disabled')).toBe('true');
 
         post_message.mockClear();
         await dispatch_host_message({
@@ -4154,22 +5182,80 @@ describe('edit mode save exit', () => {
         });
         // The reply itself is the observable result, so wait for *it* rather than
         // for a tick that happens to be long enough on this machine.
-        let flush: { highestProducedSequence?: number } | undefined;
-        for (let attempt = 0; attempt < 100 && !flush; attempt += 1) {
-            await act(async () => { await Promise.resolve(); });
-            flush = post_message.mock.calls
-                .map(([message]) => message)
-                .find((message) => message?.type === 'pendingEditsFlush');
-        }
+        await vi.waitUntil(() => post_message.mock.calls.some(
+            ([message]) => message?.type === 'pendingEditsFlush',
+        ));
+        const flush = post_message.mock.calls
+            .map(([message]) => message)
+            .find((message) => message?.type === 'pendingEditsFlush');
         // Fenced: the flush reports the sequence already produced rather than
         // publishing a new one that could never be acknowledged.
-        expect(flush).toBeDefined();
         expect(flush?.highestProducedSequence).toBe(0);
         expect(
             post_message.mock.calls.some(
                 ([message]) => message?.type === 'pendingEditsChanged',
             ),
         ).toBe(false);
+    });
+
+    it('keeps the pointer sheet’s newer edits when a sibling grid reports clean', async () => {
+        // The live-map ref belongs to the edit pointer, not whichever grid is
+        // mounted. A read-only sibling reports an empty map on mount; if that
+        // overwrites the ref, the succeeding save removes its own entries from
+        // `undefined` and clears edits made on the pointer sheet after the save
+        // began.
+        await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'people-session',
+            sheetIndex: 0,
+        });
+        const operation: CsvSaveOperation = {
+            editSessionId: 'people-session',
+            sheetIndex: 0,
+            saveRequestId: 'save-1',
+            edits: { '0:0': 'Alicia' },
+            dirtyEdits: { '0:0': { value: 'Alicia', base: 'Alice' } },
+        };
+        await dispatch_host_message({
+            type: 'saveOperationStarted',
+            lifecycle: { revision: 1, state: 'active', operation },
+        });
+
+        const store = grid_shell_mock.latest_props?.edit_session as EditSessionStore;
+        await act(async () => {
+            store.commit('people-session', '1:0', { value: 'newer', base: 'before' });
+            grid_shell_mock.on_editing_change?.({
+                is_dirty: true,
+                has_live_uncommitted: false,
+                save_in_flight: true,
+                edits: {
+                    ...operation.dirtyEdits,
+                    '1:0': { value: 'newer', base: 'before' },
+                },
+                conflicted: [],
+            });
+        });
+
+        grid_shell_mock.is_dirty = false;
+        grid_shell_mock.save_in_flight = false;
+        await click_sheet_tab('Inventory');
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: true,
+            lifecycle: { revision: 2, state: 'succeeded', operation },
+        });
+
+        expect(Object.fromEntries(store.snapshot())).toEqual({
+            '1:0': { value: 'newer', base: 'before' },
+        });
     });
 
     it('disables transform affordances on a non-owning sheet while a save runs', async () => {
@@ -4285,12 +5371,8 @@ describe('edit mode save exit', () => {
         const posted = (type: string) => post_message.mock.calls
             .map(([message]) => message)
             .find((message) => message?.type === type);
-        let flush: { highestProducedSequence?: number } | undefined;
-        for (let attempt = 0; attempt < 100 && !flush; attempt += 1) {
-            await act(async () => { await Promise.resolve(); });
-            flush = posted('pendingEditsFlush');
-        }
-        expect(flush).toBeDefined();
+        await vi.waitUntil(() => posted('pendingEditsFlush') !== undefined);
+        const flush = posted('pendingEditsFlush');
         // No save is in flight any more, so the flush publishes the restored edits
         // instead of advertising a sequence the host will never acknowledge.
         expect(flush?.highestProducedSequence).toBeGreaterThan(0);
@@ -4339,8 +5421,8 @@ describe('edit mode save exit', () => {
 
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
         expect(grid_shell_mock.latest_props?.edit_session_id).toBe('clean-owned-session');
-        expect(grid_shell_mock.latest_props?.initial_edits).toEqual({});
-        expect(grid_stub().getAttribute('data-initial-edits')).toBe('{}');
+        expect(latest_store_edits()).toEqual({});
+        expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
     });
 
     it('clears stale initial edits when a granted session has none', async () => {
@@ -4363,7 +5445,7 @@ describe('edit mode save exit', () => {
             editSessionId: 'old-session',
             pendingEdits: stale,
         });
-        expect(grid_shell_mock.latest_props?.initial_edits).toEqual(stale);
+        expect(latest_store_edits()).toEqual(stale);
 
         await click_button('Edit');
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
@@ -4376,11 +5458,9 @@ describe('edit mode save exit', () => {
         });
 
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
-        expect(grid_shell_mock.latest_props?.initial_edits).toBeUndefined();
-        expect(grid_stub().getAttribute('data-initial-edits')).toBe('null');
-        // Authoritative absence has to reach the live store too, not just the prop:
-        // the stale entry must be gone from what a mounted grid paints from, and
-        // without a remount to wipe it that install is the only thing that can do it.
+        // Authoritative absence has to reach the live store: the stale entry must
+        // be gone from what a mounted grid paints from, without a remount to wipe it.
+        expect(latest_store_edits()).toEqual({});
         expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
         expect(grid_stub().getAttribute('data-mount-id')).toBe(before_grant);
         expect(post_message.mock.calls.filter(([message]) => (
@@ -4610,14 +5690,62 @@ describe('edit mode save exit', () => {
             },
         }));
         expect(grid_shell_mock.latest_props?.save_operation).toEqual(proposed);
-        expect(grid_shell_mock.latest_props?.initial_edits).toEqual(proposed.dirtyEdits);
+        expect(latest_store_edits()).toEqual(proposed.dirtyEdits);
 
         await dispatch_host_message({
             type: 'saveOperationStarted',
             lifecycle: { revision: 4, state: 'active', operation: proposed },
         });
         expect(grid_shell_mock.latest_props?.save_operation).toEqual(proposed);
-        expect(grid_shell_mock.latest_props?.initial_edits).toEqual(proposed.dirtyEdits);
+        expect(latest_store_edits()).toEqual(proposed.dirtyEdits);
+    });
+
+    it('applies a succeeded save lifecycle to a non-pointer worksheet on initial hydration', async () => {
+        await render_app();
+        const meta = make_meta(['People', 'Inventory'], false);
+        meta.sheets[0].worksheetId = '1';
+        meta.sheets[1].worksheetId = '2';
+        const operation: CsvSaveOperation = {
+            editSessionId: 'restored-session',
+            sheetIndex: 1,
+            sheetName: 'Inventory',
+            worksheetId: '2',
+            saveRequestId: 'saved-inventory',
+            edits: { '0:0': 'Gadget' },
+            dirtyEdits: { '0:0': { value: 'Gadget', base: 'Widget' } },
+        };
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            state: {
+                pendingEdits: [
+                    {
+                        sheetName: 'People',
+                        worksheetId: '1',
+                        cells: { '0:0': { value: 'Bob', base: 'Alice' } },
+                    },
+                    {
+                        sheetName: 'Inventory',
+                        worksheetId: '2',
+                        cells: operation.dirtyEdits,
+                    },
+                ],
+            },
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: operation.editSessionId,
+                csvSaveLifecycle: {
+                    revision: 1,
+                    state: 'succeeded',
+                    operation,
+                },
+            },
+        }));
+
+        expect(latest_store_edits()).toEqual({
+            '0:0': { value: 'Bob', base: 'Alice' },
+        });
+        await click_sheet_tab('Inventory');
+        expect(latest_store_edits()).toEqual({});
     });
 
     it('applies a newer save terminal carried by a stale same-file snapshot', async () => {
@@ -4659,7 +5787,7 @@ describe('edit mode save exit', () => {
         }));
 
         expect(grid_shell_mock.latest_props?.save_operation).toBeUndefined();
-        expect(grid_shell_mock.latest_props?.initial_edits).toEqual(
+        expect(latest_store_edits()).toEqual(
             operation.dirtyEdits,
         );
         expect(grid_stub().getAttribute('data-generation')).toBe('1');
@@ -4693,7 +5821,7 @@ describe('edit mode save exit', () => {
         ));
 
         expect(grid_shell_mock.latest_props?.save_operation).toBeUndefined();
-        expect(grid_shell_mock.latest_props?.initial_edits).toEqual(
+        expect(latest_store_edits()).toEqual(
             operation.dirtyEdits,
         );
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
@@ -4726,7 +5854,7 @@ describe('edit mode save exit', () => {
             },
         ));
 
-        expect(grid_shell_mock.latest_props?.initial_edits).toEqual(newer);
+        expect(latest_store_edits()).toEqual(newer);
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
     });
 
@@ -4756,7 +5884,7 @@ describe('edit mode save exit', () => {
             },
         ));
 
-        expect(grid_shell_mock.latest_props?.initial_edits).toBeUndefined();
+        expect(latest_store_edits()).toEqual({});
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
     });
 
@@ -4788,7 +5916,7 @@ describe('edit mode save exit', () => {
                 },
             },
         ));
-        expect(grid_shell_mock.latest_props?.initial_edits).toBeUndefined();
+        expect(latest_store_edits()).toEqual({});
         const initial_mount = grid_stub().getAttribute('data-mount-id');
 
         // Cleanup can arrive with the same lifecycle revision. A generation
@@ -4805,7 +5933,7 @@ describe('edit mode save exit', () => {
             },
         ));
         expect(grid_stub().getAttribute('data-mount-id')).not.toBe(initial_mount);
-        expect(grid_shell_mock.latest_props?.initial_edits).toBeUndefined();
+        expect(latest_store_edits()).toEqual({});
 
         post_message.mockClear();
         await click_button('Edit');
@@ -4820,7 +5948,7 @@ describe('edit mode save exit', () => {
         });
 
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
-        expect(grid_shell_mock.latest_props?.initial_edits).toBeUndefined();
+        expect(latest_store_edits()).toEqual({});
     });
 
     it('preserves pending edits for a newer session after an older success', async () => {
@@ -4850,7 +5978,7 @@ describe('edit mode save exit', () => {
             },
         ));
 
-        expect(grid_shell_mock.latest_props?.initial_edits).toEqual(newer);
+        expect(latest_store_edits()).toEqual(newer);
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
     });
 
@@ -5283,6 +6411,49 @@ describe('edit mode save exit', () => {
         expect(grid_shell_mock.discard_conflicted).not.toHaveBeenCalled();
         expect(grid_shell_mock.discard_keys).toHaveBeenCalledTimes(1);
         expect(grid_shell_mock.discard_keys).toHaveBeenCalledWith(['4:1']);
+    });
+
+    it('scopes host save rejections to their worksheet', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await enter_edit_mode(post_message);
+        const edits = { '4:1': { value: 'edited', base: 'stale' } };
+        await report_grid_editing(true, true, [], edits);
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 904,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    sheetIndex: 0,
+                    sheetName: 'People',
+                    saveRequestId: 'save-sheet-scope',
+                    edits: { '4:1': 'edited' },
+                    dirtyEdits: edits,
+                },
+            },
+            rejection: { reason: 'baseMismatch', keys: ['4:1'] },
+        });
+        await report_grid_editing(true, true, ['4:1'], edits);
+        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
+            .toEqual(['4:1']);
+
+        await click_sheet_tab('Inventory');
+        await report_grid_editing(true, true, [], edits);
+        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
+            .toEqual([]);
+        expect(document.querySelector('.conflict-banner')).toBeNull();
+
+        await click_sheet_tab('People');
+        await report_grid_editing(true, true, ['4:1'], edits);
+        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
+            .toEqual(['4:1']);
     });
 
     it('clears host-named and derived conflicts in one press', async () => {
@@ -5974,8 +7145,10 @@ describe('sorting and filtering', () => {
 
     it('disables transform controls while an edit-session request is pending', async () => {
         const { post_message } = await render_app();
+        const identified_meta = make_meta(['Sheet1'], false);
+        identified_meta.sheets[0].worksheetId = '7';
         await dispatch_host_message(
-            initial_snapshot_message(make_meta(['Sheet1'], false), {
+            initial_snapshot_message(identified_meta, {
                 capabilities: {
                     csvEditable: true,
                     csvEditingSupported: true,
@@ -5985,7 +7158,12 @@ describe('sorting and filtering', () => {
 
         post_message.mockClear();
         await click_button('Edit');
-        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({ type: 'requestEditSession' }));
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'requestEditSession',
+            sheetIndex: 0,
+            sheetName: 'Sheet1',
+            worksheetId: '7',
+        }));
         expect(grid_shell_mock.latest_props?.transform_sections).toBe(false);
 
         await dispatch_host_message({ type: 'editSessionResult', granted: true });
@@ -6916,9 +8094,8 @@ describe('edit session store hydration', () => {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
         await enter_edit_mode(post_message);
-        // A committed edit, the way the grid's own hook writes one. Deliberately not
-        // an install: only an install moves initial_edits, so this edit exists in
-        // the store and nowhere else.
+        // A committed edit, the way the grid's own hook writes one. It exists only
+        // in the registry store that the remounted grid receives.
         await act(async () => {
             (grid_shell_mock.latest_props?.edit_session as EditSessionStore)
                 .commit('test-edit-session', '0:0', { value: 'committed', base: 'base' });
@@ -6939,9 +8116,9 @@ describe('edit session store hydration', () => {
 
         expect(grid_stub().getAttribute('data-mount-id')).not.toBe(mount_id);
         expect(store_edits()).toEqual({ '0:0': { value: 'committed', base: 'base' } });
-        // The prop channel that used to seed the fresh mount never saw this edit,
-        // so the store is the only thing carrying it across.
-        expect(grid_stub().getAttribute('data-initial-edits')).toBe('null');
+        expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!)).toEqual({
+            '0:0': { value: 'committed', base: 'base' },
+        });
     });
 
     it('accepts a commit after a refresh re-stamps the session without installing', async () => {

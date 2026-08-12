@@ -47,6 +47,8 @@ export interface CellSink {
  */
 export interface StreamingSheet {
     name: string;
+    /** Stable format-neutral worksheet identity when the source exposes one. */
+    worksheetId?: string;
     rowCount: number;
     columnCount: number;
     merges: MergeRange[];
@@ -119,10 +121,12 @@ export function make_streaming_sheet(
     name: string,
     working: WorkingSet,
     merges: MergeRange[],
+    worksheetId?: string,
 ): StreamingSheet {
     let pending: WorkingSet | null = working;
     return {
         name,
+        worksheetId,
         rowCount: working.row_count,
         columnCount: working.col_count,
         merges,

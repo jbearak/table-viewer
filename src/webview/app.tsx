@@ -16,6 +16,7 @@ import {
     transform_is_active,
     transform_schema_for_sheet,
     with_pending_edits_for_sheet,
+    worksheet_target_index,
     type CellHighlightColor,
     type CellHighlightMutation,
     type CellHighlightSelection,
@@ -33,6 +34,7 @@ import {
     type SheetViewRecord,
     type TransformIntent,
     type ViewBasis,
+    type WorksheetTarget,
 } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
 import {
@@ -81,7 +83,6 @@ import {
     resolve_csv_save_hydration,
     type CsvSaveProjection,
 } from './csv-save-lifecycle';
-import { type EditSessionStore } from './edit-session-store';
 import {
     create_edit_session_registry,
     type EditSessionRegistry,
@@ -436,7 +437,10 @@ export function App(): React.JSX.Element {
         if (next && next !== previous) {
             renderer_publication_fenced_session_ref.current = undefined;
         }
-        if (previous && previous !== next) pending_edit_durability.retire(previous);
+        if (previous && previous !== next) {
+            pending_edit_durability.retire(previous);
+            edit_session_registry_ref.current?.retire_parked();
+        }
         csv_edit_session_id_ref.current = next;
         set_csv_edit_session_id_state(next);
     }, []);
@@ -522,15 +526,6 @@ export function App(): React.JSX.Element {
         useState(false);
     const [highlight_request_pending, set_highlight_request_pending] = useState(false);
     const [highlight_status, set_highlight_status] = useState('');
-    // Pending edits restored from per-file state, fed to GridShell on (re)mount so
-    // unsaved work survives a webview reload. Flat, not worksheet-indexed like
-    // the durable leaf: always the pointer sheet's map — other sheets hydrate
-    // straight into their registry stores. Keys are source-keyed — see the
-    // `pendingEdits` declaration in types.ts for why existing maps are
-    // reinterpreted as source-keyed rather than migrated.
-    const [initial_edits, set_initial_edits] = useState<
-        Record<string, string | { value: string; base: string }> | undefined
-    >(undefined);
     // Conflict signature the user dismissed ("Keep All"); the banner reappears only
     // if a *different* set of cells later conflicts.
     const [dismissed_conflict_signature, set_dismissed_conflict_signature] =
@@ -563,6 +558,9 @@ export function App(): React.JSX.Element {
         reason: 'baseMismatch' | 'rowsRemoved';
         keys: string[];
         session_id: string | undefined;
+        sheet_index: number;
+        sheet_name: string | undefined;
+        worksheet_id: string | undefined;
         entries: Record<string, { value: string; base: string }>;
     } | null>(null);
 
@@ -625,20 +623,13 @@ export function App(): React.JSX.Element {
     const pending_save_dialog_ref = useRef<{
         requestId: string;
         editSessionId: string;
+        target: WorksheetTarget;
+        multipleDirtySheets: boolean;
     } | null>(null);
+    const pending_dialog_save_target_ref = useRef<WorksheetTarget | null>(null);
     const save_projection_ref = useRef<CsvSaveProjection>(
         INITIAL_CSV_SAVE_PROJECTION,
     );
-    // The pointer sheet's live dirty cells, mirrored from the mounted grid's
-    // reports. Other sheets' maps live only in their registry stores; the
-    // durable leaf keeps one slot per sheet, written by the host.
-    const latest_live_edits_ref = useRef<SheetPendingEditCells | undefined>(undefined);
-    /** The store for the worksheet the edit pointer names. */
-    const edit_session_store = useCallback((): EditSessionStore => (
-        edit_session_registry_ref.current!.for_sheet(
-            edit_session_sheet_index_ref.current,
-        )
-    ), []);
     const meta_ref = useRef<WorkbookMeta | null>(null);
     const pending_transform_request_ids_ref = useRef<(string | undefined)[]>([]);
     const pending_transform_states_ref = useRef<(SheetTransformState | undefined)[]>([]);
@@ -712,20 +703,48 @@ export function App(): React.JSX.Element {
         await new Promise<void>((resolve) => queueMicrotask(resolve));
 
         const durability = pending_edit_durability.snapshot(edit_session_id);
-        const snapshot = edit_session_store().snapshot();
         const publication_fenced = renderer_publication_fenced_session_ref.current
             === edit_session_id;
-        const edit_sheet_index = edit_session_sheet_index_ref.current;
-        const highest_produced_sequence = save_in_flight_ref.current || publication_fenced
-            ? durability.highestProducedSequence
-            : pending_edit_durability.publish(
-                edit_session_id,
-                snapshot.size > 0 ? Object.fromEntries(snapshot) : null,
-                edit_sheet_index,
-                meta_ref.current?.sheets[edit_sheet_index]?.name,
-                durability.highestAcknowledgedSequence
-                    < durability.highestProducedSequence,
-            );
+        let highest_produced_sequence = durability.highestProducedSequence;
+        if (!save_in_flight_ref.current && !publication_fenced) {
+            // The session is workbook-scoped: any sheet's store may hold edits
+            // the host has not durably acknowledged, not just the sheet the
+            // edit pointer names. Publish each store's current truth — content
+            // or explicit null — so the host's slots match what the user sees
+            // when the document comes back.
+            for (const { target, store, parked } of
+                edit_session_registry_ref.current!.publication_entries(
+                    meta_ref.current?.sheets ?? [],
+                )) {
+                const snapshot = store.snapshot();
+                if (
+                    !parked
+                    && snapshot.size === 0
+                    && !pending_edit_durability.has_publication(
+                        edit_session_id,
+                        target.sheetIndex,
+                        target.sheetName,
+                        target.worksheetId,
+                    )
+                ) continue;
+                highest_produced_sequence = Math.max(
+                    highest_produced_sequence,
+                    pending_edit_durability.publish(
+                        edit_session_id,
+                        snapshot.size > 0 ? Object.fromEntries(snapshot) : null,
+                        target.sheetIndex,
+                        target.sheetName,
+                        pending_edit_durability.has_unacknowledged_payload(
+                            edit_session_id,
+                            target.sheetIndex,
+                            target.sheetName,
+                            target.worksheetId,
+                        ),
+                        target.worksheetId,
+                    ),
+                );
+            }
+        }
         return {
             editSessionId: edit_session_id,
             highestProducedSequence: highest_produced_sequence,
@@ -790,20 +809,25 @@ export function App(): React.JSX.Element {
         set_dismissed_conflict_signature(null);
     }, []);
 
-    const release_edit_session = useCallback(() => {
-        if (!csv_edit_session_id) return;
+    const fence_edit_session_exit = useCallback((edit_session_id: string) => {
         // Fence both the document-level final publication and every mounted-grid
-        // publication before the release message can reach the host. Otherwise a
+        // publication before the terminal message can reach the host. Otherwise a
         // concurrent close flush can sample a sequence emitted after release began,
         // which the releasing host correctly refuses and therefore never acknowledges.
-        renderer_publication_fenced_session_ref.current = csv_edit_session_id;
+        renderer_publication_fenced_session_ref.current = edit_session_id;
         editing_ref.current?.stop_edit_admission();
         pending_save_dialog_ref.current = null;
+        pending_dialog_save_target_ref.current = null;
+    }, []);
+
+    const release_edit_session = useCallback(() => {
+        if (!csv_edit_session_id) return;
+        fence_edit_session_exit(csv_edit_session_id);
         host_bridge.postMessage({
             type: 'releaseEditSession',
             editSessionId: csv_edit_session_id,
         });
-    }, [csv_edit_session_id]);
+    }, [csv_edit_session_id, fence_edit_session_exit]);
 
     const leave_edit_mode = useCallback(() => {
         set_edit_mode(false);
@@ -815,9 +839,7 @@ export function App(): React.JSX.Element {
 
     const discard_edit_session = useCallback(() => {
         if (!csv_edit_session_id) return;
-        renderer_publication_fenced_session_ref.current = csv_edit_session_id;
-        editing_ref.current?.stop_edit_admission();
-        pending_save_dialog_ref.current = null;
+        fence_edit_session_exit(csv_edit_session_id);
         set_edit_mode(false);
         // Every edit is being thrown away, including the rejected ones.
         clear_save_verdict();
@@ -826,35 +848,34 @@ export function App(): React.JSX.Element {
         // store left full here would repaint edits the user just discarded
         // the next time its sheet is opened.
         edit_session_registry_ref.current!.clear_all(csv_edit_session_id);
-        latest_live_edits_ref.current = undefined;
-        set_initial_edits(undefined);
         host_bridge.postMessage({
             type: 'discardEditSession',
             editSessionId: csv_edit_session_id,
         });
-    }, [clear_save_verdict, csv_edit_session_id]);
+    }, [clear_save_verdict, csv_edit_session_id, fence_edit_session_exit]);
 
     const begin_save_operation = useCallback((
         edits: Record<string, string>,
         dirty_edits: CsvDirtyMap,
     ): CsvSaveOperation | undefined => {
         if (!csv_edit_session_id || save_projection_ref.current.operation) return undefined;
+        const sheet_index = edit_session_sheet_index_ref.current;
+        const sheet = meta_ref.current?.sheets[sheet_index];
+        const sheet_name = sheet?.name;
+        const worksheet_id = sheet?.worksheetId;
         const operation = Object.freeze<CsvSaveOperation>({
             editSessionId: csv_edit_session_id,
             // The sheet this session is editing; a save writes only its slot.
-            sheetIndex: edit_session_sheet_index_ref.current,
+            sheetIndex: sheet_index,
+            ...(sheet_name !== undefined ? { sheetName: sheet_name } : {}),
+            ...(worksheet_id !== undefined ? { worksheetId: worksheet_id } : {}),
             saveRequestId: [
                 'save',
                 save_request_prefix_ref.current,
                 ++save_request_seq_ref.current,
             ].join(':'),
             edits: Object.freeze({ ...edits }),
-            dirtyEdits: Object.freeze(Object.fromEntries(
-                Object.entries(dirty_edits).map(([key, entry]) => [
-                    key,
-                    Object.freeze({ value: entry.value, base: entry.base }),
-                ]),
-            )),
+            dirtyEdits: dirty_edits,
         });
         const projection = propose_csv_save(save_projection_ref.current, operation);
         save_projection_ref.current = projection;
@@ -868,9 +889,8 @@ export function App(): React.JSX.Element {
         set_save_operation(undefined);
     }, []);
 
-    // The single edit-map hydration boundary. Everything that used to only set the
-    // prop now also installs into the session store, which outlives the
-    // generation-keyed grid; the install stamps the session so a write from a
+    // The single edit-map hydration boundary. The registry store outlives the
+    // generation-keyed grid; installing here stamps the session so a write from a
     // previously mounted hook cannot land in another session's map.
     const install_edit_session = useCallback((
         edits: SheetPendingEditCells | undefined,
@@ -881,11 +901,6 @@ export function App(): React.JSX.Element {
         // the restored map into the wrong store.
         sheet_index: number = edit_session_sheet_index_ref.current,
     ) => {
-        const on_pointer_sheet = sheet_index === edit_session_sheet_index_ref.current;
-        if (on_pointer_sheet) {
-            latest_live_edits_ref.current = edits;
-            set_initial_edits(edits ? { ...edits } : undefined);
-        }
         // Read the outgoing stamp before install overwrites it.
         const store = edit_session_registry_ref.current!.for_sheet(sheet_index);
         const previous_identity = store.identity();
@@ -947,64 +962,42 @@ export function App(): React.JSX.Element {
         }
 
         const current_session_id = csv_edit_session_id_ref.current;
+        const operation_sheet_index = (operation: CsvSaveOperation) =>
+            worksheet_target_index(meta_ref.current?.sheets ?? [], operation);
+        const incoming_operation = incoming.state === 'idle'
+            ? undefined
+            : incoming.operation;
+        const incoming_sheet_index = incoming_operation
+            ? operation_sheet_index(incoming_operation)
+            : undefined;
         // A save lifecycle is about its operation's worksheet, and the session
-        // pointer may have moved on to another one by the time it settles. The
-        // live map fed into hydration must be that sheet's own — the ref only
-        // mirrors the pointer sheet's grid.
-        const live_edits_for_sheet = (
-            sheet_index: number,
-        ): SheetPendingEditCells | undefined => {
-            if (sheet_index === edit_session_sheet_index_ref.current) {
-                return latest_live_edits_ref.current;
-            }
+        // pointer may have moved on to another one by the time it settles. Read the
+        // operation sheet's registry store rather than the mounted pointer grid.
+        const hydrate_and_install = (sheet_index: number) => {
             const entries = edit_session_registry_ref.current!
                 .for_sheet(sheet_index).snapshot();
-            return entries.size > 0
-                ? Object.fromEntries(
-                    [...entries].map(([key, entry]) => [
-                        key,
-                        { value: entry.value, base: entry.base },
-                    ]),
-                )
-                : undefined;
+            const hydrated = resolve_csv_save_hydration(
+                next,
+                current_session_id,
+                sheet_index,
+                meta_ref.current?.sheets[sheet_index]?.name,
+                meta_ref.current?.sheets[sheet_index]?.worksheetId,
+                entries.size > 0 ? Object.fromEntries(entries) : undefined,
+            );
+            install_edit_session(hydrated, current_session_id, sheet_index);
         };
         if (incoming.state === 'active') {
             if (
                 incoming.operation.editSessionId === current_session_id
+                && incoming_sheet_index !== undefined
                 && csv_save_operations_equal(next.operation, incoming.operation)
             ) {
-                const hydrated = resolve_csv_save_hydration(
-                    next,
-                    current_session_id,
-                    live_edits_for_sheet(incoming.operation.sheetIndex),
-                );
-                install_edit_session(
-                    hydrated,
-                    current_session_id,
-                    incoming.operation.sheetIndex,
-                );
-            }
-        } else if (incoming.state === 'idle') {
-            // Currently unreachable, and pre-existing: reduce_csv_save_projection
-            // carries `current.operation` forward unchanged on every idle incoming,
-            // so `previous.operation && !next.operation` cannot hold. Left in place
-            // as the restore for an idle projection that does drop the lock, rather
-            // than removed and re-derived if the reducer ever gains one.
-            if (
-                previous.operation
-                && !next.operation
-                && previous.operation.editSessionId === current_session_id
-            ) {
-                install_edit_session(
-                    previous.operation.dirtyEdits,
-                    current_session_id,
-                    previous.operation.sheetIndex,
-                );
-                pending_exit_ref.current = false;
+                hydrate_and_install(incoming_sheet_index);
             }
         } else if (
-            !previous.operation
-            || csv_save_operations_equal(previous.operation, incoming.operation)
+            incoming.state !== 'idle'
+            && (!previous.operation
+                || csv_save_operations_equal(previous.operation, incoming.operation))
         ) {
             if (incoming.state === 'failed') {
                 // A failure restores edits only when it settles an operation this
@@ -1014,38 +1007,24 @@ export function App(): React.JSX.Element {
                 // made after the initial snapshot was acknowledged.
                 if (
                     previous.operation
+                    && incoming_sheet_index !== undefined
                     && incoming.operation.editSessionId === current_session_id
                     && csv_save_operations_equal(
                         previous.operation,
                         incoming.operation,
                     )
                 ) {
-                    const hydrated = resolve_csv_save_hydration(
-                        next,
-                        current_session_id,
-                        live_edits_for_sheet(incoming.operation.sheetIndex),
-                    );
-                    install_edit_session(
-                        hydrated,
-                        current_session_id,
-                        incoming.operation.sheetIndex,
-                    );
+                    hydrate_and_install(incoming_sheet_index);
                     pending_exit_ref.current = false;
                 }
             } else if (
-                current_session_id === undefined
-                || incoming.operation.editSessionId === current_session_id
+                incoming_sheet_index !== undefined
+                && (
+                    current_session_id === undefined
+                    || incoming.operation.editSessionId === current_session_id
+                )
             ) {
-                const hydrated = resolve_csv_save_hydration(
-                    next,
-                    current_session_id,
-                    live_edits_for_sheet(incoming.operation.sheetIndex),
-                );
-                install_edit_session(
-                    hydrated,
-                    current_session_id,
-                    incoming.operation.sheetIndex,
-                );
+                hydrate_and_install(incoming_sheet_index);
                 set_csv_edit_session_id(undefined);
                 set_edit_session_pending(false);
                 set_edit_mode(false);
@@ -1288,21 +1267,42 @@ export function App(): React.JSX.Element {
                     // is the common case by far, since every edit commit during an
                     // owned session and every sibling touch of durable state delivers
                     // one.
+                    const previous_sheets = meta_ref.current?.sheets ?? [];
+                    const next_sheets = snapshot.meta.sheets;
+                    const sheets_moved = previous_sheets.length !== next_sheets.length
+                        || previous_sheets.some((sheet, index) => {
+                            const next = next_sheets[index];
+                            return next === undefined
+                                || (sheet.worksheetId !== undefined
+                                    ? sheet.worksheetId !== next.worksheetId
+                                    : sheet.name !== next.name);
+                        });
+                    const next_active_sheet_index = clamp_sheet_index(
+                        active_sheet_index,
+                        snapshot.meta.sheets.length,
+                    );
+                    const previous_active_sheet = previous_sheets[active_sheet_index];
+                    const next_active_sheet = next_sheets[next_active_sheet_index];
+                    const active_sheet_changed = previous_active_sheet?.worksheetId !== undefined
+                        ? previous_active_sheet.worksheetId !== next_active_sheet?.worksheetId
+                        : previous_active_sheet?.name !== next_active_sheet?.name;
                     const remounts_the_grid =
                         snapshot.presentation === 'initial'
                         || snapshot.generation !== generation_ref.current
-                        || clamp_sheet_index(
-                            active_sheet_index,
-                            snapshot.meta.sheets.length,
-                        ) !== active_sheet_index;
-                    if (remounts_the_grid) editing_ref.current?.commit_live_edit();
+                        || next_active_sheet_index !== active_sheet_index
+                        || active_sheet_changed;
+                    if (active_sheet_changed) {
+                        editing_ref.current?.flush_live_edit();
+                    } else if (remounts_the_grid) {
+                        editing_ref.current?.commit_live_edit();
+                    }
                     snapshot_identity_ref.current = snapshot.identity;
-                    const previous_sheets = new Map(
-                        (meta_ref.current?.sheets ?? []).map((sheet) => [sheet.name, sheet]),
+                    const previous_sheets_by_name = new Map(
+                        previous_sheets.map((sheet) => [sheet.name, sheet]),
                     );
                     const header_changed = new Set<number>();
                     snapshot.meta.sheets.forEach((sheet, index) => {
-                        const previous = previous_sheets.get(sheet.name);
+                        const previous = previous_sheets_by_name.get(sheet.name);
                         if (
                             previous
                             && (
@@ -1347,19 +1347,6 @@ export function App(): React.JSX.Element {
                     }
                     const snapshot_edit_session_id =
                         snapshot.capabilities.csvEditSessionId;
-                    // The sheet whose restored edits the snapshot carries, which
-                    // is the key space to hydrate. The session is workbook-scoped,
-                    // so no capability names a sheet; the durable slots do. A
-                    // snapshot can arrive before any grant this panel asked for
-                    // (adoption, reload, a restored window), so the ref's own
-                    // value is not authoritative here.
-                    const snapshot_edit_sheet_index =
-                        sheet_index_with_pending_edits(
-                            snapshot.presentation === 'refresh'
-                                ? refresh_authoritative_state?.pendingEdits
-                                : initial_normalized_state?.pendingEdits,
-                        )
-                        ?? edit_session_sheet_index_ref.current;
                     // Reconcile the registry at the snapshot itself, not in
                     // install_edit_session: a refresh that advances the session
                     // id makes `refresh_editing_current_session` false and skips
@@ -1373,42 +1360,163 @@ export function App(): React.JSX.Element {
                     // sheet whose name no longer resolves was deleted, and its
                     // in-memory store goes with it — the durable slot is what
                     // survives a deletion-shaped rename.
+                    const followed_sheet_index = (previous_index: number) => {
+                        const previous = previous_sheets[previous_index];
+                        if (!previous) return undefined;
+                        return worksheet_target_index(next_sheets, {
+                            sheetIndex: previous_index,
+                            sheetName: previous.name,
+                            worksheetId: previous.worksheetId,
+                        });
+                    };
+                    let locally_retained_sheet_indices: ReadonlySet<number> = new Set();
                     if (snapshot.presentation === 'initial') {
                         edit_session_registry_ref.current!.replace_document();
                     } else {
-                        const previous_names = meta_ref.current?.sheets
-                            .map((sheet) => sheet.name) ?? [];
-                        const next_index_by_name = new Map(
-                            snapshot.meta.sheets.map((sheet, index) => [sheet.name, index]),
-                        );
-                        edit_session_registry_ref.current!.remap((previous_index) => {
-                            const name = previous_names[previous_index];
-                            return name === undefined
-                                ? undefined
-                                : next_index_by_name.get(name);
-                        });
+                        const edit_session_id = csv_edit_session_id_ref.current;
+                        const reconciliation = edit_session_registry_ref.current!
+                            .reconcile_sheets(
+                                previous_sheets,
+                                next_sheets,
+                                (target, store) => !!edit_session_id && (
+                                    sheets_moved
+                                        ? store.size() > 0
+                                            || pending_edit_durability.has_publication(
+                                                edit_session_id,
+                                                target.sheetIndex,
+                                                target.sheetName,
+                                                target.worksheetId,
+                                            )
+                                        : pending_edit_durability.has_unacknowledged_payload(
+                                            edit_session_id,
+                                            target.sheetIndex,
+                                            target.sheetName,
+                                            target.worksheetId,
+                                        )
+                                ),
+                            );
+                        locally_retained_sheet_indices =
+                            reconciliation.locallyRetainedIndices;
+
+                        // Every refresh changes the host authority revision and can
+                        // abort a publication admitted against the preceding one.
+                        // Retry each retained store's complete truth, including an
+                        // explicit null after the last edit was cleared. Returned
+                        // stores are already reattached, so there is only one owner.
+                        if (edit_session_id) {
+                            for (const { target, store } of
+                                reconciliation.retryPublications) {
+                                const store_snapshot = store.snapshot();
+                                pending_edit_durability.publish(
+                                    edit_session_id,
+                                    store_snapshot.size > 0
+                                        ? Object.fromEntries(store_snapshot)
+                                        : null,
+                                    target.sheetIndex,
+                                    target.sheetName,
+                                    true,
+                                    target.worksheetId,
+                                );
+                            }
+                        }
                     }
+                    // Where the edit pointer stands after this snapshot. A refresh
+                    // of the session this panel already holds keeps the pointer on
+                    // the sheet the user is editing — followed by name if the
+                    // sheets moved — rather than retargeting to whichever slot
+                    // happens to be dirty first; the user chose that sheet, and a
+                    // sibling's durable write must not yank the session off it.
+                    // The dirty-slot scan is the fallback for a snapshot with no
+                    // pointer of this panel's to preserve: adoption, reload, a
+                    // restored window — or a pointer sheet the refresh deleted.
+                    const session_continues = snapshot.presentation === 'refresh'
+                        && csv_edit_session_id_ref.current !== undefined
+                        && csv_edit_session_id_ref.current === snapshot_edit_session_id;
+                    const pointer_followed = session_continues
+                        ? (!sheets_moved
+                            ? edit_session_sheet_index_ref.current
+                            : followed_sheet_index(edit_session_sheet_index_ref.current))
+                        : undefined;
+                    const snapshot_pending_edits = snapshot.presentation === 'refresh'
+                        ? refresh_authoritative_state?.pendingEdits
+                        : initial_normalized_state?.pendingEdits;
+                    const pending_edit_sheet_index = sheet_index_with_pending_edits(
+                        snapshot_pending_edits,
+                        next_sheets,
+                    );
+                    const pointer_deleted = session_continues
+                        && sheets_moved
+                        && pointer_followed === undefined;
+                    const fallback_sheet_index = clamp_sheet_index(
+                        edit_session_sheet_index_ref.current,
+                        next_sheets.length,
+                    );
+                    const snapshot_edit_sheet_index = pointer_followed
+                        ?? pending_edit_sheet_index
+                        ?? fallback_sheet_index;
                     edit_session_sheet_index_ref.current = snapshot_edit_sheet_index;
                     set_edit_session_sheet_index(snapshot_edit_sheet_index);
                     const refresh_editing_current_session =
                         snapshot.presentation === 'refresh'
                         && edit_mode_ref.current
-                        && csv_edit_session_id_ref.current === snapshot_edit_session_id;
-                    const refresh_edits = snapshot.presentation === 'refresh'
-                        ? resolve_csv_save_hydration(
-                            applied_save_transition.next,
-                            snapshot_edit_session_id,
-                            pending_edits_for_sheet(
-                                refresh_authoritative_state?.pendingEdits,
-                                snapshot_edit_sheet_index,
-                            ),
-                        )
-                        : undefined;
+                        && csv_edit_session_id_ref.current === snapshot_edit_session_id
+                        && (!pointer_deleted || pending_edit_sheet_index !== undefined);
+                    if (pointer_deleted && pending_edit_sheet_index === undefined) {
+                        edit_mode_ref.current = false;
+                        set_edit_mode(false);
+                    }
+                    const refresh_edits_for_sheet = (sheet_index: number) => (
+                        snapshot.presentation === 'refresh'
+                            ? resolve_csv_save_hydration(
+                                applied_save_transition.next,
+                                snapshot_edit_session_id,
+                                sheet_index,
+                                snapshot.meta.sheets[sheet_index]?.name,
+                                snapshot.meta.sheets[sheet_index]?.worksheetId,
+                                pending_edits_for_sheet(
+                                    refresh_authoritative_state?.pendingEdits,
+                                    sheet_index,
+                                    snapshot.meta.sheets[sheet_index]?.name,
+                                    snapshot.meta.sheets[sheet_index]?.worksheetId,
+                                ),
+                            )
+                            : undefined
+                    );
+                    const refresh_edits = refresh_edits_for_sheet(snapshot_edit_sheet_index);
                     if (refresh_editing_current_session) {
-                        install_edit_session(
-                            refresh_edits,
-                            snapshot_edit_session_id,
+                        if (!locally_retained_sheet_indices.has(snapshot_edit_sheet_index)) {
+                            edit_session_registry_ref.current!
+                                .for_sheet(snapshot_edit_sheet_index)
+                                .reconcile(
+                                    { session_id: snapshot_edit_session_id },
+                                    refresh_edits,
+                                );
+                        }
+                        // A refresh carries the complete authoritative workbook
+                        // leaf. Reconcile every store already known to the session,
+                        // plus every newly projected slot, so recovered sibling
+                        // drafts appear and removed slots cannot remain stale.
+                        const refresh_sheet_indices = new Set<number>();
+                        for (const [index] of edit_session_registry_ref.current!.entries()) {
+                            refresh_sheet_indices.add(index);
+                        }
+                        refresh_authoritative_state?.pendingEdits?.forEach(
+                            (slot, index) => {
+                                if (slot !== undefined) refresh_sheet_indices.add(index);
+                            },
                         );
+                        for (const sheet_index of refresh_sheet_indices) {
+                            if (
+                                sheet_index === snapshot_edit_sheet_index
+                                || locally_retained_sheet_indices.has(sheet_index)
+                            ) continue;
+                            edit_session_registry_ref.current!
+                                .for_sheet(sheet_index)
+                                .reconcile(
+                                    { session_id: snapshot_edit_session_id },
+                                    refresh_edits_for_sheet(sheet_index),
+                                );
+                        }
                     }
                     document_epoch_ref.current += 1;
                     set_grid_focus_restore(null);
@@ -1448,6 +1556,7 @@ export function App(): React.JSX.Element {
                         set_edit_session_pending(false);
                         pending_edit_request_ref.current = null;
                         pending_save_dialog_ref.current = null;
+                        pending_dialog_save_target_ref.current = null;
                     }
                     set_source_epoch((n) => n + 1);
                     // What the rows *are* changes with a new source, a new view
@@ -1528,7 +1637,7 @@ export function App(): React.JSX.Element {
                         const normalized = initial_normalized_state!;
                         const base = normalize_complete_per_file_state(
                             snapshot.state,
-                            snapshot.meta.sheets.map((sheet) => sheet.name),
+                            snapshot.meta.sheets,
                         );
                         correction_required = JSON.stringify({
                             transforms: base.transforms ?? [],
@@ -1553,9 +1662,14 @@ export function App(): React.JSX.Element {
                         const restored_edits = resolve_csv_save_hydration(
                             applied_save_transition.next,
                             snapshot_edit_session_id,
+                            snapshot_edit_sheet_index,
+                            snapshot.meta.sheets[snapshot_edit_sheet_index]?.name,
+                            snapshot.meta.sheets[snapshot_edit_sheet_index]?.worksheetId,
                             pending_edits_for_sheet(
                                 normalized.pendingEdits,
                                 snapshot_edit_sheet_index,
+                                snapshot.meta.sheets[snapshot_edit_sheet_index]?.name,
+                                snapshot.meta.sheets[snapshot_edit_sheet_index]?.worksheetId,
                             ),
                         );
                         const exact_session_succeeded =
@@ -1575,15 +1689,22 @@ export function App(): React.JSX.Element {
                         );
                         // The session covers the whole workbook, so restored
                         // edits can sit in any sheet's slot, not just the
-                        // pointer sheet's. Seed each one's store directly:
-                        // the pointer sheet above is the only one whose map
-                        // also feeds initial_edits and the live-edits ref.
+                        // pointer sheet's. Seed each one's registry store directly.
                         normalized.pendingEdits?.forEach((_slot, index) => {
                             if (index === snapshot_edit_sheet_index) return;
-                            const cells = pending_edits_for_sheet(
-                                normalized.pendingEdits,
+                            const sheet = snapshot.meta.sheets[index];
+                            const cells = resolve_csv_save_hydration(
+                                applied_save_transition.next,
+                                snapshot_edit_session_id,
                                 index,
-                                snapshot.meta.sheets[index]?.name,
+                                sheet?.name,
+                                sheet?.worksheetId,
+                                pending_edits_for_sheet(
+                                    normalized.pendingEdits,
+                                    index,
+                                    sheet?.name,
+                                    sheet?.worksheetId,
+                                ),
                             );
                             if (!cells) return;
                             edit_session_registry_ref.current!
@@ -1687,9 +1808,15 @@ export function App(): React.JSX.Element {
                             ...(refresh_editing_current_session
                                 ? {
                                     pendingEdits: with_pending_edits_for_sheet(
-                                        state_ref.current.pendingEdits,
+                                        authoritative_state.pendingEdits,
                                         edit_session_sheet_index_ref.current,
                                         refresh_edits,
+                                        snapshot.meta.sheets[
+                                            edit_session_sheet_index_ref.current
+                                        ]?.name,
+                                        snapshot.meta.sheets[
+                                            edit_session_sheet_index_ref.current
+                                        ]?.worksheetId,
                                     ),
                                 }
                                 : {}),
@@ -2650,19 +2777,42 @@ export function App(): React.JSX.Element {
                 ++edit_request_seq_ref.current,
             ].join(':');
             pending_edit_request_ref.current = request_id;
+            const requested_sheet = meta?.sheets[active_sheet_index];
             host_bridge.postMessage({
                 type: 'requestEditSession',
                 requestId: request_id,
-                // The sheet the Edit button belongs to. Each worksheet has its own
-                // Edit button and its own session.
+                // The sheet whose Edit button requested the workbook session. It
+                // becomes the initial renderer pointer for this one shared grant.
                 sheetIndex: active_sheet_index,
+                sheetName: requested_sheet?.name,
+                worksheetId: requested_sheet?.worksheetId,
             });
             return;
         }
         // Leaving edit mode with unsaved work: defer to a host Save/Discard/Cancel
-        // dialog (handled below); otherwise exit immediately.
-        if (editing_ref.current?.has_uncommitted_changes()) {
+        // dialog (handled below); otherwise exit immediately. The mounted grid
+        // answers for the sheet on screen — its store plus the live overlay —
+        // but the session is workbook-scoped: exiting ends it for every sheet,
+        // so a store still holding another worksheet's edits is unsaved work
+        // exactly as much as the visible grid's. Exit only runs with the
+        // pointer sheet active (anything else is an entry above), so the
+        // pointer's own store is the grid's to answer for, not the scan's.
+        let sibling_dirty_sheet: number | undefined;
+        let dirty_sibling_count = 0;
+        for (const [index, store] of edit_session_registry_ref.current!.entries()) {
+            if (index === edit_session_sheet_index_ref.current || store.size() === 0) {
+                continue;
+            }
+            sibling_dirty_sheet ??= index;
+            dirty_sibling_count += 1;
+        }
+        const pointer_dirty = editing_ref.current?.has_uncommitted_changes() === true;
+        if (pointer_dirty || sibling_dirty_sheet !== undefined) {
             if (!csv_edit_session_id || pending_save_dialog_ref.current) return;
+            const target_sheet_index = pointer_dirty
+                ? edit_session_sheet_index_ref.current
+                : sibling_dirty_sheet!;
+            const target_sheet = meta?.sheets[target_sheet_index];
             const request = {
                 requestId: [
                     'dialog',
@@ -2670,9 +2820,24 @@ export function App(): React.JSX.Element {
                     ++dialog_request_seq_ref.current,
                 ].join(':'),
                 editSessionId: csv_edit_session_id,
+                target: {
+                    sheetIndex: target_sheet_index,
+                    ...(target_sheet?.name !== undefined
+                        ? { sheetName: target_sheet.name }
+                        : {}),
+                    ...(target_sheet?.worksheetId !== undefined
+                        ? { worksheetId: target_sheet.worksheetId }
+                        : {}),
+                },
+                multipleDirtySheets: dirty_sibling_count
+                    + (pointer_dirty ? 1 : 0) > 1,
             };
             pending_save_dialog_ref.current = request;
-            host_bridge.postMessage({ type: 'showSaveDialog', ...request });
+            host_bridge.postMessage({
+                type: 'showSaveDialog',
+                requestId: request.requestId,
+                editSessionId: request.editSessionId,
+            });
             return;
         }
         leave_edit_mode();
@@ -2683,6 +2848,7 @@ export function App(): React.JSX.Element {
         edit_session_pending,
         active_sheet_index,
         csv_edit_session_id,
+        meta,
     ]);
 
     /**
@@ -2976,6 +3142,13 @@ export function App(): React.JSX.Element {
         transform_request_blocked,
     ]);
 
+    const request_save_or_remain_dirty = useCallback(() => {
+        const editing = editing_ref.current;
+        if (!editing) return false;
+        // request_save() has side effects, so it is evaluated first.
+        return editing.request_save() || editing.has_uncommitted_changes();
+    }, []);
+
     useEffect(() => {
         const handler = (event: MessageEvent) => {
             const msg = event.data as HostMessage;
@@ -3024,7 +3197,7 @@ export function App(): React.JSX.Element {
                     // not a data reload.
                     install_edit_session(msg.pendingEdits, msg.editSessionId);
                     set_edit_mode(true);
-                } else {
+                } else if (csv_edit_session_id_ref.current === undefined) {
                     pending_exit_ref.current = false;
                     set_csv_edit_session_id(undefined);
                     set_edit_mode(false);
@@ -3040,45 +3213,50 @@ export function App(): React.JSX.Element {
                 ) return;
                 pending_save_dialog_ref.current = null;
                 if (msg.choice === 'save') {
-                    // `editing_ref` is the *active* sheet's store, and the answer is
-                    // about the session's sheet. Those are normally the same — the
-                    // tab strip refuses to switch while a dialog is open — but a
-                    // reorder or a restore can move the active sheet without one, and
-                    // acting on the wrong store here silently drops the save: a
-                    // sessionless store reports nothing to save, so the exit path
-                    // runs and releases the session instead. Answering "save" must
-                    // never end in "exited without saving".
-                    //
-                    // Deliberately untested, and deliberately kept: no message the
-                    // host can currently send moves the active sheet while a dialog
-                    // is open without also tearing the session down — `workbookSnapshot`
-                    // is the only route and it ends edit mode, so the branch is
-                    // unreachable today. It guards the invariant rather than a known
-                    // path, and a future lighter-weight restore would reach it.
-                    const on_session_sheet =
-                        active_sheet_index_ref.current === edit_session_sheet_index_ref.current;
-                    const editing = on_session_sheet ? editing_ref.current : null;
-                    if (!on_session_sheet) {
-                        // Stay in edit mode with the edits intact rather than
-                        // exiting: the draft is preserved and the user can press
-                        // Edit again on the owning worksheet. Said out loud, though
-                        // — the user pressed Save, and silence there reads as "saved"
-                        // for work that is still only a draft.
-                        const owning = meta_ref.current
-                            ?.sheets[edit_session_sheet_index_ref.current]?.name;
+                    if (pending_dialog.multipleDirtySheets) {
                         host_bridge.postMessage({
                             type: 'showWarning',
-                            message: 'Your changes are still unsaved. Switch to '
-                                + (owning ? `"${owning}"` : 'the worksheet being edited')
-                                + ' and press Edit again to save them.',
+                            message: 'More than one worksheet has unsaved changes. Keep editing or discard the workbook changes before leaving Edit mode.',
                         });
-                    // request_save() has side effects, so it is evaluated first.
-                    } else if (editing?.request_save() || editing?.has_uncommitted_changes()) {
-                        pending_exit_ref.current = true;
+                        return;
+                    }
+                    const target_sheet_index = worksheet_target_index(
+                        meta_ref.current?.sheets ?? [],
+                        pending_dialog.target,
+                    );
+                    if (target_sheet_index === undefined) {
+                        host_bridge.postMessage({
+                            type: 'showWarning',
+                            message: 'The worksheet with unsaved changes is no longer available.',
+                        });
+                        return;
+                    }
+                    const on_target_sheet =
+                        active_sheet_index_ref.current === target_sheet_index
+                        && edit_session_sheet_index_ref.current === target_sheet_index;
+                    if (!on_target_sheet) {
+                        // The dialog can be raised by a dirty sibling store while
+                        // the mounted pointer grid is clean. Retain the worksheet
+                        // identity while mounting it so a refresh can move the target
+                        // without redirecting the user's Save choice.
+                        pending_dialog_save_target_ref.current = pending_dialog.target;
+                        edit_session_sheet_index_ref.current = target_sheet_index;
+                        set_edit_session_sheet_index(target_sheet_index);
+                        set_active_sheet_index(target_sheet_index);
+                        state_ref.current = {
+                            ...state_ref.current,
+                            activeSheetIndex: target_sheet_index,
+                        };
+                        persist_immediate();
                     } else {
-                        leave_edit_mode();
+                        if (request_save_or_remain_dirty()) {
+                            pending_exit_ref.current = true;
+                        } else {
+                            leave_edit_mode();
+                        }
                     }
                 } else if (msg.choice === 'discard') {
+                    pending_dialog_save_target_ref.current = null;
                     editing_ref.current?.clear_dirty();
                     discard_edit_session();
                 }
@@ -3112,6 +3290,9 @@ export function App(): React.JSX.Element {
                         reason: msg.rejection.reason,
                         keys: [...msg.rejection.keys],
                         session_id: csv_edit_session_id_ref.current,
+                        sheet_index: msg.lifecycle.operation.sheetIndex,
+                        sheet_name: msg.lifecycle.operation.sheetName,
+                        worksheet_id: msg.lifecycle.operation.worksheetId,
                         // Snapshot what the host actually judged, from the operation
                         // it judged it over rather than from the live map, which may
                         // already have moved on. `live_rejected_keys` compares against
@@ -3137,7 +3318,57 @@ export function App(): React.JSX.Element {
         discard_edit_session,
         install_edit_session,
         leave_edit_mode,
+        persist_immediate,
+        request_save_or_remain_dirty,
         run_edit_command,
+    ]);
+
+    useEffect(() => {
+        const target = pending_dialog_save_target_ref.current;
+        if (!target) return;
+        const target_sheet_index = worksheet_target_index(meta?.sheets ?? [], target);
+        if (target_sheet_index === undefined) {
+            pending_dialog_save_target_ref.current = null;
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: 'The worksheet with unsaved changes is no longer available.',
+            });
+            return;
+        }
+        if (
+            active_sheet_index !== target_sheet_index
+            || edit_session_sheet_index !== target_sheet_index
+        ) {
+            edit_session_sheet_index_ref.current = target_sheet_index;
+            set_edit_session_sheet_index(target_sheet_index);
+            set_active_sheet_index(target_sheet_index);
+            state_ref.current = {
+                ...state_ref.current,
+                activeSheetIndex: target_sheet_index,
+            };
+            persist_immediate();
+            return;
+        }
+        const editing = editing_ref.current;
+        if (!editing) return;
+        pending_dialog_save_target_ref.current = null;
+        if (request_save_or_remain_dirty()) {
+            pending_exit_ref.current = true;
+            return;
+        }
+        // The target was dirty when the dialog opened. If it stopped being
+        // saveable while remounting, preserve the session rather than turn an
+        // explicit Save choice into an unsignalled release.
+        host_bridge.postMessage({
+            type: 'showWarning',
+            message: 'Your changes are still unsaved. Press Edit again to retry saving them.',
+        });
+    }, [
+        active_sheet_index,
+        edit_session_sheet_index,
+        meta,
+        persist_immediate,
+        request_save_or_remain_dirty,
     ]);
 
     // If editing becomes unavailable (e.g. a reload disables CSV editing), leave
@@ -3154,8 +3385,7 @@ export function App(): React.JSX.Element {
     // what the grant's hydration-boundary comment describes — and must never
     // strand a *current* writer against a lagging stamp, which would silently
     // drop every subsequent edit. Attributing the retained map to the newly
-    // adopted session matches the old behavior exactly: the unchanged
-    // initial_edits prop re-seeded the map across that same transition.
+    // adopted session preserves the retained registry map across that transition.
     //
     // useLayoutEffect, not useEffect: React runs child passive effects BEFORE the
     // parent's, so as a passive effect this would re-stamp only after GridShell's
@@ -3184,9 +3414,6 @@ export function App(): React.JSX.Element {
     editing_another_sheet_ref.current = editing_another_sheet;
 
     const handle_editing_change = useCallback((status: EditingStatus) => {
-        latest_live_edits_ref.current = Object.keys(status.edits).length > 0
-            ? status.edits
-            : undefined;
         // `save_in_flight_ref` is document-scoped, but only the grid that owns the
         // session is told about the save — a grid on any other worksheet is
         // deliberately handed no lifecycle, so it reports `false` while a save is
@@ -3616,6 +3843,12 @@ export function App(): React.JSX.Element {
             // then had no session on it, so a rejection could ride into a new session
             // on a restored `pendingEdits` map that happens to hold the same keys.
             if (save_rejection.session_id !== csv_edit_session_id) return [];
+            const on_rejected_sheet = save_rejection.worksheet_id !== undefined
+                ? save_rejection.worksheet_id === current_sheet?.worksheetId
+                : save_rejection.sheet_name !== undefined
+                    ? save_rejection.sheet_name === current_sheet?.name
+                    : save_rejection.sheet_index === active_sheet_index;
+            if (!on_rejected_sheet) return [];
             return save_rejection.keys.filter((key) => {
                 const live = live_edits?.[key];
                 if (live === undefined) return false;
@@ -3631,7 +3864,14 @@ export function App(): React.JSX.Element {
                 return live.value === judged.value && live.base === judged.base;
             });
         },
-        [save_rejection, live_edits, csv_edit_session_id],
+        [
+            save_rejection,
+            live_edits,
+            csv_edit_session_id,
+            active_sheet_index,
+            current_sheet?.name,
+            current_sheet?.worksheetId,
+        ],
     );
 
     if (!meta) {
@@ -3922,7 +4162,7 @@ export function App(): React.JSX.Element {
 
     const grid = (
         <GridShell
-            key={`${active_sheet_index}:${load_epoch}:${generation}`}
+            key={`${active_sheet_index}:${current_sheet.worksheetId ?? current_sheet.name}:${load_epoch}:${generation}`}
             sheet_meta={current_sheet}
             sheet_index={active_sheet_index}
             generation={generation}
@@ -3954,7 +4194,6 @@ export function App(): React.JSX.Element {
             save_operation={editing_another_sheet ? undefined : save_operation}
             save_lifecycle={editing_another_sheet ? undefined : save_lifecycle}
             on_save_request={begin_save_operation}
-            initial_edits={editing_another_sheet ? undefined : initial_edits}
             // This sheet's own store, so what the grid paints is always in the key
             // space it is painting into. The old single store had to be *withheld*
             // here whenever the session belonged to another worksheet — the grid
@@ -4082,7 +4321,8 @@ export function App(): React.JSX.Element {
                 // moves no rows. `transform_pending` — work in flight — still
                 // disables, matching the host's own transient refusal.
                 edit_disabled={
-                    editing_status?.save_in_flight === true
+                    save_lifecycle.state === 'active'
+                    || editing_status?.save_in_flight === true
                     // The session covers the whole workbook, so a session open on
                     // another worksheet no longer disables this sheet's Edit
                     // button — pressing it continues the same session here. Only
@@ -4094,7 +4334,8 @@ export function App(): React.JSX.Element {
                     ))
                 }
                 edit_disabled_reason={
-                    editing_status?.save_in_flight
+                    save_lifecycle.state === 'active'
+                    || editing_status?.save_in_flight
                         ? 'Saving changes.'
                         : edit_session_pending
                         ? 'Waiting to enter edit mode.'

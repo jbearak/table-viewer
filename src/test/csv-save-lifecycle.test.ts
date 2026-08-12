@@ -1,11 +1,30 @@
 import { describe, expect, it } from 'vitest';
-import type { CsvSaveOperation } from '../types';
+import type { CsvSaveOperation, SheetPendingEditCells } from '../types';
 import {
+    csv_save_operations_equal,
     propose_csv_save,
     reduce_csv_save_projection,
     resolve_csv_save_hydration,
     type CsvSaveProjection,
 } from '../webview/csv-save-lifecycle';
+
+function hydrate(
+    projection: Pick<CsvSaveProjection, 'authoritative' | 'operation'>,
+    edit_session_id: string | undefined,
+    pending_edits: SheetPendingEditCells | undefined,
+    sheet_index = 0,
+    sheet_name?: string,
+    worksheet_id?: string,
+): SheetPendingEditCells | undefined {
+    return resolve_csv_save_hydration(
+        projection,
+        edit_session_id,
+        sheet_index,
+        sheet_name,
+        worksheet_id,
+        pending_edits,
+    );
+}
 
 function operation(id: string, edit_session_id = 'edit-session'): CsvSaveOperation {
     return {
@@ -102,7 +121,7 @@ describe('CSV save lifecycle projection', () => {
             state: 'idle',
         });
         expect(projection.operation).toEqual(local);
-        expect(resolve_csv_save_hydration(
+        expect(hydrate(
             projection,
             local.editSessionId,
             undefined,
@@ -123,17 +142,17 @@ describe('CSV save lifecycle projection', () => {
             authoritative: { revision: 4, state: 'failed', operation: failed } as const,
         };
 
-        expect(resolve_csv_save_hydration(
+        expect(hydrate(
             projection,
             'old-session',
             newer,
         )).toEqual(failed.dirtyEdits);
-        expect(resolve_csv_save_hydration(
+        expect(hydrate(
             projection,
             'new-session',
             newer,
         )).toBe(newer);
-        expect(resolve_csv_save_hydration(
+        expect(hydrate(
             projection,
             'new-session',
             failed.dirtyEdits,
@@ -147,17 +166,17 @@ describe('CSV save lifecycle projection', () => {
             authoritative: { revision: 5, state: 'succeeded', operation: succeeded } as const,
         };
 
-        expect(resolve_csv_save_hydration(
+        expect(hydrate(
             projection,
             undefined,
             succeeded.dirtyEdits,
         )).toBeUndefined();
-        expect(resolve_csv_save_hydration(
+        expect(hydrate(
             projection,
             'saved-session',
             succeeded.dirtyEdits,
         )).toBeUndefined();
-        expect(resolve_csv_save_hydration(
+        expect(hydrate(
             projection,
             'new-session',
             pending,
@@ -171,7 +190,7 @@ describe('CSV save lifecycle projection', () => {
             authoritative: { revision: 6, state: 'succeeded', operation: succeeded } as const,
         };
 
-        expect(resolve_csv_save_hydration(
+        expect(hydrate(
             projection,
             undefined,
             {
@@ -179,6 +198,79 @@ describe('CSV save lifecycle projection', () => {
                 '1:0': newer,
             },
         )).toEqual({ '1:0': newer });
+    });
+
+    it('treats worksheet identity as part of the save operation identity', () => {
+        const people = { ...operation('same'), sheetName: 'People' };
+        const inventory = {
+            ...people,
+            sheetIndex: 1,
+            sheetName: 'Inventory',
+        };
+
+        expect(csv_save_operations_equal(people, inventory)).toBe(false);
+    });
+
+    it('uses worksheet ID before name when hydrating a save', () => {
+        const saved = {
+            ...operation('identified'),
+            sheetName: 'Data',
+            worksheetId: 'old',
+        };
+        const failed = {
+            authoritative: { revision: 7, state: 'failed', operation: saved } as const,
+        };
+        const replacement = { '0:0': { value: 'replacement', base: 'base' } };
+
+        expect(hydrate(
+            failed,
+            saved.editSessionId,
+            replacement,
+            0,
+            'Data',
+            'new',
+        )).toBe(replacement);
+        expect(hydrate(
+            failed,
+            saved.editSessionId,
+            undefined,
+            1,
+            'Renamed',
+            'old',
+        )).toEqual(saved.dirtyEdits);
+    });
+
+    it('hydrates and tombstones only the operation worksheet', () => {
+        const people = { ...operation('people'), sheetName: 'People' };
+        const inventory = { '0:0': { value: 'stock', base: 'old-stock' } };
+        const failed = {
+            authoritative: { revision: 7, state: 'failed', operation: people } as const,
+        };
+        const succeeded = {
+            authoritative: { revision: 8, state: 'succeeded', operation: people } as const,
+        };
+
+        expect(hydrate(
+            failed,
+            people.editSessionId,
+            inventory,
+            1,
+            'Inventory',
+        )).toBe(inventory);
+        expect(hydrate(
+            succeeded,
+            people.editSessionId,
+            inventory,
+            1,
+            'Inventory',
+        )).toBe(inventory);
+        expect(hydrate(
+            failed,
+            people.editSessionId,
+            undefined,
+            0,
+            'People',
+        )).toEqual(people.dirtyEdits);
     });
 
     it('keeps a retained local proposal ahead of a mismatched terminal', () => {
@@ -192,7 +284,7 @@ describe('CSV save lifecycle projection', () => {
             operation: local,
         };
 
-        expect(resolve_csv_save_hydration(
+        expect(hydrate(
             projection,
             'current-session',
             undefined,

@@ -42,6 +42,7 @@ export interface ExcelHeaderOverridePlan {
 
 export interface ExcelHeaderPlanningSheet {
     readonly name: string;
+    readonly worksheetId?: string;
     readonly rowCount: number;
     readonly sourceRowCount: number;
     readonly columnCount: number;
@@ -204,6 +205,7 @@ export class ExcelHeaderDataSource implements DataSource {
                     : undefined;
                 return Object.freeze({
                     name: sheet.physical.name,
+                    worksheetId: sheet.physical.worksheetId,
                     rowCount: sheet.physical.rowCount,
                     sourceRowCount: sheet.physical.sourceRowCount,
                     columnCount: sheet.physical.columnCount,
@@ -454,6 +456,7 @@ function project_sheet(
 ): SheetMeta {
     return project_excel_header_sheet({
         name: sheet.physical.name,
+        worksheetId: sheet.physical.worksheetId,
         rowCount: sheet.physical.rowCount,
         sourceRowCount: sheet.physical.sourceRowCount,
         columnCount: sheet.physical.columnCount,
@@ -497,6 +500,7 @@ export function project_excel_header_sheet(
         : sheet.columnNames;
     return {
         name: sheet.name,
+        worksheetId: sheet.worksheetId,
         rowCount: active ? Math.max(0, sheet.rowCount - 1) : sheet.rowCount,
         sourceRowCount: sheet.sourceRowCount,
         columnCount: sheet.columnCount,

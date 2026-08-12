@@ -1,3 +1,5 @@
+import { worksheet_target_key } from '../types';
+
 /**
  * Host bridge: a narrow abstraction over the channel the webview uses to talk
  * to its host. In VS Code this wraps `acquireVsCodeApi()`. Other hosts (e.g.
@@ -41,16 +43,26 @@ export const host_bridge: HostBridge = create_host_bridge();
 
 export interface PendingEditDurabilitySnapshot {
     readonly highestProducedSequence: number;
-    readonly highestAcknowledgedSequence: number;
+}
+
+interface PendingEditPublication {
+    readonly payload: string;
+    readonly sheetIndex: number;
+    readonly sequence: number;
 }
 
 interface PendingEditSessionChannel {
     nextSequence: number;
-    highestAcknowledgedSequence: number;
     // Dedupe per sheet: two sheets with byte-identical maps are distinct
-    // slots' content and must not suppress each other's posts.
-    lastPayloadBySheet: Map<number, string>;
-    listeners: Set<(snapshot: PendingEditDurabilitySnapshot) => void>;
+    // slots' content and must not suppress each other's posts. Keyed by sheet
+    // stable worksheet ID when available, then by name for legacy workbooks,
+    // because an external reorder moves sheets under the indices. An
+    // unacknowledged publication also retains its
+    // coordinates: if the host rejected a now-stale index/name pair, the same
+    // payload must be allowed through at the sheet's new index. The index is
+    // only the key of last resort for the untagged single-sheet CSV path.
+    latestPublicationBySheet: Map<string, PendingEditPublication>;
+    unacknowledgedSequences: Set<number>;
 }
 
 const pending_edit_channels = new Map<string, PendingEditSessionChannel>();
@@ -60,21 +72,12 @@ function pending_edit_channel(session_id: string): PendingEditSessionChannel {
     if (!channel) {
         channel = {
             nextSequence: 1,
-            highestAcknowledgedSequence: 0,
-            lastPayloadBySheet: new Map(),
-            listeners: new Set(),
+            latestPublicationBySheet: new Map(),
+            unacknowledgedSequences: new Set(),
         };
         pending_edit_channels.set(session_id, channel);
     }
     return channel;
-}
-
-function notify_pending_edit_channel(channel: PendingEditSessionChannel): void {
-    const snapshot = {
-        highestProducedSequence: channel.nextSequence - 1,
-        highestAcknowledgedSequence: channel.highestAcknowledgedSequence,
-    } as const;
-    for (const listener of channel.listeners) listener(snapshot);
 }
 
 /** Webview-lifetime sequence owner, so GridShell remounts cannot reuse a sequence. */
@@ -105,6 +108,21 @@ export function install_pending_edit_flush_responder(
     };
 }
 
+function latest_pending_edit_publication(
+    edit_session_id: string,
+    sheet_index: number,
+    sheet_name: string | undefined,
+    worksheet_id: string | undefined,
+): PendingEditPublication | undefined {
+    return pending_edit_channels.get(edit_session_id)?.latestPublicationBySheet.get(
+        worksheet_target_key({
+            sheetIndex: sheet_index,
+            sheetName: sheet_name,
+            worksheetId: worksheet_id,
+        }),
+    );
+}
+
 export const pending_edit_durability = {
     publish(
         editSessionId: string,
@@ -112,14 +130,34 @@ export const pending_edit_durability = {
         sheetIndex: number,
         sheetName: string | undefined,
         force = false,
+        worksheetId?: string,
     ): number {
         const channel = pending_edit_channel(editSessionId);
         const payload = JSON.stringify(edits);
-        if (!force && channel.lastPayloadBySheet.get(sheetIndex) === payload) {
+        const dedupe_key = worksheet_target_key({
+            sheetIndex,
+            sheetName,
+            worksheetId,
+        });
+        const latest = channel.latestPublicationBySheet.get(dedupe_key);
+        if (
+            !force
+            && latest?.payload === payload
+            && (
+                !channel.unacknowledgedSequences.has(latest.sequence)
+                || latest.sheetIndex === sheetIndex
+            )
+        ) {
             return channel.nextSequence - 1;
         }
         const sequence = channel.nextSequence++;
-        channel.lastPayloadBySheet.set(sheetIndex, payload);
+        if (latest) channel.unacknowledgedSequences.delete(latest.sequence);
+        channel.latestPublicationBySheet.set(dedupe_key, {
+            payload,
+            sheetIndex,
+            sequence,
+        });
+        channel.unacknowledgedSequences.add(sequence);
         host_bridge.postMessage({
             type: 'pendingEditsChanged',
             editSessionId,
@@ -127,34 +165,50 @@ export const pending_edit_durability = {
             sequence,
             sheetIndex,
             ...(sheetName !== undefined ? { sheetName } : {}),
+            ...(worksheetId !== undefined ? { worksheetId } : {}),
         });
-        notify_pending_edit_channel(channel);
         return sequence;
     },
     snapshot(editSessionId: string): PendingEditDurabilitySnapshot {
         const channel = pending_edit_channel(editSessionId);
         return {
             highestProducedSequence: channel.nextSequence - 1,
-            highestAcknowledgedSequence: channel.highestAcknowledgedSequence,
         };
     },
-    subscribe(
+    has_publication(
         editSessionId: string,
-        listener: (snapshot: PendingEditDurabilitySnapshot) => void,
-    ): () => void {
-        const channel = pending_edit_channel(editSessionId);
-        channel.listeners.add(listener);
-        listener(this.snapshot(editSessionId));
-        return () => channel.listeners.delete(listener);
+        sheetIndex: number,
+        sheetName: string | undefined,
+        worksheetId?: string,
+    ): boolean {
+        return latest_pending_edit_publication(
+            editSessionId,
+            sheetIndex,
+            sheetName,
+            worksheetId,
+        ) !== undefined;
+    },
+    has_unacknowledged_payload(
+        editSessionId: string,
+        sheetIndex: number,
+        sheetName: string | undefined,
+        worksheetId?: string,
+    ): boolean {
+        const channel = pending_edit_channels.get(editSessionId);
+        const publication = latest_pending_edit_publication(
+            editSessionId,
+            sheetIndex,
+            sheetName,
+            worksheetId,
+        );
+        return publication !== undefined
+            && channel !== undefined
+            && channel.unacknowledgedSequences.has(publication.sequence);
     },
     acknowledge(editSessionId: string, sequence: number): void {
         const channel = pending_edit_channels.get(editSessionId);
         if (!channel || sequence > channel.nextSequence - 1) return;
-        channel.highestAcknowledgedSequence = Math.max(
-            channel.highestAcknowledgedSequence,
-            sequence,
-        );
-        notify_pending_edit_channel(channel);
+        channel.unacknowledgedSequences.delete(sequence);
     },
     retire(editSessionId: string): void {
         pending_edit_channels.delete(editSessionId);

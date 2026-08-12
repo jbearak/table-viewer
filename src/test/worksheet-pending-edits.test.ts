@@ -4,6 +4,7 @@ import {
     has_any_pending_edits,
     pending_edits_for_sheet,
     reconcile_pending_edit_sheets,
+    sheet_index_with_pending_edits,
     stringify_stored_per_file_state,
     with_pending_edits_for_sheet,
 } from '../types';
@@ -67,6 +68,9 @@ describe('decode_stored_per_file_state — pendingEdits migration', () => {
             pendingEdits: [{ sheetName: 7, cells: { '0:0': entry('x') } }],
         })).toThrow();
         expect(() => decode_stored_per_file_state({
+            pendingEdits: [{ worksheetId: 7, cells: { '0:0': entry('x') } }],
+        })).toThrow();
+        expect(() => decode_stored_per_file_state({
             pendingEdits: [{ cells: { '0:0': { value: 'x' } } }],
         })).toThrow();
     });
@@ -77,7 +81,11 @@ describe('decode_stored_per_file_state — pendingEdits migration', () => {
         // passes — see `stringify_stored_per_file_state`.
         const state = {
             activeSheetIndex: 2,
-            pendingEdits: [{ sheetName: 'S', cells: { '1:2': entry('v', 'b') } }],
+            pendingEdits: [{
+                sheetName: 'S',
+                worksheetId: '7',
+                cells: { '1:2': entry('v', 'b') },
+            }],
         };
         const json = stringify_stored_per_file_state(state as never);
         expect(JSON.parse(json).pendingEdits).toEqual({ sheets: state.pendingEdits });
@@ -134,6 +142,36 @@ describe('pending_edits_for_sheet', () => {
         expect(pending_edits_for_sheet(state, 1)).toBeUndefined();
         expect(pending_edits_for_sheet(state, 9)).toBeUndefined();
         expect(pending_edits_for_sheet(undefined, 0)).toBeUndefined();
+    });
+
+    it('does not fall back to a matching name when a slot has a different ID', () => {
+        const identified: PerFileState['pendingEdits'] = [{
+            sheetName: 'Data',
+            worksheetId: 'old',
+            cells: { '0:0': entry('draft') },
+        }];
+        expect(pending_edits_for_sheet(identified, 0, 'Data', 'new')).toBeUndefined();
+        expect(pending_edits_for_sheet(identified, 0, 'Renamed', 'old'))
+            .toEqual({ '0:0': entry('draft') });
+    });
+});
+
+describe('sheet_index_with_pending_edits', () => {
+    it('skips an ID-tagged draft parked over a replacement worksheet', () => {
+        const pending: PerFileState['pendingEdits'] = [{
+            sheetName: 'Data',
+            worksheetId: 'old',
+            cells: { '0:0': entry('draft') },
+        }];
+
+        expect(sheet_index_with_pending_edits(pending, [{
+            name: 'Data',
+            worksheetId: 'new',
+        }])).toBeUndefined();
+        expect(sheet_index_with_pending_edits(pending, [{
+            name: 'Renamed',
+            worksheetId: 'old',
+        }])).toBe(0);
     });
 });
 
@@ -192,6 +230,36 @@ describe('has_any_pending_edits', () => {
 });
 
 describe('reconcile_pending_edit_sheets', () => {
+    it('follows the same worksheet ID through a rename', () => {
+        const pending: PerFileState['pendingEdits'] = [{
+            sheetName: 'Before',
+            worksheetId: '9',
+            cells: { '0:0': entry('draft') },
+        }];
+        const after = reconcile_pending_edit_sheets(pending, [{
+            name: 'After',
+            worksheetId: '9',
+        }]);
+
+        expect(pending_edits_for_sheet(after, 0, 'After', '9'))
+            .toEqual({ '0:0': entry('draft') });
+    });
+
+    it('does not give a recreated same-name worksheet the old ID draft', () => {
+        const pending: PerFileState['pendingEdits'] = [{
+            sheetName: 'Data',
+            worksheetId: 'old',
+            cells: { '0:0': entry('draft') },
+        }];
+        const after = reconcile_pending_edit_sheets(pending, [{
+            name: 'Data',
+            worksheetId: 'new',
+        }]);
+
+        expect(pending_edits_for_sheet(after, 0, 'Data', 'new')).toBeUndefined();
+        expect(JSON.stringify(after)).toContain('draft');
+    });
+
     it('keeps slots whose name still matches its position', () => {
         const pending: PerFileState['pendingEdits'] = [
             { sheetName: 'A', cells: { '0:0': entry('a') } },

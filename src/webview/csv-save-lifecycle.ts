@@ -1,7 +1,8 @@
-import type {
-    CsvSaveLifecycle,
-    CsvSaveOperation,
-    SheetPendingEditCells,
+import {
+    worksheet_target_matches,
+    type CsvSaveLifecycle,
+    type CsvSaveOperation,
+    type SheetPendingEditCells,
 } from '../types';
 
 export interface CsvSaveProjection {
@@ -27,12 +28,9 @@ function records_equal(
     left: Readonly<Record<string, string>>,
     right: Readonly<Record<string, string>>,
 ): boolean {
-    const left_keys = Object.keys(left).sort();
-    const right_keys = Object.keys(right).sort();
-    return left_keys.length === right_keys.length
-        && left_keys.every((key, index) => (
-            key === right_keys[index] && left[key] === right[key]
-        ));
+    const left_keys = Object.keys(left);
+    if (left_keys.length !== Object.keys(right).length) return false;
+    return left_keys.every((key) => right[key] === left[key]);
 }
 
 export function csv_save_operations_equal(
@@ -43,19 +41,21 @@ export function csv_save_operations_equal(
     if (!left || !right) return false;
     if (
         left.editSessionId !== right.editSessionId
+        || left.sheetIndex !== right.sheetIndex
+        || left.sheetName !== right.sheetName
+        || left.worksheetId !== right.worksheetId
         || left.saveRequestId !== right.saveRequestId
         || !records_equal(left.edits, right.edits)
     ) return false;
-    const left_keys = Object.keys(left.dirtyEdits).sort();
-    const right_keys = Object.keys(right.dirtyEdits).sort();
-    return left_keys.length === right_keys.length
-        && left_keys.every((key, index) => {
-            const left_entry = left.dirtyEdits[key];
-            const right_entry = right.dirtyEdits[key];
-            return key === right_keys[index]
-                && left_entry.value === right_entry.value
-                && left_entry.base === right_entry.base;
-        });
+    const left_keys = Object.keys(left.dirtyEdits);
+    if (left_keys.length !== Object.keys(right.dirtyEdits).length) return false;
+    return left_keys.every((key) => {
+        const left_entry = left.dirtyEdits[key];
+        const right_entry = right.dirtyEdits[key];
+        return right_entry !== undefined
+            && left_entry.value === right_entry.value
+            && left_entry.base === right_entry.base;
+    });
 }
 
 function remove_operation_owned_pending_edits(
@@ -63,17 +63,22 @@ function remove_operation_owned_pending_edits(
     operation: CsvSaveOperation,
 ): SheetPendingEditCells | undefined {
     if (!pending_edits) return undefined;
-    let removed = false;
-    const retained = Object.fromEntries(Object.entries(pending_edits).filter(([key, pending]) => {
+    let retained: SheetPendingEditCells | undefined;
+    let remaining = 0;
+    for (const [key, pending] of Object.entries(pending_edits)) {
         const owned = operation.dirtyEdits[key];
         const matches = owned !== undefined && (typeof pending === 'string'
             ? pending === owned.value
             : pending.value === owned.value && pending.base === owned.base);
-        if (matches) removed = true;
-        return !matches;
-    }));
-    if (!removed) return pending_edits;
-    return Object.keys(retained).length > 0 ? retained : undefined;
+        if (matches) {
+            retained ??= { ...pending_edits };
+            delete retained[key];
+        } else {
+            remaining += 1;
+        }
+    }
+    if (!retained) return pending_edits;
+    return remaining > 0 ? retained : undefined;
 }
 
 export function propose_csv_save(
@@ -93,19 +98,47 @@ export function propose_csv_save(
  * operation restores only that same session, while success tombstones stale
  * operation-owned state unless the host has already granted a different one.
  */
+export function save_operation_targets_sheet(
+    operation: CsvSaveOperation,
+    sheet_index: number,
+    sheet_name: string | undefined,
+    worksheet_id: string | undefined,
+): boolean {
+    return worksheet_target_matches(operation, {
+        sheetIndex: sheet_index,
+        sheetName: sheet_name,
+        worksheetId: worksheet_id,
+    });
+}
+
 export function resolve_csv_save_hydration(
     projection: Pick<CsvSaveProjection, 'authoritative' | 'operation'>,
     edit_session_id: string | undefined,
+    sheet_index: number,
+    sheet_name: string | undefined,
+    worksheet_id: string | undefined,
     pending_edits: SheetPendingEditCells | undefined,
 ): SheetPendingEditCells | undefined {
     if (
         projection.operation
         && projection.operation.editSessionId === edit_session_id
+        && save_operation_targets_sheet(
+            projection.operation,
+            sheet_index,
+            sheet_name,
+            worksheet_id,
+        )
     ) {
         return projection.operation.dirtyEdits;
     }
 
     const lifecycle = projection.authoritative;
+    if (lifecycle.state === 'idle' || !save_operation_targets_sheet(
+        lifecycle.operation,
+        sheet_index,
+        sheet_name,
+        worksheet_id,
+    )) return pending_edits;
     if (lifecycle.state === 'active' || lifecycle.state === 'failed') {
         return lifecycle.operation.editSessionId === edit_session_id
             ? lifecycle.operation.dirtyEdits
@@ -114,13 +147,10 @@ export function resolve_csv_save_hydration(
                 lifecycle.operation,
             );
     }
-    if (lifecycle.state === 'succeeded') {
-        return remove_operation_owned_pending_edits(
-            pending_edits,
-            lifecycle.operation,
-        );
-    }
-    return pending_edits;
+    return remove_operation_owned_pending_edits(
+        pending_edits,
+        lifecycle.operation,
+    );
 }
 
 /** Apply one host projection without using request IDs as ordering authority. */

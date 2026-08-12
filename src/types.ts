@@ -16,6 +16,8 @@ export interface WorkbookData {
 
 export interface SheetData {
     name: string;
+    /** Stable format-neutral worksheet identity when the source exposes one. */
+    worksheetId?: string;
     rows: (CellData | null)[][];
     merges: MergeRange[];
     columnCount: number;
@@ -768,11 +770,16 @@ function decode_pending_edits(value: unknown): (WorksheetPendingEdits | undefine
         if (slot.sheetName !== undefined && typeof slot.sheetName !== 'string') {
             invalid_leaf('pendingEdits');
         }
+        if (slot.worksheetId !== undefined && typeof slot.worksheetId !== 'string') {
+            invalid_leaf('pendingEdits');
+        }
         const cells = validate_edit_cells(slot.cells);
         if (Object.keys(cells).length === 0) return undefined;
-        return slot.sheetName === undefined
-            ? { cells }
-            : { sheetName: slot.sheetName, cells };
+        return {
+            ...(slot.sheetName !== undefined ? { sheetName: slot.sheetName } : {}),
+            ...(slot.worksheetId !== undefined ? { worksheetId: slot.worksheetId } : {}),
+            cells,
+        };
     });
 
     // Trailing empties carry no information; trimming keeps the persisted array
@@ -865,7 +872,64 @@ export function decode_stored_per_file_state(value: unknown): StoredPerFileState
  */
 export interface WorksheetPendingEdits {
     readonly sheetName?: string;
+    /** Stable worksheet identity. Absent only on legacy slots and formats without one. */
+    readonly worksheetId?: string;
     readonly cells: SheetPendingEditCells;
+}
+
+/** Format-neutral worksheet identity used to reconcile durable positional state. */
+export interface WorksheetIdentity {
+    readonly name: string;
+    readonly worksheetId?: string;
+}
+
+export type WorksheetIdentityInput = string | WorksheetIdentity;
+
+export interface WorksheetTarget {
+    readonly sheetIndex: number;
+    readonly sheetName?: string;
+    readonly worksheetId?: string;
+}
+
+export function worksheet_identity(input: WorksheetIdentityInput): WorksheetIdentity {
+    return typeof input === 'string' ? { name: input } : input;
+}
+
+export function worksheet_target_key(target: WorksheetTarget): string {
+    return target.worksheetId !== undefined
+        ? `id:${target.worksheetId}`
+        : target.sheetName !== undefined
+            ? `name:${target.sheetName}`
+            : `index:${target.sheetIndex}`;
+}
+
+export function worksheet_target_matches(
+    target: WorksheetTarget,
+    candidate: WorksheetTarget,
+): boolean {
+    return target.worksheetId !== undefined
+        ? target.worksheetId === candidate.worksheetId
+        : target.sheetName !== undefined
+            ? target.sheetName === candidate.sheetName
+            : target.sheetIndex === candidate.sheetIndex;
+}
+
+export function worksheet_target_index(
+    sheets: readonly WorksheetIdentityInput[],
+    target: WorksheetTarget,
+): number | undefined {
+    if (target.worksheetId !== undefined || target.sheetName !== undefined) {
+        const index = sheets.findIndex((sheet, sheetIndex) => {
+            const identity = worksheet_identity(sheet);
+            return worksheet_target_matches(target, {
+                sheetIndex,
+                sheetName: identity.name,
+                worksheetId: identity.worksheetId,
+            });
+        });
+        return index < 0 ? undefined : index;
+    }
+    return sheets[target.sheetIndex] === undefined ? undefined : target.sheetIndex;
 }
 
 /**
@@ -882,20 +946,28 @@ export function pending_edits_for_sheet(
     sheet_index: number,
     // The worksheet actually at `sheet_index`, when the caller knows it.
     sheet_name?: string,
+    worksheet_id?: string,
 ): Record<string, string | CsvDirtyEntry> | undefined {
     const slot = pending?.[sheet_index];
     if (!slot) return undefined;
-    // Position alone is not proof of ownership. Reconciliation cannot place two
-    // same-named slots at one index, so a slot tagged for a *different* worksheet
-    // can be sitting here — and handing its draft to a session on this sheet
-    // leaked one worksheet's edits into another, keyed to rows that mean something
-    // else. An untagged slot predates tagging and is single-sheet CSV by
-    // construction, so it keeps the positional answer.
-    if (sheet_name !== undefined && slot.sheetName !== undefined
-        && slot.sheetName !== sheet_name) {
+    // A stable ID is authoritative whenever the slot has one. Name fallback is
+    // reserved for legacy ID-less slots; otherwise deleting a worksheet and
+    // recreating one under the same name would inherit the deleted sheet's draft.
+    if (slot.worksheetId !== undefined) {
+        if (worksheet_id === undefined || slot.worksheetId !== worksheet_id) {
+            return undefined;
+        }
+    } else if (
+        sheet_name !== undefined
+        && slot.sheetName !== undefined
+        && slot.sheetName !== sheet_name
+    ) {
         return undefined;
     }
-    return Object.keys(slot.cells).length > 0 ? slot.cells : undefined;
+    for (const key in slot.cells) {
+        if (Object.prototype.hasOwnProperty.call(slot.cells, key)) return slot.cells;
+    }
+    return undefined;
 }
 
 /**
@@ -909,10 +981,18 @@ export function pending_edits_for_sheet(
  */
 export function sheet_index_with_pending_edits(
     pending: PerFileState['pendingEdits'],
+    sheets: readonly WorksheetIdentityInput[],
 ): number | undefined {
     if (!pending) return undefined;
     for (let i = 0; i < pending.length; i++) {
-        if (pending_edits_for_sheet(pending, i)) return i;
+        const sheet = sheets[i];
+        const identity = sheet === undefined ? undefined : worksheet_identity(sheet);
+        if (identity && pending_edits_for_sheet(
+            pending,
+            i,
+            identity.name,
+            identity.worksheetId,
+        )) return i;
     }
     return undefined;
 }
@@ -938,14 +1018,18 @@ export function with_pending_edits_for_sheet(
     sheet_index: number,
     cells: Record<string, string | CsvDirtyEntry> | undefined,
     sheet_name?: string,
+    worksheet_id?: string,
 ): PerFileState['pendingEdits'] {
     const next = pending ? [...pending] : [];
     while (next.length <= sheet_index) next.push(undefined);
     const incumbent = next[sheet_index];
-    const foreign = sheet_name !== undefined
-        && incumbent !== undefined
-        && incumbent.sheetName !== undefined
-        && incumbent.sheetName !== sheet_name;
+    const foreign = incumbent !== undefined && (
+        incumbent.worksheetId !== undefined
+            ? worksheet_id === undefined || incumbent.worksheetId !== worksheet_id
+            : sheet_name !== undefined
+                && incumbent.sheetName !== undefined
+                && incumbent.sheetName !== sheet_name
+    );
     // Nothing of this worksheet's is here to clear. A slot tagged for another
     // worksheet at this index is a displaced draft, and an empty replacement is
     // this worksheet saying it has no draft — so emptying the slot would delete
@@ -956,7 +1040,11 @@ export function with_pending_edits_for_sheet(
     if (foreign && !(cells && Object.keys(cells).length > 0)) return pending;
     const displaced = foreign ? incumbent : undefined;
     next[sheet_index] = cells && Object.keys(cells).length > 0
-        ? (sheet_name === undefined ? { cells } : { sheetName: sheet_name, cells })
+        ? {
+            ...(sheet_name !== undefined ? { sheetName: sheet_name } : {}),
+            ...(worksheet_id !== undefined ? { worksheetId: worksheet_id } : {}),
+            cells,
+        }
         : undefined;
     if (displaced && next[sheet_index] !== undefined) {
         let free = next.findIndex((slot, index) => index !== sheet_index && slot === undefined);
@@ -973,63 +1061,52 @@ export function has_any_pending_edits(pending: PerFileState['pendingEdits']): bo
 }
 
 /**
- * Reattach slots to the workbook as loaded, by name where one was recorded.
+ * Reattach slots to the workbook as loaded, using stable worksheet identity
+ * whenever the slot has one. OOXML `sheetId` survives rename and reorder but
+ * changes when a worksheet is deleted and recreated, so an ID-bearing slot must
+ * never fall back to a matching name. Legacy ID-less slots still reconcile by
+ * name, preserving drafts written before stable identity was available; fully
+ * untagged single-sheet CSV migrations stay positional.
  *
- * Guards the one case a positional array cannot: the workbook was reordered
- * externally, so slot *i* no longer describes sheet *i*. Reattaching by position
- * would apply a draft to the wrong worksheet, keyed to rows that mean something
- * else there — silent corruption.
+ * Worksheet IDs are scoped to an XLSX workbook, while durable file state is
+ * scoped to the document URI. Replacing the bytes at the same URI therefore
+ * continues the same logical document: a matching worksheet ID is intentionally
+ * treated as the same sheet even if the replacement came from another workbook.
+ * There is no separate workbook-lineage identity in this extension's contract.
  *
- * Worksheet names are unique within a workbook, so a reorder is not ambiguous:
- * the draft moves to wherever its sheet went, and only a sheet that is gone
- * entirely (deleted, or renamed outside this app) loses its draft. Dropping is
- * the last resort rather than the answer to any mismatch, because the draft is
- * the user's only copy of that work.
- *
- * "Loses its draft" is scoped to what this workbook shows: the drop is applied to
- * the snapshot a panel is projected from, and deliberately *not* written back to
- * durable state. So a name that comes back — the file restored from a backup, a
- * rename undone in Excel, a branch switched under the editor — brings its draft
- * with it. The alternative is deleting unsaved work the first time a sheet is
- * missing, with no undo and nothing shown to the user; a draft that reappears
- * alongside its worksheet is visible and dismissable, which is the recoverable
- * direction to be wrong in. (A slot only truly goes when some later write to this
- * file commits state that no longer carries it.)
- *
- * Slots with no recorded name are legacy CSV migrations (single-sheet by
- * construction) and stay where they are.
- *
- * The name is the only identity there is, and it is not a strong one: delete
- * `Inventory` elsewhere, rename another worksheet to `Inventory`, and this
- * function reattaches the draft to a sheet that merely inherited the label. The
- * save's base check is what stands between that and corruption, and it holds
- * unless the targeted cell happens to hold the same value — so the failure needs
- * an external delete, a name reuse, *and* a coincident base.
- *
- * Not fixed here, deliberately. A real identity means a stable per-worksheet key
- * (`sheetId` from `xl/workbook.xml` survives renames and changes on recreate)
- * persisted alongside the name — a durable-schema change, with a migration for
- * every slot already written without one, threaded through reconciliation and
- * rehydration both. That is a larger design than this branch's remit, and the
- * cheap version is worse than nothing: keying on the name *and* refusing when it
- * cannot prove identity would delete a draft on every ordinary rename, which is
- * the far likelier event and the loss this function exists to prevent.
+ * A slot whose identity no longer resolves is parked rather than deleted. The
+ * workbook may be temporarily replaced or the worksheet may return, and the
+ * durable draft is the user's only copy. Parking keeps that work recoverable
+ * without exposing it to a same-name replacement.
  */
 export function reconcile_pending_edit_sheets(
     pending: PerFileState['pendingEdits'],
-    sheet_names: readonly string[],
+    sheets: readonly WorksheetIdentityInput[],
 ): PerFileState['pendingEdits'] {
     if (!pending) return undefined;
-    // No names is "we don't know", not "the workbook has no sheets". A save or
-    // cleanup can outlive its panel, and a disposed panel has no source to name
-    // them; treating that as a total mismatch would drop every tagged slot —
-    // silently discarding the user's unsaved work on the way past.
-    if (sheet_names.length === 0) return pending;
+    // No identities is "we don't know", not "the workbook has no sheets". A save
+    // or cleanup can outlive its panel, and a disposed panel has no source to
+    // identify them; treating that as a total mismatch would drop every tagged slot.
+    if (sheets.length === 0) return pending;
 
+    const index_of_id = new Map<string, number>();
     const index_of_name = new Map<string, number>();
-    sheet_names.forEach((name, index) => {
-        if (!index_of_name.has(name)) index_of_name.set(name, index);
+    sheets.forEach((input, index) => {
+        const sheet = worksheet_identity(input);
+        if (sheet.worksheetId !== undefined && !index_of_id.has(sheet.worksheetId)) {
+            index_of_id.set(sheet.worksheetId, index);
+        }
+        if (!index_of_name.has(sheet.name)) index_of_name.set(sheet.name, index);
     });
+    const target_index_for_slot = (
+        slot: WorksheetPendingEdits,
+    ): number | undefined => slot.worksheetId !== undefined
+        ? index_of_id.get(slot.worksheetId)
+        : slot.sheetName !== undefined
+            ? index_of_name.get(slot.sheetName)
+            : undefined;
+    const slot_has_identity = (slot: WorksheetPendingEdits): boolean =>
+        slot.worksheetId !== undefined || slot.sheetName !== undefined;
 
     let changed = false;
     const next: (WorksheetPendingEdits | undefined)[] = [];
@@ -1046,11 +1123,18 @@ export function reconcile_pending_edit_sheets(
     // next pass did the same in reverse. Preferring the incumbent is a fixed point.
     const claimant = new Map<number, number>();
     pending.forEach((slot, index) => {
-        if (!slot?.sheetName) return;
-        const moved_to = index_of_name.get(slot.sheetName);
+        if (!slot || !slot_has_identity(slot)) return;
+        const moved_to = target_index_for_slot(slot);
         if (moved_to === undefined) return;
         const held = claimant.get(moved_to);
-        if (held === undefined || (held !== moved_to && index === moved_to)) {
+        const incumbent = held === undefined ? undefined : pending[held];
+        const stronger_identity = slot.worksheetId !== undefined
+            && incumbent?.worksheetId === undefined;
+        const same_strength_incumbent = (slot.worksheetId !== undefined)
+            === (incumbent?.worksheetId !== undefined)
+            && held !== moved_to
+            && index === moved_to;
+        if (held === undefined || stronger_identity || same_strength_incumbent) {
             claimant.set(moved_to, index);
         }
     });
@@ -1063,8 +1147,8 @@ export function reconcile_pending_edit_sheets(
     // there, its own real one displaced and invisible.
     const displaced: Array<{ slot: WorksheetPendingEdits; index: number }> = [];
     pending.forEach((slot, index) => {
-        if (!slot?.sheetName) return;
-        const moved_to = index_of_name.get(slot.sheetName);
+        if (!slot || !slot_has_identity(slot)) return;
+        const moved_to = target_index_for_slot(slot);
         if (moved_to === undefined) return;
         while (next.length <= moved_to) next.push(undefined);
         if (claimant.get(moved_to) !== index || next[moved_to] !== undefined) {
@@ -1091,12 +1175,12 @@ export function reconcile_pending_edit_sheets(
     // was pushed aside, so the worksheet the user opened showed a foreign draft and
     // its own was invisible.
     pending.forEach((slot, index) => {
-        if (!slot || slot.sheetName) return;
+        if (!slot || slot_has_identity(slot)) return;
         displaced.push({ slot, index });
     });
     pending.forEach((slot, index) => {
-        if (!slot?.sheetName) return;
-        if (index_of_name.get(slot.sheetName) !== undefined) return;
+        if (!slot || !slot_has_identity(slot)) return;
+        if (target_index_for_slot(slot) !== undefined) return;
         // The name is not in this workbook — and nothing here can tell why. A
         // worksheet deleted and a worksheet *renamed* look identical from this
         // side: both are a tag that no longer resolves. Dropping the slot was
@@ -1116,10 +1200,26 @@ export function reconcile_pending_edit_sheets(
     // changes nothing else moves nothing. Otherwise it takes the first free one.
     // Either way its draft stays attached to a worksheet that may not be its own —
     // visible and dismissable, which is the recoverable direction to be wrong in.
+    const free_indices = new Set<number>();
+    for (let index = 0; index < next.length; index += 1) {
+        if (next[index] === undefined) free_indices.add(index);
+    }
+    let first_free = 0;
+    const take_first_free = () => {
+        while (first_free < next.length && !free_indices.has(first_free)) {
+            first_free += 1;
+        }
+        if (first_free >= next.length) return next.length;
+        const index = first_free;
+        free_indices.delete(index);
+        return index;
+    };
     for (const { slot, index } of displaced) {
-        while (next.length <= index) next.push(undefined);
-        let landing = next[index] === undefined ? index : next.indexOf(undefined);
-        if (landing === -1) landing = next.length;
+        while (next.length <= index) {
+            free_indices.add(next.length);
+            next.push(undefined);
+        }
+        const landing = free_indices.delete(index) ? index : take_first_free();
         next[landing] = slot;
         if (landing !== index) changed = true;
     }
@@ -1164,15 +1264,19 @@ export interface CsvSaveOperation {
     /** Worksheet this save writes. Part of the operation's identity: a tombstone
      *  or cleanup for one sheet must never touch another's slot. */
     readonly sheetIndex: number;
+    /** Worksheet name captured by the renderer for legacy ID-less compatibility. */
+    readonly sheetName?: string;
+    /** Stable worksheet identity captured by the renderer when the source exposes one. */
+    readonly worksheetId?: string;
     readonly saveRequestId: string;
     readonly edits: Readonly<Record<string, string>>;
     readonly dirtyEdits: CsvDirtyMap;
 }
 
-/** A save as the webview posts it. `sheetIndex` is optional on the wire for the
- *  same reason it is on the edit-session messages: a single-sheet source has
- *  only sheet 0 to name. The host normalizes it before the operation becomes an
- *  identity anything is compared against. */
+/** A save as the webview posts it. Worksheet coordinates remain optional on
+ *  the wire for the legacy single-sheet shape; workbook renderers send both the
+ *  index and stable name. The host normalizes the index before the operation is
+ *  compared or applied. */
 export type CsvSaveOperationRequest =
     Omit<CsvSaveOperation, 'sheetIndex'> & { readonly sheetIndex?: number };
 
@@ -1293,7 +1397,13 @@ export type WebviewMessage =
     | { type: 'visibleRowChanged'; row: number }
     // `sheetIndex` is optional so a single-sheet source can omit it; the host
     // reads a missing field as sheet 0, which is the only sheet such a source has.
-    | { type: 'requestEditSession'; requestId: string; sheetIndex?: number }
+    | {
+        type: 'requestEditSession';
+        requestId: string;
+        sheetIndex?: number;
+        sheetName?: string;
+        worksheetId?: string;
+    }
     | { type: 'releaseEditSession'; editSessionId: string }
     | { type: 'discardEditSession'; editSessionId: string }
     | { type: 'saveCsv'; operation: CsvSaveOperationRequest }
@@ -1306,7 +1416,7 @@ export type WebviewMessage =
     // no sheet names to reorder (the CSV shape). The host validates the pair and
     // resolves the *name* at write time, so a post queued across an external
     // reorder still lands in the worksheet the user actually edited.
-    | { type: 'pendingEditsChanged'; edits: Record<string, { value: string; base: string }> | null; editSessionId: string; sequence: number; sheetIndex?: number; sheetName?: string }
+    | { type: 'pendingEditsChanged'; edits: Record<string, { value: string; base: string }> | null; editSessionId: string; sequence: number; sheetIndex?: number; sheetName?: string; worksheetId?: string }
     /** Renderer close/reload barrier response; zero means no map was produced. */
     | { type: 'pendingEditsFlush'; requestId: string; editSessionId?: string; highestProducedSequence: number }
     /** The renderer could not establish the requested close/reload barrier. */
