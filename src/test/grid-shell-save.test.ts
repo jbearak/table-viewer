@@ -147,6 +147,7 @@ async function render_grid(
         save_lifecycle?: CsvSaveLifecycle;
         initial_edits?: Record<string, string | { value: string; base: string }>;
         edit_session?: EditSessionStore;
+        use_fallback_store?: boolean;
         host_rejected_keys?: readonly string[];
         on_editing_change?: (status: {
             is_dirty: boolean;
@@ -175,6 +176,18 @@ async function render_grid(
     document.body.appendChild(container);
     root = createRoot(container);
 
+    const {
+        use_fallback_store = false,
+        ...grid_save_props
+    } = save_props;
+    const test_edit_session = Object.prototype.hasOwnProperty.call(save_props, 'edit_session')
+        ? save_props.edit_session
+        : use_fallback_store
+            ? undefined
+            : create_edit_session_store(
+                { session_id: 'session-1' },
+                save_props.initial_edits,
+            );
     const props = {
         sheet_meta: {
             name: 'Sheet1',
@@ -196,18 +209,31 @@ async function render_grid(
         edit_mode: true,
         csv_editable: true,
         edit_session_id: 'session-1',
-        on_save_request: (edits: Record<string, string>, dirtyEdits: Record<string, {
-            value: string;
-            base: string;
-        }>) => ({
-            editSessionId: 'session-1',
-            sheetIndex: 0,
-            saveRequestId: `save-${++save_request_sequence}`,
-            edits,
-            dirtyEdits,
-        }),
+        ...(test_edit_session ? { edit_session: test_edit_session } : {}),
+        on_save_request: () => {
+            if (!test_edit_session) return undefined;
+            const snapshot = test_edit_session.snapshot();
+            const edits = Object.fromEntries([...snapshot].map(([key, entry]) => [
+                key,
+                entry.value,
+            ]));
+            const dirtyEdits = Object.fromEntries(snapshot);
+            if (Object.keys(edits).length === 0) return undefined;
+            const operation: CsvSaveOperation = {
+                editSessionId: 'session-1',
+                saveRequestId: `save-${++save_request_sequence}`,
+                worksheets: [{
+                    sheetIndex: 0,
+                    sheetName: 'Sheet1',
+                    edits,
+                    dirtyEdits,
+                }],
+            };
+            post_message({ type: 'saveCsv', operation });
+            return operation;
+        },
         editing_ref,
-        ...save_props,
+        ...grid_save_props,
     };
     const rerender_save_lifecycle = async (save_lifecycle: CsvSaveLifecycle) => {
         await act(async () => {
@@ -286,7 +312,7 @@ function save_messages(post_message: ReturnType<typeof vi.fn>) {
     return post_message.mock.calls
         .map(([msg]) => msg)
         .filter((msg) => msg && typeof msg === 'object' && 'type' in msg && msg.type === 'saveCsv')
-        .map((msg) => ({ type: msg.type, edits: msg.operation.edits }));
+        .map((msg) => ({ type: msg.type, edits: msg.operation.worksheets[0].edits }));
 }
 
 function pending_edit_messages(post_message: ReturnType<typeof vi.fn>) {
@@ -444,7 +470,7 @@ describe('GridShell CSV save', () => {
         await act(async () => {
             edit_session.install(
                 { session_id: 'session-1' },
-                save!.operation!.dirtyEdits,
+                save!.operation!.worksheets[0].dirtyEdits,
             );
         });
 
@@ -551,7 +577,7 @@ describe('GridShell CSV save', () => {
         expect(save_messages(post_message)).toEqual([{
             type: 'saveCsv', edits: { '0:0': 'open editor value' },
         }]);
-        expect(post_message.mock.calls.at(-1)?.[0].operation.dirtyEdits).toEqual({
+        expect(post_message.mock.calls.at(-1)?.[0].operation.worksheets[0].dirtyEdits).toEqual({
             '0:0': { value: 'open editor value', base: 'base' },
         });
         await edit_cell('too late');
@@ -561,15 +587,22 @@ describe('GridShell CSV save', () => {
     it('hydrates an active operation across remount and restores its exact map on failure', async () => {
         const operation: CsvSaveOperation = {
             editSessionId: 'session-1',
-            sheetIndex: 0,
             saveRequestId: 'accepted-overlay',
-            edits: { '0:0': 'overlay' },
-            dirtyEdits: {
-                '0:0': { value: 'overlay', base: 'exact-conflict-base' },
-            },
+            worksheets: [{
+                sheetIndex: 0,
+                edits: { '0:0': 'overlay' },
+                dirtyEdits: {
+                    '0:0': { value: 'overlay', base: 'exact-conflict-base' },
+                },
+            }],
         };
+        const edit_session = create_edit_session_store(
+            { session_id: 'session-1' },
+            operation.worksheets[0].dirtyEdits,
+        );
         const { post_message, editing_ref } = await render_grid(undefined, {
             save_lifecycle: { revision: 4, state: 'active', operation },
+            edit_session,
         });
 
         expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('overlay');
@@ -584,7 +617,7 @@ describe('GridShell CSV save', () => {
             } }));
         });
         expect(await request_save(editing_ref)).toBe(true);
-        expect(post_message.mock.calls.at(-1)?.[0].operation.dirtyEdits).toEqual({
+        expect(post_message.mock.calls.at(-1)?.[0].operation.worksheets[0].dirtyEdits).toEqual({
             '0:0': { value: 'overlay', base: 'exact-conflict-base' },
         });
     });
@@ -592,10 +625,12 @@ describe('GridShell CSV save', () => {
     it('keeps the exact dirty map locked through delayed idle before active acceptance', async () => {
         const failed: CsvSaveOperation = {
             editSessionId: 'older-session',
+        saveRequestId: 'failed-r2',
+        worksheets: [{
             sheetIndex: 0,
-            saveRequestId: 'failed-r2',
             edits: { '0:0': 'older' },
             dirtyEdits: { '0:0': { value: 'older', base: 'older-base' } },
+        }],
         };
         const { post_message, editing_ref, rerender_save_lifecycle } = await render_grid(undefined, {
             save_lifecycle: { revision: 2, state: 'failed', operation: failed },
@@ -619,14 +654,17 @@ describe('GridShell CSV save', () => {
     it('does not rehydrate operation-owned edits from a succeeded snapshot', async () => {
         const operation: CsvSaveOperation = {
             editSessionId: 'session-1',
+        saveRequestId: 'already-written',
+        worksheets: [{
             sheetIndex: 0,
-            saveRequestId: 'already-written',
             edits: { '0:0': 'saved' },
             dirtyEdits: { '0:0': { value: 'saved', base: 'base' } },
+        }],
         };
         const { editing_ref } = await render_grid(undefined, {
             save_lifecycle: { revision: 8, state: 'succeeded', operation },
-            initial_edits: operation.dirtyEdits,
+            initial_edits: operation.worksheets[0].dirtyEdits,
+            use_fallback_store: true,
         });
 
         expect(editing_ref.current!.has_uncommitted_changes()).toBe(false);
@@ -637,10 +675,12 @@ describe('GridShell CSV save', () => {
         const newer = { '0:0': { value: 'newer', base: 'new-base' } };
         const failed: CsvSaveOperation = {
             editSessionId: 'old-session',
+        saveRequestId: 'old-failure',
+        worksheets: [{
             sheetIndex: 0,
-            saveRequestId: 'old-failure',
             edits: { '0:0': 'old' },
             dirtyEdits: { '0:0': { value: 'old', base: 'old-base' } },
+        }],
         };
         const { post_message, editing_ref } = await render_grid(undefined, {
             save_lifecycle: { revision: 8, state: 'failed', operation: failed },
@@ -649,17 +689,19 @@ describe('GridShell CSV save', () => {
 
         expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('newer');
         expect(await request_save(editing_ref)).toBe(true);
-        expect(post_message.mock.calls.at(-1)?.[0].operation.dirtyEdits).toEqual(newer);
+        expect(post_message.mock.calls.at(-1)?.[0].operation.worksheets[0].dirtyEdits).toEqual(newer);
     });
 
     it('preserves a newer session across an older succeeded lifecycle', async () => {
         const newer = { '0:0': { value: 'newer', base: 'new-base' } };
         const succeeded: CsvSaveOperation = {
             editSessionId: 'old-session',
+        saveRequestId: 'old-success',
+        worksheets: [{
             sheetIndex: 0,
-            saveRequestId: 'old-success',
             edits: { '0:0': 'old' },
             dirtyEdits: { '0:0': { value: 'old', base: 'old-base' } },
+        }],
         };
         const { post_message, editing_ref } = await render_grid(undefined, {
             save_lifecycle: { revision: 8, state: 'succeeded', operation: succeeded },
@@ -668,17 +710,19 @@ describe('GridShell CSV save', () => {
 
         expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('newer');
         expect(await request_save(editing_ref)).toBe(true);
-        expect(post_message.mock.calls.at(-1)?.[0].operation.dirtyEdits).toEqual(newer);
+        expect(post_message.mock.calls.at(-1)?.[0].operation.worksheets[0].dirtyEdits).toEqual(newer);
     });
 
     it('ignores a live failed lifecycle from a different session', async () => {
         const newer = { '0:0': { value: 'newer', base: 'new-base' } };
         const failed: CsvSaveOperation = {
             editSessionId: 'old-session',
+        saveRequestId: 'old-failure',
+        worksheets: [{
             sheetIndex: 0,
-            saveRequestId: 'old-failure',
             edits: { '0:0': 'old' },
             dirtyEdits: { '0:0': { value: 'old', base: 'old-base' } },
+        }],
         };
         const { post_message, editing_ref } = await render_grid(undefined, {
             initial_edits: newer,
@@ -694,18 +738,20 @@ describe('GridShell CSV save', () => {
 
         expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('newer');
         expect(await request_save(editing_ref)).toBe(true);
-        expect(post_message.mock.calls.at(-1)?.[0].operation.dirtyEdits).toEqual(newer);
+        expect(post_message.mock.calls.at(-1)?.[0].operation.worksheets[0].dirtyEdits).toEqual(newer);
     });
 
     it('ignores an active lifecycle for another sheet in the workbook session', async () => {
         const own = { '0:0': { value: 'own draft', base: 'base' } };
         const other: CsvSaveOperation = {
             editSessionId: 'session-1',
+        saveRequestId: 'other-sheet-save',
+        worksheets: [{
             sheetIndex: 1,
             sheetName: 'Sheet2',
-            saveRequestId: 'other-sheet-save',
             edits: { '0:0': 'other draft' },
             dirtyEdits: { '0:0': { value: 'other draft', base: 'other base' } },
+        }],
         };
         const store = create_edit_session_store({ session_id: 'session-1' }, own);
         const { editing_ref } = await render_grid(undefined, { edit_session: store });
@@ -766,6 +812,7 @@ describe('GridShell edits across a generation bump', () => {
         // this ever starts reporting 'survivor', the test above proves nothing.
         const { remount_at_generation } = await render_grid(undefined, {
             generation: 1,
+            use_fallback_store: true,
         });
 
         await edit_cell('survivor');
@@ -864,10 +911,12 @@ describe('GridShell edits across a generation bump', () => {
         // install — including a session the host has since replaced.
         const failed: CsvSaveOperation = {
             editSessionId: 'session-1',
+        saveRequestId: 'failed-save',
+        worksheets: [{
             sheetIndex: 0,
-            saveRequestId: 'failed-save',
             edits: { '0:0': 'from-failed' },
             dirtyEdits: { '0:0': { value: 'from-failed', base: 'base' } },
+        }],
         };
         const store = create_edit_session_store({ session_id: 'session-1' }, {
             '0:1': { value: 'store-only', base: 'middle' },
@@ -936,8 +985,8 @@ describe('GridShell source-keyed save payloads', () => {
         // Display-keyed, this would post '0:0' — and its base would be whatever
         // source row 0 holds, which is not the text the user was looking at.
         const operation = posted_save(post_message);
-        expect(operation.edits).toEqual({ '5:0': 'typed' });
-        expect(operation.dirtyEdits).toEqual({
+        expect(operation.worksheets[0].edits).toEqual({ '5:0': 'typed' });
+        expect(operation.worksheets[0].dirtyEdits).toEqual({
             '5:0': { value: 'typed', base: 'five-a' },
         });
     });
@@ -952,8 +1001,8 @@ describe('GridShell source-keyed save payloads', () => {
         // read_live_edit builds the key, so a display-keyed LiveEdit would poison
         // the collectors even though nothing was ever committed through commit_edit.
         const operation = posted_save(post_message);
-        expect(operation.edits).toEqual({ '5:0': 'overlay-text' });
-        expect(operation.dirtyEdits).toEqual({
+        expect(operation.worksheets[0].edits).toEqual({ '5:0': 'overlay-text' });
+        expect(operation.worksheets[0].dirtyEdits).toEqual({
             '5:0': { value: 'overlay-text', base: 'five-a' },
         });
     });

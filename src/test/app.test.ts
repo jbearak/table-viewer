@@ -78,22 +78,9 @@ vi.mock('../webview/grid-shell', () => ({
         merges: { startRow: number }[];
         edit_mode?: boolean;
         edit_session_id?: string;
-        save_operation?: {
-            editSessionId: string;
-            saveRequestId: string;
-            edits: Readonly<Record<string, string>>;
-            dirtyEdits: Readonly<Record<string, { value: string; base: string }>>;
-        };
+        save_operation?: CsvSaveOperation;
         save_lifecycle?: CsvSaveLifecycle;
-        on_save_request?: (
-            edits: Record<string, string>,
-            dirtyEdits: Record<string, { value: string; base: string }>,
-        ) => {
-            editSessionId: string;
-            saveRequestId: string;
-            edits: Readonly<Record<string, string>>;
-            dirtyEdits: Readonly<Record<string, { value: string; base: string }>>;
-        } | undefined;
+        on_save_request?: () => CsvSaveOperation | undefined;
         edit_session?: EditSessionStore;
         host_rejected_keys?: readonly string[];
         on_editing_change?: (status: { is_dirty: boolean; has_live_uncommitted: boolean; save_in_flight: boolean; edits: Record<string, { value: string; base: string }>; conflicted: string[] }) => void;
@@ -245,12 +232,7 @@ vi.mock('../webview/grid-shell', () => ({
             props.editing_ref.current = {
                 request_save: () => {
                     const result = grid_shell_mock.request_save();
-                    if (!props.save_operation) {
-                        props.on_save_request?.(
-                            { '0:0': 'dirty' },
-                            { '0:0': { value: 'dirty', base: 'base' } },
-                        );
-                    }
+                    if (!props.save_operation) props.on_save_request?.();
                     return result;
                 },
                 clear_dirty: grid_shell_mock.clear_dirty,
@@ -456,45 +438,33 @@ async function dispatch_host_message(input: HostMessage | Record<string, unknown
             editSessionId: request?.editSessionId ?? 'test-edit-session',
         };
     } else if (msg.type === 'saveOperationStarted' && msg.lifecycle === undefined) {
-        const operation = msg.operation as Record<string, unknown>;
+        const operation = msg.operation as CsvSaveOperation;
         msg = {
             type: msg.type,
             lifecycle: {
                 revision: ++save_lifecycle_revision,
                 state: 'active',
-                operation: {
-                    ...operation,
-                    dirtyEdits: operation.dirtyEdits
-                        ?? Object.fromEntries(Object.entries(
-                            (operation.edits ?? {}) as Record<string, string>,
-                        ).map(([key, value]) => [key, { value, base: 'base' }])),
-                },
+                operation,
             },
         };
     } else if (
         (msg.type === 'saveResult' || msg.type === 'editSessionRevoked')
         && msg.lifecycle === undefined
     ) {
-        const operation = grid_shell_mock.latest_props?.save_operation as {
-            editSessionId: string;
-            sheetIndex: number;
-            sheetName?: string;
-            saveRequestId: string;
-            edits: Record<string, string>;
-            dirtyEdits: Record<string, { value: string; base: string }>;
-        } | undefined;
-        const terminal_operation = {
-            editSessionId: msg.editSessionId ?? operation?.editSessionId
-                ?? 'test-edit-session',
-            sheetIndex: operation?.sheetIndex ?? 0,
-            ...(operation?.sheetName !== undefined
-                ? { sheetName: operation.sheetName }
-                : {}),
-            saveRequestId: msg.saveRequestId ?? operation?.saveRequestId
-                ?? 'legacy-save-request',
-            edits: operation?.edits ?? { '0:0': 'dirty' },
-            dirtyEdits: operation?.dirtyEdits
-                ?? { '0:0': { value: 'dirty', base: 'base' } },
+        const operation = grid_shell_mock.latest_props?.save_operation as
+            CsvSaveOperation | undefined;
+        const terminal_operation: CsvSaveOperation = operation ?? {
+            editSessionId: typeof msg.editSessionId === 'string'
+                ? msg.editSessionId
+                : 'test-edit-session',
+            saveRequestId: typeof msg.saveRequestId === 'string'
+                ? msg.saveRequestId
+                : 'legacy-save-request',
+            worksheets: [{
+                sheetIndex: 0,
+                edits: { '0:0': 'dirty' },
+                dirtyEdits: { '0:0': { value: 'dirty', base: 'base' } },
+            }],
         };
         msg = {
             type: msg.type,
@@ -689,6 +659,20 @@ async function enter_edit_mode(
         granted: true,
         editSessionId: edit_session_id,
     });
+}
+
+function seed_mounted_store(
+    edits: Record<string, { value: string; base: string }> = {
+        '0:0': { value: 'dirty', base: 'base' },
+    },
+) {
+    const props = grid_shell_mock.latest_props as {
+        edit_session?: EditSessionStore;
+        edit_session_id?: string;
+    } | null;
+    expect(props?.edit_session).toBeDefined();
+    expect(props?.edit_session_id).toBeDefined();
+    props!.edit_session!.replace(props!.edit_session_id, edits);
 }
 
 async function report_grid_editing(
@@ -3548,6 +3532,7 @@ describe('edit mode save exit', () => {
             })
         );
         await enter_edit_mode(post_message);
+        seed_mounted_store();
 
         post_message.mockClear();
         await click_button('Edit');
@@ -3663,31 +3648,15 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
 
         await click_sheet_tab('People');
-        // The pointer names Inventory, so People renders read-only until its own
-        // grant lands — but it must not be handed the other sheet's dirty map.
-        // Read-only is not enough on its own: the grid paints a dirty value and
-        // its tint whenever an edit exists for the key, edit mode or not, so
-        // sheet 1's '0:0' would show up as sheet 0's own edited cell.
+        // The grant is workbook-scoped: every worksheet is editable immediately,
+        // while each grid still projects only its own store.
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
-        expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
-        // The session covers the whole workbook, so Edit here is an *entry*:
-        // enabled, and pressing it asks the host for this sheet's own grant of
-        // the same session rather than being refused.
-        expect(get_button('Edit').getAttribute('aria-disabled')).not.toBe('true');
-        post_message.mockClear();
-        await click_button('Edit');
-        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
-            type: 'requestEditSession',
-            sheetIndex: 0,
-        }));
-        await dispatch_host_message({
-            type: 'editSessionResult',
-            granted: true,
-            editSessionId: 'workbook-session',
-            sheetIndex: 0,
-        });
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
+        expect(get_button('Edit').getAttribute('aria-disabled')).not.toBe('true');
+        expect(post_message.mock.calls.filter(([message]) => (
+            message?.type === 'requestEditSession'
+        ))).toHaveLength(1);
 
         // Returning to the first edited sheet finds its edits exactly as they
         // were — the pointer moved, the session and Inventory's store did not.
@@ -3697,7 +3666,7 @@ describe('edit mode save exit', () => {
         );
     });
 
-    it('retains the workbook session when a sibling entry request is refused', async () => {
+    it('does not request another session when switching worksheets', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(
             initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
@@ -3714,19 +3683,14 @@ describe('edit mode save exit', () => {
             editSessionId: 'workbook-session',
             sheetIndex: 0,
         });
-        await click_sheet_tab('Inventory');
         post_message.mockClear();
-        await click_button('Edit');
-        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
-            type: 'requestEditSession',
-            sheetIndex: 1,
-        }));
-
-        await dispatch_host_message({ type: 'editSessionResult', granted: false });
-        await click_sheet_tab('People');
+        await click_sheet_tab('Inventory');
 
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
         expect(grid_shell_mock.latest_props?.edit_session_id).toBe('workbook-session');
+        expect(post_message).not.toHaveBeenCalledWith(
+            expect.objectContaining({ type: 'requestEditSession' })
+        );
         expect(post_message).not.toHaveBeenCalledWith(
             expect.objectContaining({ type: 'releaseEditSession' })
         );
@@ -4326,11 +4290,13 @@ describe('edit mode save exit', () => {
                         state: 'active',
                         operation: {
                             editSessionId: 'restored-session',
-                            sheetIndex: 0,
-                            sheetName: 'People',
                             saveRequestId: 'people-save',
-                            edits: { '0:0': 'Bob' },
-                            dirtyEdits: people,
+                            worksheets: [{
+                                sheetIndex: 0,
+                                sheetName: 'People',
+                                edits: { '0:0': 'Bob' },
+                                dirtyEdits: people,
+                            }],
                         },
                     },
                 },
@@ -4449,15 +4415,8 @@ describe('edit mode save exit', () => {
                 },
             })
         );
-        // The pointer adopted Inventory (the dirty slot); walk it back to People
-        // so the mounted grid \u2014 clean \u2014 is not the sheet holding the work.
-        await click_button('Edit');
-        await dispatch_host_message({
-            type: 'editSessionResult',
-            granted: true,
-            editSessionId: 'restored-session',
-            sheetIndex: 0,
-        });
+        // The restored workbook session is active while People is mounted clean;
+        // Inventory's registry store still owns the unsaved work.
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
         expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
@@ -4485,14 +4444,6 @@ describe('edit mode save exit', () => {
             })
         );
         await click_button('Edit');
-        await dispatch_host_message({
-            type: 'editSessionResult',
-            granted: true,
-            editSessionId: 'restored-session',
-            sheetIndex: 0,
-        });
-
-        await click_button('Edit');
         const dialog = post_message.mock.calls
             .map(([message]) => message)
             .find((message) => message?.type === 'showSaveDialog');
@@ -4504,14 +4455,17 @@ describe('edit mode save exit', () => {
             choice: 'save',
         });
 
-        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
         expect(grid_shell_mock.request_save).toHaveBeenCalledTimes(1);
         expect(grid_shell_mock.latest_props?.save_operation).toMatchObject({
             editSessionId: 'restored-session',
-            sheetIndex: 1,
-            sheetName: 'Inventory',
+            worksheets: [{
+                sheetIndex: 1,
+                sheetName: 'Inventory',
+                edits: { '0:0': 'Gadget' },
+            }],
         });
-        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+        expect(post_message).not.toHaveBeenCalledWith(expect.objectContaining({
             type: 'stateChanged',
             state: expect.objectContaining({ activeSheetIndex: 1 }),
         }));
@@ -4582,13 +4536,15 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
         expect(grid_shell_mock.latest_props?.save_operation).toMatchObject({
             editSessionId: 'restored-session',
-            sheetIndex: 0,
-            sheetName: 'Inventory',
-            worksheetId: '2',
+            worksheets: [{
+                sheetIndex: 0,
+                sheetName: 'Inventory',
+                worksheetId: '2',
+            }],
         });
     });
 
-    it('does not present one worksheet save as saving multiple dirty worksheets', async () => {
+    it('saves multiple dirty worksheets atomically', async () => {
         grid_shell_mock.has_uncommitted_changes = true;
         const { post_message } = await render_app();
         await dispatch_host_message(
@@ -4625,11 +4581,20 @@ describe('edit mode save exit', () => {
             choice: 'save',
         });
 
-        expect(grid_shell_mock.request_save).not.toHaveBeenCalled();
+        expect(grid_shell_mock.request_save).toHaveBeenCalledTimes(1);
         expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
-            type: 'showWarning',
-            message: expect.stringContaining('More than one worksheet'),
+            type: 'saveCsv',
+            operation: expect.objectContaining({
+                editSessionId: 'restored-session',
+                worksheets: [
+                    expect.objectContaining({ sheetIndex: 0, sheetName: 'People' }),
+                    expect.objectContaining({ sheetIndex: 1, sheetName: 'Inventory' }),
+                ],
+            }),
         }));
+        expect(post_message).not.toHaveBeenCalledWith(
+            expect.objectContaining({ type: 'showWarning' })
+        );
         expect(post_message).not.toHaveBeenCalledWith(
             expect.objectContaining({ type: 'releaseEditSession' })
         );
@@ -5109,17 +5074,25 @@ describe('edit mode save exit', () => {
                 state: 'active',
                 operation: {
                     editSessionId: 'people-session',
-                    sheetIndex: 0,
                     saveRequestId: 'save-1',
-                    edits: { '0:0': 'Alicia' },
-                    dirtyEdits: { '0:0': { value: 'Alicia', base: 'Alice' } },
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: { '0:0': 'Alicia' },
+                        dirtyEdits: { '0:0': { value: 'Alicia', base: 'Alice' } },
+                    }],
                 },
             },
         });
 
         await click_sheet_tab('Inventory');
-        expect(grid_shell_mock.latest_props?.save_operation).toBeUndefined();
-        expect(grid_shell_mock.latest_props?.save_lifecycle).toBeUndefined();
+        expect(grid_shell_mock.latest_props?.save_operation).toMatchObject({
+            editSessionId: 'people-session',
+            worksheets: [expect.objectContaining({ sheetIndex: 0 })],
+        });
+        expect(grid_shell_mock.latest_props?.save_lifecycle).toMatchObject({
+            state: 'active',
+            operation: expect.objectContaining({ editSessionId: 'people-session' }),
+        });
     });
 
     it('keeps the save fence while a non-owning worksheet is on screen', async () => {
@@ -5149,10 +5122,12 @@ describe('edit mode save exit', () => {
                 state: 'active',
                 operation: {
                     editSessionId: 'people-session',
-                    sheetIndex: 0,
                     saveRequestId: 'save-1',
-                    edits: { '0:0': 'Alicia' },
-                    dirtyEdits: { '0:0': { value: 'Alicia', base: 'Alice' } },
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: { '0:0': 'Alicia' },
+                        dirtyEdits: { '0:0': { value: 'Alicia', base: 'Alice' } },
+                    }],
                 },
             },
         });
@@ -5188,14 +5163,13 @@ describe('edit mode save exit', () => {
         const flush = post_message.mock.calls
             .map(([message]) => message)
             .find((message) => message?.type === 'pendingEditsFlush');
-        // Fenced: the flush reports the sequence already produced rather than
-        // publishing a new one that could never be acknowledged.
-        expect(flush?.highestProducedSequence).toBe(0);
-        expect(
-            post_message.mock.calls.some(
-                ([message]) => message?.type === 'pendingEditsChanged',
-            ),
-        ).toBe(false);
+        // Every mounted worksheet participates in the workbook session. The flush
+        // may publish its current store, but it must report the sequence it actually
+        // produced rather than advertising an untracked future write.
+        const pending = post_message.mock.calls.filter(
+            ([message]) => message?.type === 'pendingEditsChanged',
+        );
+        expect(flush?.highestProducedSequence).toBeGreaterThanOrEqual(pending.length);
     });
 
     it('keeps the pointer sheet’s newer edits when a sibling grid reports clean', async () => {
@@ -5219,10 +5193,12 @@ describe('edit mode save exit', () => {
         });
         const operation: CsvSaveOperation = {
             editSessionId: 'people-session',
-            sheetIndex: 0,
             saveRequestId: 'save-1',
-            edits: { '0:0': 'Alicia' },
-            dirtyEdits: { '0:0': { value: 'Alicia', base: 'Alice' } },
+            worksheets: [{
+                sheetIndex: 0,
+                edits: { '0:0': 'Alicia' },
+                dirtyEdits: { '0:0': { value: 'Alicia', base: 'Alice' } },
+            }],
         };
         await dispatch_host_message({
             type: 'saveOperationStarted',
@@ -5237,7 +5213,7 @@ describe('edit mode save exit', () => {
                 has_live_uncommitted: false,
                 save_in_flight: true,
                 edits: {
-                    ...operation.dirtyEdits,
+                    ...operation.worksheets[0].dirtyEdits,
                     '1:0': { value: 'newer', base: 'before' },
                 },
                 conflicted: [],
@@ -5285,10 +5261,12 @@ describe('edit mode save exit', () => {
                 state: 'active',
                 operation: {
                     editSessionId: 'people-session',
-                    sheetIndex: 0,
                     saveRequestId: 'save-1',
-                    edits: { '0:0': 'Alicia' },
-                    dirtyEdits: { '0:0': { value: 'Alicia', base: 'Alice' } },
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: { '0:0': 'Alicia' },
+                        dirtyEdits: { '0:0': { value: 'Alicia', base: 'Alice' } },
+                    }],
                 },
             },
         });
@@ -5331,10 +5309,12 @@ describe('edit mode save exit', () => {
         });
         const operation = {
             editSessionId: 'people-session',
-            sheetIndex: 0,
             saveRequestId: 'save-1',
-            edits: { '0:0': 'Alicia' },
-            dirtyEdits: { '0:0': { value: 'Alicia', base: 'Alice' } },
+            worksheets: [{
+                sheetIndex: 0,
+                edits: { '0:0': 'Alicia' },
+                dirtyEdits: { '0:0': { value: 'Alicia', base: 'Alice' } },
+            }],
         };
         await dispatch_host_message({
             type: 'saveOperationStarted',
@@ -5403,7 +5383,7 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
         await click_sheet_tab('People');
-        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
     });
 
     it('restores a clean owned edit session after receiver recreation', async () => {
@@ -5448,6 +5428,7 @@ describe('edit mode save exit', () => {
         expect(latest_store_edits()).toEqual(stale);
 
         await click_button('Edit');
+        await dispatch_host_message({ type: 'saveDialogResult', choice: 'discard' });
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
         await click_button('Edit');
         const before_grant = grid_stub().getAttribute('data-mount-id');
@@ -5532,10 +5513,12 @@ describe('edit mode save exit', () => {
         post_message.mockClear();
         const operation: CsvSaveOperation = {
             editSessionId: 'test-edit-session',
-            sheetIndex: 0,
             saveRequestId: 'save:matching',
-            edits: { '0:0': 'draft' },
-            dirtyEdits: { '0:0': { value: 'draft', base: 'a' } },
+            worksheets: [{
+                sheetIndex: 0,
+                edits: { '0:0': 'draft' },
+                dirtyEdits: { '0:0': { value: 'draft', base: 'a' } },
+            }],
         };
         await dispatch_host_message({
             type: 'saveOperationStarted',
@@ -5611,6 +5594,7 @@ describe('edit mode save exit', () => {
             capabilities: { csvEditable: true, csvEditingSupported: true },
         }));
         await enter_edit_mode(post_message);
+        seed_mounted_store();
         const before_mount = grid_stub().getAttribute('data-mount-id');
 
         await click_button('Edit');
@@ -5654,10 +5638,12 @@ describe('edit mode save exit', () => {
         grid_shell_mock.has_uncommitted_changes = true;
         const previous: CsvSaveOperation = {
             editSessionId: 'session-delayed-idle',
-            sheetIndex: 0,
             saveRequestId: 'failed-r2',
-            edits: { '0:0': 'old' },
-            dirtyEdits: { '0:0': { value: 'old', base: 'old-base' } },
+            worksheets: [{
+                sheetIndex: 0,
+                edits: { '0:0': 'old' },
+                dirtyEdits: { '0:0': { value: 'old', base: 'old-base' } },
+            }],
         };
         await render_app();
         const meta = make_meta(['Sheet1'], false);
@@ -5681,7 +5667,7 @@ describe('edit mode save exit', () => {
         expect(proposed.saveRequestId).toEqual(expect.any(String));
 
         await dispatch_host_message(refresh_snapshot_message(meta, {
-            state: { pendingEdits: sheet_edits(proposed.dirtyEdits) },
+            state: { pendingEdits: sheet_edits(proposed.worksheets[0].dirtyEdits) },
             capabilities: {
                 csvEditable: true,
                 csvEditingSupported: true,
@@ -5690,14 +5676,14 @@ describe('edit mode save exit', () => {
             },
         }));
         expect(grid_shell_mock.latest_props?.save_operation).toEqual(proposed);
-        expect(latest_store_edits()).toEqual(proposed.dirtyEdits);
+        expect(latest_store_edits()).toEqual(proposed.worksheets[0].dirtyEdits);
 
         await dispatch_host_message({
             type: 'saveOperationStarted',
             lifecycle: { revision: 4, state: 'active', operation: proposed },
         });
         expect(grid_shell_mock.latest_props?.save_operation).toEqual(proposed);
-        expect(latest_store_edits()).toEqual(proposed.dirtyEdits);
+        expect(latest_store_edits()).toEqual(proposed.worksheets[0].dirtyEdits);
     });
 
     it('applies a succeeded save lifecycle to a non-pointer worksheet on initial hydration', async () => {
@@ -5707,12 +5693,14 @@ describe('edit mode save exit', () => {
         meta.sheets[1].worksheetId = '2';
         const operation: CsvSaveOperation = {
             editSessionId: 'restored-session',
-            sheetIndex: 1,
-            sheetName: 'Inventory',
-            worksheetId: '2',
             saveRequestId: 'saved-inventory',
-            edits: { '0:0': 'Gadget' },
-            dirtyEdits: { '0:0': { value: 'Gadget', base: 'Widget' } },
+            worksheets: [{
+                sheetIndex: 1,
+                sheetName: 'Inventory',
+                worksheetId: '2',
+                edits: { '0:0': 'Gadget' },
+                dirtyEdits: { '0:0': { value: 'Gadget', base: 'Widget' } },
+            }],
         };
         await dispatch_host_message(initial_snapshot_message(meta, {
             state: {
@@ -5725,7 +5713,7 @@ describe('edit mode save exit', () => {
                     {
                         sheetName: 'Inventory',
                         worksheetId: '2',
-                        cells: operation.dirtyEdits,
+                        cells: operation.worksheets[0].dirtyEdits,
                     },
                 ],
             },
@@ -5763,6 +5751,7 @@ describe('edit mode save exit', () => {
             },
         }));
         await enter_edit_mode(post_message);
+        seed_mounted_store();
         await click_button('Edit');
         await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
         const operation = grid_shell_mock.latest_props?.save_operation as CsvSaveOperation;
@@ -5788,7 +5777,7 @@ describe('edit mode save exit', () => {
 
         expect(grid_shell_mock.latest_props?.save_operation).toBeUndefined();
         expect(latest_store_edits()).toEqual(
-            operation.dirtyEdits,
+            operation.worksheets[0].dirtyEdits,
         );
         expect(grid_stub().getAttribute('data-generation')).toBe('1');
     });
@@ -5796,12 +5785,14 @@ describe('edit mode save exit', () => {
     it('rehydrates an exact failed operation even when durable pending state is absent', async () => {
         const operation: CsvSaveOperation = {
             editSessionId: 'failed-session',
-            sheetIndex: 0,
             saveRequestId: 'failed-before-acceptance',
-            edits: { '0:0': 'overlay' },
-            dirtyEdits: {
-                '0:0': { value: 'overlay', base: 'exact-base' },
-            },
+            worksheets: [{
+                sheetIndex: 0,
+                edits: { '0:0': 'overlay' },
+                dirtyEdits: {
+                    '0:0': { value: 'overlay', base: 'exact-base' },
+                },
+            }],
         };
         await render_app();
         await dispatch_host_message(initial_snapshot_message(
@@ -5822,7 +5813,7 @@ describe('edit mode save exit', () => {
 
         expect(grid_shell_mock.latest_props?.save_operation).toBeUndefined();
         expect(latest_store_edits()).toEqual(
-            operation.dirtyEdits,
+            operation.worksheets[0].dirtyEdits,
         );
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
     });
@@ -5831,10 +5822,12 @@ describe('edit mode save exit', () => {
         const newer = { '0:0': { value: 'newer', base: 'new-base' } };
         const failed: CsvSaveOperation = {
             editSessionId: 'old-session',
-            sheetIndex: 0,
             saveRequestId: 'old-failure',
-            edits: { '0:0': 'old' },
-            dirtyEdits: { '0:0': { value: 'old', base: 'old-base' } },
+            worksheets: [{
+                sheetIndex: 0,
+                edits: { '0:0': 'old' },
+                dirtyEdits: { '0:0': { value: 'old', base: 'old-base' } },
+            }],
         };
         await render_app();
         await dispatch_host_message(initial_snapshot_message(
@@ -5861,16 +5854,18 @@ describe('edit mode save exit', () => {
     it('tombstones stale pending edits for a succeeded current session', async () => {
         const succeeded: CsvSaveOperation = {
             editSessionId: 'saved-session',
-            sheetIndex: 0,
             saveRequestId: 'saved-operation',
-            edits: { '0:0': 'saved' },
-            dirtyEdits: { '0:0': { value: 'saved', base: 'base' } },
+            worksheets: [{
+                sheetIndex: 0,
+                edits: { '0:0': 'saved' },
+                dirtyEdits: { '0:0': { value: 'saved', base: 'base' } },
+            }],
         };
         await render_app();
         await dispatch_host_message(initial_snapshot_message(
             make_meta(['Sheet1'], false),
             {
-                state: { pendingEdits: sheet_edits(succeeded.dirtyEdits) },
+                state: { pendingEdits: sheet_edits(succeeded.worksheets[0].dirtyEdits) },
                 capabilities: {
                     csvEditable: true,
                     csvEditingSupported: true,
@@ -5891,10 +5886,12 @@ describe('edit mode save exit', () => {
     it('keeps saved entries cleared across reliable success, remount, and edit reacquisition', async () => {
         const operation: CsvSaveOperation = {
             editSessionId: 'saved-session',
-            sheetIndex: 0,
             saveRequestId: 'saved-operation',
-            edits: { '0:0': 'saved' },
-            dirtyEdits: { '0:0': { value: 'saved', base: 'base' } },
+            worksheets: [{
+                sheetIndex: 0,
+                edits: { '0:0': 'saved' },
+                dirtyEdits: { '0:0': { value: 'saved', base: 'base' } },
+            }],
         };
         const lifecycle = {
             revision: 4,
@@ -5908,7 +5905,7 @@ describe('edit mode save exit', () => {
         await dispatch_host_message(initial_snapshot_message(
             make_meta(['Sheet1'], false),
             {
-                state: { pendingEdits: sheet_edits(operation.dirtyEdits) },
+                state: { pendingEdits: sheet_edits(operation.worksheets[0].dirtyEdits) },
                 capabilities: {
                     csvEditable: false,
                     csvEditingSupported: true,
@@ -5955,10 +5952,12 @@ describe('edit mode save exit', () => {
         const newer = { '0:0': { value: 'newer', base: 'new-base' } };
         const succeeded: CsvSaveOperation = {
             editSessionId: 'old-session',
-            sheetIndex: 0,
             saveRequestId: 'old-success',
-            edits: { '0:0': 'old' },
-            dirtyEdits: { '0:0': { value: 'old', base: 'old-base' } },
+            worksheets: [{
+                sheetIndex: 0,
+                edits: { '0:0': 'old' },
+                dirtyEdits: { '0:0': { value: 'old', base: 'old-base' } },
+            }],
         };
         await render_app();
         await dispatch_host_message(initial_snapshot_message(
@@ -5999,6 +5998,7 @@ describe('edit mode save exit', () => {
 
         await enter_edit_mode(post_message);
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        seed_mounted_store();
 
         post_message.mockClear();
         await click_button('Edit');
@@ -6030,6 +6030,7 @@ describe('edit mode save exit', () => {
 
         await enter_edit_mode(post_message);
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        seed_mounted_store();
 
         post_message.mockClear();
         await click_button('Edit');
@@ -6061,6 +6062,7 @@ describe('edit mode save exit', () => {
 
         await enter_edit_mode(post_message);
         await report_grid_editing(false, true);
+        seed_mounted_store();
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
 
         post_message.mockClear();
@@ -6092,6 +6094,7 @@ describe('edit mode save exit', () => {
 
         await enter_edit_mode(post_message);
         await report_grid_editing(false, true);
+        seed_mounted_store();
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
 
         post_message.mockClear();
@@ -6128,6 +6131,7 @@ describe('edit mode save exit', () => {
 
         await enter_edit_mode(post_message);
         await report_grid_editing(false, true);
+        seed_mounted_store();
         post_message.mockClear();
         await click_button('Edit');
         expect(post_message).toHaveBeenCalledWith(expect.objectContaining({ type: 'showSaveDialog' }));
@@ -6161,6 +6165,7 @@ describe('edit mode save exit', () => {
 
         await enter_edit_mode(post_message);
         await report_grid_editing(false, true);
+        seed_mounted_store();
         post_message.mockClear();
         await click_button('Edit');
         expect(post_message).toHaveBeenCalledWith(expect.objectContaining({ type: 'showSaveDialog' }));
@@ -6251,10 +6256,12 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
-                    sheetIndex: 0,
                     saveRequestId: 'rehydration:1',
-                    edits: { '4:1': 'edited' },
-                    dirtyEdits: restored,
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: { '4:1': 'edited' },
+                        dirtyEdits: restored,
+                    }],
                 },
             },
             rejection: { reason: 'baseMismatch', keys: ['4:1'] },
@@ -6287,10 +6294,12 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
-                    sheetIndex: 0,
                     saveRequestId: 'save-1',
-                    edits: { '4:1': 'edited' },
-                    dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: { '4:1': 'edited' },
+                        dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                    }],
                 },
             },
             rejection: { reason: 'baseMismatch', keys: ['4:1'] },
@@ -6333,13 +6342,15 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
-                    sheetIndex: 0,
                     saveRequestId: 'save-2',
-                    edits: { '7:0': 'orphan', '7:2': 'orphan too' },
-                    dirtyEdits: {
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: { '7:0': 'orphan', '7:2': 'orphan too' },
+                        dirtyEdits: {
                         '7:0': { value: 'orphan', base: 'gone' },
                         '7:2': { value: 'orphan too', base: 'gone' },
                     },
+                    }],
                 },
             },
             rejection: { reason: 'rowsRemoved', keys: ['7:0', '7:2'] },
@@ -6381,13 +6392,15 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
-                    sheetIndex: 0,
                     saveRequestId: 'save-3',
-                    edits: { '4:1': 'edited', '0:0': 'fine' },
-                    dirtyEdits: {
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: { '4:1': 'edited', '0:0': 'fine' },
+                        dirtyEdits: {
                         '4:1': { value: 'edited', base: 'stale' },
                         '0:0': { value: 'fine', base: 'a' },
                     },
+                    }],
                 },
             },
             rejection: { reason: 'baseMismatch', keys: ['4:1'] },
@@ -6431,11 +6444,13 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
-                    sheetIndex: 0,
-                    sheetName: 'People',
                     saveRequestId: 'save-sheet-scope',
-                    edits: { '4:1': 'edited' },
-                    dirtyEdits: edits,
+                    worksheets: [{
+                        sheetIndex: 0,
+                        sheetName: 'People',
+                        edits: { '4:1': 'edited' },
+                        dirtyEdits: edits,
+                    }],
                 },
             },
             rejection: { reason: 'baseMismatch', keys: ['4:1'] },
@@ -6479,13 +6494,15 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
-                    sheetIndex: 0,
                     saveRequestId: 'save-4',
-                    edits: { '4:1': 'edited', '9:3': 'local' },
-                    dirtyEdits: {
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: { '4:1': 'edited', '9:3': 'local' },
+                        dirtyEdits: {
                         '4:1': { value: 'edited', base: 'stale' },
                         '9:3': { value: 'local', base: 'drifted' },
                     },
+                    }],
                 },
             },
             rejection: { reason: 'baseMismatch', keys: ['4:1'] },
@@ -6524,13 +6541,15 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
-                    sheetIndex: 0,
                     saveRequestId: 'save-4',
-                    edits: { '4:1': 'edited', '0:0': 'fine' },
-                    dirtyEdits: {
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: { '4:1': 'edited', '0:0': 'fine' },
+                        dirtyEdits: {
                         '4:1': { value: 'edited', base: 'stale' },
                         '0:0': { value: 'fine', base: 'a' },
                     },
+                    }],
                 },
             },
             rejection: { reason: 'baseMismatch', keys: ['4:1'] },
@@ -6583,10 +6602,12 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
-                    sheetIndex: 0,
                     saveRequestId: 'save-5',
-                    edits: { '4:1': 'edited' },
-                    dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: { '4:1': 'edited' },
+                        dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                    }],
                 },
             },
             rejection: { reason: 'baseMismatch', keys: ['4:1'] },
@@ -6641,10 +6662,12 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
-                    sheetIndex: 0,
                     saveRequestId: 'save-6',
-                    edits: { '4:1': 'edited' },
-                    dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: { '4:1': 'edited' },
+                        dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                    }],
                 },
             },
             rejection: { reason: 'baseMismatch', keys: ['4:1'] },
@@ -6701,10 +6724,12 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
-                    sheetIndex: 0,
                     saveRequestId: 'save-10',
-                    edits: { '4:1': 'edited' },
-                    dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: { '4:1': 'edited' },
+                        dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                    }],
                 },
             },
             rejection: { reason: 'baseMismatch', keys: ['4:1'] },
@@ -6768,10 +6793,12 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
-                    sheetIndex: 0,
                     saveRequestId: 'save-7',
-                    edits: { '4:1': 'edited' },
-                    dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: { '4:1': 'edited' },
+                        dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                    }],
                 },
             },
             rejection: { reason: 'baseMismatch', keys: ['4:1'] },
@@ -6792,10 +6819,12 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
-                    sheetIndex: 0,
                     saveRequestId: 'save-8',
-                    edits: { '4:1': 'edited' },
-                    dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: { '4:1': 'edited' },
+                        dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                    }],
                 },
             },
         });
@@ -6832,10 +6861,12 @@ describe('edit mode save exit', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
-                    sheetIndex: 0,
                     saveRequestId: 'save-9',
-                    edits: { '4:1': 'edited' },
-                    dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: { '4:1': 'edited' },
+                        dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+                    }],
                 },
             },
             rejection: { reason: 'baseMismatch', keys: ['4:1'] },
@@ -10126,10 +10157,12 @@ describe('stale-view banner', () => {
                 state: 'failed',
                 operation: {
                     editSessionId: 'test-edit-session',
-                    sheetIndex: 0,
                     saveRequestId: 'save-shrunk',
-                    edits: { '7:1': 'orphan' },
-                    dirtyEdits: removed,
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: { '7:1': 'orphan' },
+                        dirtyEdits: removed,
+                    }],
                 },
             },
             rejection: { reason: 'rowsRemoved', keys: ['7:1'] },

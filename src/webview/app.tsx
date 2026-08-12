@@ -24,6 +24,7 @@ import {
     type CsvDirtyMap,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
+    type CsvSaveWorksheetOperation,
     type DisplayRowInterval,
     type PerFileState,
     type SheetPendingEditCells,
@@ -450,17 +451,9 @@ export function App(): React.JSX.Element {
         edit_mode_ref.current = next;
         set_edit_mode_state(next);
     }, []);
-    /**
-     * Edit mode as *this tab* sees it. The session covers the whole workbook,
-     * but the grid edits where the pointer is: a tab the pointer does not name
-     * renders read-only (its Edit button re-enters the session there), and
-     * must not light up as if it were the sheet being edited.
-     */
-    const edit_mode_on_active_sheet =
-        edit_mode && active_sheet_index === edit_session_sheet_index;
-    /** The session's edit pointer names some other worksheet. */
-    const editing_another_sheet =
-        edit_mode && active_sheet_index !== edit_session_sheet_index;
+    // One granted session makes every worksheet editable. The active tab chooses
+    // only which per-sheet store the mounted grid views; it is not an edit pointer.
+    const edit_mode_on_active_sheet = edit_mode;
     const [edit_session_pending, set_edit_session_pending] = useState(false);
     const [save_operation, set_save_operation] = useState<CsvSaveOperation>();
     const [save_lifecycle, set_save_lifecycle] = useState<CsvSaveLifecycle>(
@@ -615,8 +608,6 @@ export function App(): React.JSX.Element {
     // in handle_editing_change, so a request always reads the latest report and
     // there is no closure to go stale.
     const save_in_flight_ref = useRef(false);
-    /** `editing_another_sheet` for callbacks that must not re-subscribe on it. */
-    const editing_another_sheet_ref = useRef(false);
     const pending_excel_header_unhide_ref = useRef(false);
     const pending_excel_header_promote_ref = useRef(false);
     const pending_edit_request_ref = useRef<string | null>(null);
@@ -854,32 +845,32 @@ export function App(): React.JSX.Element {
         });
     }, [clear_save_verdict, csv_edit_session_id, fence_edit_session_exit]);
 
-    const begin_save_operation = useCallback((
-        edits: Record<string, string>,
-        dirty_edits: CsvDirtyMap,
-    ): CsvSaveOperation | undefined => {
+    const begin_save_operation = useCallback((): CsvSaveOperation | undefined => {
         if (!csv_edit_session_id || save_projection_ref.current.operation) return undefined;
-        const sheet_index = edit_session_sheet_index_ref.current;
-        const sheet = meta_ref.current?.sheets[sheet_index];
-        const sheet_name = sheet?.name;
-        const worksheet_id = sheet?.worksheetId;
+        const sheets = meta_ref.current?.sheets ?? [];
+        const collected = edit_session_registry_ref.current!
+            .collect_dirty_worksheets(sheets);
+        if (collected.length === 0) return undefined;
+        const worksheets = collected.map(({ target, edits, dirtyEdits }) =>
+            Object.freeze<CsvSaveWorksheetOperation>({
+                ...target,
+                edits,
+                dirtyEdits,
+            }));
         const operation = Object.freeze<CsvSaveOperation>({
             editSessionId: csv_edit_session_id,
-            // The sheet this session is editing; a save writes only its slot.
-            sheetIndex: sheet_index,
-            ...(sheet_name !== undefined ? { sheetName: sheet_name } : {}),
-            ...(worksheet_id !== undefined ? { worksheetId: worksheet_id } : {}),
             saveRequestId: [
                 'save',
                 save_request_prefix_ref.current,
                 ++save_request_seq_ref.current,
             ].join(':'),
-            edits: Object.freeze({ ...edits }),
-            dirtyEdits: dirty_edits,
+            worksheets: Object.freeze(worksheets),
         });
         const projection = propose_csv_save(save_projection_ref.current, operation);
         save_projection_ref.current = projection;
         set_save_operation(operation);
+        save_in_flight_ref.current = true;
+        host_bridge.postMessage({ type: 'saveCsv', operation });
         return operation;
     }, [csv_edit_session_id]);
 
@@ -962,37 +953,33 @@ export function App(): React.JSX.Element {
         }
 
         const current_session_id = csv_edit_session_id_ref.current;
-        const operation_sheet_index = (operation: CsvSaveOperation) =>
-            worksheet_target_index(meta_ref.current?.sheets ?? [], operation);
-        const incoming_operation = incoming.state === 'idle'
-            ? undefined
-            : incoming.operation;
-        const incoming_sheet_index = incoming_operation
-            ? operation_sheet_index(incoming_operation)
-            : undefined;
-        // A save lifecycle is about its operation's worksheet, and the session
-        // pointer may have moved on to another one by the time it settles. Read the
-        // operation sheet's registry store rather than the mounted pointer grid.
-        const hydrate_and_install = (sheet_index: number) => {
-            const entries = edit_session_registry_ref.current!
-                .for_sheet(sheet_index).snapshot();
-            const hydrated = resolve_csv_save_hydration(
-                next,
-                current_session_id,
-                sheet_index,
-                meta_ref.current?.sheets[sheet_index]?.name,
-                meta_ref.current?.sheets[sheet_index]?.worksheetId,
-                entries.size > 0 ? Object.fromEntries(entries) : undefined,
-            );
-            install_edit_session(hydrated, current_session_id, sheet_index);
+        const operation_sheet_indices = (operation: CsvSaveOperation) => operation.worksheets
+            .map((worksheet) => worksheet_target_index(
+                meta_ref.current?.sheets ?? [],
+                worksheet,
+            ))
+            .filter((index): index is number => index !== undefined);
+        const hydrate_and_install = (operation: CsvSaveOperation) => {
+            for (const sheet_index of operation_sheet_indices(operation)) {
+                const entries = edit_session_registry_ref.current!
+                    .for_sheet(sheet_index).snapshot();
+                const hydrated = resolve_csv_save_hydration(
+                    next,
+                    current_session_id,
+                    sheet_index,
+                    meta_ref.current?.sheets[sheet_index]?.name,
+                    meta_ref.current?.sheets[sheet_index]?.worksheetId,
+                    entries.size > 0 ? Object.fromEntries(entries) : undefined,
+                );
+                install_edit_session(hydrated, current_session_id, sheet_index);
+            }
         };
         if (incoming.state === 'active') {
             if (
                 incoming.operation.editSessionId === current_session_id
-                && incoming_sheet_index !== undefined
                 && csv_save_operations_equal(next.operation, incoming.operation)
             ) {
-                hydrate_and_install(incoming_sheet_index);
+                hydrate_and_install(incoming.operation);
             }
         } else if (
             incoming.state !== 'idle'
@@ -1000,31 +987,22 @@ export function App(): React.JSX.Element {
                 || csv_save_operations_equal(previous.operation, incoming.operation))
         ) {
             if (incoming.state === 'failed') {
-                // A failure restores edits only when it settles an operation this
-                // renderer actually locked. Host-generated rehydration validation
-                // has no local operation: its rejection keys are compared with the
-                // live map below, but its historical map must never replace edits
-                // made after the initial snapshot was acknowledged.
                 if (
                     previous.operation
-                    && incoming_sheet_index !== undefined
                     && incoming.operation.editSessionId === current_session_id
                     && csv_save_operations_equal(
                         previous.operation,
                         incoming.operation,
                     )
                 ) {
-                    hydrate_and_install(incoming_sheet_index);
+                    hydrate_and_install(incoming.operation);
                     pending_exit_ref.current = false;
                 }
             } else if (
-                incoming_sheet_index !== undefined
-                && (
-                    current_session_id === undefined
-                    || incoming.operation.editSessionId === current_session_id
-                )
+                current_session_id === undefined
+                || incoming.operation.editSessionId === current_session_id
             ) {
-                hydrate_and_install(incoming_sheet_index);
+                hydrate_and_install(incoming.operation);
                 set_csv_edit_session_id(undefined);
                 set_edit_session_pending(false);
                 set_edit_mode(false);
@@ -2750,13 +2728,7 @@ export function App(): React.JSX.Element {
     }, [request_excel_header]);
 
     const handle_toggle_edit_mode = useCallback(() => {
-        // Pressing Edit on a worksheet other than the one being edited is an
-        // *entry*, not an exit: the session is workbook-scoped, so the host
-        // answers with the same session and this sheet's own slot, and the
-        // pointer moves here. The sheet left behind keeps its edits in its
-        // store and its durable slot.
-        const entering = !edit_mode
-            || active_sheet_index !== edit_session_sheet_index_ref.current;
+        const entering = !edit_mode;
         if (entering) {
             if (edit_session_pending) return;
             // Only work in flight, and only because the host refuses it: warning
@@ -2789,30 +2761,12 @@ export function App(): React.JSX.Element {
             });
             return;
         }
-        // Leaving edit mode with unsaved work: defer to a host Save/Discard/Cancel
-        // dialog (handled below); otherwise exit immediately. The mounted grid
-        // answers for the sheet on screen — its store plus the live overlay —
-        // but the session is workbook-scoped: exiting ends it for every sheet,
-        // so a store still holding another worksheet's edits is unsaved work
-        // exactly as much as the visible grid's. Exit only runs with the
-        // pointer sheet active (anything else is an entry above), so the
-        // pointer's own store is the grid's to answer for, not the scan's.
-        let sibling_dirty_sheet: number | undefined;
-        let dirty_sibling_count = 0;
-        for (const [index, store] of edit_session_registry_ref.current!.entries()) {
-            if (index === edit_session_sheet_index_ref.current || store.size() === 0) {
-                continue;
-            }
-            sibling_dirty_sheet ??= index;
-            dirty_sibling_count += 1;
-        }
-        const pointer_dirty = editing_ref.current?.has_uncommitted_changes() === true;
-        if (pointer_dirty || sibling_dirty_sheet !== undefined) {
+        // Fold the active overlay before testing the registry: the session is
+        // workbook-wide and App owns the complete dirty-set decision.
+        editing_ref.current?.commit_live_edit();
+        if (edit_session_registry_ref.current!.has_dirty_entries()) {
             if (!csv_edit_session_id || pending_save_dialog_ref.current) return;
-            const target_sheet_index = pointer_dirty
-                ? edit_session_sheet_index_ref.current
-                : sibling_dirty_sheet!;
-            const target_sheet = meta?.sheets[target_sheet_index];
+            const target_sheet = meta?.sheets[active_sheet_index];
             const request = {
                 requestId: [
                     'dialog',
@@ -2821,7 +2775,7 @@ export function App(): React.JSX.Element {
                 ].join(':'),
                 editSessionId: csv_edit_session_id,
                 target: {
-                    sheetIndex: target_sheet_index,
+                    sheetIndex: active_sheet_index,
                     ...(target_sheet?.name !== undefined
                         ? { sheetName: target_sheet.name }
                         : {}),
@@ -2829,8 +2783,7 @@ export function App(): React.JSX.Element {
                         ? { worksheetId: target_sheet.worksheetId }
                         : {}),
                 },
-                multipleDirtySheets: dirty_sibling_count
-                    + (pointer_dirty ? 1 : 0) > 1,
+                multipleDirtySheets: false,
             };
             pending_save_dialog_ref.current = request;
             host_bridge.postMessage({
@@ -3216,47 +3169,10 @@ export function App(): React.JSX.Element {
                 ) return;
                 pending_save_dialog_ref.current = null;
                 if (msg.choice === 'save') {
-                    if (pending_dialog.multipleDirtySheets) {
-                        host_bridge.postMessage({
-                            type: 'showWarning',
-                            message: 'More than one worksheet has unsaved changes. Keep editing or discard the workbook changes before leaving Edit mode.',
-                        });
-                        return;
-                    }
-                    const target_sheet_index = worksheet_target_index(
-                        meta_ref.current?.sheets ?? [],
-                        pending_dialog.target,
-                    );
-                    if (target_sheet_index === undefined) {
-                        host_bridge.postMessage({
-                            type: 'showWarning',
-                            message: 'The worksheet with unsaved changes is no longer available.',
-                        });
-                        return;
-                    }
-                    const on_target_sheet =
-                        active_sheet_index_ref.current === target_sheet_index
-                        && edit_session_sheet_index_ref.current === target_sheet_index;
-                    if (!on_target_sheet) {
-                        // The dialog can be raised by a dirty sibling store while
-                        // the mounted pointer grid is clean. Retain the worksheet
-                        // identity while mounting it so a refresh can move the target
-                        // without redirecting the user's Save choice.
-                        pending_dialog_save_target_ref.current = pending_dialog.target;
-                        edit_session_sheet_index_ref.current = target_sheet_index;
-                        set_edit_session_sheet_index(target_sheet_index);
-                        set_active_sheet_index(target_sheet_index);
-                        state_ref.current = {
-                            ...state_ref.current,
-                            activeSheetIndex: target_sheet_index,
-                        };
-                        persist_immediate();
+                    if (request_save_or_remain_dirty()) {
+                        pending_exit_ref.current = true;
                     } else {
-                        if (request_save_or_remain_dirty()) {
-                            pending_exit_ref.current = true;
-                        } else {
-                            leave_edit_mode();
-                        }
+                        leave_edit_mode();
                     }
                 } else if (msg.choice === 'discard') {
                     pending_dialog_save_target_ref.current = null;
@@ -3288,14 +3204,20 @@ export function App(): React.JSX.Element {
                     && msg.lifecycle.operation.editSessionId
                         === csv_edit_session_id_ref.current
                 ) {
-                    const submitted = msg.lifecycle.operation.dirtyEdits;
+                    const submitted_worksheet = msg.lifecycle.operation.worksheets.find(
+                        (worksheet) => msg.rejection!.keys.every(
+                            (key) => worksheet.dirtyEdits[key] !== undefined,
+                        ),
+                    );
+                    if (!submitted_worksheet) return;
+                    const submitted = submitted_worksheet.dirtyEdits;
                     set_save_rejection({
                         reason: msg.rejection.reason,
                         keys: [...msg.rejection.keys],
                         session_id: csv_edit_session_id_ref.current,
-                        sheet_index: msg.lifecycle.operation.sheetIndex,
-                        sheet_name: msg.lifecycle.operation.sheetName,
-                        worksheet_id: msg.lifecycle.operation.worksheetId,
+                        sheet_index: submitted_worksheet.sheetIndex,
+                        sheet_name: submitted_worksheet.sheetName,
+                        worksheet_id: submitted_worksheet.worksheetId,
                         // Snapshot what the host actually judged, from the operation
                         // it judged it over rather than from the live map, which may
                         // already have moved on. `live_rejected_keys` compares against
@@ -3325,54 +3247,6 @@ export function App(): React.JSX.Element {
         persist_immediate,
         request_save_or_remain_dirty,
         run_edit_command,
-    ]);
-
-    useEffect(() => {
-        const target = pending_dialog_save_target_ref.current;
-        if (!target) return;
-        const target_sheet_index = worksheet_target_index(meta?.sheets ?? [], target);
-        if (target_sheet_index === undefined) {
-            pending_dialog_save_target_ref.current = null;
-            host_bridge.postMessage({
-                type: 'showWarning',
-                message: 'The worksheet with unsaved changes is no longer available.',
-            });
-            return;
-        }
-        if (
-            active_sheet_index !== target_sheet_index
-            || edit_session_sheet_index !== target_sheet_index
-        ) {
-            edit_session_sheet_index_ref.current = target_sheet_index;
-            set_edit_session_sheet_index(target_sheet_index);
-            set_active_sheet_index(target_sheet_index);
-            state_ref.current = {
-                ...state_ref.current,
-                activeSheetIndex: target_sheet_index,
-            };
-            persist_immediate();
-            return;
-        }
-        const editing = editing_ref.current;
-        if (!editing) return;
-        pending_dialog_save_target_ref.current = null;
-        if (request_save_or_remain_dirty()) {
-            pending_exit_ref.current = true;
-            return;
-        }
-        // The target was dirty when the dialog opened. If it stopped being
-        // saveable while remounting, preserve the session rather than turn an
-        // explicit Save choice into an unsignalled release.
-        host_bridge.postMessage({
-            type: 'showWarning',
-            message: 'Your changes are still unsaved. Press Edit again to retry saving them.',
-        });
-    }, [
-        active_sheet_index,
-        edit_session_sheet_index,
-        meta,
-        persist_immediate,
-        request_save_or_remain_dirty,
     ]);
 
     // If editing becomes unavailable (e.g. a reload disables CSV editing), leave
@@ -3409,25 +3283,10 @@ export function App(): React.JSX.Element {
         edit_session_registry_ref.current!.adopt_session();
     }, [csv_edit_session_id]);
 
-    // GridShell reports editing status up so the toolbar dirty dot, pending-edit
-    // persistence, and conflict banner — App-level concerns — can react. The
-    // dirty map itself lives in edit_session_ref.
-    // Assigned during render, not in an effect: a grid mounted by this same render
-    // reports its editing status before effects run, and the stale value would be
-    // exactly the one that has to be right.
-    editing_another_sheet_ref.current = editing_another_sheet;
-
+    // GridShell reports the active worksheet's status; save ownership remains
+    // document-scoped because every grid receives the same workbook lifecycle.
     const handle_editing_change = useCallback((status: EditingStatus) => {
-        // `save_in_flight_ref` is document-scoped, but only the grid that owns the
-        // session is told about the save — a grid on any other worksheet is
-        // deliberately handed no lifecycle, so it reports `false` while a save is
-        // very much in flight. Letting it write that through cleared the flag, and
-        // the close/reload flush then published a pending-edit sequence the host
-        // ignores while a save is active: advertised, never acknowledged, and
-        // quitting waited on it until the barrier timed out.
-        if (!editing_another_sheet_ref.current) {
-            save_in_flight_ref.current = status.save_in_flight;
-        }
+        save_in_flight_ref.current = status.save_in_flight;
         set_editing_status(status);
     }, []);
 
@@ -4195,8 +4054,8 @@ export function App(): React.JSX.Element {
             // hydrating that from another sheet's operation painted that sheet's
             // pending values and dirty tint here, at coordinates that mean
             // something else, in a worksheet the user cannot even edit.
-            save_operation={editing_another_sheet ? undefined : save_operation}
-            save_lifecycle={editing_another_sheet ? undefined : save_lifecycle}
+            save_operation={save_operation}
+            save_lifecycle={save_lifecycle}
             on_save_request={begin_save_operation}
             // This sheet's own store, so what the grid paints is always in the key
             // space it is painting into. The old single store had to be *withheld*
