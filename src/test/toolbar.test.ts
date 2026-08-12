@@ -224,12 +224,10 @@ describe('Toolbar', () => {
         });
 
         expect(get_action_labels(container)).toEqual([
+            'Edit',
             'Formatting',
             'Vertical Tabs',
             '|',
-            // Edit is worksheet-scoped today: one session, owned by one sheet. It
-            // joins the workbook group when that stops being true.
-            'Edit',
             'First Row as Header',
             'Columns',
             'Auto-fit Columns',
@@ -271,9 +269,9 @@ describe('Toolbar', () => {
         // The divider follows from whether the workbook group rendered anything, so
         // it must sit at exactly the group boundary in all eight combinations —
         // including the two where only one workbook action is visible, which a
-        // hand-written condition is most likely to get wrong. `show_edit_button`
-        // varies too: it belongs to the worksheet group, so it must never move the
-        // rule.
+        // hand-written condition is most likely to get wrong. Edit varies too and
+        // now belongs to the workbook group, including when it is the only action
+        // before the rule.
         for (const show_edit_button of [false, true]) {
             for (const show_formatting_button of [false, true]) {
                 for (const show_vertical_tabs_button of [false, true]) {
@@ -285,6 +283,7 @@ describe('Toolbar', () => {
                     });
                     const labels = get_action_labels(container);
                     const workbook_count = [
+                        show_edit_button,
                         show_formatting_button,
                         show_vertical_tabs_button,
                     ].filter(Boolean).length;
@@ -296,8 +295,12 @@ describe('Toolbar', () => {
                         // and every worksheet action after it.
                         expect(labels.filter((label) => label === '|')).toHaveLength(1);
                         expect(labels.indexOf('|')).toBe(workbook_count);
-                        expect(labels.slice(workbook_count + 1)).toEqual([
+                        expect(labels.slice(0, workbook_count)).toEqual([
                             ...(show_edit_button ? ['Edit'] : []),
+                            ...(show_formatting_button ? ['Formatting'] : []),
+                            ...(show_vertical_tabs_button ? ['Vertical Tabs'] : []),
+                        ]);
+                        expect(labels.slice(workbook_count + 1)).toEqual([
                             'First Row as Header',
                             'Columns',
                             'Auto-fit Columns',

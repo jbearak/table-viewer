@@ -2,6 +2,7 @@ import {
     worksheet_target_matches,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
+    type CsvSaveWorksheetOperation,
     type SheetPendingEditCells,
 } from '../types';
 
@@ -33,40 +34,55 @@ function records_equal(
     return left_keys.every((key) => right[key] === left[key]);
 }
 
-export function csv_save_operations_equal(
-    left: CsvSaveOperation | undefined,
-    right: CsvSaveOperation | undefined,
+function dirty_maps_equal(
+    left: CsvSaveWorksheetOperation['dirtyEdits'],
+    right: CsvSaveWorksheetOperation['dirtyEdits'],
 ): boolean {
-    if (left === right) return true;
-    if (!left || !right) return false;
-    if (
-        left.editSessionId !== right.editSessionId
-        || left.sheetIndex !== right.sheetIndex
-        || left.sheetName !== right.sheetName
-        || left.worksheetId !== right.worksheetId
-        || left.saveRequestId !== right.saveRequestId
-        || !records_equal(left.edits, right.edits)
-    ) return false;
-    const left_keys = Object.keys(left.dirtyEdits);
-    if (left_keys.length !== Object.keys(right.dirtyEdits).length) return false;
+    const left_keys = Object.keys(left);
+    if (left_keys.length !== Object.keys(right).length) return false;
     return left_keys.every((key) => {
-        const left_entry = left.dirtyEdits[key];
-        const right_entry = right.dirtyEdits[key];
+        const left_entry = left[key];
+        const right_entry = right[key];
         return right_entry !== undefined
             && left_entry.value === right_entry.value
             && left_entry.base === right_entry.base;
     });
 }
 
+function worksheet_operations_equal(
+    left: CsvSaveWorksheetOperation,
+    right: CsvSaveWorksheetOperation,
+): boolean {
+    return left.sheetIndex === right.sheetIndex
+        && left.sheetName === right.sheetName
+        && left.worksheetId === right.worksheetId
+        && records_equal(left.edits, right.edits)
+        && dirty_maps_equal(left.dirtyEdits, right.dirtyEdits);
+}
+
+export function csv_save_operations_equal(
+    left: CsvSaveOperation | undefined,
+    right: CsvSaveOperation | undefined,
+): boolean {
+    if (left === right) return true;
+    if (!left || !right) return false;
+    return left.editSessionId === right.editSessionId
+        && left.saveRequestId === right.saveRequestId
+        && left.worksheets.length === right.worksheets.length
+        && left.worksheets.every((worksheet, index) => (
+            worksheet_operations_equal(worksheet, right.worksheets[index])
+        ));
+}
+
 function remove_operation_owned_pending_edits(
     pending_edits: SheetPendingEditCells | undefined,
-    operation: CsvSaveOperation,
+    worksheet: CsvSaveWorksheetOperation,
 ): SheetPendingEditCells | undefined {
     if (!pending_edits) return undefined;
     let retained: SheetPendingEditCells | undefined;
     let remaining = 0;
     for (const [key, pending] of Object.entries(pending_edits)) {
-        const owned = operation.dirtyEdits[key];
+        const owned = worksheet.dirtyEdits[key];
         const matches = owned !== undefined && (typeof pending === 'string'
             ? pending === owned.value
             : pending.value === owned.value && pending.base === owned.base);
@@ -98,17 +114,34 @@ export function propose_csv_save(
  * operation restores only that same session, while success tombstones stale
  * operation-owned state unless the host has already granted a different one.
  */
+function save_operation_worksheet(
+    operation: CsvSaveOperation,
+    sheet_index: number,
+    sheet_name: string | undefined,
+    worksheet_id: string | undefined,
+): CsvSaveWorksheetOperation | undefined {
+    const target = {
+        sheetIndex: sheet_index,
+        sheetName: sheet_name,
+        worksheetId: worksheet_id,
+    };
+    return operation.worksheets.find((worksheet) => (
+        worksheet_target_matches(worksheet, target)
+    ));
+}
+
 export function save_operation_targets_sheet(
     operation: CsvSaveOperation,
     sheet_index: number,
     sheet_name: string | undefined,
     worksheet_id: string | undefined,
 ): boolean {
-    return worksheet_target_matches(operation, {
-        sheetIndex: sheet_index,
-        sheetName: sheet_name,
-        worksheetId: worksheet_id,
-    });
+    return save_operation_worksheet(
+        operation,
+        sheet_index,
+        sheet_name,
+        worksheet_id,
+    ) !== undefined;
 }
 
 export function resolve_csv_save_hydration(
@@ -122,35 +155,31 @@ export function resolve_csv_save_hydration(
     if (
         projection.operation
         && projection.operation.editSessionId === edit_session_id
-        && save_operation_targets_sheet(
+    ) {
+        const worksheet = save_operation_worksheet(
             projection.operation,
             sheet_index,
             sheet_name,
             worksheet_id,
-        )
-    ) {
-        return projection.operation.dirtyEdits;
+        );
+        if (worksheet) return worksheet.dirtyEdits;
     }
 
     const lifecycle = projection.authoritative;
-    if (lifecycle.state === 'idle' || !save_operation_targets_sheet(
+    if (lifecycle.state === 'idle') return pending_edits;
+    const worksheet = save_operation_worksheet(
         lifecycle.operation,
         sheet_index,
         sheet_name,
         worksheet_id,
-    )) return pending_edits;
+    );
+    if (!worksheet) return pending_edits;
     if (lifecycle.state === 'active' || lifecycle.state === 'failed') {
         return lifecycle.operation.editSessionId === edit_session_id
-            ? lifecycle.operation.dirtyEdits
-            : remove_operation_owned_pending_edits(
-                pending_edits,
-                lifecycle.operation,
-            );
+            ? worksheet.dirtyEdits
+            : remove_operation_owned_pending_edits(pending_edits, worksheet);
     }
-    return remove_operation_owned_pending_edits(
-        pending_edits,
-        lifecycle.operation,
-    );
+    return remove_operation_owned_pending_edits(pending_edits, worksheet);
 }
 
 /** Apply one host projection without using request IDs as ordering authority. */

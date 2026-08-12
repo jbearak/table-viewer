@@ -40,6 +40,7 @@
 import {
     worksheet_identity,
     worksheet_target_lookup,
+    type CsvDirtyMap,
     type WorksheetIdentityInput,
     type WorksheetTarget,
 } from '../types';
@@ -84,6 +85,18 @@ export interface EditSessionRegistry {
         store: EditSessionStore;
         parked: boolean;
     }>;
+    /** Whether any live or parked worksheet store contains dirty entries. */
+    has_dirty_entries(): boolean;
+    /**
+     * Immutable snapshots of every dirty live and parked worksheet, ordered by
+     * worksheet index. Parked collisions retain their insertion order.
+     */
+    collect_dirty_worksheets(sheets: readonly WorksheetIdentityInput[]): readonly {
+        target: WorksheetTarget;
+        edits: Readonly<Record<string, string>>;
+        dirtyEdits: CsvDirtyMap;
+        parked: boolean;
+    }[];
     /**
      * A different document replaced this one: drop every store. An initial
      * snapshot owns the complete pending-edit projection, so any store that
@@ -202,6 +215,64 @@ export function create_edit_session_registry(
                 };
             }
             for (const entry of parked.values()) yield { ...entry, parked: true };
+        },
+        has_dirty_entries: () => {
+            for (const store of stores.values()) {
+                if (store.size() > 0) return true;
+            }
+            for (const { store } of parked.values()) {
+                if (store.size() > 0) return true;
+            }
+            return false;
+        },
+        collect_dirty_worksheets: (sheets) => {
+            const collected: Array<{
+                target: WorksheetTarget;
+                edits: Readonly<Record<string, string>>;
+                dirtyEdits: CsvDirtyMap;
+                parked: boolean;
+                order: number;
+            }> = [];
+            let order = 0;
+            const collect = (
+                target: WorksheetTarget,
+                store: EditSessionStore,
+                is_parked: boolean,
+            ): void => {
+                const snapshot = store.snapshot();
+                if (snapshot.size === 0) return;
+                const edits: Record<string, string> = {};
+                const dirty_edits: Record<string, { value: string; base: string }> = {};
+                for (const [key, entry] of snapshot) {
+                    edits[key] = entry.value;
+                    dirty_edits[key] = Object.freeze({
+                        value: entry.value,
+                        base: entry.base,
+                    });
+                }
+                collected.push({
+                    target: Object.freeze({ ...target }),
+                    edits: Object.freeze(edits),
+                    dirtyEdits: Object.freeze(dirty_edits),
+                    parked: is_parked,
+                    order: order++,
+                });
+            };
+
+            for (const [sheet_index, store] of stores) {
+                const sheet = sheets[sheet_index];
+                if (!sheet) continue;
+                collect(target_for_sheet(sheet_index, sheet), store, false);
+            }
+            for (const { target, store } of parked.values()) {
+                collect(target, store, true);
+            }
+            collected.sort((left, right) =>
+                left.target.sheetIndex - right.target.sheetIndex
+                || Number(left.parked) - Number(right.parked)
+                || left.order - right.order);
+            return Object.freeze(collected.map(({ order: _order, ...entry }) =>
+                Object.freeze(entry)));
         },
         replace_document: () => {
             stores.clear();

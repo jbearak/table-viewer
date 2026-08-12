@@ -166,6 +166,76 @@ describe('edit session registry', () => {
         expect(publications.filter(({ parked }) => parked)).toHaveLength(1);
     });
 
+    it('collects immutable dirty snapshots from live and parked stores deterministically', () => {
+        const { registry } = make_session_ref('s');
+        const parked_later_index = registry.for_sheet(2);
+        parked_later_index.commit('s', '2:0', { value: 'parked two', base: 'old two' });
+        const parked_earlier_index = registry.for_sheet(0);
+        parked_earlier_index.commit('s', '0:0', { value: 'parked zero', base: 'old zero' });
+        registry.reconcile_sheets(
+            [{ name: 'Zero' }, { name: 'One' }, { name: 'Two' }],
+            [],
+            () => true,
+        );
+        const live = registry.for_sheet(0);
+        live.commit('s', '1:1', { value: 'live zero', base: 'live old' });
+        registry.for_sheet(1); // clean stores are excluded
+
+        const collected = registry.collect_dirty_worksheets([
+            { name: 'Live Zero', worksheetId: 'live-0' },
+            { name: 'Clean' },
+        ]);
+
+        expect(collected).toEqual([
+            {
+                target: { sheetIndex: 0, sheetName: 'Live Zero', worksheetId: 'live-0' },
+                edits: { '1:1': 'live zero' },
+                dirtyEdits: { '1:1': { value: 'live zero', base: 'live old' } },
+                parked: false,
+            },
+            {
+                target: { sheetIndex: 0, sheetName: 'Zero' },
+                edits: { '0:0': 'parked zero' },
+                dirtyEdits: { '0:0': { value: 'parked zero', base: 'old zero' } },
+                parked: true,
+            },
+            {
+                target: { sheetIndex: 2, sheetName: 'Two' },
+                edits: { '2:0': 'parked two' },
+                dirtyEdits: { '2:0': { value: 'parked two', base: 'old two' } },
+                parked: true,
+            },
+        ]);
+        expect(Object.isFrozen(collected)).toBe(true);
+        expect(Object.isFrozen(collected[0])).toBe(true);
+        expect(Object.isFrozen(collected[0].target)).toBe(true);
+        expect(Object.isFrozen(collected[0].edits)).toBe(true);
+        expect(Object.isFrozen(collected[0].dirtyEdits)).toBe(true);
+        expect(Object.isFrozen(collected[0].dirtyEdits['1:1'])).toBe(true);
+
+        live.commit('s', '1:1', { value: 'changed later', base: 'live old' });
+        expect(collected[0].edits['1:1']).toBe('live zero');
+        expect(collected[0].dirtyEdits['1:1'].value).toBe('live zero');
+    });
+
+    it('reports dirty state across live and parked worksheet stores', () => {
+        const { registry } = make_session_ref('s');
+        expect(registry.has_dirty_entries()).toBe(false);
+
+        const live = registry.for_sheet(0);
+        live.commit('s', '0:0', { value: 'live', base: 'old' });
+        expect(registry.has_dirty_entries()).toBe(true);
+
+        live.clear('s');
+        expect(registry.has_dirty_entries()).toBe(false);
+        live.commit('s', '0:0', { value: 'parked', base: 'old' });
+        registry.reconcile_sheets([{ name: 'Removed' }], [], () => true);
+        expect(registry.has_dirty_entries()).toBe(true);
+
+        registry.retire_parked();
+        expect(registry.has_dirty_entries()).toBe(false);
+    });
+
     it('replace_document drops every store', () => {
         const { registry } = make_session_ref('s');
         registry.for_sheet(0).commit('s', '0:0', { value: 'old file', base: 'a' });
