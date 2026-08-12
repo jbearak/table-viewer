@@ -3192,10 +3192,9 @@ describe('CSV edit sessions', () => {
         await cleanup_started.promise;
         await flush_promises();
 
-        expect(owner.__messages).toContainEqual(expect.objectContaining({
-            type: 'editSessionRevoked',
-            reason: 'saved',
-        }));
+        expect(owner.__messages.filter((message: any) => (
+            message?.type === 'editSessionRevoked'
+        ))).toHaveLength(0);
         expect(owner.__messages.filter((message: any) => message?.type === 'saveResult'))
             .toEqual([expect.objectContaining({ type: 'saveResult', success: true })]);
         const peer_refresh = [...peer.__messages].reverse().find((message: any) => (

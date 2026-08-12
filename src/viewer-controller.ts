@@ -4819,15 +4819,6 @@ export function attach_viewer(
             success: true,
             lifecycle: succeeded_lifecycle,
         });
-        void post_to_receiver({
-            type: 'editSessionRevoked',
-            reason: 'saved',
-            // Scoped to the saved worksheet: a successful save ends *that* sheet's
-            // edit session, and must leave any other sheet the user is editing
-            // untouched.
-            sheetIndex: identity.worksheets[0].sheetIndex,
-            lifecycle: succeeded_lifecycle,
-        });
         notify_edit_state();
 
         void refresh_subscription.request('postSave').catch((error) => {

@@ -662,7 +662,7 @@ async function enter_edit_mode(
 }
 
 function seed_mounted_store(
-    edits: Record<string, { value: string; base: string }> = {
+    edits: Record<string, { value: string; base: string; base_pending?: boolean }> = {
         '0:0': { value: 'dirty', base: 'base' },
     },
 ) {
@@ -4429,6 +4429,55 @@ describe('edit mode save exit', () => {
         );
     });
 
+    it('keeps the workbook session when a dirty sibling blocks save preflight', async () => {
+        grid_shell_mock.has_uncommitted_changes = false;
+        grid_shell_mock.request_save.mockReturnValue(false);
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'restored-session',
+                },
+            })
+        );
+        await click_sheet_tab('Inventory');
+        seed_mounted_store({
+            '0:0': {
+                value: 'Gadget',
+                base: '',
+                base_pending: true,
+            },
+        });
+        await click_sheet_tab('People');
+        await click_button('Edit');
+        const dialog = post_message.mock.calls
+            .map(([message]) => message)
+            .find((message) => message?.type === 'showSaveDialog');
+        post_message.mockClear();
+
+        await dispatch_host_message({
+            type: 'saveDialogResult',
+            requestId: dialog.requestId,
+            editSessionId: dialog.editSessionId,
+            choice: 'save',
+        });
+
+        expect(grid_shell_mock.request_save).toHaveBeenCalledTimes(1);
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'showWarning',
+        }));
+        expect(post_message).not.toHaveBeenCalledWith(expect.objectContaining({
+            type: 'saveCsv',
+        }));
+        expect(post_message).not.toHaveBeenCalledWith(expect.objectContaining({
+            type: 'releaseEditSession',
+        }));
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(get_button('Edit').classList.contains('has-unsaved')).toBe(true);
+    });
+
     it('saves the dirty sibling chosen from a clean pointer sheet', async () => {
         grid_shell_mock.has_uncommitted_changes = false;
         grid_shell_mock.request_save.mockReturnValue(true);
@@ -7463,7 +7512,7 @@ describe('sorting and filtering', () => {
         await dispatch_host_message(
             transform_installed_message(request, { generation: 2 }),
         );
-        await act(async () => new Promise((resolve) => window.setTimeout(resolve, 40)));
+        await vi.waitUntil(() => grid_shell_mock.focus_grid.mock.calls.length > 0);
 
         expect(grid_stub().getAttribute('data-mount-id')).not.toBe(previous_mount);
         expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
@@ -7480,12 +7529,13 @@ describe('sorting and filtering', () => {
             container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement
         ).click());
         const request = latest_transform_request(post_message);
+        const focus_checks_before = has_focus.mock.calls.length;
         await acknowledge_transform(request, 2);
-        await act(async () => new Promise((resolve) => window.setTimeout(resolve, 40)));
+        await vi.waitUntil(() => has_focus.mock.calls.length > focus_checks_before);
 
         expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
         has_focus.mockReturnValue(true);
-        await act(async () => new Promise((resolve) => window.setTimeout(resolve, 160)));
+        await act(async () => Promise.resolve());
         expect(grid_shell_mock.focus_grid).not.toHaveBeenCalled();
     });
 
@@ -7519,7 +7569,7 @@ describe('sorting and filtering', () => {
         await dispatch_host_message(
             transform_installed_message(request, { generation: 2 }),
         );
-        await act(async () => new Promise((resolve) => window.setTimeout(resolve, 40)));
+        await vi.waitUntil(() => grid_shell_mock.focus_grid.mock.calls.length > 0);
         expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
     });
 
@@ -7542,7 +7592,7 @@ describe('sorting and filtering', () => {
             reason: 'failed',
             terminal: true,
         });
-        await act(async () => new Promise((resolve) => window.setTimeout(resolve, 40)));
+        await vi.waitUntil(() => grid_shell_mock.focus_grid.mock.calls.length > 0);
 
         expect(grid_stub().getAttribute('data-mount-id')).toBe(previous_mount);
         expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();

@@ -3076,8 +3076,11 @@ export function App(): React.JSX.Element {
     const request_save_or_remain_dirty = useCallback(() => {
         const editing = editing_ref.current;
         if (!editing) return false;
-        // request_save() has side effects, so it is evaluated first.
-        return editing.request_save() || editing.has_uncommitted_changes();
+        // request_save() has side effects, so it is evaluated first. If workbook
+        // preflight blocks, the active sheet may be clean while a sibling store is
+        // still dirty; keep the session open from the registry-wide truth.
+        return editing.request_save()
+            || edit_session_registry_ref.current!.has_dirty_entries();
     }, []);
 
     useEffect(() => {
