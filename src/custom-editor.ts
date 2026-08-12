@@ -5,7 +5,6 @@ import type { AuthorityFileStateStore } from './state';
 import { build_vscode_webview_html, vscode_viewer_host } from './vscode-host-ports';
 import { generate_nonce } from './webview-html';
 
-const EXCEL_VIEW_TYPE = 'tableViewer.excelViewer';
 export const TABLE_VIEW_TYPE = 'tableViewer.editor';
 
 class TableViewerDocument implements vscode.CustomDocument {
@@ -97,7 +96,7 @@ export class TableViewerEditorProvider
             let opening = this.#workbook_opens.get(resource);
             if (!opening) {
                 opening = Promise.resolve(
-                    vscode.commands.executeCommand('vscode.openWith', uri, EXCEL_VIEW_TYPE),
+                    vscode.commands.executeCommand('vscode.openWith', uri, TABLE_VIEW_TYPE),
                 ).then(() => {});
                 this.#workbook_opens.set(resource, opening);
                 void opening.finally(() => {
@@ -153,25 +152,18 @@ export function register_table_viewer(
     state_store: AuthorityFileStateStore,
 ): TableViewerRegistration {
     const provider = new TableViewerEditorProvider(context.extensionUri, state_store);
-    // Both editors deliberately allow multiple tabs per document. The CSV/TSV
-    // editor could have set this to false to dodge the cross-tab pending-edits
+    // The editor deliberately allows multiple tabs per document. It could have
+    // set this to false to dodge the CSV/TSV cross-tab pending-edits
     // race (#22), but we keep multi-viewer support and serialize editing with
     // an exclusive edit-session lock (see viewer-controller) instead.
-    const excel_options = {
-        supportsMultipleEditorsPerDocument: true,
-        webviewOptions: { retainContextWhenHidden: true },
-    };
-    const table_options = {
+    const options = {
         supportsMultipleEditorsPerDocument: true,
         webviewOptions: { retainContextWhenHidden: true },
     };
     const registrations: vscode.Disposable[] = [];
     try {
         registrations.push(
-            vscode.window.registerCustomEditorProvider(EXCEL_VIEW_TYPE, provider, excel_options),
-        );
-        registrations.push(
-            vscode.window.registerCustomEditorProvider(TABLE_VIEW_TYPE, provider, table_options),
+            vscode.window.registerCustomEditorProvider(TABLE_VIEW_TYPE, provider, options),
         );
     } catch (error) {
         for (const registration of [...registrations].reverse()) {

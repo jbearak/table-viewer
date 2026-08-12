@@ -55,7 +55,7 @@ describe('register_table_viewer', () => {
 
     function excel_provider() {
         const registered = vscode_mock.__getCustomEditorRegistrations()
-            .find((candidate) => candidate.viewType === 'tableViewer.excelViewer');
+            .find((candidate) => candidate.viewType === 'tableViewer.editor');
         return registered?.provider as {
             openCustomDocument(candidate: vscode.Uri): Promise<vscode.CustomDocument>;
             resolveCustomEditor(
@@ -111,7 +111,7 @@ describe('register_table_viewer', () => {
         const registration = register_table_viewer(context(), state_store());
         const provider = excel_provider();
         const panel = vscode_mock.window.createWebviewPanel(
-            'tableViewer.excelViewer',
+            'tableViewer.editor',
             'basic.xlsx',
         ) as unknown as vscode.WebviewPanel;
         const reveal = vi.spyOn(panel, 'reveal');
@@ -140,7 +140,7 @@ describe('register_table_viewer', () => {
         const registration = register_table_viewer(context(), state_store());
         const provider = excel_provider();
         const panel = vscode_mock.window.createWebviewPanel(
-            'tableViewer.excelViewer',
+            'tableViewer.editor',
             'basic.xlsx',
         ) as unknown as vscode.WebviewPanel;
         const document = await provider.openCustomDocument(fixture.uri);
@@ -163,7 +163,7 @@ describe('register_table_viewer', () => {
         const registration = register_table_viewer(context(), state_store());
         const provider = excel_provider();
         const panel = vscode_mock.window.createWebviewPanel(
-            'tableViewer.excelViewer',
+            'tableViewer.editor',
             'basic.xlsx',
         ) as unknown as vscode.WebviewPanel;
         const document = await provider.openCustomDocument(uri);
@@ -210,7 +210,7 @@ describe('register_table_viewer', () => {
         const registration = register_table_viewer(context(), state_store());
         const provider = excel_provider();
         const panel = vscode_mock.window.createWebviewPanel(
-            'tableViewer.excelViewer',
+            'tableViewer.editor',
             'basic.xlsx',
         ) as unknown as vscode.WebviewPanel;
         const reveal = vi.spyOn(panel, 'reveal');
@@ -238,9 +238,9 @@ describe('register_table_viewer', () => {
         const provider = excel_provider();
         vscode_mock.__setCommand('vscode.openWith', async (target: unknown, view_type: unknown) => {
             expect(target).toBe(uri);
-            expect(view_type).toBe('tableViewer.excelViewer');
+            expect(view_type).toBe('tableViewer.editor');
             const panel = vscode_mock.window.createWebviewPanel(
-                'tableViewer.excelViewer',
+                'tableViewer.editor',
                 'basic.xlsx',
             ) as unknown as vscode.WebviewPanel;
             const document = await provider.openCustomDocument(uri);
@@ -272,7 +272,7 @@ describe('register_table_viewer', () => {
         const open_with = vi.fn(async () => {
             await open_gate;
             const panel = vscode_mock.window.createWebviewPanel(
-                'tableViewer.excelViewer',
+                'tableViewer.editor',
                 'basic.xlsx',
             ) as unknown as vscode.WebviewPanel;
             const document = await provider.openCustomDocument(uri);
@@ -304,7 +304,7 @@ describe('register_table_viewer', () => {
         const registration = register_table_viewer(context(), state_store());
         const provider = excel_provider();
         const panels = [0, 1].map(() => vscode_mock.window.createWebviewPanel(
-            'tableViewer.excelViewer',
+            'tableViewer.editor',
             'basic.xlsx',
         ) as unknown as vscode.WebviewPanel);
         for (const panel of panels) {
@@ -346,7 +346,7 @@ describe('register_table_viewer', () => {
 
         const retry = vi.fn(async () => {
             const panel = vscode_mock.window.createWebviewPanel(
-                'tableViewer.excelViewer',
+                'tableViewer.editor',
                 'basic.xlsx',
             ) as unknown as vscode.WebviewPanel;
             const document = await provider.openCustomDocument(uri);
@@ -359,15 +359,15 @@ describe('register_table_viewer', () => {
         await dispose_registration(registration, vscode_mock.__getPanels()[0]);
     });
 
-    it('keeps multi-viewer support for both Excel and CSV custom editors', () => {
+    it('keeps multi-viewer support for the unified custom editor', () => {
         register_table_viewer(context(), state_store());
 
         const registrations = vscode_mock.__getCustomEditorRegistrations();
-        const excel = registrations.find((r) => r.viewType === 'tableViewer.excelViewer');
-        const csv = registrations.find((r) => r.viewType === 'tableViewer.editor');
-
-        expect(excel?.options).toMatchObject({ supportsMultipleEditorsPerDocument: true });
-        expect(csv?.options).toMatchObject({ supportsMultipleEditorsPerDocument: true });
+        expect(registrations).toHaveLength(1);
+        expect(registrations[0]).toMatchObject({
+            viewType: 'tableViewer.editor',
+            options: { supportsMultipleEditorsPerDocument: true },
+        });
     });
 
     async function csv_capabilities(

@@ -51,33 +51,20 @@ afterEach(async () => {
 });
 
 describe('VS Code custom-editor activation rollback', () => {
-    it('disposes the first provider before closing SQLite when the second registration throws', async () => {
-        const register_provider = vscode_mock.window.registerCustomEditorProvider
-            .bind(vscode_mock.window);
-        let calls = 0;
+    it('closes SQLite when the custom-editor registration throws', async () => {
         vi.spyOn(vscode_mock.window, 'registerCustomEditorProvider')
-            .mockImplementation((view_type, provider, options) => {
-                calls += 1;
+            .mockImplementation((view_type) => {
                 seams.events.push(`register:${view_type}`);
-                if (calls === 2) throw new Error('CSV provider registration failed');
-                const registered = register_provider(view_type, provider, options);
-                return {
-                    dispose() {
-                        seams.events.push(`dispose:${view_type}`);
-                        registered.dispose();
-                    },
-                };
+                throw new Error('Table Viewer provider registration failed');
             });
         const extension_context = context();
 
         await expect(activate(extension_context)).rejects
-            .toThrow('CSV provider registration failed');
+            .toThrow('Table Viewer provider registration failed');
 
         expect(seams.events).toEqual([
             'open:database',
-            'register:tableViewer.excelViewer',
             'register:tableViewer.editor',
-            'dispose:tableViewer.excelViewer',
             'close:database',
         ]);
         expect(vscode_mock.__getCustomEditorRegistrations()).toEqual([]);
