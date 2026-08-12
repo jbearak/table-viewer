@@ -1,5 +1,6 @@
 import React, {
     forwardRef,
+    useEffect,
     useId,
     useImperativeHandle,
     useLayoutEffect,
@@ -230,7 +231,20 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
               * would break it.
               */}
             <ScopeMenuContext.Provider value={scope_menu_context}>
-            <div ref={actions_ref} className="toolbar-actions">
+            <div
+                ref={actions_ref}
+                className="toolbar-actions"
+                // Pressing any control in the row dismisses an open menu, including
+                // the ones that know nothing about scope menus — Columns, Edit. Two
+                // exceptions: a press inside the menu is the menu being used, and a
+                // press on a chevron is its own toggle, which would otherwise close
+                // here and reopen on click.
+                onPointerDown={(event) => {
+                    const target = event.target as HTMLElement;
+                    if (target.closest('[role="menu"], .toolbar-split-caret')) return;
+                    set_open_scope_menu(null);
+                }}
+            >
                 {workbook_actions}
                 {workbook_actions.length > 0 && (
                     <div
@@ -282,6 +296,28 @@ function ToolbarButton({
     // opened, and clicking a caret does not reliably blur the previous one.
     const show_tooltip = (is_hovered || is_focused) && !scope_context?.open;
     const native_disabled = disabled && !focusable_when_disabled;
+
+    /*
+     * Forget the hover and focus that were live when the menu opened.
+     *
+     * The menu renders inside this control's `.toolbar-item`, so focus moving into it
+     * never fires the wrapper's `onBlur`, and the pointer travelling over it never
+     * fires `onMouseLeave`. Dismissing by clicking elsewhere then removes the menu
+     * without either event ever arriving, leaving both flags stuck on — and the
+     * tooltip, suppressed only while the menu was open, would pop back over a control
+     * the pointer left long ago.
+     *
+     * Safe for the keyboard path: Escape restores focus to the chevron on a later
+     * tick, which sets `is_focused` again and brings the tooltip back, as it should.
+     */
+    const menu_was_open_ref = useRef(false);
+    useEffect(() => {
+        if (menu_was_open_ref.current && !menu_open) {
+            set_is_hovered(false);
+            set_is_focused(false);
+        }
+        menu_was_open_ref.current = menu_open;
+    }, [menu_open]);
 
     /**
      * Anchor the menu to the left edge of the whole control, not to the chevron.

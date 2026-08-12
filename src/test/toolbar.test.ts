@@ -833,6 +833,83 @@ describe('Toolbar scope menus', () => {
         ]);
     });
 
+    it('closes an open menu when any toolbar button is pressed', () => {
+        render_toolbar({ auto_fit_scope_menu: scope_menu(), show_edit_button: true });
+        open_caret();
+        expect(document.querySelector('[role="menu"]')).not.toBeNull();
+
+        act(() => get_button('Edit').dispatchEvent(
+            new MouseEvent('pointerdown', { bubbles: true, cancelable: true }),
+        ));
+        expect(document.querySelector('[role="menu"]')).toBeNull();
+    });
+
+    it('closes an open menu when the Columns trigger is pressed', () => {
+        // Columns knows nothing about scope menus, so the dismissal has to live on
+        // the row rather than on the buttons that own the menus.
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+        open_caret();
+
+        act(() => get_button('Columns').dispatchEvent(
+            new MouseEvent('pointerdown', { bubbles: true, cancelable: true }),
+        ));
+        expect(document.querySelector('[role="menu"]')).toBeNull();
+    });
+
+    it('still toggles its own menu shut from the chevron', () => {
+        // The row-level dismissal must not swallow the chevron's own toggle: closing
+        // on pointerdown would let the click that follows reopen it every time.
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+        const caret = open_caret();
+        expect(document.querySelector('[role="menu"]')).not.toBeNull();
+
+        act(() => caret.dispatchEvent(
+            new MouseEvent('pointerdown', { bubbles: true, cancelable: true }),
+        ));
+        act(() => caret.click());
+        expect(document.querySelector('[role="menu"]')).toBeNull();
+    });
+
+    it('keeps a menu item clickable through the row-level dismissal', () => {
+        const menu = scope_menu();
+        render_toolbar({ auto_fit_scope_menu: menu });
+        open_caret();
+
+        const first = document.querySelector<HTMLButtonElement>('[role="menuitem"]')!;
+        act(() => first.dispatchEvent(
+            new MouseEvent('pointerdown', { bubbles: true, cancelable: true }),
+        ));
+        act(() => first.click());
+        expect(menu.items[0].on_click).toHaveBeenCalledOnce();
+    });
+
+    it('does not bring the tooltip back when the menu is dismissed from outside', async () => {
+        // The menu renders inside the control, so focus moving into it fires no blur
+        // and the pointer crossing it fires no mouseleave. Dismissing from elsewhere
+        // removed the menu with both flags stuck on, and the tooltip — suppressed
+        // only while the menu was open — popped back over a control the pointer had
+        // long since left.
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+
+        dispatch_mouse_event(get_button('Auto-fit Columns'), 'mouseover');
+        expect(get_tooltip()).not.toBeNull();
+        const caret = open_caret();
+        act(() => caret.focus());
+        expect(get_tooltip()).toBeNull();
+
+        // A click out in the grid: ContextMenu dismisses on an outside pointerdown
+        // and restores no focus, so nothing else clears the flags. Its listener is
+        // attached a tick after mount, so wait for that before dispatching.
+        await act(async () => {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+        });
+        await act(async () => {
+            document.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true }));
+        });
+        expect(document.querySelector('[role="menu"]')).toBeNull();
+        expect(get_tooltip()).toBeNull();
+    });
+
     it('does not stack the tooltip on top of the menu it opened', () => {
         render_toolbar({ auto_fit_scope_menu: scope_menu() });
 
