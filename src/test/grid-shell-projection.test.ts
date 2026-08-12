@@ -9,7 +9,8 @@ import type {
     GridShellProps,
 } from '../webview/grid-shell';
 import { matches_filter } from '../table-transform';
-import type { FilterEntry, SheetTransformState } from '../types';
+import type { CsvSaveOperation, FilterEntry, SheetTransformState } from '../types';
+import { create_edit_session_store } from '../webview/edit-session-store';
 import {
     MAX_ROW_HEIGHT_PX,
     default_row_height_for_font,
@@ -2230,12 +2231,13 @@ describe('GridShell source-row edit identity', () => {
     });
 
     it('folds an evicted overlay into the save under the key it opened with', async () => {
-        // The same drop on the read_live_edit path, which is what collect_save_edits
+        // The same drop on the read_live_edit path, which is what collect_save_payload
         // consumes: an overlay the user never closed before hitting Save.
         const editing_ref = React.createRef<EditingHandle | null>();
         grid_mock.source_row_for_display = (display_row: number) => (
             display_row === 0 ? 5 : display_row + 100
         );
+        const edit_session = create_edit_session_store({ session_id: 'session-1' });
         await render_grid(props({
             sheet_meta: { ...props().sheet_meta, rowCount: 3, sourceRowCount: 3 },
             row_count: 3,
@@ -2243,13 +2245,24 @@ describe('GridShell source-row edit identity', () => {
             csv_editable: true,
             editing_ref,
             edit_session_id: 'session-1',
-            on_save_request: (edits, dirty_edits) => ({
-                editSessionId: 'session-1',
-                sheetIndex: 0,
-                saveRequestId: 'save-1',
-                edits,
-                dirtyEdits: dirty_edits,
-            }),
+            edit_session,
+            on_save_request: () => {
+                const snapshot = edit_session.snapshot();
+                const operation: CsvSaveOperation = {
+                    editSessionId: 'session-1',
+                    saveRequestId: 'save-1',
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: Object.fromEntries([...snapshot].map(([key, entry]) => [
+                            key,
+                            entry.value,
+                        ])),
+                        dirtyEdits: Object.fromEntries(snapshot),
+                    }],
+                };
+                grid_mock.post_message({ type: 'saveCsv', operation });
+                return operation;
+            },
         }));
 
         await open_tracking_overlay([0, 0], 'live text');
@@ -2261,13 +2274,11 @@ describe('GridShell source-row edit identity', () => {
 
         const save = [...grid_mock.post_message.mock.calls]
             .reverse()
-            .map(([message]) => message as { type?: string; operation?: {
-                edits: Record<string, string>;
-            } })
+            .map(([message]) => message as { type?: string; operation?: CsvSaveOperation })
             .find((message) => message?.type === 'saveCsv');
         // Dropped, this save posts nothing at all (request_save returns false on an
         // empty map); display-keyed, it posts '0:0'.
-        expect(save!.operation!.edits).toEqual({ '5:0': 'live text' });
+        expect(save!.operation!.worksheets[0].edits).toEqual({ '5:0': 'live text' });
     });
 
     it('commits nothing when onCellEdited fires on an unresolved row', async () => {

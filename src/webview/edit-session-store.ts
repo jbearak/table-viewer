@@ -139,7 +139,7 @@ export interface EditSessionStore {
      * `''`. Dropping the flag would promote that placeholder to a real base:
      * conflict detection would start comparing against `''` and a save would be
      * admitted with a base the user never saw, instead of being held back by
-     * `collect_exact_dirty_edits`.
+     * `collect_save_payload`.
      */
     replace(
         session_id: string | undefined,
@@ -232,7 +232,7 @@ export function create_edit_session_store(
     // generation remount no longer re-runs an install: a hook-local ref would
     // reset to false while base_pending entries remain, and both consequences
     // are silent — is_entry_conflicted would never flag a real external change,
-    // and collect_exact_dirty_edits (csv-save-model.ts) would refuse the save
+    // and collect_save_payload (csv-save-model.ts) would refuse the save
     // forever with "Load every edited row before saving…", with no path out.
 
     // The stamp rejects a write from a hook that mounted under an earlier

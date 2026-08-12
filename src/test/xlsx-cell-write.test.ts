@@ -1,7 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'fs';
 import CFB from 'cfb';
-import { write_xlsx_cell_edits } from '../xlsx-package';
+import {
+    write_xlsx_cell_edits,
+    write_xlsx_workbook_cell_edits,
+} from '../xlsx-package';
 import { parse_xlsx, worksheet_part_paths } from '../parse-xlsx';
 import {
     apply_cell_edits,
@@ -1203,6 +1206,26 @@ describe('widen_dimension', () => {
 });
 
 describe('write_xlsx_cell_edits', () => {
+    it('writes several worksheets through one workbook operation', async () => {
+        const raw = readFileSync('src/test/fixtures/basic.xlsx');
+        const out = write_xlsx_workbook_cell_edits(raw, [
+            { sheetIndex: 0, edits: [{ row: 1, col: 0, value: 'Alicia' }] },
+            { sheetIndex: 1, edits: [{ row: 1, col: 0, value: 'Gadget' }] },
+        ]);
+        const { data } = await parse_xlsx(out);
+
+        expect(data.sheets[0].rows[1][0]?.raw).toBe('Alicia');
+        expect(data.sheets[1].rows[1][0]?.raw).toBe('Gadget');
+    });
+
+    it('rejects duplicate worksheet targets as one operation', () => {
+        const raw = readFileSync('src/test/fixtures/basic.xlsx');
+        expect(() => write_xlsx_workbook_cell_edits(raw, [
+            { sheetIndex: 0, edits: [{ row: 1, col: 0, value: 'Alicia' }] },
+            { sheetIndex: 0, edits: [{ row: 2, col: 0, value: 'Bob' }] },
+        ])).toThrow('Invalid or duplicate worksheet');
+    });
+
     it('writes values that read back through the parser', async () => {
         const raw = readFileSync(FORMATTED);
         const out = write_xlsx_cell_edits(raw, 0, [

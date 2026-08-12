@@ -33,7 +33,7 @@ import {
 import { create_resource_identity, type ResourceUriLike } from './resource-identity';
 import { assert_safe_file_size, MAX_CSV_ROWS } from './spreadsheet-safety';
 import { serialize_csv } from './serialize-csv';
-import { write_xlsx_cell_edits } from './xlsx-package';
+import { write_xlsx_workbook_cell_edits } from './xlsx-package';
 import type { XlsxCellEdit } from './xlsx-cell-write';
 import { validate_dirty_bases } from './csv-base-validation';
 import type {
@@ -84,8 +84,10 @@ import {
     type CsvSaveLifecycle,
     type CsvSaveOperation,
     type CsvSaveOperationRequest,
+    type CsvSaveWorksheetOperation,
     type CsvSaveRejection,
     type HostMessage,
+    type LegacyCsvSaveOperationRequest,
     type PerFileState,
     type SheetPendingEditCells,
     type SheetTransformState,
@@ -134,19 +136,23 @@ const SAVE_WINDOW = 10_000;
  * already makes, so the two jobs are one interface rather than two traversals
  * of a million-row file.
  */
-export interface SavePlanInput {
-    readonly source: DataSource;
+export interface SavePlanWorksheetInput {
     readonly sheet_index: number;
-    readonly file_path: string;
     /** Source-keyed `row:col` → new text, exactly the cells the user changed. */
     readonly edits: Readonly<Record<string, string>>;
     readonly wanted_bases: ReadonlySet<string>;
 }
 
+export interface SavePlanInput {
+    readonly source: DataSource;
+    readonly file_path: string;
+    readonly worksheets: readonly SavePlanWorksheetInput[];
+}
+
 export interface SavePlan {
-    /** Observed pre-edit raw text, `row:col` → text, for the wanted keys that
-     *  exist. A missing key reads as "" downstream, matching a blank cell. */
-    readonly observed_bases: ReadonlyMap<string, string>;
+    /** Observed pre-edit raw text per worksheet, in input order. A missing key
+     *  reads as "" downstream, matching a blank cell. */
+    readonly observed_bases: readonly ReadonlyMap<string, string>[];
     /**
      * The bytes to write, given the file's current bytes.
      *
@@ -239,12 +245,7 @@ export type ViewerProfile = ViewerProfileBase & (
  */
 type EditCleanupScope =
     | { type: 'workbook' }
-    | {
-        type: 'sheet';
-        sheetIndex: number;
-        sheetName?: string;
-        worksheetId?: string;
-    };
+    | { type: 'worksheets'; targets: readonly WorksheetTarget[] };
 
 type CsvEditFilePhase =
     | { type: 'free' }
@@ -358,10 +359,10 @@ interface PanelLoadRequest {
 }
 
 interface CsvSaveHostOperation {
-    /** Exact renderer operation used for lifecycle correlation. */
+    /** Exact normalized operation used for host lifecycle ownership. */
     readonly identity: CsvSaveOperation;
-    /** Host-resolved worksheet target used for durable state and movement fences. */
-    readonly durableTarget: WorksheetTarget;
+    /** Host-resolved worksheet targets, in the operation's deterministic order. */
+    readonly durableTargets: readonly WorksheetTarget[];
     phase: 'preparing' | 'accepted' | 'writing';
 }
 
@@ -498,21 +499,24 @@ function harvest_source_bases(
  * out, which is what `projected_row_for_source` is for.
  */
 function plan_xlsx_save(input: SavePlanInput): SavePlan {
-    const { source: src, sheet_index, edits, wanted_bases } = input;
+    const { source: src } = input;
 
-    // Only the wanted rows are read, not the whole sheet: unlike CSV there is no
-    // serialization walk to ride along with, and an edit touches a handful of
-    // rows out of a million.
-    const observed_bases = harvest_source_bases(src, sheet_index, wanted_bases);
-    const cell_edits: XlsxCellEdit[] = [];
-    for (const [key, value] of Object.entries(edits)) {
-        const [row, col] = key.split(':').map(Number);
-        if (!Number.isInteger(row) || !Number.isInteger(col)) continue;
-        cell_edits.push({ row, col, value });
-    }
+    // Every worksheet is fully planned before bytes are produced. The package
+    // writer likewise computes every replacement before mutating the container,
+    // so one invalid worksheet rejects the workbook save atomically.
+    const planned = input.worksheets.map(({ sheet_index, edits, wanted_bases }) => {
+        const observed_bases = harvest_source_bases(src, sheet_index, wanted_bases);
+        const cell_edits: XlsxCellEdit[] = [];
+        for (const [key, value] of Object.entries(edits)) {
+            const [row, col] = key.split(':').map(Number);
+            if (!Number.isInteger(row) || !Number.isInteger(col)) continue;
+            cell_edits.push({ row, col, value });
+        }
+        return { observed_bases, sheetIndex: sheet_index, edits: cell_edits };
+    });
     return {
-        observed_bases,
-        produce: (raw) => write_xlsx_cell_edits(raw, sheet_index, cell_edits),
+        observed_bases: planned.map(({ observed_bases }) => observed_bases),
+        produce: (raw) => write_xlsx_workbook_cell_edits(raw, planned),
     };
 }
 
@@ -564,7 +568,11 @@ export function build_csv_source(
  * rides along with the serialization rather than making a second pass.
  */
 export function plan_csv_save(input: SavePlanInput): SavePlan {
-    const { source: src, edits, wanted_bases } = input;
+    if (input.worksheets.length !== 1 || input.worksheets[0].sheet_index !== 0) {
+        throw new Error('CSV saves require exactly one worksheet payload.');
+    }
+    const { source: src } = input;
+    const { edits, wanted_bases } = input.worksheets[0];
     const observed_bases = new Map<string, string>();
     const wanted_columns = new Map<number, number[]>();
     for (const key of wanted_bases) {
@@ -619,7 +627,7 @@ export function plan_csv_save(input: SavePlanInput): SavePlan {
         src.headerLine,
     );
     const bytes = new TextEncoder().encode(content);
-    return { observed_bases, produce: () => bytes };
+    return { observed_bases: [observed_bases], produce: () => bytes };
 }
 
 export function csv_table_profile(config?: ConfigPort): ViewerProfile {
@@ -710,7 +718,7 @@ export function attach_viewer(
     // A failed save only needs a tombstone if it got that far; see the write site in
     // `release_edit_session`. Weak so a retired operation's entry goes with it —
     // `save_lifecycle.operation` is the only strong reference either way.
-    const persisted_save_targets = new WeakMap<CsvSaveOperation, WorksheetTarget>();
+    const persisted_save_targets = new WeakMap<CsvSaveOperation, readonly WorksheetTarget[]>();
     const pending_rehydration_rejections = new WeakMap<PanelAdoption, {
         readonly operation: CsvSaveOperation;
         readonly rejection: CsvSaveRejection;
@@ -1730,7 +1738,7 @@ export function attach_viewer(
      */
     function save_sheet_moved(operation: CsvSaveHostOperation): boolean {
         return save_operation_owns_lifecycle(operation)
-            && save_sheet_displaced(operation.durableTarget);
+            && operation.durableTargets.some(save_sheet_displaced);
     }
 
     /**
@@ -1787,7 +1795,7 @@ export function attach_viewer(
             // `handle_save` validated the index against the live workbook to start,
             // so this can only fail if the workbook moved underneath, and the save
             // is refused as for any other mid-flight external change.
-            && !save_sheet_displaced(operation.durableTarget);
+            && !operation.durableTargets.some(save_sheet_displaced);
     }
 
     function recapture_edit_capabilities(deliver = false): void {
@@ -1955,15 +1963,8 @@ export function attach_viewer(
             // silently discarding work the user still has open in the grid: hit Save
             // on an externally-changed file, read the "try again" warning, close the
             // tab, and the edit is gone.
-            const durable_target = persisted_save_targets.get(
-                save_lifecycle.operation,
-            );
-            if (durable_target) {
-                file_edit_state.failedSaveTombstone = Object.freeze({
-                    ...save_lifecycle.operation,
-                    ...durable_target,
-                });
-            }
+            const durable_targets = persisted_save_targets.get(save_lifecycle.operation);
+            if (durable_targets) file_edit_state.failedSaveTombstone = save_lifecycle.operation;
             retire_save_lifecycle(edit_session_id, 'failed');
         }
 
@@ -2024,12 +2025,7 @@ export function attach_viewer(
         // A save clears the one worksheet it wrote; a discard ends the session
         // for the whole workbook and clears every live slot.
         const scope: EditCleanupScope = save_operation
-            ? {
-                type: 'sheet',
-                sheetIndex: save_operation.durableTarget.sheetIndex,
-                sheetName: save_operation.durableTarget.sheetName,
-                worksheetId: save_operation.durableTarget.worksheetId,
-            }
+            ? { type: 'worksheets', targets: save_operation.durableTargets }
             : { type: 'workbook' };
         active_save_operation = undefined;
         active_edit_session_targets.delete(edit_session_id);
@@ -2163,7 +2159,7 @@ export function attach_viewer(
      * otherwise, so the ordinary case is unchanged.
      */
     function slot_indices_holding(
-        operation: CsvSaveOperation,
+        operation: CsvSaveWorksheetOperation,
         slots: PerFileState['pendingEdits'],
         sheets?: readonly WorksheetIdentityInput[],
     ): number[] {
@@ -2214,7 +2210,7 @@ export function attach_viewer(
      * this cleanup is about to modify; see {@link slot_index_tagged}.
      */
     function operation_sheet_index(
-        operation: CsvSaveOperation,
+        operation: CsvSaveWorksheetOperation,
         sheets?: readonly WorksheetIdentityInput[],
         slots?: PerFileState['pendingEdits'],
     ): number | undefined {
@@ -2242,7 +2238,7 @@ export function attach_viewer(
      */
     function holds_operation_entries(
         cells: SheetPendingEditCells | undefined,
-        operation: CsvSaveOperation,
+        operation: CsvSaveWorksheetOperation,
     ): boolean {
         if (!cells) return false;
         return Object.entries(cells).some(([key, pending]) => {
@@ -2256,7 +2252,7 @@ export function attach_viewer(
 
     function strip_operation_owned_pending_edits(
         pending_edits: SheetPendingEditCells | undefined,
-        operation: CsvSaveOperation,
+        operation: CsvSaveWorksheetOperation,
     ): SheetPendingEditCells | undefined {
         if (!pending_edits) return undefined;
         const retained = Object.fromEntries(
@@ -2285,7 +2281,7 @@ export function attach_viewer(
      */
     function post_echoes_operation(
         pending_edits: SheetPendingEditCells | undefined,
-        operation: CsvSaveOperation,
+        operation: CsvSaveWorksheetOperation,
     ): boolean {
         const owned = Object.keys(operation.dirtyEdits).length;
         if (owned === 0 || !pending_edits) return false;
@@ -2310,8 +2306,8 @@ export function attach_viewer(
             slots?: PerFileState['pendingEdits'];
         },
     ): SheetPendingEditCells | undefined {
-        const applies = (operation: CsvSaveOperation) => !scope
-            || operation_sheet_index(operation, scope.sheets, scope.slots)
+        const applies = (worksheet: CsvSaveWorksheetOperation) => !scope
+            || operation_sheet_index(worksheet, scope.sheets, scope.slots)
                 === scope.sheetIndex;
         let projected = pending_edits;
         if (save_lifecycle.state !== 'idle') {
@@ -2319,20 +2315,17 @@ export function attach_viewer(
                 save_lifecycle.state !== 'succeeded'
                 && save_lifecycle.operation.editSessionId === active_edit_session_id
             ) return projected;
-            if (applies(save_lifecycle.operation)) {
-                projected = strip_operation_owned_pending_edits(
-                    projected,
-                    save_lifecycle.operation,
-                );
+            for (const worksheet of save_lifecycle.operation.worksheets) {
+                if (!applies(worksheet)) continue;
+                projected = strip_operation_owned_pending_edits(projected, worksheet);
             }
         }
         const tombstone = file_edit_state?.failedSaveTombstone;
-        if (
-            tombstone
-            && tombstone.editSessionId !== active_edit_session_id
-            && applies(tombstone)
-        ) {
-            projected = strip_operation_owned_pending_edits(projected, tombstone);
+        if (tombstone && tombstone.editSessionId !== active_edit_session_id) {
+            for (const worksheet of tombstone.worksheets) {
+                if (!applies(worksheet)) continue;
+                projected = strip_operation_owned_pending_edits(projected, worksheet);
+            }
         }
         return projected;
     }
@@ -2422,28 +2415,26 @@ export function attach_viewer(
                     // Every slot holding this operation's entries, not one guessed
                     // between indistinguishable candidates: the strip matches key
                     // *and* value, so it removes only what this save wrote.
-                    const targets = slot_indices_holding(
-                        operation,
-                        current.pendingEdits,
-                        sheets,
-                    );
                     let next = current.pendingEdits;
                     let changed = false;
-                    for (const sheet_index of targets) {
-                        const slot = next?.[sheet_index];
-                        const pending_edits = strip_operation_owned_pending_edits(
-                            slot?.cells,
-                            operation,
-                        );
-                        if (pending_edits === slot?.cells) continue;
-                        changed = true;
-                        next = with_pending_edits_for_sheet(
-                            next,
-                            sheet_index,
-                            pending_edits,
-                            slot?.sheetName,
-                            slot?.worksheetId,
-                        );
+                    for (const worksheet of operation.worksheets) {
+                        const targets = slot_indices_holding(worksheet, next, sheets);
+                        for (const sheet_index of targets) {
+                            const slot = next?.[sheet_index];
+                            const pending_edits = strip_operation_owned_pending_edits(
+                                slot?.cells,
+                                worksheet,
+                            );
+                            if (pending_edits === slot?.cells) continue;
+                            changed = true;
+                            next = with_pending_edits_for_sheet(
+                                next,
+                                sheet_index,
+                                pending_edits,
+                                slot?.sheetName,
+                                slot?.worksheetId,
+                            );
+                        }
                     }
                     if (!changed) return current;
                     if (next) return { ...current, pendingEdits: next };
@@ -2595,8 +2586,8 @@ export function attach_viewer(
         return {
             dirtyEdits: dirty_edits,
             rejection: validation.type === 'removedRows'
-                ? { reason: 'rowsRemoved', keys: validation.keys }
-                : { reason: 'baseMismatch', keys: validation.keys },
+                ? { reason: 'rowsRemoved', worksheetOperationIndex: 0, keys: validation.keys }
+                : { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: validation.keys },
         };
     }
 
@@ -3550,14 +3541,16 @@ export function attach_viewer(
                                 if (!validation) continue;
                                 const operation = clone_save_operation({
                                     editSessionId: active_edit_session_id,
-                                    sheetIndex: restored_sheet_index,
-                                    sheetName: next_sheets[restored_sheet_index]?.name,
-                                    worksheetId: next_sheets[restored_sheet_index]?.worksheetId,
                                     saveRequestId: `rehydration:${seq}`,
-                                    edits: Object.fromEntries(Object.entries(
-                                        validation.dirtyEdits,
-                                    ).map(([key, entry]) => [key, entry.value])),
-                                    dirtyEdits: validation.dirtyEdits,
+                                    worksheets: [{
+                                        sheetIndex: restored_sheet_index,
+                                        sheetName: next_sheets[restored_sheet_index]?.name,
+                                        worksheetId: next_sheets[restored_sheet_index]?.worksheetId,
+                                        edits: Object.fromEntries(Object.entries(
+                                            validation.dirtyEdits,
+                                        ).map(([key, entry]) => [key, entry.value])),
+                                        dirtyEdits: validation.dirtyEdits,
+                                    }],
                                 });
                                 pending_rehydration_rejections.set(adoption, {
                                     operation,
@@ -3845,39 +3838,12 @@ export function attach_viewer(
         const committed = await update_file_state((current, sheets) => {
             if (!current.pendingEdits) return current;
             if (scope.type === 'workbook') {
-                // A discard ends the workbook-scoped session, so every slot the
-                // session was showing goes at once: untagged slots (single-sheet
-                // CSV), and slots whose name resolves at their own index. What
-                // survives is exactly what the projection was withholding — a
-                // *parked* slot (tagged for a worksheet this workbook does not
-                // have) or a *displaced* one (its sheet is live but elsewhere,
-                // reconciliation seated a same-named winner there). Neither was
-                // shown to the user, so neither is theirs to discard; both stay
-                // durable and reappear with their worksheets.
-                const shown = (
-                    slot: WorksheetPendingEdits | undefined,
-                    index: number,
-                ) => {
-                    if (slot === undefined) return false;
-                    const identity = worksheet_identity(sheets[index] ?? '');
-                    return pending_edits_for_sheet(
-                        current.pendingEdits,
-                        index,
-                        identity.name,
-                        identity.worksheetId,
-                    ) === slot.cells;
-                };
-                const retained = current.pendingEdits.map(
-                    (slot, index) => (shown(slot, index) ? undefined : slot),
-                );
-                while (
-                    retained.length > 0 && retained[retained.length - 1] === undefined
-                ) retained.pop();
-                if (!retained.some(Boolean)) {
-                    const { pendingEdits: _drop, ...rest } = current;
-                    return rest;
-                }
-                return { ...current, pendingEdits: retained };
+                // The one workbook dialog discards the entire session, including
+                // parked drafts whose worksheets are temporarily absent. Keeping a
+                // durable slot after the renderer cleared its matching parked store
+                // would make discarded edits reappear when that worksheet returns.
+                const { pendingEdits: _drop, ...rest } = current;
+                return rest;
             }
             // Resolved inside the updater, because `current` has already been
             // reconciled against the adopted workbook: after a reorder the captured
@@ -3890,35 +3856,30 @@ export function attach_viewer(
             // reads — so the captured position may already be someone else's. The
             // durable slots' own tags answer without a workbook; see
             // `slot_index_tagged`.
-            const has_identity = scope.worksheetId !== undefined
-                || scope.sheetName !== undefined;
-            const target = !has_identity
-                ? scope.sheetIndex
-                : source
-                    ? sheet_index_identified(scope.worksheetId, scope.sheetName, sheets)
-                    : slot_index_identified(
-                        current.pendingEdits,
-                        scope.worksheetId,
-                        scope.sheetName,
-                        scope.sheetIndex,
-                    );
-            if (target === undefined) return current;
-            // One sheet's slot, not the leaf: a save on this worksheet must leave
-            // another worksheet's unsaved draft exactly where it is.
-            const next = with_pending_edits_for_sheet(
-                current.pendingEdits,
-                target,
-                undefined,
-                // Named, so the clear can tell its own slot from a displaced one.
-                // Without it the resolved position was emptied whatever was sitting
-                // there, and when this worksheet had no durable slot of its own —
-                // a session discarded before it ever published a map — `target` fell
-                // back to the captured index, which another worksheet's draft may
-                // legitimately occupy. That draft was deleted with no message asking
-                // to discard it.
-                scope.sheetName,
-                scope.worksheetId,
-            );
+            let next: PerFileState['pendingEdits'] = current.pendingEdits;
+            for (const saved of scope.targets) {
+                const has_identity = saved.worksheetId !== undefined
+                    || saved.sheetName !== undefined;
+                const target = !has_identity
+                    ? saved.sheetIndex
+                    : source
+                        ? sheet_index_identified(saved.worksheetId, saved.sheetName, sheets)
+                        : slot_index_identified(
+                            next,
+                            saved.worksheetId,
+                            saved.sheetName,
+                            saved.sheetIndex,
+                        );
+                if (target === undefined) continue;
+                next = with_pending_edits_for_sheet(
+                    next,
+                    target,
+                    undefined,
+                    saved.sheetName,
+                    saved.worksheetId,
+                );
+            }
+            if (next === current.pendingEdits) return current;
             if (next) return { ...current, pendingEdits: next };
             const { pendingEdits: _drop, ...rest } = current;
             return rest;
@@ -4398,30 +4359,58 @@ export function attach_viewer(
     }
 
     function clone_save_operation(input: CsvSaveOperationRequest): CsvSaveOperation {
-        const dirty_edits = Object.fromEntries(
-            Object.entries(input.dirtyEdits).map(([key, entry]) => [
-                key,
-                Object.freeze({ value: entry.value, base: entry.base }),
-            ]),
-        );
-        const sheet_index = input.sheetIndex ?? 0;
-        const sheet_name = input.sheetName ?? (
-            (source?.meta().sheets.length ?? 0) <= 1
-                ? sheet_name_at(sheet_index)
-                : undefined
-        );
-        const worksheet_id = input.worksheetId;
-        return Object.freeze({
+        const requested_worksheets: readonly CsvSaveWorksheetOperation[] = (
+            'worksheets' in input && Array.isArray(input.worksheets)
+        )
+            ? input.worksheets
+            : [input as LegacyCsvSaveOperationRequest];
+        const worksheets = requested_worksheets.map((worksheet) => {
+            const dirty_edits = Object.fromEntries(
+                Object.entries(worksheet.dirtyEdits).map(([key, entry]) => [
+                    key,
+                    Object.freeze({ value: entry.value, base: entry.base }),
+                ]),
+            );
+            const sheet_index = worksheet.sheetIndex ?? 0;
+            const sheet_name = worksheet.sheetName ?? (
+                (source?.meta().sheets.length ?? 0) <= 1
+                    ? sheet_name_at(sheet_index)
+                    : undefined
+            );
+            return Object.freeze<CsvSaveWorksheetOperation>({
+                sheetIndex: sheet_index,
+                ...(sheet_name !== undefined ? { sheetName: sheet_name } : {}),
+                ...(worksheet.worksheetId !== undefined
+                    ? { worksheetId: worksheet.worksheetId }
+                    : {}),
+                edits: Object.freeze({ ...worksheet.edits }),
+                dirtyEdits: Object.freeze(dirty_edits),
+            });
+        });
+        const workbook_operation = {
             editSessionId: input.editSessionId,
-            // Normalized here, at the boundary where a wire message becomes an
-            // identity: everything downstream compares whole operations, so both
-            // worksheet coordinates must be settled before any of them sees one.
-            sheetIndex: sheet_index,
-            ...(sheet_name !== undefined ? { sheetName: sheet_name } : {}),
-            ...(worksheet_id !== undefined ? { worksheetId: worksheet_id } : {}),
             saveRequestId: input.saveRequestId,
-            edits: Object.freeze({ ...input.edits }),
-            dirtyEdits: Object.freeze(dirty_edits),
+            worksheets: Object.freeze(worksheets),
+        };
+        if ('worksheets' in input && Array.isArray(input.worksheets)) {
+            return Object.freeze(workbook_operation);
+        }
+        // Old renderers compare the flat fields they proposed and ignore unknown
+        // fields; current renderers compare `worksheets` and ignore these aliases.
+        // One hybrid identity therefore settles both generations through every
+        // lifecycle channel, including snapshots, without weakening either reducer.
+        const worksheet = worksheets[0];
+        return Object.freeze({
+            ...workbook_operation,
+            sheetIndex: worksheet.sheetIndex,
+            ...(worksheet.sheetName !== undefined
+                ? { sheetName: worksheet.sheetName }
+                : {}),
+            ...(worksheet.worksheetId !== undefined
+                ? { worksheetId: worksheet.worksheetId }
+                : {}),
+            edits: worksheet.edits,
+            dirtyEdits: worksheet.dirtyEdits,
         });
     }
 
@@ -4434,24 +4423,26 @@ export function attach_viewer(
         // too late: the edits reach disk, the tombstone is skipped, and they survive
         // into the next session. That is the leak this gate exists to close, and the
         // surviving edit is the folded live-editor value the user never posted.
-        persisted_save_targets.set(operation.identity, operation.durableTarget);
-        const committed = await update_file_state((current) => ({
-            ...current,
-            // Written into the operation's own slot: a save must never disturb a
-            // sibling worksheet's unsaved edits.
-            pendingEdits: with_pending_edits_for_sheet(
-                current.pendingEdits,
-                operation.durableTarget.sheetIndex,
-                Object.fromEntries(
-                    Object.entries(operation.identity.dirtyEdits).map(([key, entry]) => [
-                        key,
-                        { value: entry.value, base: entry.base },
-                    ]),
-                ),
-                operation.durableTarget.sheetName,
-                operation.durableTarget.worksheetId,
-            ),
-        }), undefined, () => save_operation_is_current(operation));
+        persisted_save_targets.set(operation.identity, operation.durableTargets);
+        const committed = await update_file_state((current) => {
+            let pending = current.pendingEdits;
+            operation.identity.worksheets.forEach((worksheet, index) => {
+                const target = operation.durableTargets[index];
+                pending = with_pending_edits_for_sheet(
+                    pending,
+                    target.sheetIndex,
+                    Object.fromEntries(
+                        Object.entries(worksheet.dirtyEdits).map(([key, entry]) => [
+                            key,
+                            { value: entry.value, base: entry.base },
+                        ]),
+                    ),
+                    target.sheetName,
+                    target.worksheetId,
+                );
+            });
+            return { ...current, pendingEdits: pending };
+        }, undefined, () => save_operation_is_current(operation));
         if (!committed || !save_operation_is_current(operation)) {
             throw new Error('The save operation changed before its edits were accepted.');
         }
@@ -4471,14 +4462,21 @@ export function attach_viewer(
         // the captured name resolve elsewhere — both are refusals, not saves into
         // whatever sheet now sits at the number.
         const live_sheet_count = source?.meta().sheets.length ?? 0;
-        const missing_multisheet_identity = live_sheet_count > 1
-            && identity.worksheetId === undefined
-            && identity.sheetName === undefined;
-        const wrong_sheet = !Number.isSafeInteger(identity.sheetIndex)
-            || identity.sheetIndex < 0
-            || identity.sheetIndex >= live_sheet_count
-            || missing_multisheet_identity
-            || save_sheet_displaced(identity);
+        const target_keys = new Set<string>();
+        const wrong_sheet = identity.worksheets.length === 0
+            || identity.worksheets.some((worksheet) => {
+                const missing_multisheet_identity = live_sheet_count > 1
+                    && worksheet.worksheetId === undefined
+                    && worksheet.sheetName === undefined;
+                const key = worksheet_target_key(worksheet);
+                if (target_keys.has(key)) return true;
+                target_keys.add(key);
+                return !Number.isSafeInteger(worksheet.sheetIndex)
+                    || worksheet.sheetIndex < 0
+                    || worksheet.sheetIndex >= live_sheet_count
+                    || missing_multisheet_identity
+                    || save_sheet_displaced(worksheet);
+            });
         if (wrong_sheet || !edit_message_is_current(identity.editSessionId)) {
             const active = begin_save_lifecycle(identity);
             const lifecycle = finish_save_lifecycle(active.operation, 'failed');
@@ -4532,10 +4530,12 @@ export function attach_viewer(
         try {
             plan = profile.plan_save({
                 source: src,
-                sheet_index: identity.sheetIndex,
                 file_path,
-                edits: identity.edits,
-                wanted_bases: new Set(Object.keys(identity.dirtyEdits)),
+                worksheets: identity.worksheets.map((worksheet) => ({
+                    sheet_index: worksheet.sheetIndex,
+                    edits: worksheet.edits,
+                    wanted_bases: new Set(Object.keys(worksheet.dirtyEdits)),
+                })),
             });
         } catch (error) {
             const active = begin_save_lifecycle(identity);
@@ -4563,23 +4563,30 @@ export function attach_viewer(
         // Read the operation's worksheet defensively: this line sits outside the
         // try below, so dereferencing a missing lookup would throw past every failure
         // path and leave the save lifecycle stuck in flight.
-        const sheet_meta = src.meta().sheets[identity.sheetIndex];
-        const validation = sheet_meta
-            ? validate_dirty_bases(
-                identity.dirtyEdits,
-                sheet_meta.sourceRowCount,
-                (source_row, col) => plan.observed_bases.get(`${source_row}:${col}`),
-            )
-            : { type: 'baseMismatch' as const, keys: Object.keys(identity.dirtyEdits) };
-        if (validation.type !== 'valid') {
+        let rejection: CsvSaveRejection | undefined;
+        const sheet_metas = src.meta().sheets;
+        for (let index = 0; index < identity.worksheets.length; index += 1) {
+            const worksheet = identity.worksheets[index];
+            const sheet_meta = sheet_metas[worksheet.sheetIndex];
+            const validation = sheet_meta
+                ? validate_dirty_bases(
+                    worksheet.dirtyEdits,
+                    sheet_meta.sourceRowCount,
+                    (source_row, col) => plan.observed_bases[index]?.get(`${source_row}:${col}`),
+                )
+                : { type: 'baseMismatch' as const, keys: Object.keys(worksheet.dirtyEdits) };
+            if (validation.type === 'valid') continue;
+            rejection = validation.type === 'removedRows'
+                ? { reason: 'rowsRemoved', worksheetOperationIndex: index, keys: validation.keys }
+                : { reason: 'baseMismatch', worksheetOperationIndex: index, keys: validation.keys };
+            break;
+        }
+        if (rejection) {
             // Same shape as the sibling early-returns above: a begin/finish pair so
             // the webview sees a terminal 'failed' lifecycle for this exact
             // operation and restores the precise dirty map it submitted.
             const active = begin_save_lifecycle(identity);
             const lifecycle = finish_save_lifecycle(active.operation, 'failed');
-            const rejection: CsvSaveRejection = validation.type === 'removedRows'
-                ? { reason: 'rowsRemoved', keys: validation.keys }
-                : { reason: 'baseMismatch', keys: validation.keys };
             // Warning, not error, matching the digest-check path: an externally
             // changed file is an expected condition the user resolves, not a
             // failure of ours.
@@ -4597,16 +4604,21 @@ export function attach_viewer(
             return;
         }
 
-        const durable_target = Object.freeze<WorksheetTarget>({
-            sheetIndex: identity.sheetIndex,
-            ...(identity.sheetName !== undefined ? { sheetName: identity.sheetName } : {}),
-            ...(identity.worksheetId !== undefined || sheet_meta?.worksheetId !== undefined
-                ? { worksheetId: identity.worksheetId ?? sheet_meta?.worksheetId }
-                : {}),
-        });
+        const durable_targets = Object.freeze(identity.worksheets.map((worksheet) => {
+            const sheet_meta = sheet_metas[worksheet.sheetIndex];
+            return Object.freeze<WorksheetTarget>({
+                sheetIndex: worksheet.sheetIndex,
+                ...(worksheet.sheetName !== undefined
+                    ? { sheetName: worksheet.sheetName }
+                    : {}),
+                ...(worksheet.worksheetId !== undefined || sheet_meta?.worksheetId !== undefined
+                    ? { worksheetId: worksheet.worksheetId ?? sheet_meta?.worksheetId }
+                    : {}),
+            });
+        }));
         const operation: CsvSaveHostOperation = {
             identity,
-            durableTarget: durable_target,
+            durableTargets: durable_targets,
             phase: 'preparing',
         };
         active_save_operation = operation;
@@ -4814,8 +4826,8 @@ export function attach_viewer(
                     type: 'cleanupPending',
                     operation: cleanup_operation,
                     scope: {
-                        type: 'sheet',
-                        ...operation.durableTarget,
+                        type: 'worksheets',
+                        targets: operation.durableTargets,
                     },
                 };
             }
@@ -4825,15 +4837,6 @@ export function attach_viewer(
         void post_to_receiver({
             type: 'saveResult',
             success: true,
-            lifecycle: succeeded_lifecycle,
-        });
-        void post_to_receiver({
-            type: 'editSessionRevoked',
-            reason: 'saved',
-            // Scoped to the saved worksheet: a successful save ends *that* sheet's
-            // edit session, and must leave any other sheet the user is editing
-            // untouched.
-            sheetIndex: identity.sheetIndex,
             lifecycle: succeeded_lifecycle,
         });
         notify_edit_state();
@@ -4847,8 +4850,8 @@ export function attach_viewer(
         });
 
         void clear_pending_edits({
-            type: 'sheet',
-            ...operation.durableTarget,
+            type: 'worksheets',
+            targets: operation.durableTargets,
         }).then((snapshot) => {
             finish_edit_cleanup(cleanup_operation, true, snapshot);
             if (!disposed) update_session_state_material(snapshot, false);
@@ -6241,14 +6244,10 @@ export function attach_viewer(
                 if (
                     active_save_operation
                     && (
-                        worksheet_target_matches(
-                            active_save_operation.durableTarget,
-                            message_target,
-                        )
-                        || worksheet_target_matches(
-                            message_target,
-                            active_save_operation.durableTarget,
-                        )
+                        active_save_operation.durableTargets.some((target) => (
+                            worksheet_target_matches(target, message_target)
+                            || worksheet_target_matches(message_target, target)
+                        ))
                     )
                 ) return;
                 if (pending_edit_sequence_session_id !== msg.editSessionId) {
@@ -6420,27 +6419,24 @@ export function attach_viewer(
                         // treating that as "not superseding" would let the tombstone
                         // strip a value the user discarded and then retyped).
                         const committed = result.snapshot.state as PerFileState;
-                        const supersedes = (operation: CsvSaveOperation) => {
-                            // `committed` is reconciled state, so the captured
-                            // position may no longer be this operation's sheet.
-                            // A deleted worksheet has no live map for this post to
-                            // replace; preserve its failed-save cleanup obligation.
-                            const operation_index = operation_sheet_index(
-                                operation,
-                                undefined,
-                                committed.pendingEdits,
-                            );
-                            if (operation_index === undefined) return false;
-                            return !post_echoes_operation(
-                                pending_edits_for_sheet(
+                        const supersedes = (operation: CsvSaveOperation) => operation.worksheets
+                            .some((worksheet) => {
+                                const operation_index = operation_sheet_index(
+                                    worksheet,
+                                    undefined,
                                     committed.pendingEdits,
-                                    operation_index,
-                                    operation.sheetName,
-                                    operation.worksheetId,
-                                ),
-                                operation,
-                            );
-                        };
+                                );
+                                if (operation_index === undefined) return false;
+                                return !post_echoes_operation(
+                                    pending_edits_for_sheet(
+                                        committed.pendingEdits,
+                                        operation_index,
+                                        worksheet.sheetName,
+                                        worksheet.worksheetId,
+                                    ),
+                                    worksheet,
+                                );
+                            });
                         const tombstone = file_edit_state?.failedSaveTombstone;
                         if (
                             file_edit_state

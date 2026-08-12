@@ -291,6 +291,59 @@ describe('paginated protocol message shapes', () => {
         });
     });
 
+    it('accepts both workbook and legacy one-worksheet save requests', () => {
+        const workbook: WebviewMessage = {
+            type: 'saveCsv',
+            operation: {
+                editSessionId: 'edit:1',
+                saveRequestId: 'save:1',
+                worksheets: [{
+                    sheetIndex: 1,
+                    sheetName: 'Inventory',
+                    edits: { '0:0': 'next' },
+                    dirtyEdits: { '0:0': { value: 'next', base: 'old' } },
+                }],
+            },
+        };
+        const legacy: WebviewMessage = {
+            type: 'saveCsv',
+            operation: {
+                editSessionId: 'edit:1',
+                saveRequestId: 'save:legacy',
+                edits: { '0:0': 'next' },
+                dirtyEdits: { '0:0': { value: 'next', base: 'old' } },
+            },
+        };
+        expect(workbook.type).toBe('saveCsv');
+        expect(legacy.type).toBe('saveCsv');
+    });
+
+    it('addresses save rejections by worksheet operation ordinal', () => {
+        const msg: HostMessage = {
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 2,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'edit:1',
+                    saveRequestId: 'save:1',
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: { '0:0': 'next' },
+                        dirtyEdits: { '0:0': { value: 'next', base: 'old' } },
+                    }],
+                },
+            },
+            rejection: {
+                reason: 'baseMismatch',
+                worksheetOperationIndex: 0,
+                keys: ['0:0'],
+            },
+        };
+        expect(msg.rejection?.worksheetOperationIndex).toBe(0);
+    });
+
     it('WebviewMessage carries a showWarning variant with a message', () => {
         const msg: WebviewMessage = {
             type: 'showWarning',

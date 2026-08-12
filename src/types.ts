@@ -1257,38 +1257,37 @@ export type CsvDirtyMap = Readonly<Record<string, CsvDirtyEntry>>;
  *  one ordering. */
 export interface CsvSaveRejection {
     readonly reason: 'baseMismatch' | 'rowsRemoved';
+    /** Ordinal of the rejected worksheet in lifecycle.operation.worksheets. */
+    readonly worksheetOperationIndex: number;
     readonly keys: readonly string[];
 }
 
-/**
- * Immutable identity and payload for one accepted save operation.
- *
- * `sheetIndex` is part of the identity, not a parameter: a save writes exactly
- * one worksheet's edits, and every consumer that reconciles an operation against
- * durable state (tombstone cleanup, hydration, revocation) has to know which
- * sheet's slot it is talking about, or it will strip a neighbouring sheet's
- * unsaved work.
- */
-export interface CsvSaveOperation {
-    readonly editSessionId: string;
-    /** Worksheet this save writes. Part of the operation's identity: a tombstone
-     *  or cleanup for one sheet must never touch another's slot. */
-    readonly sheetIndex: number;
-    /** Worksheet name captured by the renderer for legacy ID-less compatibility. */
-    readonly sheetName?: string;
-    /** Stable worksheet identity captured by the renderer when the source exposes one. */
-    readonly worksheetId?: string;
-    readonly saveRequestId: string;
+/** One worksheet-local payload inside an atomic workbook save. */
+export interface CsvSaveWorksheetOperation extends WorksheetTarget {
     readonly edits: Readonly<Record<string, string>>;
     readonly dirtyEdits: CsvDirtyMap;
 }
 
-/** A save as the webview posts it. Worksheet coordinates remain optional on
- *  the wire for the legacy single-sheet shape; workbook renderers send both the
- *  index and stable name. The host normalizes the index before the operation is
- *  compared or applied. */
-export type CsvSaveOperationRequest =
-    Omit<CsvSaveOperation, 'sheetIndex'> & { readonly sheetIndex?: number };
+/** Immutable identity and complete payload for one accepted workbook save. */
+export interface CsvSaveOperation {
+    readonly editSessionId: string;
+    readonly saveRequestId: string;
+    /** Nonempty, deterministic current-sheet order. */
+    readonly worksheets: readonly CsvSaveWorksheetOperation[];
+}
+
+/** Legacy one-worksheet wire shape accepted from an already-open older webview. */
+export interface LegacyCsvSaveOperationRequest
+    extends Omit<WorksheetTarget, 'sheetIndex'> {
+    readonly editSessionId: string;
+    readonly saveRequestId: string;
+    readonly sheetIndex?: number;
+    readonly edits: Readonly<Record<string, string>>;
+    readonly dirtyEdits: CsvDirtyMap;
+}
+
+/** A workbook save as the webview posts it, including the prior one-sheet shape. */
+export type CsvSaveOperationRequest = CsvSaveOperation | LegacyCsvSaveOperationRequest;
 
 export type CsvSaveLifecycle =
     | { readonly revision: number; readonly state: 'idle' }

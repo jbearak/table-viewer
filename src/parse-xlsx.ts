@@ -214,8 +214,9 @@ function parse_sheet_rels(cfb_file: ReturnType<typeof CFB.read>): Map<string, st
  * here. Indexing identically is, and sharing one enumeration is the only way to
  * have it hold for the next difference nobody thought of.
  */
-export function worksheet_part_paths(buffer: Uint8Array): string[] {
-    const cfb_file = CFB.read(buffer, { type: 'buffer' });
+export function worksheet_part_paths_from_package(
+    cfb_file: ReturnType<typeof CFB.read>,
+): string[] {
     const rels = parse_sheet_rels(cfb_file);
     const workbook_xml = get_entry_text(cfb_file, '/xl/workbook.xml');
     if (!workbook_xml) return [];
@@ -224,6 +225,10 @@ export function worksheet_part_paths(buffer: Uint8Array): string[] {
     return parse_workbook_xml(workbook_xml).sheets
         .map((sheet) => rels.get(sheet.rId))
         .filter((path): path is string => path !== undefined);
+}
+
+export function worksheet_part_paths(buffer: Uint8Array): string[] {
+    return worksheet_part_paths_from_package(CFB.read(buffer, { type: 'buffer' }));
 }
 
 function parse_shared_strings(xml: string): string[] {

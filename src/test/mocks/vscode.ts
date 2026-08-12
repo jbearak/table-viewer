@@ -345,15 +345,18 @@ function make_panel(title: string): MockWebviewPanel {
                 forwarded = {
                     type: 'saveCsv',
                     operation: {
-                        editSessionId: legacy.editSessionId ?? '',
-                        saveRequestId: legacy.saveRequestId ?? '',
-                        edits,
-                        dirtyEdits: Object.fromEntries(
-                            Object.entries(edits).map(([key, value]) => [
-                                key,
-                                { value, base: 'a' },
-                            ]),
-                        ),
+                        editSessionId: legacy.editSessionId ?? latest_grant()?.editSessionId ?? '',
+                        saveRequestId: legacy.saveRequestId ?? `test-save-request:${++protocol_sequence}`,
+                        worksheets: [{
+                            sheetIndex: 0,
+                            edits,
+                            dirtyEdits: Object.fromEntries(
+                                Object.entries(edits).map(([key, value]) => [
+                                    key,
+                                    { value, base: 'a' },
+                                ]),
+                            ),
+                        }],
                     },
                 };
             }

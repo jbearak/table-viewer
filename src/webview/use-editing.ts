@@ -248,7 +248,7 @@ export function use_editing(
     // refresh while editing), where get_cell_raw does not rebind because no page
     // loaded. Without this dep the pending entries would never be resolved for
     // already-resident rows: is_entry_conflicted short-circuits on base_pending,
-    // so conflict detection would be silently off, and collect_exact_dirty_edits
+    // so conflict detection would be silently off, and collect_save_payload
     // would keep refusing the save with no user-reachable way to clear it.
     useEffect(() => {
         // Hot-path guard: nothing pending means nothing to resolve, so skip the

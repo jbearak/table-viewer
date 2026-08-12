@@ -91,14 +91,9 @@ import {
     type EditSessionStore,
 } from './edit-session-store';
 import {
-    collect_exact_dirty_edits,
-    collect_save_edits,
-    type LiveEdit,
-} from './csv-save-model';
-import {
     csv_save_operations_equal,
     resolve_csv_save_hydration,
-    save_operation_targets_sheet,
+    save_operation_worksheet,
 } from './csv-save-lifecycle';
 import {
     canvas_font,
@@ -114,6 +109,12 @@ import {
 } from './row-resize-overlay';
 import { row_boundary_hit } from './row-resize-model';
 import { read_overlay_editor_value } from './live-editor';
+
+interface LiveEdit {
+    key: string;
+    value: string;
+    original: string;
+}
 import {
     changed_highlight_keys,
     changed_tint_keys,
@@ -182,8 +183,7 @@ export interface EditingStatus {
  * next to the loader). Populated into a ref App provides.
  */
 export interface EditingHandle {
-    /** Collect dirty + in-progress edits and post `saveCsv`; returns whether a
-     *  save was actually posted (false when clean or already saving). */
+    /** Fold this sheet's live editor, then ask App to atomically save the workbook. */
     request_save(): boolean;
     /** Drop every dirty edit. */
     clear_dirty(): void;
@@ -302,10 +302,8 @@ export interface GridShellProps {
     /** App-owned operation survives generation-keyed GridShell remounts. */
     save_operation?: CsvSaveOperation;
     save_lifecycle?: CsvSaveLifecycle;
-    on_save_request?: (
-        edits: Record<string, string>,
-        dirty_edits: CsvDirtyMap,
-    ) => CsvSaveOperation | undefined;
+    /** App owns workbook-wide operation construction and host posting. */
+    on_save_request?: () => CsvSaveOperation | undefined;
     initial_edits?: Record<string, string | DirtyEntry>;
     /**
      * App-owned dirty map. Its lifetime is the edit session, so committed edits
@@ -584,6 +582,14 @@ export function GridShell({
         : save_lifecycle.state === 'active'
             ? lifecycle_operation
             : undefined;
+    const worksheet_payload = useCallback((operation: CsvSaveOperation | undefined) =>
+        operation && save_operation_worksheet(
+            operation,
+            sheet_index,
+            sheet_meta.name,
+            sheet_meta.worksheetId,
+        ), [sheet_index, sheet_meta.name, sheet_meta.worksheetId]);
+    const restored_worksheet = worksheet_payload(restored_save_operation);
     // Fallback for a consumer that doesn't hoist the session store (the shell's
     // own tests). Lazy so `resolve_csv_save_hydration` runs once at store
     // creation rather than on every render; its live job is session filtering at
@@ -605,7 +611,7 @@ export function GridShell({
     const store = edit_session ?? fallback_store_ref.current!;
     // Values posted in the in-flight save; edit bases use these before reload.
     const saved_edits_ref = useRef<Record<string, string>>(
-        restored_save_operation ? { ...restored_save_operation.edits } : {},
+        restored_worksheet ? { ...restored_worksheet.edits } : {},
     );
     const save_operation_ref = useRef<CsvSaveOperation | undefined>(
         restored_save_operation,
@@ -701,31 +707,25 @@ export function GridShell({
             || save_operation.editSessionId !== edit_session_id
             || csv_save_operations_equal(save_operation_ref.current, save_operation)
         ) return;
+        const worksheet = worksheet_payload(save_operation);
         save_operation_ref.current = save_operation;
-        saved_edits_ref.current = { ...save_operation.edits };
+        saved_edits_ref.current = worksheet ? { ...worksheet.edits } : {};
         save_in_flight_ref.current = true;
         set_save_in_flight(true);
-    }, [edit_session_id, save_operation]);
+    }, [edit_session_id, save_operation, worksheet_payload]);
 
     const apply_save_lifecycle = useCallback((lifecycle: CsvSaveLifecycle) => {
         if (lifecycle.revision <= applied_save_lifecycle_revision_ref.current) return;
         applied_save_lifecycle_revision_ref.current = lifecycle.revision;
         if (lifecycle.state === 'active') {
             const operation = lifecycle.operation;
-            if (
-                operation.editSessionId !== edit_session_id
-                || !save_operation_targets_sheet(
-                    operation,
-                    sheet_index,
-                    sheet_meta.name,
-                    sheet_meta.worksheetId,
-                )
-            ) return;
+            if (operation.editSessionId !== edit_session_id) return;
             const locked = save_operation_ref.current;
             if (locked && !csv_save_operations_equal(locked, operation)) return;
+            const worksheet = worksheet_payload(operation);
             save_operation_ref.current = operation;
-            saved_edits_ref.current = { ...operation.edits };
-            replace_dirty(operation.dirtyEdits);
+            saved_edits_ref.current = worksheet ? { ...worksheet.edits } : {};
+            if (worksheet) replace_dirty(worksheet.dirtyEdits);
             save_in_flight_ref.current = true;
             set_save_in_flight(true);
             return;
@@ -763,6 +763,7 @@ export function GridShell({
         sheet_meta.name,
         sheet_meta.worksheetId,
         store,
+        worksheet_payload,
     ]);
 
     useEffect(() => {
@@ -1206,7 +1207,7 @@ export function GridShell({
         const source_column = source_column_for_display(display_column);
         if (source_column === undefined) return null;
         // The `key` is a durable edit key, so it must be fully source-keyed: the
-        // save collectors (collect_save_edits / collect_exact_dirty_edits) merge it
+        // save collectors (collect_save_payload) merge it
         // straight into the source-keyed dirty map, and a display-keyed LiveEdit
         // would poison them. Falls back to the identity captured when this overlay
         // opened, so an editor whose page left mid-edit still reaches the save
@@ -1231,64 +1232,42 @@ export function GridShell({
         set_live_uncommitted(!!live && live.value !== live.original);
     }, []);
 
-    // Collect committed dirty edits + any in-progress editor and post saveCsv.
-    // Returns false (no message sent) when there is nothing to save.
+    // Fold this sheet's live editor, then let App snapshot every dirty worksheet
+    // and post one atomic workbook operation. GridShell never assembles a partial
+    // operation: the registry and operation identity both live above this mount.
     const request_save = useCallback((): boolean => {
         if (close_barrier_ref.current || save_in_flight_ref.current || !edit_session_id) {
             return false;
         }
         const live = read_live_edit();
-        const edits = collect_save_edits(store.snapshot(), live);
-        if (Object.keys(edits).length === 0) return false;
-        const dirty_edits = collect_exact_dirty_edits(store.snapshot(), live);
-        if (!dirty_edits) {
-            host_bridge.postMessage({
-                type: 'showWarning',
-                message: 'Load every edited row before saving so its conflict base can be verified.',
-            });
-            return false;
+        if (live) {
+            const [source_row, source_column] = live.key.split(':').map(Number);
+            if (Number.isInteger(source_row) && Number.isInteger(source_column)) {
+                commit_edit(source_row, source_column, live.value);
+            }
         }
-        const operation = on_save_request(edits, dirty_edits);
+        const operation = on_save_request();
         if (
             !operation
             || operation.editSessionId !== edit_session_id
             || operation.saveRequestId.length === 0
         ) return false;
-        if (live) {
-            // `source_row` despite reading like a display row: `live.key` is
-            // source-keyed (see read_live_edit) and commit_edit's first parameter is
-            // a source row, so this split needs no conversion.
-            const [source_row, source_column] = live.key.split(':').map(Number);
-            if (Number.isInteger(source_row) && Number.isInteger(source_column)) {
-                // Accept the open editor's current value before closing the mutation
-                // boundary. The store's write is synchronous, so the value is
-                // visible to every synchronous guard below and to failure
-                // restoration, without waiting for React to commit.
-                commit_edit(source_row, source_column, live.value);
-            }
-        }
+        const worksheet = worksheet_payload(operation);
         save_operation_ref.current = operation;
-        saved_edits_ref.current = { ...operation.edits };
-        // This ref is the actual boundary: every mutation handler consults it before
-        // React has a chance to render the disabled grid.
+        saved_edits_ref.current = worksheet ? { ...worksheet.edits } : {};
         save_in_flight_ref.current = true;
         set_save_in_flight(true);
         set_live_uncommitted(false);
         if (document.activeElement instanceof HTMLElement) {
             document.activeElement.blur();
         }
-        host_bridge.postMessage({
-            type: 'saveCsv',
-            operation,
-        });
         return true;
     }, [
         commit_edit,
         edit_session_id,
         on_save_request,
         read_live_edit,
-        save_in_flight_ref,
-        store,
+        worksheet_payload,
     ]);
 
     /**

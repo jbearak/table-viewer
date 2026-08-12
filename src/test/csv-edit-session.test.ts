@@ -1466,10 +1466,12 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: second.editSessionId!,
-                sheetIndex: 0,
                 saveRequestId: 'second-session-save',
-                edits: { '0:0': 'second' },
-                dirtyEdits: { '0:0': { value: 'second', base: 'first' } },
+                worksheets: [{
+                    sheetIndex: 0,
+                    edits: { '0:0': 'second' },
+                    dirtyEdits: { '0:0': { value: 'second', base: 'first' } },
+                }],
             },
         });
         expect(panel.__messages.filter((message: any) => (
@@ -1779,11 +1781,13 @@ describe('CSV edit sessions', () => {
             lifecycle: expect.objectContaining({
                 state: 'failed',
                 operation: expect.objectContaining({
-                    edits: { '0:0': 'draft' },
-                    dirtyEdits: pendingEdits,
+                    worksheets: [expect.objectContaining({
+                        edits: { '0:0': 'draft' },
+                        dirtyEdits: pendingEdits,
+                    })],
                 }),
             }),
-            rejection: { reason: 'baseMismatch', keys: ['0:0'] },
+            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['0:0'] },
         });
         expect(sheet_cells(state.get_state('/tmp/rehydrated-mismatch.csv').pendingEdits))
             .toEqual(pendingEdits);
@@ -1805,7 +1809,7 @@ describe('CSV edit sessions', () => {
         expect(panel.__messages).toContainEqual(expect.objectContaining({
             type: 'saveResult',
             success: false,
-            rejection: { reason: 'rowsRemoved', keys: ['3:0'] },
+            rejection: { reason: 'rowsRemoved', worksheetOperationIndex: 0, keys: ['3:0'] },
         }));
     });
 
@@ -1851,7 +1855,7 @@ describe('CSV edit sessions', () => {
         ))).toBe(true);
         expect(panel.__messages).toContainEqual(expect.objectContaining({
             type: 'saveResult',
-            rejection: { reason: 'baseMismatch', keys: ['0:0', '500:0'] },
+            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['0:0', '500:0'] },
         }));
     });
 
@@ -1919,6 +1923,62 @@ describe('CSV edit sessions', () => {
             .toEqual(pendingEdits);
     });
 
+    it('normalizes a legacy one-worksheet save request', async () => {
+        const file_path = '/tmp/legacy-save-request.csv';
+        const versioned = state_store();
+        const written: Uint8Array[] = [];
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+        vscode_mock.__setWriteFileImplementation(async (_target, bytes) => {
+            written.push(bytes as Uint8Array);
+        });
+        const panel = open_csv_table(uri(file_path), versioned.store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit' });
+        const edit_session_id = latest_edit_session_message(panel)!.editSessionId!;
+
+        const legacy_operation = {
+            editSessionId: edit_session_id,
+            saveRequestId: 'legacy-save',
+            sheetIndex: 0,
+            sheetName: 'Sheet1',
+            edits: { '0:0': 'next' },
+            dirtyEdits: { '0:0': { value: 'next', base: 'a' } },
+        };
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: legacy_operation,
+        } as never);
+
+        expect(written).toHaveLength(1);
+        expect(new TextDecoder().decode(written[0])).toBe('h\nnext\n');
+        const lifecycle_operations = panel.__messages
+            .filter((message: any) => (
+                message?.type === 'saveOperationStarted'
+                || message?.type === 'saveResult'
+            ))
+            .map((message: any) => message.lifecycle.operation);
+        expect(lifecycle_operations).toHaveLength(2);
+        for (const operation of lifecycle_operations) {
+            expect(operation).toMatchObject({
+                ...legacy_operation,
+                worksheets: [{
+                    sheetIndex: 0,
+                    sheetName: 'Sheet1',
+                    edits: legacy_operation.edits,
+                    dirtyEdits: legacy_operation.dirtyEdits,
+                }],
+            });
+            expect({
+                editSessionId: operation.editSessionId,
+                saveRequestId: operation.saveRequestId,
+                sheetIndex: operation.sheetIndex,
+                sheetName: operation.sheetName,
+                edits: operation.edits,
+                dirtyEdits: operation.dirtyEdits,
+            }).toEqual(legacy_operation);
+        }
+    });
+
     it('refuses a save whose base never matched the file, before writing any bytes', async () => {
         const file_path = '/tmp/base-mismatch-rejected.csv';
         const versioned = state_store();
@@ -1936,13 +1996,15 @@ describe('CSV edit sessions', () => {
 
         const operation = {
             editSessionId: edit_session_id,
-            sheetIndex: 0,
             saveRequestId: 'save-mismatch',
-            edits: { '0:0': 'next', '1:0': 'fine' },
-            dirtyEdits: {
-                '0:0': { value: 'next', base: 'stale' },
-                '1:0': { value: 'fine', base: 'b' },
-            },
+            worksheets: [{
+                sheetIndex: 0,
+                edits: { '0:0': 'next', '1:0': 'fine' },
+                dirtyEdits: {
+                    '0:0': { value: 'next', base: 'stale' },
+                    '1:0': { value: 'fine', base: 'b' },
+                },
+            }],
         };
         await panel.__receive({ type: 'saveCsv', operation });
 
@@ -1953,11 +2015,14 @@ describe('CSV edit sessions', () => {
             success: false,
             lifecycle: expect.objectContaining({
                 state: 'failed',
-                operation: { ...operation, sheetName: 'Sheet1' },
+                operation: {
+                    ...operation,
+                    worksheets: [{ ...operation.worksheets[0], sheetName: 'Sheet1' }],
+                },
             }),
             // Only the drifted key: the honest edit stays saveable once the user
             // resolves this one.
-            rejection: { reason: 'baseMismatch', keys: ['0:0'] },
+            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['0:0'] },
         });
     });
 
@@ -1980,10 +2045,12 @@ describe('CSV edit sessions', () => {
 
         const operation = {
             editSessionId: edit_session_id,
-            sheetIndex: 0,
             saveRequestId: 'save-removed',
-            edits: { '3:0': 'orphan' },
-            dirtyEdits: { '3:0': { value: 'orphan', base: 'gone' } },
+            worksheets: [{
+                sheetIndex: 0,
+                edits: { '3:0': 'orphan' },
+                dirtyEdits: { '3:0': { value: 'orphan', base: 'gone' } },
+            }],
         };
         await panel.__receive({ type: 'saveCsv', operation });
 
@@ -1991,7 +2058,7 @@ describe('CSV edit sessions', () => {
         expect(panel.__messages).toContainEqual(expect.objectContaining({
             type: 'saveResult',
             success: false,
-            rejection: { reason: 'rowsRemoved', keys: ['3:0'] },
+            rejection: { reason: 'rowsRemoved', worksheetOperationIndex: 0, keys: ['3:0'] },
         }));
     });
 
@@ -2013,10 +2080,12 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: edit_session_id,
-                sheetIndex: 0,
                 saveRequestId: 'save-valid',
-                edits: { '1:0': 'B' },
-                dirtyEdits: { '1:0': { value: 'B', base: 'b' } },
+                worksheets: [{
+                    sheetIndex: 0,
+                    edits: { '1:0': 'B' },
+                    dirtyEdits: { '1:0': { value: 'B', base: 'b' } },
+                }],
             },
         });
 
@@ -2110,10 +2179,12 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: edit_session_id,
-                sheetIndex: 0,
                 saveRequestId: 'save-highlight',
-                edits: { '0:0': 'saved' },
-                dirtyEdits: { '0:0': { value: 'saved', base: 'a' } },
+                worksheets: [{
+                    sheetIndex: 0,
+                    edits: { '0:0': 'saved' },
+                    dirtyEdits: { '0:0': { value: 'saved', base: 'a' } },
+                }],
             },
         });
         await post_conflict_read_started.promise;
@@ -2170,13 +2241,15 @@ describe('CSV edit sessions', () => {
 
         const operation = {
             editSessionId: edit_session_id,
-            sheetIndex: 0,
             saveRequestId: 'save-overlay',
-            edits: { '0:0': 'overlay', '0:1': 'committed' },
-            dirtyEdits: {
-                '0:0': { value: 'overlay', base: 'a' },
-                '0:1': { value: 'committed', base: 'b' },
-            },
+            worksheets: [{
+                sheetIndex: 0,
+                edits: { '0:0': 'overlay', '0:1': 'committed' },
+                dirtyEdits: {
+                    '0:0': { value: 'overlay', base: 'a' },
+                    '0:1': { value: 'committed', base: 'b' },
+                },
+            }],
         };
         const save = panel.__receive({ type: 'saveCsv', operation });
         await acceptance_started.promise;
@@ -2197,13 +2270,16 @@ describe('CSV edit sessions', () => {
         await save;
 
         expect(write).toHaveBeenCalledTimes(1);
-        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual(operation.dirtyEdits);
+        expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual(operation.worksheets[0].dirtyEdits);
         expect(panel.__messages).toContainEqual(expect.objectContaining({
             type: 'saveResult',
             success: false,
             lifecycle: expect.objectContaining({
                 state: 'failed',
-                operation: { ...operation, sheetName: 'Sheet1' },
+                operation: {
+                    ...operation,
+                    worksheets: [{ ...operation.worksheets[0], sheetName: 'Sheet1' }],
+                },
             }),
         }));
 
@@ -2246,19 +2322,21 @@ describe('CSV edit sessions', () => {
 
         const operation = {
             editSessionId: edit_session_id,
-            sheetIndex: 0,
             saveRequestId: 'retry-accepted-map',
-            edits: { '0:0': 'exact' },
-            // 'a' is what the default fixture file holds at 0:0. Host-side base
-            // validation now rejects a save whose base never matched the file, so a
-            // placeholder base would never reach the acceptance retry under test.
-            dirtyEdits: { '0:0': { value: 'exact', base: 'a' } },
+            worksheets: [{
+                sheetIndex: 0,
+                edits: { '0:0': 'exact' },
+                // 'a' is what the default fixture file holds at 0:0. Host-side base
+                // validation now rejects a save whose base never matched the file, so a
+                // placeholder base would never reach the acceptance retry under test.
+                dirtyEdits: { '0:0': { value: 'exact', base: 'a' } },
+            }],
         };
         const save = panel.__receive({ type: 'saveCsv', operation });
         await write_started.promise;
 
         expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual(
-            operation.dirtyEdits,
+            operation.worksheets[0].dirtyEdits,
         );
         write_gate.resolve();
         await save;
@@ -2317,10 +2395,12 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: edit_session_id,
-                sheetIndex: 0,
                 saveRequestId: 'save',
-                edits: { '0:0': 'saved' },
-                dirtyEdits: { '0:0': { value: 'saved', base: 'a' } },
+                worksheets: [{
+                    sheetIndex: 0,
+                    edits: { '0:0': 'saved' },
+                    dirtyEdits: { '0:0': { value: 'saved', base: 'a' } },
+                }],
             },
         });
         await cleanup_started.promise;
@@ -2358,10 +2438,12 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: edit_session_id,
-                sheetIndex: 0,
                 saveRequestId: 'save-a',
-                edits: { '0:0': 'A' },
-                dirtyEdits: { '0:0': { value: 'A', base: 'a' } },
+                worksheets: [{
+                    sheetIndex: 0,
+                    edits: { '0:0': 'A' },
+                    dirtyEdits: { '0:0': { value: 'A', base: 'a' } },
+                }],
             },
         });
         const failed = [...panel.__messages].reverse().find((message) => (
@@ -2404,10 +2486,12 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session_a,
-                sheetIndex: 0,
                 saveRequestId: 'failed-a',
-                edits: { '0:0': 'A' },
-                dirtyEdits: { '0:0': { value: 'A', base: 'a' } },
+                worksheets: [{
+                    sheetIndex: 0,
+                    edits: { '0:0': 'A' },
+                    dirtyEdits: { '0:0': { value: 'A', base: 'a' } },
+                }],
             },
         });
         await panel.__receive({
@@ -2476,10 +2560,12 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session_a,
-                sheetIndex: 0,
                 saveRequestId: 'failed-a',
-                edits: { '0:0': 'A' },
-                dirtyEdits: failed_map,
+                worksheets: [{
+                    sheetIndex: 0,
+                    edits: { '0:0': 'A' },
+                    dirtyEdits: failed_map,
+                }],
             },
         });
         await flush_promises();
@@ -2523,10 +2609,12 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session_a,
-                sheetIndex: 0,
                 saveRequestId: 'failed-a',
-                edits: { '0:0': 'A' },
-                dirtyEdits: failed_map,
+                worksheets: [{
+                    sheetIndex: 0,
+                    edits: { '0:0': 'A' },
+                    dirtyEdits: failed_map,
+                }],
             },
         });
         await flush_promises();
@@ -2622,13 +2710,15 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session_a,
-                sheetIndex: 0,
                 saveRequestId: 'failed-a',
-                edits: { '0:0': 'A', '1:0': 'UNPOSTED' },
-                dirtyEdits: {
-                    '0:0': { value: 'A', base: 'a' },
-                    '1:0': { value: 'UNPOSTED', base: 'b' },
-                },
+                worksheets: [{
+                    sheetIndex: 0,
+                    edits: { '0:0': 'A', '1:0': 'UNPOSTED' },
+                    dirtyEdits: {
+                        '0:0': { value: 'A', base: 'a' },
+                        '1:0': { value: 'UNPOSTED', base: 'b' },
+                    },
+                }],
             },
         });
         await flush_promises();
@@ -2677,10 +2767,12 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session_a,
-                sheetIndex: 0,
                 saveRequestId: 'failed-a',
-                edits: { '0:0': 'A' },
-                dirtyEdits: failed_map,
+                worksheets: [{
+                    sheetIndex: 0,
+                    edits: { '0:0': 'A' },
+                    dirtyEdits: failed_map,
+                }],
             },
         });
         await flush_promises();
@@ -2750,10 +2842,12 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session_a,
-                sheetIndex: 0,
                 saveRequestId: 'failed-a',
-                edits: { '0:0': 'A', '1:0': 'B' },
-                dirtyEdits: failed_map,
+                worksheets: [{
+                    sheetIndex: 0,
+                    edits: { '0:0': 'A', '1:0': 'B' },
+                    dirtyEdits: failed_map,
+                }],
             },
         });
         await flush_promises();
@@ -2812,10 +2906,12 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session_a,
-                sheetIndex: 0,
                 saveRequestId: 'rejected',
-                edits: { '0:0': 'A' },
-                dirtyEdits: user_map,
+                worksheets: [{
+                    sheetIndex: 0,
+                    edits: { '0:0': 'A' },
+                    dirtyEdits: user_map,
+                }],
             },
         });
         await flush_promises();
@@ -2870,10 +2966,12 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session_a,
-                sheetIndex: 0,
                 saveRequestId: 'failed-a',
-                edits: { '0:0': 'A' },
-                dirtyEdits: failed_map,
+                worksheets: [{
+                    sheetIndex: 0,
+                    edits: { '0:0': 'A' },
+                    dirtyEdits: failed_map,
+                }],
             },
         });
         await flush_promises();
@@ -2938,10 +3036,12 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: first_session,
-                sheetIndex: 0,
                 saveRequestId: 'panel-a-failed-save',
-                edits: { '0:0': 'panel-a' },
-                dirtyEdits: failed_map,
+                worksheets: [{
+                    sheetIndex: 0,
+                    edits: { '0:0': 'panel-a' },
+                    dirtyEdits: failed_map,
+                }],
             },
         });
         expect(sheet_cells(versioned.get_state(file_path).pendingEdits)).toEqual(failed_map);
@@ -3107,10 +3207,9 @@ describe('CSV edit sessions', () => {
         await cleanup_started.promise;
         await flush_promises();
 
-        expect(owner.__messages).toContainEqual(expect.objectContaining({
-            type: 'editSessionRevoked',
-            reason: 'saved',
-        }));
+        expect(owner.__messages.filter((message: any) => (
+            message?.type === 'editSessionRevoked'
+        ))).toHaveLength(0);
         expect(owner.__messages.filter((message: any) => message?.type === 'saveResult'))
             .toEqual([expect.objectContaining({ type: 'saveResult', success: true })]);
         const peer_refresh = [...peer.__messages].reverse().find((message: any) => (
@@ -3349,10 +3448,12 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: edit_session_id,
-                sheetIndex: 0,
                 saveRequestId: 'accepted-before-dispose',
-                edits: { '0:0': 'saved' },
-                dirtyEdits: { '0:0': { value: 'saved', base: 'a' } },
+                worksheets: [{
+                    sheetIndex: 0,
+                    edits: { '0:0': 'saved' },
+                    dirtyEdits: { '0:0': { value: 'saved', base: 'a' } },
+                }],
             },
         });
         await verification_started.promise;
@@ -5911,10 +6012,12 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: session_a,
-                sheetIndex: 0,
                 saveRequestId: 'failing-save',
-                edits: { '2:0': 'edited-b' },
-                dirtyEdits,
+                worksheets: [{
+                    sheetIndex: 0,
+                    edits: { '2:0': 'edited-b' },
+                    dirtyEdits,
+                }],
             },
         });
         await panel.__receive({ type: 'releaseEditSession', editSessionId: session_a });
@@ -6887,10 +6990,12 @@ describe('CSV edit sessions', () => {
                 type: 'saveCsv',
                 operation: {
                     editSessionId: session_id,
-                    sheetIndex: 0,
                     saveRequestId: 'save-before-reopen',
-                    edits: { '0:0': 'edited-c' },
-                    dirtyEdits: { '0:0': { value: 'edited-c', base: 'c' } },
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: { '0:0': 'edited-c' },
+                        dirtyEdits: { '0:0': { value: 'edited-c', base: 'c' } },
+                    }],
                 },
             });
             if (phase === 'cleanupPending') {
@@ -7004,10 +7109,12 @@ describe('CSV edit sessions', () => {
                     type: 'saveCsv',
                     operation: {
                         editSessionId: session_id,
-                        sheetIndex: 0,
                         saveRequestId: 'failing-save',
-                        edits: saved,
-                        dirtyEdits,
+                        worksheets: [{
+                            sheetIndex: 0,
+                            edits: saved,
+                            dirtyEdits,
+                        }],
                     },
                 });
                 await owner.__receive({ type: 'releaseEditSession', editSessionId: session_id });
@@ -7088,10 +7195,12 @@ describe('CSV edit sessions', () => {
                 type: 'saveCsv',
                 operation: {
                     editSessionId: failed_session,
-                    sheetIndex: 0,
                     saveRequestId: 'failing-save',
-                    edits: { '2:0': 'edited-b' },
-                    dirtyEdits,
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: { '2:0': 'edited-b' },
+                        dirtyEdits,
+                    }],
                 },
             });
             await owner.__receive({
@@ -7179,10 +7288,12 @@ describe('CSV edit sessions', () => {
                 type: 'saveCsv',
                 operation: {
                     editSessionId: session_id,
-                    sheetIndex: 0,
                     saveRequestId: 'save-then-clear',
-                    edits: { '0:0': 'edited-c' },
-                    dirtyEdits: { '0:0': { value: 'edited-c', base: 'c' } },
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: { '0:0': 'edited-c' },
+                        dirtyEdits: { '0:0': { value: 'edited-c', base: 'c' } },
+                    }],
                 },
             });
             await flush_promises();
@@ -7383,10 +7494,12 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: edit_session_id,
-                sheetIndex: 0,
                 saveRequestId: 'save-during-transform',
-                edits: { '0:0': 'edited-c' },
-                dirtyEdits: { '0:0': { value: 'edited-c', base: 'c' } },
+                worksheets: [{
+                    sheetIndex: 0,
+                    edits: { '0:0': 'edited-c' },
+                    dirtyEdits: { '0:0': { value: 'edited-c', base: 'c' } },
+                }],
             },
         });
         await flush_promises();
@@ -7413,10 +7526,12 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: edit_session_id,
-                sheetIndex: 0,
                 saveRequestId: 'save-after-transform',
-                edits: { '0:0': 'edited-c' },
-                dirtyEdits: { '0:0': { value: 'edited-c', base: 'c' } },
+                worksheets: [{
+                    sheetIndex: 0,
+                    edits: { '0:0': 'edited-c' },
+                    dirtyEdits: { '0:0': { value: 'edited-c', base: 'c' } },
+                }],
             },
         });
         await vi.waitFor(() => expect(owner.__messages).toContainEqual(
@@ -7483,10 +7598,12 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: edit_session_id,
-                sheetIndex: 0,
                 saveRequestId: 'save-natural-row',
-                edits: { '0:0': 'edited-c' },
-                dirtyEdits: { '0:0': { value: 'edited-c', base: 'c' } },
+                worksheets: [{
+                    sheetIndex: 0,
+                    edits: { '0:0': 'edited-c' },
+                    dirtyEdits: { '0:0': { value: 'edited-c', base: 'c' } },
+                }],
             },
         });
         await flush_promises();
@@ -7546,10 +7663,12 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: edit_session_id,
-                sheetIndex: 0,
                 saveRequestId: 'save-under-owner-sort',
-                edits: { '0:0': 'edited-c' },
-                dirtyEdits: { '0:0': { value: 'edited-c', base: 'c' } },
+                worksheets: [{
+                    sheetIndex: 0,
+                    edits: { '0:0': 'edited-c' },
+                    dirtyEdits: { '0:0': { value: 'edited-c', base: 'c' } },
+                }],
             },
         });
         await flush_promises();
@@ -7640,12 +7759,14 @@ describe('CSV edit sessions', () => {
                 type: 'saveCsv',
                 operation: {
                     editSessionId: edit_session_id,
-                    sheetIndex: 0,
                     saveRequestId: 'save-under-view',
-                    edits: Object.fromEntries(
-                        Object.entries(dirty).map(([key, entry]) => [key, entry.value]),
-                    ),
-                    dirtyEdits: dirty,
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: Object.fromEntries(
+                            Object.entries(dirty).map(([key, entry]) => [key, entry.value]),
+                            ),
+                        dirtyEdits: dirty,
+                    }],
                 },
             });
             await flush_promises();
@@ -7722,7 +7843,7 @@ describe('CSV edit sessions', () => {
             expect(panel.__messages).toContainEqual(expect.objectContaining({
                 type: 'saveResult',
                 success: false,
-                rejection: { reason: 'baseMismatch', keys: ['2:0'] },
+                rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['2:0'] },
             }));
             expect(warning).toHaveBeenCalled();
         });
@@ -7754,10 +7875,12 @@ describe('CSV edit sessions', () => {
             type: 'saveCsv',
             operation: {
                 editSessionId: edit_session_id,
-                sheetIndex: 0,
                 saveRequestId: 'gated-save',
-                edits: { '0:0': 'edited-c' },
-                dirtyEdits: { '0:0': { value: 'edited-c', base: 'c' } },
+                worksheets: [{
+                    sheetIndex: 0,
+                    edits: { '0:0': 'edited-c' },
+                    dirtyEdits: { '0:0': { value: 'edited-c', base: 'c' } },
+                }],
             },
         });
         await vi.waitFor(() => expect(owner.__messages).toContainEqual(
