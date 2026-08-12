@@ -35,6 +35,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install Electron (retry transient downloads)
+        run: npm run desktop:ensure-electron
+
       # Covers all three projects: the extension + webview + unit tests
       # (tsconfig.json), the desktop shell (desktop/tsconfig.json), and the
       # integration tests (tsconfig.integration.json). The bundlers strip types
@@ -117,6 +120,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install Electron (retry transient downloads)
+        run: npm run desktop:ensure-electron
+
       - name: Install Playwright
         run: npx playwright install --with-deps chromium
 
@@ -144,6 +150,9 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Install Electron (retry transient downloads)
+        run: npm run desktop:ensure-electron
 
       - name: Typecheck
         run: npm run typecheck:all
@@ -231,6 +240,9 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Install Electron (retry transient downloads)
+        run: npm run desktop:ensure-electron
 
       - name: Windows durability verification probe
         shell: pwsh
