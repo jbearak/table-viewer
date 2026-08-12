@@ -288,6 +288,12 @@ describe('every persisted leaf is classified', () => {
         'cellHighlights',
         'pendingEdits',
         'excelFirstRowHeaders',
+        // A cache of the last effective projection, plus two one-time migration
+        // markers. Host-computed bookkeeping, not preferences — a webview has no
+        // business writing any of them.
+        'excelFirstRowHeaderActive',
+        'excelFirstRowHeaderVersion',
+        'rowHeightsVersion',
     ] as const;
 
     it('classifies every leaf of a fully populated PerFileState', () => {
@@ -300,9 +306,12 @@ describe('every persisted leaf is classified', () => {
             pendingEdits: sheet_edits({}),
             transforms: [],
             columnVisibility: [],
-            cellHighlights: { sheets: [] },
+            cellHighlights: { sourceDigest: '', sheets: [] },
             showFormatting: [],
             excelFirstRowHeaders: {},
+            excelFirstRowHeaderActive: {},
+            excelFirstRowHeaderVersion: 1,
+            rowHeightsVersion: 1,
         };
 
         expect(Object.keys(populated).sort())
