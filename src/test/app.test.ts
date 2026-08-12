@@ -492,6 +492,23 @@ function get_button(label: string): HTMLButtonElement {
     return button as HTMLButtonElement;
 }
 
+/** Open a toolbar split button's all-sheets menu by its chevron's accessible name. */
+async function open_scope_menu(aria_label: string) {
+    const caret = Array.from(
+        document.querySelectorAll<HTMLButtonElement>('.toolbar-split-caret'),
+    ).find((button) => button.getAttribute('aria-label') === aria_label);
+    expect(caret, `no scope menu named ${aria_label}`).toBeDefined();
+    await act(async () => caret!.click());
+}
+
+async function click_menu_item(label: string) {
+    const item = Array.from(
+        document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
+    ).find((node) => node.textContent === label);
+    expect(item, `no menu item ${label}`).toBeDefined();
+    await act(async () => item!.click());
+}
+
 async function click_sheet_tab(name: string) {
     const tab = Array.from(document.querySelectorAll<HTMLButtonElement>('.sheet-tab'))
         .find((button) => button.textContent === name);
@@ -1229,11 +1246,11 @@ describe('workbook snapshot hydration', () => {
                 sourceBasis: { physicalRevision: 1, projectionRevision: 0 },
             },
         }));
-        await click_button('First Row as Header');
+        await click_button('Header Row');
         const request = post_message.mock.calls.map((call) => call[0] as WebviewMessage)
             .find((item): item is Extract<WebviewMessage, { type: 'setExcelFirstRowHeader' }> =>
                 item.type === 'setExcelFirstRowHeader')!;
-        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBe('true');
+        expect(get_button('Header Row').getAttribute('aria-disabled')).toBe('true');
         post_message.mockClear();
 
         const file_b = make_meta(['Orders']);
@@ -1268,7 +1285,7 @@ describe('workbook snapshot hydration', () => {
             sourceGeneration: 1,
         });
         await acknowledge_transform(restored_transform, 2);
-        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBeNull();
+        expect(get_button('Header Row').getAttribute('aria-disabled')).toBeNull();
 
         await dispatch_host_message(workbook_snapshot_message(file_a, {
             identity: {
@@ -1285,7 +1302,7 @@ describe('workbook snapshot hydration', () => {
                 outcome: 'applied',
             },
         }));
-        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBeNull();
+        expect(get_button('Header Row').getAttribute('aria-disabled')).toBeNull();
         expect(document.querySelector('[role="status"]')?.textContent ?? '').toBe('');
         expect(grid_stub().getAttribute('data-generation')).toBe('2');
     });
@@ -1297,7 +1314,7 @@ describe('workbook snapshot hydration', () => {
             mode: 'auto', detected: true, active: true, available: true,
         };
         await dispatch_host_message(workbook_snapshot_message(meta));
-        await click_button('First Row as Header');
+        await click_button('Header Row');
         const request = post_message.mock.calls.map((call) => call[0] as WebviewMessage)
             .find((item): item is Extract<WebviewMessage, { type: 'setExcelFirstRowHeader' }> =>
                 item.type === 'setExcelFirstRowHeader')!;
@@ -1317,7 +1334,7 @@ describe('workbook snapshot hydration', () => {
                 outcome: 'applied',
             },
         }));
-        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBe('true');
+        expect(get_button('Header Row').getAttribute('aria-disabled')).toBe('true');
 
         const result = workbook_snapshot_message(meta, {
             identity: {
@@ -1335,7 +1352,7 @@ describe('workbook snapshot hydration', () => {
             },
         });
         await dispatch_host_message(result);
-        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBeNull();
+        expect(get_button('Header Row').getAttribute('aria-disabled')).toBeNull();
         expect(document.querySelector('[role="status"]')?.textContent)
             .toBe('Column names updated.');
         await dispatch_host_message(result);
@@ -1397,6 +1414,43 @@ describe('formatting toggle', () => {
         expect(grid_stub().getAttribute('data-show-formatting')).toBe('false');
     });
 
+    it('keeps formatting per sheet, not per workbook', async () => {
+        // Reading one sheet raw while another stays formatted is a real thing to
+        // want, and it is what makes Formatting a sibling of the other view toggles
+        // rather than the odd one out (#164).
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['First', 'Second'])));
+
+        await click_button('Formatting');
+        expect(grid_stub().getAttribute('data-show-formatting')).toBe('false');
+
+        await click_sheet_tab('Second');
+        expect(grid_stub().getAttribute('data-show-formatting')).toBe('true');
+
+        await click_sheet_tab('First');
+        expect(grid_stub().getAttribute('data-show-formatting')).toBe('false');
+    });
+
+    it('applies raw values to every sheet from the scope menu', async () => {
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['First', 'Second'])));
+
+        await open_scope_menu('Formatting scope');
+        await click_menu_item('Show raw values on all 2 sheets');
+        expect(grid_stub().getAttribute('data-show-formatting')).toBe('false');
+
+        await click_sheet_tab('Second');
+        expect(grid_stub().getAttribute('data-show-formatting')).toBe('false');
+    });
+
+    it('offers no scope menu for a single-sheet workbook', async () => {
+        // The chevron could only restate the button.
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Only'])));
+
+        expect(document.querySelector('.toolbar-split-caret')).toBeNull();
+    });
+
     it('hides the Formatting button when the workbook has no formatting', async () => {
         await render_app();
         await dispatch_host_message(
@@ -1427,15 +1481,66 @@ describe('Excel first-row header toggle', () => {
         return meta;
     }
 
+    function excel_meta_multi(active: boolean[]) {
+        const meta = make_meta(active.map((_, i) => `S${i + 1}`), false);
+        meta.sheets = meta.sheets.map((sheet, index) => ({
+            ...sheet,
+            rowCount: 3,
+            columnCount: 2,
+            excelFirstRowHeader: {
+                mode: 'auto' as const,
+                detected: true,
+                active: active[index],
+                available: true,
+            },
+        }));
+        return meta;
+    }
+
+    it('queues one host request per sheet for the all-sheets action', async () => {
+        // The host takes one of these at a time, so "all sheets" drains as a queue.
+        // Sheets already in the target state never enter it — S2 is already on.
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(excel_meta_multi([false, true, false])),
+        );
+
+        await open_scope_menu('Header row scope');
+        await click_menu_item('Use first row as header on all 3 sheets');
+
+        const header_requests = () => post_message.mock.calls
+            .map((call) => call[0] as { type: string; sheetIndex?: number })
+            .filter((message) => message.type === 'setExcelFirstRowHeader');
+
+        // One in flight, and only one: the second must wait for the first to land.
+        expect(header_requests().map((request) => request.sheetIndex)).toEqual([0]);
+    });
+
+    it('leaves the all-sheets items dead when every sheet is already there', async () => {
+        await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(excel_meta_multi([true, true])),
+        );
+
+        await open_scope_menu('Header row scope');
+        const items = Array.from(
+            document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
+        );
+        expect(items.map((item) => [item.textContent, item.disabled])).toEqual([
+            ['Use first row as header on all 2 sheets', true],
+            ['Show first row as data on all 2 sheets', false],
+        ]);
+    });
+
     it('is shown only for Excel-capable sheet metadata', async () => {
         await render_app();
         await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'], false)));
         expect(Array.from(document.querySelectorAll('button')).some(
-            (button) => button.textContent === 'First Row as Header',
+            (button) => button.textContent === 'Header Row',
         )).toBe(false);
 
         await dispatch_host_message(initial_snapshot_message(excel_meta(true)));
-        const button = get_button('First Row as Header');
+        const button = get_button('Header Row');
         expect(button.getAttribute('aria-pressed')).toBe('true');
     });
 
@@ -1453,10 +1558,10 @@ describe('Excel first-row header toggle', () => {
         await dispatch_host_message(initial_snapshot_message(active_empty));
         post_message.mockClear();
 
-        const button = get_button('First Row as Header');
+        const button = get_button('Header Row');
         expect(button.getAttribute('aria-pressed')).toBe('true');
         expect(button.getAttribute('aria-disabled')).toBeNull();
-        await click_button('First Row as Header');
+        await click_button('Header Row');
         const request = post_message.mock.calls
             .map((call) => call[0] as WebviewMessage)
             .find((message): message is Extract<
@@ -1482,12 +1587,12 @@ describe('Excel first-row header toggle', () => {
                 outcome: 'applied',
             },
         }));
-        expect(get_button('First Row as Header').getAttribute('aria-pressed')).toBe('false');
-        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBe('true');
+        expect(get_button('Header Row').getAttribute('aria-pressed')).toBe('false');
+        expect(get_button('Header Row').getAttribute('aria-disabled')).toBe('true');
         const request_count = post_message.mock.calls
             .map((call) => call[0] as WebviewMessage)
             .filter((message) => message.type === 'setExcelFirstRowHeader').length;
-        await click_button('First Row as Header');
+        await click_button('Header Row');
         expect(post_message.mock.calls
             .map((call) => call[0] as WebviewMessage)
             .filter((message) => message.type === 'setExcelFirstRowHeader')).toHaveLength(
@@ -1506,7 +1611,7 @@ describe('Excel first-row header toggle', () => {
         post_message.mockClear();
         const old_mount = grid_stub().getAttribute('data-mount-id');
 
-        const header_button = get_button('First Row as Header');
+        const header_button = get_button('Header Row');
         await act(async () => {
             header_button.focus();
             header_button.click();
@@ -1526,10 +1631,10 @@ describe('Excel first-row header toggle', () => {
             sourceGeneration: 7,
         });
         expect(request.requestId).toMatch(/^header:[a-z0-9]+-[a-z0-9]+:1$/);
-        expect(get_button('First Row as Header').getAttribute('aria-pressed')).toBe('true');
-        expect(get_button('First Row as Header').disabled).toBe(false);
-        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBe('true');
-        expect(document.activeElement).toBe(get_button('First Row as Header'));
+        expect(get_button('Header Row').getAttribute('aria-pressed')).toBe('true');
+        expect(get_button('Header Row').disabled).toBe(false);
+        expect(get_button('Header Row').getAttribute('aria-disabled')).toBe('true');
+        expect(document.activeElement).toBe(get_button('Header Row'));
         expect(document.querySelector('[role="status"]')?.textContent)
             .toBe('Updating column names…');
         expect(grid_shell_mock.latest_props?.transform_sections).toBe(false);
@@ -1559,9 +1664,9 @@ describe('Excel first-row header toggle', () => {
             generation: 5,
             sourceGeneration: 8,
         }));
-        expect(get_button('First Row as Header').getAttribute('aria-pressed')).toBe('false');
-        expect(get_button('First Row as Header').disabled).toBe(false);
-        expect(document.activeElement).toBe(get_button('First Row as Header'));
+        expect(get_button('Header Row').getAttribute('aria-pressed')).toBe('false');
+        expect(get_button('Header Row').disabled).toBe(false);
+        expect(document.activeElement).toBe(get_button('Header Row'));
         expect(document.querySelector('[role="status"]')?.textContent)
             .toBe('Column names updated.');
         expect(grid_stub().getAttribute('data-row-count')).toBe('3');
@@ -1716,8 +1821,8 @@ describe('Excel first-row header toggle', () => {
         await acknowledge_transform(unhide, 3);
         post_message.mockClear();
 
-        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBeNull();
-        await click_button('First Row as Header');
+        expect(get_button('Header Row').getAttribute('aria-disabled')).toBeNull();
+        await click_button('Header Row');
         expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
             type: 'setExcelFirstRowHeader',
             enabled: true,
@@ -1772,7 +1877,7 @@ describe('Excel first-row header toggle', () => {
                 }],
             },
         }));
-        await click_button('First Row as Header');
+        await click_button('Header Row');
         post_message.mockClear();
 
         await click_button('Notes');
@@ -1793,9 +1898,9 @@ describe('Excel first-row header toggle', () => {
             mode: 'off', detected: false, active: false, available: true,
         };
         await dispatch_host_message(initial_snapshot_message(meta));
-        expect(get_button('First Row as Header').getAttribute('aria-pressed')).toBe('true');
+        expect(get_button('Header Row').getAttribute('aria-pressed')).toBe('true');
         await click_button('Notes');
-        expect(get_button('First Row as Header').getAttribute('aria-pressed')).toBe('false');
+        expect(get_button('Header Row').getAttribute('aria-pressed')).toBe('false');
     });
 
     it('keeps the toggle enabled for active transforms but disables it while one is pending', async () => {
@@ -1822,10 +1927,10 @@ describe('Excel first-row header toggle', () => {
         }));
         await acknowledge_transform(latest_transform_request(post_message), 2);
 
-        expect(get_button('First Row as Header').disabled).toBe(false);
+        expect(get_button('Header Row').disabled).toBe(false);
 
         await click_button('Notes');
-        const button = get_button('First Row as Header');
+        const button = get_button('Header Row');
         expect(button.disabled).toBe(false);
         expect(button.getAttribute('aria-disabled')).toBe('true');
         await act(async () => button.focus());
@@ -2075,7 +2180,7 @@ describe('Excel first-row header toggle', () => {
             sourceGeneration: 1,
         }));
         post_message.mockClear();
-        await click_button('First Row as Header');
+        await click_button('Header Row');
         const request = post_message.mock.calls
             .map((call) => call[0] as WebviewMessage)
             .find((message): message is Extract<
@@ -2087,7 +2192,7 @@ describe('Excel first-row header toggle', () => {
             generation: 7,
             sourceGeneration: 5,
         }));
-        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBe('true');
+        expect(get_button('Header Row').getAttribute('aria-disabled')).toBe('true');
 
         await dispatch_host_message(refresh_snapshot_message(excel_meta(false), {
             state: {
@@ -2126,7 +2231,7 @@ describe('Excel first-row header toggle', () => {
         });
         await acknowledge_transform(transform_request, 9);
 
-        await click_button('First Row as Header');
+        await click_button('Header Row');
         expect(post_message.mock.calls
             .map((call) => call[0] as WebviewMessage)
             .filter((message) => message.type === 'setExcelFirstRowHeader')
@@ -2143,7 +2248,7 @@ describe('Excel first-row header toggle', () => {
             sourceGeneration: 1,
         }));
         post_message.mockClear();
-        await click_button('First Row as Header');
+        await click_button('Header Row');
         const request = post_message.mock.calls
             .map((call) => call[0] as WebviewMessage)
             .find((message): message is Extract<
@@ -2155,7 +2260,7 @@ describe('Excel first-row header toggle', () => {
             generation: 8,
             sourceGeneration: 6,
         }));
-        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBe('true');
+        expect(get_button('Header Row').getAttribute('aria-disabled')).toBe('true');
 
         await dispatch_host_message(refresh_snapshot_message(excel_meta(false), {
             state: {
@@ -2172,7 +2277,7 @@ describe('Excel first-row header toggle', () => {
             generation: 9,
             sourceGeneration: 7,
         }));
-        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBeNull();
+        expect(get_button('Header Row').getAttribute('aria-disabled')).toBeNull();
         expect(document.querySelector('[role="status"]')?.textContent)
             .toBe('Column names updated.');
 
@@ -2185,7 +2290,7 @@ describe('Excel first-row header toggle', () => {
             sourceGeneration: 7,
         });
         await acknowledge_transform(transform_request, 10);
-        await click_button('First Row as Header');
+        await click_button('Header Row');
         expect(post_message.mock.calls
             .map((call) => call[0] as WebviewMessage)
             .filter((message) => message.type === 'setExcelFirstRowHeader')
@@ -2200,7 +2305,7 @@ describe('Excel first-row header toggle', () => {
         const initial = workbook_snapshot_message(excel_meta(false));
         await dispatch_host_message(initial);
         post_message.mockClear();
-        await click_button('First Row as Header');
+        await click_button('Header Row');
         const request = post_message.mock.calls
             .map((call) => call[0] as WebviewMessage)
             .find((message): message is Extract<
@@ -2223,8 +2328,8 @@ describe('Excel first-row header toggle', () => {
         });
         await dispatch_host_message(rejected);
         await dispatch_host_message(rejected);
-        expect(get_button('First Row as Header').disabled).toBe(false);
-        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBeNull();
+        expect(get_button('Header Row').disabled).toBe(false);
+        expect(get_button('Header Row').getAttribute('aria-disabled')).toBeNull();
         expect(document.querySelector('[role="status"]')?.textContent)
             .toBe('Column names were not updated.');
         expect(post_message).toHaveBeenCalledWith({
@@ -2242,7 +2347,7 @@ describe('Excel first-row header toggle', () => {
         const initial = workbook_snapshot_message(initial_meta);
         await dispatch_host_message(initial);
         post_message.mockClear();
-        await click_button('First Row as Header');
+        await click_button('Header Row');
         const request = post_message.mock.calls
             .map((call) => call[0] as WebviewMessage)
             .find((message): message is Extract<
@@ -2269,7 +2374,7 @@ describe('Excel first-row header toggle', () => {
             },
         }));
 
-        expect(get_button('First Row as Header').getAttribute('aria-disabled')).toBeNull();
+        expect(get_button('Header Row').getAttribute('aria-disabled')).toBeNull();
         expect(document.querySelector('[role="status"]')?.textContent)
             .toBe('Column names were updated, but recovery was required.');
         expect(grid_stub().getAttribute('data-generation')).toBe('2');

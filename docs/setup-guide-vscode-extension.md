@@ -51,7 +51,7 @@ Nothing in this section edits the `.xlsx` file, so feel free to poke around.
 3. Right-click a column header to sort or [filter](filtering.md) it. On **Coffee Shelf**, try filtering **Roast** to values containing `Light`, then sort **Price / bag** ascending.
 4. Open **Columns** to hide fields you do not need. Try hiding **Origin**; open the menu again to bring it back.
 5. Select one or more cells, open **Highlight**, choose a color, and click **Apply to selection**.
-6. Click **Formatting** to switch between the workbook's formatted display values and the underlying raw values.
+6. Click **Formatting** to switch this sheet between its formatted display values and the underlying raw values. **Formatting**, **Header Row** and **Auto-fit Columns** each apply to the current sheet; use the chevron beside them (or right-click) to apply the change to every sheet at once.
 
 Right-clicking a column header is the quickest way to find its sort, filter, copy, and hide actions.
 

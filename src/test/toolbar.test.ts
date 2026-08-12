@@ -195,7 +195,7 @@ describe('Toolbar', () => {
             'Edit',
             'Formatting',
             '|',
-            'First Row as Header',
+            'Header Row',
             'Columns',
             'Auto-fit Columns',
         ]);
@@ -263,7 +263,7 @@ describe('Toolbar', () => {
                         ...(show_formatting_button ? ['Formatting'] : []),
                     ]);
                     expect(labels.slice(workbook_count + 1)).toEqual([
-                        'First Row as Header',
+                        'Header Row',
                         'Columns',
                         'Auto-fit Columns',
                     ]);
@@ -307,13 +307,13 @@ describe('Toolbar', () => {
 
         const formatting = get_button('Formatting');
         dispatch_mouse_event(formatting, 'mouseover');
-        expect(get_tooltip()?.textContent).toBe('Show raw cell values.');
+        expect(get_tooltip()?.textContent).toBe('Show raw cell values on this sheet.');
         dispatch_mouse_event(formatting, 'mouseout');
         expect(get_tooltip()).toBeNull();
 
         const auto_fit = get_button('Auto-fit Columns');
         dispatch_mouse_event(auto_fit, 'mouseover');
-        expect(get_tooltip()?.textContent).toBe('Auto-fit all columns to their content.');
+        expect(get_tooltip()?.textContent).toBe('Auto-fit all columns to their content on this sheet.');
         dispatch_mouse_event(auto_fit, 'mouseout');
         expect(get_tooltip()).toBeNull();
     });
@@ -328,7 +328,7 @@ describe('Toolbar', () => {
         act(() => {
             formatting.focus();
         });
-        expect(get_tooltip()?.textContent).toBe('Show formatted cell values.');
+        expect(get_tooltip()?.textContent).toBe('Show formatted cell values on this sheet.');
         act(() => {
             formatting.blur();
         });
@@ -338,7 +338,7 @@ describe('Toolbar', () => {
         act(() => {
             auto_fit.focus();
         });
-        expect(get_tooltip()?.textContent).toBe('Restore original column widths.');
+        expect(get_tooltip()?.textContent).toBe('Restore original column widths on this sheet.');
         act(() => {
             auto_fit.blur();
         });
@@ -354,7 +354,7 @@ describe('Toolbar', () => {
         });
         dispatch_mouse_event(formatting, 'mouseover');
         dispatch_mouse_event(formatting, 'mouseout');
-        expect(get_tooltip()?.textContent).toBe('Show raw cell values.');
+        expect(get_tooltip()?.textContent).toBe('Show raw cell values on this sheet.');
 
         act(() => {
             formatting.blur();
@@ -371,7 +371,7 @@ describe('Toolbar', () => {
             on_toggle_excel_header,
         });
 
-        const button = get_button('First Row as Header');
+        const button = get_button('Header Row');
         expect(button.classList.contains('active')).toBe(true);
         expect(button.getAttribute('aria-pressed')).toBe('true');
         dispatch_mouse_event(button, 'mouseover');
@@ -393,7 +393,7 @@ describe('Toolbar', () => {
             on_toggle_excel_header,
         });
 
-        const button = get_button('First Row as Header');
+        const button = get_button('Header Row');
         act(() => button.focus());
         expect(document.activeElement).toBe(button);
         expect(button.disabled).toBe(false);
@@ -414,7 +414,7 @@ describe('Toolbar', () => {
             excel_header_disabled_reason: 'Clear sorting and filters first.',
         });
 
-        const button = get_button('First Row as Header');
+        const button = get_button('Header Row');
         expect(button.disabled).toBe(false);
         expect(button.getAttribute('aria-disabled')).toBe('true');
         const wrapper = button.closest<HTMLElement>('.toolbar-item')!;
@@ -475,7 +475,7 @@ describe('Toolbar', () => {
         expect(auto_fit.classList.contains('active')).toBe(true);
 
         dispatch_mouse_event(auto_fit, 'mouseover');
-        expect(get_tooltip()?.textContent).toBe('Restore original column widths.');
+        expect(get_tooltip()?.textContent).toBe('Restore original column widths on this sheet.');
     });
 
     it('shows correct tooltip when auto-fit is inactive', () => {
@@ -487,7 +487,7 @@ describe('Toolbar', () => {
         const auto_fit = get_button('Auto-fit Columns');
         dispatch_mouse_event(auto_fit, 'mouseover');
         expect(get_tooltip()?.textContent).toBe(
-            'Auto-fit all columns to their content.'
+            'Auto-fit all columns to their content on this sheet.'
         );
     });
 
@@ -665,5 +665,121 @@ describe('Toolbar', () => {
             configurable: true,
             value: original_inner_width,
         });
+    });
+});
+
+describe('Toolbar scope menus', () => {
+    const scope_menu = (overrides?: Partial<{ disabled: boolean }>) => ({
+        aria_label: 'Auto-fit scope',
+        items: [
+            { label: 'Auto-fit columns on all 3 sheets', on_click: vi.fn() },
+            {
+                label: 'Restore original widths on all 3 sheets',
+                on_click: vi.fn(),
+                disabled: overrides?.disabled ?? false,
+            },
+        ],
+    });
+
+    function open_caret(): HTMLButtonElement {
+        const caret = document.querySelector<HTMLButtonElement>('.toolbar-split-caret');
+        expect(caret).not.toBeNull();
+        act(() => caret!.click());
+        return caret!;
+    }
+
+    function menu_labels(): (string | null)[] {
+        return Array.from(
+            document.querySelectorAll('[role="menuitem"]'),
+            (item) => item.textContent,
+        );
+    }
+
+    it('renders a plain button when there is no scope menu', () => {
+        // A single-sheet workbook: the chevron could only restate the button.
+        const { container } = render_toolbar();
+
+        expect(container.querySelector('.toolbar-split')).toBeNull();
+        expect(container.querySelector('.toolbar-split-caret')).toBeNull();
+    });
+
+    it('opens the all-sheets actions from the chevron', () => {
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+
+        const caret = open_caret();
+        expect(menu_labels()).toEqual([
+            'Auto-fit columns on all 3 sheets',
+            'Restore original widths on all 3 sheets',
+        ]);
+        expect(caret.getAttribute('aria-expanded')).toBe('true');
+        expect(caret.getAttribute('aria-haspopup')).toBe('menu');
+    });
+
+    it('names every item with both its action and its scope', () => {
+        // A bare "Restore original widths" under an "…all 3 sheets" item reads as
+        // ambiguous: the reader cannot tell whether the omission means this sheet or
+        // the same scope as the line above.
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+        open_caret();
+
+        for (const label of menu_labels()) {
+            expect(label).toMatch(/all 3 sheets$/);
+        }
+    });
+
+    it('greys an item that would change nothing', () => {
+        render_toolbar({ auto_fit_scope_menu: scope_menu({ disabled: true }) });
+        open_caret();
+
+        const restore = Array.from(
+            document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
+        ).find((item) => item.textContent?.startsWith('Restore'));
+        expect(restore?.disabled).toBe(true);
+    });
+
+    it('runs the chosen action and closes', () => {
+        const menu = scope_menu();
+        render_toolbar({ auto_fit_scope_menu: menu });
+        open_caret();
+
+        const first = document.querySelector<HTMLButtonElement>('[role="menuitem"]');
+        act(() => first!.click());
+        expect(menu.items[0].on_click).toHaveBeenCalledOnce();
+        expect(document.querySelector('[role="menu"]')).toBeNull();
+    });
+
+    it('leaves the button itself meaning this sheet', () => {
+        const on_toggle_auto_fit = vi.fn();
+        const menu = scope_menu();
+        render_toolbar({ auto_fit_scope_menu: menu, on_toggle_auto_fit });
+
+        dispatch_mouse_event(get_button('Auto-fit Columns'), 'click');
+        expect(on_toggle_auto_fit).toHaveBeenCalledOnce();
+        expect(menu.items[0].on_click).not.toHaveBeenCalled();
+        expect(document.querySelector('[role="menu"]')).toBeNull();
+    });
+
+    it('opens the same menu on right-click, for people who reach for it', () => {
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+
+        const button = get_button('Auto-fit Columns');
+        const event = new MouseEvent('contextmenu', {
+            bubbles: true, cancelable: true, clientX: 20, clientY: 30,
+        });
+        act(() => button.dispatchEvent(event));
+        expect(event.defaultPrevented).toBe(true);
+        expect(menu_labels()).toEqual([
+            'Auto-fit columns on all 3 sheets',
+            'Restore original widths on all 3 sheets',
+        ]);
+    });
+
+    it('does not stack the tooltip on top of the menu it opened', () => {
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+
+        dispatch_mouse_event(get_button('Auto-fit Columns'), 'mouseover');
+        expect(get_tooltip()).not.toBeNull();
+        open_caret();
+        expect(get_tooltip()).toBeNull();
     });
 });

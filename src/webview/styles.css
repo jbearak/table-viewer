@@ -120,6 +120,74 @@ body {
     outline-offset: 2px;
 }
 
+/*
+ * A toggle that also carries all-sheets actions: ( label | ⌄ ). The two halves read
+ * as one control with a seam, rather than as two buttons that happen to be adjacent
+ * — the border is on the wrapper and the inner `.toggle` gives its own up, so a
+ * single outline surrounds both and the seam is the 1px gap between them.
+ */
+.toolbar-split {
+    display: inline-flex;
+    align-items: stretch;
+    border: 1px solid var(--vscode-panel-border, #444);
+    border-radius: 3px;
+    overflow: hidden;
+}
+
+.toolbar-split.active {
+    border-color: var(--vscode-button-background, #0e639c);
+    background: var(--vscode-button-background, #0e639c);
+}
+
+.toolbar-split > .toggle {
+    border: 0;
+    border-radius: 0;
+}
+
+.toolbar-split-gap {
+    flex: 0 0 auto;
+    width: 1px;
+    margin: 3px 0;
+    background: var(--vscode-panel-border, #444);
+}
+
+.toolbar-split.active .toolbar-split-gap {
+    background: var(--vscode-button-foreground, #fff);
+    opacity: 0.45;
+}
+
+.toolbar-split-caret {
+    display: inline-flex;
+    align-items: center;
+    padding: 0 6px;
+    border: 0;
+    background: transparent;
+    color: var(--vscode-foreground, #ccc);
+    cursor: pointer;
+    opacity: 0.75;
+}
+
+.toolbar-split.active .toolbar-split-caret {
+    color: var(--vscode-button-foreground, #fff);
+}
+
+.toolbar-split-caret:hover,
+.toolbar-split-caret.open {
+    background: var(--vscode-list-hoverBackground, #2a2d2e);
+    opacity: 1;
+}
+
+.toolbar-split.active .toolbar-split-caret:hover,
+.toolbar-split.active .toolbar-split-caret.open {
+    background: var(--vscode-button-hoverBackground, #1177bb);
+}
+
+.toolbar-split-caret:focus-visible {
+    outline: 2px solid var(--vscode-focusBorder, #007acc);
+    outline-offset: -2px;
+    opacity: 1;
+}
+
 .column-visibility-anchor {
     flex: 0 0 auto;
 }
