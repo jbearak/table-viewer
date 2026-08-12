@@ -22,7 +22,15 @@ function describe_failure(result) {
  */
 export function install_electron({
     attempts = DEFAULT_ATTEMPTS,
-    run_installer = () => spawnSync(process.execPath, [electron_installer], { stdio: 'inherit' }),
+    run_installer = () => spawnSync(process.execPath, [electron_installer], {
+        stdio: 'inherit',
+        env: {
+            ...process.env,
+            // @electron/get does not honor HTTP(S)_PROXY unless explicitly
+            // enabled. Keep an explicit caller choice, including an empty value.
+            ELECTRON_GET_USE_PROXY: process.env.ELECTRON_GET_USE_PROXY ?? 'true',
+        },
+    }),
     log = console,
 } = {}) {
     if (!Number.isInteger(attempts) || attempts < 1) {
