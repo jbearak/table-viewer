@@ -20,6 +20,10 @@ appId: com.jbearak.table-viewer
 productName: Table Viewer
 directories:
   output: dist/desktop-packages
+publish:
+  provider: github
+  owner: jbearak
+  repo: table-viewer
 # productName has a space, which would land in the release URL the Homebrew
 # cask downloads; name the artifacts after the slug instead.
 artifactName: table-viewer-${version}-${arch}.${ext}
@@ -143,9 +147,9 @@ nsis:
   # arch instead so the download matches the ${arch} in artifactName and an
   # arm64 laptop isn't made to download the x64 payload it won't run.
   buildUniversalInstaller: false
-  # There is no auto-update channel, so the .blockmap files electron-builder
-  # otherwise emits next to each installer are unused weight on the release page.
-  differentialPackage: false
+  # Keep differential metadata for electron-updater. Each architecture is built
+  # separately so its manifest and blockmap unambiguously match its installer.
+  differentialPackage: true
   # nsis and portable are both `.exe`, so the shared artifactName above would
   # have them overwrite each other. Disambiguate per target.
   artifactName: table-viewer-${version}-${arch}-setup.${ext}

@@ -1,29 +1,15 @@
 #!/usr/bin/env node
 
-import { spawnSync } from 'node:child_process';
+import { copyFileSync, existsSync, readFileSync, rmSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { validate_update_metadata } from './validate-update-metadata.mjs';
 
 const DEFAULT_ATTEMPTS = 3;
 const repo_dir = join(dirname(fileURLToPath(import.meta.url)), '..');
-const electron_builder_cli = join(
-    repo_dir,
-    'node_modules',
-    'electron-builder',
-    'out',
-    'cli',
-    'cli.js',
-);
-const electron_builder_arguments = [
-    electron_builder_cli,
-    '--config',
-    'desktop/electron-builder.yml',
-    '--publish',
-    'never',
-    '--win',
-    '--x64',
-    '--arm64',
-];
+const output_dir = join(repo_dir, 'dist', 'desktop-packages');
+const electron_builder_cli = join(repo_dir, 'node_modules', 'electron-builder', 'out', 'cli', 'cli.js');
 
 function describe_failure(result) {
     if (result.error) return result.error.message;
@@ -31,45 +17,51 @@ function describe_failure(result) {
     return `exit code ${result.status ?? 'unknown'}`;
 }
 
-/**
- * Package both Windows architectures with bounded retries. electron-builder
- * downloads architecture-specific Electron archives and installer tooling at
- * packaging time, independently of Electron's npm install script. A transient
- * failure in any one of those downloads should not discard the artifacts and
- * verified cache entries produced by the preceding attempt.
- */
-export function package_desktop_windows({
-    attempts = DEFAULT_ATTEMPTS,
-    run_builder = () => spawnSync(process.execPath, electron_builder_arguments, {
-        cwd: repo_dir,
-        stdio: 'inherit',
-    }),
-    log = console,
-} = {}) {
-    if (!Number.isInteger(attempts) || attempts < 1) {
-        throw new TypeError('Windows packaging attempts must be a positive integer');
-    }
-
-    let last_failure = 'unknown failure';
-    for (let attempt = 1; attempt <= attempts; attempt += 1) {
-        log.info(`Packaging Windows desktop app (attempt ${attempt}/${attempts})...`);
-        const result = run_builder();
-        if (!result.error && result.status === 0) return;
-
-        last_failure = describe_failure(result);
-        if (attempt < attempts) {
-            log.warn(`Windows packaging failed with ${last_failure}; retrying.`);
-        }
-    }
-
-    throw new Error(
-        `Windows packaging failed after ${attempts} attempts (last failure: ${last_failure})`,
-    );
+function build_arguments(arch) {
+    return [electron_builder_cli, '--config', 'desktop/electron-builder.yml', '--publish', 'never', '--win', `--${arch}`];
 }
 
-const invoked_path = process.argv[1]
-    ? pathToFileURL(resolve(process.argv[1])).href
-    : undefined;
+export function package_desktop_windows({
+    attempts = DEFAULT_ATTEMPTS,
+    version = process.env.npm_package_version || JSON.parse(readFileSync(join(repo_dir, 'package.json'), 'utf8')).version,
+    run_builder = (arch) => spawnSync(process.execPath, build_arguments(arch), { cwd: repo_dir, stdio: 'inherit' }),
+    copy_file = copyFileSync,
+    exists = existsSync,
+    remove = rmSync,
+    validate = validate_update_metadata,
+    log = console,
+} = {}) {
+    if (!Number.isInteger(attempts) || attempts < 1) throw new TypeError('Windows packaging attempts must be a positive integer');
+
+    for (const arch of ['x64', 'arm64']) {
+        let last_failure = 'unknown failure';
+        let succeeded = false;
+        for (let attempt = 1; attempt <= attempts; attempt += 1) {
+            log.info(`Packaging Windows ${arch} desktop app (attempt ${attempt}/${attempts})...`);
+            const result = run_builder(arch);
+            if (!result.error && result.status === 0) {
+                succeeded = true;
+                break;
+            }
+            last_failure = describe_failure(result);
+            if (attempt < attempts) log.warn(`Windows ${arch} packaging failed with ${last_failure}; retrying.`);
+        }
+        if (!succeeded) throw new Error(`Windows ${arch} packaging failed after ${attempts} attempts (last failure: ${last_failure})`);
+
+        const source_manifest = join(output_dir, 'latest.yml');
+        const target_manifest = join(output_dir, arch === 'x64' ? 'latest.yml' : 'latest-arm64.yml');
+        const setup = `table-viewer-${version}-${arch}-setup.exe`;
+        if (!exists(source_manifest)) throw new Error(`Windows ${arch} packaging did not produce latest.yml`);
+        if (source_manifest !== target_manifest) copy_file(source_manifest, target_manifest);
+        validate(target_manifest, { expected_version: version, expected_asset: setup, require_blockmap: true });
+        if (arch === 'x64') copy_file(source_manifest, join(output_dir, 'latest-x64.yml'));
+    }
+    const saved_x64_manifest = join(output_dir, 'latest-x64.yml');
+    copy_file(saved_x64_manifest, join(output_dir, 'latest.yml'));
+    remove(saved_x64_manifest, { force: true });
+}
+
+const invoked_path = process.argv[1] ? pathToFileURL(resolve(process.argv[1])).href : undefined;
 if (invoked_path === import.meta.url) {
     try {
         package_desktop_windows();

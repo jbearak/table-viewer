@@ -84,6 +84,9 @@ jobs:
         with:
           node-version: '26.5.1'
 
+      - name: Install release metadata validator dependencies
+        run: npm ci --ignore-scripts
+
       - name: Validate tag + versions
         id: version
         shell: bash
@@ -213,17 +216,15 @@ jobs:
           # the exact extension VSIX path, so desktop downloads cannot
           # be mistaken for extension packages or their checksums.
           #
-          # Absent is not fatal: tags built before the desktop job existed, and
-          # runs whose artifacts have aged out, have no desktop-* artifact. The
-          # extension publish must not be held hostage to that — the release
-          # simply ships without the app, and the cask bump is skipped.
-          if grep -Fxq "desktop-${THE_TAG}" <<< "$RUN_ARTIFACTS"; then
-            gh run download "$BUILD_RUN_ID" --name "desktop-${THE_TAG}" --dir desktop-dist
-            echo "desktop=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "desktop=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::No desktop-${THE_TAG} artifact; publishing without the macOS app and skipping the Homebrew bump."
+          # Every newly published release is an update channel head. Publishing
+          # one without its macOS manifest would make installed Macs stop at a
+          # channel-file 404 instead of finding the newest compatible release.
+          if ! grep -Fxq "desktop-${THE_TAG}" <<< "$RUN_ARTIFACTS"; then
+            echo "ERROR: successful Release Build has no desktop-${THE_TAG} artifact" >&2
+            exit 1
           fi
+          gh run download "$BUILD_RUN_ID" --name "desktop-${THE_TAG}" --dir desktop-dist
+          echo "desktop=true" >> "$GITHUB_OUTPUT"
 
           if ! grep -Fxq "windows-${THE_TAG}" <<< "$RUN_ARTIFACTS"; then
             echo "ERROR: successful Release Build has no windows-${THE_TAG} artifact" >&2
@@ -242,6 +243,11 @@ jobs:
             (cd desktop-dist && sha256sum -c ./*.sha256)
           fi
           (cd windows-dist && sha256sum -c ./*.sha256)
+          if [[ "${{ steps.artifacts.outputs.desktop }}" == "true" ]]; then
+            node scripts/validate-update-metadata.mjs desktop-dist/latest-mac.yml "$VERSION" "table-viewer-${VERSION}-arm64.zip"
+          fi
+          node scripts/validate-update-metadata.mjs windows-dist/latest.yml "$VERSION" "table-viewer-${VERSION}-x64-setup.exe" --require-blockmap
+          node scripts/validate-update-metadata.mjs windows-dist/latest-arm64.yml "$VERSION" "table-viewer-${VERSION}-arm64-setup.exe" --require-blockmap
 
       - name: Install locked publish tools
         working-directory: .github/release-tools
@@ -367,8 +373,12 @@ jobs:
             table-viewer-${{ steps.version.outputs.version }}.vsix.sha256
             desktop-dist/table-viewer-*.dmg
             desktop-dist/table-viewer-*.zip
+            desktop-dist/latest-mac.yml
             desktop-dist/*.sha256
             windows-dist/table-viewer-*.exe
+            windows-dist/table-viewer-*.exe.blockmap
+            windows-dist/latest.yml
+            windows-dist/latest-arm64.yml
             windows-dist/*.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
