@@ -1765,6 +1765,25 @@ describe('Excel first-row header toggle', () => {
         expect(grid_stub().getAttribute('data-mount-id')).not.toBe(old_mount);
     });
 
+    it('does not allow the header row to change during Edit mode', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+            },
+        }));
+        await enter_edit_mode(post_message);
+        post_message.mockClear();
+
+        const button = get_button('Header Row');
+        expect(button.getAttribute('aria-disabled')).toBe('true');
+        await click_button('Header Row');
+        expect(post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .some((message) => message.type === 'setExcelFirstRowHeader')).toBe(false);
+    });
+
     it('requests row promotion from the row-header context action', async () => {
         const { post_message } = await render_app();
         const meta = excel_meta(false, 'off');

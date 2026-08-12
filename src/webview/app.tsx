@@ -4012,6 +4012,7 @@ export function App(): React.JSX.Element {
         (!excel_header_candidate_available
             && !excel_header.active
             && excel_header.mode !== 'on')
+        || edit_mode_on_active_sheet
         || any_transform_pending
         || excel_header_pending
     );
@@ -4024,6 +4025,8 @@ export function App(): React.JSX.Element {
             : pending_excel_header_promote_ref.current
             ? 'Making row header…'
             : 'Updating column names…'
+        : edit_mode_on_active_sheet
+        ? 'Exit Edit mode before changing the header row.'
         : 'Wait for sorting and filtering to finish.';
     const effective_row_count = installed_view?.rowCount ?? current_sheet.rowCount;
     const visibility_reset_key = [
