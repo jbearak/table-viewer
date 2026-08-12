@@ -178,6 +178,8 @@ export interface ViewerControllerOptions {
 }
 
 export interface ViewerController extends Disposable {
+    /** Select a worksheet by its workbook name once the renderer has a snapshot. */
+    select_sheet(sheet_name: string): Promise<boolean>;
     /** Refuse every new edit session before a shutdown/activation barrier begins. */
     stop_edit_admission(): void;
     /** Fence the current renderer and wait for its exact durable edit acknowledgement. */
@@ -729,6 +731,11 @@ export function attach_viewer(
     let highest_acknowledged_edit_sequence = 0;
     const pending_edit_admissions = new Set<symbol>();
     let renderer_ready = false;
+    const pending_sheet_selections = new Set<{
+        readonly sheetName: string;
+        readonly resolve: (found: boolean) => void;
+        readonly reject: (error: Error) => void;
+    }>();
     let renderer_protocol_epoch = 0;
     let next_pending_edit_flush_request = 0;
     const pending_edit_flush_waiters = new Map<string, {
@@ -837,6 +844,45 @@ export function attach_viewer(
         } catch {
             return Promise.resolve(false);
         }
+    }
+
+    function flush_sheet_selections(): void {
+        if (
+            disposed
+            || !renderer_ready
+            || !session.acknowledged_current()
+            || !source
+            || active_save_dialog_request
+        ) return;
+        for (const request of [...pending_sheet_selections]) {
+            const sheets = source.meta().sheets;
+            let sheet_index = sheets.findIndex((sheet) => sheet.name === request.sheetName);
+            if (sheet_index === -1 && /^[1-9]\d*$/.test(request.sheetName)) {
+                const ordinal = Number(request.sheetName);
+                if (Number.isSafeInteger(ordinal) && ordinal <= sheets.length) {
+                    sheet_index = ordinal - 1;
+                }
+            }
+            if (sheet_index === -1) {
+                pending_sheet_selections.delete(request);
+                request.resolve(false);
+                continue;
+            }
+            pending_sheet_selections.delete(request);
+            void post_to_receiver({ type: 'selectSheet', sheetIndex: sheet_index })
+                .then((posted) => {
+                    if (posted) request.resolve(true);
+                    else request.reject(new Error('The Table Viewer renderer is unavailable.'));
+                });
+        }
+    }
+
+    function select_sheet(sheet_name: string): Promise<boolean> {
+        if (disposed) return Promise.reject(new Error('Viewer controller is disposed.'));
+        return new Promise<boolean>((resolve, reject) => {
+            pending_sheet_selections.add({ sheetName: sheet_name, resolve, reject });
+            flush_sheet_selections();
+        });
     }
 
     const session = new PanelSession({
@@ -3526,6 +3572,8 @@ export function attach_viewer(
                             );
                         }
                     }
+                    // Until this adoption's snapshot is acknowledged, the renderer
+                    // still indexes sheets using the preceding workbook projection.
                     core = installed;
                     source = next;
                     source_authority = committed.receipt.resultingBasis;
@@ -5184,6 +5232,7 @@ export function attach_viewer(
             }
             case 'snapshotApplied':
                 session.handle_snapshot_applied(msg.identity, msg.disposition);
+                if (session.acknowledged_current()) flush_sheet_selections();
                 return;
             case 'stateChanged': {
                 const expected_authority = source_authority.authorityRevision;
@@ -6487,12 +6536,13 @@ export function attach_viewer(
                     || !edit_message_is_current(request.editSessionId)
                 ) return;
                 active_save_dialog_request = undefined;
-                void post_to_receiver({
+                await post_to_receiver({
                     type: 'saveDialogResult',
                     requestId: request.requestId,
                     editSessionId: request.editSessionId,
                     choice,
                 }, request.receiverEpoch);
+                flush_sheet_selections();
                 return;
             }
             default:
@@ -6606,6 +6656,7 @@ export function attach_viewer(
     }
 
     return {
+        select_sheet,
         stop_edit_admission,
         flush_pending_edits,
         drain: drain_controller,
@@ -6613,6 +6664,12 @@ export function attach_viewer(
             if (disposed) return;
             disposed = true;
             renderer_ready = false;
+            for (const request of pending_sheet_selections) {
+                request.reject(new Error(
+                    'Viewer controller was disposed before the worksheet could be selected.',
+                ));
+            }
+            pending_sheet_selections.clear();
             reject_pending_edit_protocol(new Error(
                 'Viewer controller was disposed before the pending-edit flush completed.',
             ));

@@ -3156,6 +3156,9 @@ export function App(): React.JSX.Element {
                 apply_font_family(msg.fontFamily);
                 apply_font_size(msg.fontSize);
             }
+            if (msg.type === 'selectSheet') {
+                handle_sheet_select(msg.sheetIndex);
+            }
             if (msg.type === 'editCommand') {
                 run_edit_command(msg.command);
             }
@@ -3317,6 +3320,7 @@ export function App(): React.JSX.Element {
         apply_save_lifecycle,
         discard_edit_session,
         install_edit_session,
+        handle_sheet_select,
         leave_edit_mode,
         persist_immediate,
         request_save_or_remain_dirty,
