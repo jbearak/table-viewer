@@ -8,7 +8,12 @@ export interface StateStripProps {
     transform_disabled: boolean;
     transform_pending: boolean;
     transform_progress?: string;
-    hidden_rows?: { count: number; pending: boolean; on_unhide_all: () => void };
+    hidden_rows?: {
+        count: number;
+        pending: boolean;
+        disabled?: boolean;
+        on_unhide_all: () => void;
+    };
     column_names: readonly string[];
     merges_flattened: boolean;
     on_transform_change: (state: SheetTransformState) => void;
@@ -77,7 +82,11 @@ export function StateStrip(props: StateStripProps): React.JSX.Element | null {
                         type="button"
                         className="toolbar-cancel"
                         onClick={props.hidden_rows!.on_unhide_all}
-                        disabled={props.hidden_rows!.pending || props.transform_disabled}
+                        disabled={
+                            props.hidden_rows!.pending
+                            || props.hidden_rows!.disabled
+                            || props.transform_disabled
+                        }
                     >
                         Unhide all
                     </button>

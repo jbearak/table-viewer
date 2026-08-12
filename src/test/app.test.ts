@@ -1765,20 +1765,55 @@ describe('Excel first-row header toggle', () => {
         expect(grid_stub().getAttribute('data-mount-id')).not.toBe(old_mount);
     });
 
-    it('does not allow the header row to change during Edit mode', async () => {
+    it('blocks every header-row command path during Edit mode', async () => {
         const { post_message } = await render_app();
-        await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
+        const meta = excel_meta_multi([true, false]);
+        meta.sheets[0].sourceRowCount = 4;
+        meta.sheets[0].excelFirstRowHeader = {
+            ...meta.sheets[0].excelFirstRowHeader!,
+            mode: 'on',
+            sourceRow: 2,
+        };
+        const transform: SheetTransformState = {
+            sort: [],
+            filters: [],
+            hiddenRows: [0, 1],
+            schema: '["S1",2,null]',
+        };
+        await dispatch_host_message(initial_snapshot_message(meta, {
             capabilities: {
                 csvEditable: true,
                 csvEditingSupported: true,
             },
+            state: { transforms: [transform] },
         }));
+        await acknowledge_transform(latest_transform_request(post_message), 2);
         await enter_edit_mode(post_message);
         post_message.mockClear();
 
         const button = get_button('Header Row');
         expect(button.getAttribute('aria-disabled')).toBe('true');
         await click_button('Header Row');
+
+        await open_scope_menu('Header row scope');
+        const scope_items = Array.from(
+            document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
+        );
+        expect(scope_items).toHaveLength(2);
+        expect(scope_items.every((item) => item.disabled)).toBe(true);
+        await click_menu_item('Show first row as data on all 2 sheets');
+
+        const unhide = get_button('Unhide all');
+        expect(unhide.disabled).toBe(true);
+        await click_button('Unhide all');
+
+        expect(grid_shell_mock.latest_props?.can_promote_row_to_header).toBe(false);
+        await act(async () => {
+            const promote = grid_shell_mock.latest_props?.on_promote_row_to_header as
+                ((display_row: number) => void);
+            promote(2);
+        });
+
         expect(post_message.mock.calls
             .map((call) => call[0] as WebviewMessage)
             .some((message) => message.type === 'setExcelFirstRowHeader')).toBe(false);

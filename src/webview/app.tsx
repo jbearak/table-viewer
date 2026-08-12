@@ -2736,7 +2736,18 @@ export function App(): React.JSX.Element {
     ) => {
         const sheet = meta?.sheets[target_sheet_index];
         const header = sheet?.excelFirstRowHeader;
-        if (!sheet || !header || pending_excel_header_ref.current) return;
+        // Every header affordance funnels through here: the primary toggle, row
+        // promotion, Unhide all for a promoted header, and the all-sheets queue.
+        // Edit mode can commit an open cell and refresh the worksheet before this
+        // command reaches the host, invalidating the generation it was posted with.
+        // Keep this guard at the shared command boundary as well as disabling each
+        // visible affordance, so a stale callback or a queue cannot bypass it.
+        if (
+            !sheet
+            || !header
+            || edit_mode_ref.current
+            || pending_excel_header_ref.current
+        ) return;
         const request_id = `header:${excel_header_request_prefix_ref.current}:${
             ++excel_header_request_seq_ref.current
         }`;
@@ -2792,6 +2803,7 @@ export function App(): React.JSX.Element {
 
     /** Queue every sheet that is not already in `enabled`, for the chevron menu. */
     const set_excel_header_all_sheets = useCallback((enabled: boolean) => {
+        if (edit_mode_ref.current) return;
         const sheets = (meta?.sheets ?? [])
             .map((sheet, index) => ({ sheet, index }))
             .filter(({ sheet }) => {
@@ -3927,16 +3939,18 @@ export function App(): React.JSX.Element {
             items: [
                 {
                     label: `Use first row as header on ${all_sheets}`,
-                    disabled: header_capable_sheets.every((sheet) =>
-                        sheet.excelFirstRowHeader!.mode === 'on'
-                        || sheet.excelFirstRowHeader!.active),
+                    disabled: edit_mode_on_active_sheet
+                        || header_capable_sheets.every((sheet) =>
+                            sheet.excelFirstRowHeader!.mode === 'on'
+                            || sheet.excelFirstRowHeader!.active),
                     on_click: () => set_excel_header_all_sheets(true),
                 },
                 {
                     label: `Show first row as data on ${all_sheets}`,
-                    disabled: header_capable_sheets.every((sheet) =>
-                        !(sheet.excelFirstRowHeader!.mode === 'on'
-                            || sheet.excelFirstRowHeader!.active)),
+                    disabled: edit_mode_on_active_sheet
+                        || header_capable_sheets.every((sheet) =>
+                            !(sheet.excelFirstRowHeader!.mode === 'on'
+                                || sheet.excelFirstRowHeader!.active)),
                     on_click: () => set_excel_header_all_sheets(false),
                 },
             ],
@@ -4310,7 +4324,9 @@ export function App(): React.JSX.Element {
             on_hide_column={handle_toggle_column}
             on_hide_columns={handle_hide_columns}
             on_hide_rows={handle_hide_rows}
-            can_promote_row_to_header={excel_header !== undefined}
+            can_promote_row_to_header={
+                excel_header !== undefined && !edit_mode_on_active_sheet
+            }
             on_promote_row_to_header={handle_promote_row_to_header}
             on_focus_columns={focus_columns_trigger}
             cell_highlights={cell_highlights?.sheets[active_sheet_index]}
@@ -4333,6 +4349,9 @@ export function App(): React.JSX.Element {
                 hidden_rows={{
                     count: hidden_row_count,
                     pending: transform_pending,
+                    disabled: edit_mode_on_active_sheet
+                        && excel_header?.mode === 'on'
+                        && excel_header.sourceRow !== 0,
                     on_unhide_all: handle_unhide_all_rows,
                 }}
                 column_names={column_names}
