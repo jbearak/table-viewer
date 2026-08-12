@@ -338,7 +338,7 @@ export function App(): React.JSX.Element {
     // formatted is a real thing to want. Sparse: an absent entry means the default,
     // which is why every read goes through `?? true`.
     const [show_formatting_by_sheet, set_show_formatting_by_sheet] =
-        useState<boolean[]>([]);
+        useState<(boolean | undefined)[]>([]);
     const [vertical_tabs, set_vertical_tabs] = useState(false);
     const [column_widths, set_column_widths] = useState<
         (Record<number, number> | undefined)[]
@@ -1624,6 +1624,7 @@ export function App(): React.JSX.Element {
                         });
                         set_active_sheet_index(normalized.activeSheetIndex);
                         set_column_widths(normalized.columnWidths);
+                        set_show_formatting_by_sheet(normalized.showFormatting ?? []);
                         set_column_visibility(normalized.columnVisibility);
                         set_transforms(normalized.transforms);
                         const tab_orient = normalized.tabOrientation;
@@ -2680,20 +2681,39 @@ export function App(): React.JSX.Element {
         else handle?.copy_selection();
     }, []);
 
+    /**
+     * The only writer, so the live array and the persisted copy cannot drift.
+     *
+     * Persisted per file: reloading the same file after an external edit keeps the
+     * choice, and opening a different file in this panel gets that file's own rather
+     * than inheriting this one's by sheet index (#164).
+     */
+    const update_show_formatting = useCallback(
+        (updater: (prev: readonly (boolean | undefined)[]) => (boolean | undefined)[]) => {
+            set_show_formatting_by_sheet((prev) => {
+                const next = updater(prev);
+                state_ref.current = { ...state_ref.current, showFormatting: [...next] };
+                persist_immediate();
+                return next;
+            });
+        },
+        [persist_immediate],
+    );
+
     const handle_toggle_formatting = useCallback(() => {
-        set_show_formatting_by_sheet((prev) => {
+        update_show_formatting((prev) => {
             const next = [...prev];
             next[active_sheet_index] = !(next[active_sheet_index] ?? true);
             return next;
         });
-    }, [active_sheet_index]);
+    }, [active_sheet_index, update_show_formatting]);
 
     /** Put every sheet into the same formatting state, for the chevron menu. */
     const set_formatting_all_sheets = useCallback((formatted: boolean) => {
-        set_show_formatting_by_sheet(
-            new Array(meta?.sheets.length ?? 0).fill(formatted),
+        update_show_formatting(
+            () => new Array(meta?.sheets.length ?? 0).fill(formatted),
         );
-    }, [meta]);
+    }, [meta, update_show_formatting]);
 
     const request_excel_header = useCallback((
         enabled: boolean,

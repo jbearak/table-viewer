@@ -1443,6 +1443,54 @@ describe('formatting toggle', () => {
         expect(grid_stub().getAttribute('data-show-formatting')).toBe('false');
     });
 
+    it('persists the per-sheet choice and restores it', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['First', 'Second'])));
+        post_message.mockClear();
+
+        await click_button('Formatting');
+        const last = post_message.mock.calls.at(-1)![0];
+        expect(last.type).toBe('stateChanged');
+        expect(last.state.showFormatting[0]).toBe(false);
+    });
+
+    it('restores saved formatting from initial snapshot state', async () => {
+        // Reloading the same file after an external edit keeps the choice, rather
+        // than snapping every sheet back to formatted.
+        await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['First', 'Second']), {
+                state: { showFormatting: [false, true] },
+            }),
+        );
+
+        expect(grid_stub().getAttribute('data-show-formatting')).toBe('false');
+        await click_sheet_tab('Second');
+        expect(grid_stub().getAttribute('data-show-formatting')).toBe('true');
+    });
+
+    it('takes the new file\'s setting when the panel opens a different file', async () => {
+        // Not the outgoing file's, which an array nobody cleared would supply by
+        // sheet index — a choice made in one workbook leaking into an unrelated one.
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['First', 'Second'])));
+        await click_button('Formatting');
+        expect(grid_stub().getAttribute('data-show-formatting')).toBe('false');
+
+        const other = workbook_snapshot_message(make_meta(['Alpha', 'Beta']), {
+            identity: {
+                deliveryId: 2,
+                authority: { fileId: 'file:other', revision: 1 },
+                stateRevision: 1,
+                sourceBasis: { physicalRevision: 1, projectionRevision: 0 },
+            },
+            presentation: 'initial',
+        });
+        await dispatch_host_message(other);
+
+        expect(grid_stub().getAttribute('data-show-formatting')).toBe('true');
+    });
+
     it('offers no scope menu for a single-sheet workbook', async () => {
         // The chevron could only restate the button.
         await render_app();

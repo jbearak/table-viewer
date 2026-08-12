@@ -550,6 +550,15 @@ export interface PerFileState {
     columnVisibility?: (SheetColumnVisibilityState | undefined)[];
     /** Sparse annotations keyed by canonical source row and source column. */
     cellHighlights?: CellHighlightState;
+    /**
+     * Per-sheet choice between formatted display values and raw cell values.
+     *
+     * Sparse: an absent entry means formatted, which is the default and by far the
+     * common case, so a workbook nobody has touched stores nothing. Per sheet rather
+     * than per workbook because reading one sheet raw while another stays formatted
+     * is a real thing to want (#164).
+     */
+    showFormatting?: (boolean | undefined)[];
 }
 
 export function sanitize_excel_header_overrides(
@@ -676,6 +685,14 @@ function validate_transforms(value: unknown): void {
         }
         if (transform.hiddenRows !== undefined) validate_integer_array(transform.hiddenRows, 'transforms');
         if (transform.schema !== undefined && typeof transform.schema !== 'string') invalid_leaf('transforms');
+    }
+}
+
+function validate_show_formatting(value: unknown): void {
+    if (!Array.isArray(value)) invalid_leaf('showFormatting');
+    for (const entry of value) {
+        if (entry === null || entry === undefined) continue;
+        if (typeof entry !== 'boolean') invalid_leaf('showFormatting');
     }
 }
 
@@ -831,6 +848,7 @@ export function decode_stored_per_file_state(value: unknown): StoredPerFileState
     if (state.transforms !== undefined) validate_transforms(state.transforms);
     if (state.columnVisibility !== undefined) validate_column_visibility(state.columnVisibility);
     if (state.cellHighlights !== undefined) validate_cell_highlights(state.cellHighlights);
+    if (state.showFormatting !== undefined) validate_show_formatting(state.showFormatting);
 
     if (state.activeSheetIndex !== undefined && !is_non_negative_integer(state.activeSheetIndex)) {
         invalid_leaf('activeSheetIndex');

@@ -75,6 +75,10 @@ export function normalize_per_file_state(
         cellHighlights: 'cellHighlights' in state
             ? (state as PerFileState).cellHighlights
             : undefined,
+        showFormatting: normalize_sheet_state_array<boolean>(
+            'showFormatting' in state ? (state as PerFileState).showFormatting : undefined,
+            sheet_names,
+        ),
     };
 }
 
