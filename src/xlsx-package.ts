@@ -237,20 +237,32 @@ function read_datemode(cfb_file: ReturnType<typeof CFB.read>): DateMode {
     return parse_workbook_xml(wb).datemode;
 }
 
+export interface XlsxWorksheetCellEdits {
+    readonly sheetIndex: number;
+    readonly edits: readonly XlsxCellEdit[];
+}
+
 /**
- * Rewrite one worksheet's cells inside an .xlsx, returning the new file bytes.
+ * Rewrite several worksheets inside one .xlsx package and serialize it once.
  *
- * `raw` must be the bytes we most recently verified against the file on disk —
- * the caller's TOCTOU checks establish that, and this function assumes it, since
- * splicing edits into stale bytes would resurrect content the user's edits were
- * never based on.
+ * Every worksheet replacement is computed before the package is mutated. A bad
+ * edit on any sheet therefore rejects the whole operation without producing a
+ * partially updated workbook.
  */
-export function write_xlsx_cell_edits(
+export function write_xlsx_workbook_cell_edits(
     raw: Uint8Array,
-    sheet_index: number,
-    edits: readonly XlsxCellEdit[],
+    worksheets: readonly XlsxWorksheetCellEdits[],
 ): Uint8Array {
-    if (edits.length === 0) return raw;
+    const active = worksheets.filter(({ edits }) => edits.length > 0);
+    if (active.length === 0) return raw;
+
+    const indices = new Set<number>();
+    for (const { sheetIndex } of active) {
+        if (!Number.isSafeInteger(sheetIndex) || sheetIndex < 0 || indices.has(sheetIndex)) {
+            throw new Error('Invalid or duplicate worksheet to save');
+        }
+        indices.add(sheetIndex);
+    }
 
     let cfb_file: ReturnType<typeof CFB.read>;
     try {
@@ -259,58 +271,52 @@ export function write_xlsx_cell_edits(
         throw new Error('Not a valid .xlsx file');
     }
 
-    // The reader's own enumeration, not a second one written to match it: see
-    // `worksheet_part_paths`. `sheet_index` is the index of the worksheet the user
-    // was looking at, so anything that numbers differently here saves into a
-    // different sheet — valid file, wrong data, no error.
-    const part = worksheet_part_paths(raw)[sheet_index];
-    if (!part) throw new Error('Could not locate the worksheet to save');
-
-    const sheet_xml = read_part_text(cfb_file, `/${part}`);
-    if (sheet_xml === null) throw new Error('Could not read the worksheet to save');
-
+    const parts = worksheet_part_paths(raw);
     const is_date_style = read_style_date_predicate(cfb_file);
     const datemode = read_datemode(cfb_file);
+    let removed_formula = false;
+    const replacements: Array<{ path: string; xml: string }> = [];
 
-    let updated = apply_cell_edits(sheet_xml, edits, { datemode, is_date_style });
+    for (const { sheetIndex, edits } of active) {
+        const part = parts[sheetIndex];
+        if (!part) throw new Error('Could not locate a worksheet to save');
+        const path = `/${part}`;
+        const sheet_xml = read_part_text(cfb_file, path);
+        if (sheet_xml === null) throw new Error('Could not read a worksheet to save');
 
-    let min_row = Infinity, min_col = Infinity, max_row = 0, max_col = 0;
-    for (const e of edits) {
-        if (e.row < min_row) min_row = e.row;
-        if (e.col < min_col) min_col = e.col;
-        if (e.row > max_row) max_row = e.row;
-        if (e.col > max_col) max_col = e.col;
+        let updated = apply_cell_edits(sheet_xml, edits, { datemode, is_date_style });
+        let min_row = Infinity, min_col = Infinity, max_row = 0, max_col = 0;
+        for (const edit of edits) {
+            if (edit.row < min_row) min_row = edit.row;
+            if (edit.col < min_col) min_col = edit.col;
+            if (edit.row > max_row) max_row = edit.row;
+            if (edit.col > max_col) max_col = edit.col;
+        }
+        updated = widen_dimension(updated, min_row, min_col, max_row, max_col);
+        removed_formula ||= formula_count(updated) < formula_count(sheet_xml);
+        replacements.push({ path, xml: updated });
     }
-    updated = widen_dimension(updated, min_row, min_col, max_row, max_col);
 
-    if (!write_part_text(cfb_file, `/${part}`, updated)) {
-        throw new Error('Could not update the worksheet to save');
+    for (const { path, xml } of replacements) {
+        if (!write_part_text(cfb_file, path, xml)) {
+            throw new Error('Could not update a worksheet to save');
+        }
     }
-
-    // `xl/calcChain.xml` caches the order Excel recalculates formulas in. Writing
-    // a literal over a formula cell leaves a chain entry pointing at a cell that
-    // no longer has an `<f>`. Excel treats a stale chain as a repairable
-    // inconsistency and may prompt on open, so drop the part: it is a pure cache,
-    // Excel rebuilds it on the next recalculation, and its absence is valid (many
-    // workbooks, including our sample, ship without one).
-    //
-    // Only when a formula was actually dropped, though. Deleting it on every save
-    // would break the guarantee this whole module exists for — an untouched part
-    // surviving byte-identically — for the ordinary case of editing a plain cell.
-    if (formula_count(updated) < formula_count(sheet_xml)) {
-        remove_part(cfb_file, '/xl/calcChain.xml');
-    }
+    if (removed_formula) remove_part(cfb_file, '/xl/calcChain.xml');
 
     // `xl/sharedStrings.xml` is deliberately not touched, including its `count`.
-    // Writing over a `t="s"` cell drops one *reference* to the table, so `count`
-    // (total references) can read high afterwards while `uniqueCount` (entries)
-    // stays exact — no `<si>` is ever added or removed here, since values are
-    // written inline. Excel and openpyxl both index by position and ignore the
-    // tally; rewriting the part to correct it would give up the byte-identity
-    // guarantee for every string edit, in exchange for a number nothing reads.
-
+    // Values are written inline, so no shared-string table entry changes.
     const out = CFB.write(cfb_file, { type: 'buffer', fileType: 'zip', compression: true });
     return out instanceof Uint8Array ? out : new Uint8Array(out as ArrayBufferLike);
+}
+
+/** Backward-compatible one-worksheet entry point. */
+export function write_xlsx_cell_edits(
+    raw: Uint8Array,
+    sheet_index: number,
+    edits: readonly XlsxCellEdit[],
+): Uint8Array {
+    return write_xlsx_workbook_cell_edits(raw, [{ sheetIndex: sheet_index, edits }]);
 }
 
 /**
