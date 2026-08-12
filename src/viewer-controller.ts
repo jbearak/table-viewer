@@ -1841,6 +1841,35 @@ export function attach_viewer(
         return true;
     }
 
+    interface EditWriteFence {
+        readonly release: symbol;
+        readonly admittedWrites: Promise<void>;
+    }
+
+    /**
+     * Stop admitting renderer writes while preserving the authority of every write
+     * that crossed the boundary first. Both release and successful save cleanup
+     * need this exact transition: clearing the session before the captured tail
+     * settles makes an admitted write fail its own CAS validation as stale.
+     */
+    function fence_edit_session_writes(
+        edit_session_id: string,
+    ): EditWriteFence | undefined {
+        if (!file_edit_state || !edit_message_is_current(edit_session_id)) {
+            return undefined;
+        }
+        active_edit_session_targets.delete(edit_session_id);
+        pending_edit_session_targets.delete(edit_session_id);
+        const release = Symbol(file_key);
+        file_edit_state.phase = {
+            type: 'releasing',
+            release,
+            token: edit_session_token,
+        };
+        notify_edit_state();
+        return { release, admittedWrites: pending_edit_writes };
+    }
+
     function release_edit_session(
         edit_session_id = active_edit_session_id,
     ): Promise<void> {
@@ -1892,27 +1921,17 @@ export function attach_viewer(
             retire_save_lifecycle(edit_session_id, 'failed');
         }
 
-        // Fence later messages synchronously, but retain the exact session/token
-        // authority needed by every pending-edit write admitted before this boundary.
-        active_edit_session_targets.delete(edit_session_id);
-        pending_edit_session_targets.delete(edit_session_id);
-        const release = Symbol(file_key);
-        file_edit_state.phase = {
-            type: 'releasing',
-            release,
-            token: edit_session_token,
-        };
-        notify_edit_state();
-        const admitted_writes = pending_edit_writes;
+        const fence = fence_edit_session_writes(edit_session_id);
+        if (!fence) return Promise.resolve();
         const completion = (async () => {
             try {
-                await admitted_writes;
+                await fence.admittedWrites;
             } catch (error) {
                 log_sanitized_failure('Failed to settle admitted CSV edits before release', error);
             } finally {
                 if (
                     file_edit_state?.phase.type === 'releasing'
-                    && file_edit_state.phase.release === release
+                    && file_edit_state.phase.release === fence.release
                     && active_edit_session_id === edit_session_id
                 ) {
                     active_edit_session_id = undefined;
@@ -1921,22 +1940,34 @@ export function attach_viewer(
                     void ensure_failed_save_cleanup();
                     delete_shared_edit_state_if_unused();
                 }
-                if (active_edit_release?.release === release) {
+                if (active_edit_release?.release === fence.release) {
                     active_edit_release = undefined;
                 }
             }
         })();
-        active_edit_release = { editSessionId: edit_session_id, release, completion };
+        active_edit_release = {
+            editSessionId: edit_session_id,
+            release: fence.release,
+            completion,
+        };
         return completion;
     }
 
     function begin_edit_cleanup(
         edit_session_id: string,
         save_operation?: CsvSaveHostOperation,
+        write_fence?: symbol,
     ): symbol | undefined {
+        const phase = edit_phase();
+        const holds_authority = write_fence === undefined
+            ? edit_message_is_current(edit_session_id)
+            : active_edit_session_id === edit_session_id
+                && phase.type === 'releasing'
+                && phase.release === write_fence
+                && phase.token === edit_session_token;
         if (
             !file_edit_state
-            || !edit_message_is_current(edit_session_id)
+            || !holds_authority
             || (save_operation !== undefined && (
                 active_save_operation !== save_operation
                 || save_operation.phase !== 'writing'
@@ -4702,10 +4733,30 @@ export function attach_viewer(
             return;
         }
 
-        // writeFile completed: atomically prevent every attachment from claiming
-        // or projecting edits until the durable pending-state clear finishes.
+        // writeFile completed: fence later publications synchronously, then let
+        // every sibling-sheet publication admitted before that boundary finish
+        // under the session/token authority it crossed with. Cleanup cannot clear
+        // ownership first: doing so makes those writes abort their own CAS checks.
+        const write_fence = fence_edit_session_writes(identity.editSessionId);
+        if (write_fence) {
+            try {
+                await write_fence.admittedWrites;
+            } catch (error) {
+                log_sanitized_failure(
+                    'Failed to settle admitted worksheet edits before save cleanup',
+                    error,
+                );
+            }
+        }
+
+        // Atomically prevent every attachment from claiming or projecting edits
+        // until the durable pending-state clear finishes.
         const succeeded_lifecycle = finish_save_lifecycle(identity, 'succeeded');
-        let cleanup_operation = begin_edit_cleanup(identity.editSessionId, operation);
+        let cleanup_operation = begin_edit_cleanup(
+            identity.editSessionId,
+            operation,
+            write_fence?.release,
+        );
         if (!cleanup_operation) {
             cleanup_operation = Symbol(file_key);
             active_save_operation = undefined;

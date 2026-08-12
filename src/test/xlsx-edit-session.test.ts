@@ -456,7 +456,7 @@ describe('xlsx edit sessions', () => {
         ).includes('Draft'));
     });
 
-    it('persists a sibling worksheet clear while another worksheet saves', async () => {
+    it('settles an admitted sibling clear before successful save cleanup', async () => {
         const state = versioned_state_store({
             pendingEdits: [{
                 sheetName: 'People',
@@ -476,11 +476,30 @@ describe('xlsx edit sessions', () => {
 
         let release_write: (() => void) | undefined;
         let writing = false;
+        let write_completed = false;
         vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
             writing = true;
             await new Promise<void>((done) => { release_write = done; });
             bytes = new Uint8Array(content);
+            write_completed = true;
         });
+
+        const compare = state.store.compare_and_set.bind(state.store);
+        let release_publication_write: (() => void) | undefined;
+        let publication_write_pending = false;
+        state.store.compare_and_set = async (...args) => {
+            if (
+                writing
+                && !publication_write_pending
+                && !JSON.stringify(args[2]).includes('Draft')
+            ) {
+                publication_write_pending = true;
+                await new Promise<void>((done) => {
+                    release_publication_write = done;
+                });
+            }
+            return compare(...args);
+        };
         const save = panel.__receive({
             type: 'saveCsv',
             operation: {
@@ -504,10 +523,28 @@ describe('xlsx edit sessions', () => {
             worksheetId: '1',
             edits: null,
         });
+        await wait_for_observable(() => publication_write_pending);
         release_write!();
+        await wait_for_observable(() => write_completed);
+
+        // Physical save has completed, but successful cleanup cannot revoke the
+        // session authority under the sibling publication already inside its CAS.
+        expect(save_results(panel)).toHaveLength(0);
+        expect(panel.__messages).not.toContainEqual({
+            type: 'pendingEditsAcknowledged',
+            editSessionId: session,
+            sequence: 1,
+        });
+
+        release_publication_write!();
         await Promise.all([save, publication]);
         await controller_of(panel).drain();
 
+        expect(panel.__messages).toContainEqual({
+            type: 'pendingEditsAcknowledged',
+            editSessionId: session,
+            sequence: 1,
+        });
         expect(JSON.stringify(state.get_state(file_path).pendingEdits ?? null))
             .not.toContain('Draft');
         expect(save_results(panel).at(-1)).toMatchObject({ success: true });
