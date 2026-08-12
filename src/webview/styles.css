@@ -723,6 +723,20 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
 
 /* Context Menu */
 
+/*
+ * The wrapper `ContextMenu` needs for its own hit-testing, generating no box.
+ *
+ * As a plain div it was an in-flow child of whatever opened the menu — and the
+ * toolbar's action row is a right-aligned flex row with a 6px gap, so an empty child
+ * still claimed a gap and slid every button 6px left the moment a chevron was
+ * pressed. The menu itself is `position: fixed`, so removing the wrapper's box costs
+ * nothing: the menu still positions from viewport coordinates, and the wrapper still
+ * contains it for `contains()` dismissal checks.
+ */
+.context-menu-root {
+    display: contents;
+}
+
 .context-menu {
     position: fixed;
     z-index: 50;
