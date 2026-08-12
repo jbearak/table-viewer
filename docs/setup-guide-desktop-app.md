@@ -50,7 +50,7 @@ The workbook has a welcome sheet followed by fruit, vegetable, coffee, berry, ci
 
 Nothing in this section touches the `.xlsx` file. Sorts, filters, hidden columns, column widths, and highlights are never written into a workbook, even after you have used edit mode — they live in Table Viewer's own database, keyed to the file. That is what lets them survive a new version of the file: regenerate the table from a script, or drop in the copy a colleague sent you, and your arrangement and highlights are still there. Feel free to poke around.
 
-1. Click **Vertical Tabs** to move the worksheet tabs between the top and left side. With this many sheets, the left side is usually easier to scan.
+1. Click the orientation button at the end of the worksheet tab strip to move the tabs between the top and left side. With this many sheets, the left side is usually easier to scan. It is also on the tab strip's right-click menu.
 2. Click **Auto-fit Columns**, or drag a column border. Double-clicking a column border fits that column to its contents.
 3. Right-click a column header to sort or [filter](filtering.md) it. On **Coffee Shelf**, try filtering **Roast** to values containing `Light`, then sort **Price / bag** ascending.
 4. Open **Columns** to hide fields you do not need. Try hiding **Origin**; open the menu again to bring it back.

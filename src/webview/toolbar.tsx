@@ -6,15 +6,11 @@ import React, {
     useRef,
     useState,
 } from 'react';
-import type { FilterEntry, SheetTransformState } from '../types';
 import {
     ColumnVisibilityControl,
     type ColumnVisibilityControlProps,
     type ColumnVisibilityFocusHandle,
 } from './column-visibility-control';
-import { FilterStrip } from './filter-strip';
-import { SortStrip } from './sort-strip';
-import { use_toolbar_wrap } from './use-toolbar-wrap';
 import { HighlightControl, type HighlightControlProps } from './highlight-control';
 
 export interface ToolbarFocusHandle {
@@ -24,16 +20,6 @@ export interface ToolbarFocusHandle {
 }
 
 export interface ToolbarProps {
-    transform: SheetTransformState;
-    transform_disabled: boolean;
-    transform_pending: boolean;
-    transform_progress?: string;
-    hidden_rows?: { count: number; pending: boolean; on_unhide_all: () => void };
-    column_names: readonly string[];
-    merges_flattened: boolean;
-    on_transform_change: (state: SheetTransformState) => void;
-    on_edit_filter: (entry: FilterEntry, trigger: HTMLElement) => void;
-    on_cancel_transform: () => void;
     show_formatting: boolean;
     on_toggle_formatting: () => void;
     show_formatting_button: boolean;
@@ -45,9 +31,6 @@ export interface ToolbarProps {
     on_toggle_excel_header: () => void;
     excel_header_disabled?: boolean;
     excel_header_disabled_reason?: string;
-    vertical_tabs: boolean;
-    on_toggle_tab_orientation: () => void;
-    show_vertical_tabs_button: boolean;
     column_visibility: ColumnVisibilityControlProps;
     highlight?: HighlightControlProps;
     auto_fit_active: boolean;
@@ -62,33 +45,12 @@ export interface ToolbarProps {
     edit_disabled_reason?: string;
 }
 
-/**
- * The keys of a rendered action group, joined — a single dependency value that
- * changes whenever the group's membership does, not merely its size.
- */
-function react_element_keys(elements: readonly React.ReactNode[]): string {
-    return elements
-        .map((element) =>
-            React.isValidElement(element) ? String(element.key) : '',
-        )
-        .join(',');
-}
-
 export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Toolbar(
     props,
     focus_ref,
 ): React.JSX.Element {
-    const {
-        transform,
-        column_names,
-        on_transform_change,
-        on_edit_filter,
-        on_cancel_transform,
-    } = props;
     const toolbar_ref = useRef<HTMLDivElement>(null);
     const columns_ref = useRef<ColumnVisibilityFocusHandle>(null);
-    const lead_ref = useRef<HTMLDivElement>(null);
-    const chips_ref = useRef<HTMLDivElement>(null);
     const actions_ref = useRef<HTMLDivElement>(null);
     useImperativeHandle(focus_ref, () => ({
         focus: () => {
@@ -126,17 +88,6 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                     ? 'Show raw cell values.'
                     : 'Show formatted cell values.'}
                 onClick={props.on_toggle_formatting}
-            />
-        ),
-        props.show_vertical_tabs_button && (
-            <ToolbarButton
-                key="vertical-tabs"
-                label="Vertical Tabs"
-                active={props.vertical_tabs}
-                tooltip_text={props.vertical_tabs
-                    ? 'Move sheet tabs above the table.'
-                    : 'Move sheet tabs to the left of the table.'}
-                onClick={props.on_toggle_tab_orientation}
             />
         ),
     ].filter(Boolean);
@@ -182,47 +133,10 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
         />,
     ].filter(Boolean);
 
-    // Each group's membership as one value, so the wrap deps below can compare
-    // identity and not merely how many there are.
-    const workbook_action_keys = react_element_keys(workbook_actions);
-    const worksheet_action_keys = react_element_keys(worksheet_actions);
-
-    const wrapped = use_toolbar_wrap(
-        { toolbar: toolbar_ref, lead: lead_ref, chips: chips_ref, actions: actions_ref },
-        [
-            transform.sort,
-            transform.filters,
-            props.hidden_rows?.count,
-            props.hidden_rows?.pending,
-            props.transform_pending,
-            props.transform_progress,
-            props.merges_flattened,
-            props.column_visibility.hidden_count,
-            props.highlight?.active_color,
-            props.highlight?.selection_available,
-            props.highlight?.pending,
-            // Which actions each group renders, rather than the individual `show_*`
-            // flags: an action added to a group is then measured without anyone
-            // having to remember to list it here too.
-            //
-            // Keys rather than counts. A count misses a swap — one action appearing
-            // as another in the same group disappears leaves the length alone while
-            // the widths differ, so the row would keep a wrapped state measured
-            // against buttons that are no longer there.
-            workbook_action_keys,
-            worksheet_action_keys,
-            // Not membership but width: these change a button's label-driven size
-            // without changing how many buttons there are.
-            props.excel_header_active,
-            props.excel_header_disabled,
-        ],
-    );
-    const controls_disabled = !!(props.transform_disabled || props.transform_pending);
-
     return (
         <div
             ref={toolbar_ref}
-            className={wrapped ? 'toolbar is-wrapped' : 'toolbar'}
+            className="toolbar"
             role="toolbar"
             tabIndex={-1}
             aria-label="Table controls"
@@ -232,69 +146,10 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                 {props.excel_header_status ?? ''}
             </span>
             {props.highlight && (
-                // Highlight is a control, not a chip: keep it out of the wrapping
-                // chip region so adding a sort or filter never shifts it to row two.
-                <div ref={lead_ref} className="toolbar-lead">
+                <div className="toolbar-lead">
                     <HighlightControl {...props.highlight} />
                 </div>
             )}
-            <div ref={chips_ref} className="toolbar-chips">
-                <SortStrip
-                    state={transform}
-                    column_names={column_names}
-                    disabled={controls_disabled}
-                    on_change={on_transform_change}
-                />
-                <FilterStrip
-                    state={transform}
-                    column_names={column_names}
-                    disabled={controls_disabled}
-                    on_change={on_transform_change}
-                    on_edit={on_edit_filter}
-                />
-                {(props.hidden_rows?.count ?? 0) > 0 && (
-                    <div className="filter-chip">
-                        <span className="filter-chip-body">
-                            {props.hidden_rows!.count} hidden row
-                            {props.hidden_rows!.count === 1 ? '' : 's'}
-                        </span>
-                        <button
-                            type="button"
-                            className="toolbar-cancel"
-                            onClick={props.hidden_rows!.on_unhide_all}
-                            disabled={props.hidden_rows!.pending || props.transform_disabled}
-                        >
-                            Unhide all
-                        </button>
-                    </div>
-                )}
-                {props.transform_pending && (
-                    <span className="toolbar-progress" role="status" aria-live="polite">
-                        {props.transform_progress ?? 'Applying sort & filters…'}
-                    </span>
-                )}
-                {props.transform_pending && (
-                    <button
-                        type="button"
-                        className="toolbar-cancel"
-                        onClick={on_cancel_transform}
-                        // A cancel is itself a transform request, so it belongs
-                        // behind the same gate: one the host would refuse would only
-                        // displace the request it is trying to cancel.
-                        disabled={props.transform_disabled}
-                    >
-                        Cancel
-                    </button>
-                )}
-                {props.merges_flattened && (
-                    <span
-                        className="toolbar-merge-notice"
-                        title="Merged values remain only in their original top-left cells."
-                    >
-                        Merged cells shown unmerged; only top-left cells contain values
-                    </span>
-                )}
-            </div>
             {/*
               * Two groups: what an action changes for the whole workbook, then what
               * it changes for this worksheet alone. The order used to interleave the
@@ -305,12 +160,13 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
               * workbook group is empty, so adding an action to a group cannot leave
               * the rule behind — the failure that condition would hide is a narrow
               * one, visible only when the new action is the *only* workbook action
-              * on screen.
+              * on screen. Edit alone on the workbook side is the expected state now
+              * that tab orientation moved to the sheet tabs (#164), and it still
+              * earns the rule: it changes what a keystroke does, not what is shown.
               *
-              * Still flat children of one row: `use_toolbar_wrap` measures the
-              * direct children here and adds one action gap between each, and
-              * `.toolbar-actions > :first-child` carries the right-alignment.
-              * Nesting either group in a wrapper would break both.
+              * Still flat children of one row: `.toolbar-actions > :first-child`
+              * carries the right-alignment, so nesting either group in a wrapper
+              * would break it.
               */}
             <div ref={actions_ref} className="toolbar-actions">
                 {workbook_actions}

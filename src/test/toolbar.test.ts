@@ -14,21 +14,12 @@ let container: HTMLDivElement | null = null;
 
 function render_toolbar(props?: Partial<React.ComponentProps<typeof Toolbar>>) {
     const on_toggle_formatting = vi.fn();
-    const on_toggle_tab_orientation = vi.fn();
 
     container = document.createElement('div');
     document.body.appendChild(container);
     root = createRoot(container);
 
     const merged_props: React.ComponentProps<typeof Toolbar> = {
-        transform: { sort: [], filters: [] },
-        transform_disabled: false,
-        transform_pending: false,
-        column_names: ['Name', 'Value'],
-        merges_flattened: false,
-        on_transform_change: vi.fn(),
-        on_edit_filter: vi.fn(),
-        on_cancel_transform: vi.fn(),
         show_formatting: true,
         on_toggle_formatting,
         show_formatting_button: true,
@@ -37,9 +28,6 @@ function render_toolbar(props?: Partial<React.ComponentProps<typeof Toolbar>>) {
         excel_header_automatic: false,
         excel_header_pending: false,
         on_toggle_excel_header: vi.fn(),
-        vertical_tabs: false,
-        on_toggle_tab_orientation,
-        show_vertical_tabs_button: true,
         column_visibility: {
             column_count: 2,
             get_column_name: (source_index) => ['Name', 'Value'][source_index] ?? '',
@@ -67,7 +55,6 @@ function render_toolbar(props?: Partial<React.ComponentProps<typeof Toolbar>>) {
     return {
         container,
         on_toggle_formatting,
-        on_toggle_tab_orientation,
         rerender(next_props?: Partial<React.ComponentProps<typeof Toolbar>>) {
             act(() => {
                 root!.render(React.createElement(Toolbar, {
@@ -94,12 +81,11 @@ describe('toolbar toggle colors', () => {
         );
     });
 
-    it('spaces the scope divider with padding so wrap measurement counts it', () => {
-        // `intrinsic_width_px` measures children by `scrollWidth`, which counts
-        // padding but not margin. Spacing the rule with margin spent width the
-        // wrap calculation never saw, so the toolbar stayed unwrapped a few pixels
-        // past the point it should have and scrolled the action strip instead.
-        // Asserted against the stylesheet because jsdom computes no layout.
+    it('paints the scope divider as a 1px rule despite its spacing', () => {
+        // The rule carries breathing room on top of the action row's gap so it reads
+        // as a boundary rather than one more crowded item. That room is padding, so
+        // without clipping the background to the content box the 1px line would paint
+        // 5px wide. Asserted against the stylesheet because jsdom computes no layout.
         const css = readFileSync(
             resolve(process.cwd(), 'src/webview/styles.css'),
             'utf8',
@@ -108,9 +94,6 @@ describe('toolbar toggle colors', () => {
         const rule = /\.toolbar-actions-divider\s*\{([^}]*)\}/.exec(css)?.[1];
         expect(rule).toBeDefined();
         expect(rule).toMatch(/padding:\s*0\s+2px/);
-        expect(rule).not.toMatch(/(^|[^-])margin/);
-        // The padding would otherwise paint as part of the rule, widening a 1px
-        // line to 5px.
         expect(rule).toMatch(/background-clip:\s*content-box/);
         expect(rule).toMatch(/box-sizing:\s*content-box/);
     });
@@ -202,21 +185,6 @@ describe('Toolbar', () => {
         expect(event.defaultPrevented).toBe(true);
     });
 
-    it('shows hidden row count and invokes Unhide all', () => {
-        const on_unhide_all = vi.fn();
-        const { container, rerender } = render_toolbar({
-            hidden_rows: { count: 0, pending: false, on_unhide_all },
-        });
-        expect(container.textContent).not.toContain('hidden row');
-
-        rerender({
-            hidden_rows: { count: 2, pending: false, on_unhide_all },
-        });
-        expect(container.textContent).toContain('2 hidden rows');
-        dispatch_mouse_event(get_button('Unhide all'), 'click');
-        expect(on_unhide_all).toHaveBeenCalledOnce();
-    });
-
     it('orders actions workbook scope first, then worksheet scope', () => {
         const { container } = render_toolbar({
             show_edit_button: true,
@@ -226,7 +194,6 @@ describe('Toolbar', () => {
         expect(get_action_labels(container)).toEqual([
             'Edit',
             'Formatting',
-            'Vertical Tabs',
             '|',
             'First Row as Header',
             'Columns',
@@ -247,7 +214,6 @@ describe('Toolbar', () => {
         // a rule there would be a stray leading line.
         const { container } = render_toolbar({
             show_formatting_button: false,
-            show_vertical_tabs_button: false,
         });
 
         expect(container.querySelector('.toolbar-actions-divider')).toBeNull();
@@ -256,137 +222,87 @@ describe('Toolbar', () => {
     });
 
     it('keeps the divider when only one workbook-scoped action is shown', () => {
+        // The expected state now that tab orientation moved to the sheet tabs (#164):
+        // Edit is usually alone on the workbook side, and the rule still belongs there.
         const { container } = render_toolbar({
             show_formatting_button: false,
-            show_vertical_tabs_button: true,
+            show_edit_button: true,
         });
 
         expect(get_action_labels(container))
-            .toEqual(['Vertical Tabs', '|', 'Columns', 'Auto-fit Columns']);
+            .toEqual(['Edit', '|', 'Columns', 'Auto-fit Columns']);
     });
 
     it('divides the two groups for every combination of optional actions', () => {
         // The divider follows from whether the workbook group rendered anything, so
-        // it must sit at exactly the group boundary in all eight combinations —
+        // it must sit at exactly the group boundary in all four combinations —
         // including the two where only one workbook action is visible, which a
-        // hand-written condition is most likely to get wrong. Edit varies too and
-        // now belongs to the workbook group, including when it is the only action
-        // before the rule.
+        // hand-written condition is most likely to get wrong.
         for (const show_edit_button of [false, true]) {
             for (const show_formatting_button of [false, true]) {
-                for (const show_vertical_tabs_button of [false, true]) {
-                    const { container } = render_toolbar({
-                        show_edit_button,
-                        show_formatting_button,
-                        show_vertical_tabs_button,
-                        show_excel_header_button: true,
-                    });
-                    const labels = get_action_labels(container);
-                    const workbook_count = [
-                        show_edit_button,
-                        show_formatting_button,
-                        show_vertical_tabs_button,
-                    ].filter(Boolean).length;
+                const { container } = render_toolbar({
+                    show_edit_button,
+                    show_formatting_button,
+                    show_excel_header_button: true,
+                });
+                const labels = get_action_labels(container);
+                const workbook_count = [
+                    show_edit_button,
+                    show_formatting_button,
+                ].filter(Boolean).length;
 
-                    if (workbook_count === 0) {
-                        expect(labels).not.toContain('|');
-                    } else {
-                        // One rule, at the boundary: every workbook action before it
-                        // and every worksheet action after it.
-                        expect(labels.filter((label) => label === '|')).toHaveLength(1);
-                        expect(labels.indexOf('|')).toBe(workbook_count);
-                        expect(labels.slice(0, workbook_count)).toEqual([
-                            ...(show_edit_button ? ['Edit'] : []),
-                            ...(show_formatting_button ? ['Formatting'] : []),
-                            ...(show_vertical_tabs_button ? ['Vertical Tabs'] : []),
-                        ]);
-                        expect(labels.slice(workbook_count + 1)).toEqual([
-                            'First Row as Header',
-                            'Columns',
-                            'Auto-fit Columns',
-                        ]);
-                    }
-                    cleanup();
+                if (workbook_count === 0) {
+                    expect(labels).not.toContain('|');
+                } else {
+                    // One rule, at the boundary: every workbook action before it
+                    // and every worksheet action after it.
+                    expect(labels.filter((label) => label === '|')).toHaveLength(1);
+                    expect(labels.indexOf('|')).toBe(workbook_count);
+                    expect(labels.slice(0, workbook_count)).toEqual([
+                        ...(show_edit_button ? ['Edit'] : []),
+                        ...(show_formatting_button ? ['Formatting'] : []),
+                    ]);
+                    expect(labels.slice(workbook_count + 1)).toEqual([
+                        'First Row as Header',
+                        'Columns',
+                        'Auto-fit Columns',
+                    ]);
                 }
+                cleanup();
             }
         }
     });
 
-    it('does not show the Sort/filter raw-values pill when idle', () => {
-        const { container } = render_toolbar({
-            transform: { sort: [], filters: [] },
-        });
+    it('holds no view state: sort, filter, and progress live in the state strip', () => {
+        // The toolbar is actions only since #164. Nothing here should render a chip
+        // or a progress badge regardless of what the sheet's transform is doing.
+        const { container } = render_toolbar();
+
         expect(container.querySelector('.sort-strip')).toBeNull();
         expect(container.querySelector('.filter-strip')).toBeNull();
-        expect(container.querySelector('.toolbar-transform-semantics')).toBeNull();
-        expect(container.querySelector('[role="note"]')).toBeNull();
-        expect(container.querySelector('[role="toolbar"]')?.getAttribute('aria-describedby'))
-            .toBeNull();
-        expect(container.textContent).not.toContain('Sort/filter: raw values');
-        expect(container.textContent).not.toContain(
-            'Sorting and filtering use raw cell values, not formatted display text.',
-        );
-    });
-
-    it('does not include removed raw-value chrome in chip-width wrapping', () => {
-        const scroll_width = Object.getOwnPropertyDescriptor(
-            HTMLElement.prototype,
-            'scrollWidth',
-        );
-        const client_width = Object.getOwnPropertyDescriptor(
-            HTMLElement.prototype,
-            'clientWidth',
-        );
-        Object.defineProperty(HTMLElement.prototype, 'scrollWidth', {
-            configurable: true,
-            get(this: HTMLElement) {
-                if (this.classList.contains('toolbar-item')) return 50;
-                return 0;
-            },
-        });
-        Object.defineProperty(HTMLElement.prototype, 'clientWidth', {
-            configurable: true,
-            get(this: HTMLElement) {
-                return this.classList.contains('toolbar') ? 400 : 0;
-            },
-        });
-        try {
-            const { container } = render_toolbar({
-                transform: { sort: [], filters: [] },
-            });
-            expect(container.querySelector('.toolbar-transform-semantics')).toBeNull();
-            expect(container.querySelector('.toolbar')?.classList.contains('is-wrapped'))
-                .toBe(false);
-        } finally {
-            if (scroll_width) {
-                Object.defineProperty(HTMLElement.prototype, 'scrollWidth', scroll_width);
-            } else {
-                Reflect.deleteProperty(HTMLElement.prototype, 'scrollWidth');
-            }
-            if (client_width) {
-                Object.defineProperty(HTMLElement.prototype, 'clientWidth', client_width);
-            } else {
-                Reflect.deleteProperty(HTMLElement.prototype, 'clientWidth');
-            }
-        }
+        expect(container.querySelector('.state-strip')).toBeNull();
+        expect(container.querySelector('.toolbar-chips')).toBeNull();
+        expect(container.querySelector('.toolbar-progress')).toBeNull();
+        expect(container.textContent).not.toContain('hidden row');
+        expect(container.textContent).not.toContain('Merged cells shown unmerged');
     });
 
     it('keeps the existing button labels and removes native title tooltips', () => {
         render_toolbar();
 
         const formatting = get_button('Formatting');
-        const vertical_tabs = get_button('Vertical Tabs');
+        const auto_fit = get_button('Auto-fit Columns');
 
         expect(formatting.textContent).toBe('Formatting');
-        expect(vertical_tabs.textContent).toBe('Vertical Tabs');
+        expect(auto_fit.textContent).toBe('Auto-fit Columns');
         expect(formatting.getAttribute('title')).toBeNull();
-        expect(vertical_tabs.getAttribute('title')).toBeNull();
+        expect(auto_fit.getAttribute('title')).toBeNull();
     });
 
     it('shows state-aware tooltip text on hover and hides it on mouseout', () => {
         render_toolbar({
             show_formatting: true,
-            vertical_tabs: false,
+            auto_fit_active: false,
         });
 
         const formatting = get_button('Formatting');
@@ -395,17 +311,17 @@ describe('Toolbar', () => {
         dispatch_mouse_event(formatting, 'mouseout');
         expect(get_tooltip()).toBeNull();
 
-        const vertical_tabs = get_button('Vertical Tabs');
-        dispatch_mouse_event(vertical_tabs, 'mouseover');
-        expect(get_tooltip()?.textContent).toBe('Move sheet tabs to the left of the table.');
-        dispatch_mouse_event(vertical_tabs, 'mouseout');
+        const auto_fit = get_button('Auto-fit Columns');
+        dispatch_mouse_event(auto_fit, 'mouseover');
+        expect(get_tooltip()?.textContent).toBe('Auto-fit all columns to their content.');
+        dispatch_mouse_event(auto_fit, 'mouseout');
         expect(get_tooltip()).toBeNull();
     });
 
     it('shows state-aware tooltip text on focus and hides it on blur', () => {
         render_toolbar({
             show_formatting: false,
-            vertical_tabs: true,
+            auto_fit_active: true,
         });
 
         const formatting = get_button('Formatting');
@@ -418,13 +334,13 @@ describe('Toolbar', () => {
         });
         expect(get_tooltip()).toBeNull();
 
-        const vertical_tabs = get_button('Vertical Tabs');
+        const auto_fit = get_button('Auto-fit Columns');
         act(() => {
-            vertical_tabs.focus();
+            auto_fit.focus();
         });
-        expect(get_tooltip()?.textContent).toBe('Move sheet tabs above the table.');
+        expect(get_tooltip()?.textContent).toBe('Restore original column widths.');
         act(() => {
-            vertical_tabs.blur();
+            auto_fit.blur();
         });
         expect(get_tooltip()).toBeNull();
     });
@@ -613,315 +529,6 @@ describe('Toolbar', () => {
         expect(get_tooltip()).toBeNull();
     });
 
-    it('composes hidden-column transform chips, progress, cancel, and actions', () => {
-        const on_cancel_transform = vi.fn();
-        const { container } = render_toolbar({
-            column_names: ['Visible', 'Hidden active'],
-            transform: {
-                sort: [{ colIndex: 1, direction: 'asc' }],
-                filters: [{
-                    id: 'f',
-                    colIndex: 1,
-                    operator: 'equals',
-                    value: '0',
-                    caseSensitive: false,
-                    enabled: false,
-                }],
-            },
-            transform_pending: true,
-            transform_progress: 'Applying saved…',
-            merges_flattened: true,
-            on_cancel_transform,
-        });
-        expect(container.textContent).not.toMatch(/\d+ of \d+ rows/);
-        expect(container.textContent).toContain('Hidden active');
-        expect(container.textContent).toContain('Applying saved…');
-        expect(container.textContent).toContain('Merged cells shown unmerged');
-        expect(get_button('Formatting')).toBeDefined();
-        expect(get_button('Cancel')).toBeDefined();
-        act(() => get_button('Cancel').click());
-        expect(on_cancel_transform).toHaveBeenCalledOnce();
-        expect((container.querySelector('.sort-chip') as HTMLButtonElement).disabled).toBe(false);
-        expect(container.querySelector('.sort-chip')?.getAttribute('aria-disabled')).toBe('true');
-        expect((container.querySelector('.filter-chip-body') as HTMLButtonElement).disabled).toBe(false);
-        expect(container.querySelector('.filter-chip-body')?.getAttribute('aria-disabled')).toBe('true');
-    });
-
-    it('keeps sort, filter, merge notice, and actions reachable in a narrow wrap', () => {
-        const scroll_width = Object.getOwnPropertyDescriptor(
-            HTMLElement.prototype,
-            'scrollWidth',
-        );
-        const client_width = Object.getOwnPropertyDescriptor(
-            HTMLElement.prototype,
-            'clientWidth',
-        );
-        Object.defineProperty(HTMLElement.prototype, 'scrollWidth', {
-            configurable: true,
-            get(this: HTMLElement) {
-                if (this.classList.contains('sort-strip')) return 210;
-                if (this.classList.contains('filter-strip')) return 240;
-                if (this.classList.contains('toolbar-merge-notice')) return 360;
-                if (this.classList.contains('toolbar-item')) return 90;
-                return 0;
-            },
-        });
-        Object.defineProperty(HTMLElement.prototype, 'clientWidth', {
-            configurable: true,
-            get(this: HTMLElement) {
-                return this.classList.contains('toolbar') ? 420 : 0;
-            },
-        });
-        const style = document.createElement('style');
-        style.textContent = readFileSync(
-            resolve(process.cwd(), 'src/webview/styles.css'),
-            'utf8',
-        );
-        document.head.appendChild(style);
-        try {
-            const { container } = render_toolbar({
-                transform: {
-                    sort: [{ colIndex: 0, direction: 'asc' }],
-                    filters: [{
-                        id: 'f', colIndex: 1, operator: 'contains', value: 'needle',
-                        caseSensitive: false, enabled: true,
-                    }],
-                },
-                merges_flattened: true,
-            });
-            const toolbar = container.querySelector('.toolbar') as HTMLElement;
-            const chips = container.querySelector('.toolbar-chips') as HTMLElement;
-            const sort = container.querySelector('.sort-strip') as HTMLElement;
-            const filter = container.querySelector('.filter-strip') as HTMLElement;
-            const notice = container.querySelector('.toolbar-merge-notice') as HTMLElement;
-            const actions = container.querySelector('.toolbar-actions') as HTMLElement;
-
-            expect(toolbar.classList.contains('is-wrapped')).toBe(true);
-            expect(container.querySelector('.toolbar-transform-semantics')).toBeNull();
-            expect(getComputedStyle(chips).flexWrap).toBe('wrap');
-            expect(getComputedStyle(chips).overflow).toBe('visible');
-            expect(getComputedStyle(sort).flexShrink).toBe('1');
-            expect(getComputedStyle(filter).flexShrink).toBe('1');
-            expect(getComputedStyle(sort).minWidth).not.toBe('0px');
-            expect(getComputedStyle(filter).minWidth).not.toBe('0px');
-            expect(getComputedStyle(notice).flexShrink).toBe('1');
-            expect(getComputedStyle(notice).whiteSpace).toBe('normal');
-            expect(getComputedStyle(notice).overflowWrap).toBe('anywhere');
-            expect(getComputedStyle(actions).maxWidth).toBe('100%');
-            expect(getComputedStyle(actions).overflowX).toBe('auto');
-            expect(getComputedStyle(actions.firstElementChild as HTMLElement).marginLeft)
-                .toBe('auto');
-            expect(getComputedStyle(actions).justifyContent).toBe('');
-            expect(container.querySelector('.sort-chip')).not.toBeNull();
-            expect(container.querySelector('.filter-chip-body')).not.toBeNull();
-            expect(get_button('Formatting')).toBeDefined();
-            expect(get_button('Auto-fit Columns')).toBeDefined();
-        } finally {
-            style.remove();
-            if (scroll_width) {
-                Object.defineProperty(HTMLElement.prototype, 'scrollWidth', scroll_width);
-            } else {
-                Reflect.deleteProperty(HTMLElement.prototype, 'scrollWidth');
-            }
-            if (client_width) {
-                Object.defineProperty(HTMLElement.prototype, 'clientWidth', client_width);
-            } else {
-                Reflect.deleteProperty(HTMLElement.prototype, 'clientWidth');
-            }
-        }
-    });
-
-    it('remeasures wrapping when pending progress text changes', () => {
-        const scroll_width = Object.getOwnPropertyDescriptor(
-            HTMLElement.prototype,
-            'scrollWidth',
-        );
-        const client_width = Object.getOwnPropertyDescriptor(
-            HTMLElement.prototype,
-            'clientWidth',
-        );
-        Object.defineProperty(HTMLElement.prototype, 'scrollWidth', {
-            configurable: true,
-            get(this: HTMLElement) {
-                if (this.classList.contains('toolbar-progress')) {
-                    return this.textContent?.includes('A much longer pending progress label')
-                        ? 700
-                        : 100;
-                }
-                return 0;
-            },
-        });
-        Object.defineProperty(HTMLElement.prototype, 'clientWidth', {
-            configurable: true,
-            get(this: HTMLElement) {
-                return this.classList.contains('toolbar') ? 500 : 0;
-            },
-        });
-        const rendered = render_toolbar({
-            transform_pending: true,
-            transform_progress: 'Short',
-        });
-        expect(rendered.container.querySelector('.toolbar')?.classList.contains('is-wrapped'))
-            .toBe(false);
-        rendered.rerender({
-            transform_pending: true,
-            transform_progress: 'A much longer pending progress label',
-        });
-        expect(rendered.container.querySelector('.toolbar')?.classList.contains('is-wrapped'))
-            .toBe(true);
-        if (scroll_width) {
-            Object.defineProperty(HTMLElement.prototype, 'scrollWidth', scroll_width);
-        } else {
-            Reflect.deleteProperty(HTMLElement.prototype, 'scrollWidth');
-        }
-        if (client_width) {
-            Object.defineProperty(HTMLElement.prototype, 'clientWidth', client_width);
-        } else {
-            Reflect.deleteProperty(HTMLElement.prototype, 'clientWidth');
-        }
-    });
-
-    it('remeasures wrapping when one group action is swapped for another', () => {
-        // A swap inside one group — Formatting going as Vertical Tabs arrives — is
-        // the case a membership *count* cannot see: the group still renders one
-        // action, so a length-keyed dependency never changes and the row keeps a
-        // wrapped state measured against a button that is no longer there.
-        const scroll_width = Object.getOwnPropertyDescriptor(
-            HTMLElement.prototype,
-            'scrollWidth',
-        );
-        const client_width = Object.getOwnPropertyDescriptor(
-            HTMLElement.prototype,
-            'clientWidth',
-        );
-        Object.defineProperty(HTMLElement.prototype, 'scrollWidth', {
-            configurable: true,
-            get(this: HTMLElement) {
-                if (this.classList.contains('toolbar-item')) {
-                    return this.textContent === 'Vertical Tabs' ? 600 : 100;
-                }
-                return 0;
-            },
-        });
-        Object.defineProperty(HTMLElement.prototype, 'clientWidth', {
-            configurable: true,
-            get(this: HTMLElement) {
-                return this.classList.contains('toolbar') ? 500 : 0;
-            },
-        });
-        try {
-            const rendered = render_toolbar({
-                // A chip is required for wrapping to be considered at all.
-                transform_pending: true,
-                transform_progress: 'Short',
-                show_formatting_button: true,
-                show_vertical_tabs_button: false,
-            });
-            expect(rendered.container.querySelector('.toolbar')?.classList.contains('is-wrapped'))
-                .toBe(false);
-
-            rendered.rerender({
-                transform_pending: true,
-                transform_progress: 'Short',
-                show_formatting_button: false,
-                show_vertical_tabs_button: true,
-            });
-            expect(get_action_labels(rendered.container))
-                .toEqual(['Vertical Tabs', '|', 'Columns', 'Auto-fit Columns']);
-            expect(rendered.container.querySelector('.toolbar')?.classList.contains('is-wrapped'))
-                .toBe(true);
-        } finally {
-            if (scroll_width) {
-                Object.defineProperty(HTMLElement.prototype, 'scrollWidth', scroll_width);
-            } else {
-                Reflect.deleteProperty(HTMLElement.prototype, 'scrollWidth');
-            }
-            if (client_width) {
-                Object.defineProperty(HTMLElement.prototype, 'clientWidth', client_width);
-            } else {
-                Reflect.deleteProperty(HTMLElement.prototype, 'clientWidth');
-            }
-        }
-    });
-
-    it('keeps Highlight on the first toolbar row when sort and filter chips wrap', () => {
-        const scroll_width = Object.getOwnPropertyDescriptor(
-            HTMLElement.prototype,
-            'scrollWidth',
-        );
-        const client_width = Object.getOwnPropertyDescriptor(
-            HTMLElement.prototype,
-            'clientWidth',
-        );
-        Object.defineProperty(HTMLElement.prototype, 'scrollWidth', {
-            configurable: true,
-            get(this: HTMLElement) {
-                if (this.classList.contains('sort-strip')) return 210;
-                if (this.classList.contains('filter-strip')) return 240;
-                if (this.classList.contains('toolbar-item')) return 90;
-                return 0;
-            },
-        });
-        Object.defineProperty(HTMLElement.prototype, 'clientWidth', {
-            configurable: true,
-            get(this: HTMLElement) {
-                return this.classList.contains('toolbar') ? 420 : 0;
-            },
-        });
-        const style = document.createElement('style');
-        style.textContent = readFileSync(
-            resolve(process.cwd(), 'src/webview/styles.css'),
-            'utf8',
-        );
-        document.head.appendChild(style);
-        try {
-            const { container } = render_toolbar({
-                transform: {
-                    sort: [{ colIndex: 0, direction: 'asc' }],
-                    filters: [{
-                        id: 'f', colIndex: 1, operator: 'contains', value: 'needle',
-                        caseSensitive: false, enabled: true,
-                    }],
-                },
-                highlight: {
-                    active_color: 'yellow',
-                    on_color_change: vi.fn(),
-                    on_apply: vi.fn(),
-                    on_clear: vi.fn(),
-                    on_clear_all: vi.fn(),
-                    selection_available: true,
-                    pending: false,
-                    status: '',
-                },
-            });
-            const toolbar = container.querySelector('.toolbar') as HTMLElement;
-            const chips = container.querySelector('.toolbar-chips') as HTMLElement;
-            const highlight = container.querySelector('.highlight-trigger') as HTMLElement;
-
-            expect(toolbar.classList.contains('is-wrapped')).toBe(true);
-            // Only .toolbar-chips is pushed onto the second row, so Highlight must
-            // live outside it to stay put when a sort or filter appears.
-            expect(getComputedStyle(chips).flexBasis).toBe('100%');
-            expect(chips.contains(highlight)).toBe(false);
-            expect(highlight.closest('.toolbar-lead')).not.toBeNull();
-            expect(getComputedStyle(
-                highlight.closest('.toolbar-lead') as HTMLElement,
-            ).flexBasis).not.toBe('100%');
-        } finally {
-            style.remove();
-            if (scroll_width) {
-                Object.defineProperty(HTMLElement.prototype, 'scrollWidth', scroll_width);
-            } else {
-                Reflect.deleteProperty(HTMLElement.prototype, 'scrollWidth');
-            }
-            if (client_width) {
-                Object.defineProperty(HTMLElement.prototype, 'clientWidth', client_width);
-            } else {
-                Reflect.deleteProperty(HTMLElement.prototype, 'clientWidth');
-            }
-        }
-    });
-
     it('repositions a visible tooltip when a captured ancestor scroll moves its button', () => {
         let button_left = 40;
         vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect')
@@ -1018,7 +625,7 @@ describe('Toolbar', () => {
             .mockImplementation(function (this: HTMLElement) {
                 if (
                     this instanceof HTMLButtonElement &&
-                    this.textContent === 'Vertical Tabs'
+                    this.textContent === 'Auto-fit Columns'
                 ) {
                     return make_rect({
                         left: 4,
@@ -1042,8 +649,8 @@ describe('Toolbar', () => {
 
         render_toolbar();
 
-        const vertical_tabs = get_button('Vertical Tabs');
-        dispatch_mouse_event(vertical_tabs, 'mouseover');
+        const auto_fit = get_button('Auto-fit Columns');
+        dispatch_mouse_event(auto_fit, 'mouseover');
 
         const tooltip = get_tooltip();
         expect(tooltip).not.toBeNull();

@@ -505,6 +505,15 @@ async function click_button(label: string) {
     });
 }
 
+/** The tab-orientation control, which lives on the sheet tab strip rather than the toolbar. */
+async function click_orientation_toggle() {
+    const button = document.querySelector<HTMLButtonElement>('.sheet-tabs-orientation');
+    expect(button).not.toBeNull();
+    await act(async () => {
+        button!.click();
+    });
+}
+
 function latest_transform_request(post_message: ReturnType<typeof vi.fn>) {
     const request = post_message.mock.calls
         .map((call) => call[0] as WebviewMessage)
@@ -1002,7 +1011,8 @@ describe('workbook snapshot hydration', () => {
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
         expect(JSON.parse(grid_stub().getAttribute('data-store-edits')!))
             .toEqual({ '0:0': { value: 'new', base: 'old' } });
-        expect(get_button('Vertical Tabs').getAttribute('aria-pressed')).toBe('true');
+        // Orientation now lives on the tab strip: the rail is what shows it applied.
+        expect(container!.querySelector('.sheet-tabs-vertical')).not.toBeNull();
         expect(post_message.mock.calls.map((call) => call[0])).toContainEqual({
             type: 'snapshotApplied',
             identity: message.snapshot.identity,
@@ -1014,7 +1024,7 @@ describe('workbook snapshot hydration', () => {
         const { post_message } = await render_app();
         const meta = make_meta(['First', 'Second']);
         await dispatch_host_message(workbook_snapshot_message(meta));
-        await click_button('Vertical Tabs');
+        await click_orientation_toggle();
         post_message.mockClear();
 
         const refresh = workbook_snapshot_message(meta, {
@@ -1040,7 +1050,8 @@ describe('workbook snapshot hydration', () => {
         await dispatch_host_message(refresh);
 
         expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
-        expect(get_button('Vertical Tabs').getAttribute('aria-pressed')).toBe('true');
+        // Orientation now lives on the tab strip: the rail is what shows it applied.
+        expect(container!.querySelector('.sheet-tabs-vertical')).not.toBeNull();
         await act(async () => {
             (container!.querySelector('.stub-resize') as HTMLButtonElement).click();
         });
@@ -2274,13 +2285,13 @@ describe('Excel first-row header toggle', () => {
 });
 
 describe('sheet tabs', () => {
-    it('hides tabs and the vertical-tabs button for a single sheet', async () => {
+    it('hides tabs and the orientation control for a single sheet', async () => {
+        // The control lives on the tab strip, so it is gone under exactly the
+        // condition the tabs are — it can never be a button with nothing to act on.
         await render_app();
         await dispatch_host_message(initial_snapshot_message(make_meta(['Only'])));
-        const vtab = Array.from(container!.querySelectorAll('button')).find(
-            (b) => b.textContent === 'Vertical Tabs'
-        );
-        expect(vtab).toBeUndefined();
+        expect(container!.querySelectorAll('.sheet-tab')).toHaveLength(0);
+        expect(container!.querySelector('.sheet-tabs-orientation')).toBeNull();
     });
 
     it('switches the active sheet and persists the selection', async () => {
@@ -2315,7 +2326,12 @@ describe('sheet tabs', () => {
         await dispatch_host_message(initial_snapshot_message(make_meta(['First', 'Second'])));
         right_click_tab('First');
         expect(Array.from(document.querySelectorAll('[role="menuitem"]'), (item) => item.textContent))
-            .toEqual(['Copy sheet', 'Select all']);
+            .toEqual([
+                'Copy sheet',
+                'Select all',
+                // An accelerator for the control on the strip, never its only route in.
+                'Move sheet tabs to the left of the table',
+            ]);
         await act(async () => get_button('Select all').click());
         expect(grid_shell_mock.select_all).toHaveBeenCalledOnce();
         expect(document.querySelector('[role="menu"]')).toBeNull();

@@ -56,6 +56,7 @@ import {
     type FilterHistogramStatus,
 } from './transform-ui-model';
 import { SheetTabs } from './sheet-tabs';
+import { StateStrip } from './state-strip';
 import { ContextMenu, type MenuItem } from './context-menu';
 import {
     pending_sheet_action_to_run,
@@ -476,7 +477,10 @@ export function App(): React.JSX.Element {
         origin: Exclude<TransformOrigin, 'restore'>;
     } | null>(null);
     const [sheet_context_menu, set_sheet_context_menu] = useState<{
-        sheet_index: number;
+        // Null for a right-click on the tab strip's own background rather than on a
+        // tab: the tab-orientation command applies to the strip, so it is offered
+        // there too, while the per-sheet actions have no sheet to act on.
+        sheet_index: number | null;
         x: number;
         y: number;
     } | null>(null);
@@ -2601,6 +2605,10 @@ export function App(): React.JSX.Element {
         set_sheet_context_menu({ sheet_index, x, y });
     }, []);
 
+    const handle_strip_context_menu = useCallback((x: number, y: number) => {
+        set_sheet_context_menu({ sheet_index: null, x, y });
+    }, []);
+
     const run_sheet_action = useCallback((
         sheet_index: number,
         action: SheetAction,
@@ -3727,19 +3735,36 @@ export function App(): React.JSX.Element {
     }
 
     const sheet_names = meta.sheets.map((s) => s.name);
-    const sheet_context_menu_items: MenuItem[] = sheet_context_menu
-        ? [
+    const has_multiple_sheets = meta.sheets.length > 1;
+    // The orientation command is offered on a tab and on empty strip space alike —
+    // as an accelerator for people who reach for right-click, never as the only
+    // route in. The button on the strip remains the discoverable one (#164).
+    const tab_orientation_item: MenuItem = {
+        label: vertical_tabs
+            ? 'Move sheet tabs above the table'
+            : 'Move sheet tabs to the left of the table',
+        on_click: () => {
+            set_sheet_context_menu(null);
+            handle_toggle_tab_orientation();
+        },
+    };
+    const menu_sheet_index = sheet_context_menu?.sheet_index ?? null;
+    const sheet_context_menu_items: MenuItem[] = !sheet_context_menu
+        ? []
+        : menu_sheet_index === null
+        ? [tab_orientation_item]
+        : [
             {
                 label: 'Copy sheet',
-                on_click: () => run_sheet_action(sheet_context_menu.sheet_index, 'copy_sheet'),
+                on_click: () => run_sheet_action(menu_sheet_index, 'copy_sheet'),
             },
             {
                 label: 'Select all',
-                on_click: () => run_sheet_action(sheet_context_menu.sheet_index, 'select_all'),
+                on_click: () => run_sheet_action(menu_sheet_index, 'select_all'),
             },
-        ]
-        : [];
-    const has_multiple_sheets = meta.sheets.length > 1;
+            { kind: 'separator' },
+            tab_orientation_item,
+        ];
     const effective_vertical_tabs = vertical_tabs && has_multiple_sheets;
     const current_transform = transforms[active_sheet_index] ?? EMPTY_TRANSFORM;
     // Synchronized preview panes are shown their rows in natural source order.
@@ -4061,10 +4086,12 @@ export function App(): React.JSX.Element {
         />
     );
 
-    return (
-        <div className={`viewer ${effective_vertical_tabs ? 'vertical-tabs' : ''}`}>
-            <Toolbar
-                ref={toolbar_focus_ref}
+    // Sort, filter, row hiding and the merge notice — worksheet state, so it sits
+    // with the worksheet's pane below the tabs rather than in the workbook chrome
+    // above them (#164). Renders nothing when the view is untransformed.
+    const sheet_pane = (
+        <div className="sheet-pane">
+            <StateStrip
                 transform={visible_transform}
                 transform_disabled={transform_ui_blocked}
                 transform_pending={transform_pending}
@@ -4076,6 +4103,8 @@ export function App(): React.JSX.Element {
                 }}
                 column_names={column_names}
                 merges_flattened={merges_flattened}
+                visible_row_count={effective_row_count}
+                source_row_count={current_sheet.rowCount}
                 on_transform_change={handle_toolbar_transform_change}
                 on_edit_filter={(entry, trigger) => {
                     const rect = trigger.getBoundingClientRect();
@@ -4083,10 +4112,22 @@ export function App(): React.JSX.Element {
                         entry.colIndex,
                         { left: rect.left, top: rect.bottom + 4 },
                         () => trigger.focus(),
+                        // Still 'toolbar': the origin discriminates a chip-opened
+                        // editor from a header-opened one, and the chips only
+                        // changed which row they live on.
                         'toolbar',
                     );
                 }}
                 on_cancel_transform={handle_cancel_transform}
+            />
+            {grid}
+        </div>
+    );
+
+    return (
+        <div className={`viewer ${effective_vertical_tabs ? 'vertical-tabs' : ''}`}>
+            <Toolbar
+                ref={toolbar_focus_ref}
                 show_formatting={show_formatting}
                 on_toggle_formatting={handle_toggle_formatting}
                 show_formatting_button={meta.hasFormatting}
@@ -4099,9 +4140,6 @@ export function App(): React.JSX.Element {
                 on_toggle_excel_header={handle_toggle_excel_header}
                 excel_header_disabled={excel_header_disabled}
                 excel_header_disabled_reason={excel_header_disabled_reason}
-                vertical_tabs={vertical_tabs}
-                on_toggle_tab_orientation={handle_toggle_tab_orientation}
-                show_vertical_tabs_button={has_multiple_sheets}
                 highlight={{
                     active_color: active_highlight_color,
                     on_color_change: set_active_highlight_color,
@@ -4263,6 +4301,12 @@ export function App(): React.JSX.Element {
                     </div>
                 </div>
             )}
+            {/*
+              * The tabs come first in both arrangements and the pane follows, so the
+              * state strip is always below them: vertically the rail runs the full
+              * height and the strip is a header on the grid pane, which is what makes
+              * it read as belonging to the selected sheet rather than to the window.
+              */}
             {effective_vertical_tabs ? (
                 <div className="content-area">
                     <SheetTabs
@@ -4270,9 +4314,11 @@ export function App(): React.JSX.Element {
                         active_sheet_index={active_sheet_index}
                         on_select={handle_sheet_select}
                         on_context_menu={handle_sheet_context_menu}
+                        on_strip_context_menu={handle_strip_context_menu}
+                        on_toggle_orientation={handle_toggle_tab_orientation}
                         vertical={true}
                     />
-                    {grid}
+                    {sheet_pane}
                 </div>
             ) : (
                 <>
@@ -4281,24 +4327,29 @@ export function App(): React.JSX.Element {
                         active_sheet_index={active_sheet_index}
                         on_select={handle_sheet_select}
                         on_context_menu={handle_sheet_context_menu}
+                        on_strip_context_menu={handle_strip_context_menu}
+                        on_toggle_orientation={handle_toggle_tab_orientation}
                         vertical={false}
                     />
-                    {grid}
+                    {sheet_pane}
                 </>
             )}
             {sheet_context_menu && (
                 <ContextMenu
                     x={sheet_context_menu.x}
                     y={sheet_context_menu.y}
-                    aria_label={`Sheet actions for ${
-                        sheet_names[sheet_context_menu.sheet_index]
-                        ?? `Sheet ${sheet_context_menu.sheet_index + 1}`
-                    }`}
+                    aria_label={menu_sheet_index === null
+                        ? 'Sheet tab actions'
+                        : `Sheet actions for ${
+                            sheet_names[menu_sheet_index]
+                            ?? `Sheet ${menu_sheet_index + 1}`
+                        }`}
                     items={sheet_context_menu_items}
                     on_dismiss={() => set_sheet_context_menu(null)}
                     restore_focus={() => {
+                        if (menu_sheet_index === null) return;
                         document.querySelectorAll<HTMLElement>('.sheet-tab')
-                            .item(sheet_context_menu.sheet_index)?.focus();
+                            .item(menu_sheet_index)?.focus();
                     }}
                 />
             )}
