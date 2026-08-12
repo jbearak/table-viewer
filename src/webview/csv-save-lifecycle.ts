@@ -126,6 +126,9 @@ export function save_operation_worksheet(
         worksheetId: worksheet_id,
     };
     return operation.worksheets.find((worksheet) => (
+        // Argument order is significant: the operation's captured identity is
+        // authoritative. A stable ID must not fall back to a reused name/index,
+        // while a legacy index-only operation may match richer current metadata.
         worksheet_target_matches(worksheet, target)
     ));
 }

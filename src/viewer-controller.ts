@@ -4359,11 +4359,14 @@ export function attach_viewer(
     }
 
     function clone_save_operation(input: CsvSaveOperationRequest): CsvSaveOperation {
-        const requested_worksheets: readonly CsvSaveWorksheetOperation[] = (
-            'worksheets' in input && Array.isArray(input.worksheets)
-        )
+        const is_workbook_request = 'worksheets' in input
+            && Array.isArray(input.worksheets);
+        const requested_worksheets: readonly (
+            | CsvSaveWorksheetOperation
+            | LegacyCsvSaveOperationRequest
+        )[] = is_workbook_request
             ? input.worksheets
-            : [input as LegacyCsvSaveOperationRequest];
+            : [input];
         const worksheets = requested_worksheets.map((worksheet) => {
             const dirty_edits = Object.fromEntries(
                 Object.entries(worksheet.dirtyEdits).map(([key, entry]) => [
@@ -4392,7 +4395,7 @@ export function attach_viewer(
             saveRequestId: input.saveRequestId,
             worksheets: Object.freeze(worksheets),
         };
-        if ('worksheets' in input && Array.isArray(input.worksheets)) {
+        if (is_workbook_request) {
             return Object.freeze(workbook_operation);
         }
         // Old renderers compare the flat fields they proposed and ignore unknown
@@ -4462,15 +4465,17 @@ export function attach_viewer(
         // the captured name resolve elsewhere — both are refusals, not saves into
         // whatever sheet now sits at the number.
         const live_sheet_count = source?.meta().sheets.length ?? 0;
-        const target_keys = new Set<string>();
+        const target_indices = identity.worksheets.map(
+            (worksheet) => worksheet.sheetIndex,
+        );
+        const has_duplicate_target = new Set(target_indices).size
+            !== target_indices.length;
         const wrong_sheet = identity.worksheets.length === 0
+            || has_duplicate_target
             || identity.worksheets.some((worksheet) => {
                 const missing_multisheet_identity = live_sheet_count > 1
                     && worksheet.worksheetId === undefined
                     && worksheet.sheetName === undefined;
-                const key = worksheet_target_key(worksheet);
-                if (target_keys.has(key)) return true;
-                target_keys.add(key);
                 return !Number.isSafeInteger(worksheet.sheetIndex)
                     || worksheet.sheetIndex < 0
                     || worksheet.sheetIndex >= live_sheet_count

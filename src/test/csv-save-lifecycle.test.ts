@@ -245,6 +245,22 @@ describe('CSV save lifecycle projection', () => {
         expect(csv_save_operations_equal(workbook, changed)).toBe(false);
     });
 
+    it('allows a legacy index-only operation to match richer current identity', () => {
+        const saved = operation('legacy');
+        const failed = {
+            authoritative: { revision: 6, state: 'failed', operation: saved } as const,
+        };
+
+        expect(hydrate(
+            failed,
+            saved.editSessionId,
+            undefined,
+            0,
+            'Data',
+            'worksheet-id',
+        )).toEqual(dirty_edits(saved));
+    });
+
     it('uses worksheet ID before name when hydrating a save', () => {
         const saved = operation('identified', 'edit-session', [
             worksheet('identified', 0, 'Data', 'old'),
@@ -273,46 +289,48 @@ describe('CSV save lifecycle projection', () => {
     });
 
     it('hydrates and tombstones each operation worksheet from its own payload', () => {
-        const people = operation('workbook', 'edit-session', [
+        const workbook = operation('workbook', 'edit-session', [
             worksheet('people', 0, 'People'),
             worksheet('inventory', 1, 'Inventory'),
         ]);
-        const inventory = { '0:0': { value: 'stock', base: 'old-stock' } };
+        const unrelated_pending = {
+            '0:0': { value: 'stock', base: 'old-stock' },
+        };
         const failed = {
-            authoritative: { revision: 7, state: 'failed', operation: people } as const,
+            authoritative: { revision: 7, state: 'failed', operation: workbook } as const,
         };
         const succeeded = {
-            authoritative: { revision: 8, state: 'succeeded', operation: people } as const,
+            authoritative: { revision: 8, state: 'succeeded', operation: workbook } as const,
         };
 
         expect(hydrate(
             failed,
-            people.editSessionId,
+            workbook.editSessionId,
             undefined,
             1,
             'Inventory',
-        )).toEqual(dirty_edits(people, 1));
+        )).toEqual(dirty_edits(workbook, 1));
         expect(hydrate(
             succeeded,
-            people.editSessionId,
-            dirty_edits(people, 1),
+            workbook.editSessionId,
+            dirty_edits(workbook, 1),
             1,
             'Inventory',
         )).toBeUndefined();
         expect(hydrate(
             failed,
-            people.editSessionId,
+            workbook.editSessionId,
             undefined,
             0,
             'People',
-        )).toEqual(dirty_edits(people));
+        )).toEqual(dirty_edits(workbook));
         expect(hydrate(
             failed,
-            people.editSessionId,
-            inventory,
+            workbook.editSessionId,
+            unrelated_pending,
             2,
             'Other',
-        )).toBe(inventory);
+        )).toBe(unrelated_pending);
     });
 
     it('keeps a retained local proposal ahead of a mismatched terminal', () => {
