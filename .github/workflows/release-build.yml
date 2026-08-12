@@ -464,12 +464,19 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Restore Electron download cache
+      - name: Restore Windows packaging download caches
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~/AppData/Local/electron/Cache
-          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('package-lock.json') }}
-          restore-keys: electron-${{ runner.os }}-${{ runner.arch }}-
+          path: |
+            ~/AppData/Local/electron/Cache
+            ~/AppData/Local/electron-builder/Cache
+          # This job downloads Electron for both target architectures. Keep its
+          # cache distinct from the host-architecture-only validation cache so
+          # an exact x64 hit cannot prevent the new arm64 entries from being saved.
+          key: electron-builder-${{ runner.os }}-x64-arm64-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            electron-builder-${{ runner.os }}-x64-arm64-
+            electron-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Package desktop app (unsigned)
         run: npm run desktop:package:win
