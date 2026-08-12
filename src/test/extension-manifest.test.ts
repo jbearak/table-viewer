@@ -64,7 +64,7 @@ describe('extension runtime manifest', () => {
             vscode: '^1.127.0',
         });
         expect(manifest.extensionKind).toEqual(['workspace']);
-        expect(manifest.devDependencies?.electron).toBe('43.2.0');
+        expect(manifest.devDependencies?.electron).toBe('43.4.0');
         expect(manifest.devDependencies?.['@types/node']).toBe('26.1.2');
     });
 
