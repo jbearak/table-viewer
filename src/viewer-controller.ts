@@ -2305,24 +2305,24 @@ export function attach_viewer(
             slots?: PerFileState['pendingEdits'];
         },
     ): SheetPendingEditCells | undefined {
-        const applicable = (operation: CsvSaveOperation) => operation.worksheets.filter(
-            (worksheet) => !scope
-                || operation_sheet_index(worksheet, scope.sheets, scope.slots)
-                    === scope.sheetIndex,
-        );
+        const applies = (worksheet: CsvSaveWorksheetOperation) => !scope
+            || operation_sheet_index(worksheet, scope.sheets, scope.slots)
+                === scope.sheetIndex;
         let projected = pending_edits;
         if (save_lifecycle.state !== 'idle') {
             if (
                 save_lifecycle.state !== 'succeeded'
                 && save_lifecycle.operation.editSessionId === active_edit_session_id
             ) return projected;
-            for (const worksheet of applicable(save_lifecycle.operation)) {
+            for (const worksheet of save_lifecycle.operation.worksheets) {
+                if (!applies(worksheet)) continue;
                 projected = strip_operation_owned_pending_edits(projected, worksheet);
             }
         }
         const tombstone = file_edit_state?.failedSaveTombstone;
         if (tombstone && tombstone.editSessionId !== active_edit_session_id) {
-            for (const worksheet of applicable(tombstone)) {
+            for (const worksheet of tombstone.worksheets) {
+                if (!applies(worksheet)) continue;
                 projected = strip_operation_owned_pending_edits(projected, worksheet);
             }
         }

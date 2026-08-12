@@ -1204,7 +1204,7 @@ export function GridShell({
         const source_column = source_column_for_display(display_column);
         if (source_column === undefined) return null;
         // The `key` is a durable edit key, so it must be fully source-keyed: the
-        // save collectors (collect_save_edits / collect_exact_dirty_edits) merge it
+        // save collectors (collect_save_payload) merge it
         // straight into the source-keyed dirty map, and a display-keyed LiveEdit
         // would poison them. Falls back to the identity captured when this overlay
         // opened, so an editor whose page left mid-edit still reaches the save

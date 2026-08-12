@@ -131,7 +131,7 @@ describe('edit session store', () => {
         // straight back to replace. A base_pending entry's `base` is the '' set at
         // normalize time, so clearing the flag here would promote that placeholder
         // to a real base: conflict detection would compare against '' and
-        // collect_exact_dirty_edits would admit the save instead of holding it.
+        // collect_save_payload would admit the save instead of holding it.
         const store = create_edit_session_store({ session_id: 's' }, { '1:0': 'D' });
         const pending = store.get('1:0');
         expect(pending).toEqual({ value: 'D', base: '', base_pending: true });

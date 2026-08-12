@@ -2231,7 +2231,7 @@ describe('GridShell source-row edit identity', () => {
     });
 
     it('folds an evicted overlay into the save under the key it opened with', async () => {
-        // The same drop on the read_live_edit path, which is what collect_save_edits
+        // The same drop on the read_live_edit path, which is what collect_save_payload
         // consumes: an overlay the user never closed before hitting Save.
         const editing_ref = React.createRef<EditingHandle | null>();
         grid_mock.source_row_for_display = (display_row: number) => (

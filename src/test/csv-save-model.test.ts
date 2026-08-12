@@ -1,71 +1,77 @@
 import { describe, it, expect } from 'vitest';
-import {
-    collect_exact_dirty_edits,
-    collect_save_edits,
-    collect_save_payload,
-} from '../webview/csv-save-model';
+import { collect_save_payload } from '../webview/csv-save-model';
 
 const dirty = (entries: Record<string, string>) =>
     new Map(Object.entries(entries).map(([k, v]) => [k, { value: v, base: '' }]));
 
-describe('collect_save_edits', () => {
-    it('maps committed dirty entries to their values', () => {
-        const out = collect_save_edits(dirty({ '0:0': 'A', '1:2': 'B' }), null);
-        expect(out).toEqual({ '0:0': 'A', '1:2': 'B' });
+describe('collect_save_payload', () => {
+    it('maps committed dirty entries to values and exact bases', () => {
+        const payload = collect_save_payload(dirty({ '0:0': 'A', '1:2': 'B' }), null);
+
+        expect(payload).toEqual({
+            status: 'ready',
+            edits: { '0:0': 'A', '1:2': 'B' },
+            dirtyEdits: {
+                '0:0': { value: 'A', base: '' },
+                '1:2': { value: 'B', base: '' },
+            },
+        });
     });
 
     it('is empty when nothing is dirty and no editor is open', () => {
-        expect(collect_save_edits(new Map(), null)).toEqual({});
+        expect(collect_save_payload(new Map(), null)).toEqual({
+            status: 'ready',
+            edits: {},
+            dirtyEdits: {},
+        });
     });
 
     it('folds an open editor whose value differs from the original', () => {
-        const out = collect_save_edits(dirty({ '0:0': 'A' }), {
+        const payload = collect_save_payload(dirty({ '0:0': 'A' }), {
             key: '2:3',
             value: 'live',
             original: 'orig',
         });
-        expect(out).toEqual({ '0:0': 'A', '2:3': 'live' });
-    });
-
-    it('overrides a committed value with the open editor live value', () => {
-        const out = collect_save_edits(dirty({ '0:0': 'old' }), {
-            key: '0:0',
-            value: 'newer',
-            original: 'orig',
-        });
-        expect(out).toEqual({ '0:0': 'newer' });
-    });
-
-    it('drops the key when the open editor value reverts to the original', () => {
-        // The cell is committed-dirty, but the user typed it back to its
-        // persisted value; that in-progress revert must not be saved.
-        const out = collect_save_edits(dirty({ '0:0': 'A' }), {
-            key: '0:0',
-            value: 'orig',
-            original: 'orig',
-        });
-        expect(out).toEqual({});
-    });
-});
-
-describe('collect_save_payload', () => {
-    it('assembles value and exact-base payloads together with live folding', () => {
-        const payload = collect_save_payload(new Map([
-            ['0:0', { value: 'committed', base: 'committed-base' }],
-            ['1:1', { value: 'reverted committed', base: 'overlay-base' }],
-        ]), {
-            key: '1:1',
-            value: 'overlay-base',
-            original: 'overlay-base',
-        });
 
         expect(payload).toEqual({
             status: 'ready',
-            edits: { '0:0': 'committed' },
+            edits: { '0:0': 'A', '2:3': 'live' },
             dirtyEdits: {
-                '0:0': { value: 'committed', base: 'committed-base' },
+                '0:0': { value: 'A', base: '' },
+                '2:3': { value: 'live', base: 'orig' },
             },
         });
+    });
+
+    it('overrides a committed value with the open editor live value', () => {
+        expect(collect_save_payload(dirty({ '0:0': 'old' }), {
+            key: '0:0',
+            value: 'newer',
+            original: 'orig',
+        })).toEqual({
+            status: 'ready',
+            edits: { '0:0': 'newer' },
+            dirtyEdits: { '0:0': { value: 'newer', base: 'orig' } },
+        });
+    });
+
+    it('drops the key when the open editor value reverts to the original', () => {
+        expect(collect_save_payload(dirty({ '0:0': 'A' }), {
+            key: '0:0',
+            value: 'orig',
+            original: 'orig',
+        })).toEqual({
+            status: 'ready',
+            edits: {},
+            dirtyEdits: {},
+        });
+    });
+
+    it('assembles immutable value and exact-base payloads together', () => {
+        const payload = collect_save_payload(new Map([
+            ['0:0', { value: 'committed', base: 'committed-base' }],
+        ]), null);
+
         expect(Object.isFrozen(payload)).toBe(true);
         if (payload.status !== 'ready') throw new Error('expected ready');
         expect(Object.isFrozen(payload.edits)).toBe(true);
@@ -81,28 +87,5 @@ describe('collect_save_payload', () => {
             status: 'blocked',
             reason: 'unresolvedBases',
         });
-    });
-});
-
-describe('collect_exact_dirty_edits', () => {
-    it('preserves committed bases and folds the open overlay with its exact base', () => {
-        const exact = collect_exact_dirty_edits(new Map([
-            ['0:0', { value: 'committed', base: 'committed-base' }],
-        ]), {
-            key: '1:2',
-            value: 'overlay',
-            original: 'overlay-base',
-        });
-
-        expect(exact).toEqual({
-            '0:0': { value: 'committed', base: 'committed-base' },
-            '1:2': { value: 'overlay', base: 'overlay-base' },
-        });
-    });
-
-    it('refuses acceptance while any conflict base is unresolved', () => {
-        expect(collect_exact_dirty_edits(new Map([
-            ['0:0', { value: 'draft', base: '', base_pending: true }],
-        ]), null)).toBeUndefined();
     });
 });

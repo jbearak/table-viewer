@@ -949,14 +949,11 @@ export function App(): React.JSX.Element {
         }
 
         const current_session_id = csv_edit_session_id_ref.current;
-        const operation_sheet_indices = (operation: CsvSaveOperation) => {
-            const sheet_index_for = worksheet_target_lookup(meta_ref.current?.sheets ?? []);
-            return operation.worksheets
-                .map(sheet_index_for)
-                .filter((index): index is number => index !== undefined);
-        };
         const hydrate_and_install = (operation: CsvSaveOperation) => {
-            for (const sheet_index of operation_sheet_indices(operation)) {
+            const sheet_index_for = worksheet_target_lookup(meta_ref.current?.sheets ?? []);
+            for (const worksheet of operation.worksheets) {
+                const sheet_index = sheet_index_for(worksheet);
+                if (sheet_index === undefined) continue;
                 const entries = edit_session_registry_ref.current!
                     .for_sheet(sheet_index).snapshot();
                 const hydrated = resolve_csv_save_hydration(

@@ -130,20 +130,6 @@ export function save_operation_worksheet(
     ));
 }
 
-export function save_operation_targets_sheet(
-    operation: CsvSaveOperation,
-    sheet_index: number,
-    sheet_name: string | undefined,
-    worksheet_id: string | undefined,
-): boolean {
-    return save_operation_worksheet(
-        operation,
-        sheet_index,
-        sheet_name,
-        worksheet_id,
-    ) !== undefined;
-}
-
 export function resolve_csv_save_hydration(
     projection: Pick<CsvSaveProjection, 'authoritative' | 'operation'>,
     edit_session_id: string | undefined,

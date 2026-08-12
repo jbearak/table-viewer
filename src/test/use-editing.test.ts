@@ -644,7 +644,7 @@ describe('hoisted store installs', () => {
         // already-resident rows nothing else would ever trigger the resolve, and
         // the entry would stay base_pending forever. That is not a cosmetic flag:
         // is_entry_conflicted short-circuits on base_pending (conflict detection
-        // silently off) and collect_exact_dirty_edits returns undefined, so the
+        // silently off) and collect_save_payload returns undefined, so the
         // save is refused with no way for the user to clear it.
         await render_store(undefined);
 
