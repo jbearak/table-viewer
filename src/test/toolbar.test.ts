@@ -910,6 +910,62 @@ describe('Toolbar scope menus', () => {
         expect(get_tooltip()).toBeNull();
     });
 
+    it('does not raise the tooltip after a menu item is clicked', async () => {
+        // ContextMenu restores focus to the chevron on activation, which is right for
+        // the keyboard and wrong for the mouse: the tooltip would appear over a
+        // control the user has just finished with.
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+        open_caret();
+
+        const first = document.querySelector<HTMLButtonElement>('[role="menuitem"]')!;
+        act(() => {
+            first.dispatchEvent(new MouseEvent('click', {
+                bubbles: true, cancelable: true, detail: 1,
+            }));
+        });
+        // The focus restore lands a tick later; the tooltip must not follow it.
+        await act(async () => {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+        });
+        expect(document.querySelector('[role="menu"]')).toBeNull();
+        expect(get_tooltip()).toBeNull();
+    });
+
+    it('shows the tooltip again once the pointer comes back', async () => {
+        // The suppression covers the interaction that just ended, not the control.
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+        open_caret();
+
+        const first = document.querySelector<HTMLButtonElement>('[role="menuitem"]')!;
+        act(() => {
+            first.dispatchEvent(new MouseEvent('click', {
+                bubbles: true, cancelable: true, detail: 1,
+            }));
+        });
+        await act(async () => {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+        });
+
+        dispatch_mouse_event(get_button('Auto-fit Columns'), 'mouseover');
+        expect(get_tooltip()).not.toBeNull();
+    });
+
+    it('keeps the tooltip for a keyboard activation, which restores focus visibly', () => {
+        // detail === 0 is a keyboard activation synthesised as a click; landing back
+        // on the chevron with its tooltip is the correct keyboard behaviour.
+        render_toolbar({ auto_fit_scope_menu: scope_menu() });
+        const caret = open_caret();
+
+        const first = document.querySelector<HTMLButtonElement>('[role="menuitem"]')!;
+        act(() => {
+            first.dispatchEvent(new MouseEvent('click', {
+                bubbles: true, cancelable: true, detail: 0,
+            }));
+        });
+        act(() => caret.focus());
+        expect(get_tooltip()).not.toBeNull();
+    });
+
     it('does not stack the tooltip on top of the menu it opened', () => {
         render_toolbar({ auto_fit_scope_menu: scope_menu() });
 

@@ -284,6 +284,17 @@ function ToolbarButton({
     const [is_hovered, set_is_hovered] = useState(false);
     const [is_focused, set_is_focused] = useState(false);
     const [tooltip_style, set_tooltip_style] = useState<React.CSSProperties>();
+    /*
+     * Set when a menu item was activated with the pointer.
+     *
+     * `ContextMenu` restores focus to the chevron after an activation, which is right
+     * for the keyboard — Enter on an item should land you back on the control you
+     * opened. But for a mouse click that restored focus is invisible to the user and
+     * would raise the tooltip over a control they have finished with. Cleared as soon
+     * as the pointer or the keyboard comes back, so the tooltip is only skipped for
+     * the interaction that just ended.
+     */
+    const [tooltip_suppressed, set_tooltip_suppressed] = useState(false);
     const scope_context = React.useContext(ScopeMenuContext);
     const tooltip_id = useId();
     const button_ref = useRef<HTMLButtonElement>(null);
@@ -294,7 +305,9 @@ function ToolbarButton({
     // Suppressed while *any* scope menu is open, not merely this button's: a tooltip
     // left hovering over one control would otherwise sit under the menu another just
     // opened, and clicking a caret does not reliably blur the previous one.
-    const show_tooltip = (is_hovered || is_focused) && !scope_context?.open;
+    const show_tooltip = (is_hovered || is_focused)
+        && !scope_context?.open
+        && !tooltip_suppressed;
     const native_disabled = disabled && !focusable_when_disabled;
 
     /*
@@ -338,8 +351,12 @@ function ToolbarButton({
     const menu_items: MenuItem[] = (scope_menu?.items ?? []).map((item) => ({
         label: item.label,
         disabled: item.disabled,
-        on_click: () => {
+        on_click: (event) => {
             close_menu();
+            // `detail` counts clicks: non-zero is a real press, zero is a keyboard
+            // activation synthesised as a click. The same idiom the button below uses
+            // to decide whether to blur itself.
+            if (event.detail > 0) set_tooltip_suppressed(true);
             item.on_click();
         },
     }));
@@ -388,10 +405,16 @@ function ToolbarButton({
             aria-label={native_disabled ? label : undefined}
             aria-disabled={native_disabled || undefined}
             aria-describedby={native_disabled && show_tooltip ? tooltip_id : undefined}
-            onMouseEnter={() => set_is_hovered(true)}
+            onMouseEnter={() => {
+                set_is_hovered(true);
+                set_tooltip_suppressed(false);
+            }}
             onMouseLeave={() => set_is_hovered(false)}
             onFocus={() => set_is_focused(true)}
-            onBlur={() => set_is_focused(false)}
+            onBlur={() => {
+                set_is_focused(false);
+                set_tooltip_suppressed(false);
+            }}
             // Right-click anywhere on the control opens the same menu as the chevron,
             // for people who reach for right-click before they look for an affordance.
             onContextMenu={scope_menu
