@@ -4103,8 +4103,6 @@ export function App(): React.JSX.Element {
                 }}
                 column_names={column_names}
                 merges_flattened={merges_flattened}
-                visible_row_count={effective_row_count}
-                source_row_count={current_sheet.rowCount}
                 on_transform_change={handle_toolbar_transform_change}
                 on_edit_filter={(entry, trigger) => {
                     const rect = trigger.getBoundingClientRect();

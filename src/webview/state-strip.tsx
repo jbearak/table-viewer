@@ -11,10 +11,6 @@ export interface StateStripProps {
     hidden_rows?: { count: number; pending: boolean; on_unhide_all: () => void };
     column_names: readonly string[];
     merges_flattened: boolean;
-    /** Rows the grid is showing, after sort, filters, and row hiding. */
-    visible_row_count: number;
-    /** Rows the worksheet holds. */
-    source_row_count: number;
     on_transform_change: (state: SheetTransformState) => void;
     on_edit_filter: (entry: FilterEntry, trigger: HTMLElement) => void;
     on_cancel_transform: () => void;
@@ -33,6 +29,11 @@ export interface StateStripProps {
  * - It renders nothing at all when the view is untransformed. A strip that could
  *   appear empty would be chrome the reader learns to skip, and it would cost every
  *   clean sheet a row of height for nothing.
+ *
+ * Deliberately no "N of M rows" readout. The room is there now, but the count was
+ * removed from the toolbar as ambiguous (6622eb7) and the ambiguity is a property of
+ * the number, not of where it was shown: with a promoted header row and hidden rows
+ * both in play, neither operand names something the reader can point at.
  */
 export function StateStrip(props: StateStripProps): React.JSX.Element | null {
     const {
@@ -51,10 +52,6 @@ export function StateStrip(props: StateStripProps): React.JSX.Element | null {
     if (!has_state) return null;
 
     const controls_disabled = !!(props.transform_disabled || props.transform_pending);
-    // Only when rows are actually missing. A sort alone changes the order and not the
-    // count, and "58,930 of 58,930 rows" would state a fact nobody asked about while
-    // reading, for a moment, like something had been filtered.
-    const show_row_count = props.visible_row_count < props.source_row_count;
 
     return (
         <div className="state-strip" role="group" aria-label="Active view state">
@@ -110,12 +107,6 @@ export function StateStrip(props: StateStripProps): React.JSX.Element | null {
                     title="Merged values remain only in their original top-left cells."
                 >
                     Merged cells shown unmerged; only top-left cells contain values
-                </span>
-            )}
-            {show_row_count && (
-                <span className="state-strip-count">
-                    {props.visible_row_count.toLocaleString()} of{' '}
-                    {props.source_row_count.toLocaleString()} rows
                 </span>
             )}
         </div>

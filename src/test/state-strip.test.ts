@@ -21,8 +21,6 @@ function render_strip(props?: Partial<React.ComponentProps<typeof StateStrip>>) 
         transform_pending: false,
         column_names: ['Name', 'Value'],
         merges_flattened: false,
-        visible_row_count: 100,
-        source_row_count: 100,
         on_transform_change: vi.fn(),
         on_edit_filter: vi.fn(),
         on_cancel_transform: vi.fn(),
@@ -139,6 +137,10 @@ describe('StateStrip', () => {
             on_cancel_transform,
         });
 
+        // The room the strip has is not an argument for putting the row count back:
+        // it was removed from the toolbar as ambiguous (6622eb7), and the ambiguity is
+        // in the number rather than in where it sat. This guard came with that removal.
+        expect(container.textContent).not.toMatch(/\d+ of \d+ rows/);
         expect(container.textContent).toContain('Hidden active');
         expect(container.textContent).toContain('Applying saved…');
         expect(container.textContent).toContain('Merged cells shown unmerged');
@@ -155,26 +157,6 @@ describe('StateStrip', () => {
             .toBe(false);
         expect(container.querySelector('.filter-chip-body')?.getAttribute('aria-disabled'))
             .toBe('true');
-    });
-
-    it('states the row count only when rows are actually missing', () => {
-        // A sort alone reorders without removing anything, and "100 of 100 rows" would
-        // read, for a moment, as though something had been filtered.
-        const { container, rerender } = render_strip({
-            transform: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
-            visible_row_count: 100,
-            source_row_count: 100,
-        });
-        expect(container.querySelector('.state-strip-count')).toBeNull();
-
-        rerender({
-            transform: { sort: [{ colIndex: 0, direction: 'asc' }], filters: [] },
-            visible_row_count: 1204,
-            source_row_count: 58930,
-        });
-        expect(container.querySelector('.state-strip-count')?.textContent).toBe(
-            `${(1204).toLocaleString()} of ${(58930).toLocaleString()} rows`,
-        );
     });
 
     it('names itself as the worksheet view state for assistive tech', () => {

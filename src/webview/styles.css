@@ -875,15 +875,6 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     max-width: 40ch;
 }
 
-.state-strip-count {
-    flex: 0 0 auto;
-    margin-left: auto;
-    color: var(--vscode-descriptionForeground, var(--vscode-foreground, #ccc));
-    font-size: var(--tv-font-size-sm);
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-}
-
 .toolbar-actions {
     display: flex;
     align-items: center;
