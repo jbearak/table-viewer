@@ -176,6 +176,7 @@ describe('VS Code state database open', () => {
         const openStore = vi.fn(async () => ({
             store: {} as never,
             persistence: {} as never,
+            maintenance: {} as never,
             close,
         }));
 

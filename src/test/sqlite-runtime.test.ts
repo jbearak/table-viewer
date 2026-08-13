@@ -772,3 +772,104 @@ describe('SQLite path-interned runtime', () => {
         database.close();
     });
 });
+
+describe('vacuum', () => {
+    /** Insert `count` padded rows, then delete them, leaving free pages behind. */
+    async function fill_then_empty(
+        runtime: SqliteRuntimeHandle,
+        count: number,
+    ): Promise<void> {
+        await runtime.write_transaction('seed', (tx) => {
+            const insert = tx.prepare(`INSERT INTO entries (
+                path, state_json, state_revision, has_pending_edits,
+                authority_commit_sequence, authority_revision, physical_revision,
+                projection_revision, recency_order, recovery_entry_id
+            ) VALUES (?, ?, 1, 0, 0, 0, 0, 0, ?, ?)`);
+            const padding = 'x'.repeat(3_000);
+            for (let index = 0; index < count; index++) {
+                insert.run(
+                    `/entry-${index}.csv`,
+                    JSON.stringify({ padding }),
+                    index + 1,
+                    `recovery-${index}`,
+                );
+            }
+        });
+        await runtime.write_transaction('empty', (tx) => {
+            tx.prepare('DELETE FROM entries').run();
+        });
+    }
+
+    it('shrinks the file that deleting alone left the same size', async () => {
+        const runtime = await openRuntime();
+        await fill_then_empty(runtime, 400);
+
+        // Deleting frees pages inside the file without returning them; this is
+        // the whole reason a trim has to vacuum.
+        const afterDelete = fs.statSync(databasePath()).size;
+        expect(await runtime.vacuum()).toBe('vacuumed');
+        expect(fs.statSync(databasePath()).size).toBeLessThan(afterDelete);
+    });
+
+    it('leaves the identity fences a reopen checks intact', async () => {
+        const runtime = await openRuntime();
+        await fill_then_empty(runtime, 50);
+        await runtime.vacuum();
+        await runtime.close();
+
+        // A rewrite that dropped application_id, user_version, or the delete
+        // journal mode would make the database unopenable — far worse than never
+        // reclaiming the space. Reopening runs the full validation path.
+        const reopened = await openRuntime();
+        expect(await reopened.read_transaction((tx) => (
+            tx.prepare('SELECT count(*) AS count FROM entries').get()?.count
+        ))).toBe(0n);
+    });
+
+    it('reports a locked file as deferred rather than throwing', async () => {
+        const runtime = await openRuntime();
+        await fill_then_empty(runtime, 50);
+
+        const intruder = new DatabaseSync(databasePath());
+        intruder.exec('PRAGMA busy_timeout = 0');
+        intruder.exec('BEGIN EXCLUSIVE');
+        try {
+            expect(await runtime.vacuum()).toBe('deferred');
+        } finally {
+            intruder.exec('ROLLBACK');
+            intruder.close();
+        }
+    });
+
+    it('reports a non-contention reclaim error as failed rather than throwing', async () => {
+        const runtime = await openRuntime();
+        await fill_then_empty(runtime, 50);
+
+        // The journal mode is delete, so VACUUM must create a rollback journal
+        // beside the database; a directory it cannot write to fails the rewrite
+        // for a reason that is not another holder's lock. The deletions above
+        // are already committed, so this must not reject.
+        fs.chmodSync(tempDirectory, 0o500);
+        try {
+            expect(await runtime.vacuum()).toBe('failed');
+        } finally {
+            fs.chmodSync(tempDirectory, 0o700);
+        }
+    });
+
+    it('still vacuums once the other holder lets go', async () => {
+        const runtime = await openRuntime();
+        await fill_then_empty(runtime, 400);
+        const afterDelete = fs.statSync(databasePath()).size;
+
+        const intruder = new DatabaseSync(databasePath());
+        intruder.exec('PRAGMA busy_timeout = 0');
+        intruder.exec('BEGIN EXCLUSIVE');
+        expect(await runtime.vacuum()).toBe('deferred');
+        intruder.exec('ROLLBACK');
+        intruder.close();
+
+        expect(await runtime.vacuum()).toBe('vacuumed');
+        expect(fs.statSync(databasePath()).size).toBeLessThan(afterDelete);
+    });
+});

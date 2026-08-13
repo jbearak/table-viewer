@@ -84,6 +84,7 @@ describe('extension runtime manifest', () => {
             'tableViewer.openCsvTable',
             'tableViewer.openAsText',
             'tableViewer.openWorkbookAtSheet',
+            'tableViewer.manageStoredFileState',
         ]);
         expect(manifest.contributes?.menus?.commandPalette).toContainEqual({
             command: 'tableViewer.openWorkbookAtSheet',

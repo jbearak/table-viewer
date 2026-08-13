@@ -183,7 +183,15 @@ export interface KeyedStateReadTransaction {
     read_entry(path: string): PersistedCompleteKeyedStateEntry | undefined;
     read_authority_stages(path: string): readonly PersistedAuthorityStageRecord[];
     scan_entry_metadata(): readonly PersistedKeyedStateEntryMetadata[];
-    entry_is_leased(path: string): boolean;
+    /**
+     * Leased by *this* session — not by any session.
+     *
+     * A lease from another session cannot be shown to mean anything: it outlives
+     * a process that did not close cleanly, and nothing reclaims it. Treating
+     * those as protective pinned entries in the store forever. See the eviction
+     * comment below, and the maintenance module for the same reasoning.
+     */
+    entry_is_leased_here(path: string): boolean;
 }
 
 export interface KeyedStateWriteTransaction extends KeyedStateReadTransaction {
@@ -586,7 +594,9 @@ export function create_keyed_file_state_persistence(
             scan_entry_metadata: () => ordered_paths().map((path) => (
                 metadata_from_entry(path, all.entries[path], order.get(path) ?? 0n)
             )),
-            entry_is_leased(path) {
+            // Already session-scoped by construction: this medium's leases live
+            // in a per-runtime map, so it has no way to see another session's.
+            entry_is_leased_here(path) {
                 for (const leasedPath of transactionLeases.values()) {
                     if (leasedPath === path) return true;
                 }
@@ -815,7 +825,7 @@ function evict_entries(
 ): boolean {
     const ordinary = tx.scan_entry_metadata().filter((entry) => (
         !protectedPaths.has(entry.path)
-        && !tx.entry_is_leased(entry.path)
+        && !tx.entry_is_leased_here(entry.path)
         && !entry.hasPendingEdits
         && entry.authorityStageCount === 0
     ));

@@ -58,6 +58,91 @@ the database path and the underlying cause, and suggesting the two things that
 help: close other windows using it, or move the file aside to start fresh.
 Nothing in that directory is modified, deleted, or set aside automatically.
 
+## Inspecting and trimming stored state
+
+Both products expose the contents of that database to the user: the desktop app
+under **Stored File State…** (in the app menu on macOS, the File menu elsewhere),
+and the extension as the **Table Viewer: Manage Stored File State** command. Both
+open the same interface — one entry per remembered file, with its size, when it
+was last used, and whether it has unsaved edits or is open right now — and both
+run the same code, `src/state-inspector/ui.ts`, bundled once per host.
+
+Entries are cleared by selection — the header checkbox selects everything the
+current filter shows — or by one of two rules: not opened in N days, or no longer
+on disk. There is deliberately no "clear everything" button: selecting all and
+clearing says the same thing while respecting the filter and showing the user
+every row they are about to act on.
+
+The word throughout the interface is *clear*, never *delete*, and a standing
+paragraph at the top of the window says that clearing never touches the file on
+disk. Both exist because "delete" next to a list of filenames reads as though it
+were the files that were going.
+
+Three rules apply to every route, and all of them live in
+`src/sqlite-file-state-maintenance.ts` rather than in the UI:
+
+- An entry this process has open, or one with a commit in flight, is never
+  cleared. No confirmation overrides that.
+
+  Note what is *not* in that rule. `entry_leases` has no foreign key to
+  `writer_sessions` — a lease deliberately outlives its session so it can keep
+  protecting an entry — and it is deleted only on a clean final close. Any
+  process that is killed instead leaves its leases behind forever, and nothing
+  reclaims them short of the coordination-generation bump in the recovery flow.
+  They accumulate: one real VS Code database had seventeen leases from seventeen
+  departed sessions across eight entries, nine of them on a single file.
+
+  So a lease from another session proves nothing. Honouring it would have made
+  those entries permanently unclearable, which is precisely what this window
+  exists to fix, and reporting it as "open" told users a file was open when
+  nothing was. Only this session's own leases count, because only those can be
+  shown to be live — there is no sound liveness test for another session's, and
+  this codebase refuses PID and heartbeat checks elsewhere for the same reason.
+  The cost is bounded: on the desktop a single-instance lock means a foreign
+  lease is always a leftover, and in VS Code, where sibling windows are real, the
+  worst case is clearing view state a live window would rewrite anyway. Unsaved
+  edits stay protected by their own gate, which is about the payload rather than
+  about who was holding the row.
+
+  **Automatic eviction follows the same rule.** `entry_is_leased_here` in
+  `src/state.ts` is deliberately named for what it asks, and `evict_entries` is
+  its only caller. Before, a lease left by a killed process pinned an entry
+  against the `maxStoredFiles` cap forever *and* made it unclearable by hand —
+  the store could grow past its own limit with rows nothing could reach. Manual
+  and automatic retention now agree on what a lease means, which is the property
+  worth keeping if either is ever changed again. The in-memory medium needed no
+  change: its leases live in a per-runtime map, so it never could see another
+  session's.
+- An entry with unsaved edits is deletable only when the caller names that exact
+  path as confirmed, which is what the second confirmation dialog collects. Since
+  the gate is decided by the resolved target set rather than by which button was
+  pressed, a bulk action cannot skip a warning a hand-picked one would show.
+- Lease, stage, and unsaved-edit status is re-read inside the deleting
+  transaction. A preview is a snapshot, and an entry that became busy in the
+  meantime is skipped and reported rather than destroyed.
+
+Deleting rows does not shrink the file: SQLite marks the freed pages reusable and
+keeps them. A trim that removed anything therefore ends with a `VACUUM`, which
+rewrites the file compactly. That needs an exclusive lock, so another process
+holding the database makes it report `deferred` — the rows are still gone, and
+the space returns with the next vacuum that gets the lock. `VACUUM` preserves
+`application_id`, `user_version`, and the delete journal mode, so the fences
+every open validates survive it; `src/test/sqlite-runtime.test.ts` covers that
+directly, because getting it wrong would cost far more than the reclaimed space.
+
+The listing marks an entry whose file is gone with a "Not on disk" badge, so the
+bulk rule acts on something the user can already see rather than on an invisible
+criterion. That check skips provider-backed keys: not every entry is keyed by a
+filesystem path — virtual providers and untitled buffers use synthetic
+`tableViewer.resource.v1:` keys (`src/resource-identity.ts`), which no `stat`
+could ever find, so testing them would report every one of them as missing and
+nominate it for clearing.
+
+Colour is spent where it means something. No toolbar button is styled
+destructive, because none of them clear anything on click — every one opens a
+confirmation first. Red is reserved for the second confirmation, the unsaved-edits
+step, which is the only action that cannot be undone.
+
 ## `scripts/setup.sh`
 
 A maintainer convenience script: it does a full local install of both front ends from a working tree, so you can use your own build the way an end user would. It is not part of CI or the release pipeline — releases go through the GitHub Actions workflows in `.github/workflows/`, kicked off by [`scripts/bump-version.sh`](#scriptsbump-versionsh).

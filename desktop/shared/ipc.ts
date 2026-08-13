@@ -45,3 +45,6 @@ export const CHANNEL_SETTINGS_CHANGED = 'settings:changed';
 export const CHANNEL_ABOUT_GET_INFO = 'about:getInfo';
 export const CHANNEL_ABOUT_OPEN_LINK = 'about:openLink';
 export const CHANNEL_ABOUT_OPEN_NOTICES = 'about:openNotices';
+
+/** Stored-file-state inspector window. One channel carries the whole protocol. */
+export const CHANNEL_STATE_INSPECTOR_REQUEST = 'stateInspector:request';

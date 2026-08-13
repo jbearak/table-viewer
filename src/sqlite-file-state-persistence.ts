@@ -27,6 +27,11 @@ import {
     create_sqlite_file_state_read_repository,
     create_sqlite_file_state_write_repository,
 } from './sqlite-file-state-repository';
+import {
+    create_sqlite_file_state_maintenance,
+    type StoredFileStateMaintenance,
+    type StoredFileStateMaintenancePorts,
+} from './sqlite-file-state-maintenance';
 
 export interface SqliteFileStatePersistenceOptions {
     readonly identity: SqliteFileStateIdentity;
@@ -45,6 +50,8 @@ export interface SqliteFileStatePersistenceOptions {
 export interface OpenedSqliteFileStateStore {
     readonly store: AuthorityFileStateStore;
     readonly persistence: KeyedFileStatePersistence;
+    /** Inspect and trim what the store has accumulated. Shares the store's connection. */
+    readonly maintenance: StoredFileStateMaintenance;
     close(): Promise<void>;
 }
 
@@ -100,10 +107,21 @@ export function create_sqlite_file_state_persistence_from_runtime(
  * Initialize without clobbering an existing database, then transfer the same
  * gated connection into the process-local runtime interned by canonical path.
  */
-export async function open_sqlite_file_state_persistence(
+/**
+ * Open the runtime and the persistence port over it.
+ *
+ * Kept separate from `open_sqlite_file_state_persistence` so the store opener can
+ * also reach the runtime handle. Maintenance has to share the very same handle:
+ * that shared serialized queue is what lets a trim run while viewer windows are
+ * open without any locking of its own.
+ */
+async function open_sqlite_file_state_runtime(
     databasePath: string,
     options: SqliteFileStatePersistenceOptions,
-): Promise<KeyedFileStatePersistence> {
+): Promise<{
+    readonly runtime: SqliteRuntimeHandle;
+    readonly persistence: KeyedFileStatePersistence;
+}> {
     try {
         await fs.promises.mkdir(path.dirname(path.resolve(databasePath)), {
             recursive: true,
@@ -139,10 +157,20 @@ export async function open_sqlite_file_state_persistence(
         randomId: options.randomId,
         hooks: options.hooks,
     });
-    return create_sqlite_file_state_persistence_from_runtime(runtime, {
-        now: options.now,
-        supportsRecoveryRecords: options.requiresPendingEditRecovery,
-    });
+    return {
+        runtime,
+        persistence: create_sqlite_file_state_persistence_from_runtime(runtime, {
+            now: options.now,
+            supportsRecoveryRecords: options.requiresPendingEditRecovery,
+        }),
+    };
+}
+
+export async function open_sqlite_file_state_persistence(
+    databasePath: string,
+    options: SqliteFileStatePersistenceOptions,
+): Promise<KeyedFileStatePersistence> {
+    return (await open_sqlite_file_state_runtime(databasePath, options)).persistence;
 }
 
 export async function recover_stale_sqlite_coordination(
@@ -198,12 +226,17 @@ export async function open_sqlite_file_state_store(
     databasePath: string,
     options: SqliteFileStatePersistenceOptions,
     getMaxStoredFiles?: () => number,
+    maintenancePorts?: StoredFileStateMaintenancePorts,
 ): Promise<OpenedSqliteFileStateStore> {
-    const persistence = await open_sqlite_file_state_persistence(databasePath, options);
+    const { runtime, persistence } = await open_sqlite_file_state_runtime(databasePath, options);
     const store = create_keyed_authority_store(persistence, getMaxStoredFiles);
     return {
         store,
         persistence,
+        maintenance: create_sqlite_file_state_maintenance(runtime, {
+            now: options.now,
+            ...maintenancePorts,
+        }),
         close: () => persistence.close(),
     };
 }

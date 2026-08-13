@@ -357,9 +357,20 @@ export class SqliteFileStateRepository implements KeyedStateWriteTransaction {
             .map((row) => metadata_from_row(this.#tx, row));
     }
 
-    entry_is_leased(path: string): boolean {
+    /**
+     * Whether this session holds a lease on the entry.
+     *
+     * Deliberately not "whether any session does". `entry_leases` has no foreign
+     * key to `writer_sessions` so a lease can protect an entry across a session's
+     * removal, and it is deleted only on a clean final close — so a process that
+     * is killed leaves its leases behind with nothing to reclaim them. Counting
+     * those made an entry immortal: never evicted, never clearable. Real
+     * databases accumulate them by the dozen.
+     */
+    entry_is_leased_here(path: string): boolean {
         return this.#tx.prepare(`SELECT 1 AS present FROM entry_leases
-            WHERE current_entry_path = ? LIMIT 1`).get(path) !== undefined;
+            WHERE current_entry_path = ? AND writer_session_id = ?
+            LIMIT 1`).get(path, this.#writerSessionId) !== undefined;
     }
 
     allocate_revision(): number {
@@ -666,7 +677,7 @@ export function create_sqlite_file_state_read_repository(
         read_entry: (path) => repository.read_entry(path),
         read_authority_stages: (path) => repository.read_authority_stages(path),
         scan_entry_metadata: () => repository.scan_entry_metadata(),
-        entry_is_leased: (path) => repository.entry_is_leased(path),
+        entry_is_leased_here: (path) => repository.entry_is_leased_here(path),
     };
 }
 
@@ -681,7 +692,7 @@ export function create_sqlite_file_state_write_repository(
         read_entry: (path) => repository.read_entry(path),
         read_authority_stages: (path) => repository.read_authority_stages(path),
         scan_entry_metadata: () => repository.scan_entry_metadata(),
-        entry_is_leased: (path) => repository.entry_is_leased(path),
+        entry_is_leased_here: (path) => repository.entry_is_leased_here(path),
         allocate_revision: () => repository.allocate_revision(),
         allocate_recency_order: () => repository.allocate_recency_order(),
         set_absence_revision: (revision) => repository.set_absence_revision(revision),
@@ -696,4 +707,65 @@ export function create_sqlite_file_state_write_repository(
         move_leases: (sourcePaths, destinationPath) => repository.move_leases(sourcePaths, destinationPath),
         delete_lease: (leaseId) => repository.delete_lease(leaseId),
     };
+}
+
+/** One `entries` row as the maintenance inspector sees it. */
+export interface SqliteFileStateInspectionRow {
+    readonly path: string;
+    /** Bytes of stored state, as SQLite measures the payload itself. */
+    readonly sizeBytes: number;
+    readonly hasPendingEdits: boolean;
+    /** A lease belonging to the caller's own session, so it is certainly live. */
+    readonly isLeasedHere: boolean;
+    readonly hasAuthorityStages: boolean;
+    readonly updatedAtMs?: number;
+    readonly touchedAtMs?: number;
+}
+
+/**
+ * Scan every entry for the maintenance inspector.
+ *
+ * This deliberately does not go through `scan_entry_metadata`, and deliberately
+ * does not decode `state_json`. The repository's usual discipline is to parse
+ * and re-validate every row it hands out, because those rows flow back into the
+ * write path where a malformed payload would corrupt real state. Nothing here
+ * does: the caller receives a size SQLite computed and a handful of flags, and
+ * a row it cannot decode is exactly a row worth showing the user so they can
+ * delete it. Parsing here would turn "you have one unreadable entry" into "your
+ * whole inspector throws", which is the opposite of what this feature is for.
+ *
+ * Size is `length(CAST(... AS BLOB))` rather than `length(...)`: on a TEXT
+ * column the latter counts characters, so any non-ASCII payload would be
+ * reported smaller than the bytes it actually occupies.
+ */
+export function scan_sqlite_file_state_inspection(
+    tx: SqliteReadTransactionContext,
+    writerSessionId: string,
+): readonly SqliteFileStateInspectionRow[] {
+    // Two lease questions, not one. Any lease protects the row from being
+    // cleared — that is what a safety lease is for, and it holds even when the
+    // session that took it is gone. But only a lease belonging to *this* session
+    // proves a window has the file open right now, because a lease outlives a
+    // process that did not close cleanly and there is no sound way to test
+    // another session's liveness from here (this codebase deliberately refuses
+    // PID and heartbeat checks elsewhere for the same reason).
+    return tx.prepare(`SELECT e.path, e.has_pending_edits, e.updated_at_ms, e.touched_at_ms,
+        length(CAST(e.state_json AS BLOB)) AS size_bytes,
+        EXISTS(SELECT 1 FROM entry_leases l WHERE l.current_entry_path = e.path
+            AND l.writer_session_id = ?) AS is_leased_here,
+        EXISTS(SELECT 1 FROM authority_stages s WHERE s.entry_path = e.path) AS has_stages
+        FROM entries e ORDER BY e.path`).all(writerSessionId)
+        .map((row) => {
+            const updatedAtMs = optional_integer(tx, row.updated_at_ms, 'updated at');
+            const touchedAtMs = optional_integer(tx, row.touched_at_ms, 'touched at');
+            return {
+                path: text(row.path),
+                sizeBytes: integer(tx, row.size_bytes, 'entry size', 0, Number.MAX_SAFE_INTEGER),
+                hasPendingEdits: integer(tx, row.has_pending_edits, 'pending flag', 0, 1) === 1,
+                isLeasedHere: integer(tx, row.is_leased_here, 'own lease flag', 0, 1) === 1,
+                hasAuthorityStages: integer(tx, row.has_stages, 'stage flag', 0, 1) === 1,
+                ...(updatedAtMs === undefined ? {} : { updatedAtMs }),
+                ...(touchedAtMs === undefined ? {} : { touchedAtMs }),
+            };
+        });
 }

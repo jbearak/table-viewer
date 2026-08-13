@@ -3,6 +3,7 @@ import {
     open_sqlite_file_state_store,
     type SqliteFileStatePersistenceOptions,
 } from './sqlite-file-state-persistence';
+import type { StoredFileStateMaintenance } from './sqlite-file-state-maintenance';
 import type { SqliteDirectVscodeFileStateIdentity } from './sqlite-file-state-schema';
 import type { AuthorityFileStateStore } from './state';
 
@@ -46,6 +47,8 @@ export interface VscodeStateDatabaseOptions {
 export interface OpenedVscodeStateDatabase {
     readonly databasePath: string;
     readonly store: AuthorityFileStateStore;
+    /** Backs the "Manage Stored File State" command. */
+    readonly maintenance: StoredFileStateMaintenance;
     close(): Promise<void>;
 }
 
@@ -124,6 +127,7 @@ export async function open_vscode_state_database(
     return {
         databasePath,
         store: opened.store,
+        maintenance: opened.maintenance,
         close() {
             closePromise ??= opened.close();
             return closePromise;
