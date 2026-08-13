@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { REPOSITORY_URL } from '../main/about-links';
 import {
     app_update_failure_dialog,
     classify_app_update_failure,
@@ -50,9 +51,15 @@ describe('desktop app update failures', () => {
     });
 
     it('recognizes only a missing Table Viewer GitHub release download', () => {
-        const missing = 'Cannot download "https://github.com/jbearak/table-viewer/releases/download/v2.0.0/table-viewer-2.0.0-arm64.zip", status 404: Not Found';
-        expect(classify_app_update_failure('download', new Error(missing), true).kind)
-            .toBe('release-artifact-missing');
+        for (const status of [404, 410]) {
+            const missing = `Cannot download "${REPOSITORY_URL}/releases/download/v2.0.0/table-viewer-2.0.0-arm64.zip", status ${status}: Not Found`;
+            expect(classify_app_update_failure(
+                'download',
+                { code: 'ERR_UPDATER_DOWNLOAD', message: missing },
+                true,
+            ).kind).toBe('release-artifact-missing');
+        }
+        const missing = `Cannot download "${REPOSITORY_URL}/releases/download/v2.0.0/table-viewer-2.0.0-arm64.zip", status 404: Not Found`;
         expect(classify_app_update_failure('check', new Error(missing), true).kind)
             .toBe('unknown');
         expect(classify_app_update_failure(

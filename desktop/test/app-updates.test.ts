@@ -92,6 +92,19 @@ describe('desktop app updates', () => {
         });
     });
 
+    it('still reports a failure when the online-status port throws', () => {
+        const value = fixture();
+        vi.mocked(value.engine.is_online).mockImplementation(() => {
+            throw new Error('network status unavailable');
+        });
+        value.updates.check_manually();
+        value.listeners.error({ code: 'ERR_UPDATER_CHANNEL_FILE_NOT_FOUND' });
+        expect(value.dialogs.show_failure).toHaveBeenCalledWith({
+            phase: 'check',
+            kind: 'release-metadata-missing',
+        });
+    });
+
     it('contains a rejected failure dialog and allows another check', async () => {
         const value = fixture();
         vi.mocked(value.dialogs.show_failure).mockRejectedValueOnce(new Error('dialog failed'));
@@ -131,6 +144,17 @@ describe('desktop app updates', () => {
         expect(value.dialogs.show_up_to_date).toHaveBeenCalledOnce();
     });
 
+    it('coalesces a manual check silently while the download offer is open', () => {
+        const value = fixture();
+        const offer = deferred<boolean>();
+        vi.mocked(value.dialogs.offer_download).mockReturnValue(offer.promise);
+        value.updates.check_manually();
+        value.listeners.available({ version: '2.0.0' });
+        value.updates.check_manually();
+        expect(value.dialogs.show_download_in_progress).not.toHaveBeenCalled();
+        expect(value.engine.check_for_updates).toHaveBeenCalledOnce();
+    });
+
     it('reports that a download is already in progress without relabeling a later failure', async () => {
         const value = fixture();
         vi.mocked(value.dialogs.offer_download).mockResolvedValue(true);
@@ -157,7 +181,9 @@ describe('desktop app updates', () => {
         expect(value.dialogs.offer_download).toHaveBeenCalledWith('2.0.0', false);
         updates.check_manually();
         expect(value.dialogs.show_download_in_progress).not.toHaveBeenCalled();
-        await vi.waitFor(() => expect(value.engine.download_update).not.toHaveBeenCalled());
+        await vi.waitFor(() => expect(value.dialogs.offer_download).toHaveBeenCalledOnce());
+        await Promise.resolve();
+        expect(value.engine.download_update).not.toHaveBeenCalled();
         expect(value.engine.quit_and_install).not.toHaveBeenCalled();
         expect(value.request_quit).not.toHaveBeenCalled();
     });

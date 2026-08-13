@@ -133,7 +133,7 @@ export function create_app_update_coordinator(
             return;
         }
         if (offering_download || downloading) {
-            if (source === 'manual' && (downloading || policy.install_updates)) {
+            if (source === 'manual' && downloading) {
                 void dialogs.show_download_in_progress().catch(() => {});
             }
             return;

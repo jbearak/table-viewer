@@ -1,3 +1,5 @@
+import { REPOSITORY_URL } from './about-links';
+
 export type AppUpdateFailurePhase = 'check' | 'download';
 
 export type AppUpdateFailureKind =
@@ -24,6 +26,7 @@ export interface AppUpdateFailureDialog {
 }
 
 const MAX_DIAGNOSTIC_LENGTH = 16_384;
+const REPOSITORY_RELEASE_DOWNLOAD_URL = `${REPOSITORY_URL}/releases/download/`;
 
 const MISSING_METADATA_CODES = new Set([
     'ERR_UPDATER_CHANNEL_FILE_NOT_FOUND',
@@ -126,8 +129,11 @@ function http_status_from_code(code: string | undefined): number | undefined {
 
 function is_missing_github_artifact(phase: AppUpdateFailurePhase, text: string): boolean {
     if (phase !== 'download') return false;
-    return /Cannot download "https:\/\/github\.com\/jbearak\/table-viewer\/releases\/download\/[^"\s]+", status (?:404|410):/i
-        .test(text);
+    const prefix = `Cannot download "${REPOSITORY_RELEASE_DOWNLOAD_URL}`;
+    const start = text.indexOf(prefix);
+    if (start < 0) return false;
+    const suffix = text.slice(start + prefix.length);
+    return /^[^"\s]+", status (?:404|410):/i.test(suffix);
 }
 
 function has_service_http_status(text: string): boolean {
