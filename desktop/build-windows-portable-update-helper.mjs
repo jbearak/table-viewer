@@ -37,7 +37,12 @@ function run_checked(run, executable, args, cwd) {
 }
 
 export function is_direct_entry(argv1, module_url, realpath = realpathSync) {
-    return Boolean(argv1) && realpath(fileURLToPath(module_url)) === realpath(argv1);
+    if (!argv1) return false;
+    try {
+        return realpath(fileURLToPath(module_url)) === realpath(argv1);
+    } catch {
+        return false;
+    }
 }
 
 if (is_direct_entry(process.argv[1], import.meta.url)) {
