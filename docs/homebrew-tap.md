@@ -120,12 +120,10 @@ carried a dmg would have meant a red tap CI pointing at a 404.
    `test` check on `main`, so a bump PR can't merge red. Do this after step 2:
    the check has to have run once before it can be selected as required.
 
-   This step is also what makes auto-merge meaningful. `gh pr merge --auto`
-   errors on a PR that is *already* mergeable, so with no required check the
-   bump PR just sits there and the workflow logs a warning. With the check
-   required, the PR merges by itself once CI is green. (Auto-merge and
-   delete-branch-on-merge are already enabled on the tap repo; auto-merge is off
-   by default and `--auto` fails outright without it.)
+   Release CI independently waits for the tap's exact `tests / test` check and
+   merges only after it succeeds, so the initial unprotected interval is safe.
+   Requiring the check remains useful defense in depth for human-created PRs
+   and any future automation that does not implement that explicit wait.
 
 The token can ship arbitrary cask Ruby to anyone installing from the tap, so
 set an expiration and keep it in the `release` environment. Any protection rule
