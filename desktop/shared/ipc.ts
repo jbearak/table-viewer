@@ -45,12 +45,6 @@ export const CHANNEL_TITLEBAR_ZOOM_CHANGED = 'tableViewer:titlebarZoomChanged';
 export const CHANNEL_TITLEBAR_ACTIVE = 'tableViewer:titlebarActive';
 /** Main → one window: it just became active, or stopped being. */
 export const CHANNEL_TITLEBAR_ACTIVE_CHANGED = 'tableViewer:titlebarActiveChanged';
-/** A drag over the title text: main moves the window. The text is not
- *  a drag region, because a drag region would swallow the path-menu gestures. */
-export const CHANNEL_TITLEBAR_DRAG = 'tableViewer:titlebarDrag';
-/** A double-click on the title text: zoom the window, as double-clicking
- *  any other part of the title bar does. */
-export const CHANNEL_TITLEBAR_ZOOM_WINDOW = 'tableViewer:titlebarZoomWindow';
 
 /** Welcome (launcher) window channels. */
 export const CHANNEL_WELCOME_OPEN_FILES = 'welcome:openFiles';

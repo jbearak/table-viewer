@@ -96,12 +96,6 @@ export interface TitlebarWindowApi {
      *  later changes. */
     titlebar_zoom(): number;
     on_titlebar_zoom(listener: (zoom: number) => void): void;
-    /** A drag over the title text, which main turns into a window move (the
-     *  text cannot be a drag region — see `TitlebarOptions.on_drag`). */
-    drag_titlebar(phase: 'start' | 'move', x: number, y: number): void;
-    /** Double-click on the title zooms the window, like a double-click
-     *  anywhere else on a title bar. */
-    zoom_titlebar_window(): void;
 }
 
 /**
@@ -124,8 +118,6 @@ export function install_titlebar_from_api(
         inset: api.titlebar_inset,
         zoom: api.titlebar_zoom(),
         active: api.titlebar_active(),
-        on_drag: (phase, x, y) => api.drag_titlebar(phase, x, y),
-        on_zoom_window: () => api.zoom_titlebar_window(),
         style,
     });
     api.on_titlebar_zoom((zoom) => set_titlebar_zoom(doc, zoom));
@@ -154,20 +146,6 @@ export interface TitlebarOptions {
     /** The ancestor-path menu AppKit's proxy icon would have opened. Only a
      *  window representing a file has one, so this is optional. */
     on_path_menu?: () => void;
-    /**
-     * Move the window, in response to a drag over the title text.
-     *
-     * The text cannot be a drag region: a drag region swallows the mouse before
-     * the page sees it, which is what the path-menu gestures need. So the strip
-     * reports the drag and the main process moves the window — `phase: 'start'`
-     * anchors it against the window's current bounds, and `'move'` carries the
-     * latest pointer screen position in CSS pixels, coalesced to one update per
-     * animation frame so main is not flooded while the window is moving.
-     */
-    on_drag?: (phase: 'start' | 'move', x: number, y: number) => void;
-    /** Zoom the window, for a double-click on the title — the other thing macOS
-     *  does with a title bar, and the title text is part of the title bar. */
-    on_zoom_window?: () => void;
 }
 
 /** What `set_titlebar_zoom` needs to re-derive the metrics on a zoom change. */
@@ -212,95 +190,40 @@ export function install_titlebar(doc: Document, options: TitlebarOptions): void 
         'z-index': '2147483647',
         // A drag across the strip would otherwise select the title text.
         '-webkit-user-select': 'none',
-        '-webkit-app-region': 'drag',
     };
     for (const [property, value] of Object.entries(properties)) {
         bar.style.setProperty(property, value);
     }
 
+    // A separate full-size drag layer lets the visible title remain an ordinary
+    // DOM target for Cmd/right-click. This is the same structure VS Code uses.
+    const drag_region = doc.createElement('div');
+    Object.assign(drag_region.style, {
+        position: 'absolute',
+        inset: '0',
+    });
+    drag_region.style.setProperty('-webkit-app-region', 'drag');
+    drag_region.dataset.appRegion = 'drag'; // jsdom drops the non-standard CSS property.
+    bar.prepend(drag_region);
+
     const label = doc.createElement('span');
     label.textContent = options.title;
-    if (options.on_zoom_window) {
-        const zoom_window = options.on_zoom_window;
-        label.addEventListener('dblclick', () => zoom_window());
-    }
-    if (options.on_path_menu || options.on_drag || options.on_zoom_window) {
-        // Opting out of the drag region is what lets the label see the mouse at
-        // all; `on_drag` and `on_zoom_window` are then what keep the title bar's
-        // own gestures — drag to move, double-click to zoom — working over it.
-        label.style.setProperty('-webkit-app-region', 'no-drag');
-    }
+    label.style.setProperty('position', 'relative');
+    label.style.setProperty('z-index', '1');
     if (options.on_path_menu) {
         const open_path_menu = options.on_path_menu;
-        // AppKit opens the proxy icon's path menu on either gesture; match both.
-        label.addEventListener('click', (event) => {
-            if (event.metaKey) open_path_menu();
-        });
+        // macOS still delivers context-menu events above this sibling drag layer,
+        // while AppKit handles ordinary drag and double-click gestures natively.
+        label.addEventListener('mousedown', (event) => {
+            if (event.button !== 0 || !event.metaKey) return;
+            event.preventDefault();
+            event.stopPropagation();
+            open_path_menu();
+        }, true);
         label.addEventListener('contextmenu', (event) => {
             event.preventDefault(); // The page's own menu must not also open.
             open_path_menu();
         });
-    }
-    if (options.on_drag) {
-        const on_drag = options.on_drag;
-        const view = doc.defaultView;
-        let active_pointer: number | undefined;
-        let pending_move: { x: number; y: number } | undefined;
-        let move_frame: number | undefined;
-
-        const flush_move = () => {
-            if (!pending_move) return;
-            const { x, y } = pending_move;
-            pending_move = undefined;
-            on_drag('move', x, y);
-        };
-        const cancel_move_frame = () => {
-            if (move_frame === undefined) return;
-            view?.cancelAnimationFrame?.(move_frame);
-            move_frame = undefined;
-        };
-        const finish_drag = (event: PointerEvent, release_capture: boolean) => {
-            if (event.pointerId !== active_pointer) return;
-            cancel_move_frame();
-            active_pointer = undefined;
-            flush_move();
-            if (release_capture && label.hasPointerCapture(event.pointerId)) {
-                label.releasePointerCapture(event.pointerId);
-            }
-        };
-
-        label.addEventListener('pointerdown', (event) => {
-            // Left button only, never the Cmd-click that opens the path menu, and
-            // never a second pointer while the first drag is still active.
-            if (event.button !== 0 || event.metaKey || active_pointer !== undefined) return;
-            event.preventDefault();
-            // Captured so the drag survives the pointer leaving the window —
-            // which it does immediately, since the window moves with it.
-            label.setPointerCapture(event.pointerId);
-            active_pointer = event.pointerId;
-            // The anchor must be recorded before any move, so start is synchronous.
-            on_drag('start', event.screenX, event.screenY);
-        });
-        label.addEventListener('pointermove', (event) => {
-            if (event.pointerId !== active_pointer) return;
-            pending_move = { x: event.screenX, y: event.screenY };
-            if (move_frame !== undefined) return;
-
-            // Moving a BrowserWindow can make pointer events arrive much faster
-            // than main can apply them. Keep only the latest position per frame.
-            if (view?.requestAnimationFrame) {
-                move_frame = view.requestAnimationFrame(() => {
-                    move_frame = undefined;
-                    flush_move();
-                });
-            } else {
-                // Non-visual DOMs and older embedders may have no frame scheduler.
-                flush_move();
-            }
-        });
-        label.addEventListener('pointerup', (event) => finish_drag(event, true));
-        label.addEventListener('pointercancel', (event) => finish_drag(event, true));
-        label.addEventListener('lostpointercapture', (event) => finish_drag(event, false));
     }
     bar.append(label);
 
