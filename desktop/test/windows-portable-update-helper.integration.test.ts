@@ -99,6 +99,10 @@ async function poll_json(
 }
 
 function wait_for_exit(child: ReturnType<typeof spawn>, expected_code: number): Promise<void> {
+    if (child.exitCode !== null) {
+        if (child.exitCode === expected_code) return Promise.resolve();
+        return Promise.reject(new Error(`Native helper exited with code ${child.exitCode}`));
+    }
     return new Promise((resolve_exit, reject) => {
         const timeout = setTimeout(() => {
             child.kill();
