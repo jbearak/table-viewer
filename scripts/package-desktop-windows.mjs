@@ -6,10 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import yaml from 'js-yaml';
 import { validate_update_metadata } from './validate-update-metadata.mjs';
-import {
-    build_windows_portable_update_helper,
-    helper_build_paths,
-} from '../desktop/build-windows-portable-update-helper.mjs';
+import { build_windows_portable_update_helper } from '../desktop/build-windows-portable-update-helper.mjs';
 
 const DEFAULT_ATTEMPTS = 3;
 const repo_dir = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -49,7 +46,6 @@ export function package_desktop_windows({
     version = process.env.npm_package_version || JSON.parse(readFileSync(join(repo_dir, 'package.json'), 'utf8')).version,
     run_builder = (arch) => spawnSync(process.execPath, build_arguments(arch), { cwd: repo_dir, stdio: 'inherit' }),
     build_helper = build_windows_portable_update_helper,
-    helper_path = (arch) => helper_build_paths(arch).output_path,
     copy_file = copyFileSync,
     exists = existsSync,
     remove = rmSync,
@@ -59,11 +55,8 @@ export function package_desktop_windows({
 } = {}) {
     if (!Number.isInteger(attempts) || attempts < 1) throw new TypeError('Windows packaging attempts must be a positive integer');
 
-    const staged_helper = join(repo_dir, 'dist', 'native', 'windows-portable-update-helper.exe');
     for (const arch of ['x64', 'arm64']) {
         build_helper(arch);
-        remove(staged_helper, { force: true });
-        copy_file(helper_path(arch), staged_helper);
         let last_failure = 'unknown failure';
         let succeeded = false;
         for (let attempt = 1; attempt <= attempts; attempt += 1) {

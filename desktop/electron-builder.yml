@@ -114,9 +114,10 @@ mac:
 win:
   # Same 1024x1024 master as macOS; electron-builder renders the .ico slices.
   icon: build/icon.png
-  # The packaging wrapper stages the helper matching this invocation's arch.
+  # FileSet paths expand electron-builder's architecture macro for each
+  # invocation, so one build can never consume the other architecture's helper.
   extraResources:
-    - from: dist/native/windows-portable-update-helper.exe
+    - from: dist/native/win32-${arch}/windows-portable-update-helper.exe
       to: windows-portable-update-helper.exe
   target:
     # Two shapes, because Windows has no single convention: the NSIS installer

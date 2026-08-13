@@ -7,7 +7,6 @@ type PackageOptions = {
     version?: string;
     run_builder?: (arch: string) => PackageResult;
     build_helper?: (arch: string) => void;
-    helper_path?: (arch: string) => string;
     copy_file?: (source: string, target: string) => void;
     exists?: (path: string) => boolean;
     remove?: (path: string, options: { force: boolean }) => void;
@@ -28,8 +27,8 @@ beforeAll(async () => {
 function options(run_builder: (arch: string) => PackageResult): PackageOptions {
     return {
         version: '1.2.3', run_builder, exists: () => true,
-        build_helper: vi.fn(), helper_path: (arch) => `/helpers/${arch}.exe`,
-        copy_file: vi.fn(), remove: vi.fn(), select_manifest: vi.fn(), validate: vi.fn(),
+        build_helper: vi.fn(), copy_file: vi.fn(), remove: vi.fn(),
+        select_manifest: vi.fn(), validate: vi.fn(),
         log: { info: vi.fn(), warn: vi.fn() },
     };
 }
@@ -44,6 +43,10 @@ describe('Windows desktop packaging wrapper', () => {
         expect(windows_config).toMatch(/^    - nsis$/m);
         expect(windows_config).toMatch(/^    - portable$/m);
         expect(windows_config).not.toMatch(/^\s+arch:/m);
+        expect(windows_config).toMatch(
+            /^    - from: dist\/native\/win32-\$\{arch\}\/windows-portable-update-helper\.exe$/m,
+        );
+        expect(windows_config).not.toMatch(/from: dist\/native\/windows-portable-update-helper\.exe/);
     });
 
     it('selects one requested executable from multi-target update metadata', () => {
@@ -74,15 +77,10 @@ describe('Windows desktop packaging wrapper', () => {
         expect(config.build_helper).toHaveBeenCalledTimes(2);
         expect(config.build_helper).toHaveBeenNthCalledWith(1, 'x64');
         expect(config.build_helper).toHaveBeenNthCalledWith(2, 'arm64');
-        const staged_helper = expect.stringMatching(/dist[/\\]native[/\\]windows-portable-update-helper\.exe$/);
-        expect(config.remove).toHaveBeenCalledTimes(3);
-        expect(config.remove).toHaveBeenNthCalledWith(1, staged_helper, { force: true });
-        expect(config.remove).toHaveBeenNthCalledWith(2, staged_helper, { force: true });
-        expect(config.copy_file).toHaveBeenCalledWith(
-            '/helpers/x64.exe', expect.stringMatching(/dist[/\\]native[/\\]windows-portable-update-helper\.exe$/),
-        );
-        expect(config.copy_file).toHaveBeenCalledWith(
-            '/helpers/arm64.exe', expect.stringMatching(/dist[/\\]native[/\\]windows-portable-update-helper\.exe$/),
+        expect(config.remove).toHaveBeenCalledTimes(1);
+        expect(config.copy_file).not.toHaveBeenCalledWith(
+            expect.stringMatching(/windows-portable-update-helper\.exe$/),
+            expect.stringMatching(/windows-portable-update-helper\.exe$/),
         );
         expect(config.select_manifest).toHaveBeenCalledTimes(4);
         expect(config.select_manifest).toHaveBeenNthCalledWith(
