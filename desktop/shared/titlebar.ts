@@ -160,8 +160,9 @@ export interface TitlebarOptions {
      * The text cannot be a drag region: a drag region swallows the mouse before
      * the page sees it, which is what the path-menu gestures need. So the strip
      * reports the drag and the main process moves the window — `phase: 'start'`
-     * anchors it against the window's current bounds, and each `'move'` carries
-     * the pointer's screen position in CSS pixels.
+     * anchors it against the window's current bounds, and `'move'` carries the
+     * latest pointer screen position in CSS pixels, coalesced to one update per
+     * animation frame so main is not flooded while the window is moving.
      */
     on_drag?: (phase: 'start' | 'move', x: number, y: number) => void;
     /** Zoom the window, for a double-click on the title — the other thing macOS
@@ -242,24 +243,64 @@ export function install_titlebar(doc: Document, options: TitlebarOptions): void 
     }
     if (options.on_drag) {
         const on_drag = options.on_drag;
+        const view = doc.defaultView;
+        let active_pointer: number | undefined;
+        let pending_move: { x: number; y: number } | undefined;
+        let move_frame: number | undefined;
+
+        const flush_move = () => {
+            if (!pending_move) return;
+            const { x, y } = pending_move;
+            pending_move = undefined;
+            on_drag('move', x, y);
+        };
+        const cancel_move_frame = () => {
+            if (move_frame === undefined) return;
+            view?.cancelAnimationFrame?.(move_frame);
+            move_frame = undefined;
+        };
+        const finish_drag = (event: PointerEvent, release_capture: boolean) => {
+            if (event.pointerId !== active_pointer) return;
+            cancel_move_frame();
+            active_pointer = undefined;
+            flush_move();
+            if (release_capture && label.hasPointerCapture(event.pointerId)) {
+                label.releasePointerCapture(event.pointerId);
+            }
+        };
+
         label.addEventListener('pointerdown', (event) => {
-            // Left button only, and never the Cmd-click that opens the path menu.
-            if (event.button !== 0 || event.metaKey) return;
+            // Left button only, never the Cmd-click that opens the path menu, and
+            // never a second pointer while the first drag is still active.
+            if (event.button !== 0 || event.metaKey || active_pointer !== undefined) return;
             event.preventDefault();
             // Captured so the drag survives the pointer leaving the window —
             // which it does immediately, since the window moves with it.
             label.setPointerCapture(event.pointerId);
+            active_pointer = event.pointerId;
+            // The anchor must be recorded before any move, so start is synchronous.
             on_drag('start', event.screenX, event.screenY);
         });
         label.addEventListener('pointermove', (event) => {
-            if (!label.hasPointerCapture(event.pointerId)) return;
-            on_drag('move', event.screenX, event.screenY);
-        });
-        label.addEventListener('pointerup', (event) => {
-            if (label.hasPointerCapture(event.pointerId)) {
-                label.releasePointerCapture(event.pointerId);
+            if (event.pointerId !== active_pointer) return;
+            pending_move = { x: event.screenX, y: event.screenY };
+            if (move_frame !== undefined) return;
+
+            // Moving a BrowserWindow can make pointer events arrive much faster
+            // than main can apply them. Keep only the latest position per frame.
+            if (view?.requestAnimationFrame) {
+                move_frame = view.requestAnimationFrame(() => {
+                    move_frame = undefined;
+                    flush_move();
+                });
+            } else {
+                // Non-visual DOMs and older embedders may have no frame scheduler.
+                flush_move();
             }
         });
+        label.addEventListener('pointerup', (event) => finish_drag(event, true));
+        label.addEventListener('pointercancel', (event) => finish_drag(event, true));
+        label.addEventListener('lostpointercapture', (event) => finish_drag(event, false));
     }
     bar.append(label);
 
