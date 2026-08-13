@@ -76,13 +76,16 @@ describe('interactive title-bar title', () => {
         expect(bubbled).toHaveBeenCalledTimes(2);
     });
 
-    it('opens the path menu and suppresses the page menu on right-click', async () => {
-        const { label, open_path_menu } = await install_path_titlebar();
+    it('opens the path menu and suppresses ancestor menus on right-click', async () => {
+        const { bar, label, open_path_menu } = await install_path_titlebar();
+        const ancestor_menu = vi.fn();
+        bar.addEventListener('contextmenu', ancestor_menu);
         const event = mouse_event('contextmenu');
 
         label.dispatchEvent(event);
 
         expect(event.defaultPrevented).toBe(true);
         expect(open_path_menu).toHaveBeenCalledOnce();
+        expect(ancestor_menu).not.toHaveBeenCalled();
     });
 });

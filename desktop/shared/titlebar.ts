@@ -236,6 +236,7 @@ export function install_titlebar(doc: Document, options: TitlebarOptions): void 
         }, true);
         label.addEventListener('contextmenu', (event) => {
             event.preventDefault(); // The page's own menu must not also open.
+            event.stopPropagation();
             open_path_menu();
         });
     }
