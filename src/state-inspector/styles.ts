@@ -103,6 +103,27 @@ input[type="text"], input[type="number"] {
 input[type="number"] { width: 64px; }
 label { display: inline-flex; align-items: center; gap: 6px; }
 
+button.chip { border-radius: 999px; }
+/* Pressed = this chip's rows are what the table is showing. The accent colour
+   marks view state, not danger: a chip never deletes anything. */
+button.chip[aria-pressed="true"] {
+  background: var(--vscode-button-background, #0078d4);
+  color: var(--vscode-button-foreground, #ffffff);
+}
+.stale-editor { color: var(--vscode-descriptionForeground, #717171); }
+
+.review-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--inspector-gap);
+  padding: 8px 20px;
+  border-top: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  background: var(--vscode-editor-inactiveSelectionBackground, rgba(64, 128, 224, 0.12));
+}
+.review-bar[hidden] { display: none; }
+.review-summary { font-variant-numeric: tabular-nums; }
+
 .table-scroll { flex: 1 1 auto; overflow: auto; }
 table { border-collapse: collapse; width: 100%; }
 th, td {

@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import {
-    describe_selection,
     format_bytes,
     pending_edit_confirmation,
     trim_confirmation,
@@ -35,19 +34,6 @@ describe('formatting sizes', () => {
     it('refuses to invent a size it does not have', () => {
         expect(format_bytes(Number.NaN)).toBe('—');
         expect(format_bytes(-1)).toBe('—');
-    });
-});
-
-describe('describing a selection', () => {
-    it('says what each bulk action covers', () => {
-        expect(describe_selection({ kind: 'paths', paths: [] }))
-            .toBe('the selected entries');
-        expect(describe_selection({ kind: 'missingOnDisk' }))
-            .toBe('entries whose files are no longer on disk');
-        expect(describe_selection({ kind: 'olderThanDays', days: 1 }))
-            .toBe('entries not opened in 1 day');
-        expect(describe_selection({ kind: 'olderThanDays', days: 30 }))
-            .toBe('entries not opened in 30 days');
     });
 });
 

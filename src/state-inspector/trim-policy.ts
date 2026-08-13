@@ -10,11 +10,7 @@
  * hand-picked selection reach the same gate, so no bulk path can quietly skip
  * the warning that a hand-picked one would have shown.
  */
-import type {
-    StateInspectorPreview,
-    StateInspectorTrimSummary,
-    StoredFileStateTrimSelection,
-} from './protocol';
+import type { StateInspectorPreview, StateInspectorTrimSummary } from './protocol';
 
 export interface TrimConfirmation {
     readonly title: string;
@@ -41,17 +37,6 @@ export function format_bytes(bytes: number): string {
 
 function plural(count: number, singular: string, plural_form = `${singular}s`): string {
     return `${count} ${count === 1 ? singular : plural_form}`;
-}
-
-export function describe_selection(selection: StoredFileStateTrimSelection): string {
-    switch (selection.kind) {
-        case 'paths':
-            return 'the selected entries';
-        case 'olderThanDays':
-            return `entries not opened in ${plural(selection.days, 'day')}`;
-        case 'missingOnDisk':
-            return 'entries whose files are no longer on disk';
-    }
 }
 
 /**

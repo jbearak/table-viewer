@@ -111,12 +111,21 @@ function dialog(root: HTMLElement): HTMLElement {
     return found as HTMLElement;
 }
 
+/** The one clearing button in the window, labelled with the live count. */
+function clearButton(root: HTMLElement): HTMLButtonElement {
+    return root.querySelector<HTMLButtonElement>('.review-clear')!;
+}
+
+function chip(root: HTMLElement, kind: 'chip-missing' | 'chip-stale'): HTMLButtonElement {
+    return root.querySelector<HTMLButtonElement>(`.${kind}`)!;
+}
+
 /** Tick the header checkbox, then clear — the route that replaced a
  *  "clear everything" button, and the only way to act on every row. */
 async function clearAll(root: HTMLElement): Promise<void> {
     const selectAll = root.querySelector<HTMLInputElement>('thead input')!;
     await click(selectAll);
-    await click(button(root, 'Clear Selected'));
+    await click(clearButton(root));
 }
 
 async function click(target: HTMLElement): Promise<void> {
@@ -184,7 +193,8 @@ describe('deleting a selection', () => {
         const harness = await mount();
         await selectPlain(harness.root);
 
-        await click(button(harness.root, 'Clear Selected'));
+        expect(clearButton(harness.root).textContent).toBe('Clear 1 entry…');
+        await click(clearButton(harness.root));
         expect(dialog(harness.root).textContent).toContain('Clear stored state for 1 file?');
 
         await click(button(dialog(harness.root), 'Cancel'));
@@ -197,7 +207,7 @@ describe('deleting a selection', () => {
         const harness = await mount();
         await selectPlain(harness.root);
 
-        await click(button(harness.root, 'Clear Selected'));
+        await click(clearButton(harness.root));
         await click(button(dialog(harness.root), 'Clear'));
 
         expect(harness.trimmed()).toMatchObject({
@@ -255,7 +265,7 @@ describe('the unsaved-edits gate', () => {
         const unsaved = rows(harness.root)
             .find((row) => row.querySelector('.path')?.textContent === '/files/unsaved.csv')!;
         await click(unsaved.querySelector<HTMLInputElement>('input')!);
-        await click(button(harness.root, 'Clear Selected'));
+        await click(clearButton(harness.root));
         await click(button(dialog(harness.root), 'Clear'));
         expect(dialog(harness.root).textContent)
             .toContain('Discard unsaved changes to 1 file?');
@@ -291,9 +301,9 @@ describe('the unsaved-edits gate', () => {
 });
 
 describe('when every match is in use', () => {
-    it('says so instead of opening an empty confirmation', async () => {
-        // Reachable through a bulk rule, which can match a row the user could
-        // not have ticked by hand: an open entry is never selectable.
+    it('says so, and ticks nothing, instead of arming the clear button', async () => {
+        // Reachable through a suggestion chip, which can match a row the user
+        // could not have ticked by hand: an open entry is never selectable.
         const harness = await mount([{
             path: '/open-and-gone.csv',
             sizeBytes: 100,
@@ -302,11 +312,124 @@ describe('when every match is in use', () => {
             isMissing: true,
         }]);
 
-        await click(button(harness.root, 'Clear Files Not on Disk'));
+        await click(chip(harness.root, 'chip-missing'));
 
         expect(harness.root.querySelector('.dialog')).toBeNull();
         expect(harness.root.querySelector('.status-bar')?.textContent)
             .toContain('currently open');
+        // The protected row is still shown — that is what explains the message
+        // — but nothing is selected, so the clear button has nothing to do.
+        expect(rows(harness.root)).toHaveLength(1);
+        expect(clearButton(harness.root).disabled).toBe(true);
+    });
+});
+
+describe('cleanup suggestions', () => {
+    const DAY = 86_400_000;
+    const NOW = Date.now();
+    const SUGGESTIBLE: StoredFileStateEntry[] = [
+        { path: '/gone.csv', sizeBytes: 300, hasPendingEdits: false, isProtected: false, openHere: false, isMissing: true, touchedAtMs: NOW - 5 * DAY },
+        { path: '/stale.csv', sizeBytes: 500, hasPendingEdits: false, isProtected: false, openHere: false, isMissing: false, touchedAtMs: NOW - 200 * DAY },
+        { path: '/fresh.csv', sizeBytes: 100, hasPendingEdits: false, isProtected: false, openHere: false, isMissing: false, touchedAtMs: NOW - 1 * DAY },
+    ];
+
+    it('reports each chip’s count and size before it is pressed', async () => {
+        const { root } = await mount(SUGGESTIBLE);
+
+        expect(chip(root, 'chip-missing').textContent).toBe('Not on disk · 1 · 300 B');
+        expect(chip(root, 'chip-stale').textContent).toBe('1 · 500 B');
+    });
+
+    it('disables a chip that would match nothing', async () => {
+        // The default entries carry no isMissing flag and no timestamps, so
+        // neither suggestion has anything to show.
+        const { root } = await mount();
+
+        expect(chip(root, 'chip-missing').disabled).toBe(true);
+        expect(chip(root, 'chip-stale').disabled).toBe(true);
+    });
+
+    it('narrows the table to the matches and ticks them, clearing by paths', async () => {
+        const harness = await mount(SUGGESTIBLE);
+
+        await click(chip(harness.root, 'chip-missing'));
+
+        // The criterion is now a visible selection, not an invisible rule.
+        expect(rows(harness.root)).toHaveLength(1);
+        expect(chip(harness.root, 'chip-missing').getAttribute('aria-pressed')).toBe('true');
+        expect(clearButton(harness.root).textContent).toBe('Clear 1 entry…');
+
+        await click(clearButton(harness.root));
+        await click(button(dialog(harness.root), 'Clear'));
+
+        // Always an explicit list of paths: the chip chose them, the host
+        // still previews and re-checks them like any hand-picked selection.
+        expect(harness.trimmed()).toMatchObject({
+            kind: 'trim',
+            paths: ['/gone.csv'],
+        });
+        expect(rows(harness.root)).toHaveLength(2);
+    });
+
+    it('lets a matched row be unticked before clearing', async () => {
+        const harness = await mount(SUGGESTIBLE.map((entry) => ({
+            ...entry,
+            isMissing: entry.path !== '/fresh.csv',
+        })));
+
+        await click(chip(harness.root, 'chip-missing'));
+        const spare = rows(harness.root)
+            .find((row) => row.querySelector('.path')?.textContent === '/stale.csv')!;
+        await click(spare.querySelector<HTMLInputElement>('input')!);
+
+        expect(clearButton(harness.root).textContent).toBe('Clear 1 entry…');
+        await click(clearButton(harness.root));
+        await click(button(dialog(harness.root), 'Clear'));
+
+        expect(harness.trimmed()).toMatchObject({ paths: ['/gone.csv'] });
+    });
+
+    it('follows the days threshold and matches only genuinely stale rows', async () => {
+        const harness = await mount(SUGGESTIBLE);
+        const days = harness.root
+            .querySelector<HTMLInputElement>('input[type="number"]')!;
+
+        days.value = '3';
+        days.dispatchEvent(new Event('input'));
+        await settle();
+
+        // 3 days catches the 5-day-old missing file too; the 1-day-old one
+        // stays out, and so would a row with no timestamp at all.
+        expect(chip(harness.root, 'chip-stale').textContent).toBe('2 · 800 B');
+        await click(chip(harness.root, 'chip-stale'));
+
+        expect(rows(harness.root)).toHaveLength(2);
+        expect(clearButton(harness.root).textContent).toBe('Clear 2 entries…');
+    });
+
+    it('steps back out through Deselect with nothing changed', async () => {
+        const harness = await mount(SUGGESTIBLE);
+
+        await click(chip(harness.root, 'chip-missing'));
+        await click(button(harness.root, 'Deselect'));
+
+        expect(rows(harness.root)).toHaveLength(3);
+        expect(harness.root.querySelector<HTMLElement>('.review-bar')!.hidden).toBe(true);
+        expect(chip(harness.root, 'chip-missing').getAttribute('aria-pressed')).toBe('false');
+        expect(harness.trimmed()).toBeUndefined();
+    });
+
+    it('shows the review bar for a hand-made selection too', async () => {
+        const harness = await mount(SUGGESTIBLE);
+        expect(harness.root.querySelector<HTMLElement>('.review-bar')!.hidden).toBe(true);
+
+        const row = rows(harness.root)
+            .find((candidate) => candidate.querySelector('.path')?.textContent === '/stale.csv')!;
+        await click(row.querySelector<HTMLInputElement>('input')!);
+
+        const bar = harness.root.querySelector<HTMLElement>('.review-bar')!;
+        expect(bar.hidden).toBe(false);
+        expect(bar.querySelector('.review-summary')?.textContent).toBe('1 selected · 500 B');
     });
 });
 

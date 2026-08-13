@@ -30,14 +30,49 @@ import {
 
 type SortKey = 'path' | 'sizeBytes' | 'activity' | 'status';
 
+/**
+ * A cleanup suggestion the toolbar can offer.
+ *
+ * Clicking one never clears anything: it narrows the table to the matching
+ * rows and ticks them, so the criterion is reviewed as a visible selection
+ * rather than trusted as a label on a button. The one clearing action in the
+ * whole window then acts on that selection, the same as a hand-picked one.
+ */
+type CleanupCriterion =
+    | { readonly kind: 'missing' }
+    | { readonly kind: 'stale'; readonly days: number };
+
 interface UiState {
     inventory?: StateInspectorInventory;
     selected: Set<string>;
     filter: string;
+    /** Which suggestion the table is currently narrowed to, if any. */
+    review?: CleanupCriterion;
+    /** The days threshold for the stale suggestion, edited in the toolbar. */
+    staleDays: number;
     sortKey: SortKey;
     ascending: boolean;
     busy: boolean;
     status?: { readonly text: string; readonly isError: boolean };
+}
+
+const MS_PER_DAY = 86_400_000;
+
+/**
+ * The client-side mirror of the host's trim criteria, over the inventory the
+ * host already sent. `missing` reads the same flag the row badge shows, and
+ * `stale` uses the same activity timestamp and cutoff rule as the maintenance
+ * layer, so what a chip highlights is what the criterion means everywhere
+ * else. The host still re-resolves and re-checks everything before deleting.
+ */
+function criterion_matches(
+    entry: StoredFileStateEntry,
+    criterion: CleanupCriterion,
+    now: number,
+): boolean {
+    if (criterion.kind === 'missing') return entry.isMissing === true;
+    const stamp = entry_activity_timestamp(entry);
+    return stamp !== undefined && stamp < now - criterion.days * MS_PER_DAY;
 }
 
 function element<K extends keyof HTMLElementTagNameMap>(
@@ -101,6 +136,7 @@ export function mount_state_inspector(
     const state: UiState = {
         selected: new Set(),
         filter: '',
+        staleDays: 90,
         sortKey: 'sizeBytes',
         ascending: false,
         busy: false,
@@ -142,31 +178,49 @@ export function mount_state_inspector(
     filterInput.placeholder = 'Filter by path';
     filterInput.setAttribute('aria-label', 'Filter by path');
 
-    // No toolbar button is styled destructive, including this one. None of them
-    // clear anything on click — every one opens a confirmation first. Red is
-    // reserved for the point of no return, which is the unsaved-edits step in
-    // that dialog; spending it on three doorways would leave nothing to mark the
-    // one action that actually cannot be undone.
-    const clearSelected = element('button', undefined, 'Clear Selected');
+    // The suggestion chips. Nothing in this row clears anything: a chip only
+    // narrows the table and ticks the matching rows, so every route to a
+    // delete runs through the same visible selection and the same single
+    // clear button below. The counts are computed from the inventory already
+    // on hand, so a chip says what it would show before it is pressed.
+    const chipMissing = element('button', 'chip chip-missing');
     const daysInput = element('input');
     daysInput.type = 'number';
     daysInput.min = '1';
     daysInput.value = '90';
     daysInput.setAttribute('aria-label', 'Days since last opened');
-    const trimOldLabel = element('label');
-    const trimOld = element('button', undefined, 'Clear Older Than');
-    trimOldLabel.append(trimOld, daysInput, element('span', undefined, 'days'));
-    const trimMissing = element('button', undefined, 'Clear Files Not on Disk');
-    const refresh = element('button', undefined, 'Refresh');
+    const staleEditor = element('label', 'stale-editor');
+    staleEditor.append(
+        element('span', undefined, 'Unused for'),
+        daysInput,
+        element('span', undefined, 'days:'),
+    );
+    const chipStale = element('button', 'chip chip-stale');
 
-    // Two rows, because these are two different kinds of control: the top row
-    // changes what is stored, the bottom row only changes what you are looking
-    // at. Mixing them put a harmless text field between two clearing actions.
-    const actions = element('div', 'toolbar actions');
-    actions.append(clearSelected, trimOldLabel, trimMissing);
+    // No "Clean up:" prefix on this row: these chips select, they do not
+    // clean anything, and a heading that says otherwise promises an action
+    // the buttons deliberately do not perform. And no Refresh button: the
+    // window loads a fresh inventory every time it opens, and closing and
+    // reopening it is the natural way to ask again.
+    const suggestions = element('div', 'toolbar suggestions');
+    suggestions.append(chipMissing, staleEditor, chipStale);
     const viewControls = element('div', 'toolbar view-controls');
-    viewControls.append(filterInput, element('span', 'spacer'), refresh);
-    toolbar.append(actions, viewControls);
+    viewControls.append(filterInput);
+
+    // The review bar: the one place anything can be cleared from. It exists
+    // only while there is a selection to act on, so the window never shows a
+    // disabled destructive doorway — and it is not styled destructive either,
+    // because clicking it only opens a confirmation. Red stays reserved for
+    // the unsaved-edits step in that dialog, the one action that cannot be
+    // undone.
+    const reviewBar = element('div', 'review-bar');
+    reviewBar.hidden = true;
+    const reviewSummary = element('span', 'review-summary');
+    const clearButton = element('button', 'review-clear');
+    const dismiss = element('button', 'review-dismiss', 'Deselect');
+    reviewBar.append(reviewSummary, element('span', 'spacer'), clearButton, dismiss);
+
+    toolbar.append(suggestions, viewControls, reviewBar);
 
     const tableScroll = element('div', 'table-scroll');
     const statusBar = element('div', 'status-bar');
@@ -176,7 +230,12 @@ export function mount_state_inspector(
     root.replaceChildren(header, toolbar, tableScroll, statusBar);
 
     function visible_entries(): StoredFileStateEntry[] {
-        const entries = state.inventory?.entries ?? [];
+        let entries = state.inventory?.entries ?? [];
+        if (state.review) {
+            const criterion = state.review;
+            const now = Date.now();
+            entries = entries.filter((entry) => criterion_matches(entry, criterion, now));
+        }
         const needle = state.filter.trim().toLowerCase();
         const filtered = needle === ''
             ? [...entries]
@@ -212,10 +271,10 @@ export function mount_state_inspector(
 
     function set_busy(busy: boolean): void {
         state.busy = busy;
-        for (const button of [clearSelected, trimOld, trimMissing, refresh]) {
+        for (const button of [clearButton, chipMissing, chipStale, dismiss]) {
             button.disabled = busy;
         }
-        if (!busy) clearSelected.disabled = state.selected.size === 0;
+        if (!busy) render_toolbar();
     }
 
     function render_header(): void {
@@ -230,6 +289,69 @@ export function mount_state_inspector(
             format_bytes(stored)
         } stored · ${format_bytes(inventory.databaseSizeBytes)} database file`;
         databasePath.textContent = inventory.databasePath;
+    }
+
+    function matching_entries(criterion: CleanupCriterion): StoredFileStateEntry[] {
+        const now = Date.now();
+        return (state.inventory?.entries ?? [])
+            .filter((entry) => criterion_matches(entry, criterion, now));
+    }
+
+    /** "7 · 312 KB", or "none", so a chip reports its yield before any click. */
+    function chip_count(matches: readonly StoredFileStateEntry[]): string {
+        if (matches.length === 0) return 'none';
+        const size = matches.reduce((total, entry) => total + entry.sizeBytes, 0);
+        return `${matches.length} · ${format_bytes(size)}`;
+    }
+
+    function render_toolbar(): void {
+        const missing = matching_entries({ kind: 'missing' });
+        chipMissing.textContent = `Not on disk · ${chip_count(missing)}`;
+        chipMissing.disabled = state.busy || missing.length === 0;
+        chipMissing.setAttribute(
+            'aria-pressed',
+            state.review?.kind === 'missing' ? 'true' : 'false',
+        );
+
+        const staleValid = Number.isFinite(state.staleDays) && state.staleDays >= 1;
+        const stale = staleValid
+            ? matching_entries({ kind: 'stale', days: state.staleDays })
+            : [];
+        chipStale.textContent = chip_count(stale);
+        chipStale.disabled = state.busy || stale.length === 0;
+        chipStale.setAttribute(
+            'aria-pressed',
+            state.review?.kind === 'stale' ? 'true' : 'false',
+        );
+        chipStale.setAttribute(
+            'aria-label',
+            `Review entries unused for ${staleValid ? state.staleDays : daysInput.value} days`,
+        );
+
+        // The review bar appears for any selection, however it was made — a
+        // chip and a hand-ticked checkbox lead to the same bar and the same
+        // single clear button.
+        const selectedCount = state.selected.size;
+        reviewBar.hidden = state.review === undefined && selectedCount === 0;
+        const bySize = new Map(
+            (state.inventory?.entries ?? []).map((entry) => [entry.path, entry.sizeBytes]),
+        );
+        const selectedBytes = [...state.selected]
+            .reduce((total, path) => total + (bySize.get(path) ?? 0), 0);
+        const selectedPhrase = `${selectedCount} selected · ${format_bytes(selectedBytes)}`;
+        if (state.review === undefined) {
+            reviewSummary.textContent = selectedPhrase;
+        } else {
+            const matched = matching_entries(state.review);
+            const criterionPhrase = state.review.kind === 'missing'
+                ? `${matched.length} not on disk`
+                : `${matched.length} unused for ${state.review.days}+ days`;
+            reviewSummary.textContent = `${criterionPhrase} — ${selectedPhrase}`;
+        }
+        clearButton.textContent = `Clear ${
+            selectedCount === 1 ? '1 entry' : `${selectedCount} entries`
+        }…`;
+        clearButton.disabled = state.busy || selectedCount === 0;
     }
 
     function render_table(): void {
@@ -306,7 +428,10 @@ export function mount_state_inspector(
             checkbox.addEventListener('change', () => {
                 if (checkbox.checked) state.selected.add(entry.path);
                 else state.selected.delete(entry.path);
-                clearSelected.disabled = state.selected.size === 0;
+                // The toolbar re-renders but the table does not: rows must hold
+                // still under a ticking finger, and the toolbar nodes are
+                // static, so updating them cannot steal this checkbox's focus.
+                render_toolbar();
                 const shown = visible_entries().filter((candidate) => !candidate.isProtected);
                 selectAll.checked = shown.length > 0
                     && shown.every((candidate) => state.selected.has(candidate.path));
@@ -345,8 +470,8 @@ export function mount_state_inspector(
 
     function render(): void {
         render_header();
+        render_toolbar();
         render_table();
-        clearSelected.disabled = state.busy || state.selected.size === 0;
     }
 
     /** Show one confirmation and resolve to whether it was accepted. */
@@ -470,6 +595,7 @@ export function mount_state_inspector(
             );
             if (!summary) return;
             state.selected.clear();
+            state.review = undefined;
             await reload();
             set_status(trim_outcome_message(summary));
         } finally {
@@ -477,28 +603,71 @@ export function mount_state_inspector(
         }
     }
 
+    /**
+     * Enter review mode for one suggestion: narrow the table to what matched
+     * and tick everything that could actually be cleared. Protected rows stay
+     * visible and unticked, so "this matched but is in use" is something the
+     * user sees rather than something a dialog apologises for later.
+     */
+    function apply_review(criterion: CleanupCriterion): void {
+        state.review = criterion;
+        const matched = matching_entries(criterion);
+        state.selected = new Set(
+            matched.filter((entry) => !entry.isProtected).map((entry) => entry.path),
+        );
+        set_status(
+            state.selected.size === 0 && matched.some((entry) => entry.isProtected)
+                ? 'Everything that matched is currently open, so nothing can be deleted.'
+                : '',
+        );
+        render();
+    }
+
+    function exit_review(): void {
+        state.review = undefined;
+        state.selected.clear();
+        set_status('');
+        render();
+    }
+
     filterInput.addEventListener('input', () => {
         state.filter = filterInput.value;
         render_table();
     });
-    clearSelected.addEventListener('click', () => {
-        void run_trim({ kind: 'paths', paths: [...state.selected] });
+    chipMissing.addEventListener('click', () => {
+        if (state.review?.kind === 'missing') exit_review();
+        else apply_review({ kind: 'missing' });
     });
-    trimOld.addEventListener('click', () => {
+    chipStale.addEventListener('click', () => {
+        if (state.review?.kind === 'stale') {
+            exit_review();
+            return;
+        }
         const days = Number(daysInput.value);
         if (!Number.isFinite(days) || days < 1) {
             set_status('Enter a number of days of at least 1.', true);
             return;
         }
-        void run_trim({ kind: 'olderThanDays', days });
+        apply_review({ kind: 'stale', days });
     });
-    trimMissing.addEventListener('click', () => {
-        void run_trim({ kind: 'missingOnDisk' });
+    daysInput.addEventListener('input', () => {
+        state.staleDays = Number(daysInput.value);
+        // An active stale review follows the edited threshold live; the rows it
+        // highlights are re-derived, the same as pressing the chip again. An
+        // invalid value leaves the current review where it was.
+        if (
+            state.review?.kind === 'stale'
+            && Number.isFinite(state.staleDays) && state.staleDays >= 1
+        ) {
+            apply_review({ kind: 'stale', days: state.staleDays });
+        } else {
+            render_toolbar();
+        }
     });
-    refresh.addEventListener('click', () => {
-        set_busy(true);
-        void reload().finally(() => set_busy(false));
+    clearButton.addEventListener('click', () => {
+        void run_trim({ kind: 'paths', paths: [...state.selected] });
     });
+    dismiss.addEventListener('click', exit_review);
 
     render();
     set_busy(true);
