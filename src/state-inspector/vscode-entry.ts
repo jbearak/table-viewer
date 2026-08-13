@@ -28,10 +28,30 @@ window.addEventListener('message', (event: MessageEvent) => {
     resolve(data.response);
 });
 
+/**
+ * How long to wait for the extension host before giving up on a reply.
+ *
+ * `ipcRenderer.invoke` rejects when its handler is gone; `postMessage` just
+ * goes quiet, so without a deadline a crashed or disposed host would leave the
+ * UI waiting forever with no error. Generous because a trim ends in VACUUM,
+ * which rewrites the whole database file.
+ */
+const REPLY_TIMEOUT_MS = 60_000;
+
 function send(request: StateInspectorRequest): Promise<StateInspectorResponse> {
     const id = nextRequestId++;
     return new Promise((resolve) => {
-        pending.set(id, resolve);
+        const deadline = setTimeout(() => {
+            if (!pending.delete(id)) return;
+            resolve({
+                kind: 'error',
+                message: 'The editor did not respond. Close and reopen the inspector to try again.',
+            });
+        }, REPLY_TIMEOUT_MS);
+        pending.set(id, (response) => {
+            clearTimeout(deadline);
+            resolve(response);
+        });
         vscodeApi.postMessage({ id, request });
     });
 }
