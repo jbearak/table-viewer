@@ -178,6 +178,21 @@ jobs:
       - name: Typecheck
         run: npm run typecheck:all
 
+      - name: Build portable update helper integration fixtures
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake -S desktop/native/windows-portable-update-helper -B dist/native-tests/windows-portable-update-helper -A x64 -DPORTABLE_UPDATE_HELPER_BUILD_TESTS=ON
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build dist/native-tests/windows-portable-update-helper --config Release --target windows-portable-update-helper-test portable-update-old-fixture portable-update-new-fixture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Portable update helper integration tests
+        shell: pwsh
+        env:
+          PORTABLE_UPDATE_HELPER_TEST_BUILD_DIR: ${{ github.workspace }}\dist\native-tests\windows-portable-update-helper
+        run: npx vitest run desktop/test/windows-portable-update-helper.integration.test.ts
+
       # Windows used to refuse the backend, and this step used to assert that
       # refusal. It now pins the opposite contract — a complete, valid v1 database
       # installed through the public entry point — so the platform cannot silently
