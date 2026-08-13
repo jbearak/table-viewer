@@ -120,8 +120,21 @@ export function mount_state_inspector(
         + 'deletes, moves, or changes the file on disk.',
     );
     const summary = element('p', 'summary', 'Loading…');
+    // The two byte figures in the summary never agree, and the gap is large on a
+    // near-empty database — a hundred kilobytes of table definitions, indexes,
+    // and reserved pages sit there whatever is stored. Reporting only the file
+    // size, as this window first did, reads as "your view settings are eating
+    // 132 KB"; reporting both without saying why reads as an accounting error.
+    // So the header states both and this line accounts for the difference.
+    const sizeNote = element(
+        'p',
+        'size-note',
+        'The database file is always larger than the total stored: it also holds '
+        + 'its own structure and space kept in reserve for future entries. '
+        + 'Clearing frees the entries, so the file itself shrinks by less.',
+    );
     const databasePath = element('p', 'database-path');
-    header.append(heading, explanation, summary, databasePath);
+    header.append(heading, explanation, summary, sizeNote, databasePath);
 
     const toolbar = element('div', 'toolbars');
     const filterInput = element('input', 'filter-input');
@@ -209,9 +222,13 @@ export function mount_state_inspector(
         const inventory = state.inventory;
         if (!inventory) return;
         const count = inventory.totalEntryCount;
+        // Two figures, because the Size column sums to the first one and not to
+        // the second, and one number in this spot invited exactly that
+        // subtraction. "stored" is the total this window can actually free.
+        const stored = inventory.entries.reduce((total, entry) => total + entry.sizeBytes, 0);
         summary.textContent = `${count === 1 ? '1 file' : `${count} files`} · ${
-            format_bytes(inventory.databaseSizeBytes)
-        } on disk`;
+            format_bytes(stored)
+        } stored · ${format_bytes(inventory.databaseSizeBytes)} database file`;
         databasePath.textContent = inventory.databasePath;
     }
 

@@ -133,7 +133,12 @@ describe('the inspector listing', () => {
         const { root } = await mount();
 
         expect(rows(root)).toHaveLength(3);
-        expect(root.querySelector('.summary')?.textContent).toBe('3 files · 2.0 KB on disk');
+        // Both figures, and the stored one is the sum of the Size column rather
+        // than the file size: a lone file size invites subtracting the column
+        // from it, and on a near-empty database the remainder is all fixed
+        // schema overhead, not anything this window could free.
+        expect(root.querySelector('.summary')?.textContent)
+            .toBe('3 files · 1.4 KB stored · 2.0 KB database file');
         expect(root.querySelector('.database-path')?.textContent)
             .toBe('/state/file-state.sqlite3');
     });
@@ -364,6 +369,16 @@ describe('the standing explanation', () => {
 
         const explanation = root.querySelector('.explanation')!.textContent!;
         expect(explanation).toContain('never deletes, moves, or changes the file on disk');
+    });
+
+    // Standing text, not a tooltip: the two numbers sit next to each other and
+    // do not add up, so the reason has to be readable without hovering anything.
+    it('accounts for the gap between the stored total and the file size', async () => {
+        const { root } = await mount();
+
+        const note = root.querySelector('.size-note')!.textContent!;
+        expect(note).toContain('always larger than the total stored');
+        expect(note).toContain('its own structure');
     });
 });
 

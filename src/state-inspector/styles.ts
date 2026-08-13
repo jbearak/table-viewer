@@ -37,6 +37,13 @@ h1 { margin: 0 0 4px; font-size: 1.15em; font-weight: 600; }
   line-height: 1.45;
   color: var(--vscode-descriptionForeground, #717171);
 }
+.size-note {
+  margin: 4px 0 0;
+  max-width: 78ch;
+  font-size: 0.9em;
+  line-height: 1.45;
+  color: var(--vscode-descriptionForeground, #717171);
+}
 .database-path {
   margin-top: 6px;
   font-family: var(--vscode-editor-font-family, monospace);
