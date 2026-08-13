@@ -118,14 +118,12 @@ win:
     # Two shapes, because Windows has no single convention: the NSIS installer
     # for people who want Start Menu + "Open with…" + an uninstaller entry, and
     # the portable single .exe for locked-down machines that can't install.
-    - target: nsis
-      arch:
-        - x64
-        - arm64
-    - target: portable
-      arch:
-        - x64
-        - arm64
+    # scripts/package-desktop-windows.mjs supplies --x64 or --arm64. Do not list
+    # architectures here: electron-builder would build both on every invocation
+    # and the second pass could overwrite an installer after its manifest was
+    # saved.
+    - nsis
+    - portable
 nsis:
   # An assisted (wizard) installer rather than the one-click default.
   #

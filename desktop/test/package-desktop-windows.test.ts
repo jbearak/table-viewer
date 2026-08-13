@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 
 type PackageResult = { error?: Error; signal?: string | null; status: number | null };
@@ -15,10 +16,11 @@ type PackageOptions = {
 
 let package_desktop_windows: (options?: PackageOptions) => void;
 let select_windows_update_asset: (metadata: unknown, expected_asset: string) => Record<string, unknown>;
+let build_arguments: (arch: string) => string[];
 
 beforeAll(async () => {
     const package_specifier = '../../scripts/package-desktop-windows.mjs';
-    ({ package_desktop_windows, select_windows_update_asset } = await import(package_specifier));
+    ({ build_arguments, package_desktop_windows, select_windows_update_asset } = await import(package_specifier));
 });
 
 function options(run_builder: (arch: string) => PackageResult): PackageOptions {
@@ -30,6 +32,17 @@ function options(run_builder: (arch: string) => PackageResult): PackageOptions {
 }
 
 describe('Windows desktop packaging wrapper', () => {
+    it('selects one architecture per builder invocation', () => {
+        expect(build_arguments('x64')).toEqual(expect.arrayContaining(['--win', '--x64']));
+        expect(build_arguments('arm64')).toEqual(expect.arrayContaining(['--win', '--arm64']));
+
+        const config = readFileSync('desktop/electron-builder.yml', 'utf8');
+        const windows_config = config.slice(config.indexOf('\nwin:'), config.indexOf('\nnsis:'));
+        expect(windows_config).toMatch(/^    - nsis$/m);
+        expect(windows_config).toMatch(/^    - portable$/m);
+        expect(windows_config).not.toMatch(/^\s+arch:/m);
+    });
+
     it('keeps only the setup executable in multi-target update metadata', () => {
         const setup = { url: 'table-viewer-1.2.3-x64-setup.exe', sha512: 'setup-digest', size: 12 };
         const portable = { url: 'table-viewer-1.2.3-x64-portable.exe', sha512: 'portable-digest', size: 34 };

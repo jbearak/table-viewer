@@ -18,7 +18,7 @@ function describe_failure(result) {
     return `exit code ${result.status ?? 'unknown'}`;
 }
 
-function build_arguments(arch) {
+export function build_arguments(arch) {
     return [electron_builder_cli, '--config', 'desktop/electron-builder.yml', '--publish', 'never', '--win', `--${arch}`];
 }
 
