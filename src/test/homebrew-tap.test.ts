@@ -28,6 +28,13 @@ function makeDmg(directory: string, version: string, contents: string): string {
     return dmg;
 }
 
+function commitSeededTap(tap: string): void {
+    execFileSync('git', ['-C', tap, 'config', 'user.name', 'Tap Test']);
+    execFileSync('git', ['-C', tap, 'config', 'user.email', 'tap-test@example.com']);
+    execFileSync('git', ['-C', tap, 'add', 'README.md', 'Casks', 'bin', '.github']);
+    execFileSync('git', ['-C', tap, 'commit', '-qm', 'Seed tap']);
+}
+
 function prepare(tap: string, version: string, dmg: string) {
     const output = path.join(path.dirname(tap), `${path.basename(tap)}.output`);
     fs.rmSync(output, { force: true });
@@ -67,6 +74,7 @@ describe.skipIf(process.platform === 'win32')('Homebrew tap release preparation'
         const tap = makeTap('README.md');
         const firstDmg = makeDmg(tap, '1.2.3', 'first dmg');
         expect(prepare(tap, '1.2.3', firstDmg).status).toBe(0);
+        commitSeededTap(tap);
 
         const nextDmg = makeDmg(tap, '1.2.4-beta.1', 'next dmg');
         const result = prepare(tap, 'v1.2.4-beta.1', nextDmg);
@@ -76,6 +84,23 @@ describe.skipIf(process.platform === 'win32')('Homebrew tap release preparation'
         const cask = fs.readFileSync(path.join(tap, 'Casks', 'table-viewer.rb'), 'utf8');
         expect(cask).toContain('version "1.2.4-beta.1"');
         expect(cask).toContain(createHash('sha256').update('next dmg').digest('hex'));
+        expect(spawnSync('git', ['-C', tap, 'diff', '--quiet', '--', 'Casks/table-viewer.rb']).status).toBe(1);
+    });
+
+    it('refuses to downgrade an initialized tap', () => {
+        const tap = makeTap('README.md');
+        const currentDmg = makeDmg(tap, '2.0.0', 'current dmg');
+        expect(prepare(tap, '2.0.0', currentDmg).status).toBe(0);
+        commitSeededTap(tap);
+
+        const oldDmg = makeDmg(tap, '1.9.9', 'old dmg');
+        const result = prepare(tap, '1.9.9', oldDmg);
+
+        expect(result.status).not.toBe(0);
+        expect(result.stderr).toContain('refusing to downgrade Homebrew cask from 2.0.0 to 1.9.9');
+        const cask = fs.readFileSync(path.join(tap, 'Casks', 'table-viewer.rb'), 'utf8');
+        expect(cask).toContain('version "2.0.0"');
+        expect(spawnSync('git', ['-C', tap, 'diff', '--quiet']).status).toBe(0);
     });
 
     it('refuses to overwrite an unexpected partial tap', () => {

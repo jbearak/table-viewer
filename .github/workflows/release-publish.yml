@@ -12,7 +12,11 @@ on:
         type: string
 
 concurrency:
-  group: release-publish-${{ inputs.tag || github.event.workflow_run.head_branch }}
+  # Every release writes the same registries, GitHub Release namespace, and
+  # Homebrew cask. Keep the group global and hold it until the tap PR merges so
+  # two tags cannot race from the same tap snapshot.
+  group: release-publish
+  queue: max
   cancel-in-progress: false
 
 permissions:
@@ -78,6 +82,19 @@ jobs:
           ref: ${{ steps.release.outputs.sha }}
           fetch-depth: 1
           persist-credentials: false
+
+      # A manual replay for an older release (for example the first tap seed
+      # from v0.9.1) still needs the publisher implementation that defined this
+      # workflow run. Keep it separate from the immutable release checkout:
+      # product sources/artifacts remain pinned to the tag, while release
+      # plumbing is pinned to GitHub's immutable workflow-file commit.
+      - name: Checkout release publisher tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          path: release-publisher-tools
 
       - name: Setup Node.js
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
@@ -390,8 +407,8 @@ jobs:
       #
       # Setup (one-time):
       #   gh secret   set HOMEBREW_TAP_TOKEN   -R jbearak/table-viewer --env release
-      # HOMEBREW_TAP_TOKEN: a GitHub App installation token or fine-grained PAT
-      # scoped to jbearak/homebrew-table-viewer with Contents:write,
+      # HOMEBREW_TAP_TOKEN: a fine-grained PAT scoped to
+      # jbearak/homebrew-table-viewer with Contents:write,
       # Pull requests:write, and Workflows:write (needed for the initial seed).
       - name: Revalidate release tag before Homebrew publish
         if: steps.artifacts.outputs.desktop == 'true'
@@ -458,7 +475,8 @@ jobs:
             echo "ERROR: expected exactly one desktop dmg" >&2
             exit 1
           fi
-          scripts/prepare-homebrew-tap.sh tap "${THE_TAG#v}" "${DMG[0]}"
+          release-publisher-tools/scripts/prepare-homebrew-tap.sh \
+            tap "${THE_TAG#v}" "${DMG[0]}"
 
       - name: Seed Homebrew tap or open bump PR
         if: steps.artifacts.outputs.desktop == 'true'
@@ -508,5 +526,38 @@ jobs:
               exit 1
             fi
           fi
-          gh pr merge "$BRANCH" --auto --squash \
-            || echo "::warning::could not enable auto-merge; merge $BRANCH manually."
+          # The tap starts without branch protection, so --auto can merge
+          # immediately even while its non-required test is still running.
+          # Observe the check first, require it to pass, then merge directly.
+          TAP_TEST_CHECKS=0
+          for _ in {1..60}; do
+            TAP_TEST_CHECKS=$(gh pr view "$BRANCH" --json statusCheckRollup \
+              --jq '[.statusCheckRollup[] | select(.name == "test" and .workflowName == "tests")] | length')
+            [[ "$TAP_TEST_CHECKS" -gt 0 ]] && break
+            sleep 5
+          done
+          if [[ "$TAP_TEST_CHECKS" -ne 1 ]]; then
+            echo "ERROR: Homebrew bump PR did not report exactly one tests / test check" >&2
+            exit 1
+          fi
+          # Always poll the exact Homebrew job. Branch protection can be absent
+          # or misconfigured to require some other check, so --required alone
+          # cannot establish that this audit/install check passed.
+          for _ in {1..180}; do
+            TAP_TEST_STATE=$(gh pr view "$BRANCH" --json statusCheckRollup --jq '
+              [.statusCheckRollup[] | select(.name == "test" and .workflowName == "tests")][0]
+              | if .status != "COMPLETED" then "PENDING"
+                elif .conclusion == "SUCCESS" then "SUCCESS"
+                else (.conclusion // "FAILURE") end')
+            [[ "$TAP_TEST_STATE" == "SUCCESS" ]] && break
+            if [[ "$TAP_TEST_STATE" != "PENDING" ]]; then
+              echo "ERROR: Homebrew tests / test check ended as $TAP_TEST_STATE" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          [[ "$TAP_TEST_STATE" == "SUCCESS" ]] || {
+            echo "ERROR: timed out waiting for Homebrew tests / test check" >&2
+            exit 1
+          }
+          gh pr merge "$BRANCH" --squash --delete-branch

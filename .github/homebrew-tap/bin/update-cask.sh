@@ -16,6 +16,47 @@ VERSION="${VERSION#v}"
   || { echo "ERROR: dmg filename does not match version $VERSION" >&2; exit 1; }
 [[ -f "$CASK" ]] || { echo "ERROR: no such cask: $CASK" >&2; exit 1; }
 
+# A delayed workflow or manual replay must never move Homebrew users backward.
+# Node is part of the upstream release runner, and this self-contained SemVer
+# comparison keeps prereleases ordered correctly without an npm dependency.
+CURRENT_VERSION="$(sed -nE 's/^  version "([^"]+)"$/\1/p' "$CASK")"
+[[ -n "$CURRENT_VERSION" ]] \
+  || { echo "ERROR: could not read current cask version" >&2; exit 1; }
+if ! node - "$CURRENT_VERSION" "$VERSION" <<'NODE'
+const [current, requested] = process.argv.slice(2);
+const parse = (text) => {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(text);
+  if (!match) throw new Error(`invalid SemVer: ${text}`);
+  return { core: match.slice(1, 4).map(Number), pre: match[4]?.split('.') };
+};
+const compare = (left, right) => {
+  for (let index = 0; index < 3; index += 1) {
+    if (left.core[index] !== right.core[index]) return left.core[index] - right.core[index];
+  }
+  if (!left.pre && !right.pre) return 0;
+  if (!left.pre) return 1;
+  if (!right.pre) return -1;
+  for (let index = 0; index < Math.max(left.pre.length, right.pre.length); index += 1) {
+    if (left.pre[index] === undefined) return -1;
+    if (right.pre[index] === undefined) return 1;
+    if (left.pre[index] === right.pre[index]) continue;
+    const leftNumeric = /^\d+$/.test(left.pre[index]);
+    const rightNumeric = /^\d+$/.test(right.pre[index]);
+    if (leftNumeric && rightNumeric) return Number(left.pre[index]) - Number(right.pre[index]);
+    if (leftNumeric !== rightNumeric) return leftNumeric ? -1 : 1;
+    return left.pre[index] < right.pre[index] ? -1 : 1;
+  }
+  return 0;
+};
+if (compare(parse(current), parse(requested)) > 0) {
+  console.error(`ERROR: refusing to downgrade Homebrew cask from ${current} to ${requested}`);
+  process.exit(1);
+}
+NODE
+then
+  exit 1
+fi
+
 if command -v sha256sum >/dev/null 2>&1; then
   SHA256="$(sha256sum "$DMG" | awk '{print $1}')"
 else

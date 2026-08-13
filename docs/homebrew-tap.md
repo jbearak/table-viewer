@@ -84,7 +84,7 @@ carried a dmg would have meant a red tap CI pointing at a 404.
 
 1. **Give release CI write access to the tap.** Store `HOMEBREW_TAP_TOKEN` as
    a secret on this repository's `release` environment. It should be a GitHub
-   App installation token or fine-grained PAT restricted to
+   fine-grained PAT restricted to
    `jbearak/homebrew-table-viewer` with **Contents: write**, **Pull requests:
    write**, and **Workflows: write**. The workflow permission is needed only
    because the initial seed installs the tap's test workflow.
@@ -99,9 +99,19 @@ carried a dmg would have meant a red tap CI pointing at a 404.
    scaffold, fills in the released version and checksum, and fast-forwards
    `main`. Re-running `release-publish.yml` manually for an existing release
    such as `v0.9.1` is also safe: registry publication is skip-duplicate and the
-   GitHub Release action updates the existing release before the tap step.
+   GitHub Release action updates the existing release before the tap step. The
+   product checkout remains pinned to that release, while the seed tooling is
+   separately pinned to the immutable commit that defines the workflow run.
 
-   The seed refuses to overwrite any unexpected tracked tap content. Once the
+   Dispatch the publisher from `main`, not from the old tag (which contains the
+   old workflow definition):
+
+   ```sh
+   gh workflow run release-publish.yml --ref main -f tag=v0.9.1
+   ```
+
+   The seed refuses to overwrite any unexpected tracked tap content, and the
+   updater refuses to move the cask to an older semantic version. Once the
    cask exists, later releases take the update path and open a bump PR instead
    of writing `main` directly. Because the cask and tap CI arrive together, the
    first CI run audits and installs a cask whose checksum matches a real dmg.
