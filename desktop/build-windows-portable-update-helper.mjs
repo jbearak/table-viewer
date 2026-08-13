@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, statSync } from 'node:fs';
+import { mkdirSync, realpathSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -36,7 +36,16 @@ function run_checked(run, executable, args, cwd) {
     if (result.status !== 0) throw new Error(`${executable} exited with status ${result.status}`);
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+export function is_direct_entry(argv1, module_url, realpath = realpathSync) {
+    if (!argv1) return false;
+    try {
+        return realpath(fileURLToPath(module_url)) === realpath(argv1);
+    } catch {
+        return false;
+    }
+}
+
+if (is_direct_entry(process.argv[1], import.meta.url)) {
     const architectures = process.argv.slice(2);
     if (architectures.length === 0) architectures.push(...SUPPORTED_ARCHITECTURES);
     for (const arch of architectures) build_windows_portable_update_helper(arch);

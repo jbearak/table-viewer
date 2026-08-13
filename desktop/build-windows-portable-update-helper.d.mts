@@ -10,6 +10,11 @@ export interface HelperBuildPaths {
 }
 
 export function helper_build_paths(arch: string): HelperBuildPaths;
+export function is_direct_entry(
+    argv1: string | undefined,
+    module_url: string,
+    realpath?: (path: string) => string,
+): boolean;
 export function build_windows_portable_update_helper(
     arch: string,
     run?: typeof spawnSync,
