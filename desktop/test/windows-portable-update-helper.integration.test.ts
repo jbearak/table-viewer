@@ -34,6 +34,19 @@ windows_only('Windows portable update helper integration', () => {
             fs.readFile(target_path), fs.readFile(replacement_path),
         ]);
         const transaction_id = '1'.repeat(32);
+        const wrapper = spawn(process.execPath, ['-e', `
+            const fs = require('node:fs');
+            const path = process.argv[1];
+            const poll = setInterval(() => {
+                try {
+                    if (JSON.parse(fs.readFileSync(path, 'utf8')).status === 'waiting-for-wrapper') {
+                        clearInterval(poll);
+                        process.exit(0);
+                    }
+                } catch {}
+            }, 10);
+        `, result_path], { windowsHide: true, stdio: 'ignore' });
+        if (!wrapper.pid) throw new Error('Failed to start wrapper fixture');
         await fs.writeFile(transaction_path, JSON.stringify({
             schema_version: 1,
             transaction_id,
@@ -44,18 +57,19 @@ windows_only('Windows portable update helper integration', () => {
             expected_target_sha512: createHash('sha512').update(old_bytes).digest('base64'),
             expected_replacement_sha512: createHash('sha512').update(new_bytes).digest('base64'),
             expected_replacement_size: new_bytes.length,
-            wrapper_pid: process.pid,
+            wrapper_pid: wrapper.pid,
             acknowledgement_path,
             acknowledgement_token: '2'.repeat(32),
             result_path,
         }));
 
         const child = spawn(helper, [transaction_path], { windowsHide: true, stdio: 'ignore' });
+        await wait_for_exit(wrapper, 0);
         const diagnostic = await poll_json(result_path, (value) => value.status === 'awaiting-acknowledgement');
         expect(diagnostic).toMatchObject({ transaction_id, error: 'ack-timeout' });
         const terminal = await poll_json(result_path, (value) => value.status === 'rolled-back');
         expect(terminal).toMatchObject({ transaction_id, status: 'rolled-back', error: 'ack-timeout' });
-        await wait_for_exit(child);
+        await wait_for_exit(child, 7);
         expect(await fs.readFile(target_path)).toEqual(old_bytes);
         expect(await fs.stat(backup_path).then(() => true, () => false)).toBe(false);
         expect(await fs.readFile(join(root, 'old-relaunched'), 'utf8')).toBe('old-relaunched\n');
@@ -84,7 +98,7 @@ async function poll_json(
     throw new Error(`Timed out polling ${path}; last result: ${JSON.stringify(last)}`);
 }
 
-function wait_for_exit(child: ReturnType<typeof spawn>): Promise<void> {
+function wait_for_exit(child: ReturnType<typeof spawn>, expected_code: number): Promise<void> {
     return new Promise((resolve_exit, reject) => {
         const timeout = setTimeout(() => {
             child.kill();
@@ -96,7 +110,7 @@ function wait_for_exit(child: ReturnType<typeof spawn>): Promise<void> {
         });
         child.once('exit', (code, signal) => {
             clearTimeout(timeout);
-            if (code === 7 && signal === null) resolve_exit();
+            if (code === expected_code && signal === null) resolve_exit();
             else reject(new Error(`Native helper exited with code ${code} and signal ${signal}`));
         });
     });
