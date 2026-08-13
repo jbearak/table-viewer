@@ -6,6 +6,7 @@ import type { AboutApi } from '../preload/about-preload';
 import type { DesktopSettings } from '../main/desktop-config';
 import type { ThemePayload } from '../main/theme';
 import { SYSTEM_FONT, font_family_with_fallback } from '../main/theme-palette';
+import { install_titlebar_from_api } from '../shared/titlebar';
 
 const about_api = (window as unknown as { aboutApi: AboutApi }).aboutApi;
 
@@ -48,3 +49,8 @@ apply_theme(about_api.get_theme());
 about_api.on_theme_changed(apply_theme);
 about_api.on_settings_changed(apply_fonts);
 void about_api.get_settings().then(apply_fonts);
+
+// macOS themed title bar. No band color and no rule: this window has no
+// toolbar for the strip to continue, so it takes the window's own background
+// and reads as one surface.
+install_titlebar_from_api(document, about_api, { background: 'var(--about-bg)' });

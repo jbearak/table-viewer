@@ -8,10 +8,11 @@ import {
     CHANNEL_WELCOME_OPEN_FILES,
     CHANNEL_WELCOME_OPEN_PREFERENCES,
 } from '../shared/ipc';
+import { titlebar_preload_api, type TitlebarApi } from './titlebar-api';
 import type { DesktopSettings } from '../main/desktop-config';
 import type { ThemePayload } from '../main/theme';
 
-export interface WelcomeApi {
+export interface WelcomeApi extends TitlebarApi {
     open_files(): void;
     open_preferences(): void;
     get_theme(): ThemePayload;
@@ -21,6 +22,7 @@ export interface WelcomeApi {
 }
 
 const api: WelcomeApi = {
+    ...titlebar_preload_api(),
     open_files: () => ipcRenderer.send(CHANNEL_WELCOME_OPEN_FILES),
     open_preferences: () => ipcRenderer.send(CHANNEL_WELCOME_OPEN_PREFERENCES),
     get_theme: () => ipcRenderer.sendSync(CHANNEL_GET_THEME) as ThemePayload,

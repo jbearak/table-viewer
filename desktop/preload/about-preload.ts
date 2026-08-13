@@ -14,6 +14,7 @@ import {
     CHANNEL_SETTINGS_CHANGED,
     CHANNEL_THEME_CHANGED,
 } from '../shared/ipc';
+import { titlebar_preload_api, type TitlebarApi } from './titlebar-api';
 import type { DesktopSettings } from '../main/desktop-config';
 import type { ThemePayload } from '../main/theme';
 
@@ -21,7 +22,7 @@ import type { ThemePayload } from '../main/theme';
  *  can never talk shell.openExternal into opening something else. */
 export type AboutLink = 'notices' | 'license';
 
-export interface AboutApi {
+export interface AboutApi extends TitlebarApi {
     /** Sync, like CHANNEL_GET_THEME: needed before the first paint. */
     get_info(): { version: string };
     open_link(target: AboutLink): void;
@@ -34,6 +35,7 @@ export interface AboutApi {
 }
 
 const api: AboutApi = {
+    ...titlebar_preload_api(),
     get_info: () => ipcRenderer.sendSync(CHANNEL_ABOUT_GET_INFO) as { version: string },
     open_link: (target) => ipcRenderer.send(CHANNEL_ABOUT_OPEN_LINK, target),
     open_notices: () => ipcRenderer.send(CHANNEL_ABOUT_OPEN_NOTICES),

@@ -15,6 +15,7 @@ import {
     sanitize_new_window_size_mode,
 } from '../main/window-geometry';
 import { SYSTEM_FONT, font_family_with_fallback } from '../main/theme-palette';
+import { install_titlebar_from_api } from '../shared/titlebar';
 
 const prefs_api = (window as unknown as { prefsApi: PrefsApi }).prefsApi;
 
@@ -469,3 +470,8 @@ prefs_api.on_settings_changed((settings) => {
     apply_window_size(settings);
 });
 repopulate();
+
+// macOS themed title bar. No band color and no rule: this window has no
+// toolbar for the strip to continue, so it takes the window's own background
+// and reads as one surface.
+install_titlebar_from_api(document, prefs_api, { background: 'var(--prefs-bg)' });

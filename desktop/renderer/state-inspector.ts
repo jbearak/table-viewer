@@ -7,6 +7,7 @@
 import { apply_theme_to_document } from '../main/theme';
 import { mount_state_inspector } from '../../src/state-inspector/ui';
 import type { StateInspectorApi } from '../preload/state-inspector-preload';
+import { install_titlebar_from_api } from '../shared/titlebar';
 
 const api = (window as unknown as { stateInspectorApi: StateInspectorApi }).stateInspectorApi;
 
@@ -15,4 +16,11 @@ api.on_theme_changed((payload) => apply_theme_to_document(document, payload));
 
 mount_state_inspector(document.getElementById('root')!, {
     send: (request) => api.request(request),
+});
+
+// macOS themed title bar, drawn from the same `--vscode-*` variables applied
+// above. Like the other dialogs it has no toolbar for a header band to
+// continue, so it takes the window's own background.
+install_titlebar_from_api(document, api, {
+    background: 'var(--vscode-editor-background, #1e1e1e)',
 });

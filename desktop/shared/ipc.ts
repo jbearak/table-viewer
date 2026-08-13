@@ -26,6 +26,32 @@ export const CHANNEL_GET_THEME = 'tableViewer:getTheme';
 /** Main → viewer: OS appearance changed (ThemePayload). */
 export const CHANNEL_THEME_CHANGED = 'tableViewer:themeChanged';
 
+/** macOS themed title bar. Sync fetch of this window's title and
+ *  file path, so the preload can draw the strip the hidden native bar left behind. */
+export const CHANNEL_TITLEBAR_INFO = 'tableViewer:titlebarInfo';
+/** Cmd-click or right-click on that strip: pop the ancestor-path menu
+ *  AppKit's proxy icon would have shown. */
+export const CHANNEL_TITLEBAR_PATH_MENU = 'tableViewer:titlebarPathMenu';
+/** Sync read of the sending window's zoom factor. The strip counts as
+ *  chrome and must not scale with the page, so it divides its metrics by this.
+ *  Asked for rather than assumed to be 1: the dialog windows all load from the
+ *  same file:// origin, so a zoom set in one is inherited by the next. */
+export const CHANNEL_TITLEBAR_ZOOM = 'tableViewer:titlebarZoom';
+/** Main → one window: that window's zoom factor changed. */
+export const CHANNEL_TITLEBAR_ZOOM_CHANGED = 'tableViewer:titlebarZoomChanged';
+/** Sync read of whether the sending window is the active one. The
+ *  title dims when it is not, like a native one. `document.hasFocus()` cannot
+ *  answer this: it is true in every window of the app at once. */
+export const CHANNEL_TITLEBAR_ACTIVE = 'tableViewer:titlebarActive';
+/** Main → one window: it just became active, or stopped being. */
+export const CHANNEL_TITLEBAR_ACTIVE_CHANGED = 'tableViewer:titlebarActiveChanged';
+/** A drag over the title text: main moves the window. The text is not
+ *  a drag region, because a drag region would swallow the path-menu gestures. */
+export const CHANNEL_TITLEBAR_DRAG = 'tableViewer:titlebarDrag';
+/** A double-click on the title text: zoom the window, as double-clicking
+ *  any other part of the title bar does. */
+export const CHANNEL_TITLEBAR_ZOOM_WINDOW = 'tableViewer:titlebarZoomWindow';
+
 /** Welcome (launcher) window channels. */
 export const CHANNEL_WELCOME_OPEN_FILES = 'welcome:openFiles';
 export const CHANNEL_WELCOME_OPEN_PREFERENCES = 'welcome:openPreferences';

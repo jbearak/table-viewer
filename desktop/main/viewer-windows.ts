@@ -11,8 +11,10 @@ import {
     BrowserWindow,
     dialog,
     ipcMain,
+    Menu,
     nativeTheme,
     screen,
+    shell,
 } from 'electron';
 import {
     attach_viewer,
@@ -37,10 +39,13 @@ import { resolve_theme_id, window_background_color, type ThemePayload } from './
 import {
     CHANNEL_HOST_MESSAGE,
     CHANNEL_HOST_MESSAGE_RECEIPT,
+    CHANNEL_TITLEBAR_INFO,
+    CHANNEL_TITLEBAR_PATH_MENU,
     CHANNEL_WEBVIEW_MESSAGE,
     type DesktopHostMessageEnvelope,
     type PendingEditAcknowledgementReceipt,
 } from '../shared/ipc';
+import { TITLEBAR_WINDOW_OPTIONS } from '../shared/titlebar';
 import { viewer_url } from './viewer-html';
 import {
     MIN_WINDOW_HEIGHT,
@@ -377,6 +382,11 @@ export class ViewerWindowManager {
             minWidth: MIN_WINDOW_WIDTH,
             minHeight: MIN_WINDOW_HEIGHT,
             title,
+            // macOS themed title bar. Electron cannot make the native
+            // bar transparent while keeping its title (no titlebarAppearsTransparent
+            // /titleVisibility in the API), so the bar is hidden and the strip is
+            // redrawn in the page, over the window's already-themed backgroundColor.
+            ...TITLEBAR_WINDOW_OPTIONS,
             // resolve_theme_id is the one place "which theme is active" is
             // decided (see theme-definitions.ts); main.ts wraps it too.
             backgroundColor: window_background_color(
@@ -474,6 +484,26 @@ export class ViewerWindowManager {
         window.on('unresponsive', on_unresponsive);
         window.on('responsive', on_responsive);
         ipcMain.on(CHANNEL_HOST_MESSAGE_RECEIPT, acknowledgement_receipt_watcher);
+
+        // macOS themed title bar: the strip's title. The inset is not sent —
+        // the preload derives it from the platform (shared/titlebar.ts), the
+        // same way every other window does.
+        const titlebar_info_watcher = (event: Electron.IpcMainEvent) => {
+            if (event.sender !== web_contents) return;
+            event.returnValue = title;
+        };
+        /** The ancestor chain, file first, as the proxy-icon menu lists it. */
+        const titlebar_path_menu_watcher = (event: Electron.IpcMainEvent) => {
+            if (event.sender !== web_contents || window.isDestroyed()) return;
+            const ancestors: string[] = [];
+            for (let p = file_path; p !== path.dirname(p); p = path.dirname(p)) ancestors.push(p);
+            Menu.buildFromTemplate(ancestors.map((p) => ({
+                label: path.basename(p) || p,
+                click: () => shell.showItemInFolder(p),
+            }))).popup({ window });
+        };
+        ipcMain.on(CHANNEL_TITLEBAR_INFO, titlebar_info_watcher);
+        ipcMain.on(CHANNEL_TITLEBAR_PATH_MENU, titlebar_path_menu_watcher);
 
         const panel = create_viewer_panel({
             send: (message: HostMessage, rendererGeneration, receipt) => {
@@ -579,6 +609,8 @@ export class ViewerWindowManager {
                 window.removeListener('unresponsive', on_unresponsive);
                 window.removeListener('responsive', on_responsive);
                 ipcMain.removeListener(CHANNEL_HOST_MESSAGE_RECEIPT, acknowledgement_receipt_watcher);
+                ipcMain.removeListener(CHANNEL_TITLEBAR_INFO, titlebar_info_watcher);
+                ipcMain.removeListener(CHANNEL_TITLEBAR_PATH_MENU, titlebar_path_menu_watcher);
                 renderer_generation_listeners.clear();
                 renderer_loss_listeners.clear();
                 renderer_responsive_listeners.clear();

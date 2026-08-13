@@ -8,10 +8,11 @@ import {
     CHANNEL_SETTINGS_CHANGED,
     CHANNEL_THEME_CHANGED,
 } from '../shared/ipc';
+import { titlebar_preload_api, type TitlebarApi } from './titlebar-api';
 import { list_themes, type ThemeId, type ThemeKind, type ThemePayload } from '../main/theme';
 import type { DesktopSettings } from '../main/desktop-config';
 
-export interface PrefsApi {
+export interface PrefsApi extends TitlebarApi {
     get_settings(): Promise<DesktopSettings>;
     set_settings(partial: Partial<DesktopSettings>): Promise<DesktopSettings>;
     /** Blocking write, for the unload-time flush only: a promise started in
@@ -29,6 +30,7 @@ export interface PrefsApi {
 }
 
 const api: PrefsApi = {
+    ...titlebar_preload_api(),
     get_settings: () => ipcRenderer.invoke(CHANNEL_PREFS_GET),
     set_settings: (partial) => ipcRenderer.invoke(CHANNEL_PREFS_SET, partial),
     set_settings_sync: (partial) => {

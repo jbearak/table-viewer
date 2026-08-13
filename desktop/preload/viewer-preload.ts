@@ -20,11 +20,19 @@ import {
     CHANNEL_HOST_MESSAGE,
     CHANNEL_HOST_MESSAGE_RECEIPT,
     CHANNEL_THEME_CHANGED,
+    CHANNEL_TITLEBAR_INFO,
+    CHANNEL_TITLEBAR_PATH_MENU,
     CHANNEL_WEBVIEW_MESSAGE,
     type DesktopHostMessageEnvelope,
     type PendingEditAcknowledgementReceipt,
 } from '../shared/ipc';
 import { apply_theme_to_document, type ThemePayload } from '../main/theme';
+import {
+    install_titlebar,
+    set_titlebar_active,
+    set_titlebar_zoom,
+} from '../shared/titlebar';
+import { titlebar_preload_api } from './titlebar-api';
 
 // contextBridge clones the object into the main world, so the shared bundle
 // (which only calls postMessage) works across the isolation boundary.
@@ -81,3 +89,28 @@ window.addEventListener('DOMContentLoaded', () => apply_theme(current_theme));
 ipcRenderer.on(CHANNEL_THEME_CHANGED, (_event, payload: ThemePayload) => {
     apply_theme(payload);
 });
+
+// macOS themed title bar. The strip itself is shared with the other
+// windows (desktop/shared/titlebar.ts); the viewer supplies the file name, the
+// toolbar's own band colors (see .toolbar in src/webview/styles.css), and the
+// proxy-icon path menu, which only a window representing a file has. The title's
+// own font and color are the system's, not the configured app font.
+const titlebar_api = titlebar_preload_api();
+if (titlebar_api.titlebar_inset) {
+    const title = ipcRenderer.sendSync(CHANNEL_TITLEBAR_INFO) as string | undefined;
+    window.addEventListener('DOMContentLoaded', () => install_titlebar(document, {
+        title: title ?? document.title,
+        inset: titlebar_api.titlebar_inset,
+        style: {
+            background: 'var(--vscode-editorGroupHeader-tabsBackground, #252526)',
+            border: 'var(--vscode-panel-border, #444)',
+        },
+        on_path_menu: () => ipcRenderer.send(CHANNEL_TITLEBAR_PATH_MENU),
+        on_drag: (phase, x, y) => titlebar_api.drag_titlebar(phase, x, y),
+        on_zoom_window: () => titlebar_api.zoom_titlebar_window(),
+        zoom: titlebar_api.titlebar_zoom(),
+        active: titlebar_api.titlebar_active(),
+    }));
+    titlebar_api.on_titlebar_zoom((zoom) => set_titlebar_zoom(document, zoom));
+    titlebar_api.on_titlebar_active((active) => set_titlebar_active(document, active));
+}
