@@ -23,6 +23,22 @@
  * getContentBounds().height` for a window that kept its native bar.
  */
 export const TITLEBAR_HEIGHT = 32;
+
+/** Strip height for this platform: TITLEBAR_HEIGHT where the themed strip
+ *  replaces the native bar, 0 where the native bar remains. The `typeof` guard
+ *  is for the renderers, which import this module without a `process`. */
+export function titlebar_inset(): number {
+    return typeof process !== 'undefined' && process.platform === 'darwin' ? TITLEBAR_HEIGHT : 0;
+}
+
+/**
+ * The BrowserWindow options that trade the native macOS title bar for this
+ * strip. `hidden` hides the bar and its title but keeps the traffic lights;
+ * every window that spreads this must also install the strip, or it has no
+ * title at all. Off macOS this is empty and the native bar stays.
+ */
+export const TITLEBAR_WINDOW_OPTIONS =
+    titlebar_inset() ? { titleBarStyle: 'hidden' as const } : {};
 /** Width of the traffic lights at the standard position, plus a gap. */
 const TRAFFIC_LIGHT_GUTTER = 78;
 const ELEMENT_ID = 'tv-titlebar';
@@ -60,6 +76,60 @@ const TITLE_COLORS = {
 function theme_kind(doc: Document): 'dark' | 'light' {
     const scheme = doc.defaultView?.getComputedStyle(doc.documentElement).colorScheme;
     return scheme === 'light' ? 'light' : 'dark';
+}
+
+/**
+ * The title-bar slice of a chrome window's preload API — what
+ * `install_titlebar_from_api` needs. Implemented once by
+ * `titlebar_preload_api()` (desktop/preload/titlebar-api.ts).
+ */
+export interface TitlebarWindowApi {
+    /** The strip height this window's renderer must draw and inset for, or 0
+     *  where the native bar remains. */
+    titlebar_inset: number;
+    /** Whether this window is the active one, which dims the title when it is
+     *  not, and a subscription to later changes. */
+    titlebar_active(): boolean;
+    on_titlebar_active(listener: (active: boolean) => void): void;
+    /** This window's zoom factor, which the strip divides its metrics by so it
+     *  stays the size of the window chrome it replaces, and a subscription to
+     *  later changes. */
+    titlebar_zoom(): number;
+    on_titlebar_zoom(listener: (zoom: number) => void): void;
+    /** A drag over the title text, which main turns into a window move (the
+     *  text cannot be a drag region — see `TitlebarOptions.on_drag`). */
+    drag_titlebar(phase: 'start' | 'move', x: number, y: number): void;
+    /** Double-click on the title zooms the window, like a double-click
+     *  anywhere else on a title bar. */
+    zoom_titlebar_window(): void;
+}
+
+/**
+ * Wire the strip to a chrome window's preload API: draw it with the window's
+ * current title, zoom, and active state, and subscribe to later changes.
+ *
+ * The one call every dialog renderer makes — only the style differs per
+ * window. A zero inset installs nothing and, deliberately, asks main nothing:
+ * the zoom and active reads are synchronous IPC, wasted where the native bar
+ * remains.
+ */
+export function install_titlebar_from_api(
+    doc: Document,
+    api: TitlebarWindowApi,
+    style: TitlebarStyle,
+): void {
+    if (!api.titlebar_inset) return;
+    install_titlebar(doc, {
+        title: doc.title,
+        inset: api.titlebar_inset,
+        zoom: api.titlebar_zoom(),
+        active: api.titlebar_active(),
+        on_drag: (phase, x, y) => api.drag_titlebar(phase, x, y),
+        on_zoom_window: () => api.zoom_titlebar_window(),
+        style,
+    });
+    api.on_titlebar_zoom((zoom) => set_titlebar_zoom(doc, zoom));
+    api.on_titlebar_active((active) => set_titlebar_active(doc, active));
 }
 
 export interface TitlebarStyle {

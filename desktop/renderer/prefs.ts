@@ -15,7 +15,7 @@ import {
     sanitize_new_window_size_mode,
 } from '../main/window-geometry';
 import { SYSTEM_FONT, font_family_with_fallback } from '../main/theme-palette';
-import { install_titlebar, set_titlebar_active, set_titlebar_zoom } from '../shared/titlebar';
+import { install_titlebar_from_api } from '../shared/titlebar';
 
 const prefs_api = (window as unknown as { prefsApi: PrefsApi }).prefsApi;
 
@@ -43,10 +43,6 @@ function apply_theme(payload: ThemePayload): void {
     root.style.setProperty('--prefs-bg', vars['--vscode-editor-background']);
     root.style.setProperty('--prefs-fg', vars['--vscode-foreground']);
     root.style.setProperty('--prefs-border', vars['--vscode-input-border']);
-    // The title-bar strip's band (desktop/shared/titlebar.ts), matching the
-    // viewer's toolbar so every window's header reads the same.
-    root.style.setProperty('--prefs-header-bg', vars['--vscode-editorGroupHeader-tabsBackground']);
-    root.style.setProperty('--prefs-header-border', vars['--vscode-panel-border']);
     root.style.setProperty('--prefs-input-bg', vars['--vscode-input-background']);
     root.style.setProperty('--prefs-muted', vars['--vscode-descriptionForeground']);
     root.style.colorScheme = payload.kind;
@@ -475,22 +471,7 @@ prefs_api.on_settings_changed((settings) => {
 });
 repopulate();
 
-// macOS themed title bar: `titleBarStyle: 'hidden'` hides the native
-// bar (and its title), so this window redraws the strip itself. No band color and
-// no rule: this window has no toolbar for the strip to continue, so it takes the
-// window's own background and reads as one surface. Colors and font are this
-// page's own variables, so a theme or font change repaints it with no work here.
-// No path menu: only a window representing a file has one.
-install_titlebar(document, {
-    title: document.title,
-    inset: prefs_api.titlebar_inset,
-    zoom: prefs_api.titlebar_zoom(),
-    active: prefs_api.titlebar_active(),
-    on_drag: (phase, x, y) => prefs_api.drag_titlebar(phase, x, y),
-    on_zoom_window: () => prefs_api.zoom_titlebar_window(),
-    style: {
-        background: 'var(--prefs-bg)',
-    },
-});
-prefs_api.on_titlebar_zoom((zoom) => set_titlebar_zoom(document, zoom));
-prefs_api.on_titlebar_active((active) => set_titlebar_active(document, active));
+// macOS themed title bar. No band color and no rule: this window has no
+// toolbar for the strip to continue, so it takes the window's own background
+// and reads as one surface.
+install_titlebar_from_api(document, prefs_api, { background: 'var(--prefs-bg)' });

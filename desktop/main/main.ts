@@ -69,6 +69,7 @@ import { notices_file_path } from './notices-path';
 import { save_open_window_paths, take_open_window_paths } from './window-restoration';
 import { REPOSITORY_URL, about_link_url } from './about-links';
 import { clamp_zoom_level } from './zoom';
+import { TITLEBAR_WINDOW_OPTIONS } from '../shared/titlebar';
 import {
     SUPPORTED_FILE_EXTENSIONS,
     register_portable_file_associations,
@@ -135,8 +136,6 @@ function file_args(argv: string[], base_dir: string = process.cwd()): string[] {
 }
 
 // dist/desktop/main.js → repo (or app) root two levels up.
-const IS_MAC = process.platform === 'darwin';
-
 const DIST_DIR = path.join(__dirname, '..');
 const WEBVIEW_DIST_DIR = path.join(DIST_DIR, 'webview');
 const DESKTOP_DIST_DIR = path.join(DIST_DIR, 'desktop');
@@ -376,7 +375,7 @@ function show_welcome_window(): BrowserWindow {
         title: 'Table Viewer',
         // macOS themed title bar (desktop/shared/titlebar.ts); the
         // strip is redrawn by this window's renderer.
-        ...(IS_MAC ? { titleBarStyle: 'hidden' as const } : {}),
+        ...TITLEBAR_WINDOW_OPTIONS,
         backgroundColor: window_background_color(current_theme_id()),
         webPreferences: {
             preload: WELCOME_PRELOAD,
@@ -422,7 +421,7 @@ function show_preferences_window(): void {
         title: 'Table Viewer Preferences',
         // macOS themed title bar (desktop/shared/titlebar.ts); the
         // strip is redrawn by this window's renderer.
-        ...(IS_MAC ? { titleBarStyle: 'hidden' as const } : {}),
+        ...TITLEBAR_WINDOW_OPTIONS,
         backgroundColor: window_background_color(current_theme_id()),
         webPreferences: {
             preload: PREFS_PRELOAD,
@@ -455,7 +454,7 @@ function show_about_window(): void {
         title: 'About Table Viewer',
         // macOS themed title bar (desktop/shared/titlebar.ts); the
         // strip is redrawn by this window's renderer.
-        ...(IS_MAC ? { titleBarStyle: 'hidden' as const } : {}),
+        ...TITLEBAR_WINDOW_OPTIONS,
         backgroundColor: window_background_color(current_theme_id()),
         webPreferences: {
             preload: ABOUT_PRELOAD,
@@ -488,7 +487,7 @@ function show_state_inspector_window(): void {
         title: 'Stored File State',
         // macOS themed title bar (desktop/shared/titlebar.ts); the
         // strip is redrawn by this window's renderer.
-        ...(IS_MAC ? { titleBarStyle: 'hidden' as const } : {}),
+        ...TITLEBAR_WINDOW_OPTIONS,
         backgroundColor: window_background_color(current_theme_id()),
         webPreferences: {
             preload: STATE_INSPECTOR_PRELOAD,
@@ -730,6 +729,9 @@ function update_settings(partial: unknown): DesktopSettings {
 const titlebar_drag_anchors = new WeakMap<BrowserWindow, {
     pointer: { x: number; y: number };
     window: { x: number; y: number };
+    /** Captured at `start`: zoom cannot change mid-drag, and reading it per
+     *  move would be a webContents call for every pointer event. */
+    zoom: number;
 }>();
 
 function drag_titlebar(
@@ -741,17 +743,20 @@ function drag_titlebar(
     if (!window || window.isDestroyed()) return;
     if (phase === 'start') {
         const { x: window_x, y: window_y } = window.getBounds();
-        titlebar_drag_anchors.set(window, { pointer: { x, y }, window: { x: window_x, y: window_y } });
+        titlebar_drag_anchors.set(window, {
+            pointer: { x, y },
+            window: { x: window_x, y: window_y },
+            zoom: window.webContents.isDestroyed() ? 1 : window.webContents.getZoomFactor(),
+        });
         return;
     }
     const anchor = titlebar_drag_anchors.get(window);
     // A move with no anchor is a drag that began before this window existed in
     // the map — nothing sensible to move it relative to, so ignore it.
     if (!anchor) return;
-    const zoom = window.webContents.isDestroyed() ? 1 : window.webContents.getZoomFactor();
     window.setPosition(
-        Math.round(anchor.window.x + (x - anchor.pointer.x) * zoom),
-        Math.round(anchor.window.y + (y - anchor.pointer.y) * zoom),
+        Math.round(anchor.window.x + (x - anchor.pointer.x) * anchor.zoom),
+        Math.round(anchor.window.y + (y - anchor.pointer.y) * anchor.zoom),
     );
 }
 

@@ -6,7 +6,7 @@ import type { AboutApi } from '../preload/about-preload';
 import type { DesktopSettings } from '../main/desktop-config';
 import type { ThemePayload } from '../main/theme';
 import { SYSTEM_FONT, font_family_with_fallback } from '../main/theme-palette';
-import { install_titlebar, set_titlebar_active, set_titlebar_zoom } from '../shared/titlebar';
+import { install_titlebar_from_api } from '../shared/titlebar';
 
 const about_api = (window as unknown as { aboutApi: AboutApi }).aboutApi;
 
@@ -50,22 +50,7 @@ about_api.on_theme_changed(apply_theme);
 about_api.on_settings_changed(apply_fonts);
 void about_api.get_settings().then(apply_fonts);
 
-// macOS themed title bar: `titleBarStyle: 'hidden'` hides the native
-// bar (and its title), so this window redraws the strip itself. No band color and
-// no rule: this window has no toolbar for the strip to continue, so it takes the
-// window's own background and reads as one surface. Colors and font are this
-// page's own variables, so a theme or font change repaints it with no work here.
-// No path menu: only a window representing a file has one.
-install_titlebar(document, {
-    title: document.title,
-    inset: about_api.titlebar_inset,
-    zoom: about_api.titlebar_zoom(),
-    active: about_api.titlebar_active(),
-    on_drag: (phase, x, y) => about_api.drag_titlebar(phase, x, y),
-    on_zoom_window: () => about_api.zoom_titlebar_window(),
-    style: {
-        background: 'var(--about-bg)',
-    },
-});
-about_api.on_titlebar_zoom((zoom) => set_titlebar_zoom(document, zoom));
-about_api.on_titlebar_active((active) => set_titlebar_active(document, active));
+// macOS themed title bar. No band color and no rule: this window has no
+// toolbar for the strip to continue, so it takes the window's own background
+// and reads as one surface.
+install_titlebar_from_api(document, about_api, { background: 'var(--about-bg)' });

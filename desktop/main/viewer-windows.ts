@@ -45,7 +45,7 @@ import {
     type DesktopHostMessageEnvelope,
     type PendingEditAcknowledgementReceipt,
 } from '../shared/ipc';
-import { TITLEBAR_HEIGHT } from '../shared/titlebar';
+import { TITLEBAR_WINDOW_OPTIONS } from '../shared/titlebar';
 import { viewer_url } from './viewer-html';
 import {
     MIN_WINDOW_HEIGHT,
@@ -386,7 +386,7 @@ export class ViewerWindowManager {
             // bar transparent while keeping its title (no titlebarAppearsTransparent
             // /titleVisibility in the API), so the bar is hidden and the strip is
             // redrawn in the page, over the window's already-themed backgroundColor.
-            ...(IS_MAC ? { titleBarStyle: 'hidden' as const } : {}),
+            ...TITLEBAR_WINDOW_OPTIONS,
             // resolve_theme_id is the one place "which theme is active" is
             // decided (see theme-definitions.ts); main.ts wraps it too.
             backgroundColor: window_background_color(
@@ -485,10 +485,12 @@ export class ViewerWindowManager {
         window.on('responsive', on_responsive);
         ipcMain.on(CHANNEL_HOST_MESSAGE_RECEIPT, acknowledgement_receipt_watcher);
 
-        // macOS themed title bar.
+        // macOS themed title bar: the strip's title. The inset is not sent —
+        // the preload derives it from the platform (shared/titlebar.ts), the
+        // same way every other window does.
         const titlebar_info_watcher = (event: Electron.IpcMainEvent) => {
             if (event.sender !== web_contents) return;
-            event.returnValue = { title, inset: IS_MAC ? TITLEBAR_HEIGHT : 0 };
+            event.returnValue = title;
         };
         /** The ancestor chain, file first, as the proxy-icon menu lists it. */
         const titlebar_path_menu_watcher = (event: Electron.IpcMainEvent) => {

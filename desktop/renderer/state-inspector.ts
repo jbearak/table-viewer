@@ -7,7 +7,7 @@
 import { apply_theme_to_document } from '../main/theme';
 import { mount_state_inspector } from '../../src/state-inspector/ui';
 import type { StateInspectorApi } from '../preload/state-inspector-preload';
-import { install_titlebar, set_titlebar_active, set_titlebar_zoom } from '../shared/titlebar';
+import { install_titlebar_from_api } from '../shared/titlebar';
 
 const api = (window as unknown as { stateInspectorApi: StateInspectorApi }).stateInspectorApi;
 
@@ -18,21 +18,9 @@ mount_state_inspector(document.getElementById('root')!, {
     send: (request) => api.request(request),
 });
 
-// macOS themed title bar: `titleBarStyle: 'hidden'` hides the native
-// bar (and its title), so this window redraws the strip itself, from the same
-// `--vscode-*` variables applied above. It takes the window's own background: like
-// the other dialogs it has no toolbar for a header band to continue. No path menu
-// either — this window inspects many files rather than representing one.
-install_titlebar(document, {
-    title: document.title,
-    inset: api.titlebar_inset,
-    zoom: api.titlebar_zoom(),
-    active: api.titlebar_active(),
-    on_drag: (phase, x, y) => api.drag_titlebar(phase, x, y),
-    on_zoom_window: () => api.zoom_titlebar_window(),
-    style: {
-        background: 'var(--vscode-editor-background, #1e1e1e)',
-    },
+// macOS themed title bar, drawn from the same `--vscode-*` variables applied
+// above. Like the other dialogs it has no toolbar for a header band to
+// continue, so it takes the window's own background.
+install_titlebar_from_api(document, api, {
+    background: 'var(--vscode-editor-background, #1e1e1e)',
 });
-api.on_titlebar_zoom((zoom) => set_titlebar_zoom(document, zoom));
-api.on_titlebar_active((active) => set_titlebar_active(document, active));

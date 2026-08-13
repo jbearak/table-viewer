@@ -22,12 +22,6 @@ import {
     CHANNEL_THEME_CHANGED,
     CHANNEL_TITLEBAR_INFO,
     CHANNEL_TITLEBAR_PATH_MENU,
-    CHANNEL_TITLEBAR_ACTIVE,
-    CHANNEL_TITLEBAR_DRAG,
-    CHANNEL_TITLEBAR_ZOOM_WINDOW,
-    CHANNEL_TITLEBAR_ACTIVE_CHANGED,
-    CHANNEL_TITLEBAR_ZOOM,
-    CHANNEL_TITLEBAR_ZOOM_CHANGED,
     CHANNEL_WEBVIEW_MESSAGE,
     type DesktopHostMessageEnvelope,
     type PendingEditAcknowledgementReceipt,
@@ -38,6 +32,7 @@ import {
     set_titlebar_active,
     set_titlebar_zoom,
 } from '../shared/titlebar';
+import { titlebar_preload_api } from './titlebar-api';
 
 // contextBridge clones the object into the main world, so the shared bundle
 // (which only calls postMessage) works across the isolation boundary.
@@ -100,27 +95,22 @@ ipcRenderer.on(CHANNEL_THEME_CHANGED, (_event, payload: ThemePayload) => {
 // toolbar's own band colors (see .toolbar in src/webview/styles.css), and the
 // proxy-icon path menu, which only a window representing a file has. The title's
 // own font and color are the system's, not the configured app font.
-const titlebar = ipcRenderer.sendSync(CHANNEL_TITLEBAR_INFO) as
-    { title: string; inset: number } | undefined;
-
-if (titlebar) {
+const titlebar_api = titlebar_preload_api();
+if (titlebar_api.titlebar_inset) {
+    const title = ipcRenderer.sendSync(CHANNEL_TITLEBAR_INFO) as string | undefined;
     window.addEventListener('DOMContentLoaded', () => install_titlebar(document, {
-        title: titlebar.title,
-        inset: titlebar.inset,
+        title: title ?? document.title,
+        inset: titlebar_api.titlebar_inset,
         style: {
             background: 'var(--vscode-editorGroupHeader-tabsBackground, #252526)',
             border: 'var(--vscode-panel-border, #444)',
         },
         on_path_menu: () => ipcRenderer.send(CHANNEL_TITLEBAR_PATH_MENU),
-        on_drag: (phase, x, y) => ipcRenderer.send(CHANNEL_TITLEBAR_DRAG, phase, x, y),
-        on_zoom_window: () => ipcRenderer.send(CHANNEL_TITLEBAR_ZOOM_WINDOW),
-        zoom: ipcRenderer.sendSync(CHANNEL_TITLEBAR_ZOOM) as number,
-        active: ipcRenderer.sendSync(CHANNEL_TITLEBAR_ACTIVE) as boolean,
+        on_drag: (phase, x, y) => titlebar_api.drag_titlebar(phase, x, y),
+        on_zoom_window: () => titlebar_api.zoom_titlebar_window(),
+        zoom: titlebar_api.titlebar_zoom(),
+        active: titlebar_api.titlebar_active(),
     }));
-    ipcRenderer.on(CHANNEL_TITLEBAR_ZOOM_CHANGED, (_event, zoom: number) => {
-        set_titlebar_zoom(document, zoom);
-    });
-    ipcRenderer.on(CHANNEL_TITLEBAR_ACTIVE_CHANGED, (_event, active: boolean) => {
-        set_titlebar_active(document, active);
-    });
+    titlebar_api.on_titlebar_zoom((zoom) => set_titlebar_zoom(document, zoom));
+    titlebar_api.on_titlebar_active((active) => set_titlebar_active(document, active));
 }
