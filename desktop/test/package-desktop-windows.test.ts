@@ -6,10 +6,12 @@ type PackageOptions = {
     attempts?: number;
     version?: string;
     run_builder?: (arch: string) => PackageResult;
+    build_helper?: (arch: string) => void;
+    helper_path?: (arch: string) => string;
     copy_file?: (source: string, target: string) => void;
     exists?: (path: string) => boolean;
     remove?: (path: string, options: { force: boolean }) => void;
-    select_manifest?: (path: string, expected_asset: string) => void;
+    select_manifest?: (source: string, expected_asset: string, target?: string) => void;
     validate?: (path: string, options: Record<string, unknown>) => void;
     log?: { info(message: string): void; warn(message: string): void };
 };
@@ -26,6 +28,7 @@ beforeAll(async () => {
 function options(run_builder: (arch: string) => PackageResult): PackageOptions {
     return {
         version: '1.2.3', run_builder, exists: () => true,
+        build_helper: vi.fn(), helper_path: (arch) => `/helpers/${arch}.exe`,
         copy_file: vi.fn(), remove: vi.fn(), select_manifest: vi.fn(), validate: vi.fn(),
         log: { info: vi.fn(), warn: vi.fn() },
     };
@@ -43,14 +46,16 @@ describe('Windows desktop packaging wrapper', () => {
         expect(windows_config).not.toMatch(/^\s+arch:/m);
     });
 
-    it('keeps only the setup executable in multi-target update metadata', () => {
+    it('selects one requested executable from multi-target update metadata', () => {
         const setup = { url: 'table-viewer-1.2.3-x64-setup.exe', sha512: 'setup-digest', size: 12 };
         const portable = { url: 'table-viewer-1.2.3-x64-portable.exe', sha512: 'portable-digest', size: 34 };
+        const metadata = { version: '1.2.3', files: [portable, setup], path: portable.url, sha512: portable.sha512 };
 
-        expect(select_windows_update_asset({
-            version: '1.2.3', files: [portable, setup], path: portable.url, sha512: portable.sha512,
-        }, setup.url)).toEqual({
+        expect(select_windows_update_asset(metadata, setup.url)).toEqual({
             version: '1.2.3', files: [setup], path: setup.url, sha512: setup.sha512,
+        });
+        expect(select_windows_update_asset(metadata, portable.url)).toEqual({
+            version: '1.2.3', files: [portable], path: portable.url, sha512: portable.sha512,
         });
     });
 
@@ -60,19 +65,69 @@ describe('Windows desktop packaging wrapper', () => {
         );
     });
 
-    it('packages each architecture separately and preserves both manifests', () => {
+    it('packages each architecture separately and preserves setup and portable manifests', () => {
         const run_builder = vi.fn().mockReturnValue({ status: 0 });
         const config = options(run_builder);
         package_desktop_windows(config);
 
         expect(run_builder.mock.calls.map(([arch]) => arch)).toEqual(['x64', 'arm64']);
-        expect(config.validate).toHaveBeenCalledTimes(2);
+        expect(config.build_helper).toHaveBeenCalledTimes(2);
+        expect(config.build_helper).toHaveBeenNthCalledWith(1, 'x64');
+        expect(config.build_helper).toHaveBeenNthCalledWith(2, 'arm64');
+        const staged_helper = expect.stringMatching(/dist[/\\]native[/\\]windows-portable-update-helper\.exe$/);
+        expect(config.remove).toHaveBeenCalledTimes(3);
+        expect(config.remove).toHaveBeenNthCalledWith(1, staged_helper, { force: true });
+        expect(config.remove).toHaveBeenNthCalledWith(2, staged_helper, { force: true });
+        expect(config.copy_file).toHaveBeenCalledWith(
+            '/helpers/x64.exe', expect.stringMatching(/dist[/\\]native[/\\]windows-portable-update-helper\.exe$/),
+        );
+        expect(config.copy_file).toHaveBeenCalledWith(
+            '/helpers/arm64.exe', expect.stringMatching(/dist[/\\]native[/\\]windows-portable-update-helper\.exe$/),
+        );
+        expect(config.select_manifest).toHaveBeenCalledTimes(4);
+        expect(config.select_manifest).toHaveBeenNthCalledWith(
+            1, expect.stringMatching(/latest\.yml$/), 'table-viewer-1.2.3-x64-portable.exe',
+            expect.stringMatching(/latest-portable\.yml$/),
+        );
+        expect(config.select_manifest).toHaveBeenNthCalledWith(
+            2, expect.stringMatching(/latest\.yml$/), 'table-viewer-1.2.3-x64-setup.exe',
+        );
+        expect(config.select_manifest).toHaveBeenNthCalledWith(
+            3, expect.stringMatching(/latest\.yml$/), 'table-viewer-1.2.3-arm64-portable.exe',
+            expect.stringMatching(/latest-portable-arm64\.yml$/),
+        );
+        expect(config.select_manifest).toHaveBeenNthCalledWith(
+            4, expect.stringMatching(/latest\.yml$/), 'table-viewer-1.2.3-arm64-setup.exe',
+        );
+        expect(config.validate).toHaveBeenCalledTimes(4);
         expect(config.validate).toHaveBeenNthCalledWith(1, expect.stringMatching(/latest\.yml$/), {
-            expected_version: '1.2.3', expected_asset: 'table-viewer-1.2.3-x64-setup.exe', require_blockmap: true,
+            expected_version: '1.2.3', expected_asset: 'table-viewer-1.2.3-x64-setup.exe',
+            strict: true, require_blockmap: true,
         });
-        expect(config.validate).toHaveBeenNthCalledWith(2, expect.stringMatching(/latest-arm64\.yml$/), {
-            expected_version: '1.2.3', expected_asset: 'table-viewer-1.2.3-arm64-setup.exe', require_blockmap: true,
+        expect(config.validate).toHaveBeenNthCalledWith(2, expect.stringMatching(/latest-portable\.yml$/), {
+            expected_version: '1.2.3', expected_asset: 'table-viewer-1.2.3-x64-portable.exe',
+            strict: true, require_blockmap: false,
         });
+        expect(config.validate).toHaveBeenNthCalledWith(3, expect.stringMatching(/latest-arm64\.yml$/), {
+            expected_version: '1.2.3', expected_asset: 'table-viewer-1.2.3-arm64-setup.exe',
+            strict: true, require_blockmap: true,
+        });
+        expect(config.validate).toHaveBeenNthCalledWith(4, expect.stringMatching(/latest-portable-arm64\.yml$/), {
+            expected_version: '1.2.3', expected_asset: 'table-viewer-1.2.3-arm64-portable.exe',
+            strict: true, require_blockmap: false,
+        });
+        const x64_setup_validation = (config.validate as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+        const saved_x64_copy = (config.copy_file as ReturnType<typeof vi.fn>).mock.invocationCallOrder.find((_, index) => {
+            const [, target] = (config.copy_file as ReturnType<typeof vi.fn>).mock.calls[index];
+            return /latest-x64\.yml$/.test(target);
+        });
+        const x64_portable_validation = (config.validate as ReturnType<typeof vi.fn>).mock.invocationCallOrder[1];
+        expect(x64_setup_validation).toBeLessThan(saved_x64_copy!);
+        expect(saved_x64_copy).toBeLessThan(x64_portable_validation);
+        expect(config.copy_file).toHaveBeenCalledWith(
+            expect.stringMatching(/latest-x64\.yml$/), expect.stringMatching(/latest\.yml$/),
+        );
+        expect(config.remove).toHaveBeenCalledWith(expect.stringMatching(/latest-x64\.yml$/), { force: true });
     });
 
     it('retries only the failing architecture and stops at success', () => {

@@ -490,8 +490,8 @@ jobs:
         run: npm run desktop:package:win
 
       # Four exes are expected: {x64,arm64} x {setup,portable}. Assert the count
-      # so a silently dropped target fails here rather than disappearing from the
-      # GitHub Release.
+      # and validate the isolated setup (with blockmaps) and portable (without
+      # blockmaps) manifests before anything reaches the GitHub Release.
       - name: Calculate checksums
         shell: bash
         working-directory: dist/desktop-packages
@@ -508,8 +508,10 @@ jobs:
             sha256sum "$exe" | tee "$exe.sha256"
           done
           VERSION=$(node -p "require('../../package.json').version")
-          node ../../scripts/validate-update-metadata.mjs latest.yml "$VERSION" "table-viewer-${VERSION}-x64-setup.exe" --require-blockmap
-          node ../../scripts/validate-update-metadata.mjs latest-arm64.yml "$VERSION" "table-viewer-${VERSION}-arm64-setup.exe" --require-blockmap
+          node ../../scripts/validate-update-metadata.mjs latest.yml "$VERSION" "table-viewer-${VERSION}-x64-setup.exe" --strict --require-blockmap
+          node ../../scripts/validate-update-metadata.mjs latest-arm64.yml "$VERSION" "table-viewer-${VERSION}-arm64-setup.exe" --strict --require-blockmap
+          node ../../scripts/validate-update-metadata.mjs latest-portable.yml "$VERSION" "table-viewer-${VERSION}-x64-portable.exe" --strict
+          node ../../scripts/validate-update-metadata.mjs latest-portable-arm64.yml "$VERSION" "table-viewer-${VERSION}-arm64-portable.exe" --strict
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
@@ -523,3 +525,5 @@ jobs:
             dist/desktop-packages/table-viewer-*.exe.sha256
             dist/desktop-packages/latest.yml
             dist/desktop-packages/latest-arm64.yml
+            dist/desktop-packages/latest-portable.yml
+            dist/desktop-packages/latest-portable-arm64.yml

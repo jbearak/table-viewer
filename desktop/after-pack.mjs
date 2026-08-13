@@ -13,8 +13,9 @@
 // produces a perfectly normal-looking installer with the attributions silently
 // missing. That is exactly the kind of thing nobody notices until it ships, so
 // fail the build here instead.
-import { stat } from 'node:fs/promises';
+import { open, stat } from 'node:fs/promises';
 import { join } from 'node:path';
+import { Arch } from 'builder-util';
 
 // Contents/Resources destinations from electron-builder.yml's extraResources.
 const REQUIRED_NOTICES = [
@@ -23,6 +24,49 @@ const REQUIRED_NOTICES = [
     'LICENSE.electron.txt',
     'LICENSES.chromium.html',
 ];
+const WINDOWS_PORTABLE_UPDATE_HELPER = 'windows-portable-update-helper.exe';
+const PE_MACHINE = new Map([
+    [Arch.x64, 0x8664],
+    [Arch.arm64, 0xaa64],
+]);
+
+export async function pe_machine(file_path) {
+    const file_size = (await stat(file_path)).size;
+    const file = await open(file_path, 'r');
+    try {
+        const dos = Buffer.alloc(64);
+        if ((await file.read(dos, 0, dos.length, 0)).bytesRead !== dos.length
+            || dos.readUInt16LE(0) !== 0x5a4d) return undefined;
+        const pe_offset = dos.readUInt32LE(0x3c);
+        const coff = Buffer.alloc(24);
+        if (pe_offset < dos.length || pe_offset + coff.length > file_size
+            || (await file.read(coff, 0, coff.length, pe_offset)).bytesRead !== coff.length
+            || coff.readUInt32LE(0) !== 0x00004550) return undefined;
+        const sections = coff.readUInt16LE(6);
+        const optional_size = coff.readUInt16LE(20);
+        const optional_offset = pe_offset + coff.length;
+        const section_offset = optional_offset + optional_size;
+        if (sections === 0 || optional_size < 2 || section_offset + sections * 40 > file_size) return undefined;
+        const magic = Buffer.alloc(2);
+        if ((await file.read(magic, 0, magic.length, optional_offset)).bytesRead !== magic.length
+            || magic.readUInt16LE(0) !== 0x20b) return undefined;
+        const section_table = Buffer.alloc(sections * 40);
+        if ((await file.read(section_table, 0, section_table.length, section_offset)).bytesRead
+            !== section_table.length) return undefined;
+        let has_file_data = false;
+        for (let index = 0; index < sections; index += 1) {
+            const offset = index * 40;
+            const raw_size = section_table.readUInt32LE(offset + 16);
+            const raw_offset = section_table.readUInt32LE(offset + 20);
+            if (raw_size > 0 && raw_offset <= file_size && raw_size <= file_size - raw_offset) {
+                has_file_data = true;
+            } else if (raw_size > 0) return undefined;
+        }
+        return has_file_data ? coff.readUInt16LE(4) : undefined;
+    } finally {
+        await file.close();
+    }
+}
 
 // Where extraResources land, per platform. macOS buries them in the .app
 // bundle; Windows and Linux put them in a sibling `resources` directory.
@@ -41,10 +85,13 @@ function resources_dir(context) {
 export default async function after_pack(context) {
     const resources = resources_dir(context);
 
+    const required = context.electronPlatformName === 'win32'
+        ? [...REQUIRED_NOTICES, WINDOWS_PORTABLE_UPDATE_HELPER]
+        : REQUIRED_NOTICES;
     const missing = [];
-    for (const name of REQUIRED_NOTICES) {
+    for (const name of required) {
         try {
-            // Empty counts as missing: a zero-byte notice is no notice.
+            // Empty counts as missing: a zero-byte notice or helper is not usable.
             if ((await stat(join(resources, name))).size === 0) missing.push(`${name} (empty)`);
         } catch {
             missing.push(name);
@@ -53,12 +100,25 @@ export default async function after_pack(context) {
 
     if (missing.length > 0) {
         throw new Error(
-            `Packaged app is missing required license notices: ${missing.join(', ')}.\n` +
+            `Packaged app is missing required resources: ${missing.join(', ')}.\n` +
                 'These come from extraResources in desktop/electron-builder.yml, whose sources ' +
-                'include node_modules/electron/dist/. If the Electron ones are missing, that ' +
-                "install is incomplete — check that node_modules/electron/path.txt exists and " +
+                'include node_modules/electron/dist/ and, on Windows, the architecture-specific helper. ' +
+                'If the Electron notices are missing, that ' +
+                'install is incomplete — check that node_modules/electron/path.txt exists and ' +
                 'node_modules/electron/dist/ is a full extraction, then repair it with:\n' +
                 '  npm run desktop:ensure-electron',
         );
+    }
+
+    if (context.electronPlatformName === 'win32') {
+        const expected_machine = PE_MACHINE.get(context.arch);
+        const actual_machine = await pe_machine(join(resources, WINDOWS_PORTABLE_UPDATE_HELPER));
+        if (expected_machine === undefined || actual_machine !== expected_machine) {
+            const expected = expected_machine === undefined
+                ? `a supported architecture, received ${String(context.arch)}`
+                : `PE machine 0x${expected_machine.toString(16)}`;
+            const actual = actual_machine === undefined ? 'an invalid PE file' : `PE machine 0x${actual_machine.toString(16)}`;
+            throw new Error(`Packaged Windows helper architecture mismatch: expected ${expected}, found ${actual}.`);
+        }
     }
 }

@@ -114,6 +114,10 @@ mac:
 win:
   # Same 1024x1024 master as macOS; electron-builder renders the .ico slices.
   icon: build/icon.png
+  # The packaging wrapper stages the helper matching this invocation's arch.
+  extraResources:
+    - from: dist/native/windows-portable-update-helper.exe
+      to: windows-portable-update-helper.exe
   target:
     # Two shapes, because Windows has no single convention: the NSIS installer
     # for people who want Start Menu + "Open with…" + an uninstaller entry, and
@@ -121,7 +125,9 @@ win:
     # scripts/package-desktop-windows.mjs supplies --x64 or --arm64. Do not list
     # architectures here: electron-builder would build both on every invocation
     # and the second pass could overwrite an installer after its manifest was
-    # saved.
+    # saved. Both targets intentionally run together for each architecture;
+    # electron-builder writes one temporary latest.yml containing both .exe files,
+    # and the wrapper splits it into isolated setup and portable channels.
     - nsis
     - portable
 nsis:
@@ -145,13 +151,15 @@ nsis:
   # arch instead so the download matches the ${arch} in artifactName and an
   # arm64 laptop isn't made to download the x64 payload it won't run.
   buildUniversalInstaller: false
-  # Keep differential metadata for electron-updater. Each architecture is built
-  # separately so its manifest and blockmap unambiguously match its installer.
+  # Keep differential metadata for electron-updater. The wrapper preserves these
+  # blockmap-backed setup channels as latest.yml and latest-arm64.yml.
   differentialPackage: true
   # nsis and portable are both `.exe`, so the shared artifactName above would
   # have them overwrite each other. Disambiguate per target.
   artifactName: table-viewer-${version}-${arch}-setup.${ext}
 portable:
-  # Same reasoning as nsis above: one exe per arch, not a combined one.
+  # Same reasoning as nsis above: one exe per arch, not a combined one. The
+  # wrapper emits latest-portable.yml and latest-portable-arm64.yml with exact
+  # size/SHA-512 validation; portable executables do not require blockmaps.
   buildUniversalInstaller: false
   artifactName: table-viewer-${version}-${arch}-portable.${ext}

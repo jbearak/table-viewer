@@ -11,5 +11,14 @@
     "rootDir": "..",
     "outDir": "../dist/desktop-tsc"
   },
-  "include": ["main/**/*", "preload/**/*", "renderer/**/*", "shared/**/*", "test/**/*", "test-smoke/**/*"]
+  "include": [
+    "main/**/*",
+    "preload/**/*",
+    "renderer/**/*",
+    "shared/**/*",
+    "test/**/*",
+    "test-smoke/**/*",
+    "build-windows-portable-update-helper.d.mts",
+    "after-pack.d.mts"
+  ]
 }

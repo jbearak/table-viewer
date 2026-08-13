@@ -41,6 +41,7 @@ function validate_sha512(value, label) {
 export function validate_update_metadata(metadata_path, {
     expected_version,
     expected_asset,
+    strict = false,
     require_blockmap = false,
     read_file = readFileSync,
     stat = statSync,
@@ -69,13 +70,11 @@ export function validate_update_metadata(metadata_path, {
     if (matching_files.length !== 1) {
         fail(`${basename(metadata_path)} must reference ${expected_asset} exactly once`);
     }
-    // NSIS chooses from every .exe entry in manifest order. Its architecture
-    // heuristic is not an installer/portable policy, so a second executable can
-    // win even when the intended setup entry is valid. macOS metadata may also
-    // describe the fresh-install DMG, but each architecture-specific Windows
-    // channel must contain only its one setup executable.
-    if (require_blockmap && metadata.files.length !== 1) {
-        fail(`${basename(metadata_path)} must describe exactly one Windows update asset`);
+    // macOS metadata may also describe the fresh-install DMG, but each
+    // architecture-specific Windows channel must contain only its intended
+    // setup or portable executable.
+    if (strict && metadata.files.length !== 1) {
+        fail(`${basename(metadata_path)} must describe exactly one update asset`);
     }
     const file = matching_files[0];
     validate_sha512(file.sha512, expected_asset);
@@ -107,16 +106,19 @@ export function validate_update_metadata(metadata_path, {
 
 const invoked_path = process.argv[1] ? pathToFileURL(resolve(process.argv[1])).href : undefined;
 if (invoked_path === import.meta.url) {
-    const [metadata_path, expected_version, expected_asset, blockmap_flag] = process.argv.slice(2);
-    if (!metadata_path || !expected_version || !expected_asset || ![undefined, '--require-blockmap'].includes(blockmap_flag)) {
-        console.error('Usage: validate-update-metadata.mjs <manifest> <version> <asset> [--require-blockmap]');
+    const [metadata_path, expected_version, expected_asset, ...flags] = process.argv.slice(2);
+    const allowed_flags = new Set(['--strict', '--require-blockmap']);
+    const valid_flags = flags.every((flag) => allowed_flags.has(flag)) && new Set(flags).size === flags.length;
+    if (!metadata_path || !expected_version || !expected_asset || !valid_flags) {
+        console.error('Usage: validate-update-metadata.mjs <manifest> <version> <asset> [--strict] [--require-blockmap]');
         process.exitCode = 2;
     } else {
         try {
             validate_update_metadata(metadata_path, {
                 expected_version,
                 expected_asset,
-                require_blockmap: blockmap_flag === '--require-blockmap',
+                strict: flags.includes('--strict'),
+                require_blockmap: flags.includes('--require-blockmap'),
             });
         } catch (error) {
             console.error(error instanceof Error ? error.message : error);
