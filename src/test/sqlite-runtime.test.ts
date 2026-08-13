@@ -841,6 +841,22 @@ describe('vacuum', () => {
         }
     });
 
+    it('reports a non-contention reclaim error as failed rather than throwing', async () => {
+        const runtime = await openRuntime();
+        await fill_then_empty(runtime, 50);
+
+        // The journal mode is delete, so VACUUM must create a rollback journal
+        // beside the database; a directory it cannot write to fails the rewrite
+        // for a reason that is not another holder's lock. The deletions above
+        // are already committed, so this must not reject.
+        fs.chmodSync(tempDirectory, 0o500);
+        try {
+            expect(await runtime.vacuum()).toBe('failed');
+        } finally {
+            fs.chmodSync(tempDirectory, 0o700);
+        }
+    });
+
     it('still vacuums once the other holder lets go', async () => {
         const runtime = await openRuntime();
         await fill_then_empty(runtime, 400);

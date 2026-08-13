@@ -114,6 +114,11 @@ describe('reporting the outcome', () => {
             .toContain('will be reclaimed once other windows using this database close');
     });
 
+    it('reports a failed vacuum without disowning the deletions', () => {
+        expect(trim_outcome_message({ ...base, vacuum: 'failed', reclaimedBytes: 0 }))
+            .toBe('Cleared stored state for 3 files. Disk space could not be reclaimed yet; it will be recovered by a later cleanup.');
+    });
+
     it('explains an empty result by what protected it', () => {
         expect(trim_outcome_message({ ...base, deletedCount: 0, skippedProtectedCount: 2 }))
             .toBe('Nothing was cleared — every matching entry is currently open.');

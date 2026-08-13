@@ -23,7 +23,7 @@ window.addEventListener('message', (event: MessageEvent) => {
     const data = event.data as { id?: unknown; response?: StateInspectorResponse } | null;
     if (!data || typeof data.id !== 'number' || !data.response) return;
     const resolve = pending.get(data.id);
-    if (!resolve) return;
+    if (typeof resolve !== 'function') return;
     pending.delete(data.id);
     resolve(data.response);
 });

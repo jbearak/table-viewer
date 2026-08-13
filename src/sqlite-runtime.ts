@@ -100,7 +100,7 @@ export interface SqliteWriteTransactionContext extends SqliteReadTransactionCont
 }
 
 /** Whether a vacuum rewrote the file, or was left for a later attempt. */
-export type SqliteVacuumOutcome = 'vacuumed' | 'deferred';
+export type SqliteVacuumOutcome = 'vacuumed' | 'deferred' | 'failed';
 
 export interface SqliteRuntimeHandle {
     readonly runtime_key: object;
@@ -933,7 +933,12 @@ function async_write_transaction<T>(
  *
  * Another OS process holding the file is an ordinary outcome, not a failure:
  * the pages stay free and are reclaimed by whichever vacuum next gets the
- * lock, so contention reports 'deferred' rather than throwing.
+ * lock, so contention reports 'deferred' rather than throwing. Any other
+ * VACUUM error reports 'failed' for the same reason — by the time this runs
+ * the deletions are already committed, and rejecting would make a successful
+ * trim look like it did nothing. Only the fence assertions afterwards throw,
+ * because a rewrite that lost the fences is a correctness fault, not a
+ * reclaim hiccup.
  */
 function vacuum(runtime: RuntimeState): Promise<SqliteVacuumOutcome> {
     return enqueue(runtime, async () => {
@@ -943,8 +948,7 @@ function vacuum(runtime: RuntimeState): Promise<SqliteVacuumOutcome> {
             database.exec('VACUUM');
         } catch (error) {
             const categorized = safe_error(error, 'vacuum');
-            if (categorized.category === 'contention') return 'deferred';
-            throw categorized;
+            return categorized.category === 'contention' ? 'deferred' : 'failed';
         }
         // VACUUM preserves application_id, user_version, and the delete journal
         // mode, so the fences a reopen would check must still hold. Proving that

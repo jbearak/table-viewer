@@ -116,6 +116,10 @@ export function trim_outcome_message(summary: StateInspectorTrimSummary): string
         // Not a failure worth alarming anyone about: the rows are gone, and the
         // pages come back whenever the file is next free to be compacted.
         parts.push('Disk space will be reclaimed once other windows using this database close.');
+    } else if (summary.vacuum === 'failed') {
+        // The deletions committed; only the compaction pass came up empty. The
+        // freed pages stay free and the next successful vacuum returns them.
+        parts.push('Disk space could not be reclaimed yet; it will be recovered by a later cleanup.');
     }
     if (summary.skippedProtectedCount > 0) {
         parts.push(
