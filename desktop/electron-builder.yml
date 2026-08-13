@@ -126,9 +126,10 @@ win:
     # scripts/package-desktop-windows.mjs supplies --x64 or --arm64. Do not list
     # architectures here: electron-builder would build both on every invocation
     # and the second pass could overwrite an installer after its manifest was
-    # saved. Both targets intentionally run together for each architecture;
-    # electron-builder writes one temporary latest.yml containing both .exe files,
-    # and the wrapper splits it into isolated setup and portable channels.
+    # saved. Both targets intentionally run together for each architecture.
+    # electron-builder's temporary latest.yml describes the NSIS setup channel;
+    # the wrapper derives portable metadata directly from the completed portable
+    # executable so both forms have isolated, byte-verified update channels.
     - nsis
     - portable
 nsis:
