@@ -13,3 +13,28 @@ if(MSVC)
 endif()
 
 install(TARGETS windows-portable-update-helper RUNTIME DESTINATION .)
+
+option(PORTABLE_UPDATE_HELPER_BUILD_TESTS "Build portable update helper integration fixtures" OFF)
+if(PORTABLE_UPDATE_HELPER_BUILD_TESTS)
+    add_executable(windows-portable-update-helper-test WIN32 main.cpp)
+    target_compile_features(windows-portable-update-helper-test PRIVATE cxx_std_20)
+    target_compile_definitions(windows-portable-update-helper-test PRIVATE
+        UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX PORTABLE_UPDATE_ACK_TIMEOUT_MS=1000)
+    target_link_libraries(windows-portable-update-helper-test PRIVATE bcrypt crypt32 shell32)
+
+    add_executable(portable-update-old-fixture WIN32 test-fixture.cpp)
+    add_executable(portable-update-new-fixture WIN32 test-fixture.cpp)
+    foreach(fixture portable-update-old-fixture portable-update-new-fixture)
+        target_compile_features(${fixture} PRIVATE cxx_std_20)
+        target_compile_definitions(${fixture} PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endforeach()
+    target_compile_definitions(portable-update-old-fixture PRIVATE PORTABLE_UPDATE_FIXTURE_OLD)
+
+    if(MSVC)
+        foreach(target windows-portable-update-helper-test portable-update-old-fixture portable-update-new-fixture)
+            target_compile_options(${target} PRIVATE /W4 /WX /permissive- /EHsc /utf-8)
+            target_link_options(${target} PRIVATE /INCREMENTAL:NO)
+            set_property(TARGET ${target} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        endforeach()
+    endif()
+endif()

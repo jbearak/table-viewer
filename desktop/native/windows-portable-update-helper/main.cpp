@@ -19,7 +19,11 @@
 #include <vector>
 
 namespace {
-constexpr DWORD kAckTimeoutMs = 30'000;
+#ifndef PORTABLE_UPDATE_ACK_TIMEOUT_MS
+#define PORTABLE_UPDATE_ACK_TIMEOUT_MS 30'000
+#endif
+constexpr DWORD kAckTimeoutMs = PORTABLE_UPDATE_ACK_TIMEOUT_MS;
+constexpr DWORD kProcessTreeStopTimeoutMs = 30'000;
 constexpr DWORD kWrapperTimeoutMs = 2 * 60'000;
 constexpr DWORD kPollIntervalMs = 100;
 constexpr std::uintmax_t kMaxTransactionBytes = 64 * 1024;
@@ -384,22 +388,77 @@ std::wstring quote_argument(std::wstring_view value) {
     return result;
 }
 
-std::optional<PROCESS_INFORMATION> launch_replacement(const Transaction& transaction, std::string& error) {
+struct ReplacementProcess {
+    HANDLE process = nullptr;
+    HANDLE job = nullptr;
+};
+
+std::optional<ReplacementProcess> launch_replacement(const Transaction& transaction, std::string& error) {
     const auto token = utf8_to_wide(transaction.acknowledgement_token);
     if (!token) { error = "invalid-token"; return std::nullopt; }
+
+    HANDLE job = CreateJobObjectW(nullptr, nullptr);
+    if (!job) { error = "create-job-" + windows_error(GetLastError()); return std::nullopt; }
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
+        error = "configure-job-" + windows_error(GetLastError());
+        CloseHandle(job);
+        return std::nullopt;
+    }
+
     std::wstring command = quote_argument(transaction.target_path.wstring()) + L" " +
                            quote_argument(std::wstring(kAckPrefix) + *token);
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     PROCESS_INFORMATION process{};
-    if (!CreateProcessW(transaction.target_path.c_str(), command.data(), nullptr, nullptr, FALSE,
-                        CREATE_UNICODE_ENVIRONMENT, nullptr, transaction.target_path.parent_path().c_str(),
-                        &startup, &process)) {
-        error = windows_error(GetLastError());
+    DWORD creation_flags = CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED;
+    BOOL helper_in_job = FALSE;
+    if (IsProcessInJob(GetCurrentProcess(), nullptr, &helper_in_job) && helper_in_job) {
+        // Prefer a fresh root job when the containing job permits breakaway. If it
+        // does not, retry in the inherited job and use Windows 8+ nested-job
+        // semantics. The portable wrapper can then create its own child job; our
+        // parent job still contains and terminates that entire hierarchy.
+        creation_flags |= CREATE_BREAKAWAY_FROM_JOB;
+    }
+    auto create = [&](DWORD flags) {
+        std::wstring mutable_command = command;
+        process = {};
+        return CreateProcessW(transaction.target_path.c_str(), mutable_command.data(), nullptr, nullptr, FALSE,
+                              flags, nullptr, transaction.target_path.parent_path().c_str(),
+                              &startup, &process);
+    };
+    if (!create(creation_flags)) {
+        const DWORD create_error = GetLastError();
+        if (!(creation_flags & CREATE_BREAKAWAY_FROM_JOB) || create_error != ERROR_ACCESS_DENIED ||
+            !create(creation_flags & ~CREATE_BREAKAWAY_FROM_JOB)) {
+            error = "create-process-" + windows_error(
+                (creation_flags & CREATE_BREAKAWAY_FROM_JOB) && create_error == ERROR_ACCESS_DENIED
+                    ? GetLastError() : create_error);
+            CloseHandle(job);
+            return std::nullopt;
+        }
+    }
+    if (!AssignProcessToJobObject(job, process.hProcess)) {
+        error = "assign-job-" + windows_error(GetLastError());
+        TerminateProcess(process.hProcess, 1);
+        WaitForSingleObject(process.hProcess, kProcessTreeStopTimeoutMs);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        CloseHandle(job);
+        return std::nullopt;
+    }
+    if (ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
+        error = "resume-process-" + windows_error(GetLastError());
+        TerminateJobObject(job, 1);
+        WaitForSingleObject(process.hProcess, kProcessTreeStopTimeoutMs);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        CloseHandle(job);
         return std::nullopt;
     }
     CloseHandle(process.hThread);
-    return process;
+    return ReplacementProcess{process.hProcess, job};
 }
 
 bool acknowledgement_matches(const Transaction& transaction) {
@@ -410,40 +469,80 @@ bool acknowledgement_matches(const Transaction& transaction) {
     return value == transaction.acknowledgement_token;
 }
 
-enum class AcknowledgementResult { acknowledged, child_exited };
+enum class AcknowledgementResult { acknowledged, process_tree_exited, timed_out };
 
-AcknowledgementResult wait_for_acknowledgement(const Transaction& transaction, HANDLE child) {
-    const ULONGLONG diagnostic_deadline = GetTickCount64() + kAckTimeoutMs;
-    bool reported_slow_start = false;
+AcknowledgementResult wait_for_acknowledgement(const Transaction& transaction, HANDLE job) {
+    const ULONGLONG acknowledgement_deadline = GetTickCount64() + kAckTimeoutMs;
     for (;;) {
         if (acknowledgement_matches(transaction)) return AcknowledgementResult::acknowledged;
-        if (WaitForSingleObject(child, 0) == WAIT_OBJECT_0) return AcknowledgementResult::child_exited;
-        if (!reported_slow_start && GetTickCount64() >= diagnostic_deadline) {
+        if (WaitForSingleObject(job, 0) == WAIT_OBJECT_0) return AcknowledgementResult::process_tree_exited;
+        if (GetTickCount64() >= acknowledgement_deadline) {
             write_result(&transaction, "awaiting-acknowledgement", "ack-timeout");
-            reported_slow_start = true;
+            return AcknowledgementResult::timed_out;
         }
         Sleep(kPollIntervalMs);
     }
 }
 
-void relaunch_rollback(const Transaction& transaction) {
+bool stop_replacement_tree(const ReplacementProcess& replacement, std::string& error) {
+    if (!TerminateJobObject(replacement.job, 1)) {
+        error += ";terminate-job-" + windows_error(GetLastError());
+        return false;
+    }
+    const DWORD wait = WaitForSingleObject(replacement.job, kProcessTreeStopTimeoutMs);
+    if (wait == WAIT_OBJECT_0) return true;
+    error += wait == WAIT_TIMEOUT ? ";terminate-job-timeout" : ";terminate-job-wait-" + windows_error(GetLastError());
+    return false;
+}
+
+bool release_replacement_tree(const ReplacementProcess& replacement, std::string& error) {
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    if (SetInformationJobObject(replacement.job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
+        return true;
+    }
+    error = "release-job-" + windows_error(GetLastError());
+    return false;
+}
+
+void close_replacement(ReplacementProcess& replacement) {
+    CloseHandle(replacement.process);
+    CloseHandle(replacement.job);
+    replacement.process = nullptr;
+    replacement.job = nullptr;
+}
+
+bool relaunch_rollback(const Transaction& transaction, std::string& error) {
     std::wstring command = quote_argument(transaction.target_path.wstring());
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     PROCESS_INFORMATION process{};
-    if (CreateProcessW(transaction.target_path.c_str(), command.data(), nullptr, nullptr, FALSE,
-                       CREATE_UNICODE_ENVIRONMENT, nullptr, transaction.target_path.parent_path().c_str(),
-                       &startup, &process)) {
-        CloseHandle(process.hThread);
-        CloseHandle(process.hProcess);
+    if (!CreateProcessW(transaction.target_path.c_str(), command.data(), nullptr, nullptr, FALSE,
+                        CREATE_UNICODE_ENVIRONMENT, nullptr, transaction.target_path.parent_path().c_str(),
+                        &startup, &process)) {
+        error += ";rollback-relaunch-" + windows_error(GetLastError());
+        return false;
     }
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return true;
 }
 
 bool rollback(const Transaction& transaction, std::string& error) {
-    if (ReplaceFileW(transaction.target_path.c_str(), transaction.backup_path.c_str(), nullptr,
-                     REPLACEFILE_WRITE_THROUGH, nullptr, nullptr)) return true;
-    error += ";rollback-" + windows_error(GetLastError());
-    return false;
+    if (!ReplaceFileW(transaction.target_path.c_str(), transaction.backup_path.c_str(), nullptr,
+                      REPLACEFILE_WRITE_THROUGH, nullptr, nullptr)) {
+        error += ";rollback-" + windows_error(GetLastError());
+        return false;
+    }
+    const auto restored_hash = sha512_file(transaction.target_path);
+    if (!restored_hash || *restored_hash != transaction.expected_target_sha512) {
+        error += ";rollback-verification-failed";
+        return false;
+    }
+    return true;
+}
+
+bool rollback_and_relaunch(const Transaction& transaction, std::string& error) {
+    return rollback(transaction, error) && relaunch_rollback(transaction, error);
 }
 
 int run(const std::filesystem::path& transaction_path) {
@@ -479,21 +578,36 @@ int run(const std::filesystem::path& transaction_path) {
     }
     write_result(&*transaction, "replaced");
 
-    auto child = launch_replacement(*transaction, error);
-    if (!child) {
+    auto replacement = launch_replacement(*transaction, error);
+    if (!replacement) {
         const std::string launch_error = error;
-        if (rollback(*transaction, error)) relaunch_rollback(*transaction);
+        rollback_and_relaunch(*transaction, error);
         write_result(&*transaction, "rolled-back", "launch-" + launch_error + ";" + error);
         return 6;
     }
-    const auto acknowledgement = wait_for_acknowledgement(*transaction, child->hProcess);
-    CloseHandle(child->hProcess);
-    if (acknowledgement == AcknowledgementResult::child_exited) {
-        error = "replacement-exited-before-ack";
-        if (rollback(*transaction, error)) relaunch_rollback(*transaction);
+    const auto acknowledgement = wait_for_acknowledgement(*transaction, replacement->job);
+    if (acknowledgement != AcknowledgementResult::acknowledged) {
+        error = acknowledgement == AcknowledgementResult::timed_out
+            ? "ack-timeout" : "replacement-exited-before-ack";
+        const bool stopped = acknowledgement == AcknowledgementResult::process_tree_exited ||
+                             stop_replacement_tree(*replacement, error);
+        close_replacement(*replacement);
+        if (!stopped) {
+            write_result(&*transaction, "failed", error);
+            return 7;
+        }
+        rollback_and_relaunch(*transaction, error);
         write_result(&*transaction, "rolled-back", error);
         return 7;
     }
+    if (!release_replacement_tree(*replacement, error)) {
+        stop_replacement_tree(*replacement, error);
+        close_replacement(*replacement);
+        rollback_and_relaunch(*transaction, error);
+        write_result(&*transaction, "rolled-back", error);
+        return 8;
+    }
+    close_replacement(*replacement);
 
     if (!DeleteFileW(transaction->backup_path.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND) {
         write_result(&*transaction, "committed", "backup-delete-" + windows_error(GetLastError()));
