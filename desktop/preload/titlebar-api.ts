@@ -6,10 +6,8 @@ import { ipcRenderer } from 'electron';
 import {
     CHANNEL_TITLEBAR_ACTIVE,
     CHANNEL_TITLEBAR_ACTIVE_CHANGED,
-    CHANNEL_TITLEBAR_DRAG,
     CHANNEL_TITLEBAR_ZOOM,
     CHANNEL_TITLEBAR_ZOOM_CHANGED,
-    CHANNEL_TITLEBAR_ZOOM_WINDOW,
 } from '../shared/ipc';
 import { titlebar_inset, type TitlebarWindowApi } from '../shared/titlebar';
 
@@ -30,7 +28,5 @@ export function titlebar_preload_api(): TitlebarApi {
                 listener(zoom),
             );
         },
-        drag_titlebar: (phase, x, y) => ipcRenderer.send(CHANNEL_TITLEBAR_DRAG, phase, x, y),
-        zoom_titlebar_window: () => ipcRenderer.send(CHANNEL_TITLEBAR_ZOOM_WINDOW),
     };
 }

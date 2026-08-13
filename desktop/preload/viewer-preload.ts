@@ -106,8 +106,6 @@ if (titlebar_api.titlebar_inset) {
             border: 'var(--vscode-panel-border, #444)',
         },
         on_path_menu: () => ipcRenderer.send(CHANNEL_TITLEBAR_PATH_MENU),
-        on_drag: (phase, x, y) => titlebar_api.drag_titlebar(phase, x, y),
-        on_zoom_window: () => titlebar_api.zoom_titlebar_window(),
         zoom: titlebar_api.titlebar_zoom(),
         active: titlebar_api.titlebar_active(),
     }));

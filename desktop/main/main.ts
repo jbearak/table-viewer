@@ -99,8 +99,6 @@ import {
     CHANNEL_STATE_INSPECTOR_REQUEST,
     CHANNEL_THEME_CHANGED,
     CHANNEL_TITLEBAR_ACTIVE,
-    CHANNEL_TITLEBAR_DRAG,
-    CHANNEL_TITLEBAR_ZOOM_WINDOW,
     CHANNEL_TITLEBAR_ACTIVE_CHANGED,
     CHANNEL_TITLEBAR_ZOOM,
     CHANNEL_TITLEBAR_ZOOM_CHANGED,
@@ -881,50 +879,6 @@ function update_settings(partial: unknown): DesktopSettings {
 }
 
 /**
- * macOS themed title bar: move a window being dragged by its title.
- *
- * Anchored on `start` rather than moved by each event's delta: the window moves
- * under the pointer as the drag proceeds, so successive positions are only
- * meaningful against where the drag began. Pointer coordinates arrive in the
- * page's CSS pixels, which the window's zoom factor converts to the device-
- * independent pixels `setPosition` wants — otherwise dragging a zoomed window
- * would move it at the wrong speed.
- */
-const titlebar_drag_anchors = new WeakMap<BrowserWindow, {
-    pointer: { x: number; y: number };
-    window: { x: number; y: number };
-    /** Captured at `start`: zoom cannot change mid-drag, and reading it per
-     *  move would be a webContents call for every pointer event. */
-    zoom: number;
-}>();
-
-function drag_titlebar(
-    window: BrowserWindow | null,
-    phase: 'start' | 'move',
-    x: number,
-    y: number,
-): void {
-    if (!window || window.isDestroyed()) return;
-    if (phase === 'start') {
-        const { x: window_x, y: window_y } = window.getBounds();
-        titlebar_drag_anchors.set(window, {
-            pointer: { x, y },
-            window: { x: window_x, y: window_y },
-            zoom: window.webContents.isDestroyed() ? 1 : window.webContents.getZoomFactor(),
-        });
-        return;
-    }
-    const anchor = titlebar_drag_anchors.get(window);
-    // A move with no anchor is a drag that began before this window existed in
-    // the map — nothing sensible to move it relative to, so ignore it.
-    if (!anchor) return;
-    window.setPosition(
-        Math.round(anchor.window.x + (x - anchor.pointer.x) * anchor.zoom),
-        Math.round(anchor.window.y + (y - anchor.pointer.y) * anchor.zoom),
-    );
-}
-
-/**
  * macOS themed title bar: tell each window's strip when it becomes
  * the active window, so the title dims like a native one.
  *
@@ -950,17 +904,6 @@ function register_ipc(): void {
     });
     ipcMain.on(CHANNEL_TITLEBAR_ACTIVE, (event) => {
         event.returnValue = BrowserWindow.fromWebContents(event.sender)?.isFocused() ?? true;
-    });
-    ipcMain.on(CHANNEL_TITLEBAR_DRAG, (event, phase: 'start' | 'move', x: number, y: number) => {
-        drag_titlebar(BrowserWindow.fromWebContents(event.sender), phase, x, y);
-    });
-    ipcMain.on(CHANNEL_TITLEBAR_ZOOM_WINDOW, (event) => {
-        const window = BrowserWindow.fromWebContents(event.sender);
-        // Zoom, as macOS means it: a toggle, and only where the window can do it
-        // at all — the fixed-size dialogs are `maximizable: false`.
-        if (!window || window.isDestroyed() || !window.isMaximizable()) return;
-        if (window.isMaximized()) window.unmaximize();
-        else window.maximize();
     });
     ipcMain.on(CHANNEL_GET_THEME, (event) => {
         event.returnValue = theme_payload(current_theme_id());
