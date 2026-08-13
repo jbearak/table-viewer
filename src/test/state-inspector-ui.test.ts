@@ -14,9 +14,9 @@ interface Harness {
 }
 
 const ENTRIES: StoredFileStateEntry[] = [
-    { path: '/files/plain.csv', sizeBytes: 400, hasPendingEdits: false, isLeased: false },
-    { path: '/files/unsaved.csv', sizeBytes: 900, hasPendingEdits: true, isLeased: false },
-    { path: '/files/open.csv', sizeBytes: 100, hasPendingEdits: false, isLeased: true },
+    { path: '/files/plain.csv', sizeBytes: 400, hasPendingEdits: false, isProtected: false, openHere: false },
+    { path: '/files/unsaved.csv', sizeBytes: 900, hasPendingEdits: true, isProtected: false, openHere: false },
+    { path: '/files/open.csv', sizeBytes: 100, hasPendingEdits: false, isProtected: true, openHere: true },
 ];
 
 /** Mount the inspector over a scripted host and wait for its first render. */
@@ -42,7 +42,7 @@ async function mount(entries: StoredFileStateEntry[] = ENTRIES): Promise<Harness
                 const matched = selection.kind === 'paths'
                     ? live.filter((entry) => selection.paths.includes(entry.path))
                     : live;
-                const targets = matched.filter((entry) => !entry.isLeased);
+                const targets = matched.filter((entry) => !entry.isProtected);
                 return {
                     kind: 'preview',
                     preview: {
@@ -53,7 +53,7 @@ async function mount(entries: StoredFileStateEntry[] = ENTRIES): Promise<Harness
                             .filter((entry) => entry.hasPendingEdits)
                             .map((entry) => entry.path),
                         protectedPaths: matched
-                            .filter((entry) => entry.isLeased)
+                            .filter((entry) => entry.isProtected)
                             .map((entry) => entry.path),
                     },
                 };
@@ -293,7 +293,7 @@ describe('when every match is in use', () => {
             path: '/open-and-gone.csv',
             sizeBytes: 100,
             hasPendingEdits: false,
-            isLeased: true,
+            isProtected: true, openHere: true,
             isMissing: true,
         }]);
 
@@ -346,8 +346,8 @@ describe('missing files', () => {
         // Without this the "Clear Missing Files" button asks the user to trust a
         // criterion they cannot see anywhere in the list.
         const harness = await mount([
-            { path: '/gone.csv', sizeBytes: 100, hasPendingEdits: false, isLeased: false, isMissing: true },
-            { path: '/here.csv', sizeBytes: 100, hasPendingEdits: false, isLeased: false, isMissing: false },
+            { path: '/gone.csv', sizeBytes: 100, hasPendingEdits: false, isProtected: false, openHere: false, isMissing: true },
+            { path: '/here.csv', sizeBytes: 100, hasPendingEdits: false, isProtected: false, openHere: false, isMissing: false },
         ]);
 
         const rowFor = (path: string) => rows(harness.root)
@@ -364,5 +364,75 @@ describe('the standing explanation', () => {
 
         const explanation = root.querySelector('.explanation')!.textContent!;
         expect(explanation).toContain('never deletes, moves, or changes the file on disk');
+    });
+});
+
+describe('sorting', () => {
+    const MIXED: StoredFileStateEntry[] = [
+        { path: '/plain-b.csv', sizeBytes: 100, hasPendingEdits: false, isProtected: false, openHere: false, isMissing: false },
+        { path: '/open.csv', sizeBytes: 100, hasPendingEdits: false, isProtected: true, openHere: true, isMissing: false },
+        { path: '/gone.csv', sizeBytes: 100, hasPendingEdits: false, isProtected: false, openHere: false, isMissing: true },
+        { path: '/unsaved.csv', sizeBytes: 100, hasPendingEdits: true, isProtected: false, openHere: false, isMissing: false },
+        { path: '/plain-a.csv', sizeBytes: 100, hasPendingEdits: false, isProtected: false, openHere: false, isMissing: false },
+    ];
+
+    function header(root: HTMLElement, label: string): HTMLElement {
+        return Array.from(root.querySelectorAll('th'))
+            .find((cell) => cell.textContent === label)!;
+    }
+
+    function paths(root: HTMLElement): (string | undefined)[] {
+        return rows(root).map((row) => row.querySelector('.path')?.textContent ?? undefined);
+    }
+
+    it('sorts by status, most notable first', async () => {
+        const { root } = await mount(MIXED);
+
+        await click(header(root, 'Status'));
+
+        // Unsaved work first — it is the one thing clearing cannot give back —
+        // then not-on-disk, then merely open, then everything unremarkable.
+        expect(paths(root)).toEqual([
+            '/unsaved.csv', '/gone.csv', '/open.csv', '/plain-a.csv', '/plain-b.csv',
+        ]);
+    });
+
+    it('reverses when the same header is clicked again', async () => {
+        const { root } = await mount(MIXED);
+
+        await click(header(root, 'Status'));
+        await click(header(root, 'Status'));
+
+        expect(paths(root)!.slice(-1)).toEqual(['/unsaved.csv']);
+        expect(header(root, 'Status').getAttribute('aria-sort')).toBe('ascending');
+    });
+
+    it('breaks ties by path so equal rows hold a stable order', async () => {
+        // Every row here has the same size, so only the fallback decides.
+        const { root } = await mount(MIXED);
+
+        await click(header(root, 'Size'));
+        const first = paths(root);
+        await click(header(root, 'Status'));
+        await click(header(root, 'Size'));
+
+        expect(paths(root)).toEqual(first);
+    });
+});
+
+
+describe('entries left leased by a departed session', () => {
+    it('shows no status and can be selected like any other row', async () => {
+        const harness = await mount([{
+            path: '/leftover.csv',
+            sizeBytes: 100,
+            hasPendingEdits: false,
+            isProtected: false,
+            openHere: false,
+        }]);
+
+        const row = rows(harness.root)[0];
+        expect(row.textContent).not.toContain('Open');
+        expect(row.querySelector<HTMLInputElement>('input')!.disabled).toBe(false);
     });
 });

@@ -138,16 +138,22 @@ export function create_sqlite_file_state_maintenance(
     async function read_entries(
         checkDisk = false,
     ): Promise<readonly StoredFileStateEntry[]> {
-        const rows = await handle.read_transaction(scan_sqlite_file_state_inspection);
-        // `hasAuthorityStages` is intentionally dropped here: an in-flight commit
-        // is an internal detail with no meaning to someone reading a list of
-        // their files. It still protects the row at deletion time, where it is
-        // re-read from the database anyway.
+        const rows = await handle.read_transaction((tx) => (
+            scan_sqlite_file_state_inspection(tx, handle.writer_session_id)
+        ));
+        // Protection covers only what can be known: a lease this process holds,
+        // or a commit in flight. A lease from another session is deliberately
+        // not protective — it is left behind by any process that did not close
+        // cleanly, nothing can prove its holder is alive, and honouring it made
+        // entries permanently unclearable, which defeats the point of this
+        // window. The unsaved-edits confirmation still guards the case where
+        // clearing would cost real work.
         const entries = rows.map((row) => ({
             path: row.path,
             sizeBytes: row.sizeBytes,
             hasPendingEdits: row.hasPendingEdits,
-            isLeased: row.isLeased || row.hasAuthorityStages,
+            isProtected: row.isLeasedHere || row.hasAuthorityStages,
+            openHere: row.isLeasedHere,
             ...(row.updatedAtMs === undefined ? {} : { updatedAtMs: row.updatedAtMs }),
             ...(row.touchedAtMs === undefined ? {} : { touchedAtMs: row.touchedAtMs }),
         }));
@@ -195,14 +201,14 @@ export function create_sqlite_file_state_maintenance(
                 await read_entries(selection.kind === 'missingOnDisk'),
                 selection,
             );
-            const targets = matched.filter((entry) => !entry.isLeased);
+            const targets = matched.filter((entry) => !entry.isProtected);
             return {
                 targets,
                 pendingEditPaths: targets
                     .filter((entry) => entry.hasPendingEdits)
                     .map((entry) => entry.path),
                 protectedPaths: matched
-                    .filter((entry) => entry.isLeased)
+                    .filter((entry) => entry.isProtected)
                     .map((entry) => entry.path),
             };
         },
@@ -218,7 +224,8 @@ export function create_sqlite_file_state_maintenance(
                 // built from a preview, and between then and now an entry may
                 // have been opened, staged, or gained unsaved edits.
                 const live = new Map(
-                    scan_sqlite_file_state_inspection(tx).map((row) => [row.path, row]),
+                    scan_sqlite_file_state_inspection(tx, handle.writer_session_id)
+                        .map((row) => [row.path, row]),
                 );
                 const repository = create_sqlite_file_state_write_repository(tx, {
                     writerSessionId: handle.writer_session_id,
@@ -227,7 +234,7 @@ export function create_sqlite_file_state_maintenance(
                 for (const path of new Set(request.paths)) {
                     const row = live.get(path);
                     if (!row) continue;
-                    if (row.isLeased || row.hasAuthorityStages) {
+                    if (row.isLeasedHere || row.hasAuthorityStages) {
                         skippedProtectedPaths.push(path);
                         continue;
                     }

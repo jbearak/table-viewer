@@ -16,8 +16,23 @@ export interface StoredFileStateEntry {
     readonly path: string;
     readonly sizeBytes: number;
     readonly hasPendingEdits: boolean;
-    /** Held by an open window, or by a session that has not released it. */
-    readonly isLeased: boolean;
+    /**
+     * Cannot be cleared: a lease or an in-flight commit is holding it.
+     *
+     * Separate from `openHere` because a lease survives a process that did not
+     * close cleanly, so "protected" and "open right now" are genuinely different
+     * questions. Protection is the cautious answer and stays absolute.
+     */
+    readonly isProtected: boolean;
+    /**
+     * A window in this very process has the file open.
+     *
+     * The only form of "open" that can be proved: it is our own session's lease.
+     * A lease from any other session may belong to a live sibling window or to
+     * one that was killed months ago, and nothing in the database distinguishes
+     * them.
+     */
+    readonly openHere: boolean;
     /**
      * The file this entry remembers is gone from disk.
      *

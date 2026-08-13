@@ -81,9 +81,28 @@ were the files that were going.
 Three rules apply to every route, and all of them live in
 `src/sqlite-file-state-maintenance.ts` rather than in the UI:
 
-- Leased and staged entries are never deleted. A lease means a window holds the
-  entry; a stage means a commit is in flight. No confirmation overrides this,
-  matching what automatic eviction has always done.
+- An entry this process has open, or one with a commit in flight, is never
+  cleared. No confirmation overrides that.
+
+  Note what is *not* in that rule. `entry_leases` has no foreign key to
+  `writer_sessions` — a lease deliberately outlives its session so it can keep
+  protecting an entry — and it is deleted only on a clean final close. Any
+  process that is killed instead leaves its leases behind forever, and nothing
+  reclaims them short of the coordination-generation bump in the recovery flow.
+  They accumulate: one real VS Code database had seventeen leases from seventeen
+  departed sessions across eight entries, nine of them on a single file.
+
+  So a lease from another session proves nothing. Honouring it would have made
+  those entries permanently unclearable, which is precisely what this window
+  exists to fix, and reporting it as "open" told users a file was open when
+  nothing was. Only this session's own leases count, because only those can be
+  shown to be live — there is no sound liveness test for another session's, and
+  this codebase refuses PID and heartbeat checks elsewhere for the same reason.
+  The cost is bounded: on the desktop a single-instance lock means a foreign
+  lease is always a leftover, and in VS Code, where sibling windows are real, the
+  worst case is clearing view state a live window would rewrite anyway. Unsaved
+  edits stay protected by their own gate, which is about the payload rather than
+  about who was holding the row.
 - An entry with unsaved edits is deletable only when the caller names that exact
   path as confirmed, which is what the second confirmation dialog collects. Since
   the gate is decided by the resolved target set rather than by which button was

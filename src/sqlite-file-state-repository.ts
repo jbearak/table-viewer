@@ -704,7 +704,8 @@ export interface SqliteFileStateInspectionRow {
     /** Bytes of stored state, as SQLite measures the payload itself. */
     readonly sizeBytes: number;
     readonly hasPendingEdits: boolean;
-    readonly isLeased: boolean;
+    /** A lease belonging to the caller's own session, so it is certainly live. */
+    readonly isLeasedHere: boolean;
     readonly hasAuthorityStages: boolean;
     readonly updatedAtMs?: number;
     readonly touchedAtMs?: number;
@@ -728,12 +729,21 @@ export interface SqliteFileStateInspectionRow {
  */
 export function scan_sqlite_file_state_inspection(
     tx: SqliteReadTransactionContext,
+    writerSessionId: string,
 ): readonly SqliteFileStateInspectionRow[] {
+    // Two lease questions, not one. Any lease protects the row from being
+    // cleared — that is what a safety lease is for, and it holds even when the
+    // session that took it is gone. But only a lease belonging to *this* session
+    // proves a window has the file open right now, because a lease outlives a
+    // process that did not close cleanly and there is no sound way to test
+    // another session's liveness from here (this codebase deliberately refuses
+    // PID and heartbeat checks elsewhere for the same reason).
     return tx.prepare(`SELECT e.path, e.has_pending_edits, e.updated_at_ms, e.touched_at_ms,
         length(CAST(e.state_json AS BLOB)) AS size_bytes,
-        EXISTS(SELECT 1 FROM entry_leases l WHERE l.current_entry_path = e.path) AS is_leased,
+        EXISTS(SELECT 1 FROM entry_leases l WHERE l.current_entry_path = e.path
+            AND l.writer_session_id = ?) AS is_leased_here,
         EXISTS(SELECT 1 FROM authority_stages s WHERE s.entry_path = e.path) AS has_stages
-        FROM entries e ORDER BY e.path`).all()
+        FROM entries e ORDER BY e.path`).all(writerSessionId)
         .map((row) => {
             const updatedAtMs = optional_integer(tx, row.updated_at_ms, 'updated at');
             const touchedAtMs = optional_integer(tx, row.touched_at_ms, 'touched at');
@@ -741,7 +751,7 @@ export function scan_sqlite_file_state_inspection(
                 path: text(row.path),
                 sizeBytes: integer(tx, row.size_bytes, 'entry size', 0, Number.MAX_SAFE_INTEGER),
                 hasPendingEdits: integer(tx, row.has_pending_edits, 'pending flag', 0, 1) === 1,
-                isLeased: integer(tx, row.is_leased, 'lease flag', 0, 1) === 1,
+                isLeasedHere: integer(tx, row.is_leased_here, 'own lease flag', 0, 1) === 1,
                 hasAuthorityStages: integer(tx, row.has_stages, 'stage flag', 0, 1) === 1,
                 ...(updatedAtMs === undefined ? {} : { updatedAtMs }),
                 ...(touchedAtMs === undefined ? {} : { touchedAtMs }),

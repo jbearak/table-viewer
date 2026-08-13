@@ -28,7 +28,7 @@ import {
     type TrimConfirmation,
 } from './trim-policy';
 
-type SortKey = 'path' | 'sizeBytes' | 'activity';
+type SortKey = 'path' | 'sizeBytes' | 'activity' | 'status';
 
 interface UiState {
     inventory?: StateInspectorInventory;
@@ -51,6 +51,21 @@ function element<K extends keyof HTMLElementTagNameMap>(
     // path or a host-supplied message, and neither is ours to trust as markup.
     if (text !== undefined) node.textContent = text;
     return node;
+}
+
+/**
+ * How notable an entry's status is, for sorting the Status column.
+ *
+ * A row can carry more than one badge, so this is a bitmask rather than a
+ * category: it groups every unsaved-edits row together, then every not-on-disk
+ * row, then the merely open ones, and stays stable for rows that are two of
+ * those at once. Descending puts the rows worth a second look at the top —
+ * unsaved work first, since that is the one thing clearing cannot give back.
+ */
+function status_rank(entry: StoredFileStateEntry): number {
+    return (entry.hasPendingEdits ? 4 : 0)
+        + (entry.isMissing ? 2 : 0)
+        + (entry.isProtected ? 1 : 0);
 }
 
 function format_date(value: number | undefined): string {
@@ -154,15 +169,25 @@ export function mount_state_inspector(
             ? [...entries]
             : entries.filter((entry) => entry.path.toLowerCase().includes(needle));
         const direction = state.ascending ? 1 : -1;
+        const rank = (entry: StoredFileStateEntry): number => {
+            switch (state.sortKey) {
+                case 'sizeBytes':
+                    return entry.sizeBytes;
+                case 'status':
+                    return status_rank(entry);
+                default:
+                    // Entries with no timestamp sort as oldest rather than
+                    // jumping to the top, matching the fact that they are never
+                    // picked up by age trims.
+                    return entry_activity_timestamp(entry) ?? 0;
+            }
+        };
         return filtered.sort((left, right) => {
             if (state.sortKey === 'path') return left.path.localeCompare(right.path) * direction;
-            if (state.sortKey === 'sizeBytes') {
-                return (left.sizeBytes - right.sizeBytes) * direction;
-            }
-            // Entries with no timestamp sort as oldest rather than jumping to the
-            // top, matching the fact that they are never picked up by age trims.
-            return ((entry_activity_timestamp(left) ?? 0)
-                - (entry_activity_timestamp(right) ?? 0)) * direction;
+            const difference = (rank(left) - rank(right)) * direction;
+            // Ties fall back to the path, so equal sizes, dates, or statuses hold
+            // one order instead of shuffling every time the column is clicked.
+            return difference !== 0 ? difference : left.path.localeCompare(right.path);
         });
     }
 
@@ -212,7 +237,7 @@ export function mount_state_inspector(
         const selectAll = element('input');
         selectAll.type = 'checkbox';
         selectAll.setAttribute('aria-label', 'Select all shown entries');
-        const selectable = entries.filter((entry) => !entry.isLeased);
+        const selectable = entries.filter((entry) => !entry.isProtected);
         selectAll.checked = selectable.length > 0
             && selectable.every((entry) => state.selected.has(entry.path));
         selectAll.disabled = selectable.length === 0;
@@ -231,6 +256,7 @@ export function mount_state_inspector(
             { key: 'path', label: 'File' },
             { key: 'sizeBytes', label: 'Size', numeric: true },
             { key: 'activity', label: 'Last used' },
+            { key: 'status', label: 'Status' },
         ];
         for (const column of columns) {
             const cell = element('th', column.numeric ? 'numeric' : undefined, column.label);
@@ -241,31 +267,30 @@ export function mount_state_inspector(
                 if (state.sortKey === column.key) state.ascending = !state.ascending;
                 else {
                     state.sortKey = column.key;
-                    // Paths read best A–Z; sizes and dates are asked about
-                    // largest-first and most-recent-first.
+                    // Paths read best A–Z; sizes, dates, and statuses are asked
+                    // about largest-, most-recent-, and most-notable-first.
                     state.ascending = column.key === 'path';
                 }
                 render();
             });
             headRow.append(cell);
         }
-        headRow.append(element('th', undefined, 'Status'));
         head.append(headRow);
 
         const body = element('tbody');
         for (const entry of entries) {
-            const row = element('tr', entry.isLeased ? 'protected' : undefined);
+            const row = element('tr', entry.isProtected ? 'protected' : undefined);
 
             const checkbox = element('input');
             checkbox.type = 'checkbox';
             checkbox.checked = state.selected.has(entry.path);
-            checkbox.disabled = entry.isLeased;
+            checkbox.disabled = entry.isProtected;
             checkbox.setAttribute('aria-label', `Select ${entry.path}`);
             checkbox.addEventListener('change', () => {
                 if (checkbox.checked) state.selected.add(entry.path);
                 else state.selected.delete(entry.path);
                 clearSelected.disabled = state.selected.size === 0;
-                const shown = visible_entries().filter((candidate) => !candidate.isLeased);
+                const shown = visible_entries().filter((candidate) => !candidate.isProtected);
                 selectAll.checked = shown.length > 0
                     && shown.every((candidate) => state.selected.has(candidate.path));
             });
@@ -276,7 +301,9 @@ export function mount_state_inspector(
             if (entry.hasPendingEdits) {
                 status.append(element('span', 'badge unsaved', 'Unsaved edits'));
             }
-            if (entry.isLeased) status.append(element('span', 'badge open', 'Open'));
+            // Claimed only for our own session's lease, the one kind that proves
+            // a window has the file open now.
+            if (entry.openHere) status.append(element('span', 'badge open', 'Open'));
             // Named on the row, so the bulk action acts on something the user
             // can already see rather than on an invisible criterion. "Not on
             // disk" rather than "missing" because that is exactly what was

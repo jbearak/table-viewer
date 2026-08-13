@@ -1,6 +1,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
     open_sqlite_file_state_store,
@@ -14,6 +15,7 @@ import { sheet_edits } from './pending-edits-helper';
 let tempDirectory: string;
 let counter = 0;
 let opened: OpenedSqliteFileStateStore[];
+const database_paths = new WeakMap<OpenedSqliteFileStateStore, string>();
 
 /** A state payload that grows with `columns`, so sizes are comparable. */
 function state(columns = 1): PerFileState {
@@ -37,6 +39,7 @@ async function openStore(
         ports,
     );
     opened.push(store);
+    database_paths.set(store, database.databasePath);
     return store;
 }
 
@@ -441,5 +444,95 @@ describe('a renderer that lies', () => {
 
         expect(result.deletedPaths).toEqual([]);
         expect((await store.maintenance.inspect()).totalEntryCount).toBe(1);
+    });
+});
+
+
+describe('leases left behind by other sessions', () => {
+    /**
+     * A lease owned by another writer session, written from another connection —
+     * which is how a process that was killed rather than closed leaves one.
+     */
+    function foreign_lease(store: OpenedSqliteFileStateStore, filePath: string): void {
+        const database = new DatabaseSync(database_paths.get(store)!);
+        try {
+            database.prepare(`INSERT INTO entry_leases (
+                lease_id, writer_session_id, current_entry_path,
+                acquired_at_ms, acquired_generation
+            ) VALUES ('stale-lease', 'a-session-that-is-gone', ?, 1, 1)`).run(filePath);
+        } finally {
+            database.close();
+        }
+    }
+
+    it('does not call an entry open just because some lease exists', async () => {
+        const store = await openStore();
+        await seed(store, '/files/leftover.csv');
+        foreign_lease(store, '/files/leftover.csv');
+
+        const entry = (await store.maintenance.inspect()).entries[0];
+
+        // Neither open nor protected. Nothing in the database can prove the
+        // holder is alive; treating it as open told the user a file was open
+        // when nothing was, and treating it as protected made the entry
+        // permanently unclearable.
+        expect(entry.openHere).toBe(false);
+        expect(entry.isProtected).toBe(false);
+    });
+
+    it('does call an entry open when this session holds the lease', async () => {
+        const store = await openStore();
+        await seed(store, '/files/mine.csv');
+        await store.store.lease_entry!('/files/mine.csv', (file_path) => file_path);
+
+        const entry = (await store.maintenance.inspect()).entries[0];
+
+        expect(entry.isProtected).toBe(true);
+        expect(entry.openHere).toBe(true);
+    });
+
+    it('clears an entry a departed session leased', async () => {
+        const store = await openStore();
+        await seed(store, '/files/leftover.csv');
+        foreign_lease(store, '/files/leftover.csv');
+
+        const result = await store.maintenance.trim({
+            paths: ['/files/leftover.csv'],
+            confirmedPendingEditPaths: [],
+        });
+
+        expect(result.deletedPaths).toEqual(['/files/leftover.csv']);
+    });
+
+    it('still refuses to clear one this session has open', async () => {
+        const store = await openStore();
+        await seed(store, '/files/mine.csv');
+        await store.store.lease_entry!('/files/mine.csv', (file_path) => file_path);
+
+        const result = await store.maintenance.trim({
+            paths: ['/files/mine.csv'],
+            confirmedPendingEditPaths: ['/files/mine.csv'],
+        });
+
+        expect(result.deletedPaths).toEqual([]);
+        expect(result.skippedProtectedPaths).toEqual(['/files/mine.csv']);
+    });
+
+    it('still guards unsaved edits in an entry a departed session leased', async () => {
+        // Losing the lease's protection must not lose the edit protection: that
+        // gate is about the payload, not about who was holding the row.
+        const store = await openStore();
+        await write(store, '/files/leftover.csv', {
+            pendingEdits: sheet_edits({ '0:0': { value: 'unsaved', base: 'saved' } }),
+        });
+        foreign_lease(store, '/files/leftover.csv');
+
+        const result = await store.maintenance.trim({
+            paths: ['/files/leftover.csv'],
+            confirmedPendingEditPaths: [],
+        });
+
+        expect(result.deletedPaths).toEqual([]);
+        expect(result.skippedUnconfirmedPaths).toEqual(['/files/leftover.csv']);
     });
 });
