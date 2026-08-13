@@ -19,6 +19,7 @@ const out_dir = join(repo_dir, 'dist', 'desktop');
 // Electron reports *its own* version. Injecting at build time keeps the root
 // package.json the single source of truth and is right in both modes.
 const { version } = JSON.parse(await readFile(join(repo_dir, 'package.json'), 'utf8'));
+const install_updates = process.env.TABLE_VIEWER_INSTALL_UPDATES !== '0';
 
 const node_common = {
     bundle: true,
@@ -28,7 +29,10 @@ const node_common = {
     // Built-in SQLite must remain a runtime import. Bundling a shim would hide
     // whether the embedded Node runtime actually supplies the API and could make
     // packaged builds depend on node_modules.
-    external: ['electron', 'node:sqlite'],
+    external: [
+        'electron',
+        'node:sqlite',
+    ],
     sourcemap: true,
     outdir: out_dir,
     logLevel: 'info',
@@ -42,7 +46,10 @@ await mkdir(out_dir, { recursive: true });
 await build({
     ...node_common,
     entryPoints: [join(desktop_dir, 'main', 'main.ts')],
-    define: { __APP_VERSION__: JSON.stringify(version) },
+    define: {
+        __APP_VERSION__: JSON.stringify(version),
+        __INSTALL_APP_UPDATES__: JSON.stringify(install_updates),
+    },
 });
 
 // Runtime-only probe and gate bundles. Keep them outside dist/desktop so

@@ -16,6 +16,7 @@ import {
     ipcMain,
     Menu,
     nativeTheme,
+    net,
     protocol,
     shell,
 } from 'electron';
@@ -70,6 +71,7 @@ import {
     create_app_update_coordinator,
     type AppUpdateCoordinator,
 } from './app-updates';
+import { app_update_failure_dialog } from './app-update-failure';
 import { clamp_zoom_level } from './zoom';
 import {
     SUPPORTED_FILE_EXTENSIONS,
@@ -106,6 +108,7 @@ import {
  * which is exactly the mode nobody watches while developing.
  */
 declare const __APP_VERSION__: string;
+declare const __INSTALL_APP_UPDATES__: boolean;
 
 function is_supported_file(file_path: string): boolean {
     const ext = path.extname(file_path).toLowerCase().replace(/^\./, '');
@@ -186,12 +189,21 @@ function create_packaged_app_updates(portable_executable: string | undefined): A
         autoUpdater.allowDowngrade = false;
     }
 
+    const show_update_message_box = (
+        options: Electron.MessageBoxOptions,
+    ): Promise<Electron.MessageBoxReturnValue> => {
+        const window = BrowserWindow.getFocusedWindow();
+        return window
+            ? dialog.showMessageBox(window, options)
+            : dialog.showMessageBox(options);
+    };
+
     const confirm_update = async (
         message: string,
         detail: string,
         affirmative_label: string,
     ): Promise<boolean> => {
-        const result = await dialog.showMessageBox({
+        const result = await show_update_message_box({
             type: 'info',
             message,
             detail,
@@ -206,6 +218,7 @@ function create_packaged_app_updates(portable_executable: string | undefined): A
         {
             check_for_updates: async () => { await autoUpdater.checkForUpdates(); },
             download_update: async () => { await autoUpdater.downloadUpdate(); },
+            is_online: () => net.isOnline(),
             quit_and_install: () => {
                 if (process.platform === 'darwin') {
                     // Squirrel fetches the already-downloaded ZIP from
@@ -232,37 +245,61 @@ function create_packaged_app_updates(portable_executable: string | undefined): A
             on_update_downloaded: (listener) => {
                 autoUpdater.on('update-downloaded', (info) => listener({ version: info.version }));
             },
-            on_error: (listener) => { autoUpdater.on('error', listener); },
+            on_error: (listener) => {
+                autoUpdater.on('error', (error) => listener(error));
+            },
         },
         {
-            offer_download: (version) => confirm_update(
-                `Table Viewer ${version} is available.`,
-                'Would you like to download it now?',
-                'Download',
-            ),
+            offer_download: async (version, install_updates) => {
+                if (!install_updates) {
+                    const result = await show_update_message_box({
+                        type: 'info',
+                        message: `Table Viewer ${version} is available.`,
+                        detail: 'This unsigned local build cannot install updates automatically. Download the latest release from GitHub, then replace this app manually.',
+                        buttons: ['Open GitHub Releases', 'OK'],
+                        defaultId: 1,
+                        cancelId: 1,
+                    });
+                    if (result.response === 0) {
+                        await shell.openExternal(`${REPOSITORY_URL}/releases`);
+                    }
+                    return false;
+                }
+                return confirm_update(
+                    `Table Viewer ${version} is available.`,
+                    'Would you like to download it now?',
+                    'Download',
+                );
+            },
             offer_restart: (version) => confirm_update(
                 `Table Viewer ${version} is ready to install.`,
                 'Restart Table Viewer to finish installing the update.',
                 'Restart and Install',
             ),
             show_up_to_date: async () => {
-                await dialog.showMessageBox({
+                await show_update_message_box({
                     type: 'info',
                     message: 'Table Viewer is up to date.',
                     detail: `You are running version ${__APP_VERSION__}.`,
                     buttons: ['OK'],
                 });
             },
-            show_check_error: async () => {
-                await dialog.showMessageBox({
+            show_failure: async (failure) => {
+                const wording = app_update_failure_dialog(failure);
+                const result = await show_update_message_box({
                     type: 'warning',
-                    message: 'Table Viewer could not check for updates.',
-                    detail: 'Check your internet connection and try again.',
-                    buttons: ['OK'],
+                    message: wording.message,
+                    detail: wording.detail,
+                    buttons: [...wording.buttons],
+                    defaultId: wording.defaultId,
+                    cancelId: wording.cancelId,
                 });
+                if (result.response === wording.open_releases_response) {
+                    await shell.openExternal(`${REPOSITORY_URL}/releases`);
+                }
             },
             show_download_in_progress: async () => {
-                await dialog.showMessageBox({
+                await show_update_message_box({
                     type: 'info',
                     message: 'Table Viewer is downloading an update.',
                     detail: 'You will be asked before the app restarts to install it.',
@@ -271,6 +308,7 @@ function create_packaged_app_updates(portable_executable: string | undefined): A
             },
         },
         () => app.quit(),
+        { install_updates: __INSTALL_APP_UPDATES__ },
     );
 }
 
@@ -329,7 +367,9 @@ const coordinate_app_quit = create_app_quit_coordinator(
                 // Reporting is best-effort; persistence must never prevent quit.
             }
         }
-        if (!app_updates?.install_if_requested()) app.quit();
+        const install_result = app_updates?.install_if_requested() ?? 'not-requested';
+        if (install_result === 'not-requested') app.quit();
+        if (install_result === 'failed') app.exit(1);
     },
     quit_shutdown,
 );
@@ -599,6 +639,12 @@ function build_menu(): void {
                         label: 'About Table Viewer',
                         click: () => show_about_window(),
                     },
+                    ...(app_updates
+                        ? [{
+                            label: 'Check for Updates…',
+                            click: () => app_updates?.check_manually(),
+                        }]
+                        : []),
                     { type: 'separator' as const },
                     {
                         label: 'Preferences…',
@@ -732,7 +778,7 @@ function build_menu(): void {
             label: 'Help',
             role: 'help',
             submenu: [
-                ...(app_updates
+                ...(!is_mac && app_updates
                     ? [
                         {
                             label: 'Check for Updates…',
