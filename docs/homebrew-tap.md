@@ -25,13 +25,13 @@ pinned to one version, which a packaged app can't be repointed at).
 | Where | What |
 | --- | --- |
 | `release-build.yml`, `desktop` job | Runs `npm run desktop:package:release` on a macOS runner, producing `table-viewer-<version>-arm64.dmg` + `.zip` and their `.sha256` files as the `desktop-<tag>` artifact. |
-| `release-publish.yml` | Downloads that artifact, verifies the checksums, attaches the dmg/zip to the GitHub Release, then opens a cask bump PR against the tap. |
+| `release-publish.yml` | Downloads that artifact, verifies the checksums, attaches the dmg/zip to the GitHub Release, seeds a placeholder tap when necessary, then opens cask bump PRs for later releases. |
 | `jbearak/homebrew-table-viewer` | `Casks/table-viewer.rb`, `bin/update-cask.sh` (the single source of truth for the cask edit), and CI that audits + installs the cask on an Apple Silicon runner. |
 
 The version and checksum in the cask are only ever written by
-`bin/update-cask.sh`, called from both the tap's `bootstrap.sh` and the bump
-steps in `release-publish.yml`, so the seed path and the per-release path can't
-drift.
+`bin/update-cask.sh`. Release CI copies the tracked scaffold on the first run
+and invokes that same updater for both the seed and every later bump, so those
+paths cannot drift.
 
 ## Architecture and macOS floor
 
@@ -82,26 +82,32 @@ placeholder README. It was created empty on purpose: a fine-grained PAT can only
 be scoped to a repository that exists, and seeding the cask before any release
 carried a dmg would have meant a red tap CI pointing at a 404.
 
-1. **Seed the tap.** From the tap scaffold (`.tap-staging/` in this repo, which
-   is gitignored — it becomes the tap's contents):
+1. **Give release CI write access to the tap.** Store `HOMEBREW_TAP_TOKEN` as
+   a secret on this repository's `release` environment. It should be a GitHub
+   App installation token or fine-grained PAT restricted to
+   `jbearak/homebrew-table-viewer` with **Contents: write**, **Pull requests:
+   write**, and **Workflows: write**. The workflow permission is needed only
+   because the initial seed installs the tap's test workflow.
 
    ```sh
-   cd .tap-staging
-   ./bootstrap.sh <version>     # a release that has the arm64 dmg attached
+   gh secret set HOMEBREW_TAP_TOKEN -R jbearak/table-viewer --env release
    ```
 
-   This downloads that release's dmg, writes the real checksum into the cask,
-   and commits the cask, `bin/`, CI and the real README on top of the existing
-   `main`. It fails loudly rather than seeding a cask that points at a missing
-   asset, so the version must be a release cut *after* the `desktop` build job
-   landed. Re-running it is safe.
+2. **Run a release publisher.** Every release carrying the arm64 dmg now runs
+   the tap publisher automatically. If the tap still contains only its
+   placeholder README, release CI copies the tracked `.github/homebrew-tap/`
+   scaffold, fills in the released version and checksum, and fast-forwards
+   `main`. Re-running `release-publish.yml` manually for an existing release
+   such as `v0.9.1` is also safe: registry publication is skip-duplicate and the
+   GitHub Release action updates the existing release before the tap step.
 
-   Because the cask and the tap's CI arrive in that one commit, the tap's first
-   CI run is also its first *real* one — it audits and installs a cask whose
-   checksum matches a dmg that exists.
+   The seed refuses to overwrite any unexpected tracked tap content. Once the
+   cask exists, later releases take the update path and open a bump PR instead
+   of writing `main` directly. Because the cask and tap CI arrive together, the
+   first CI run audits and installs a cask whose checksum matches a real dmg.
 
-2. **Require the tap's CI.** In the tap repo, Settings → Branches: require the
-   `test` check on `main`, so a bump PR can't merge red. Do this after step 1:
+3. **Require the tap's CI.** In the tap repo, Settings → Branches: require the
+   `test` check on `main`, so a bump PR can't merge red. Do this after step 2:
    the check has to have run once before it can be selected as required.
 
    This step is also what makes auto-merge meaningful. `gh pr merge --auto`
@@ -111,25 +117,10 @@ carried a dmg would have meant a red tap CI pointing at a 404.
    delete-branch-on-merge are already enabled on the tap repo; auto-merge is off
    by default and `--auto` fails outright without it.)
 
-3. **Give this repo write access to the tap and enable the bump:**
-
-   ```sh
-   gh secret   set HOMEBREW_TAP_TOKEN   -R jbearak/table-viewer --env release
-   gh variable set ENABLE_HOMEBREW_BUMP -R jbearak/table-viewer --body true
-   ```
-
-   `HOMEBREW_TAP_TOKEN` should be a GitHub App installation token or a
-   fine-grained PAT restricted to `jbearak/homebrew-table-viewer` with
-   **Contents: write** + **Pull requests: write** only — it can ship arbitrary
-   cask Ruby to anyone installing from the tap. Set an expiration.
-
-   It lives on the `release` environment so the bump steps need no second
-   approval. Note that any protection rule added to that environment (required
-   reviewers, a wait timer) would gate the `desktop` build job too.
-
-Until `ENABLE_HOMEBREW_BUMP` is `true` the bump steps are skipped entirely; the
-release still builds and attaches the dmg, so turning it on later needs no
-workflow change.
+The token can ship arbitrary cask Ruby to anyone installing from the tap, so
+set an expiration and keep it in the `release` environment. Any protection rule
+added to that environment (required reviewers, a wait timer) gates both the
+desktop build and publisher jobs.
 
 ## Verifying a cask change locally
 

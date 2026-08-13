@@ -5,6 +5,5 @@ out/
 test-results/
 *.vsix
 .superpowers/
-# Scaffold for the jbearak/homebrew-table-viewer tap repo; seeded from here by
-# its bootstrap.sh and then lives in its own repo (see docs/homebrew-tap.md).
+# Legacy local scaffold from before release CI owned tap seeding.
 .tap-staging/

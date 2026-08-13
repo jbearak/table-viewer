@@ -1,0 +1,44 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Table Viewer and its cask are intentionally Apple Silicon only.
+    runs-on: macos-latest
+    steps:
+      - name: Checkout tap
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Homebrew
+        uses: Homebrew/actions/setup-homebrew@962acc985cf741e4f7a112a3cfa6194386b63edf
+
+      - name: Audit cask
+        run: brew audit --strict --online --cask jbearak/table-viewer/table-viewer
+
+      - name: Install cask
+        run: brew install --cask --verbose jbearak/table-viewer/table-viewer
+
+      - name: Verify installed app
+        run: |
+          set -euo pipefail
+          APP="/Applications/Table Viewer.app"
+          test -d "$APP"
+          test -x "$APP/Contents/MacOS/Table Viewer"
+          EXPECTED=$(brew info --cask --json=v2 jbearak/table-viewer/table-viewer \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["casks"][0]["version"])')
+          ACTUAL=$(plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist")
+          echo "cask=$EXPECTED bundle=$ACTUAL"
+          [[ "$EXPECTED" == "$ACTUAL" ]]
+          for file in LICENSE.txt THIRD_PARTY_NOTICES.txt LICENSE.electron.txt LICENSES.chromium.html; do
+            test -s "$APP/Contents/Resources/$file" || { echo "missing $file" >&2; exit 1; }
+          done
+
+      - name: Uninstall cask
+        run: brew uninstall --cask --verbose jbearak/table-viewer/table-viewer
