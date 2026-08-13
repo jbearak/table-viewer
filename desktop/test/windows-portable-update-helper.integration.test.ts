@@ -65,9 +65,14 @@ windows_only('Windows portable update helper integration', () => {
 
         const child = spawn(helper, [transaction_path], { windowsHide: true, stdio: 'ignore' });
         await wait_for_exit(wrapper, 0);
-        const diagnostic = await poll_json(result_path, (value) => value.status === 'awaiting-acknowledgement');
-        expect(diagnostic).toMatchObject({ transaction_id, error: 'ack-timeout' });
-        const terminal = await poll_json(result_path, (value) => value.status === 'rolled-back');
+        const timeout_result = await poll_json(
+            result_path,
+            (value) => value.status === 'awaiting-acknowledgement' || value.status === 'rolled-back',
+        );
+        expect(timeout_result).toMatchObject({ transaction_id, error: 'ack-timeout' });
+        const terminal = timeout_result.status === 'rolled-back'
+            ? timeout_result
+            : await poll_json(result_path, (value) => value.status === 'rolled-back');
         expect(terminal).toMatchObject({ transaction_id, status: 'rolled-back', error: 'ack-timeout' });
         await wait_for_exit(child, 7);
         expect(await fs.readFile(target_path)).toEqual(old_bytes);

@@ -23,7 +23,6 @@ namespace {
 #define PORTABLE_UPDATE_ACK_TIMEOUT_MS 30'000
 #endif
 constexpr DWORD kAckTimeoutMs = PORTABLE_UPDATE_ACK_TIMEOUT_MS;
-constexpr DWORD kProcessTreeStopTimeoutMs = 30'000;
 constexpr DWORD kWrapperTimeoutMs = 2 * 60'000;
 constexpr DWORD kPollIntervalMs = 100;
 constexpr std::uintmax_t kMaxTransactionBytes = 64 * 1024;
@@ -442,7 +441,7 @@ std::optional<ReplacementProcess> launch_replacement(const Transaction& transact
     if (!AssignProcessToJobObject(job, process.hProcess)) {
         error = "assign-job-" + windows_error(GetLastError());
         TerminateProcess(process.hProcess, 1);
-        WaitForSingleObject(process.hProcess, kProcessTreeStopTimeoutMs);
+        WaitForSingleObject(process.hProcess, INFINITE);
         CloseHandle(process.hThread);
         CloseHandle(process.hProcess);
         CloseHandle(job);
@@ -451,7 +450,7 @@ std::optional<ReplacementProcess> launch_replacement(const Transaction& transact
     if (ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
         error = "resume-process-" + windows_error(GetLastError());
         TerminateJobObject(job, 1);
-        WaitForSingleObject(process.hProcess, kProcessTreeStopTimeoutMs);
+        WaitForSingleObject(process.hProcess, INFINITE);
         CloseHandle(process.hThread);
         CloseHandle(process.hProcess);
         CloseHandle(job);
@@ -489,9 +488,9 @@ bool stop_replacement_tree(const ReplacementProcess& replacement, std::string& e
         error += ";terminate-job-" + windows_error(GetLastError());
         return false;
     }
-    const DWORD wait = WaitForSingleObject(replacement.job, kProcessTreeStopTimeoutMs);
+    const DWORD wait = WaitForSingleObject(replacement.job, INFINITE);
     if (wait == WAIT_OBJECT_0) return true;
-    error += wait == WAIT_TIMEOUT ? ";terminate-job-timeout" : ";terminate-job-wait-" + windows_error(GetLastError());
+    error += ";terminate-job-wait-" + windows_error(GetLastError());
     return false;
 }
 
@@ -581,8 +580,11 @@ int run(const std::filesystem::path& transaction_path) {
     auto replacement = launch_replacement(*transaction, error);
     if (!replacement) {
         const std::string launch_error = error;
-        rollback_and_relaunch(*transaction, error);
-        write_result(&*transaction, "rolled-back", "launch-" + launch_error + ";" + error);
+        if (!rollback_and_relaunch(*transaction, error)) {
+            write_result(&*transaction, "failed", "launch-" + launch_error + ";" + error);
+            return 6;
+        }
+        write_result(&*transaction, "rolled-back", "launch-" + launch_error);
         return 6;
     }
     const auto acknowledgement = wait_for_acknowledgement(*transaction, replacement->job);
@@ -596,14 +598,20 @@ int run(const std::filesystem::path& transaction_path) {
             write_result(&*transaction, "failed", error);
             return 7;
         }
-        rollback_and_relaunch(*transaction, error);
+        if (!rollback_and_relaunch(*transaction, error)) {
+            write_result(&*transaction, "failed", error);
+            return 7;
+        }
         write_result(&*transaction, "rolled-back", error);
         return 7;
     }
     if (!release_replacement_tree(*replacement, error)) {
-        stop_replacement_tree(*replacement, error);
+        const bool stopped = stop_replacement_tree(*replacement, error);
         close_replacement(*replacement);
-        rollback_and_relaunch(*transaction, error);
+        if (!stopped || !rollback_and_relaunch(*transaction, error)) {
+            write_result(&*transaction, "failed", error);
+            return 8;
+        }
         write_result(&*transaction, "rolled-back", error);
         return 8;
     }
