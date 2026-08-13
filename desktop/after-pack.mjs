@@ -23,6 +23,7 @@ const REQUIRED_NOTICES = [
     'LICENSE.electron.txt',
     'LICENSES.chromium.html',
 ];
+const WINDOWS_PORTABLE_UPDATE_HELPER = 'windows-portable-update-helper.exe';
 
 // Where extraResources land, per platform. macOS buries them in the .app
 // bundle; Windows and Linux put them in a sibling `resources` directory.
@@ -41,10 +42,13 @@ function resources_dir(context) {
 export default async function after_pack(context) {
     const resources = resources_dir(context);
 
+    const required = context.electronPlatformName === 'win32'
+        ? [...REQUIRED_NOTICES, WINDOWS_PORTABLE_UPDATE_HELPER]
+        : REQUIRED_NOTICES;
     const missing = [];
-    for (const name of REQUIRED_NOTICES) {
+    for (const name of required) {
         try {
-            // Empty counts as missing: a zero-byte notice is no notice.
+            // Empty counts as missing: a zero-byte notice or helper is not usable.
             if ((await stat(join(resources, name))).size === 0) missing.push(`${name} (empty)`);
         } catch {
             missing.push(name);
@@ -53,10 +57,11 @@ export default async function after_pack(context) {
 
     if (missing.length > 0) {
         throw new Error(
-            `Packaged app is missing required license notices: ${missing.join(', ')}.\n` +
+            `Packaged app is missing required resources: ${missing.join(', ')}.\n` +
                 'These come from extraResources in desktop/electron-builder.yml, whose sources ' +
-                'include node_modules/electron/dist/. If the Electron ones are missing, that ' +
-                "install is incomplete — check that node_modules/electron/path.txt exists and " +
+                'include node_modules/electron/dist/ and, on Windows, the architecture-specific helper. ' +
+                'If the Electron notices are missing, that ' +
+                'install is incomplete — check that node_modules/electron/path.txt exists and ' +
                 'node_modules/electron/dist/ is a full extraction, then repair it with:\n' +
                 '  npm run desktop:ensure-electron',
         );

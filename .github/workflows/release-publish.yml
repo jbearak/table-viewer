@@ -102,6 +102,7 @@ jobs:
           node-version: '26.5.1'
 
       - name: Install release metadata validator dependencies
+        working-directory: release-publisher-tools
         run: npm ci --ignore-scripts
 
       - name: Validate tag + versions
@@ -261,10 +262,12 @@ jobs:
           fi
           (cd windows-dist && sha256sum -c ./*.sha256)
           if [[ "${{ steps.artifacts.outputs.desktop }}" == "true" ]]; then
-            node scripts/validate-update-metadata.mjs desktop-dist/latest-mac.yml "$VERSION" "table-viewer-${VERSION}-arm64.zip"
+            node release-publisher-tools/scripts/validate-update-metadata.mjs desktop-dist/latest-mac.yml "$VERSION" "table-viewer-${VERSION}-arm64.zip"
           fi
-          node scripts/validate-update-metadata.mjs windows-dist/latest.yml "$VERSION" "table-viewer-${VERSION}-x64-setup.exe" --require-blockmap
-          node scripts/validate-update-metadata.mjs windows-dist/latest-arm64.yml "$VERSION" "table-viewer-${VERSION}-arm64-setup.exe" --require-blockmap
+          node release-publisher-tools/scripts/validate-update-metadata.mjs windows-dist/latest.yml "$VERSION" "table-viewer-${VERSION}-x64-setup.exe" --strict --require-blockmap
+          node release-publisher-tools/scripts/validate-update-metadata.mjs windows-dist/latest-arm64.yml "$VERSION" "table-viewer-${VERSION}-arm64-setup.exe" --strict --require-blockmap
+          node release-publisher-tools/scripts/validate-update-metadata.mjs windows-dist/latest-portable.yml "$VERSION" "table-viewer-${VERSION}-x64-portable.exe" --strict
+          node release-publisher-tools/scripts/validate-update-metadata.mjs windows-dist/latest-portable-arm64.yml "$VERSION" "table-viewer-${VERSION}-arm64-portable.exe" --strict
 
       - name: Install locked publish tools
         working-directory: .github/release-tools
@@ -396,6 +399,8 @@ jobs:
             windows-dist/table-viewer-*.exe.blockmap
             windows-dist/latest.yml
             windows-dist/latest-arm64.yml
+            windows-dist/latest-portable.yml
+            windows-dist/latest-portable-arm64.yml
             windows-dist/*.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -75,6 +75,15 @@ import {
     type AppUpdateCoordinator,
 } from './app-updates';
 import { app_update_failure_dialog } from './app-update-failure';
+import {
+    acknowledge_windows_portable_update,
+    clean_windows_portable_update_transactions,
+    create_windows_portable_update_engine,
+} from './windows-portable-app-updates';
+import {
+    portable_update_acknowledgement,
+    without_portable_update_arguments,
+} from './windows-portable-update-protocol';
 import { clamp_zoom_level } from './zoom';
 import { TITLEBAR_WINDOW_OPTIONS } from '../shared/titlebar';
 import {
@@ -186,19 +195,65 @@ const state_backend = create_desktop_state_backend<OpenedSqliteFileStateStore>(
 );
 
 function create_packaged_app_updates(portable_executable: string | undefined): AppUpdateCoordinator | undefined {
-    if (!app.isPackaged || !['darwin', 'win32'].includes(process.platform) || portable_executable) {
-        return undefined;
-    }
+    if (!app.isPackaged || !['darwin', 'win32'].includes(process.platform)) return undefined;
 
-    autoUpdater.autoDownload = false;
-    autoUpdater.autoInstallOnAppQuit = false;
-    autoUpdater.allowPrerelease = false;
-    if (process.platform === 'win32') {
-        autoUpdater.channel = process.arch === 'arm64' ? 'latest-arm64' : 'latest';
-        // electron-updater's channel setter enables downgrades as a side effect;
-        // architecture selection is not permission to install an older release.
-        autoUpdater.allowDowngrade = false;
-    }
+    const engine = portable_executable
+        ? create_windows_portable_update_engine({
+            current_version: __APP_VERSION__,
+            arch: process.arch,
+            portable_executable,
+            wrapper_pid: process.ppid,
+            user_data_dir: app.getPath('userData'),
+            resources_dir: process.resourcesPath,
+            is_online: () => net.isOnline(),
+            finish_quit: () => app.quit(),
+            fail_quit: () => app.exit(1),
+        })
+        : (() => {
+            autoUpdater.autoDownload = false;
+            autoUpdater.autoInstallOnAppQuit = false;
+            autoUpdater.allowPrerelease = false;
+            if (process.platform === 'win32') {
+                autoUpdater.channel = process.arch === 'arm64' ? 'latest-arm64' : 'latest';
+                // electron-updater's channel setter enables downgrades as a side effect;
+                // architecture selection is not permission to install an older release.
+                autoUpdater.allowDowngrade = false;
+            }
+            return {
+                check_for_updates: async () => { await autoUpdater.checkForUpdates(); },
+                download_update: async () => { await autoUpdater.downloadUpdate(); },
+                is_online: () => net.isOnline(),
+                quit_and_install: () => {
+                    if (process.platform === 'darwin') {
+                        // Squirrel fetches the already-downloaded ZIP from
+                        // electron-updater's local proxy only after this call. If that
+                        // handoff fails, no updater quit follows; the normal backend is
+                        // already drained, so exit rather than leave a windowless app
+                        // alive over closed state.
+                        autoUpdater.once('error', () => app.exit(1));
+                        autoUpdater.quitAndInstall();
+                    } else {
+                        autoUpdater.quitAndInstall(false, true);
+                        // BaseUpdater quits only when it successfully starts the
+                        // installer. Its API returns void, so retain the old post-drain
+                        // terminal guarantee when cached installer state is missing.
+                        setImmediate(() => app.quit());
+                    }
+                },
+                on_update_available: (listener: (info: { version: string }) => void) => {
+                    autoUpdater.on('update-available', (info) => listener({ version: info.version }));
+                },
+                on_update_not_available: (listener: () => void) => {
+                    autoUpdater.on('update-not-available', listener);
+                },
+                on_update_downloaded: (listener: (info: { version: string }) => void) => {
+                    autoUpdater.on('update-downloaded', (info) => listener({ version: info.version }));
+                },
+                on_error: (listener: (error: unknown) => void) => {
+                    autoUpdater.on('error', (error) => listener(error));
+                },
+            };
+        })();
 
     const show_update_message_box = (
         options: Electron.MessageBoxOptions,
@@ -226,40 +281,7 @@ function create_packaged_app_updates(portable_executable: string | undefined): A
     };
 
     return create_app_update_coordinator(
-        {
-            check_for_updates: async () => { await autoUpdater.checkForUpdates(); },
-            download_update: async () => { await autoUpdater.downloadUpdate(); },
-            is_online: () => net.isOnline(),
-            quit_and_install: () => {
-                if (process.platform === 'darwin') {
-                    // Squirrel fetches the already-downloaded ZIP from
-                    // electron-updater's local proxy only after this call. If that
-                    // handoff fails, no updater quit follows; the normal backend is
-                    // already drained, so exit rather than leave a windowless app
-                    // alive over closed state.
-                    autoUpdater.once('error', () => app.exit(1));
-                    autoUpdater.quitAndInstall();
-                } else {
-                    autoUpdater.quitAndInstall(false, true);
-                    // BaseUpdater quits only when it successfully starts the
-                    // installer. Its API returns void, so retain the old post-drain
-                    // terminal guarantee when cached installer state is missing.
-                    setImmediate(() => app.quit());
-                }
-            },
-            on_update_available: (listener) => {
-                autoUpdater.on('update-available', (info) => listener({ version: info.version }));
-            },
-            on_update_not_available: (listener) => {
-                autoUpdater.on('update-not-available', listener);
-            },
-            on_update_downloaded: (listener) => {
-                autoUpdater.on('update-downloaded', (info) => listener({ version: info.version }));
-            },
-            on_error: (listener) => {
-                autoUpdater.on('error', (error) => listener(error));
-            },
-        },
+        engine,
         {
             offer_download: async (version, install_updates) => {
                 if (!install_updates) {
@@ -1305,9 +1327,16 @@ if (!got_lock) {
             kind: 'startup',
             files: [
                 ...take_open_window_paths(user_data_dir, can_restore_file),
-                ...file_args(process.argv.slice(app.isPackaged ? 1 : 2)),
+                ...file_args(without_portable_update_arguments(
+                    process.argv.slice(app.isPackaged ? 1 : 2),
+                )),
             ],
         });
+        await acknowledge_windows_portable_update(
+            user_data_dir,
+            portable_update_acknowledgement(process.argv),
+        );
+        void clean_windows_portable_update_transactions(user_data_dir);
         // Detached from startup: update service/network failures must never turn
         // into a fatal state-backend startup failure.
         setImmediate(() => app_updates?.check_automatically());
