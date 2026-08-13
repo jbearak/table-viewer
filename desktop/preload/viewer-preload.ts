@@ -20,11 +20,24 @@ import {
     CHANNEL_HOST_MESSAGE,
     CHANNEL_HOST_MESSAGE_RECEIPT,
     CHANNEL_THEME_CHANGED,
+    CHANNEL_TITLEBAR_INFO,
+    CHANNEL_TITLEBAR_PATH_MENU,
+    CHANNEL_TITLEBAR_ACTIVE,
+    CHANNEL_TITLEBAR_DRAG,
+    CHANNEL_TITLEBAR_ZOOM_WINDOW,
+    CHANNEL_TITLEBAR_ACTIVE_CHANGED,
+    CHANNEL_TITLEBAR_ZOOM,
+    CHANNEL_TITLEBAR_ZOOM_CHANGED,
     CHANNEL_WEBVIEW_MESSAGE,
     type DesktopHostMessageEnvelope,
     type PendingEditAcknowledgementReceipt,
 } from '../shared/ipc';
 import { apply_theme_to_document, type ThemePayload } from '../main/theme';
+import {
+    install_titlebar,
+    set_titlebar_active,
+    set_titlebar_zoom,
+} from '../shared/titlebar';
 
 // contextBridge clones the object into the main world, so the shared bundle
 // (which only calls postMessage) works across the isolation boundary.
@@ -81,3 +94,33 @@ window.addEventListener('DOMContentLoaded', () => apply_theme(current_theme));
 ipcRenderer.on(CHANNEL_THEME_CHANGED, (_event, payload: ThemePayload) => {
     apply_theme(payload);
 });
+
+// macOS themed title bar. The strip itself is shared with the other
+// windows (desktop/shared/titlebar.ts); the viewer supplies the file name, the
+// toolbar's own band colors (see .toolbar in src/webview/styles.css), and the
+// proxy-icon path menu, which only a window representing a file has. The title's
+// own font and color are the system's, not the configured app font.
+const titlebar = ipcRenderer.sendSync(CHANNEL_TITLEBAR_INFO) as
+    { title: string; inset: number } | undefined;
+
+if (titlebar) {
+    window.addEventListener('DOMContentLoaded', () => install_titlebar(document, {
+        title: titlebar.title,
+        inset: titlebar.inset,
+        style: {
+            background: 'var(--vscode-editorGroupHeader-tabsBackground, #252526)',
+            border: 'var(--vscode-panel-border, #444)',
+        },
+        on_path_menu: () => ipcRenderer.send(CHANNEL_TITLEBAR_PATH_MENU),
+        on_drag: (phase, x, y) => ipcRenderer.send(CHANNEL_TITLEBAR_DRAG, phase, x, y),
+        on_zoom_window: () => ipcRenderer.send(CHANNEL_TITLEBAR_ZOOM_WINDOW),
+        zoom: ipcRenderer.sendSync(CHANNEL_TITLEBAR_ZOOM) as number,
+        active: ipcRenderer.sendSync(CHANNEL_TITLEBAR_ACTIVE) as boolean,
+    }));
+    ipcRenderer.on(CHANNEL_TITLEBAR_ZOOM_CHANGED, (_event, zoom: number) => {
+        set_titlebar_zoom(document, zoom);
+    });
+    ipcRenderer.on(CHANNEL_TITLEBAR_ACTIVE_CHANGED, (_event, active: boolean) => {
+        set_titlebar_active(document, active);
+    });
+}

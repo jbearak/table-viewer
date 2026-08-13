@@ -90,6 +90,12 @@ import {
     CHANNEL_SETTINGS_CHANGED,
     CHANNEL_STATE_INSPECTOR_REQUEST,
     CHANNEL_THEME_CHANGED,
+    CHANNEL_TITLEBAR_ACTIVE,
+    CHANNEL_TITLEBAR_DRAG,
+    CHANNEL_TITLEBAR_ZOOM_WINDOW,
+    CHANNEL_TITLEBAR_ACTIVE_CHANGED,
+    CHANNEL_TITLEBAR_ZOOM,
+    CHANNEL_TITLEBAR_ZOOM_CHANGED,
     CHANNEL_WELCOME_OPEN_FILES,
     CHANNEL_WELCOME_OPEN_PREFERENCES,
 } from '../shared/ipc';
@@ -129,6 +135,8 @@ function file_args(argv: string[], base_dir: string = process.cwd()): string[] {
 }
 
 // dist/desktop/main.js → repo (or app) root two levels up.
+const IS_MAC = process.platform === 'darwin';
+
 const DIST_DIR = path.join(__dirname, '..');
 const WEBVIEW_DIST_DIR = path.join(DIST_DIR, 'webview');
 const DESKTOP_DIST_DIR = path.join(DIST_DIR, 'desktop');
@@ -351,6 +359,9 @@ function apply_zoom(delta: number | 'reset', window: Electron.BaseWindow | undef
     contents.setZoomLevel(
         delta === 'reset' ? 0 : clamp_zoom_level(contents.getZoomLevel() + delta),
     );
+    // macOS themed title bar: the strip stands in for window chrome,
+    // which macOS does not scale, so it re-derives its metrics from the new factor.
+    contents.send(CHANNEL_TITLEBAR_ZOOM_CHANGED, contents.getZoomFactor());
 }
 
 /** The launcher shown with no file open, and by File → New Window. Several may
@@ -363,6 +374,9 @@ function show_welcome_window(): BrowserWindow {
         maximizable: false,
         fullscreenable: false,
         title: 'Table Viewer',
+        // macOS themed title bar (desktop/shared/titlebar.ts); the
+        // strip is redrawn by this window's renderer.
+        ...(IS_MAC ? { titleBarStyle: 'hidden' as const } : {}),
         backgroundColor: window_background_color(current_theme_id()),
         webPreferences: {
             preload: WELCOME_PRELOAD,
@@ -406,6 +420,9 @@ function show_preferences_window(): void {
         maximizable: false,
         fullscreenable: false,
         title: 'Table Viewer Preferences',
+        // macOS themed title bar (desktop/shared/titlebar.ts); the
+        // strip is redrawn by this window's renderer.
+        ...(IS_MAC ? { titleBarStyle: 'hidden' as const } : {}),
         backgroundColor: window_background_color(current_theme_id()),
         webPreferences: {
             preload: PREFS_PRELOAD,
@@ -436,6 +453,9 @@ function show_about_window(): void {
         maximizable: false,
         fullscreenable: false,
         title: 'About Table Viewer',
+        // macOS themed title bar (desktop/shared/titlebar.ts); the
+        // strip is redrawn by this window's renderer.
+        ...(IS_MAC ? { titleBarStyle: 'hidden' as const } : {}),
         backgroundColor: window_background_color(current_theme_id()),
         webPreferences: {
             preload: ABOUT_PRELOAD,
@@ -466,6 +486,9 @@ function show_state_inspector_window(): void {
         minWidth: 520,
         minHeight: 320,
         title: 'Stored File State',
+        // macOS themed title bar (desktop/shared/titlebar.ts); the
+        // strip is redrawn by this window's renderer.
+        ...(IS_MAC ? { titleBarStyle: 'hidden' as const } : {}),
         backgroundColor: window_background_color(current_theme_id()),
         webPreferences: {
             preload: STATE_INSPECTOR_PRELOAD,
@@ -694,7 +717,82 @@ function update_settings(partial: unknown): DesktopSettings {
     );
 }
 
+/**
+ * macOS themed title bar: move a window being dragged by its title.
+ *
+ * Anchored on `start` rather than moved by each event's delta: the window moves
+ * under the pointer as the drag proceeds, so successive positions are only
+ * meaningful against where the drag began. Pointer coordinates arrive in the
+ * page's CSS pixels, which the window's zoom factor converts to the device-
+ * independent pixels `setPosition` wants — otherwise dragging a zoomed window
+ * would move it at the wrong speed.
+ */
+const titlebar_drag_anchors = new WeakMap<BrowserWindow, {
+    pointer: { x: number; y: number };
+    window: { x: number; y: number };
+}>();
+
+function drag_titlebar(
+    window: BrowserWindow | null,
+    phase: 'start' | 'move',
+    x: number,
+    y: number,
+): void {
+    if (!window || window.isDestroyed()) return;
+    if (phase === 'start') {
+        const { x: window_x, y: window_y } = window.getBounds();
+        titlebar_drag_anchors.set(window, { pointer: { x, y }, window: { x: window_x, y: window_y } });
+        return;
+    }
+    const anchor = titlebar_drag_anchors.get(window);
+    // A move with no anchor is a drag that began before this window existed in
+    // the map — nothing sensible to move it relative to, so ignore it.
+    if (!anchor) return;
+    const zoom = window.webContents.isDestroyed() ? 1 : window.webContents.getZoomFactor();
+    window.setPosition(
+        Math.round(anchor.window.x + (x - anchor.pointer.x) * zoom),
+        Math.round(anchor.window.y + (y - anchor.pointer.y) * zoom),
+    );
+}
+
+/**
+ * macOS themed title bar: tell each window's strip when it becomes
+ * the active window, so the title dims like a native one.
+ *
+ * Registered once for every window the app will ever create, rather than per
+ * window: the strip is chrome that every window has, and a window that opened
+ * without being wired would keep an undimmed title forever.
+ */
+function watch_window_activation(): void {
+    app.on('browser-window-created', (_event, window) => {
+        const send = (active: boolean) => {
+            if (window.isDestroyed()) return;
+            const contents = window.webContents;
+            if (!contents.isDestroyed()) contents.send(CHANNEL_TITLEBAR_ACTIVE_CHANGED, active);
+        };
+        window.on('focus', () => send(true));
+        window.on('blur', () => send(false));
+    });
+}
+
 function register_ipc(): void {
+    ipcMain.on(CHANNEL_TITLEBAR_ZOOM, (event) => {
+        event.returnValue = event.sender.getZoomFactor();
+    });
+    ipcMain.on(CHANNEL_TITLEBAR_ACTIVE, (event) => {
+        event.returnValue = BrowserWindow.fromWebContents(event.sender)?.isFocused() ?? true;
+    });
+    ipcMain.on(CHANNEL_TITLEBAR_DRAG, (event, phase: 'start' | 'move', x: number, y: number) => {
+        drag_titlebar(BrowserWindow.fromWebContents(event.sender), phase, x, y);
+    });
+    ipcMain.on(CHANNEL_TITLEBAR_ZOOM_WINDOW, (event) => {
+        const window = BrowserWindow.fromWebContents(event.sender);
+        // Zoom, as macOS means it: a toggle, and only where the window can do it
+        // at all — the fixed-size dialogs are `maximizable: false`.
+        if (!window || window.isDestroyed() || !window.isMaximizable()) return;
+        if (window.isMaximized()) window.unmaximize();
+        else window.maximize();
+    });
     ipcMain.on(CHANNEL_GET_THEME, (event) => {
         event.returnValue = theme_payload(current_theme_id());
     });
@@ -1016,6 +1114,7 @@ if (!got_lock) {
         apply_theme_source(config_store.settings().theme);
         register_app_protocol();
         register_ipc();
+        watch_window_activation();
         watch_settings();
         build_menu();
         nativeTheme.on('updated', broadcast_theme);

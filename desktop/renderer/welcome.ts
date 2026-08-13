@@ -6,6 +6,7 @@ import type { WelcomeApi } from '../preload/welcome-preload';
 import type { DesktopSettings } from '../main/desktop-config';
 import type { ThemePayload } from '../main/theme';
 import { SYSTEM_FONT, font_family_with_fallback } from '../main/theme-palette';
+import { install_titlebar, set_titlebar_active, set_titlebar_zoom } from '../shared/titlebar';
 
 const welcome_api = (window as unknown as { welcomeApi: WelcomeApi }).welcomeApi;
 
@@ -39,3 +40,23 @@ welcome_api.on_theme_changed(apply_theme);
 welcome_api.on_settings_changed(apply_settings);
 apply_theme(welcome_api.get_theme());
 void welcome_api.get_settings().then(apply_settings);
+
+// macOS themed title bar: `titleBarStyle: 'hidden'` hides the native
+// bar (and its title), so this window redraws the strip itself. No band color and
+// no rule: this window has no toolbar for the strip to continue, so it takes the
+// window's own background and reads as one surface. Colors and font are this
+// page's own variables, so a theme or font change repaints it with no work here.
+// No path menu: only a window representing a file has one.
+install_titlebar(document, {
+    title: document.title,
+    inset: welcome_api.titlebar_inset,
+    zoom: welcome_api.titlebar_zoom(),
+    active: welcome_api.titlebar_active(),
+    on_drag: (phase, x, y) => welcome_api.drag_titlebar(phase, x, y),
+    on_zoom_window: () => welcome_api.zoom_titlebar_window(),
+    style: {
+        background: 'var(--welcome-bg)',
+    },
+});
+welcome_api.on_titlebar_zoom((zoom) => set_titlebar_zoom(document, zoom));
+welcome_api.on_titlebar_active((active) => set_titlebar_active(document, active));
