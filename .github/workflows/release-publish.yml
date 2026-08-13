@@ -12,7 +12,11 @@ on:
         type: string
 
 concurrency:
-  group: release-publish-${{ inputs.tag || github.event.workflow_run.head_branch }}
+  # Every release writes the same registries, GitHub Release namespace, and
+  # Homebrew cask. Keep the group global and hold it until the tap PR merges so
+  # two tags cannot race from the same tap snapshot.
+  group: release-publish
+  queue: max
   cancel-in-progress: false
 
 permissions:
@@ -78,6 +82,19 @@ jobs:
           ref: ${{ steps.release.outputs.sha }}
           fetch-depth: 1
           persist-credentials: false
+
+      # A manual replay for an older release (for example the first tap seed
+      # from v0.9.1) still needs the publisher implementation that defined this
+      # workflow run. Keep it separate from the immutable release checkout:
+      # product sources/artifacts remain pinned to the tag, while release
+      # plumbing is pinned to GitHub's immutable workflow-file commit.
+      - name: Checkout release publisher tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          path: release-publisher-tools
 
       - name: Setup Node.js
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
@@ -383,21 +400,18 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # With the release published (and the dmg attached above), open a PR
-      # against the Homebrew tap (jbearak/homebrew-table-viewer) bumping the
-      # cask to this version, with the checksum recomputed from the very
-      # artifact this run published. Keeping these steps in the `release`
-      # environment lets HOMEBREW_TAP_TOKEN live as an environment secret
-      # without a second release approval.
+      # With the release published (and the dmg attached above), seed a
+      # placeholder Homebrew tap or open its normal cask bump PR. Keeping these
+      # steps in the `release` environment lets HOMEBREW_TAP_TOKEN live as an
+      # environment secret without a second release approval.
       #
-      # Setup (one-time), then these steps activate themselves:
+      # Setup (one-time):
       #   gh secret   set HOMEBREW_TAP_TOKEN   -R jbearak/table-viewer --env release
-      #   gh variable set ENABLE_HOMEBREW_BUMP -R jbearak/table-viewer --body true
-      # HOMEBREW_TAP_TOKEN: a GitHub App installation token or fine-grained PAT
-      # scoped to jbearak/homebrew-table-viewer with Contents:write +
-      # Pull requests:write.
-      - name: Revalidate release tag before Homebrew bump
-        if: vars.ENABLE_HOMEBREW_BUMP == 'true' && steps.artifacts.outputs.desktop == 'true'
+      # HOMEBREW_TAP_TOKEN: a fine-grained PAT scoped to
+      # jbearak/homebrew-table-viewer with Contents:write,
+      # Pull requests:write, and Workflows:write (needed for the initial seed).
+      - name: Revalidate release tag before Homebrew publish
+        if: steps.artifacts.outputs.desktop == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -416,13 +430,13 @@ jobs:
             CURRENT_TAG_SHA=$(jq -r '.object.sha' <<<"$OBJECT")
           done
           if [[ "$TYPE" != "commit" || "$CURRENT_TAG_SHA" != "$RELEASE_SHA" ]]; then
-            echo "ERROR: release tag moved before the Homebrew bump" >&2
+            echo "ERROR: release tag moved before the Homebrew publish" >&2
             exit 1
           fi
 
       - name: Resolve Homebrew tap snapshot
         id: tap
-        if: vars.ENABLE_HOMEBREW_BUMP == 'true' && steps.artifacts.outputs.desktop == 'true'
+        if: steps.artifacts.outputs.desktop == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -436,7 +450,7 @@ jobs:
           echo "sha=$TAP_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Checkout Homebrew tap data
-        if: vars.ENABLE_HOMEBREW_BUMP == 'true' && steps.artifacts.outputs.desktop == 'true'
+        if: steps.artifacts.outputs.desktop == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           repository: jbearak/homebrew-table-viewer
@@ -447,8 +461,9 @@ jobs:
           persist-credentials: false
           path: tap
 
-      - name: Bump Homebrew cask
-        if: vars.ENABLE_HOMEBREW_BUMP == 'true' && steps.artifacts.outputs.desktop == 'true'
+      - name: Prepare Homebrew tap
+        id: homebrew
+        if: steps.artifacts.outputs.desktop == 'true'
         shell: bash
         env:
           THE_TAG: ${{ env.RELEASE_TAG }}
@@ -460,45 +475,46 @@ jobs:
             echo "ERROR: expected exactly one desktop dmg" >&2
             exit 1
           fi
-          VERSION="${THE_TAG#v}"
-          SHA256="$(sha256sum "${DMG[0]}" | cut -d' ' -f1)"
-          CASK_PATH="tap/Casks/table-viewer.rb"
-          export VERSION SHA256 CASK_PATH
-          ruby <<'RUBY'
-          path = ENV.fetch('CASK_PATH')
-          text = File.read(path)
-          version = /^([ \t]*)version[ \t]+"[^"]+"[ \t]*$/
-          checksum = /^([ \t]*)sha256[ \t]+"[0-9a-f]+"[ \t]*$/
-          raise 'expected exactly one cask version' unless text.scan(version).length == 1
-          raise 'expected exactly one cask checksum' unless text.scan(checksum).length == 1
-          text.sub!(version) { "#{$1}version \"#{ENV.fetch('VERSION')}\"" }
-          text.sub!(checksum) { "#{$1}sha256 \"#{ENV.fetch('SHA256')}\"" }
-          File.write(path, text)
-          RUBY
+          release-publisher-tools/scripts/prepare-homebrew-tap.sh \
+            tap "${THE_TAG#v}" "${DMG[0]}"
 
-      - name: Open Homebrew bump PR + enable auto-merge
-        if: vars.ENABLE_HOMEBREW_BUMP == 'true' && steps.artifacts.outputs.desktop == 'true'
+      - name: Seed Homebrew tap or open bump PR
+        if: steps.artifacts.outputs.desktop == 'true'
         working-directory: tap
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           THE_TAG: ${{ env.RELEASE_TAG }}
+          TAP_MODE: ${{ steps.homebrew.outputs.mode }}
         run: |
           set -euo pipefail
+          : "${GH_TOKEN:?HOMEBREW_TAP_TOKEN is not configured in the release environment}"
           VERSION="${THE_TAG#v}"
-          if git diff --quiet; then
+          if [[ "$TAP_MODE" == "update" ]] && git diff --quiet; then
             echo "Cask already at $VERSION - nothing to do."
             exit 0
           fi
-          BRANCH="bump-table-viewer-$VERSION"
           git config user.name "table-viewer-release-bot"
           git config user.email "table-viewer-release-bot@users.noreply.github.com"
+          AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+
+          if [[ "$TAP_MODE" == "seed" ]]; then
+            git add Casks README.md bin .github
+            git commit -m "Seed tap with table-viewer $VERSION"
+            # The push is deliberately a normal fast-forward. If main moved
+            # since the immutable snapshot was resolved, retry the release
+            # publisher instead of overwriting somebody else's tap work.
+            git -c http.extraheader="$AUTH_HEADER" push origin HEAD:main
+            exit 0
+          fi
+
+          [[ "$TAP_MODE" == "update" ]] || { echo "ERROR: unknown tap mode: $TAP_MODE" >&2; exit 1; }
+          BRANCH="bump-table-viewer-$VERSION"
           # Only this job ever writes bump-table-viewer-*, so reset the branch
           # from HEAD and force-push. No remote-tracking ref / pre-fetch needed,
           # so reruns can't fail on a stale lease.
           git checkout -B "$BRANCH"
           git add Casks/table-viewer.rb
           git commit -m "table-viewer $VERSION"
-          AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
           git -c http.extraheader="$AUTH_HEADER" push --force origin "HEAD:$BRANCH"
           if ! gh pr create --base main --head "$BRANCH" \
                 --title "table-viewer $VERSION" \
@@ -510,5 +526,38 @@ jobs:
               exit 1
             fi
           fi
-          gh pr merge "$BRANCH" --auto --squash \
-            || echo "::warning::could not enable auto-merge; merge $BRANCH manually."
+          # The tap starts without branch protection, so --auto can merge
+          # immediately even while its non-required test is still running.
+          # Observe the check first, require it to pass, then merge directly.
+          TAP_TEST_CHECKS=0
+          for _ in {1..60}; do
+            TAP_TEST_CHECKS=$(gh pr view "$BRANCH" --json statusCheckRollup \
+              --jq '[.statusCheckRollup[] | select(.name == "test" and .workflowName == "tests")] | length')
+            [[ "$TAP_TEST_CHECKS" -gt 0 ]] && break
+            sleep 5
+          done
+          if [[ "$TAP_TEST_CHECKS" -ne 1 ]]; then
+            echo "ERROR: Homebrew bump PR did not report exactly one tests / test check" >&2
+            exit 1
+          fi
+          # Always poll the exact Homebrew job. Branch protection can be absent
+          # or misconfigured to require some other check, so --required alone
+          # cannot establish that this audit/install check passed.
+          for _ in {1..180}; do
+            TAP_TEST_STATE=$(gh pr view "$BRANCH" --json statusCheckRollup --jq '
+              [.statusCheckRollup[] | select(.name == "test" and .workflowName == "tests")][0]
+              | if .status != "COMPLETED" then "PENDING"
+                elif .conclusion == "SUCCESS" then "SUCCESS"
+                else (.conclusion // "FAILURE") end')
+            [[ "$TAP_TEST_STATE" == "SUCCESS" ]] && break
+            if [[ "$TAP_TEST_STATE" != "PENDING" ]]; then
+              echo "ERROR: Homebrew tests / test check ended as $TAP_TEST_STATE" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          [[ "$TAP_TEST_STATE" == "SUCCESS" ]] || {
+            echo "ERROR: timed out waiting for Homebrew tests / test check" >&2
+            exit 1
+          }
+          gh pr merge "$BRANCH" --squash --delete-branch
