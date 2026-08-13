@@ -16,9 +16,11 @@ import {
     ipcMain,
     Menu,
     nativeTheme,
+    net,
     protocol,
     shell,
 } from 'electron';
+import { autoUpdater } from 'electron-updater';
 import type { OpenedSqliteFileStateStore } from '../../src/sqlite-file-state-persistence';
 import {
     canonical_existing_path,
@@ -68,6 +70,11 @@ import {
 import { notices_file_path } from './notices-path';
 import { save_open_window_paths, take_open_window_paths } from './window-restoration';
 import { REPOSITORY_URL, about_link_url } from './about-links';
+import {
+    create_app_update_coordinator,
+    type AppUpdateCoordinator,
+} from './app-updates';
+import { app_update_failure_dialog } from './app-update-failure';
 import { clamp_zoom_level } from './zoom';
 import {
     SUPPORTED_FILE_EXTENSIONS,
@@ -105,6 +112,7 @@ import {
  * which is exactly the mode nobody watches while developing.
  */
 declare const __APP_VERSION__: string;
+declare const __INSTALL_APP_UPDATES__: boolean;
 
 function is_supported_file(file_path: string): boolean {
     const ext = path.extname(file_path).toLowerCase().replace(/^\./, '');
@@ -140,6 +148,7 @@ const STATE_INSPECTOR_PRELOAD = path.join(DESKTOP_DIST_DIR, 'state-inspector-pre
 
 let config_store: DesktopConfigStore;
 let viewer_windows: ViewerWindowManager | undefined;
+let app_updates: AppUpdateCoordinator | undefined;
 let prefs_window: BrowserWindow | undefined;
 let about_window: BrowserWindow | undefined;
 let state_inspector_window: BrowserWindow | undefined;
@@ -170,6 +179,144 @@ const state_backend = create_desktop_state_backend<OpenedSqliteFileStateStore>(
     () => viewer_windows?.stop_admission(),
     () => viewer_windows?.resume_admission(),
 );
+
+function create_packaged_app_updates(portable_executable: string | undefined): AppUpdateCoordinator | undefined {
+    if (!app.isPackaged || !['darwin', 'win32'].includes(process.platform) || portable_executable) {
+        return undefined;
+    }
+
+    autoUpdater.autoDownload = false;
+    autoUpdater.autoInstallOnAppQuit = false;
+    autoUpdater.allowPrerelease = false;
+    if (process.platform === 'win32') {
+        autoUpdater.channel = process.arch === 'arm64' ? 'latest-arm64' : 'latest';
+        // electron-updater's channel setter enables downgrades as a side effect;
+        // architecture selection is not permission to install an older release.
+        autoUpdater.allowDowngrade = false;
+    }
+
+    const show_update_message_box = (
+        options: Electron.MessageBoxOptions,
+    ): Promise<Electron.MessageBoxReturnValue> => {
+        const window = BrowserWindow.getFocusedWindow();
+        return window
+            ? dialog.showMessageBox(window, options)
+            : dialog.showMessageBox(options);
+    };
+
+    const confirm_update = async (
+        message: string,
+        detail: string,
+        affirmative_label: string,
+    ): Promise<boolean> => {
+        const result = await show_update_message_box({
+            type: 'info',
+            message,
+            detail,
+            buttons: [affirmative_label, 'Later'],
+            defaultId: 0,
+            cancelId: 1,
+        });
+        return result.response === 0;
+    };
+
+    return create_app_update_coordinator(
+        {
+            check_for_updates: async () => { await autoUpdater.checkForUpdates(); },
+            download_update: async () => { await autoUpdater.downloadUpdate(); },
+            is_online: () => net.isOnline(),
+            quit_and_install: () => {
+                if (process.platform === 'darwin') {
+                    // Squirrel fetches the already-downloaded ZIP from
+                    // electron-updater's local proxy only after this call. If that
+                    // handoff fails, no updater quit follows; the normal backend is
+                    // already drained, so exit rather than leave a windowless app
+                    // alive over closed state.
+                    autoUpdater.once('error', () => app.exit(1));
+                    autoUpdater.quitAndInstall();
+                } else {
+                    autoUpdater.quitAndInstall(false, true);
+                    // BaseUpdater quits only when it successfully starts the
+                    // installer. Its API returns void, so retain the old post-drain
+                    // terminal guarantee when cached installer state is missing.
+                    setImmediate(() => app.quit());
+                }
+            },
+            on_update_available: (listener) => {
+                autoUpdater.on('update-available', (info) => listener({ version: info.version }));
+            },
+            on_update_not_available: (listener) => {
+                autoUpdater.on('update-not-available', listener);
+            },
+            on_update_downloaded: (listener) => {
+                autoUpdater.on('update-downloaded', (info) => listener({ version: info.version }));
+            },
+            on_error: (listener) => {
+                autoUpdater.on('error', (error) => listener(error));
+            },
+        },
+        {
+            offer_download: async (version, install_updates) => {
+                if (!install_updates) {
+                    const result = await show_update_message_box({
+                        type: 'info',
+                        message: `Table Viewer ${version} is available.`,
+                        detail: 'This unsigned local build cannot install updates automatically. Download the latest release from GitHub, then replace this app manually.',
+                        buttons: ['Open GitHub Releases', 'OK'],
+                        defaultId: 1,
+                        cancelId: 1,
+                    });
+                    if (result.response === 0) {
+                        await shell.openExternal(`${REPOSITORY_URL}/releases`);
+                    }
+                    return false;
+                }
+                return confirm_update(
+                    `Table Viewer ${version} is available.`,
+                    'Would you like to download it now?',
+                    'Download',
+                );
+            },
+            offer_restart: (version) => confirm_update(
+                `Table Viewer ${version} is ready to install.`,
+                'Restart Table Viewer to finish installing the update.',
+                'Restart and Install',
+            ),
+            show_up_to_date: async () => {
+                await show_update_message_box({
+                    type: 'info',
+                    message: 'Table Viewer is up to date.',
+                    detail: `You are running version ${__APP_VERSION__}.`,
+                    buttons: ['OK'],
+                });
+            },
+            show_failure: async (failure) => {
+                const wording = app_update_failure_dialog(failure);
+                const result = await show_update_message_box({
+                    type: 'warning',
+                    message: wording.message,
+                    detail: wording.detail,
+                    buttons: [...wording.buttons],
+                    defaultId: wording.defaultId,
+                    cancelId: wording.cancelId,
+                });
+                if (result.response === wording.open_releases_response) {
+                    await shell.openExternal(`${REPOSITORY_URL}/releases`);
+                }
+            },
+            show_download_in_progress: async () => {
+                await show_update_message_box({
+                    type: 'info',
+                    message: 'Table Viewer is downloading an update.',
+                    detail: 'You will be asked before the app restarts to install it.',
+                    buttons: ['OK'],
+                });
+            },
+        },
+        () => app.quit(),
+        { install_updates: __INSTALL_APP_UPDATES__ },
+    );
+}
 
 /**
  * The quit barrier's view of the backend.
@@ -226,7 +373,9 @@ const coordinate_app_quit = create_app_quit_coordinator(
                 // Reporting is best-effort; persistence must never prevent quit.
             }
         }
-        app.quit();
+        const install_result = app_updates?.install_if_requested() ?? 'not-requested';
+        if (install_result === 'not-requested') app.quit();
+        if (install_result === 'failed') app.exit(1);
     },
     quit_shutdown,
 );
@@ -526,6 +675,12 @@ function build_menu(): void {
                         label: 'About Table Viewer',
                         click: () => show_about_window(),
                     },
+                    ...(app_updates
+                        ? [{
+                            label: 'Check for Updates…',
+                            click: () => app_updates?.check_manually(),
+                        }]
+                        : []),
                     { type: 'separator' as const },
                     {
                         label: 'Preferences…',
@@ -667,6 +822,15 @@ function build_menu(): void {
             label: 'Help',
             role: 'help',
             submenu: [
+                ...(!is_mac && app_updates
+                    ? [
+                        {
+                            label: 'Check for Updates…',
+                            click: () => app_updates?.check_manually(),
+                        },
+                        { type: 'separator' as const },
+                    ]
+                    : []),
                 {
                     label: 'Table Viewer on GitHub',
                     click: () => void shell.openExternal(REPOSITORY_URL),
@@ -1017,6 +1181,7 @@ if (!got_lock) {
         register_app_protocol();
         register_ipc();
         watch_settings();
+        app_updates = create_packaged_app_updates(portable_executable);
         build_menu();
         nativeTheme.on('updated', broadcast_theme);
 
@@ -1096,6 +1261,9 @@ if (!got_lock) {
                 ...file_args(process.argv.slice(app.isPackaged ? 1 : 2)),
             ],
         });
+        // Detached from startup: update service/network failures must never turn
+        // into a fatal state-backend startup failure.
+        setImmediate(() => app_updates?.check_automatically());
     }
 
     /**

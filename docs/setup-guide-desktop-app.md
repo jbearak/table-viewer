@@ -36,6 +36,8 @@ Open the [latest Table Viewer release](https://github.com/jbearak/table-viewer/r
 
 Run the downloaded file. The installer defaults to installing only for your account, which does not require administrator access. Windows builds are unsigned, so SmartScreen may show **Windows protected your PC** the first time. Click **More info**, confirm that the app is Table Viewer, then click **Run anyway**. If you would rather check the download first, each `.exe` on the release page has a matching `.sha256` file; run `Get-FileHash <file>` in PowerShell and compare.
 
+Official installed macOS and Windows builds check GitHub Releases for updates after startup. When an update is available, Table Viewer asks before downloading and again before restarting to install it. To check manually, choose **Table Viewer → Check for Updates…** on macOS or **Help → Check for Updates…** on Windows. Unsigned macOS builds installed from the repository's setup script can check for a newer release from that same macOS menu, but direct you to GitHub to replace the app manually because macOS cannot install an update over an unsigned app. The portable Windows executable likewise does not self-update; download and replace it manually when you want a newer version.
+
 ## 2. Open the sample workbook
 
 Download the [sample workbook](https://github.com/jbearak/table-viewer/raw/refs/heads/main/docs/examples/garden-cafe-sample.xlsx). Launch Table Viewer and click **Open File…**, or choose **File → Open…**, then select the downloaded workbook.

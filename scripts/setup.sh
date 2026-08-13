@@ -143,12 +143,13 @@ if [ $DESKTOP -eq 1 ]; then
         echo -e "${YELLOW}Skipping desktop app: packaging is macOS-only for now (see desktop/README.md)${NC}"
         echo ""
     else
-        # electron-builder --dir writes to an arch-specific dist/desktop-packages/mac*
-        # directory. Clear any previous ones first so we cannot pick up a stale bundle
-        # (e.g. an earlier native build alongside one made under Rosetta).
+        # Use a ZIP target so the installed app has release-shaped update metadata.
+        # This unsigned local build can check GitHub and direct the user to a newer
+        # release, but it must not offer Squirrel.Mac's signature-dependent install.
+        # Clear previous package output so the app we install must come from this run.
         echo "Building desktop app..."
-        rm -rf dist/desktop-packages/mac dist/desktop-packages/mac-*
-        npm run desktop:package:dir
+        rm -rf dist/desktop-packages
+        npm run desktop:package:zip
         echo -e "${GREEN}✓ Desktop app built${NC}"
         echo ""
 
@@ -171,6 +172,10 @@ if [ $DESKTOP -eq 1 ]; then
         echo "Built: $APP_SRC"
 
         APP_DEST="/Applications/Table Viewer.app"
+        if pgrep -f "$APP_DEST/Contents/MacOS/Table Viewer" >/dev/null 2>&1; then
+            echo -e "${RED}Error: Table Viewer is running. Quit it, then re-run setup.${NC}"
+            exit 1
+        fi
         echo "Installing desktop app to $APP_DEST..."
         if [ -e "$APP_DEST" ]; then
             echo "  replacing existing install"

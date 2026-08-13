@@ -332,10 +332,9 @@ jobs:
           key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('package-lock.json') }}
           restore-keys: electron-${{ runner.os }}-${{ runner.arch }}-
 
-      # Signing and notarization activate themselves once the Apple credentials
-      # exist as `release` environment secrets; until then the job produces the
-      # same unsigned dmg a local `npm run desktop:package` does, and the cask
-      # documents the Gatekeeper first-launch step.
+      # Automatic updates require a stable Developer ID signature, so an official
+      # update-bearing release fails closed when the signing certificate is absent.
+      # Notarization still activates when all three notarytool credentials exist.
       #
       # Setup (one-time), all in the `release` environment:
       #   CSC_LINK                     base64 of a Developer ID Application .p12
@@ -354,9 +353,8 @@ jobs:
         run: |
           set -euo pipefail
           if [[ -z "${CSC_LINK:-}" ]]; then
-            echo "sign=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::No CSC_LINK secret - producing an unsigned build."
-            exit 0
+            echo "ERROR: CSC_LINK is required for an update-bearing macOS release." >&2
+            exit 1
           fi
           echo "sign=true" >> "$GITHUB_OUTPUT"
           if [[ -n "${APPLE_ID:-}" && -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" && -n "${APPLE_TEAM_ID:-}" ]]; then
@@ -407,6 +405,15 @@ jobs:
             shasum -a 256 "${files[0]}" | tee "${files[0]}.sha256"
           done
 
+      - name: Validate macOS update metadata
+        shell: bash
+        working-directory: dist/desktop-packages
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('../../package.json').version")
+          ZIP="table-viewer-${VERSION}-arm64.zip"
+          node ../../scripts/validate-update-metadata.mjs latest-mac.yml "$VERSION" "$ZIP"
+
       - name: Upload desktop artifacts
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
@@ -416,6 +423,7 @@ jobs:
           path: |
             dist/desktop-packages/table-viewer-*.dmg
             dist/desktop-packages/table-viewer-*.zip
+            dist/desktop-packages/latest-mac.yml
             dist/desktop-packages/*.sha256
 
   # Build the standalone Windows app only after its SQLite/runtime release gates
@@ -499,6 +507,9 @@ jobs:
           for exe in "${exes[@]}"; do
             sha256sum "$exe" | tee "$exe.sha256"
           done
+          VERSION=$(node -p "require('../../package.json').version")
+          node ../../scripts/validate-update-metadata.mjs latest.yml "$VERSION" "table-viewer-${VERSION}-x64-setup.exe" --require-blockmap
+          node ../../scripts/validate-update-metadata.mjs latest-arm64.yml "$VERSION" "table-viewer-${VERSION}-arm64-setup.exe" --require-blockmap
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
@@ -508,4 +519,7 @@ jobs:
           retention-days: 30
           path: |
             dist/desktop-packages/table-viewer-*.exe
+            dist/desktop-packages/table-viewer-*.exe.blockmap
             dist/desktop-packages/table-viewer-*.exe.sha256
+            dist/desktop-packages/latest.yml
+            dist/desktop-packages/latest-arm64.yml

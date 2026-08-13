@@ -41,11 +41,16 @@ intentionally out of scope, matching `sight` and `raven`.
 
 ## Signing
 
-The desktop artifact is currently **unsigned and un-notarized**, so Gatekeeper
-blocks the first launch of a cask-installed (quarantined) app; the cask's
-`caveats` tell users how to approve it.
+The application inside an official desktop artifact is Developer ID signed.
+When all three notarytool credentials are available it is also notarized and
+stapled, so Gatekeeper accepts the installed `Table Viewer.app` as a Notarized
+Developer ID application. With incomplete notarytool credentials the workflow
+ships a signed-but-not-notarized app instead and Gatekeeper may warn. The outer
+DMG container is signed but is not separately notarized/stapled, which does not
+affect the app payload used by the cask or the ZIP payload used for automatic
+updates.
 
-The release workflow is already wired for signing and turns it on by itself once
+The release workflow is wired for signing and turns it on by itself once
 the credentials exist as `release` **environment** secrets in this repo:
 
 | Secret | What |

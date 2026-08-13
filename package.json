@@ -198,8 +198,9 @@
     "desktop:dev": "npm run desktop:prepackage && electron dist/desktop/main.js",
     "desktop:ensure-electron": "node scripts/install-electron.mjs",
     "desktop:prepackage": "npm run desktop:ensure-electron && npm run bundle:webview && npm run bundle:desktop && node desktop/collect-licenses.mjs",
-    "desktop:package": "npm run desktop:prepackage && electron-builder --config desktop/electron-builder.yml --publish never --mac -c.mac.identity=null -c.dmg.sign=false",
-    "desktop:package:dir": "npm run desktop:prepackage && electron-builder --config desktop/electron-builder.yml --publish never --mac --dir -c.mac.identity=null",
+    "desktop:package": "TABLE_VIEWER_INSTALL_UPDATES=0 npm run desktop:prepackage && electron-builder --config desktop/electron-builder.yml --publish never --mac -c.mac.identity=null -c.dmg.sign=false",
+    "desktop:package:dir": "TABLE_VIEWER_INSTALL_UPDATES=0 npm run desktop:prepackage && electron-builder --config desktop/electron-builder.yml --publish never --mac --dir -c.mac.identity=null",
+    "desktop:package:zip": "TABLE_VIEWER_INSTALL_UPDATES=0 npm run desktop:prepackage && electron-builder --config desktop/electron-builder.yml --publish never --mac zip -c.mac.identity=null",
     "desktop:package:release": "npm run desktop:prepackage && electron-builder --config desktop/electron-builder.yml --publish never --mac --arm64",
     "desktop:package:win": "npm run desktop:prepackage && node scripts/package-desktop-windows.mjs",
     "test:desktop-smoke": "npm run desktop:prepackage && playwright test --config=desktop/test-smoke/playwright.config.ts",
@@ -210,12 +211,14 @@
   "dependencies": {
     "@glideapps/glide-data-grid": "6.0.3",
     "cfb": "^1.2.2",
+    "electron-updater": "6.8.9",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "ssf": "^0.11.2"
   },
   "overrides": {
     "brace-expansion": "5.0.9",
+    "js-yaml": "4.3.1",
     "minimatch": "10.2.5",
     "serialize-javascript": "7.0.5"
   },
