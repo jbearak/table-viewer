@@ -386,7 +386,7 @@ describe('SQLite real multi-process behavior', () => {
         direct.close();
     });
 
-    it('leaves a crashed lease protective under cross-process quota churn', async () => {
+    it('stops honouring a crashed lease under cross-process quota churn', async () => {
         await seed('/protected.csv', { activeSheetIndex: 1 });
         const owner = await spawn({ maxStoredFiles: 1 });
         await owner.request('lease', {
@@ -410,11 +410,24 @@ describe('SQLite real multi-process behavior', () => {
                 state: { activeSheetIndex: index },
             });
         }
+        // The crashed owner's lease no longer pins the entry: eviction asks
+        // whether *this* session holds it, so a lease from a process that is
+        // gone protects nothing and the quota can reach the row.
+        //
+        // This deliberately reverses the older rule. Honouring a crashed lease
+        // meant the row could never be evicted and could never be cleared by
+        // hand either — the store grew past its own cap holding entries nothing
+        // could reach, and real databases accumulated dozens of such leases,
+        // because a lease is deleted only on a clean final close. What is given
+        // up is view state for files a crashed process happened to have open;
+        // unsaved edits and in-flight commits are excluded from eviction on
+        // their own terms, so neither is at stake here.
         await expect(churn.request('read', { path: '/protected.csv' })).resolves.toMatchObject({
-            revision: 1,
-            state: { activeSheetIndex: 1 },
+            state: {},
         });
         const direct = inspectionDatabase();
+        // The row itself is still there. Nothing reclaims it; it is simply not
+        // treated as evidence any more.
         expect(direct.prepare('SELECT count(*) AS count FROM entry_leases').get()?.count).toBe(1);
         direct.close();
     });

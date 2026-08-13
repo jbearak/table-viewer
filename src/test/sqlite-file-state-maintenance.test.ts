@@ -26,16 +26,15 @@ function state(columns = 1): PerFileState {
 
 async function openStore(
     ports: StoredFileStateMaintenancePorts = {},
-    now?: () => number,
+    maxStoredFiles?: number,
 ): Promise<OpenedSqliteFileStateStore> {
     const database = new SqliteTestDatabase(
         path.join(tempDirectory, `maintenance-${counter++}`, 'file-state.sqlite3'),
-        now ? { now } : {},
     );
     const store = await open_sqlite_file_state_store(
         database.databasePath,
         database.options,
-        undefined,
+        maxStoredFiles === undefined ? undefined : () => maxStoredFiles,
         ports,
     );
     opened.push(store);
@@ -69,6 +68,22 @@ async function seed(
     columns = 1,
 ): Promise<void> {
     await write(store, filePath, state(columns));
+}
+
+/**
+ * A lease owned by another writer session, written from another connection —
+ * which is how a process that was killed rather than closed leaves one.
+ */
+function foreign_lease(store: OpenedSqliteFileStateStore, filePath: string): void {
+    const database = new DatabaseSync(database_paths.get(store)!);
+    try {
+        database.prepare(`INSERT INTO entry_leases (
+            lease_id, writer_session_id, current_entry_path,
+            acquired_at_ms, acquired_generation
+        ) VALUES ('stale-lease', 'a-session-that-is-gone', ?, 1, 1)`).run(filePath);
+    } finally {
+        database.close();
+    }
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -447,24 +462,7 @@ describe('a renderer that lies', () => {
     });
 });
 
-
 describe('leases left behind by other sessions', () => {
-    /**
-     * A lease owned by another writer session, written from another connection —
-     * which is how a process that was killed rather than closed leaves one.
-     */
-    function foreign_lease(store: OpenedSqliteFileStateStore, filePath: string): void {
-        const database = new DatabaseSync(database_paths.get(store)!);
-        try {
-            database.prepare(`INSERT INTO entry_leases (
-                lease_id, writer_session_id, current_entry_path,
-                acquired_at_ms, acquired_generation
-            ) VALUES ('stale-lease', 'a-session-that-is-gone', ?, 1, 1)`).run(filePath);
-        } finally {
-            database.close();
-        }
-    }
-
     it('does not call an entry open just because some lease exists', async () => {
         const store = await openStore();
         await seed(store, '/files/leftover.csv');
@@ -534,5 +532,33 @@ describe('leases left behind by other sessions', () => {
 
         expect(result.deletedPaths).toEqual([]);
         expect(result.skippedUnconfirmedPaths).toEqual(['/files/leftover.csv']);
+    });
+});
+
+describe('automatic eviction and manual clearing agree', () => {
+    it('evicts an entry a departed session leased, rather than pinning it forever', async () => {
+        // The same rule the inspector applies. Before, a lease left behind by a
+        // killed process made an entry immortal: the LRU cap could never reach
+        // it and the user could never clear it either.
+        const store = await openStore({}, 1);
+        await seed(store, '/files/abandoned.csv');
+        foreign_lease(store, '/files/abandoned.csv');
+
+        // A second write puts the store over its cap of one, running retention.
+        await seed(store, '/files/newer.csv');
+
+        const paths = (await store.maintenance.inspect()).entries.map((entry) => entry.path);
+        expect(paths).toEqual(['/files/newer.csv']);
+    });
+
+    it('still refuses to evict one this session holds', async () => {
+        const store = await openStore({}, 1);
+        await seed(store, '/files/mine.csv');
+        await store.store.lease_entry!('/files/mine.csv', (file_path) => file_path);
+
+        await seed(store, '/files/newer.csv');
+
+        const paths = (await store.maintenance.inspect()).entries.map((entry) => entry.path);
+        expect(paths.sort()).toEqual(['/files/mine.csv', '/files/newer.csv']);
     });
 });

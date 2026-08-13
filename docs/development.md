@@ -103,6 +103,16 @@ Three rules apply to every route, and all of them live in
   worst case is clearing view state a live window would rewrite anyway. Unsaved
   edits stay protected by their own gate, which is about the payload rather than
   about who was holding the row.
+
+  **Automatic eviction follows the same rule.** `entry_is_leased_here` in
+  `src/state.ts` is deliberately named for what it asks, and `evict_entries` is
+  its only caller. Before, a lease left by a killed process pinned an entry
+  against the `maxStoredFiles` cap forever *and* made it unclearable by hand —
+  the store could grow past its own limit with rows nothing could reach. Manual
+  and automatic retention now agree on what a lease means, which is the property
+  worth keeping if either is ever changed again. The in-memory medium needed no
+  change: its leases live in a per-runtime map, so it never could see another
+  session's.
 - An entry with unsaved edits is deletable only when the caller names that exact
   path as confirmed, which is what the second confirmation dialog collects. Since
   the gate is decided by the resolved target set rather than by which button was

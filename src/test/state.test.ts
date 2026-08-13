@@ -414,10 +414,10 @@ describe('FileStateStore versioned state', () => {
         backing.failNextWrite();
         await expect(persistence.write_transaction('lease', (tx) => {
             tx.insert_lease('exact-lease', '/alias');
-            expect(tx.entry_is_leased('/alias')).toBe(true);
+            expect(tx.entry_is_leased_here('/alias')).toBe(true);
             tx.set_updated_at(1);
         })).rejects.toThrow('injected write failure');
-        await expect(persistence.read_transaction((tx) => tx.entry_is_leased('/alias')))
+        await expect(persistence.read_transaction((tx) => tx.entry_is_leased_here('/alias')))
             .resolves.toBe(false);
 
         await persistence.write_transaction('lease', (tx) => {
@@ -427,23 +427,23 @@ describe('FileStateStore versioned state', () => {
         backing.failNextWrite();
         await expect(persistence.write_transaction('canonicalize', (tx) => {
             tx.move_leases(['/alias'], '/canonical');
-            expect(tx.entry_is_leased('/alias')).toBe(false);
-            expect(tx.entry_is_leased('/canonical')).toBe(true);
+            expect(tx.entry_is_leased_here('/alias')).toBe(false);
+            expect(tx.entry_is_leased_here('/canonical')).toBe(true);
             tx.set_updated_at(3);
         })).rejects.toThrow('injected write failure');
         await expect(persistence.read_transaction((tx) => ({
-            alias: tx.entry_is_leased('/alias'),
-            canonical: tx.entry_is_leased('/canonical'),
+            alias: tx.entry_is_leased_here('/alias'),
+            canonical: tx.entry_is_leased_here('/canonical'),
         }))).resolves.toEqual({ alias: true, canonical: false });
 
         backing.failNextWrite();
         await expect(persistence.write_transaction('releaseLease', (tx) => {
             expect(tx.delete_lease('different-lease')).toBe(false);
             expect(tx.delete_lease('exact-lease')).toBe(true);
-            expect(tx.entry_is_leased('/alias')).toBe(false);
+            expect(tx.entry_is_leased_here('/alias')).toBe(false);
             tx.set_updated_at(4);
         })).rejects.toThrow('injected write failure');
-        await expect(persistence.read_transaction((tx) => tx.entry_is_leased('/alias')))
+        await expect(persistence.read_transaction((tx) => tx.entry_is_leased_here('/alias')))
             .resolves.toBe(true);
 
         await persistence.write_transaction('releaseLease', (tx) => {
@@ -452,7 +452,7 @@ describe('FileStateStore versioned state', () => {
         await persistence.write_transaction('releaseLease', (tx) => {
             expect(tx.delete_lease('exact-lease')).toBe(false);
         });
-        await expect(persistence.read_transaction((tx) => tx.entry_is_leased('/alias')))
+        await expect(persistence.read_transaction((tx) => tx.entry_is_leased_here('/alias')))
             .resolves.toBe(false);
         await persistence.close();
     });
@@ -473,7 +473,7 @@ describe('FileStateStore versioned state', () => {
                 ...tx,
                 insert_lease(leaseId, path) {
                     tx.insert_lease(leaseId, path);
-                    expect(tx.entry_is_leased(path)).toBe(true);
+                    expect(tx.entry_is_leased_here(path)).toBe(true);
                     events.push({ kind, operation: 'insert', leaseId, path });
                 },
                 move_leases(sourcePaths, destinationPath) {
@@ -526,11 +526,11 @@ describe('FileStateStore versioned state', () => {
             ...base,
             read_transaction: (body) => base.read_transaction((tx) => body({
                 ...tx,
-                entry_is_leased: (path) => path === '/backend-owned' || tx.entry_is_leased(path),
+                entry_is_leased_here: (path) => path === '/backend-owned' || tx.entry_is_leased_here(path),
             })),
             write_transaction: (kind, body) => base.write_transaction(kind, (tx) => body({
                 ...tx,
-                entry_is_leased: (path) => path === '/backend-owned' || tx.entry_is_leased(path),
+                entry_is_leased_here: (path) => path === '/backend-owned' || tx.entry_is_leased_here(path),
             })),
         };
         const store = create_keyed_authority_store(persistence, () => 1);

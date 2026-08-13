@@ -357,9 +357,20 @@ export class SqliteFileStateRepository implements KeyedStateWriteTransaction {
             .map((row) => metadata_from_row(this.#tx, row));
     }
 
-    entry_is_leased(path: string): boolean {
+    /**
+     * Whether this session holds a lease on the entry.
+     *
+     * Deliberately not "whether any session does". `entry_leases` has no foreign
+     * key to `writer_sessions` so a lease can protect an entry across a session's
+     * removal, and it is deleted only on a clean final close — so a process that
+     * is killed leaves its leases behind with nothing to reclaim them. Counting
+     * those made an entry immortal: never evicted, never clearable. Real
+     * databases accumulate them by the dozen.
+     */
+    entry_is_leased_here(path: string): boolean {
         return this.#tx.prepare(`SELECT 1 AS present FROM entry_leases
-            WHERE current_entry_path = ? LIMIT 1`).get(path) !== undefined;
+            WHERE current_entry_path = ? AND writer_session_id = ?
+            LIMIT 1`).get(path, this.#writerSessionId) !== undefined;
     }
 
     allocate_revision(): number {
@@ -666,7 +677,7 @@ export function create_sqlite_file_state_read_repository(
         read_entry: (path) => repository.read_entry(path),
         read_authority_stages: (path) => repository.read_authority_stages(path),
         scan_entry_metadata: () => repository.scan_entry_metadata(),
-        entry_is_leased: (path) => repository.entry_is_leased(path),
+        entry_is_leased_here: (path) => repository.entry_is_leased_here(path),
     };
 }
 
@@ -681,7 +692,7 @@ export function create_sqlite_file_state_write_repository(
         read_entry: (path) => repository.read_entry(path),
         read_authority_stages: (path) => repository.read_authority_stages(path),
         scan_entry_metadata: () => repository.scan_entry_metadata(),
-        entry_is_leased: (path) => repository.entry_is_leased(path),
+        entry_is_leased_here: (path) => repository.entry_is_leased_here(path),
         allocate_revision: () => repository.allocate_revision(),
         allocate_recency_order: () => repository.allocate_recency_order(),
         set_absence_revision: (revision) => repository.set_absence_revision(revision),
