@@ -1,3 +1,5 @@
+import type { spawnSync } from 'node:child_process';
+
 export const PORTABLE_UPDATE_HELPER_NAME: 'windows-portable-update-helper.exe';
 export const SUPPORTED_ARCHITECTURES: readonly ['x64', 'arm64'];
 
@@ -8,4 +10,7 @@ export interface HelperBuildPaths {
 }
 
 export function helper_build_paths(arch: string): HelperBuildPaths;
-export function build_windows_portable_update_helper(arch: string): void;
+export function build_windows_portable_update_helper(
+    arch: string,
+    run?: typeof spawnSync,
+): void;

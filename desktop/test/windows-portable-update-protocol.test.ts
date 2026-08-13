@@ -50,10 +50,26 @@ describe('Windows portable update protocol', () => {
     it('rejects competing files, wrong artifacts, and arbitrary metadata hosts', () => {
         expect(() => parse_portable_update_manifest(manifest({ files: [] }), 'https://github.com/x', 'x64'))
             .toThrow('invalid shape');
+        expect(() => parse_portable_update_manifest(manifest({
+            files: [
+                { url: 'table-viewer-1.2.3-x64-portable.exe', sha512: digest, size: 123 },
+                { url: 'other.exe', sha512: digest, size: 123 },
+            ],
+        }), 'https://github.com/x', 'x64')).toThrow('invalid shape');
         expect(() => parse_portable_update_manifest(manifest({ path: '../app.exe' }), 'https://github.com/x', 'x64'))
             .toThrow('wrong artifact');
         expect(() => parse_portable_update_manifest(manifest(), 'https://example.com/latest.yml', 'x64'))
             .toThrow('unexpected host');
+    });
+
+    it('rejects invalid sizes, digest disagreement, and architecture mismatches', () => {
+        expect(() => parse_portable_update_manifest(manifest({
+            files: [{ url: 'table-viewer-1.2.3-x64-portable.exe', sha512: digest, size: 0 }],
+        }), 'https://github.com/x', 'x64')).toThrow('invalid size');
+        expect(() => parse_portable_update_manifest(manifest({ sha512: Buffer.alloc(64, 8).toString('base64') }),
+            'https://github.com/x', 'x64')).toThrow('digests disagree');
+        expect(() => parse_portable_update_manifest(manifest(), 'https://github.com/x', 'arm64'))
+            .toThrow('wrong artifact');
     });
 
     it('compares release versions without allowing lexical mistakes', () => {

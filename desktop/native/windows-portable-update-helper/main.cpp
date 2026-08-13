@@ -20,6 +20,7 @@
 
 namespace {
 constexpr DWORD kAckTimeoutMs = 30'000;
+constexpr DWORD kWrapperTimeoutMs = 2 * 60'000;
 constexpr DWORD kPollIntervalMs = 100;
 constexpr std::uintmax_t kMaxTransactionBytes = 64 * 1024;
 constexpr wchar_t kAckPrefix[] = L"--portable-update-ack=";
@@ -324,7 +325,7 @@ std::optional<std::string> sha512_file(const std::filesystem::path& path) {
         cleanup(); return std::nullopt;
     }
     std::ifstream input(path, std::ios::binary);
-    std::array<char, 1024 * 1024> buffer{};
+    std::vector<char> buffer(64 * 1024);
     if (!input) { cleanup(); return std::nullopt; }
     while (input) {
         input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
@@ -355,10 +356,11 @@ bool wait_for_wrapper(DWORD pid, std::string& error) {
         error = windows_error(GetLastError());
         return false;
     }
-    const DWORD wait = WaitForSingleObject(process, INFINITE);
+    const DWORD wait = WaitForSingleObject(process, kWrapperTimeoutMs);
     CloseHandle(process);
     if (wait == WAIT_OBJECT_0) return true;
-    error = windows_error(GetLastError());
+    if (wait == WAIT_TIMEOUT) error = "timeout";
+    else error = windows_error(GetLastError());
     return false;
 }
 

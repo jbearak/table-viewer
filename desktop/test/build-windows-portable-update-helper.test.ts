@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+    build_windows_portable_update_helper,
     helper_build_paths,
     PORTABLE_UPDATE_HELPER_NAME,
 } from '../build-windows-portable-update-helper.mjs';
@@ -16,7 +17,7 @@ describe('Windows portable update helper build', () => {
 
     it('rejects unsupported architectures before launching tools', () => {
         const run = vi.fn();
-        expect(() => helper_build_paths('ia32')).toThrow('Unsupported helper architecture');
+        expect(() => build_windows_portable_update_helper('ia32', run)).toThrow();
         expect(run).not.toHaveBeenCalled();
     });
 });

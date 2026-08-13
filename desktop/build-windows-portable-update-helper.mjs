@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -19,13 +19,14 @@ export function helper_build_paths(arch) {
 
 export function build_windows_portable_update_helper(arch, run = spawnSync) {
     if (process.platform !== 'win32') throw new Error('The Windows portable update helper must be built on Windows');
-    const { build_dir, output_dir } = helper_build_paths(arch);
+    const { build_dir, output_dir, output_path } = helper_build_paths(arch);
     mkdirSync(build_dir, { recursive: true });
     mkdirSync(output_dir, { recursive: true });
     const cmake_arch = arch === 'x64' ? 'x64' : 'ARM64';
     run_checked(run, 'cmake', ['-S', source_dir, '-B', build_dir, '-A', cmake_arch], repo_dir);
     run_checked(run, 'cmake', ['--build', build_dir, '--config', 'Release', '--target', 'windows-portable-update-helper'], repo_dir);
     run_checked(run, 'cmake', ['--install', build_dir, '--config', 'Release', '--prefix', output_dir], repo_dir);
+    if (statSync(output_path).size === 0) throw new Error(`Windows portable update helper is empty: ${output_path}`);
 }
 
 function run_checked(run, executable, args, cwd) {

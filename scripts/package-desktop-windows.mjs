@@ -59,9 +59,11 @@ export function package_desktop_windows({
 } = {}) {
     if (!Number.isInteger(attempts) || attempts < 1) throw new TypeError('Windows packaging attempts must be a positive integer');
 
+    const staged_helper = join(repo_dir, 'dist', 'native', 'windows-portable-update-helper.exe');
     for (const arch of ['x64', 'arm64']) {
         build_helper(arch);
-        copy_file(helper_path(arch), join(repo_dir, 'dist', 'native', 'windows-portable-update-helper.exe'));
+        remove(staged_helper, { force: true });
+        copy_file(helper_path(arch), staged_helper);
         let last_failure = 'unknown failure';
         let succeeded = false;
         for (let attempt = 1; attempt <= attempts; attempt += 1) {

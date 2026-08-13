@@ -71,6 +71,19 @@ describe('Windows desktop packaging wrapper', () => {
         package_desktop_windows(config);
 
         expect(run_builder.mock.calls.map(([arch]) => arch)).toEqual(['x64', 'arm64']);
+        expect(config.build_helper).toHaveBeenCalledTimes(2);
+        expect(config.build_helper).toHaveBeenNthCalledWith(1, 'x64');
+        expect(config.build_helper).toHaveBeenNthCalledWith(2, 'arm64');
+        const staged_helper = expect.stringMatching(/dist[/\\]native[/\\]windows-portable-update-helper\.exe$/);
+        expect(config.remove).toHaveBeenCalledTimes(3);
+        expect(config.remove).toHaveBeenNthCalledWith(1, staged_helper, { force: true });
+        expect(config.remove).toHaveBeenNthCalledWith(2, staged_helper, { force: true });
+        expect(config.copy_file).toHaveBeenCalledWith(
+            '/helpers/x64.exe', expect.stringMatching(/dist[/\\]native[/\\]windows-portable-update-helper\.exe$/),
+        );
+        expect(config.copy_file).toHaveBeenCalledWith(
+            '/helpers/arm64.exe', expect.stringMatching(/dist[/\\]native[/\\]windows-portable-update-helper\.exe$/),
+        );
         expect(config.select_manifest).toHaveBeenCalledTimes(4);
         expect(config.select_manifest).toHaveBeenNthCalledWith(
             1, expect.stringMatching(/latest\.yml$/), 'table-viewer-1.2.3-x64-portable.exe',

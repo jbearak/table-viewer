@@ -146,7 +146,7 @@ describe('update metadata validator', () => {
                 files: [{ url: 'app.exe', sha512: asset_digest, size: asset.length }],
                 path: 'app.exe', sha512: asset_digest,
             }));
-            const script = join(process.cwd(), 'scripts', 'validate-update-metadata.mjs');
+            const script = join(__dirname, '..', '..', 'scripts', 'validate-update-metadata.mjs');
             const run = (...flags: string[]) => spawnSync(
                 process.execPath,
                 [script, join(directory, 'latest.yml'), '1.2.3', 'app.exe', ...flags],
@@ -156,9 +156,14 @@ describe('update metadata validator', () => {
             expect(run('--strict').status).toBe(0);
             expect(run('--strict', '--require-blockmap').status).toBe(0);
             expect(run('--require-blockmap', '--strict').status).toBe(0);
-            expect(run('--unknown').status).toBe(2);
-            expect(run('--strict', '--strict').status).toBe(2);
-            expect(run('extra-position').status).toBe(2);
+            for (const invalid of [
+                run('--unknown'),
+                run('--strict', '--strict'),
+                run('extra-position'),
+            ]) {
+                expect(invalid.status).toBe(2);
+                expect(invalid.stderr).toContain('Usage: validate-update-metadata.mjs');
+            }
         } finally {
             rmSync(directory, { recursive: true, force: true });
         }

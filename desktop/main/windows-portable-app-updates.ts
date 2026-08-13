@@ -22,6 +22,9 @@ import {
     type PortableUpdateTransaction,
 } from './windows-portable-update-protocol';
 
+const MANIFEST_TIMEOUT_MS = 30_000;
+const DOWNLOAD_TIMEOUT_MS = 15 * 60_000;
+
 interface PortableUpdateListeners {
     available: ((info: UpdateInfo) => void)[];
     unavailable: (() => void)[];
@@ -60,7 +63,10 @@ export function create_windows_portable_update_engine(
         check_for_updates: async () => {
             try {
                 const manifest_url = portable_update_manifest_url(options.arch);
-                const response = await fetch_url(manifest_url, { redirect: 'follow' });
+                const response = await fetch_url(manifest_url, {
+                    redirect: 'follow',
+                    signal: AbortSignal.timeout(MANIFEST_TIMEOUT_MS),
+                });
                 if (!response.ok) throw http_error(response.status, response.statusText, true);
                 if (new URL(response.url || manifest_url).protocol !== 'https:') {
                     throw portable_update_error('ERR_UPDATER_INVALID_RELEASE_FEED', 'Portable update metadata used an insecure redirect');
@@ -133,7 +139,10 @@ async function prepare_portable_update(
     const downloaded_path = join(transaction_dir, info.asset);
     let replacement_path: string | undefined;
     try {
-        const response = await fetch_url(info.asset_url, { redirect: 'follow' });
+        const response = await fetch_url(info.asset_url, {
+            redirect: 'follow',
+            signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
+        });
         if (!response.ok) throw http_error(response.status, response.statusText, false);
         if (!response.body || new URL(response.url || info.asset_url).protocol !== 'https:') {
             throw portable_update_error('ERR_UPDATER_INVALID_RELEASE_FEED', 'Portable update download is invalid');
@@ -276,9 +285,13 @@ export async function acknowledge_windows_portable_update(
                 || typeof transaction.acknowledgement_path !== 'string'
                 || typeof transaction.result_path !== 'string'
                 || typeof transaction.transaction_id !== 'string') continue;
-            const temporary_path = `${transaction.acknowledgement_path}.tmp`;
-            await fs.writeFile(temporary_path, acknowledgement_token, { flag: 'wx' });
-            await fs.rename(temporary_path, transaction.acknowledgement_path);
+            const temporary_path = `${transaction.acknowledgement_path}.${randomBytes(8).toString('hex')}.tmp`;
+            try {
+                await fs.writeFile(temporary_path, acknowledgement_token, { flag: 'wx' });
+                await fs.rename(temporary_path, transaction.acknowledgement_path);
+            } finally {
+                await fs.rm(temporary_path, { force: true }).catch(() => {});
+            }
             void remove_terminal_transaction(
                 transaction_dir,
                 transaction.result_path,
