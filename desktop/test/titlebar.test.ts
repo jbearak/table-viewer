@@ -40,17 +40,24 @@ describe('interactive title-bar title', () => {
         expect(label.getAttribute('style')).not.toContain('no-drag');
     });
 
-    it('opens the path menu on Cmd-mousedown in the capture phase', async () => {
+    it('makes Cmd-click interactive and opens the path menu in capture phase', async () => {
         const { bar, label, open_path_menu } = await install_path_titlebar();
         const bubbled = vi.fn();
         bar.addEventListener('mousedown', bubbled);
-        const event = mouse_event('mousedown', { metaKey: true });
 
+        const set_property = vi.spyOn(label.style, 'setProperty');
+        const remove_property = vi.spyOn(label.style, 'removeProperty');
+        window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Meta' }));
+        expect(set_property).toHaveBeenCalledWith('-webkit-app-region', 'no-drag');
+        const event = mouse_event('mousedown', { metaKey: true });
         label.dispatchEvent(event);
 
         expect(event.defaultPrevented).toBe(true);
         expect(open_path_menu).toHaveBeenCalledOnce();
         expect(bubbled).not.toHaveBeenCalled();
+
+        window.dispatchEvent(new KeyboardEvent('keyup', { key: 'Meta' }));
+        expect(remove_property).toHaveBeenCalledWith('-webkit-app-region');
     });
 
     it('does not intercept ordinary or Cmd-right mousedown', async () => {

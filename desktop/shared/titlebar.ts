@@ -212,8 +212,22 @@ export function install_titlebar(doc: Document, options: TitlebarOptions): void 
     label.style.setProperty('z-index', '1');
     if (options.on_path_menu) {
         const open_path_menu = options.on_path_menu;
-        // macOS still delivers context-menu events above this sibling drag layer,
-        // while AppKit handles ordinary drag and double-click gestures natively.
+        // macOS delivers context-menu events above the sibling drag layer, while
+        // AppKit handles ordinary drag and double-click gestures natively. A
+        // Cmd-left click is swallowed by the drag region, though, so make only
+        // the title a no-drag hit target while Command is held.
+        const set_command_hit_target = (enabled: boolean) => {
+            if (enabled) label.style.setProperty('-webkit-app-region', 'no-drag');
+            else label.style.removeProperty('-webkit-app-region');
+        };
+        const view = doc.defaultView;
+        view?.addEventListener('keydown', (event) => {
+            if (event.key === 'Meta') set_command_hit_target(true);
+        });
+        view?.addEventListener('keyup', (event) => {
+            if (event.key === 'Meta') set_command_hit_target(false);
+        });
+        view?.addEventListener('blur', () => set_command_hit_target(false));
         label.addEventListener('mousedown', (event) => {
             if (event.button !== 0 || !event.metaKey) return;
             event.preventDefault();
