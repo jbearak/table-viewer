@@ -443,11 +443,32 @@ export function GridShell({
     const [row_resize_preview, set_row_resize_preview] =
         useState<RowResizePreview | null>(null);
     const visible_ref = useRef<Rectangle>({ x: 0, y: 0, width: 0, height: 0 });
+    const overlay_repaint_frame_ref = useRef<number | null>(null);
+    const overlay_repaint_region_ref = useRef<Rectangle | null>(null);
     const last_preview_row = useRef<number | null>(null);
     const applied_preview_sequence_ref = useRef<number | null>(null);
     const preview_restore_not_before_ref = useRef(0);
     const preview_restore_timer_ref = useRef<number | null>(null);
     const preview_restore_token_ref = useRef(0);
+
+    const schedule_overlay_scroll_repaint = useCallback((range: Rectangle) => {
+        overlay_repaint_region_ref.current = range;
+        if (overlay_repaint_frame_ref.current !== null) return;
+        overlay_repaint_frame_ref.current = window.requestAnimationFrame(() => {
+            overlay_repaint_frame_ref.current = null;
+            const latest = overlay_repaint_region_ref.current;
+            overlay_repaint_region_ref.current = null;
+            if (latest) overlay_ref.current?.repaint(latest);
+        });
+    }, []);
+
+    useEffect(() => () => {
+        if (overlay_repaint_frame_ref.current !== null) {
+            window.cancelAnimationFrame(overlay_repaint_frame_ref.current);
+            overlay_repaint_frame_ref.current = null;
+        }
+        overlay_repaint_region_ref.current = null;
+    }, []);
 
     const focus_grid = useCallback((): boolean => {
         // Glide's ref can exist before its internal focus target is wired after a
@@ -2835,9 +2856,13 @@ export function GridShell({
             // Scroll moves cells under the cursor; drop any open tooltip so it
             // can't float over the wrong content mid-scroll.
             hide_cell_tooltip();
-            // Repaint the merge overlay against the live scroll (fires per
-            // smooth-scroll frame, so blocks stay pinned to their cells).
-            overlay_ref.current?.repaint(range);
+            // Glide records the new visible region in React state before it
+            // invokes this callback. Its imperative getBounds still closes over
+            // the preceding render until that state commits, so repainting here
+            // synchronously leaves merged cells at the penultimate horizontal
+            // offset when scrolling stops. Paint on the next frame, coalescing
+            // rapid callbacks while retaining the final region.
+            schedule_overlay_scroll_repaint(range);
             const start = range.y;
             const end = range.y + range.height - 1;
             ensure_rows(start, end);
@@ -2863,6 +2888,7 @@ export function GridShell({
             pending_preview_scroll,
             preview_mode,
             restore_pending_preview_row,
+            schedule_overlay_scroll_repaint,
         ],
     );
 

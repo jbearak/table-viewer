@@ -346,6 +346,39 @@ afterEach(() => {
     vi.useRealTimers();
 });
 
+describe('GridShell merge overlay scroll synchronization', () => {
+    it('repaints merged cells after Glide commits reverse horizontal scroll bounds', async () => {
+        let paint_frame: FrameRequestCallback | undefined;
+        const request_frame = vi.fn((callback: FrameRequestCallback) => {
+            paint_frame = callback;
+            return 17;
+        });
+        vi.stubGlobal('requestAnimationFrame', request_frame);
+        vi.stubGlobal('cancelAnimationFrame', vi.fn());
+        await render_grid(props());
+        grid_mock.overlay_repaint.mockClear();
+
+        const on_visible_region_changed = grid_mock.props!.onVisibleRegionChanged as
+            (range: { x: number; y: number; width: number; height: number }) => void;
+        const scrolled_right = { x: 8, y: 0, width: 2, height: 20 };
+        const returned_left = { x: 0, y: 0, width: 2, height: 20 };
+        act(() => {
+            on_visible_region_changed(scrolled_right);
+            on_visible_region_changed(returned_left);
+        });
+
+        // Glide updates the bounds read by MergeOverlay through React state.
+        // Painting in this callback sees the preceding horizontal position;
+        // waiting for the next frame sees Glide's committed, final bounds.
+        expect(grid_mock.overlay_repaint).not.toHaveBeenCalled();
+        expect(request_frame).toHaveBeenCalledOnce();
+
+        act(() => paint_frame?.(0));
+        expect(grid_mock.overlay_repaint).toHaveBeenCalledOnce();
+        expect(grid_mock.overlay_repaint).toHaveBeenCalledWith(returned_left);
+    });
+});
+
 describe('GridShell column projection', () => {
     it('builds displayed columns and reads/resizes canonical source columns', async () => {
         const on_column_resize = vi.fn();
