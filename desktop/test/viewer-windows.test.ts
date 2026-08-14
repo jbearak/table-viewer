@@ -68,6 +68,7 @@ const electron_mock = vi.hoisted(() => {
         readonly webContents = new WebContents();
         destroyed = false;
         closeCalls = 0;
+        destroyCalls = 0;
         bounds = { x: 100, y: 100, width: 900, height: 600 };
 
         constructor(_options: unknown) {
@@ -139,6 +140,15 @@ const electron_mock = vi.hoisted(() => {
          */
         closeDestroysSilently = false;
 
+        destroy() {
+            this.destroyCalls += 1;
+            if (this.destroyed) return;
+            this.destroyed = true;
+            this.webContents.destroyed = true;
+            this.webContents.emit('destroyed');
+            this.emit('closed');
+        }
+
         close() {
             this.closeCalls += 1;
             if (this.closeThrows) throw new Error('close failed');
@@ -204,9 +214,18 @@ const controller_mock = vi.hoisted(() => ({
     panel: undefined as any,
     profile: undefined as any,
     controller: undefined as any,
-    attach_viewer: vi.fn((panel: any, _file: string, _store: any, profile: any) => {
+    options: undefined as any,
+    attach_viewer: vi.fn((
+        panel: any,
+        _file: string,
+        _store: any,
+        profile: any,
+        _host: any,
+        options: any,
+    ) => {
         controller_mock.panel = panel;
         controller_mock.profile = profile;
+        controller_mock.options = options;
         return controller_mock.controller;
     }),
     profile_for: vi.fn(() => ({ editing: true })),
@@ -353,6 +372,7 @@ beforeEach(() => {
     electron_mock.dialog.showMessageBox.mockClear();
     controller_mock.panel = undefined;
     controller_mock.profile = undefined;
+    controller_mock.options = undefined;
     controller_mock.controller = {
         drain: vi.fn(async () => {}),
         dispose: vi.fn(),
@@ -1046,6 +1066,36 @@ describe('viewer window close protocol', () => {
         await vi.waitFor(() => expect(window.destroyed).toBe(true));
         expect(window.webContents.sent).toEqual([]);
         expect(controller_mock.controller.drain).toHaveBeenCalledTimes(2);
+    });
+
+    it('closes an initial declined viewer asynchronously through the normal fence', async () => {
+        const draining = deferred();
+        controller_mock.controller.drain.mockImplementationOnce(() => draining.promise);
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/initial-declined.csv');
+        const window = latest_window();
+
+        expect(controller_mock.options.requestClose()).toBeUndefined();
+        expect(window.destroyed).toBe(false);
+        draining.resolve();
+
+        await vi.waitFor(() => expect(window.destroyed).toBe(true));
+        expect(window.destroyCalls).toBe(0);
+        expect(controller_mock.controller.dispose).toHaveBeenCalledOnce();
+    });
+
+    it('destroys an initial declined viewer when the normal close is refused', async () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/initial-declined-veto.csv');
+        const window = latest_window();
+        window.on('close', (event: { preventDefault(): void }) => event.preventDefault());
+
+        controller_mock.options.requestClose();
+
+        await vi.waitFor(() => expect(window.destroyed).toBe(true));
+        expect(window.destroyCalls).toBe(1);
+        expect(controller_mock.controller.dispose).toHaveBeenCalledOnce();
+        expect(viewer_manager.has_windows()).toBe(false);
     });
 
     it('settles a pending close when a successful reload replaces the renderer', async () => {

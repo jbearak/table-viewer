@@ -580,7 +580,13 @@ export class ViewerWindowManager {
             this.state_store,
             profile_for(file_path, this.config_store.config_port()),
             this.viewer_host(window),
-            { requestClose: () => { void this.close_entry(entry); } },
+            {
+                requestClose: () => {
+                    void this.close_initial_entry(entry).catch((error) => {
+                        console.error('Failed to close the initial viewer window', error);
+                    });
+                },
+            },
         );
 
         // Track the size as the user drags, not only on close: opening a second
@@ -1016,6 +1022,14 @@ export class ViewerWindowManager {
             });
         }
         return this.start_lifecycle(entry, 'close');
+    }
+
+    private async close_initial_entry(entry: ViewerWindow): Promise<void> {
+        if (await this.close_entry(entry) || entry.window.isDestroyed()) return;
+        // The controller requests this only when the initial source was declined,
+        // before any document or edits were adopted. There is therefore nothing to
+        // preserve if Electron refuses the ordinary durability-aware close.
+        entry.window.destroy();
     }
 
     private bounds_for_new_window() {

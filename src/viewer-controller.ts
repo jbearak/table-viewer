@@ -64,7 +64,10 @@ import {
     type PhysicalAuthorityCommitReceipt,
 } from './file-coordinator';
 import { reconcile_finalization } from './finalization-reconciliation';
-import { SourceCandidate } from './source-candidate';
+import {
+    SourceCandidate,
+    type PhysicalSourceObservation,
+} from './source-candidate';
 import {
     EMPTY_TRANSFORM,
     MAX_PERSISTED_HIDDEN_ROWS,
@@ -707,6 +710,7 @@ export function attach_viewer(
     // session adoption. PanelSession remains the sole source/core lifecycle owner.
     let core: ViewerPanelCore | undefined;
     let source: DataSource | undefined;
+    let source_observation: Readonly<PhysicalSourceObservation> | undefined;
     let source_authority = file_coordinator.authority();
     const transform_authorities = new Map<
         Extract<WebviewMessage, { type: 'setTransform' }>,
@@ -3614,6 +3618,7 @@ export function attach_viewer(
                     sync_active_transform_panel();
                     session.replace_adoption(adoption, () => {
                         confirm_transfer();
+                        source_observation = candidate.observation;
                         adopted = next;
                     });
                 },
@@ -4091,6 +4096,7 @@ export function attach_viewer(
                         return inactive_refresh_result();
                     }
                     if (deduplicated.type === 'committed') {
+                        source_observation = candidate.observation;
                         source_authority = deduplicated.receipt.resultingBasis;
                         update_session_state_material(
                             deduplicated.receipt.stateSnapshot,
@@ -4186,6 +4192,7 @@ export function attach_viewer(
                     candidate, request.seq, expected_authority, true,
                 );
                 if (deduplicated.type === 'committed' && load_is_current(request.seq)) {
+                    source_observation = candidate.observation;
                     source_authority = deduplicated.receipt.resultingBasis;
                     update_session_state_material(deduplicated.receipt.stateSnapshot, true);
                     reset_reload_retry();
@@ -4541,6 +4548,7 @@ export function attach_viewer(
 
         const current_adoption = session.current_adoption();
         const expected_digest = session.acknowledged_physical_digest();
+        const expected_observation = source_observation;
         const src = source;
         const expected_authority = source_authority.authorityRevision;
         // `transform_work_in_flight()` is the other half of the exclusion
@@ -4561,6 +4569,7 @@ export function attach_viewer(
             || !src
             || !!src.truncationMessage
             || expected_digest === undefined
+            || expected_observation === undefined
             || !session.acknowledged_current()
             || current_adoption?.resources.source !== src
             || current_adoption.resources.core !== core
@@ -4691,23 +4700,9 @@ export function attach_viewer(
             await persist_accepted_save(operation);
             operation.phase = 'accepted';
 
-            const current_stat = await host.fs.stat(uri);
-            if (!save_may_continue(operation)) return;
-            const max_mib = host.config.max_file_size_mib();
-            assert_safe_file_size(current_stat.size, max_mib);
-
-            const current_raw = await host.fs.read_file(uri);
-            if (!save_may_continue(operation)) return;
-            assert_safe_file_size(current_raw.byteLength, max_mib);
-
-            const verified_stat = await host.fs.stat(uri);
-            if (!save_may_continue(operation)) return;
-            const snapshot_changed = current_stat.mtime !== verified_stat.mtime
-                || current_stat.size !== verified_stat.size;
-
-            // Shared refusal path: both the full verification below and the final
-            // pre-write re-stat must report a conflict identically, so a detected
-            // race never surfaces as a generic "Failed to save" error.
+            // Shared refusal path: the adopted-source check, full verification,
+            // and final pre-write re-stat must report a conflict identically, so a
+            // detected race never surfaces as a generic "Failed to save" error.
             const refuse_as_external_change = async (): Promise<void> => {
                 show_owner_warning(
                     'File was modified externally. Please review the changes and try again.',
@@ -4716,6 +4711,24 @@ export function attach_viewer(
                 if (!save_operation_owns_lifecycle(operation)) return;
                 finish_save_failure(operation);
             };
+
+            const current_stat = await host.fs.stat(uri);
+            if (!save_may_continue(operation)) return;
+            // The size setting admits new source loads; save operates on the exact
+            // source already adopted. Reject a changed physical snapshot before a
+            // potentially much larger replacement is read into memory.
+            if (`${current_stat.mtime}:${current_stat.size}` !== expected_observation.fingerprint) {
+                await refuse_as_external_change();
+                return;
+            }
+
+            const current_raw = await host.fs.read_file(uri);
+            if (!save_may_continue(operation)) return;
+
+            const verified_stat = await host.fs.stat(uri);
+            if (!save_may_continue(operation)) return;
+            const snapshot_changed = current_stat.mtime !== verified_stat.mtime
+                || current_stat.size !== verified_stat.size;
 
             if (
                 snapshot_changed

@@ -170,6 +170,34 @@ describe('CSV reload races', () => {
         expect(warning).toHaveBeenCalledTimes(2);
     });
 
+    it('saves a file admitted through Open Anyway', async () => {
+        const bytes = enc.encode('h\na\n');
+        const writes: Uint8Array[] = [];
+        vscode_mock.__setConfigurationValue('tableViewer.maxFileSizeMiB', 1);
+        vscode_mock.__setStatImplementation(async () => ({
+            size: 2 * 1024 * 1024,
+            mtime: 1,
+        }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            writes.push(new Uint8Array(content));
+        });
+        vi.spyOn(vscode_mock.window, 'showWarningMessage')
+            .mockResolvedValue('Open Anyway' as never);
+        const panel = open_csv_table(uri('/tmp/oversized-save.csv'));
+
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+        await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+
+        expect(writes).toHaveLength(1);
+        expect(new TextDecoder().decode(writes[0])).toBe('h\nsaved\n');
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'saveResult',
+            success: true,
+        }));
+    });
+
     it('closes an initially loading viewer when the user declines an oversized file', async () => {
         vscode_mock.__setConfigurationValue('tableViewer.maxFileSizeMiB', 1);
         vscode_mock.__setStatImplementation(async () => ({ size: 2 * 1024 * 1024, mtime: 1 }));
@@ -2115,6 +2143,38 @@ describe('CSV reload races', () => {
         // The refusal's recovery refresh arms a bounded reload retry; dispose
         // here rather than relying on the next test's beforeEach to do it.
         panel.dispose();
+    });
+
+    it('refuses a changed source fingerprint before the save verification read', async () => {
+        let mtime = 1;
+        let reads = 0;
+        const warning_spy = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime }));
+        vscode_mock.__setReadFileImplementation(async () => {
+            reads += 1;
+            if (reads > 2) {
+                expect(warning_spy).toHaveBeenCalledWith(
+                    expect.stringContaining('modified externally'),
+                );
+            }
+            return enc.encode('h\na\n');
+        });
+
+        open_csv_table(uri('/tmp/fingerprint-conflict.csv'));
+        const panel = vscode_mock.__getPanels()[0];
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession' });
+        mtime = 2;
+
+        await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'b' } });
+
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'saveResult',
+            success: false,
+        }));
+        expect(warning_spy).toHaveBeenCalledWith(
+            expect.stringContaining('modified externally'),
+        );
     });
 
     it('refuses a same-size same-mtime external edit before saving', async () => {
