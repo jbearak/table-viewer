@@ -73,6 +73,7 @@ const grid_mock = vi.hoisted(() => ({
         x: 30, y: 10, width: 100, height: 36,
     })),
     loader_enabled: [] as boolean[],
+    loader_version: 0,
     // Display row → canonical source row; null means identity, which is what a
     // CSV with no transform installed reports. Overridable so a test can make the
     // two row spaces diverge — the only condition under which an assertion about
@@ -171,7 +172,7 @@ vi.mock('../webview/use-row-loader', () => ({
                 resident_display_row(source_row) !== undefined
             ),
             sample_loaded_rows: () => [],
-            version: 0,
+            version: grid_mock.loader_version,
         };
     },
 }));
@@ -341,6 +342,7 @@ afterEach(() => {
         { raw: 'source-c', formatted: 'source-c', bold: false, italic: false },
     ] as any);
     grid_mock.loader_enabled = [];
+    grid_mock.loader_version = 0;
     vi.unstubAllGlobals();
     Reflect.deleteProperty(navigator, 'clipboard');
     vi.useRealTimers();
@@ -418,6 +420,51 @@ describe('GridShell column projection', () => {
             (column: unknown, size: number, display_column: number) => void;
         on_column_resize_grid({}, 222, 1);
         expect(on_column_resize).toHaveBeenCalledWith(2, 222);
+    });
+
+    it('notifies App when a deferred auto-fit becomes measurable', async () => {
+        const on_auto_fit_sample_change = vi.fn();
+        const initial = props({ on_auto_fit_sample_change });
+        const GridShell = await render_grid(initial);
+        const rerender = async (next: GridShellProps) => {
+            await act(async () => {
+                root!.render(React.createElement(GridShell, next));
+            });
+        };
+
+        // Version zero is the newly mounted, still-empty loader.
+        expect(on_auto_fit_sample_change).not.toHaveBeenCalled();
+
+        grid_mock.loader_version = 1;
+        await rerender(initial);
+        expect(on_auto_fit_sample_change).toHaveBeenCalledOnce();
+
+        grid_mock.loader_version = 2;
+        await rerender(initial);
+        expect(on_auto_fit_sample_change).toHaveBeenCalledTimes(2);
+
+        // A pending fit can also become measurable when columns are revealed after
+        // rows are already resident, without another loader version bump. Hiding all
+        // columns is not itself a reason to retry an impossible measurement.
+        await rerender(props({
+            on_auto_fit_sample_change,
+            column_projection: {
+                visible_to_source: [],
+                source_to_visible: [undefined, undefined, undefined],
+                hidden_count: 3,
+            },
+        }));
+        expect(on_auto_fit_sample_change).toHaveBeenCalledTimes(2);
+
+        await rerender(props({
+            on_auto_fit_sample_change,
+            column_projection: {
+                visible_to_source: [0, 1, 2],
+                source_to_visible: [0, 1, 2],
+                hidden_count: 0,
+            },
+        }));
+        expect(on_auto_fit_sample_change).toHaveBeenCalledTimes(3);
     });
 
     it('exposes an imperative focus handle for the mounted Glide grid', async () => {
