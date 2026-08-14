@@ -16,6 +16,7 @@ export const STATE_INSPECTOR_CSS = `
   --inspector-gap: 12px;
 }
 * { box-sizing: border-box; }
+html, body { height: 100%; }
 body {
   margin: 0;
   font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif);
@@ -23,7 +24,7 @@ body {
   color: var(--vscode-foreground, #3b3b3b);
   background: var(--vscode-editor-background, #ffffff);
 }
-#root { display: flex; flex-direction: column; height: 100vh; }
+#root { display: flex; flex-direction: column; height: 100%; }
 
 header {
   padding: 16px 20px 12px;
