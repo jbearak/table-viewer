@@ -88,4 +88,52 @@ describe('XlsxDataSource', () => {
         expect(ds.meta().sheets[0].rowCount).toBe(3);
         expect(ds.read_rows(0, 0, 1).rows[0][0]?.raw).toBe('Name');
     });
+
+    it('inherits the simple vertical merge anchors on worksheet row 9', async () => {
+        const physical = await XlsxDataSource.create(load(
+            'undesa_pd_2024_wcu_country_data_survey-based.xlsx',
+        ));
+        const ds = new ExcelHeaderDataSource(physical);
+        const cases = [
+            {
+                sheetName: 'By methods',
+                expectedNames: [
+                    'Country or area',
+                    'ISO code',
+                    'Survey\r\nstart year',
+                    'Survey\r\nend year',
+                    'Age group',
+                    'Any method',
+                    'Any modern method',
+                ],
+            },
+            {
+                sheetName: 'By marital status and age',
+                expectedNames: [
+                    'Country or area',
+                    'ISO code',
+                    'Survey\r\nstart year',
+                    'Survey\r\nend year',
+                    'Marital status',
+                    'Age group',
+                    'Age group standardised',
+                    'Indicator',
+                    'Data value',
+                    'Source',
+                    'DataCatalog ID',
+                ],
+            },
+        ];
+
+        for (const { sheetName, expectedNames } of cases) {
+            const input = ds.planning_input_for_header_source(sheetName, 8)!;
+            const sheet = input.sheets.find((entry) => entry.name === sheetName)!;
+            expect(sheet).toMatchObject({
+                manualHeaderRow: 8,
+                manualHeaderSourceRow: 8,
+            });
+            expect(sheet.manualColumnNames?.slice(0, expectedNames.length))
+                .toEqual(expectedNames);
+        }
+    }, 15_000);
 });

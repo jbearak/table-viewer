@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { ExcelHeaderDataSource } from '../data-source/excel-header-source';
+import {
+    ExcelHeaderDataSource,
+    project_excel_header_workbook,
+} from '../data-source/excel-header-source';
 import type {
     ColumnWindow,
     DataSource,
@@ -453,6 +456,92 @@ describe('ExcelHeaderDataSource', () => {
         expect(Object.isFrozen(input)).toBe(true);
         expect(Object.isFrozen(input.sheets[0].manualColumnNames)).toBe(true);
         expect(ds.planning_input_for_header_source('Sheet1', 9)).toBeUndefined();
+    });
+
+    it('inherits a blank manual header from a simple vertical merge anchor', () => {
+        const base = new StubSource([
+            [cell('Report'), null],
+            [cell('  Country  ', { formatted: '  Country label  ' }), cell('Anchor B')],
+            [null, cell('Selected B')],
+            [cell('Value A'), cell('Value B')],
+        ], [
+            { startRow: 1, startCol: 0, endRow: 2, endCol: 0 },
+            { startRow: 1, startCol: 1, endRow: 2, endCol: 1 },
+        ]);
+        const ds = new ExcelHeaderDataSource(base);
+        const reads_before = base.read_requests.length;
+
+        const input = ds.planning_input_for_header_source('Sheet1', 2)!;
+
+        expect(input.sheets[0].manualColumnNames).toEqual([
+            'Country label',
+            'Selected B',
+        ]);
+        expect(base.read_requests.slice(reads_before)).toEqual([
+            { start: 2, count: 1 },
+            { start: 1, count: 1 },
+        ]);
+    });
+
+    it('leaves nonqualifying manual header merges blank', () => {
+        const base = new StubSource([
+            [cell('Tall anchor'), null, null, null, null],
+            [null, cell('Wide anchor'), null, cell('Selected anchor'), cell('Other row')],
+            [null, null, null, cell('Selected value'), null],
+            [cell('Value A'), cell('Value B'), cell('Value C'), cell('Value D'), cell('Value E')],
+        ], [
+            { startRow: 0, startCol: 0, endRow: 2, endCol: 0 },
+            { startRow: 1, startCol: 1, endRow: 2, endCol: 2 },
+            { startRow: 1, startCol: 3, endRow: 2, endCol: 3 },
+            { startRow: 0, startCol: 4, endRow: 1, endCol: 4 },
+        ]);
+        const ds = new ExcelHeaderDataSource(base);
+        const reads_before = base.read_requests.length;
+
+        const input = ds.planning_input_for_header_source('Sheet1', 2)!;
+
+        expect(input.sheets[0].manualColumnNames).toEqual([
+            '',
+            '',
+            '',
+            'Selected value',
+            '',
+        ]);
+        expect(base.read_requests.slice(reads_before)).toEqual([
+            { start: 2, count: 1 },
+        ]);
+    });
+
+    it('reconstructs merge-aware manual names from persisted header state', () => {
+        const base = new StubSource([
+            [cell('Country', { formatted: ' Country label ' }), cell('Code')],
+            [null, cell('ISO')],
+            [cell('France'), cell('FRA')],
+        ], [
+            { startRow: 0, startCol: 0, endRow: 1, endCol: 0 },
+        ]);
+        const ds = new ExcelHeaderDataSource(
+            base,
+            { Sheet1: 'on' },
+            [[0]],
+        );
+
+        const expected_projection = {
+            columnNames: ['Country label', 'ISO'],
+            excelFirstRowHeader: { mode: 'on', active: true, sourceRow: 1 },
+        };
+        const input = ds.planning_input();
+
+        expect(ds.meta().sheets[0]).toMatchObject(expected_projection);
+        expect(input.sheets[0].manualColumnNames).toEqual([
+            'Country label',
+            'ISO',
+        ]);
+        expect(project_excel_header_workbook(
+            input,
+            { Sheet1: 'on' },
+        ).sheets[0]).toMatchObject(expected_projection);
+        expect(base.read_requests.filter((request) => request.start === 0)).toHaveLength(1);
     });
 
     it('makes manual promotion unavailable when every source row is hidden', () => {
