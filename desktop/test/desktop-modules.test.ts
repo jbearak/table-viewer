@@ -146,6 +146,7 @@ describe('desktop-config', () => {
         expect(reread.settings().tabOrientation).toBe('vertical');
         // Untouched keys keep their defaults.
         expect(reread.settings().csvMaxRows).toBe(DEFAULT_SETTINGS.csvMaxRows);
+        expect(reread.settings().automaticallyCheckForUpdates).toBe(true);
     });
 
     it('defaults worksheet tabs to vertical, like the extension', () => {
@@ -192,6 +193,8 @@ describe('desktop-config', () => {
             csvMaxRows: -5,
             maxFileSizeMiB: 'huge',
             maxStoredFiles: 2.9,
+            automaticallyCheckForUpdates: 'yes',
+            dismissedUpdateVersion: 42,
             newWindowSize: 'whatever',
             windowWidth: 'wide',
             windowHeight: 10,
@@ -205,6 +208,8 @@ describe('desktop-config', () => {
             csvMaxRows: 1,
             maxFileSizeMiB: DEFAULT_SETTINGS.maxFileSizeMiB,
             maxStoredFiles: 2,
+            automaticallyCheckForUpdates: true,
+            dismissedUpdateVersion: '',
             newWindowSize: 'match-last',
             windowWidth: DEFAULT_SETTINGS.windowWidth,
             // Below the usable minimum: raised, not taken literally.

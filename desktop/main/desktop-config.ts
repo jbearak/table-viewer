@@ -82,6 +82,12 @@ export interface DesktopSettings {
     csvMaxRows: number;
     maxFileSizeMiB: number;
     maxStoredFiles: number;
+    /** Check the release feed once after the desktop app finishes opening. */
+    automaticallyCheckForUpdates: boolean;
+    /** The available version whose notification the user dismissed. Empty means
+     *  no version is dismissed. This is internal update state, not a control in
+     *  Preferences; a newer release replaces it when that release is dismissed. */
+    dismissedUpdateVersion: string;
     /** Whether the two sizes below are tracked from the windows the user
      *  resizes, or typed in the Preferences window. */
     newWindowSize: NewWindowSizeMode;
@@ -117,6 +123,8 @@ export const DEFAULT_SETTINGS: Readonly<DesktopSettings> = Object.freeze({
     csvMaxRows: 1_000_000,
     maxFileSizeMiB: 256,
     maxStoredFiles: 10_000,
+    automaticallyCheckForUpdates: true,
+    dismissedUpdateVersion: '',
     newWindowSize: 'match-last',
     windowWidth: DEFAULT_WINDOW_WIDTH,
     windowHeight: DEFAULT_WINDOW_HEIGHT,
@@ -155,6 +163,13 @@ export function sanitize_settings(raw: unknown): DesktopSettings {
         csvMaxRows: Math.floor(sanitize_number(record.csvMaxRows, DEFAULT_SETTINGS.csvMaxRows, 1)),
         maxFileSizeMiB: sanitize_number(record.maxFileSizeMiB, DEFAULT_SETTINGS.maxFileSizeMiB, 1),
         maxStoredFiles: Math.floor(sanitize_number(record.maxStoredFiles, DEFAULT_SETTINGS.maxStoredFiles, 1)),
+        automaticallyCheckForUpdates: typeof record.automaticallyCheckForUpdates === 'boolean'
+            ? record.automaticallyCheckForUpdates
+            : DEFAULT_SETTINGS.automaticallyCheckForUpdates,
+        dismissedUpdateVersion: typeof record.dismissedUpdateVersion === 'string'
+            && record.dismissedUpdateVersion.length <= 100
+            ? record.dismissedUpdateVersion
+            : DEFAULT_SETTINGS.dismissedUpdateVersion,
         newWindowSize: sanitize_new_window_size_mode(record.newWindowSize),
         windowWidth: Math.round(sanitize_number(
             record.windowWidth,

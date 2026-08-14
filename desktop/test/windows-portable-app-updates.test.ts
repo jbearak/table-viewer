@@ -32,6 +32,19 @@ function response(body: string | Uint8Array): Response {
     return new Response(value, { status: 200, headers: { 'content-type': 'application/octet-stream' } });
 }
 
+function chunked_response(chunks: Uint8Array[]): Response {
+    const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+            for (const chunk of chunks) controller.enqueue(chunk);
+            controller.close();
+        },
+    });
+    return new Response(stream, {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+    });
+}
+
 function update_fetcher(payload: Buffer, declared_size = payload.length, sha512?: string) {
     const manifest_url = 'https://github.com/jbearak/table-viewer/releases/latest/download/latest-portable.yml';
     const digest = sha512 ?? createHash('sha512').update(payload).digest('base64');
@@ -74,6 +87,7 @@ describe('Windows portable update engine', () => {
         });
         const available = vi.fn();
         const downloaded = vi.fn();
+        const progress = vi.fn();
         const engine = create_windows_portable_update_engine({
             current_version: '1.0.0', arch: 'x64', portable_executable: files.portable,
             wrapper_pid: 42, user_data_dir: files.user_data, resources_dir: files.resources,
@@ -81,12 +95,18 @@ describe('Windows portable update engine', () => {
         });
         engine.on_update_available(available);
         engine.on_update_downloaded(downloaded);
+        engine.on_download_progress(progress);
 
         await engine.check_for_updates();
         await engine.download_update();
 
         expect(available).toHaveBeenCalledWith({ version: '1.1.0' });
         expect(downloaded).toHaveBeenCalledWith({ version: '1.1.0' });
+        expect(progress).toHaveBeenLastCalledWith(expect.objectContaining({
+            percent: 100,
+            transferred: payload.length,
+            total: payload.length,
+        }));
         expect((await fs.readdir(files.root)).some((name) => name.endsWith('.new'))).toBe(true);
         const transactions = await fs.readdir(join(files.user_data, 'portable-updates'));
         expect(transactions).toHaveLength(1);
@@ -167,6 +187,41 @@ describe('Windows portable update engine', () => {
         await engine.download_update();
         expect(fetcher).toHaveBeenCalledTimes(2);
         for (const [, init] of fetcher.mock.calls) expect(init?.signal).toBeInstanceOf(AbortSignal);
+    });
+
+    it('bounds progress notifications for a highly fragmented download', async () => {
+        const files = await fixture();
+        const payload = Buffer.alloc(1_000, 7);
+        const digest = createHash('sha512').update(payload).digest('base64');
+        const fetcher = vi.fn(async (url: string | URL | Request) => {
+            const value = String(url);
+            const result = value.endsWith('latest-portable.yml')
+                ? response(JSON.stringify({
+                    version: '1.1.0',
+                    files: [{
+                        url: 'table-viewer-1.1.0-x64-portable.exe',
+                        sha512: digest,
+                        size: payload.length,
+                    }],
+                    path: 'table-viewer-1.1.0-x64-portable.exe',
+                    sha512: digest,
+                }))
+                : chunked_response([...payload].map((byte) => Uint8Array.of(byte)));
+            Object.defineProperty(result, 'url', { value });
+            return result;
+        });
+        const progress = vi.fn();
+        const engine = create_windows_portable_update_engine({
+            current_version: '1.0.0', arch: 'x64', portable_executable: files.portable,
+            wrapper_pid: 42, user_data_dir: files.user_data, resources_dir: files.resources,
+            is_online: () => true, finish_quit: vi.fn(), fail_quit: vi.fn(), fetch: fetcher as typeof fetch,
+        });
+        engine.on_download_progress(progress);
+        await engine.check_for_updates();
+        await engine.download_update();
+
+        expect(progress.mock.calls.length).toBeLessThanOrEqual(101);
+        expect(progress).toHaveBeenLastCalledWith(expect.objectContaining({ percent: 100 }));
     });
 
     it('does not collide with a stale acknowledgement temporary file', async () => {

@@ -30,6 +30,9 @@ const window_width = document.getElementById('windowWidth') as HTMLInputElement;
 const window_height = document.getElementById('windowHeight') as HTMLInputElement;
 const csv_max_rows = document.getElementById('csvMaxRows') as HTMLInputElement;
 const max_file_size = document.getElementById('maxFileSizeMiB') as HTMLInputElement;
+const automatically_check_for_updates = document.getElementById(
+    'automaticallyCheckForUpdates',
+) as HTMLInputElement;
 
 /** The kind the color-theme select is currently offering themes for. Tracked
  *  from the theme payload rather than from the settings, because under
@@ -171,6 +174,7 @@ function populate(settings: DesktopSettings): void {
     tab_orientation.value = settings.tabOrientation;
     set_input(csv_max_rows, String(settings.csvMaxRows));
     set_input(max_file_size, String(settings.maxFileSizeMiB));
+    automatically_check_for_updates.checked = settings.automaticallyCheckForUpdates;
     apply_window_size(settings);
     apply_fonts(settings);
 }
@@ -457,6 +461,9 @@ tab_orientation.addEventListener('change', () => {
 new_window_size.addEventListener('change', () => {
     save({ newWindowSize: sanitize_new_window_size_mode(new_window_size.value) });
 });
+automatically_check_for_updates.addEventListener('change', () => {
+    save({ automaticallyCheckForUpdates: automatically_check_for_updates.checked });
+});
 
 window_width.min = String(MIN_WINDOW_WIDTH);
 window_height.min = String(MIN_WINDOW_HEIGHT);
@@ -468,6 +475,7 @@ prefs_api.on_theme_changed(apply_theme);
 prefs_api.on_settings_changed((settings) => {
     apply_fonts(settings);
     apply_window_size(settings);
+    automatically_check_for_updates.checked = settings.automaticallyCheckForUpdates;
 });
 repopulate();
 

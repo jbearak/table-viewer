@@ -23,12 +23,13 @@ export function isolated_user_data(prefix: string): string {
 export function launch_app(
     user_data_dir: string,
     files: readonly string[] = [],
+    env: NodeJS.ProcessEnv = {},
 ): Promise<ElectronApplication> {
     expect(fs.existsSync(main_js), 'run npm run bundle:desktop first').toBe(true);
     return electron.launch({
         args: [main_js, ...files],
         cwd: repo_dir,
-        env: { ...process.env, TABLE_VIEWER_USER_DATA_DIR: user_data_dir },
+        env: { ...process.env, ...env, TABLE_VIEWER_USER_DATA_DIR: user_data_dir },
     });
 }
 
