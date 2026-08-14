@@ -40,6 +40,7 @@ h1 { margin: 0; font-size: 1.15em; font-weight: 600; }
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  margin-left: auto;
   width: 24px;
   height: 24px;
   padding: 3px;
@@ -50,7 +51,15 @@ h1 { margin: 0; font-size: 1.15em; font-weight: 600; }
 .header-refresh:hover:not(:disabled) {
   background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.18));
 }
-.header-refresh svg { width: 16px; height: 16px; fill: currentColor; }
+.header-refresh svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
 .header-refresh.loading svg { animation: inspector-refresh-spin 0.8s linear infinite; }
 @keyframes inspector-refresh-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) {

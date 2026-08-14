@@ -92,14 +92,13 @@ function element<K extends keyof HTMLElementTagNameMap>(
 function refresh_icon(): SVGSVGElement {
     const namespace = 'http://www.w3.org/2000/svg';
     const svg = document.createElementNS(namespace, 'svg');
-    svg.setAttribute('viewBox', '0 0 16 16');
+    svg.setAttribute('viewBox', '0 0 24 24');
     svg.setAttribute('aria-hidden', 'true');
     const path = document.createElementNS(namespace, 'path');
-    path.setAttribute(
-        'd',
-        'M13.15 3.85A6 6 0 1 0 14 9h-1.5a4.5 4.5 0 1 1-.68-2.38L9.5 8.25H15V2.5l-1.85 1.35Z',
-    );
-    svg.append(path);
+    path.setAttribute('d', 'M20.49 15a9 9 0 1 1-2.12-9.36L23 10');
+    const arrow = document.createElementNS(namespace, 'polyline');
+    arrow.setAttribute('points', '23 4 23 10 17 10');
+    svg.append(path, arrow);
     return svg;
 }
 
