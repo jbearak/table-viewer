@@ -2,11 +2,13 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import {
     CHANNEL_GET_THEME,
+    CHANNEL_PREFS_FOCUS_TARGET,
     CHANNEL_PREFS_GET,
     CHANNEL_PREFS_SET,
     CHANNEL_PREFS_SET_SYNC,
     CHANNEL_SETTINGS_CHANGED,
     CHANNEL_THEME_CHANGED,
+    type PreferencesTarget,
 } from '../shared/ipc';
 import { titlebar_preload_api, type TitlebarApi } from './titlebar-api';
 import { list_themes, type ThemeId, type ThemeKind, type ThemePayload } from '../main/theme';
@@ -27,6 +29,7 @@ export interface PrefsApi extends TitlebarApi {
     get_theme(): ThemePayload;
     on_theme_changed(listener: (payload: ThemePayload) => void): void;
     on_settings_changed(listener: (settings: DesktopSettings) => void): void;
+    on_focus_target(listener: (target: PreferencesTarget) => void): void;
 }
 
 const api: PrefsApi = {
@@ -49,6 +52,11 @@ const api: PrefsApi = {
     on_settings_changed: (listener) => {
         ipcRenderer.on(CHANNEL_SETTINGS_CHANGED, (_event, settings: DesktopSettings) => {
             listener(settings);
+        });
+    },
+    on_focus_target: (listener) => {
+        ipcRenderer.on(CHANNEL_PREFS_FOCUS_TARGET, (_event, target: PreferencesTarget) => {
+            listener(target);
         });
     },
 };

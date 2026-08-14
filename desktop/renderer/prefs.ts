@@ -16,6 +16,10 @@ import {
 } from '../main/window-geometry';
 import { SYSTEM_FONT, font_family_with_fallback } from '../main/theme-palette';
 import { install_titlebar_from_api } from '../shared/titlebar';
+import {
+    focus_preferences_target,
+    type PreferencesFocusTargets,
+} from './preferences-focus';
 
 const prefs_api = (window as unknown as { prefsApi: PrefsApi }).prefsApi;
 
@@ -33,6 +37,9 @@ const max_file_size = document.getElementById('maxFileSizeMiB') as HTMLInputElem
 const automatically_check_for_updates = document.getElementById(
     'automaticallyCheckForUpdates',
 ) as HTMLInputElement;
+const focus_targets: PreferencesFocusTargets = {
+    maxFileSizeMiB: max_file_size,
+};
 
 /** The kind the color-theme select is currently offering themes for. Tracked
  *  from the theme payload rather than from the settings, because under
@@ -470,6 +477,9 @@ window_height.min = String(MIN_WINDOW_HEIGHT);
 
 apply_theme(prefs_api.get_theme());
 prefs_api.on_theme_changed(apply_theme);
+prefs_api.on_focus_target((target) => {
+    focus_preferences_target(target, focus_targets);
+});
 // Not just the fonts: under `match-last` the app itself writes the window size
 // as viewer windows are resized, and this window is showing that number.
 prefs_api.on_settings_changed((settings) => {

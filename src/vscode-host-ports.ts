@@ -2,12 +2,14 @@
 // the only module that bridges the shared viewer controller to the `vscode`
 // API surface it used to call directly.
 import * as vscode from 'vscode';
-import type {
-    ConfigPort,
-    FileSystemPort,
-    HostUiPort,
-    SaveDialogChoice,
-    ViewerHost,
+import {
+    file_size_limit_dialog_detail,
+    type ConfigPort,
+    type FileSizeLimitDialogChoice,
+    type FileSystemPort,
+    type HostUiPort,
+    type SaveDialogChoice,
+    type ViewerHost,
 } from './host-ports';
 import type { ResourceUriLike } from './resource-identity';
 import {
@@ -63,6 +65,25 @@ export const vscode_host_ui_port: HostUiPort = {
         const choice = await vscode.window.showWarningMessage(
             'You have unsaved changes.', { modal: true }, 'Save', 'Discard');
         return choice === 'Save' ? 'save' : choice === 'Discard' ? 'discard' : 'cancel';
+    },
+    async show_file_size_limit_dialog(details): Promise<FileSizeLimitDialogChoice> {
+        const choice = await vscode.window.showWarningMessage(
+            'This file exceeds the configured file-size threshold.',
+            { modal: true, detail: file_size_limit_dialog_detail(details) },
+            'Open Anyway',
+            'Change Limit',
+        );
+        return choice === 'Open Anyway'
+            ? 'openAnyway'
+            : choice === 'Change Limit'
+                ? 'configure'
+                : 'cancel';
+    },
+    async open_file_size_limit_setting(): Promise<void> {
+        await vscode.commands.executeCommand(
+            'workbench.action.openSettings',
+            '@id:tableViewer.maxFileSizeMiB',
+        );
     },
 };
 

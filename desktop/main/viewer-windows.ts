@@ -22,7 +22,10 @@ import {
     type ViewerController,
 } from '../../src/viewer-controller';
 import type { AuthorityFileStateStore } from '../../src/state';
-import type { ViewerHost } from '../../src/host-ports';
+import {
+    file_size_limit_dialog_detail,
+    type ViewerHost,
+} from '../../src/host-ports';
 import { canonical_file_key } from '../../src/resource-identity';
 import { node_file_refresh_watcher_factory } from '../../src/node-file-refresh-watcher';
 import type { HostMessage, WebviewMessage } from '../../src/types';
@@ -352,6 +355,7 @@ export class ViewerWindowManager {
         private readonly config_store: DesktopConfigStore,
         private readonly viewer_preload_path: string,
         private readonly viewer_panel_deadline_scheduler?: ViewerPanelDeadlineScheduler,
+        private readonly open_preferences: () => void = () => {},
     ) {}
 
     /**
@@ -567,6 +571,7 @@ export class ViewerWindowManager {
         };
         ipcMain.on(CHANNEL_WEBVIEW_MESSAGE, dirty_watcher);
 
+        let entry: ViewerWindow;
         // Format capabilities come from the same shared profile factory as the
         // VS Code extension: CSV/TSV and .xlsx worksheets are editable, .xls is not.
         const controller = attach_viewer(
@@ -575,6 +580,7 @@ export class ViewerWindowManager {
             this.state_store,
             profile_for(file_path, this.config_store.config_port()),
             this.viewer_host(window),
+            { requestClose: () => { void this.close_entry(entry); } },
         );
 
         // Track the size as the user drags, not only on close: opening a second
@@ -592,7 +598,7 @@ export class ViewerWindowManager {
             settle_timer = undefined;
         };
 
-        const entry: ViewerWindow = {
+        entry = {
             filePath: file_path,
             fileKey: file_key,
             window,
@@ -1151,6 +1157,23 @@ export class ViewerWindowManager {
                     });
                     return response === 0 ? 'save' : response === 1 ? 'discard' : 'cancel';
                 },
+                show_file_size_limit_dialog: async (details) => {
+                    const { response } = await message_box({
+                        type: 'warning',
+                        message: 'This file exceeds the configured file-size threshold.',
+                        detail: file_size_limit_dialog_detail(details),
+                        buttons: ['Open Anyway', 'Change Limit', 'Cancel'],
+                        defaultId: 0,
+                        cancelId: 2,
+                        noLink: true,
+                    });
+                    return response === 0
+                        ? 'openAnyway'
+                        : response === 1
+                            ? 'configure'
+                            : 'cancel';
+                },
+                open_file_size_limit_setting: async () => this.open_preferences(),
             }),
             config: this.config_store.config_port(),
             refreshWatcherFactory: node_file_refresh_watcher_factory,

@@ -4,6 +4,8 @@
 // fakes. This module deliberately does not import `electron`.
 import * as fs from 'fs';
 import type {
+    FileSizeLimitDialogChoice,
+    FileSizeLimitDialogDetails,
     FileSystemPort,
     HostUiPort,
     SaveDialogChoice,
@@ -34,6 +36,10 @@ export interface DesktopUiDialogs {
     show_warning(message: string): void;
     show_error(message: string): void;
     show_save_discard_dialog(): Promise<SaveDialogChoice>;
+    show_file_size_limit_dialog(
+        details: FileSizeLimitDialogDetails,
+    ): Promise<FileSizeLimitDialogChoice>;
+    open_file_size_limit_setting(): Promise<void>;
 }
 
 export function create_desktop_ui_port(dialogs: DesktopUiDialogs): HostUiPort {
@@ -41,5 +47,8 @@ export function create_desktop_ui_port(dialogs: DesktopUiDialogs): HostUiPort {
         show_warning: (message) => dialogs.show_warning(message),
         show_error: (message) => dialogs.show_error(message),
         show_save_discard_dialog: () => dialogs.show_save_discard_dialog(),
+        show_file_size_limit_dialog: (details) =>
+            dialogs.show_file_size_limit_dialog(details),
+        open_file_size_limit_setting: () => dialogs.open_file_size_limit_setting(),
     };
 }

@@ -25,13 +25,30 @@ export interface FileSystemPort {
 }
 
 export type SaveDialogChoice = 'save' | 'discard' | 'cancel';
+export type FileSizeLimitDialogChoice = 'openAnyway' | 'configure' | 'cancel';
 
-/** User-facing notifications and the modal unsaved-changes dialog. */
+export interface FileSizeLimitDialogDetails {
+    readonly actualBytes: number;
+    readonly limitBytes: number;
+}
+
+export function file_size_limit_dialog_detail(
+    { actualBytes, limitBytes }: FileSizeLimitDialogDetails,
+): string {
+    const mib = (bytes: number) => String(Math.round(bytes / 1024 / 1024 * 10) / 10);
+    return `The file is ${mib(actualBytes)} MiB. Table Viewer is configured to ask before opening files larger than ${mib(limitBytes)} MiB. Opening it may use significant memory or take some time, depending on your computer and the file.`;
+}
+
+/** User-facing notifications and modal decision dialogs. */
 export interface HostUiPort {
     show_warning(message: string): void;
     show_error(message: string): void;
     /** Modal "You have unsaved changes." dialog with Save / Discard / cancel. */
     show_save_discard_dialog(): Promise<SaveDialogChoice>;
+    show_file_size_limit_dialog(
+        details: FileSizeLimitDialogDetails,
+    ): Promise<FileSizeLimitDialogChoice>;
+    open_file_size_limit_setting(): Promise<void>;
 }
 
 /** Viewer configuration reads (replaces direct viewer-config/vscode reads). */

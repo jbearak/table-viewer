@@ -232,7 +232,14 @@ function setup_preview(
 
     // Attach the shared controller (owns the `ready` handshake, watcher, reload
     // guard, and core dispatch; forwards visibleRowChanged to profile.on_message).
-    const controller = attach_viewer(panel, uri, state_store, profile, vscode_viewer_host);
+    const controller = attach_viewer(
+        panel,
+        uri,
+        state_store,
+        profile,
+        vscode_viewer_host,
+        { requestClose: () => panel.dispose() },
+    );
 
     // When reusing an existing panel for a different file, rebuild the webview
     // HTML rather than messaging the live (stale) one. This clears the previous

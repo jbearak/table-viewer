@@ -163,7 +163,7 @@
           "type": "number",
           "default": 256,
           "minimum": 1,
-          "description": "Maximum file size in MiB for all file types (xlsx, xls, csv, tsv)."
+          "description": "File-size threshold in MiB above which Table Viewer asks for confirmation before opening an xlsx, xls, csv, or tsv file."
         }
       }
     }

@@ -23,6 +23,7 @@ const manifest = JSON.parse(readFileSync(
                 default?: unknown;
                 minimum?: unknown;
                 maximum?: unknown;
+                description?: unknown;
             }>;
         };
     };
@@ -65,6 +66,17 @@ describe('extension runtime manifest', () => {
             'tsconfig.integration.json',
         ]));
         expect(vscodeignore).not.toContain('companion/**');
+    });
+
+    it('describes the file-size limit as a confirmation threshold', () => {
+        expect(manifest.contributes?.configuration?.properties?.[
+            'tableViewer.maxFileSizeMiB'
+        ]).toMatchObject({
+            type: 'number',
+            default: 256,
+            minimum: 1,
+            description: 'File-size threshold in MiB above which Table Viewer asks for confirmation before opening an xlsx, xls, csv, or tsv file.',
+        });
     });
 
     it('bounds the retention setting so a large value cannot disable eviction', () => {

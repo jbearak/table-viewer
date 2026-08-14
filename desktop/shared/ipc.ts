@@ -51,6 +51,8 @@ export const CHANNEL_WELCOME_OPEN_FILES = 'welcome:openFiles';
 export const CHANNEL_WELCOME_OPEN_PREFERENCES = 'welcome:openPreferences';
 
 /** Preferences window channels. */
+export type PreferencesTarget = 'maxFileSizeMiB';
+export const CHANNEL_PREFS_FOCUS_TARGET = 'prefs:focusTarget';
 export const CHANNEL_PREFS_GET = 'prefs:get';
 export const CHANNEL_PREFS_SET = 'prefs:set';
 /** Same write, synchronously. Only for the flush the Preferences window does as

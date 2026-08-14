@@ -47,6 +47,7 @@ function open_csv_table(
         resolved_store,
         profile,
         fake_viewer_host,
+        { requestClose: () => panel.dispose() },
     );
     panel.onDidDispose(() => controller.dispose());
     return panel;
@@ -135,6 +136,101 @@ beforeEach(() => {
 });
 
 describe('CSV reload races', () => {
+    it('opens a file above the configured threshold when the user confirms once', async () => {
+        const bytes = enc.encode('h\na\n');
+        let reads = 0;
+        vscode_mock.__setConfigurationValue('tableViewer.maxFileSizeMiB', 1);
+        vscode_mock.__setStatImplementation(async () => ({ size: 2 * 1024 * 1024, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => {
+            reads += 1;
+            return bytes;
+        });
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage')
+            .mockResolvedValue('Open Anyway' as never);
+        const panel = open_csv_table(uri('/tmp/oversized-confirmed.csv'));
+
+        await panel.__receive({ type: 'ready' });
+        await flush_promises();
+
+        expect(warning).toHaveBeenCalledOnce();
+        expect(warning).toHaveBeenCalledWith(
+            'This file exceeds the configured file-size threshold.',
+            expect.objectContaining({
+                modal: true,
+                detail: expect.stringContaining('configured to ask before opening files larger than 1 MiB'),
+            }),
+            'Open Anyway',
+            'Change Limit',
+        );
+        expect(initial_snapshots(panel)).toHaveLength(1);
+        expect(reads).toBe(2);
+
+        await vscode_mock.__getWatchers()[0].__fireChange();
+        await flush_promises();
+        expect(warning).toHaveBeenCalledTimes(2);
+    });
+
+    it('closes an initially loading viewer when the user declines an oversized file', async () => {
+        vscode_mock.__setConfigurationValue('tableViewer.maxFileSizeMiB', 1);
+        vscode_mock.__setStatImplementation(async () => ({ size: 2 * 1024 * 1024, mtime: 1 }));
+        const read = vi.fn(async () => enc.encode('h\na\n'));
+        vscode_mock.__setReadFileImplementation(read);
+        vi.spyOn(vscode_mock.window, 'showWarningMessage').mockResolvedValue(undefined as never);
+        const error = vi.spyOn(vscode_mock.window, 'showErrorMessage');
+        const panel = open_csv_table(uri('/tmp/oversized-declined.csv'));
+        const close = vi.spyOn(panel, 'dispose');
+
+        await panel.__receive({ type: 'ready' });
+        await flush_promises();
+
+        expect(close).toHaveBeenCalledOnce();
+        expect(read).not.toHaveBeenCalled();
+        expect(initial_snapshots(panel)).toHaveLength(0);
+        expect(error).not.toHaveBeenCalled();
+    });
+
+    it('ignores an Open Anyway choice after the viewer is disposed', async () => {
+        vscode_mock.__setConfigurationValue('tableViewer.maxFileSizeMiB', 1);
+        vscode_mock.__setStatImplementation(async () => ({ size: 2 * 1024 * 1024, mtime: 1 }));
+        const read = vi.fn(async () => enc.encode('h\na\n'));
+        vscode_mock.__setReadFileImplementation(read);
+        const choice = deferred<unknown>();
+        vi.spyOn(vscode_mock.window, 'showWarningMessage')
+            .mockReturnValue(choice.promise);
+        const panel = open_csv_table(uri('/tmp/oversized-stale-choice.csv'));
+
+        const ready = panel.__receive({ type: 'ready' });
+        await flush_promises();
+        panel.dispose();
+        choice.resolve('Open Anyway');
+        await ready;
+        await flush_promises();
+
+        expect(read).not.toHaveBeenCalled();
+        expect(initial_snapshots(panel)).toHaveLength(0);
+    });
+
+    it('opens the exact limit setting and closes the initially loading viewer', async () => {
+        vscode_mock.__setConfigurationValue('tableViewer.maxFileSizeMiB', 1);
+        vscode_mock.__setStatImplementation(async () => ({ size: 2 * 1024 * 1024, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+        vi.spyOn(vscode_mock.window, 'showWarningMessage')
+            .mockResolvedValue('Change Limit' as never);
+        const execute = vi.spyOn(vscode_mock.commands, 'executeCommand');
+        const panel = open_csv_table(uri('/tmp/oversized-configure.csv'));
+        const close = vi.spyOn(panel, 'dispose');
+
+        await panel.__receive({ type: 'ready' });
+        await flush_promises();
+
+        expect(execute).toHaveBeenCalledWith(
+            'workbench.action.openSettings',
+            '@id:tableViewer.maxFileSizeMiB',
+        );
+        expect(close).toHaveBeenCalledOnce();
+        expect(initial_snapshots(panel)).toHaveLength(0);
+    });
+
     it('uses only native metadata and resends an active source on a new ready epoch', async () => {
         let reads = 0;
         vscode_mock.__setStatImplementation(async () => ({ size: 20, mtime: 1 }));

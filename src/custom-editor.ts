@@ -134,6 +134,7 @@ export class TableViewerEditorProvider
             this.state_store,
             profile_for(document.uri.fsPath, vscode_viewer_host.config),
             vscode_viewer_host,
+            { requestClose: () => webview_panel.dispose() },
         );
         this.#controllers.add(controller);
         this.#panels.set(controller, webview_panel);

@@ -31,7 +31,11 @@ import {
     type ViewerHost,
 } from './host-ports';
 import { create_resource_identity, type ResourceUriLike } from './resource-identity';
-import { assert_safe_file_size, MAX_CSV_ROWS } from './spreadsheet-safety';
+import {
+    assert_safe_file_size,
+    FileSizeLimitExceededError,
+    MAX_CSV_ROWS,
+} from './spreadsheet-safety';
 import { serialize_csv } from './serialize-csv';
 import { write_xlsx_workbook_cell_edits } from './xlsx-package';
 import type { XlsxCellEdit } from './xlsx-cell-write';
@@ -181,6 +185,8 @@ export interface ViewerControllerScheduler {
 export interface ViewerControllerOptions {
     readonly pendingEditFlushTimeoutMs?: number;
     readonly scheduler?: ViewerControllerScheduler;
+    /** Close the exact host surface when its initial source load is declined. */
+    readonly requestClose?: () => void | Promise<void>;
 }
 
 export interface ViewerController extends Disposable {
@@ -3121,13 +3127,15 @@ export function attach_viewer(
         return ++load_seq;
     }
 
-    async function build_source(): Promise<SourceCandidate> {
+    async function build_source(
+        { bypassFileSizeLimit = false }: { bypassFileSizeLimit?: boolean } = {},
+    ): Promise<SourceCandidate> {
         const state = (await read_file_state()).state as PerFileState;
         const stat = await host.fs.stat(uri);
         const max_mib = host.config.max_file_size_mib();
-        assert_safe_file_size(stat.size, max_mib);
+        if (!bypassFileSizeLimit) assert_safe_file_size(stat.size, max_mib);
         const raw = await host.fs.read_file(uri);
-        assert_safe_file_size(raw.byteLength, max_mib);
+        if (!bypassFileSizeLimit) assert_safe_file_size(raw.byteLength, max_mib);
         const observation = {
             fingerprint: `${stat.mtime}:${stat.size}`,
             digest: content_digest(raw),
@@ -3136,6 +3144,39 @@ export function attach_viewer(
             await profile.build_source(raw, file_path, state),
             observation,
         );
+    }
+
+    async function build_source_with_file_size_decision(
+        request: PanelLoadRequest,
+        initial: boolean,
+    ): Promise<
+        | { type: 'candidate'; candidate: SourceCandidate }
+        | { type: 'stopped' }
+        | { type: 'stale' }
+    > {
+        try {
+            return { type: 'candidate', candidate: await build_source() };
+        } catch (error) {
+            if (!(error instanceof FileSizeLimitExceededError)) throw error;
+            if (!load_is_current(request.seq, request.refreshEvent)) return { type: 'stale' };
+            const choice = await host.ui.show_file_size_limit_dialog({
+                actualBytes: error.actualBytes,
+                limitBytes: error.limitBytes,
+            });
+            if (!load_is_current(request.seq, request.refreshEvent)) return { type: 'stale' };
+            if (choice === 'openAnyway') {
+                return {
+                    type: 'candidate',
+                    candidate: await build_source({ bypassFileSizeLimit: true }),
+                };
+            }
+            if (choice === 'configure') {
+                await host.ui.open_file_size_limit_setting();
+                if (!load_is_current(request.seq, request.refreshEvent)) return { type: 'stale' };
+            }
+            if (initial) await options.requestClose?.();
+            return { type: 'stopped' };
+        }
     }
 
     async function built_source_is_current(
@@ -4018,7 +4059,10 @@ export function attach_viewer(
             let candidate: SourceCandidate | undefined;
             try {
                 const expected_authority = file_coordinator.authority().authorityRevision;
-                candidate = await build_source();
+                const build = await build_source_with_file_size_decision(request, initial);
+                if (build.type === 'stale') return inactive_refresh_result();
+                if (build.type === 'stopped') return { type: 'completed' };
+                candidate = build.candidate;
                 if (!load_is_current(request.seq, request.refreshEvent)) {
                     return inactive_refresh_result();
                 }
@@ -4118,7 +4162,9 @@ export function attach_viewer(
         let candidate: SourceCandidate | undefined;
         try {
             const expected_authority = file_coordinator.authority().authorityRevision;
-            candidate = await build_source();
+            const build = await build_source_with_file_size_decision(request, initial);
+            if (build.type !== 'candidate') return false;
+            candidate = build.candidate;
             if (!await built_source_is_current(request.seq, candidate)) {
                 if (
                     !schedule_local_refresh_retry(request, force, reason, initial)

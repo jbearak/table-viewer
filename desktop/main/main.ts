@@ -111,6 +111,7 @@ import {
     CHANNEL_APP_UPDATE_GET_STATE,
     CHANNEL_APP_UPDATE_STATE_CHANGED,
     CHANNEL_GET_THEME,
+    CHANNEL_PREFS_FOCUS_TARGET,
     CHANNEL_PREFS_GET,
     CHANNEL_PREFS_SET,
     CHANNEL_PREFS_SET_SYNC,
@@ -123,6 +124,7 @@ import {
     CHANNEL_TITLEBAR_ZOOM_CHANGED,
     CHANNEL_WELCOME_OPEN_FILES,
     CHANNEL_WELCOME_OPEN_PREFERENCES,
+    type PreferencesTarget,
 } from '../shared/ipc';
 
 /**
@@ -180,6 +182,8 @@ let app_update_presenter: AppUpdateWindowPresenter;
 let app_update_window: BrowserWindow | undefined;
 let app_quit_requested = false;
 let prefs_window: BrowserWindow | undefined;
+let prefs_renderer_loaded = false;
+let pending_prefs_target: PreferencesTarget | undefined;
 let about_window: BrowserWindow | undefined;
 let state_inspector_window: BrowserWindow | undefined;
 /** Open launcher windows; tracked so opening a file can replace the one it was
@@ -688,12 +692,25 @@ async function show_open_dialog(source?: BrowserWindow): Promise<void> {
     if (!canceled) open_files(filePaths, source);
 }
 
-function show_preferences_window(): void {
+function show_preferences_window(target?: PreferencesTarget): void {
+    if (target) pending_prefs_target = target;
     if (prefs_window && !prefs_window.isDestroyed()) {
         prefs_window.focus();
+        if (
+            prefs_renderer_loaded
+            && pending_prefs_target
+            && !prefs_window.webContents.isDestroyed()
+        ) {
+            prefs_window.webContents.send(
+                CHANNEL_PREFS_FOCUS_TARGET,
+                pending_prefs_target,
+            );
+            pending_prefs_target = undefined;
+        }
         return;
     }
-    prefs_window = new BrowserWindow({
+    prefs_renderer_loaded = false;
+    const created = new BrowserWindow({
         width: 460,
         // Fixed size, so the height must cover every field; the color-theme
         // field pushed the last controls (and the font-size input, the only way
@@ -714,10 +731,21 @@ function show_preferences_window(): void {
             nodeIntegration: false,
         },
     });
-    prefs_window.once('closed', () => {
-        prefs_window = undefined;
+    prefs_window = created;
+    created.webContents.once('did-finish-load', () => {
+        if (prefs_window !== created || created.isDestroyed()) return;
+        prefs_renderer_loaded = true;
+        if (!pending_prefs_target || created.webContents.isDestroyed()) return;
+        created.webContents.send(CHANNEL_PREFS_FOCUS_TARGET, pending_prefs_target);
+        pending_prefs_target = undefined;
     });
-    void prefs_window.loadFile(path.join(DESKTOP_DIST_DIR, 'prefs.html'));
+    created.once('closed', () => {
+        if (prefs_window !== created) return;
+        prefs_window = undefined;
+        prefs_renderer_loaded = false;
+        pending_prefs_target = undefined;
+    });
+    void created.loadFile(path.join(DESKTOP_DIST_DIR, 'prefs.html'));
 }
 
 /** A custom About window rather than the native panel: GPLv3 expects an
@@ -1439,7 +1467,13 @@ if (!got_lock) {
         // and possibly leaving a hot journal for the next launch. `publish`
         // closes it instead and answers false, and no window is created.
         if (!await state_backend.publish(opened)) return;
-        viewer_windows = new ViewerWindowManager(opened.store, config_store, VIEWER_PRELOAD);
+        viewer_windows = new ViewerWindowManager(
+            opened.store,
+            config_store,
+            VIEWER_PRELOAD,
+            undefined,
+            () => show_preferences_window('maxFileSizeMiB'),
+        );
         // After the window manager exists, and before the argv files below: the
         // flush releases whatever `open-file` / `second-instance` / `activate`
         // buffered during startup, and that work looks for a live

@@ -5,6 +5,7 @@ import {
     assert_safe_file_size,
     assert_safe_sheet_shape,
     create_workbook_budget,
+    FileSizeLimitExceededError,
     MAX_WORKBOOK_FILE_BYTES,
     MAX_SHEET_COLUMNS,
     MAX_SHEET_MERGES,
@@ -61,10 +62,23 @@ function build_minimal_xlsx(row: number): Uint8Array {
 }
 
 describe('spreadsheet safety limits', () => {
-    it('rejects oversized files before parsing', () => {
-        expect(() =>
-            assert_safe_file_size(MAX_WORKBOOK_FILE_BYTES + 1)
-        ).toThrow('File is too large to open safely');
+    it('rejects oversized files with structured threshold details', () => {
+        let thrown: unknown;
+        try {
+            assert_safe_file_size(MAX_WORKBOOK_FILE_BYTES + 1);
+        } catch (error) {
+            thrown = error;
+        }
+        expect(thrown).toBeInstanceOf(FileSizeLimitExceededError);
+        expect(thrown).toMatchObject({
+            actualBytes: MAX_WORKBOOK_FILE_BYTES + 1,
+            limitBytes: MAX_WORKBOOK_FILE_BYTES,
+            message: 'File size exceeds the configured 256 MiB threshold.',
+        });
+    });
+
+    it('accepts a file exactly at the configured threshold', () => {
+        expect(() => assert_safe_file_size(MAX_WORKBOOK_FILE_BYTES)).not.toThrow();
     });
 
     it('rejects excessive sheet counts', () => {
@@ -142,7 +156,7 @@ describe('spreadsheet safety limits', () => {
         // 1 MiB custom limit
         expect(() =>
             assert_safe_file_size(2 * 1024 * 1024, 1)
-        ).toThrow('File is too large to open safely');
+        ).toThrow('File size exceeds the configured 1 MiB threshold.');
 
         // Should not throw at 0.5 MiB with 1 MiB limit
         expect(() =>
