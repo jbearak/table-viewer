@@ -323,6 +323,17 @@ export function transforms_semantically_equal(
         === JSON.stringify(semantic_filters(right.filters));
 }
 
+function transform_reconciliation_required(
+    durable: SheetTransformState | undefined,
+    installed: SheetViewRecord | undefined,
+): boolean {
+    if (transforms_semantically_equal(
+        durable,
+        installed?.permuted ? installed.rules : undefined,
+    )) return false;
+    return transform_is_active(durable) || installed?.permuted === true;
+}
+
 /** Shared so clearing an already-empty auto-fit queue is not a state change. */
 const EMPTY_PENDING_AUTO_FIT: ReadonlySet<number> = new Set<number>();
 
@@ -406,6 +417,28 @@ export function App(): React.JSX.Element {
      */
     const [pending_auto_fit_sheets, set_pending_auto_fit_sheets] =
         useState<ReadonlySet<number>>(EMPTY_PENDING_AUTO_FIT);
+    const pending_auto_fit_sheets_ref = useRef<ReadonlySet<number>>(
+        EMPTY_PENDING_AUTO_FIT,
+    );
+    const update_pending_auto_fit_sheets = useCallback((
+        update: ReadonlySet<number> | (
+            (previous: ReadonlySet<number>) => ReadonlySet<number>
+        ),
+    ) => {
+        const previous = pending_auto_fit_sheets_ref.current;
+        const next = typeof update === 'function' ? update(previous) : update;
+        if (next === previous) return;
+        pending_auto_fit_sheets_ref.current = next;
+        set_pending_auto_fit_sheets(next);
+    }, []);
+    const cancel_pending_auto_fit_for_sheet = useCallback((sheet_index: number) => {
+        update_pending_auto_fit_sheets((prev) => {
+            if (!prev.has(sheet_index)) return prev;
+            const next = new Set(prev);
+            next.delete(sheet_index);
+            return next;
+        });
+    }, [update_pending_auto_fit_sheets]);
     const [truncation_message, set_truncation_message] = useState<string | null>(null);
     const [preview_mode, set_preview_mode] = useState(false);
     const [csv_editable, set_csv_editable] = useState(false);
@@ -654,6 +687,7 @@ export function App(): React.JSX.Element {
     const restore_abandoned_ref = useRef<boolean[]>([]);
     const generation_ref = useRef(1);
     const source_generation_ref = useRef(1);
+    const mapping_generations_ref = useRef<number[]>([]);
     const histogram_cache_ref = useRef(new Map<string, FilterHistogramReady>());
     const pending_histogram_ref = useRef<{
         requestId: string;
@@ -1535,6 +1569,19 @@ export function App(): React.JSX.Element {
                     }
                     const view_generation_changed =
                         generation_ref.current !== snapshot.generation;
+                    const previous_mapping_generations = mapping_generations_ref.current;
+                    const changed_mapping_indices = new Set<number>();
+                    const mapping_count = Math.max(
+                        previous_mapping_generations.length,
+                        snapshot.mappingGenerations.length,
+                    );
+                    for (let index = 0; index < mapping_count; index += 1) {
+                        if (
+                            previous_mapping_generations[index]
+                            !== snapshot.mappingGenerations[index]
+                        ) changed_mapping_indices.add(index);
+                    }
+                    mapping_generations_ref.current = [...snapshot.mappingGenerations];
                     set_generation(snapshot.generation);
                     generation_ref.current = snapshot.generation;
                     source_generation_ref.current = snapshot.sourceGeneration;
@@ -1559,37 +1606,75 @@ export function App(): React.JSX.Element {
                         source_changed
                         || view_generation_changed
                         || header_changed.size > 0;
-                    // Auto-fit measures the loaded rows, so a changed row basis
-                    // invalidates the measurement.
-                    if (row_basis_changed) {
+                    // Auto-fit measurements are per sheet. A source replacement may
+                    // reorder or replace every bare queue index, so fail closed for the
+                    // whole workbook. Within the same source, mapping generations and
+                    // header changes identify exactly the sheets whose sampled rows changed.
+                    const invalid_auto_fit_sheets = new Set([
+                        ...changed_mapping_indices,
+                        ...header_changed,
+                    ]);
+                    if (source_changed) {
                         auto_fit_active_ref.current = [];
                         auto_fit_snapshot_ref.current = [];
                         set_auto_fit_active([]);
                         set_auto_fit_snapshot([]);
-                    } else {
+                        update_pending_auto_fit_sheets(EMPTY_PENDING_AUTO_FIT);
+                    } else if (invalid_auto_fit_sheets.size > 0) {
+                        const next_active = auto_fit_active_ref.current
+                            .map((active, index) => (
+                                invalid_auto_fit_sheets.has(index) ? false : active
+                            ));
+                        const next_snapshot = auto_fit_snapshot_ref.current
+                            .map((saved, index) => (
+                                invalid_auto_fit_sheets.has(index) ? undefined : saved
+                            ));
+                        auto_fit_active_ref.current = next_active;
+                        auto_fit_snapshot_ref.current = next_snapshot;
+                        set_auto_fit_active(next_active);
+                        set_auto_fit_snapshot(next_snapshot);
+                        update_pending_auto_fit_sheets((prev) => {
+                            const next = new Set(prev);
+                            invalid_auto_fit_sheets.forEach((index) => next.delete(index));
+                            return next.size === prev.size ? prev : next;
+                        });
+                    }
+                    if (snapshot.presentation === 'refresh' && !source_changed) {
                         // The refresh reinstalls the host's authoritative widths, which
-                        // can predate this panel's own fitted-width write. Where the
-                        // widths we fitted are not the widths coming back, the toggle
-                        // would claim fitted columns it no longer has, so drop it for
-                        // those sheets and keep the authoritative widths.
+                        // can predate this panel's own fitted-width write. Any differing
+                        // width supersedes both a completed fit and a still-owed fit.
                         const incoming = refresh_authoritative_state!.columnWidths;
                         const local = state_ref.current.columnWidths ?? [];
+                        const width_count = Math.max(incoming.length, local.length);
+                        const changed_widths = Array.from(
+                            { length: width_count },
+                            (_unused, index) => !sheet_widths_equal(
+                                incoming[index],
+                                local[index],
+                            ),
+                        );
                         const stale = auto_fit_active_ref.current
-                            .map((active, index) => (
-                                active
-                                && !sheet_widths_equal(incoming[index], local[index])
-                            ));
+                            .map((active, index) => active && changed_widths[index]);
                         if (stale.some(Boolean)) {
                             const next_active = auto_fit_active_ref.current
                                 .map((active, index) => active && !stale[index]);
                             const next_snapshot = auto_fit_snapshot_ref.current
-                                .map((snapshot, index) => (
-                                    stale[index] ? undefined : snapshot
+                                .map((saved, index) => (
+                                    stale[index] ? undefined : saved
                                 ));
                             auto_fit_active_ref.current = next_active;
                             auto_fit_snapshot_ref.current = next_snapshot;
                             set_auto_fit_active(next_active);
                             set_auto_fit_snapshot(next_snapshot);
+                        }
+                        if (changed_widths.some(Boolean)) {
+                            update_pending_auto_fit_sheets((prev) => {
+                                const next = new Set(prev);
+                                changed_widths.forEach((changed, index) => {
+                                    if (changed) next.delete(index);
+                                });
+                                return next.size === prev.size ? prev : next;
+                            });
                         }
                     }
                     // An in-flight transform is only invalidated by a snapshot that
@@ -1640,12 +1725,9 @@ export function App(): React.JSX.Element {
                         set_active_sheet_index(normalized.activeSheetIndex);
                         set_column_widths(normalized.columnWidths);
                         set_show_formatting_by_sheet(normalized.showFormatting ?? []);
-                        // Work owed to the *previous* document. Both are queues of
-                        // bare sheet indices, so left standing they would be redeemed
-                        // against whatever sheet now sits at that index — fitting
-                        // columns and promoting header rows in a file the user never
-                        // asked it of, and persisting both.
-                        set_pending_auto_fit_sheets(EMPTY_PENDING_AUTO_FIT);
+                        // Header work owed to the *previous* document is keyed by bare
+                        // sheet index, so it cannot cross this boundary. Pending auto-fit
+                        // was already cleared with the changed row basis above.
                         set_excel_header_queue(null);
                         set_column_visibility(normalized.columnVisibility);
                         set_transforms(normalized.transforms);
@@ -2135,6 +2217,14 @@ export function App(): React.JSX.Element {
                     return;
                 }
                 const view = msg.view;
+                const mapping_changed =
+                    mapping_generations_ref.current[msg.sheetIndex]
+                    !== msg.mappingGeneration;
+                const next_mapping_generations = [
+                    ...mapping_generations_ref.current,
+                ];
+                next_mapping_generations[msg.sheetIndex] = msg.mappingGeneration;
+                mapping_generations_ref.current = next_mapping_generations;
                 // Fold the open overlay into the store before the generation bump
                 // below unmounts the grid that owns it — and only when that bump is
                 // real. Arriving here is necessary but not sufficient: this is the
@@ -2328,19 +2418,26 @@ export function App(): React.JSX.Element {
                     transforms: next_transforms,
                 };
                 set_transforms(next_transforms);
-                // A transform changes the population sampled by auto-fit. Keep
-                // current widths, but discard the toggle/snapshot so restoring
-                // cannot apply a stale pre-transform measurement.
-                set_auto_fit_active((prev) => {
-                    const next = [...prev];
-                    next[msg.sheetIndex] = false;
-                    return next;
-                });
-                set_auto_fit_snapshot((prev) => {
-                    const next = [...prev];
-                    next[msg.sheetIndex] = undefined;
-                    return next;
-                });
+                // Only an advanced mapping changes the population sampled by
+                // auto-fit. A rules-only no-op install moves the core generation but
+                // leaves the measured rows intact.
+                if (mapping_changed) {
+                    // A restore was already durably owed when an all-sheets fit was
+                    // requested, so keep that fit queued for the installed rows when
+                    // there are any to sample. A transform initiated afterward
+                    // supersedes the older request.
+                    if (origin !== 'restore' || view.rowCount === 0) {
+                        cancel_pending_auto_fit_for_sheet(msg.sheetIndex);
+                    }
+                    const next_active = [...auto_fit_active_ref.current];
+                    const next_snapshot = [...auto_fit_snapshot_ref.current];
+                    next_active[msg.sheetIndex] = false;
+                    next_snapshot[msg.sheetIndex] = undefined;
+                    auto_fit_active_ref.current = next_active;
+                    auto_fit_snapshot_ref.current = next_snapshot;
+                    set_auto_fit_active(next_active);
+                    set_auto_fit_snapshot(next_snapshot);
+                }
             }
         };
 
@@ -2349,10 +2446,12 @@ export function App(): React.JSX.Element {
     }, [
         active_sheet_index,
         apply_save_lifecycle,
+        cancel_pending_auto_fit_for_sheet,
         clear_pending_preview_scroll,
         persist_immediate,
         queue_preview_scroll,
         reset_save_projection,
+        update_pending_auto_fit_sheets,
     ]);
 
     useEffect(() => {
@@ -2539,22 +2638,10 @@ export function App(): React.JSX.Element {
         // question here is whether the durable rules already describe the view we hold,
         // and a view holding no permutation is described by no rules at all. The
         // inactive-both case that used to reach this comparison through a retained
-        // record's stale copy now falls through to the guard below, which answers it
-        // from the same two facts and without the copy.
-        if (
-            transforms_semantically_equal(
-                state,
-                installed?.permuted ? installed.rules : undefined,
-            )
-        ) return;
-        // Differing rules the host has nothing to do about, and the one case that is
-        // not a reconciliation: neither side describes a permutation, so the rules
-        // differ only in definitions nobody is applying — a filter a sibling added
-        // and left switched off, say. The toolbar already reads those from durable
-        // state. Asking the host to "install" them would bump the generation, remount
-        // the grid and fold whatever the user was typing, all for a view identical to
-        // the one on screen.
-        if (!transform_is_active(state) && !installed?.permuted) return;
+        // record's stale copy is rejected by the shared predicate from the same two
+        // facts and without the copy. That also excludes differing definitions nobody
+        // is applying, such as a disabled filter over a natural view.
+        if (!transform_reconciliation_required(state, installed)) return;
         // Sending the sanitized durable state — rather than the active half of it, or
         // a bare EMPTY_TRANSFORM — is what carries both directions. When it is active
         // this installs it. When it is not, it is the rule-free view, and sending it
@@ -3456,13 +3543,6 @@ export function App(): React.JSX.Element {
     }, [persist_immediate]);
 
     const deactivate_auto_fit_for_sheet = useCallback((sheet_index: number) => {
-        set_pending_auto_fit_sheets((prev) => {
-            if (!prev.has(sheet_index)) return prev;
-            const next = new Set(prev);
-            next.delete(sheet_index);
-            return next;
-        });
-
         const is_active = auto_fit_active_ref.current[sheet_index];
         const has_snapshot =
             auto_fit_snapshot_ref.current[sheet_index] !== undefined;
@@ -3577,9 +3657,15 @@ export function App(): React.JSX.Element {
             });
             // A direct resize supersedes both active and still-pending auto-fit.
             // Keep the current widths and discard any restore snapshot or owed fit.
+            cancel_pending_auto_fit_for_sheet(active_sheet_index);
             deactivate_auto_fit_for_sheet(active_sheet_index);
         },
-        [active_sheet_index, persist_immediate, deactivate_auto_fit_for_sheet]
+        [
+            active_sheet_index,
+            cancel_pending_auto_fit_for_sheet,
+            deactivate_auto_fit_for_sheet,
+            persist_immediate,
+        ]
     );
 
     /**
@@ -3759,19 +3845,36 @@ export function App(): React.JSX.Element {
         restore_widths_for_sheets,
     ]);
 
+    const auto_fit_waits_for_transform = useCallback((sheet_index: number) => {
+        if (
+            pending_transform_request_ids_ref.current[sheet_index]
+            || pending_transforms[sheet_index]
+        ) return true;
+        if (preview_mode || restore_abandoned_ref.current[sheet_index]) return false;
+        const sheet = meta?.sheets[sheet_index];
+        if (!sheet) return false;
+        const durable_transform = sanitize_transform_state(
+            state_ref.current.transforms?.[sheet_index],
+            sheet.columnCount,
+            transform_schema_for_sheet(sheet),
+            sheet.sourceRowCount,
+        );
+        return transform_reconciliation_required(
+            durable_transform,
+            sheet_views[sheet_index],
+        );
+    }, [meta, pending_transforms, preview_mode, sheet_views, transforms]);
+
     const try_apply_pending_auto_fit = useCallback(() => {
-        if (!pending_auto_fit_sheets.has(active_sheet_index)) return;
+        if (!pending_auto_fit_sheets_ref.current.has(active_sheet_index)) return;
+        if (auto_fit_waits_for_transform(active_sheet_index)) return;
         if (!apply_auto_fit_to_active_sheet()) return;
-        set_pending_auto_fit_sheets((prev) => {
-            if (!prev.has(active_sheet_index)) return prev;
-            const next = new Set(prev);
-            next.delete(active_sheet_index);
-            return next;
-        });
+        cancel_pending_auto_fit_for_sheet(active_sheet_index);
     }, [
         active_sheet_index,
         apply_auto_fit_to_active_sheet,
-        pending_auto_fit_sheets,
+        auto_fit_waits_for_transform,
+        cancel_pending_auto_fit_for_sheet,
     ]);
 
     useEffect(() => {
@@ -3790,31 +3893,41 @@ export function App(): React.JSX.Element {
         const sheets = meta?.sheets ?? [];
         const can_eventually_measure = (index: number) => {
             const sheet = sheets[index];
-            return sheet !== undefined && sheet.rowCount > 0 && sheet.columnCount > 0;
+            const row_count = sheet_views[index]?.rowCount ?? sheet?.rowCount ?? 0;
+            return sheet !== undefined && row_count > 0 && sheet.columnCount > 0;
         };
         // The active sheet joins the queue when it could not be measured — a grid
         // with no rows loaded yet. Leaving it out on the grounds that it was "done
         // now" would make the one sheet the user is looking at the only one the
         // action skipped, with nothing left to retry it. Empty sheets are omitted:
         // they can never deliver the row sample that settles a deferred fit.
-        const fitted_active = can_eventually_measure(active_sheet_index)
-            && apply_auto_fit_to_active_sheet();
-        set_pending_auto_fit_sheets(new Set(
+        const fitted_active = auto_fit_active_ref.current[active_sheet_index]
+            || (can_eventually_measure(active_sheet_index)
+                && !auto_fit_waits_for_transform(active_sheet_index)
+                && apply_auto_fit_to_active_sheet());
+        update_pending_auto_fit_sheets(new Set(
             sheets.map((_sheet, index) => index)
                 .filter((index) => can_eventually_measure(index)
                     && (index === active_sheet_index
                         ? !fitted_active
                         : !auto_fit_active_ref.current[index])),
         ));
-    }, [active_sheet_index, apply_auto_fit_to_active_sheet, meta]);
+    }, [
+        active_sheet_index,
+        apply_auto_fit_to_active_sheet,
+        auto_fit_waits_for_transform,
+        meta,
+        sheet_views,
+        update_pending_auto_fit_sheets,
+    ]);
 
     /** Restore every sheet's pre-fit widths, and drop any fit still owed. */
     const handle_restore_widths_all_sheets = useCallback(() => {
-        set_pending_auto_fit_sheets(EMPTY_PENDING_AUTO_FIT);
+        update_pending_auto_fit_sheets(EMPTY_PENDING_AUTO_FIT);
         restore_widths_for_sheets(
             Array.from({ length: meta?.sheets.length ?? 0 }, (_, index) => index),
         );
-    }, [meta, restore_widths_for_sheets]);
+    }, [meta, restore_widths_for_sheets, update_pending_auto_fit_sheets]);
 
     const current_sheet = meta?.sheets[active_sheet_index];
     const current_column_projection = useMemo(

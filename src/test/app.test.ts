@@ -4,7 +4,6 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type {
-    CsvSaveLifecycle,
     CsvSaveOperation,
     HostMessage,
     SheetTransformState,
@@ -16,6 +15,7 @@ import { MAX_PERSISTED_ROW_HEIGHTS } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
 import type { WorkbookSnapshot } from '../viewer-snapshot';
 import type { EditSessionStore } from '../webview/edit-session-store';
+import type { GridShellProps } from '../webview/grid-shell';
 import { sheet_edits } from './pending-edits-helper';
 
 const grid_shell_mock = vi.hoisted(() => ({
@@ -34,7 +34,8 @@ const grid_shell_mock = vi.hoisted(() => ({
     stop_edit_admission: vi.fn(),
     focus_grid: vi.fn(),
     select_all: vi.fn(),
-    copy_sheet: vi.fn(),
+    copy_sheet: vi.fn(async () => {}),
+    copy_selection: vi.fn(),
     auto_fit_result: { 0: 120 } as Record<number, number> | null,
     latest_props: null as Record<string, unknown> | null,
     emit_pending_edits_on_mount: false,
@@ -56,76 +57,7 @@ const empty_edit_session = vi.hoisted(() => {
 // generation, formatting flag, preview flag, column widths) and exposes a button
 // that fires `on_column_resize`, so we can exercise App's wiring without canvas.
 vi.mock('../webview/grid-shell', () => ({
-    GridShell: (props: {
-        sheet_index: number;
-        generation: number;
-        row_count?: number;
-        show_formatting: boolean;
-        preview_mode?: boolean;
-        column_projection: {
-            visible_to_source: number[];
-            source_to_visible: (number | undefined)[];
-        };
-        column_widths: Record<number, number>;
-        // The host's display-keyed projection, and the resizes App has committed but
-        // not yet seen delivered back. Reported separately because that is how the real
-        // shell reads them: the projection is authoritative, the overlay sits over it.
-        row_heights: Record<number, number>;
-        row_height_overlay?: readonly {
-            rows: readonly { start: number; end: number }[];
-            height: number;
-        }[];
-        merges: { startRow: number }[];
-        edit_mode?: boolean;
-        edit_session_id?: string;
-        save_operation?: CsvSaveOperation;
-        save_lifecycle?: CsvSaveLifecycle;
-        on_save_request?: () => CsvSaveOperation | undefined;
-        edit_session?: EditSessionStore;
-        host_rejected_keys?: readonly string[];
-        on_editing_change?: (status: { is_dirty: boolean; has_live_uncommitted: boolean; save_in_flight: boolean; edits: Record<string, { value: string; base: string }>; conflicted: string[] }) => void;
-        editing_ref?: {
-            current: {
-                request_save: () => boolean;
-                clear_dirty: () => void;
-                discard_conflicted: () => void;
-                discard_keys: (keys: readonly string[]) => void;
-                stop_edit_admission: () => void;
-                commit_live_edit: () => void;
-                flush_live_edit: () => void;
-                has_uncommitted_changes: () => boolean;
-            } | null;
-        };
-        on_column_resize: (col: number, width: number) => void;
-        on_row_resize: (
-            rows: readonly { start: number; end: number }[],
-            height: number,
-        ) => void;
-        auto_fit_ref?: {
-            current: (() => Record<number, number> | null) | null;
-        };
-        on_auto_fit_sample_change?: () => void;
-        grid_focus_ref?: {
-            current: { generation: number; focus: () => boolean } | null;
-        };
-        grid_actions_ref?: {
-            current: {
-                sheet_index: number;
-                select_all: () => void;
-                copy_sheet: () => void;
-            } | null;
-        };
-        pending_preview_scroll?: { row: number; sequence: number } | null;
-        on_preview_scroll_applied?: (sequence: number) => void;
-        on_preview_visible_row_change?: (row: number) => void;
-        transform_sections: boolean;
-        transform_pending: boolean;
-        on_transform_change: (state: { sort: Array<{ colIndex: number; direction: 'asc' | 'desc' }>; filters: unknown[] }) => void;
-        on_open_filter: (source_column: number, anchor: { left: number; top: number }, restore_focus: () => void) => void;
-        can_promote_row_to_header?: boolean;
-        on_promote_row_to_header?: (display_row: number) => void;
-        on_focus_columns?: () => void;
-    }) => {
+    GridShell: (props: GridShellProps) => {
         grid_shell_mock.latest_props = props as unknown as Record<string, unknown>;
         const mount_id = React.useRef(++grid_shell_mock.mount_count);
         // Subscribe the way the real use_editing does, so `data-store-edits`
@@ -193,6 +125,7 @@ vi.mock('../webview/grid-shell', () => ({
                 sheet_index: props.sheet_index,
                 select_all: () => grid_shell_mock.select_all(),
                 copy_sheet: () => grid_shell_mock.copy_sheet(),
+                copy_selection: () => grid_shell_mock.copy_selection(),
             };
             props.grid_actions_ref.current = handle;
             return () => {
@@ -317,7 +250,7 @@ vi.mock('../webview/grid-shell', () => ({
                 'button',
                 {
                     className: 'stub-shortcut-transform',
-                    onClick: () => props.on_transform_change({
+                    onClick: () => props.on_transform_change?.({
                         sort: [{ colIndex: 0, direction: 'asc' }],
                         filters: [],
                     }),
@@ -328,7 +261,7 @@ vi.mock('../webview/grid-shell', () => ({
                 'button',
                 {
                     className: 'stub-header-transform',
-                    onClick: () => props.on_transform_change({
+                    onClick: () => props.on_transform_change?.({
                         sort: [{ colIndex: 0, direction: 'desc' }],
                         filters: [],
                     }),
@@ -342,7 +275,7 @@ vi.mock('../webview/grid-shell', () => ({
                     // moves the view generation, but nothing active, so it produces no
                     // permutation and moves no row.
                     className: 'stub-inactive-filter-transform',
-                    onClick: () => props.on_transform_change({
+                    onClick: () => props.on_transform_change?.({
                         sort: [],
                         filters: [{
                             id: 'f1',
@@ -502,12 +435,23 @@ async function open_scope_menu(aria_label: string) {
     await act(async () => caret!.click());
 }
 
-async function click_menu_item(label: string) {
+function get_menu_item(label: string): HTMLButtonElement {
     const item = Array.from(
         document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
     ).find((node) => node.textContent === label);
     expect(item, `no menu item ${label}`).toBeDefined();
-    await act(async () => item!.click());
+    return item!;
+}
+
+async function click_menu_item(label: string) {
+    await act(async () => get_menu_item(label).click());
+}
+
+async function notify_auto_fit_sample_change() {
+    const notify = grid_shell_mock.latest_props?.on_auto_fit_sample_change as
+        (() => void) | undefined;
+    expect(notify).toBeDefined();
+    await act(async () => notify!());
 }
 
 async function click_sheet_tab(name: string) {
@@ -883,6 +827,7 @@ function cleanup() {
     grid_shell_mock.focus_grid.mockReset();
     grid_shell_mock.select_all.mockReset();
     grid_shell_mock.copy_sheet.mockReset();
+    grid_shell_mock.copy_selection.mockReset();
     grid_shell_mock.auto_fit_result = { 0: 120 };
     grid_shell_mock.emit_pending_edits_on_mount = false;
     grid_shell_mock.write_on_session_change = false;
@@ -3601,12 +3546,7 @@ describe('auto-fit state', () => {
         // Model rowData landing in the mounted GridShell: its loader version changes,
         // waking App to retry through the same imperative measurement ref.
         grid_shell_mock.auto_fit_result = { 0: 220 };
-        await act(async () => {
-            const notify = grid_shell_mock.latest_props?.on_auto_fit_sample_change as
-                (() => void) | undefined;
-            expect(notify).toBeDefined();
-            notify!();
-        });
+        await notify_auto_fit_sample_change();
 
         await vi.waitFor(() => {
             expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!))
@@ -3614,6 +3554,40 @@ describe('auto-fit state', () => {
             expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
         });
         expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeUndefined();
+    });
+
+    it('keeps an owed fit when hidden columns become visible', async () => {
+        await render_app();
+        const meta = make_meta(['A', 'B']);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            state: {
+                columnVisibility: [undefined, {
+                    hiddenColumns: [0],
+                    schema: '["B",1,null]',
+                }],
+            },
+        }));
+
+        await open_scope_menu('Auto-fit scope');
+        await click_menu_item('Auto-fit columns on all 2 sheets');
+
+        grid_shell_mock.auto_fit_result = null;
+        await click_sheet_tab('B');
+        expect(JSON.parse(grid_stub().getAttribute('data-projection')!)).toEqual([]);
+        expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeDefined();
+
+        await open_columns();
+        await click_button('Show all');
+        expect(JSON.parse(grid_stub().getAttribute('data-projection')!)).toEqual([0]);
+        expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeDefined();
+
+        grid_shell_mock.auto_fit_result = { 0: 220 };
+        await notify_auto_fit_sample_change();
+        await vi.waitFor(() => {
+            expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!))
+                .toEqual({ 0: 220 });
+        });
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
     });
 
     it('cancels an owed fit when the user resizes before rows arrive', async () => {
@@ -3656,10 +3630,8 @@ describe('auto-fit state', () => {
         await click_menu_item('Auto-fit columns on all 2 sheets');
 
         await open_scope_menu('Auto-fit scope');
-        const restore = Array.from(
-            document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
-        ).find((item) => item.textContent === 'Restore original widths on all 2 sheets');
-        expect(restore?.disabled).toBe(true);
+        const restore = get_menu_item('Restore original widths on all 2 sheets');
+        expect(restore.disabled).toBe(true);
         expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeUndefined();
     });
 
@@ -3677,15 +3649,34 @@ describe('auto-fit state', () => {
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
 
         await open_scope_menu('Auto-fit scope');
-        const restore = Array.from(
-            document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
-        ).find((item) => item.textContent === 'Restore original widths on all 2 sheets');
-        expect(restore?.disabled).toBe(false);
+        const restore = get_menu_item('Restore original widths on all 2 sheets');
+        expect(restore.disabled).toBe(false);
 
         // And taking it drops the queue: arriving at B fits nothing.
         await click_menu_item('Restore original widths on all 2 sheets');
         grid_shell_mock.auto_fit_result = { 0: 120 };
         await click_sheet_tab('B');
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
+    });
+
+    it('does not replace original widths when auto-fit-all is repeated', async () => {
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B'])));
+
+        await open_scope_menu('Auto-fit scope');
+        await click_menu_item('Auto-fit columns on all 2 sheets');
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({ 0: 120 });
+
+        // B is still owed, so the action remains available. Repeating it must not
+        // treat A's fitted widths as the restore point for a second fit.
+        grid_shell_mock.auto_fit_result = { 0: 180 };
+        await open_scope_menu('Auto-fit scope');
+        await click_menu_item('Auto-fit columns on all 2 sheets');
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({ 0: 120 });
+
+        await open_scope_menu('Auto-fit scope');
+        await click_menu_item('Restore original widths on all 2 sheets');
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({});
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
     });
 
@@ -3708,6 +3699,219 @@ describe('auto-fit state', () => {
         }));
         await click_sheet_tab('D');
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
+    });
+
+    it('drops pending fits when a refresh changes the row basis', async () => {
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B'])));
+
+        await open_scope_menu('Auto-fit scope');
+        await click_menu_item('Auto-fit columns on all 2 sheets');
+
+        // A same-file reload may reorder sheets. Bare queue indices from the old row
+        // basis must not follow whatever worksheet now occupies that slot.
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['B', 'A'])));
+        grid_shell_mock.auto_fit_result = { 0: 220 };
+        await click_sheet_tab('A');
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
+        expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeUndefined();
+    });
+
+    it('cancels an owed fit when authoritative widths change elsewhere', async () => {
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B'])));
+
+        await open_scope_menu('Auto-fit scope');
+        await click_menu_item('Auto-fit columns on all 2 sheets');
+
+        grid_shell_mock.auto_fit_result = null;
+        await click_sheet_tab('B');
+        const stale_notify = grid_shell_mock.latest_props?.on_auto_fit_sample_change as
+            (() => void) | undefined;
+        expect(stale_notify).toBeDefined();
+
+        // Another panel manually resized B while this panel still owed it a fit.
+        // The authoritative width wins, even if a loader effect retained the callback
+        // from the render immediately before invalidation.
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['A', 'B']), {
+            generation: 1,
+            sourceGeneration: 1,
+            mappingGenerations: [1, 1],
+            reason: 'other',
+            state: { columnWidths: [{ 0: 120 }, { 0: 180 }] },
+        }));
+        expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeUndefined();
+
+        grid_shell_mock.auto_fit_result = { 0: 220 };
+        await act(async () => stale_notify!());
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({ 0: 180 });
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
+    });
+
+    it('waits for a saved transform before fitting an unopened sheet', async () => {
+        const { post_message } = await render_app();
+        const saved_transform: SheetTransformState = {
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [],
+            schema: '["B",1,null]',
+        };
+        await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B']), {
+            state: { transforms: [undefined, saved_transform] },
+        }));
+
+        await open_scope_menu('Auto-fit scope');
+        await click_menu_item('Auto-fit columns on all 2 sheets');
+        grid_shell_mock.auto_fit_result = null;
+        await click_sheet_tab('B');
+        const restore = latest_transform_request(post_message);
+        expect(restore.intent).toBe('restore');
+
+        // Even if natural rows become measurable first, the queued fit waits for the
+        // durable view rather than sampling a temporary row population.
+        grid_shell_mock.auto_fit_result = { 0: 180 };
+        await notify_auto_fit_sample_change();
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({});
+
+        grid_shell_mock.auto_fit_result = null;
+        await acknowledge_transform(restore, 2);
+        expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeDefined();
+
+        grid_shell_mock.auto_fit_result = { 0: 220 };
+        await notify_auto_fit_sample_change();
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({ 0: 220 });
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
+    });
+
+    it('settles an owed fit when a saved transform produces no rows', async () => {
+        const { post_message } = await render_app();
+        const saved_transform: SheetTransformState = {
+            sort: [],
+            filters: [{
+                id: 'none',
+                colIndex: 0,
+                operator: 'contains',
+                value: 'no matches',
+                caseSensitive: false,
+                enabled: true,
+            }],
+            schema: '["B",1,null]',
+        };
+        await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B']), {
+            state: { transforms: [undefined, saved_transform] },
+        }));
+
+        await open_scope_menu('Auto-fit scope');
+        await click_menu_item('Auto-fit columns on all 2 sheets');
+        grid_shell_mock.auto_fit_result = null;
+        await click_sheet_tab('B');
+        const restore = latest_transform_request(post_message);
+        await dispatch_host_message(transform_installed_message(restore, {
+            generation: 2,
+            rowCount: 0,
+        }));
+
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
+        expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeUndefined();
+    });
+
+    it('cancels only the pending fit whose row mapping is transformed', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B'])));
+
+        await open_scope_menu('Auto-fit scope');
+        await click_menu_item('Auto-fit columns on all 2 sheets');
+        grid_shell_mock.auto_fit_result = null;
+        await click_sheet_tab('B');
+        expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeDefined();
+
+        await act(async () => {
+            (container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement).click();
+        });
+        await acknowledge_transform(latest_transform_request(post_message), 2);
+        expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeUndefined();
+
+        grid_shell_mock.auto_fit_result = { 0: 220 };
+        await click_sheet_tab('A');
+        await click_sheet_tab('B');
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
+    });
+
+    it('keeps an owed fit when transform rules leave the row mapping unchanged', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B'])));
+
+        await open_scope_menu('Auto-fit scope');
+        await click_menu_item('Auto-fit columns on all 2 sheets');
+        grid_shell_mock.auto_fit_result = null;
+        await click_sheet_tab('B');
+
+        await act(async () => {
+            (container!.querySelector(
+                '.stub-inactive-filter-transform',
+            ) as HTMLButtonElement).click();
+        });
+        const request = latest_transform_request(post_message);
+        await dispatch_host_message(transform_installed_message(request, {
+            generation: 2,
+            mappingGeneration: 1,
+            permuted: false,
+        }));
+        expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeDefined();
+
+        grid_shell_mock.auto_fit_result = { 0: 220 };
+        await notify_auto_fit_sample_change();
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({ 0: 220 });
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
+    });
+
+    it('preserves sibling fits owed across another sheet mapping change', async () => {
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B', 'C'])));
+
+        await open_scope_menu('Auto-fit scope');
+        await click_menu_item('Auto-fit columns on all 3 sheets');
+
+        // The core generation is workbook-wide, but only A's mapping changed. B and C
+        // still name the same rows and must remain queued.
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['A', 'B', 'C']), {
+            generation: 2,
+            sourceGeneration: 1,
+            mappingGenerations: [2, 1, 1],
+            reason: 'other',
+            state: { columnWidths: [{ 0: 120 }] },
+        }));
+        grid_shell_mock.auto_fit_result = null;
+        await click_sheet_tab('B');
+        expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeDefined();
+
+        grid_shell_mock.auto_fit_result = { 0: 220 };
+        await notify_auto_fit_sample_change();
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({ 0: 220 });
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
+    });
+
+    it('does not queue a transformed view with no effective rows', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B'])));
+        await click_sheet_tab('B');
+
+        await act(async () => {
+            (container!.querySelector('.stub-shortcut-transform') as HTMLButtonElement).click();
+        });
+        const request = latest_transform_request(post_message);
+        await dispatch_host_message(transform_installed_message(request, {
+            generation: 2,
+            rowCount: 0,
+        }));
+        await click_sheet_tab('A');
+
+        await open_scope_menu('Auto-fit scope');
+        await click_menu_item('Auto-fit columns on all 2 sheets');
+        grid_shell_mock.auto_fit_result = { 0: 220 };
+        await click_sheet_tab('B');
+
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
+        expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeUndefined();
     });
 
     it('clears auto-fit state on live reload', async () => {
