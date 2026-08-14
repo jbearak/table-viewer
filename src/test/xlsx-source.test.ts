@@ -65,6 +65,28 @@ describe('XlsxDataSource', () => {
         const ds = await XlsxDataSource.create(load('merged.xlsx'));
         expect(ds.meta().sheets[0].merges.length).toBeGreaterThan(0);
     });
+    it('preserves the survey workbook multiline B8:E8 INFORMATION NOTE merge', async () => {
+        const ds = await XlsxDataSource.create(
+            load('undesa_pd_2024_wcu_country_data_survey-based.xlsx'),
+        );
+        const sheet_index = ds.meta().sheets.findIndex(
+            (sheet) => sheet.name === 'INFORMATION NOTE',
+        );
+        expect(sheet_index).toBeGreaterThanOrEqual(0);
+        const sheet = ds.meta().sheets[sheet_index];
+        expect(sheet.merges).toContainEqual({
+            startRow: 7,
+            startCol: 1,
+            endRow: 7,
+            endCol: 4,
+        });
+
+        const row = ds.read_rows(sheet_index, 7, 1).rows[0];
+        expect(row[1]?.formatted)
+            .toMatch(/\r?\n\r?\nThe data set contains survey-based estimates/);
+        expect(row[1]?.formatted).toContain('Oficina Nacional de Estadísticas, Cuba)');
+        expect(row.slice(2, 5)).toEqual([null, null, null]);
+    }, 15_000);
     it('preserves bold/italic flags', async () => {
         const ds = await XlsxDataSource.create(load('styled.xlsx'));
         const w = ds.read_rows(0, 0, 50);

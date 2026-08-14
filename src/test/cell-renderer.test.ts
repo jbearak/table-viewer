@@ -129,6 +129,30 @@ describe('build_grid_cell — horizontal merges (native span)', () => {
             expect((c as { displayData: string }).displayData).toBe('Merged Header');
         }
     });
+
+    it('wraps complete multiline content on the anchor and covered cells', () => {
+        const note = 'First paragraph.\n\nSecond paragraph.\nFinal line.';
+        const note_rows: (RenderedCell | null)[] = [null, rc(note), null, null, null];
+        const note_idx = new MergeIndex([
+            { startRow: 7, startCol: 1, endRow: 7, endCol: 4 },
+        ]);
+
+        for (const col of [1, 2, 3, 4]) {
+            const c = build_grid_cell(7, col, note_rows, note_idx, true);
+            expect(c).toMatchObject({
+                data: note,
+                displayData: note,
+                span: [1, 4],
+                allowWrapping: true,
+            });
+        }
+    });
+
+    it('does not enable wrapping for a single-line horizontal merge', () => {
+        for (const col of [0, 1, 2]) {
+            expect((cell(0, col) as { allowWrapping?: boolean }).allowWrapping).toBeUndefined();
+        }
+    });
 });
 
 describe('build_grid_cell — edit overlay (CSV edit mode)', () => {
