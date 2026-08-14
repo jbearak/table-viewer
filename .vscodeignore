@@ -7,6 +7,10 @@ tsconfig.integration.json
 desktop/**
 dist/desktop/**
 dist/desktop-packages/**
+# electron-builder's legacy/default unpacked output layouts. These app bundles
+# contain symlinks to directories, which vsce's secret scan cannot read as files.
+dist/mac*/**
+dist/*-unpacked/**
 dist/runtime-probes/**
 .node-version
 .gitignore
