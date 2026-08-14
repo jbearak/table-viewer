@@ -326,6 +326,8 @@ export interface GridShellProps {
     // App provides this ref; GridShell populates it with a function that measures
     // loaded rows and returns fitted column widths (null when nothing is loaded).
     auto_fit_ref?: MutableRefObject<(() => Record<number, number> | null) | null>;
+    /** Notifies App when a deferred auto-fit may have become measurable. */
+    on_auto_fit_sample_change?: () => void;
     /** App-owned bridge for restoring focus after generation-keyed remounts. */
     grid_focus_ref?: MutableRefObject<GridFocusHandle | null>;
     /** App-owned bridge for sheet-tab actions (select all / copy sheet). */
@@ -395,6 +397,7 @@ export function GridShell({
     on_editing_change,
     editing_ref,
     auto_fit_ref,
+    on_auto_fit_sample_change,
     grid_focus_ref,
     grid_actions_ref,
     pending_preview_scroll = null,
@@ -1734,6 +1737,11 @@ export function GridShell({
             auto_fit_ref.current = null;
         };
     }, [auto_fit_ref, compute_auto_fit]);
+
+    useEffect(() => {
+        if (version === 0 || !has_visible_columns) return;
+        on_auto_fit_sample_change?.();
+    }, [has_visible_columns, on_auto_fit_sample_change, version]);
 
     const get_highlight_background = useCallback((
         source_row: number,

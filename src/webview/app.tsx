@@ -394,6 +394,18 @@ export function App(): React.JSX.Element {
     const [auto_fit_snapshot, set_auto_fit_snapshot] = useState<
         (Record<number, number> | undefined)[]
     >([]);
+    /**
+     * Sheets marked "auto-fit" that have not been measured yet.
+     *
+     * Fitting reads the mounted grid's *loaded* rows, so a sheet the user has never
+     * opened has nothing to measure — there is no width to compute without first
+     * mounting its grid and loading rows. Rather than flicker the whole workbook
+     * through the viewport to service one menu click, "auto-fit all sheets" marks
+     * them and each fits on arrival. That matches what auto-fit already promises on
+     * the active sheet, where it only ever measures what is loaded.
+     */
+    const [pending_auto_fit_sheets, set_pending_auto_fit_sheets] =
+        useState<ReadonlySet<number>>(EMPTY_PENDING_AUTO_FIT);
     const [truncation_message, set_truncation_message] = useState<string | null>(null);
     const [preview_mode, set_preview_mode] = useState(false);
     const [csv_editable, set_csv_editable] = useState(false);
@@ -3444,6 +3456,13 @@ export function App(): React.JSX.Element {
     }, [persist_immediate]);
 
     const deactivate_auto_fit_for_sheet = useCallback((sheet_index: number) => {
+        set_pending_auto_fit_sheets((prev) => {
+            if (!prev.has(sheet_index)) return prev;
+            const next = new Set(prev);
+            next.delete(sheet_index);
+            return next;
+        });
+
         const is_active = auto_fit_active_ref.current[sheet_index];
         const has_snapshot =
             auto_fit_snapshot_ref.current[sheet_index] !== undefined;
@@ -3556,7 +3575,8 @@ export function App(): React.JSX.Element {
                 persist_immediate();
                 return next;
             });
-            // Deactivate auto-fit if it was active (keep current widths, discard snapshot)
+            // A direct resize supersedes both active and still-pending auto-fit.
+            // Keep the current widths and discard any restore snapshot or owed fit.
             deactivate_auto_fit_for_sheet(active_sheet_index);
         },
         [active_sheet_index, persist_immediate, deactivate_auto_fit_for_sheet]
@@ -3739,22 +3759,8 @@ export function App(): React.JSX.Element {
         restore_widths_for_sheets,
     ]);
 
-    /**
-     * Sheets marked "auto-fit" that have not been measured yet.
-     *
-     * Fitting reads the mounted grid's *loaded* rows, so a sheet the user has never
-     * opened has nothing to measure — there is no width to compute without first
-     * mounting its grid and loading rows. Rather than flicker the whole workbook
-     * through the viewport to service one menu click, "auto-fit all sheets" marks
-     * them and each fits on arrival. That matches what auto-fit already promises on
-     * the active sheet, where it only ever measures what is loaded.
-     */
-    const [pending_auto_fit_sheets, set_pending_auto_fit_sheets] =
-        useState<ReadonlySet<number>>(EMPTY_PENDING_AUTO_FIT);
-
-    useEffect(() => {
+    const try_apply_pending_auto_fit = useCallback(() => {
         if (!pending_auto_fit_sheets.has(active_sheet_index)) return;
-        if (!auto_fit_ref.current) return;
         if (!apply_auto_fit_to_active_sheet()) return;
         set_pending_auto_fit_sheets((prev) => {
             if (!prev.has(active_sheet_index)) return prev;
@@ -3765,26 +3771,40 @@ export function App(): React.JSX.Element {
     }, [
         active_sheet_index,
         apply_auto_fit_to_active_sheet,
-        // A newly mounted or remounted grid is what makes the fit possible, and
-        // neither identity is visible to this effect — the generation and load epoch
-        // are, and they change with it.
-        generation,
-        load_epoch,
         pending_auto_fit_sheets,
     ]);
 
+    useEffect(() => {
+        try_apply_pending_auto_fit();
+    }, [
+        // A newly mounted or remounted grid is what makes the fit possible, and
+        // neither identity is visible to this effect — the generation and load epoch
+        // are, and they change with it. Row delivery within that mount calls the same
+        // retry directly through GridShell's notification prop.
+        generation,
+        load_epoch,
+        try_apply_pending_auto_fit,
+    ]);
+
     const handle_auto_fit_all_sheets = useCallback(() => {
-        const sheet_count = meta?.sheets.length ?? 0;
+        const sheets = meta?.sheets ?? [];
+        const can_eventually_measure = (index: number) => {
+            const sheet = sheets[index];
+            return sheet !== undefined && sheet.rowCount > 0 && sheet.columnCount > 0;
+        };
         // The active sheet joins the queue when it could not be measured — a grid
         // with no rows loaded yet. Leaving it out on the grounds that it was "done
         // now" would make the one sheet the user is looking at the only one the
-        // action skipped, with nothing left to retry it.
-        const fitted_active = apply_auto_fit_to_active_sheet();
+        // action skipped, with nothing left to retry it. Empty sheets are omitted:
+        // they can never deliver the row sample that settles a deferred fit.
+        const fitted_active = can_eventually_measure(active_sheet_index)
+            && apply_auto_fit_to_active_sheet();
         set_pending_auto_fit_sheets(new Set(
-            Array.from({ length: sheet_count }, (_, index) => index)
-                .filter((index) => (index === active_sheet_index
-                    ? !fitted_active
-                    : !auto_fit_active_ref.current[index])),
+            sheets.map((_sheet, index) => index)
+                .filter((index) => can_eventually_measure(index)
+                    && (index === active_sheet_index
+                        ? !fitted_active
+                        : !auto_fit_active_ref.current[index])),
         ));
     }, [active_sheet_index, apply_auto_fit_to_active_sheet, meta]);
 
@@ -4311,6 +4331,11 @@ export function App(): React.JSX.Element {
             on_editing_change={handle_editing_change}
             editing_ref={editing_ref}
             auto_fit_ref={auto_fit_ref}
+            on_auto_fit_sample_change={
+                pending_auto_fit_sheets.has(active_sheet_index)
+                    ? try_apply_pending_auto_fit
+                    : undefined
+            }
             grid_focus_ref={grid_focus_ref}
             grid_actions_ref={grid_actions_ref}
             pending_preview_scroll={pending_preview_scroll}

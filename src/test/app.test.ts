@@ -104,6 +104,7 @@ vi.mock('../webview/grid-shell', () => ({
         auto_fit_ref?: {
             current: (() => Record<number, number> | null) | null;
         };
+        on_auto_fit_sample_change?: () => void;
         grid_focus_ref?: {
             current: { generation: number; focus: () => boolean } | null;
         };
@@ -3588,9 +3589,78 @@ describe('auto-fit state', () => {
         await open_scope_menu('Auto-fit scope');
         await click_menu_item('Auto-fit columns on all 2 sheets');
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({ 0: 120 });
 
+        // A newly mounted sheet has not received its first row page yet. The initial
+        // deferred pass therefore has nothing to measure and must remain queued.
+        grid_shell_mock.auto_fit_result = null;
         await click_sheet_tab('B');
-        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({});
+
+        // Model rowData landing in the mounted GridShell: its loader version changes,
+        // waking App to retry through the same imperative measurement ref.
+        grid_shell_mock.auto_fit_result = { 0: 220 };
+        await act(async () => {
+            const notify = grid_shell_mock.latest_props?.on_auto_fit_sample_change as
+                (() => void) | undefined;
+            expect(notify).toBeDefined();
+            notify!();
+        });
+
+        await vi.waitFor(() => {
+            expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!))
+                .toEqual({ 0: 220 });
+            expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
+        });
+        expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeUndefined();
+    });
+
+    it('cancels an owed fit when the user resizes before rows arrive', async () => {
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['A', 'B'])));
+
+        await open_scope_menu('Auto-fit scope');
+        await click_menu_item('Auto-fit columns on all 2 sheets');
+
+        grid_shell_mock.auto_fit_result = null;
+        await click_sheet_tab('B');
+        expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeDefined();
+
+        await act(async () => {
+            (container!.querySelector('.stub-resize') as HTMLButtonElement).click();
+        });
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({ 2: 222 });
+        expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeUndefined();
+
+        // Returning after rows become measurable must preserve the direct resize,
+        // rather than redeeming the now-cancelled fit over it.
+        grid_shell_mock.auto_fit_result = { 2: 333 };
+        await click_sheet_tab('A');
+        await click_sheet_tab('B');
+        expect(JSON.parse(grid_stub().getAttribute('data-col-widths')!)).toEqual({ 2: 222 });
+        expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
+    });
+
+    it('does not queue empty sheets that can never provide a sample', async () => {
+        grid_shell_mock.auto_fit_result = null;
+        await render_app();
+        const meta = make_meta(['A', 'B']);
+        for (const sheet of meta.sheets) {
+            sheet.rowCount = 0;
+            sheet.sourceRowCount = 0;
+        }
+        await dispatch_host_message(initial_snapshot_message(meta));
+
+        await open_scope_menu('Auto-fit scope');
+        await click_menu_item('Auto-fit columns on all 2 sheets');
+
+        await open_scope_menu('Auto-fit scope');
+        const restore = Array.from(
+            document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'),
+        ).find((item) => item.textContent === 'Restore original widths on all 2 sheets');
+        expect(restore?.disabled).toBe(true);
+        expect(grid_shell_mock.latest_props?.on_auto_fit_sample_change).toBeUndefined();
     });
 
     it('offers to call off a fit that is only owed', async () => {
