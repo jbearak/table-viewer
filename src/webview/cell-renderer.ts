@@ -118,10 +118,9 @@ function text_cell(
         displayData: display,
         allowOverlay: overlay?.editable ?? false,
         // Render hard line breaks across multiple lines so a grown row's content
-        // is visible (rows auto-grow after a multiline edit in grid-shell). Not
-        // applied to spanned (horizontal-merge) cells — wrapping inside a span is
-        // unsupported and multiline merge text is vanishingly rare.
-        ...(display.includes('\n') && !span ? { allowWrapping: true } : {}),
+        // is visible (rows auto-grow after a multiline edit in grid-shell). Glide
+        // supports wrapping while retaining a horizontal merge's native span.
+        ...(display.includes('\n') ? { allowWrapping: true } : {}),
         // Belt and braces with `allowOverlay: false`. Glide's paste path
         // (`pasteToCell` in data-editor.js) does not consult `allowOverlay` at all
         // — it gates on `isReadWriteCell`, which for a Text cell checks only
