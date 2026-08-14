@@ -1188,8 +1188,7 @@ export class ViewerWindowManager {
                             ? 'configure'
                             : 'cancel';
                 },
-                open_file_size_limit_setting: async () => this.open_preferences('maxFileSizeMiB'),
-                open_csv_row_limit_setting: async () => this.open_preferences('csvMaxRows'),
+                open_setting: async (target) => this.open_preferences(target),
             }),
             config: this.config_store.config_port(),
             refreshWatcherFactory: node_file_refresh_watcher_factory,

@@ -3772,8 +3772,8 @@ describe('auto-fit state', () => {
 });
 
 describe('truncation banner', () => {
-    it('shows editing-disabled text when csvEditingSupported and truncated', async () => {
-        await render_app();
+    it('shows editing-disabled text and recovery actions when truncated', async () => {
+        const { post_message } = await render_app();
         await dispatch_host_message(
             initial_snapshot_message(make_meta(['Sheet1'], false), {
                 truncationMessage: 'Showing 10,000 of 50,000 rows',
@@ -3794,7 +3794,15 @@ describe('truncation banner', () => {
         expect(banner!.textContent).toContain('Load all rows');
         const edit = get_button('Edit');
         expect(edit.disabled).toBe(true);
-        expect(edit.classList.contains('is-disabled')).toBe(true);
+        expect(edit.getAttribute('aria-disabled')).toBe('true');
+
+        post_message.mockClear();
+        await click_button('Change row limit');
+        await click_button('Load all rows');
+        expect(post_message.mock.calls.map(([message]) => message)).toEqual([
+            { type: 'openCsvRowLimitSetting' },
+            { type: 'loadAllCsvRows' },
+        ]);
     });
 
     it('omits editing-disabled text in preview mode (editing never available)', async () => {
@@ -3844,28 +3852,6 @@ describe('truncation banner', () => {
         expect(banner!.textContent).toContain(
             'Editing is disabled until all rows are loaded.'
         );
-    });
-
-    it('posts the setting and one-time load-all actions', async () => {
-        const { post_message } = await render_app();
-        await dispatch_host_message(
-            initial_snapshot_message(make_meta(['Sheet1'], false), {
-                truncationMessage: 'Showing 10,000 of 50,000 rows',
-                capabilities: {
-                    csvEditable: false,
-                    csvEditingSupported: true,
-                },
-            })
-        );
-
-        post_message.mockClear();
-        await click_button('Change row limit');
-        await click_button('Load all rows');
-
-        expect(post_message.mock.calls.map(([message]) => message)).toEqual([
-            { type: 'openCsvRowLimitSetting' },
-            { type: 'loadAllCsvRows' },
-        ]);
     });
 });
 

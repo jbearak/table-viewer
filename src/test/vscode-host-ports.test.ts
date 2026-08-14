@@ -40,25 +40,17 @@ describe('VS Code host UI port', () => {
         })).resolves.toBe('cancel');
     });
 
-    it('opens the exact file-size threshold setting', async () => {
+    it.each([
+        ['maxFileSizeMiB', '@id:tableViewer.maxFileSizeMiB'],
+        ['csvMaxRows', '@id:tableViewer.csvMaxRows'],
+    ] as const)('opens the exact %s setting', async (target, query) => {
         const execute = vi.spyOn(vscode_mock.commands, 'executeCommand');
 
-        await vscode_host_ui_port.open_file_size_limit_setting();
+        await vscode_host_ui_port.open_setting(target);
 
         expect(execute).toHaveBeenCalledWith(
             'workbench.action.openSettings',
-            '@id:tableViewer.maxFileSizeMiB',
-        );
-    });
-
-    it('opens the exact CSV row-limit setting', async () => {
-        const execute = vi.spyOn(vscode_mock.commands, 'executeCommand');
-
-        await vscode_host_ui_port.open_csv_row_limit_setting();
-
-        expect(execute).toHaveBeenCalledWith(
-            'workbench.action.openSettings',
-            '@id:tableViewer.csvMaxRows',
+            query,
         );
     });
 });

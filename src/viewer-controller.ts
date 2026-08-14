@@ -203,13 +203,17 @@ export interface ViewerController extends Disposable {
     drain(): Promise<void>;
 }
 
+export interface ViewerSourceBuildOptions {
+    readonly loadAllRows?: boolean;
+}
+
 interface ViewerProfileBase {
     /** Build a DataSource from freshly-read bytes. Throws are surfaced as errors. */
     build_source(
         raw: Uint8Array,
         file_path: string,
         state: PerFileState,
-        options?: { readonly loadAllCsvRows?: boolean },
+        options?: ViewerSourceBuildOptions,
     ): Promise<DataSource>;
     /** Sets previewMode on the meta envelope (read-only synced preview). */
     previewMode?: boolean;
@@ -559,7 +563,7 @@ export function build_csv_source(
     raw: Uint8Array,
     file_path: string,
     csv_max_rows: number = MAX_CSV_ROWS,
-    options?: { readonly loadAllRows?: boolean },
+    options?: ViewerSourceBuildOptions,
 ): Promise<CsvDataSource> {
     const requested_max_rows = Number.isFinite(csv_max_rows)
         ? Math.floor(csv_max_rows)
@@ -653,12 +657,7 @@ export function csv_table_profile(config?: ConfigPort): ViewerProfile {
         editing: true,
         plan_save: plan_csv_save,
         build_source: (raw, file_path, _state, options) =>
-            build_csv_source(
-                raw,
-                file_path,
-                config?.csv_max_rows(),
-                { loadAllRows: options?.loadAllCsvRows },
-            ),
+            build_csv_source(raw, file_path, config?.csv_max_rows(), options),
     };
 }
 
@@ -3162,9 +3161,12 @@ export function attach_viewer(
             digest: content_digest(raw),
         };
         return new SourceCandidate(
-            await profile.build_source(raw, file_path, state, {
-                loadAllCsvRows: load_all_csv_rows,
-            }),
+            await profile.build_source(
+                raw,
+                file_path,
+                state,
+                load_all_csv_rows ? { loadAllRows: true } : undefined,
+            ),
             observation,
         );
     }
@@ -3194,7 +3196,7 @@ export function attach_viewer(
                 };
             }
             if (choice === 'configure') {
-                await host.ui.open_file_size_limit_setting();
+                await host.ui.open_setting('maxFileSizeMiB');
                 if (!load_is_current(request.seq, request.refreshEvent)) return { type: 'stale' };
             }
             if (initial) await options.requestClose?.();
@@ -6304,7 +6306,7 @@ export function attach_viewer(
                 host.ui.show_warning(msg.message);
                 return;
             case 'openCsvRowLimitSetting':
-                await host.ui.open_csv_row_limit_setting();
+                await host.ui.open_setting('csvMaxRows');
                 return;
             case 'loadAllCsvRows':
                 // Only a currently truncated CSV-like profile can make this do

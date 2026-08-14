@@ -93,7 +93,6 @@ body {
     background: var(--vscode-list-hoverBackground, #2a2d2e);
 }
 
-.toggle.is-disabled,
 .toggle[aria-disabled="true"] {
     cursor: not-allowed;
     color: var(--vscode-disabledForeground, rgba(204, 204, 204, 0.5));
@@ -121,8 +120,7 @@ body {
    disabled by a truncated reload retains the saturated active-blue fill. */
 .toggle.active:disabled,
 .toggle.active[aria-disabled="true"],
-.toggle.active.is-disabled,
-.toggle.is-disabled:hover {
+.toggle[aria-disabled="true"]:hover {
     background: transparent;
     color: var(--vscode-disabledForeground, rgba(204, 204, 204, 0.5));
     border-color: var(--vscode-panel-border, #444);
@@ -819,34 +817,13 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     gap: 12px;
 }
 
-.truncation-banner-actions button {
-    border-radius: 3px;
-    font: inherit;
-    cursor: pointer;
-}
-
 .truncation-setting-action {
     padding: 3px 2px;
-    border: 0;
-    background: transparent;
-    color: var(--vscode-textLink-foreground, #3794ff);
-}
-
-.truncation-setting-action:hover {
-    color: var(--vscode-textLink-activeForeground, #4daafc);
-    text-decoration: underline;
+    border-radius: 3px;
 }
 
 .truncation-load-action {
     padding: 4px 10px;
-    border: 1px solid var(--vscode-button-background, #0e639c);
-    background: var(--vscode-button-background, #0e639c);
-    color: var(--vscode-button-foreground, #fff);
-}
-
-.truncation-load-action:hover {
-    border-color: var(--vscode-button-hoverBackground, #1177bb);
-    background: var(--vscode-button-hoverBackground, #1177bb);
 }
 
 .truncation-banner-actions button:focus-visible {

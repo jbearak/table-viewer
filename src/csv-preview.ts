@@ -3,7 +3,7 @@ import * as vscode from 'vscode';
 import { CsvDataSource } from './data-source/csv-source';
 import {
     attach_viewer,
-    build_csv_source,
+    csv_table_profile,
     type ViewerController,
     type ViewerProfile,
 } from './viewer-controller';
@@ -185,15 +185,11 @@ function setup_preview(
 
     // Read-only preview profile: the controller owns load/adopt/reload/watcher
     // and paginated row serving; scroll-sync is layered on via the hooks below.
+    const csv_source_builder = csv_table_profile(vscode_viewer_host.config).build_source;
     const profile: ViewerProfile = {
         editing: false,
         previewMode: true,
-        build_source: (raw, file_path, _state, options) => build_csv_source(
-            raw,
-            file_path,
-            vscode_viewer_host.config.csv_max_rows(),
-            { loadAllRows: options?.loadAllCsvRows },
-        ),
+        build_source: csv_source_builder,
         on_source_adopted(ds) {
             line_map = (ds as CsvDataSource).lineMap();
         },

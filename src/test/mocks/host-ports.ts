@@ -21,6 +21,7 @@ import {
 } from '../../host-ports';
 import type { ResourceUriLike } from '../../resource-identity';
 import { vscode_file_refresh_watcher_factory } from '../../vscode-file-refresh-watcher';
+import { vscode_host_ui_port } from '../../vscode-host-ports';
 import * as vscode_mock from './vscode';
 
 type MockUri = Parameters<typeof vscode_mock.workspace.fs.stat>[0];
@@ -61,18 +62,7 @@ export const fake_host_ui_port: HostUiPort = {
                 ? 'configure'
                 : 'cancel';
     },
-    async open_file_size_limit_setting(): Promise<void> {
-        await vscode_mock.commands.executeCommand(
-            'workbench.action.openSettings',
-            '@id:tableViewer.maxFileSizeMiB',
-        );
-    },
-    async open_csv_row_limit_setting(): Promise<void> {
-        await vscode_mock.commands.executeCommand(
-            'workbench.action.openSettings',
-            '@id:tableViewer.csvMaxRows',
-        );
-    },
+    open_setting: (target) => vscode_host_ui_port.open_setting(target),
 };
 
 function config_value<T>(key: string, fallback: T): T {
