@@ -347,7 +347,7 @@ afterEach(() => {
 });
 
 describe('GridShell merge overlay scroll synchronization', () => {
-    it('repaints merged cells after Glide commits reverse horizontal scroll bounds', async () => {
+    it('keeps repainting merged cells for trailing frames after the last scroll', async () => {
         let paint_frame: FrameRequestCallback | undefined;
         const request_frame = vi.fn((callback: FrameRequestCallback) => {
             paint_frame = callback;
@@ -367,15 +367,31 @@ describe('GridShell merge overlay scroll synchronization', () => {
             on_visible_region_changed(returned_left);
         });
 
-        // Glide updates the bounds read by MergeOverlay through React state.
-        // Painting in this callback sees the preceding horizontal position;
-        // waiting for the next frame sees Glide's committed, final bounds.
+        // Glide updates the bounds read by MergeOverlay through React state, and
+        // that commit can land a frame or more after this callback. Painting only
+        // synchronously (or on exactly one deferred frame) can capture the
+        // penultimate scroll position on either axis. The repaint must instead
+        // run across several frames after the last scroll callback so the final
+        // paint sees Glide's committed bounds.
         expect(grid_mock.overlay_repaint).not.toHaveBeenCalled();
         expect(request_frame).toHaveBeenCalledOnce();
 
-        act(() => paint_frame?.(0));
-        expect(grid_mock.overlay_repaint).toHaveBeenCalledOnce();
-        expect(grid_mock.overlay_repaint).toHaveBeenCalledWith(returned_left);
+        // First frame paints, then trailing frames keep painting the same final
+        // region until the loop exhausts itself; every paint uses the latest
+        // region, never the stale one.
+        let frames = 0;
+        while (paint_frame && frames < 10) {
+            const frame = paint_frame;
+            paint_frame = undefined;
+            act(() => frame(0));
+            frames += 1;
+        }
+        expect(frames).toBeGreaterThanOrEqual(2);
+        expect(frames).toBeLessThan(10);
+        expect(grid_mock.overlay_repaint).toHaveBeenCalledTimes(frames);
+        for (const call of grid_mock.overlay_repaint.mock.calls) {
+            expect(call[0]).toEqual(returned_left);
+        }
     });
 });
 

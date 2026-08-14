@@ -445,21 +445,43 @@ export function GridShell({
     const visible_ref = useRef<Rectangle>({ x: 0, y: 0, width: 0, height: 0 });
     const overlay_repaint_frame_ref = useRef<number | null>(null);
     const overlay_repaint_region_ref = useRef<Rectangle | null>(null);
+    const overlay_repaint_attempts_ref = useRef(0);
     const last_preview_row = useRef<number | null>(null);
     const applied_preview_sequence_ref = useRef<number | null>(null);
     const preview_restore_not_before_ref = useRef(0);
     const preview_restore_timer_ref = useRef<number | null>(null);
     const preview_restore_token_ref = useRef(0);
 
+    // Glide records a scroll in React state before invoking
+    // onVisibleRegionChanged; its imperative getBounds only reflects that
+    // state once React commits the re-render. That commit runs as a scheduled
+    // continuous-priority task, so a single one-frame deferral can still lose
+    // the race to the browser's next paint — the overlay then freezes one
+    // scroll event behind on whichever axis moved last (the bug this replaces
+    // fixed only sometimes, and only appeared to be horizontal). Repaint on
+    // every frame while scroll callbacks keep arriving, then for a few trailing
+    // frames after the last one, so the final paint is guaranteed to run after
+    // Glide's commit has landed on both axes.
     const schedule_overlay_scroll_repaint = useCallback((range: Rectangle) => {
+        // Frames to keep repainting after the last scroll callback. The commit
+        // is a user-blocking task; it cannot starve for this many paints.
+        const TRAILING_FRAMES = 3;
         overlay_repaint_region_ref.current = range;
+        overlay_repaint_attempts_ref.current = 0;
         if (overlay_repaint_frame_ref.current !== null) return;
-        overlay_repaint_frame_ref.current = window.requestAnimationFrame(() => {
+        const tick = () => {
             overlay_repaint_frame_ref.current = null;
             const latest = overlay_repaint_region_ref.current;
-            overlay_repaint_region_ref.current = null;
-            if (latest) overlay_ref.current?.repaint(latest);
-        });
+            if (!latest) return;
+            overlay_ref.current?.repaint(latest);
+            if (overlay_repaint_attempts_ref.current >= TRAILING_FRAMES) {
+                overlay_repaint_region_ref.current = null;
+                return;
+            }
+            overlay_repaint_attempts_ref.current += 1;
+            overlay_repaint_frame_ref.current = window.requestAnimationFrame(tick);
+        };
+        overlay_repaint_frame_ref.current = window.requestAnimationFrame(tick);
     }, []);
 
     useEffect(() => () => {
