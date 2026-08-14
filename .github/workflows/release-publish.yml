@@ -349,6 +349,8 @@ jobs:
           fi
 
       - name: Publish main extension to Open VSX
+        id: openvsx
+        continue-on-error: true
         run: .github/release-tools/node_modules/.bin/ovsx publish --skip-duplicate "table-viewer-${VERSION}.vsix"
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -566,3 +568,9 @@ jobs:
             exit 1
           }
           gh pr merge "$BRANCH" --squash --delete-branch
+
+      - name: Report Open VSX publication failure
+        if: always() && steps.openvsx.outcome == 'failure'
+        run: |
+          echo "::error::Open VSX publication failed; other independent release targets were still attempted."
+          exit 1
