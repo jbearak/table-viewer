@@ -50,4 +50,15 @@ describe('VS Code host UI port', () => {
             '@id:tableViewer.maxFileSizeMiB',
         );
     });
+
+    it('opens the exact CSV row-limit setting', async () => {
+        const execute = vi.spyOn(vscode_mock.commands, 'executeCommand');
+
+        await vscode_host_ui_port.open_csv_row_limit_setting();
+
+        expect(execute).toHaveBeenCalledWith(
+            'workbench.action.openSettings',
+            '@id:tableViewer.csvMaxRows',
+        );
+    });
 });

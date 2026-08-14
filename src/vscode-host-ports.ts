@@ -85,6 +85,12 @@ export const vscode_host_ui_port: HostUiPort = {
             '@id:tableViewer.maxFileSizeMiB',
         );
     },
+    async open_csv_row_limit_setting(): Promise<void> {
+        await vscode.commands.executeCommand(
+            'workbench.action.openSettings',
+            '@id:tableViewer.csvMaxRows',
+        );
+    },
 };
 
 export const vscode_config_port: ConfigPort = {

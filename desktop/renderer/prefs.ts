@@ -39,6 +39,7 @@ const automatically_check_for_updates = document.getElementById(
 ) as HTMLInputElement;
 const focus_targets: PreferencesFocusTargets = {
     maxFileSizeMiB: max_file_size,
+    csvMaxRows: csv_max_rows,
 };
 
 /** The kind the color-theme select is currently offering themes for. Tracked

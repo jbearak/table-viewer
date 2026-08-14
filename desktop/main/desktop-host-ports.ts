@@ -40,6 +40,7 @@ export interface DesktopUiDialogs {
         details: FileSizeLimitDialogDetails,
     ): Promise<FileSizeLimitDialogChoice>;
     open_file_size_limit_setting(): Promise<void>;
+    open_csv_row_limit_setting(): Promise<void>;
 }
 
 export function create_desktop_ui_port(dialogs: DesktopUiDialogs): HostUiPort {
@@ -50,5 +51,6 @@ export function create_desktop_ui_port(dialogs: DesktopUiDialogs): HostUiPort {
         show_file_size_limit_dialog: (details) =>
             dialogs.show_file_size_limit_dialog(details),
         open_file_size_limit_setting: () => dialogs.open_file_size_limit_setting(),
+        open_csv_row_limit_setting: () => dialogs.open_csv_row_limit_setting(),
     };
 }

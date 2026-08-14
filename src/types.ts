@@ -1429,6 +1429,8 @@ export type HostMessage =
 /** Messages from webview to extension host */
 export type WebviewMessage =
     | { type: 'ready' }
+    | { type: 'openCsvRowLimitSetting' }
+    | { type: 'loadAllCsvRows' }
     | { type: 'snapshotApplied'; identity: WorkbookSnapshotIdentity; disposition: SnapshotDisposition }
     | { type: 'requestRows'; sheetIndex: number; startRow: number; count: number; requestId: string; generation: number }
     | { type: 'stateChanged'; state: PerFileState; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity }

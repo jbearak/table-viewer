@@ -95,6 +95,7 @@ interface CsvSnapshot {
         configuration: { previewMode: boolean };
         capabilities: { csvEditable: boolean; csvEditingSupported: boolean };
         meta: { sheets: { rowCount: number }[] };
+        truncationMessage?: string | null;
         state: Record<string, unknown>;
         identity: WorkbookSnapshotIdentity;
     };
@@ -136,6 +137,44 @@ beforeEach(() => {
 });
 
 describe('CSV reload races', () => {
+    it('opens the row-limit setting and loads all rows for this viewer', async () => {
+        const bytes = enc.encode('h\na\nb\nc\nd\n');
+        vscode_mock.__setConfigurationValue('tableViewer.csvMaxRows', 2);
+        vscode_mock.__setStatImplementation(async () => ({
+            size: bytes.byteLength,
+            mtime: 1,
+        }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        const execute = vi.spyOn(vscode_mock.commands, 'executeCommand');
+        const panel = open_csv_table(
+            uri('/tmp/truncated-load-all.csv'),
+            undefined,
+            csv_table_profile(fake_viewer_host.config),
+        );
+
+        await panel.__receive({ type: 'ready' });
+        await flush_promises();
+        expect(initial_snapshots(panel).at(-1)).toMatchObject({
+            truncationMessage: 'Showing 2 of 4 rows',
+            capabilities: { csvEditable: false },
+            meta: { sheets: [{ rowCount: 2 }] },
+        });
+
+        await panel.__receive({ type: 'openCsvRowLimitSetting' });
+        expect(execute).toHaveBeenCalledWith(
+            'workbench.action.openSettings',
+            '@id:tableViewer.csvMaxRows',
+        );
+
+        await panel.__receive({ type: 'loadAllCsvRows' });
+        await flush_promises();
+        expect(refresh_snapshots(panel).at(-1)).toMatchObject({
+            truncationMessage: null,
+            capabilities: { csvEditable: true },
+            meta: { sheets: [{ rowCount: 4 }] },
+        });
+    });
+
     it('opens a file above the configured threshold when the user confirms once', async () => {
         const bytes = enc.encode('h\na\n');
         let reads = 0;

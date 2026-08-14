@@ -21,4 +21,18 @@ describe('Preferences focus targets', () => {
     it('ignores a target whose element is unavailable', () => {
         expect(() => focus_preferences_target('maxFileSizeMiB', {})).not.toThrow();
     });
+
+    it('centers and focuses the CSV row-limit setting', () => {
+        const scrollIntoView = vi.fn();
+        const focus = vi.fn();
+        const element = { scrollIntoView, focus } as unknown as HTMLElement;
+
+        focus_preferences_target('csvMaxRows', { csvMaxRows: element });
+
+        expect(scrollIntoView).toHaveBeenCalledWith({
+            block: 'center',
+            inline: 'nearest',
+        });
+        expect(focus).toHaveBeenCalledWith({ preventScroll: true });
+    });
 });

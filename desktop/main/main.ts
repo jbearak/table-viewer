@@ -1472,7 +1472,7 @@ if (!got_lock) {
             config_store,
             VIEWER_PRELOAD,
             undefined,
-            () => show_preferences_window('maxFileSizeMiB'),
+            (target) => show_preferences_window(target),
         );
         // After the window manager exists, and before the argv files below: the
         // flush releases whatever `open-file` / `second-instance` / `activate`

@@ -81,6 +81,36 @@ describe('toolbar toggle colors', () => {
         );
     });
 
+    it('removes the active fill from disabled toggles', () => {
+        const css = readFileSync(
+            resolve(process.cwd(), 'src/webview/styles.css'),
+            'utf8',
+        );
+
+        expect(css).toMatch(
+            /\.toggle\.active:disabled[\s\S]*?background:\s*transparent[\s\S]*?--vscode-disabledForeground/,
+        );
+    });
+
+    it('keeps disabled toggles muted on hover', () => {
+        const { container } = render_toolbar({
+            show_edit_button: true,
+            edit_disabled: true,
+        });
+        const edit = container.querySelector<HTMLButtonElement>('button');
+        expect(edit?.classList.contains('is-disabled')).toBe(true);
+
+        const css = readFileSync(
+            resolve(process.cwd(), 'src/webview/styles.css'),
+            'utf8',
+        );
+        const rule = /\.toggle\.is-disabled:hover\s*\{([^}]*)\}/.exec(css)?.[1];
+        expect(rule).toBeDefined();
+        expect(rule).toMatch(/background:\s*transparent/);
+        expect(rule).toMatch(/--vscode-disabledForeground/);
+        expect(rule).toMatch(/opacity:\s*0\.45/);
+    });
+
     it('paints the scope divider as a 1px rule despite its spacing', () => {
         // The rule carries breathing room on top of the action row's gap so it reads
         // as a boundary rather than one more crowded item. That room is padding, so

@@ -452,7 +452,7 @@ function ToolbarButton({
                 <button
                     ref={button_ref}
                     type="button"
-                    className={`toggle ${active ? 'active' : ''} ${extra_class ?? ''}`.trim()}
+                    className={`toggle ${active ? 'active' : ''} ${disabled ? 'is-disabled' : ''} ${extra_class ?? ''}`.trim()}
                     disabled={native_disabled}
                     aria-disabled={disabled || undefined}
                     onClick={(event) => {

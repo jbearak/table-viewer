@@ -188,10 +188,11 @@ function setup_preview(
     const profile: ViewerProfile = {
         editing: false,
         previewMode: true,
-        build_source: (raw, file_path) => build_csv_source(
+        build_source: (raw, file_path, _state, options) => build_csv_source(
             raw,
             file_path,
             vscode_viewer_host.config.csv_max_rows(),
+            { loadAllRows: options?.loadAllCsvRows },
         ),
         on_source_adopted(ds) {
             line_map = (ds as CsvDataSource).lineMap();

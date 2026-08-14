@@ -49,6 +49,8 @@ export interface HostUiPort {
         details: FileSizeLimitDialogDetails,
     ): Promise<FileSizeLimitDialogChoice>;
     open_file_size_limit_setting(): Promise<void>;
+    /** Open the host's CSV/TSV row-limit preference, focused on that field. */
+    open_csv_row_limit_setting(): Promise<void>;
 }
 
 /** Viewer configuration reads (replaces direct viewer-config/vscode reads). */
