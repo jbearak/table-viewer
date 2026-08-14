@@ -187,7 +187,13 @@ export class ExcelHeaderDataSource implements DataSource {
             sheetIndex: sheet_index,
             projectedRow: projected_row,
             sourceRow: source_row,
-            columnNames: first_row_names(sheet.physical, row),
+            columnNames: manual_row_names(
+                this.base,
+                sheet_index,
+                sheet.physical,
+                projected_row,
+                row,
+            ),
         });
     }
 
@@ -428,7 +434,16 @@ export class ExcelHeaderDataSource implements DataSource {
             : candidate.projectedRow === 0 && cached_first_row !== undefined
             ? cached_first_row
             : this.base.read_rows(sheet_index, candidate.projectedRow, 1).rows[0];
-        projection.manualColumnNames = first_row_names(projection.physical, row);
+        projection.manualColumnNames = candidate === undefined
+            ? first_row_names(projection.physical, undefined)
+            : manual_row_names(
+                this.base,
+                sheet_index,
+                projection.physical,
+                candidate.projectedRow,
+                row,
+                candidate.projectedRow === 1 ? cached_first_row : undefined,
+            );
     }
 }
 
@@ -699,6 +714,41 @@ export function detect_first_row_as_header(
         && body_rows_with_data >= 2
         && body_nonempty > 0
         && body_bold / body_nonempty <= 0.25;
+}
+
+function manual_row_names(
+    source: DataSource,
+    sheet_index: number,
+    sheet: SheetMeta,
+    projected_row: number,
+    row: readonly (RenderedCell | null)[] | undefined,
+    cached_preceding_row?: readonly (RenderedCell | null)[],
+): string[] {
+    const names = first_row_names(sheet, row);
+    if (projected_row === 0) return names;
+
+    const inherited_columns = new Set<number>();
+    for (const merge of sheet.merges) {
+        if (
+            merge.startRow === projected_row - 1
+            && merge.endRow === projected_row
+            && merge.startCol === merge.endCol
+            && names[merge.startCol] === ''
+        ) {
+            inherited_columns.add(merge.startCol);
+        }
+    }
+    if (inherited_columns.size === 0) return names;
+
+    const preceding_row = cached_preceding_row ?? source.read_rows(
+        sheet_index,
+        projected_row - 1,
+        1,
+    ).rows[0];
+    for (const column of inherited_columns) {
+        names[column] = header_text(preceding_row?.[column] ?? null);
+    }
+    return names;
 }
 
 function first_row_names(
