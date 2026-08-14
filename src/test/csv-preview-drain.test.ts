@@ -12,7 +12,7 @@ const seams = vi.hoisted(() => ({
 
 vi.mock('../viewer-controller', () => ({
     attach_viewer: () => seams.controller,
-    csv_table_profile: () => ({ build_source: vi.fn() }),
+    csv_source_builder: () => vi.fn(),
 }));
 
 import {

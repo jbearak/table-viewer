@@ -45,25 +45,16 @@ describe('build_csv_source max-row normalization', () => {
         infinite.close();
     });
 
-    it('forwards an unlimited row count for an explicit per-view override', async () => {
-        const create = vi.spyOn(CsvDataSource, 'create')
-            .mockResolvedValue({} as CsvDataSource);
-        try {
-            await build_csv_source(
-                csv,
-                '/tmp/rows.csv',
-                2,
-                { loadAllRows: true },
-            );
+    it('loads every row for an explicit per-view override', async () => {
+        const source = await build_csv_source(
+            csv,
+            '/tmp/rows.csv',
+            2,
+            { loadAllRows: true },
+        );
 
-            expect(create).toHaveBeenCalledWith(
-                csv,
-                ',',
-                Number.MAX_SAFE_INTEGER,
-                { firstRowIsHeader: true },
-            );
-        } finally {
-            create.mockRestore();
-        }
+        expect(source.meta().sheets[0].rowCount).toBe(3);
+        expect(source.truncationMessage).toBeUndefined();
+        source.close();
     });
 });

@@ -817,13 +817,34 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     gap: 12px;
 }
 
+.truncation-banner-actions button {
+    border-radius: 3px;
+    font: inherit;
+    cursor: pointer;
+}
+
 .truncation-setting-action {
     padding: 3px 2px;
-    border-radius: 3px;
+    border: 0;
+    background: transparent;
+    color: var(--vscode-textLink-foreground, #3794ff);
+}
+
+.truncation-setting-action:hover {
+    color: var(--vscode-textLink-activeForeground, #4daafc);
+    text-decoration: underline;
 }
 
 .truncation-load-action {
     padding: 4px 10px;
+    border: 1px solid var(--vscode-button-background, #0e639c);
+    background: var(--vscode-button-background, #0e639c);
+    color: var(--vscode-button-foreground, #fff);
+}
+
+.truncation-load-action:hover {
+    border-color: var(--vscode-button-hoverBackground, #1177bb);
+    background: var(--vscode-button-hoverBackground, #1177bb);
 }
 
 .truncation-banner-actions button:focus-visible {

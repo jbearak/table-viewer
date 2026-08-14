@@ -4500,7 +4500,7 @@ export function App(): React.JSX.Element {
                     <div className="truncation-banner-actions">
                         <button
                             type="button"
-                            className="truncation-setting-action column-visibility-action"
+                            className="truncation-setting-action"
                             title="Change the CSV/TSV row limit in settings, then reload the file."
                             onClick={() => host_bridge.postMessage({
                                 type: 'openCsvRowLimitSetting',
@@ -4510,7 +4510,7 @@ export function App(): React.JSX.Element {
                         </button>
                         <button
                             type="button"
-                            className="truncation-load-action filter-popover-btn filter-popover-btn-primary"
+                            className="truncation-load-action"
                             onClick={() => host_bridge.postMessage({
                                 type: 'loadAllCsvRows',
                             })}

@@ -268,17 +268,14 @@ describe('CSV reload races', () => {
         vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
         vi.spyOn(vscode_mock.window, 'showWarningMessage')
             .mockResolvedValue('Change Limit' as never);
-        const execute = vi.spyOn(vscode_mock.commands, 'executeCommand');
+        const open_setting = vi.spyOn(fake_viewer_host.ui, 'open_setting');
         const panel = open_csv_table(uri('/tmp/oversized-configure.csv'));
         const close = vi.spyOn(panel, 'dispose');
 
         await panel.__receive({ type: 'ready' });
         await flush_promises();
 
-        expect(execute).toHaveBeenCalledWith(
-            'workbench.action.openSettings',
-            '@id:tableViewer.maxFileSizeMiB',
-        );
+        expect(open_setting).toHaveBeenCalledWith('maxFileSizeMiB');
         expect(close).toHaveBeenCalledOnce();
         expect(initial_snapshots(panel)).toHaveLength(0);
     });

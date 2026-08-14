@@ -10,7 +10,6 @@ import {
     type HostUiPort,
     type SaveDialogChoice,
     type ViewerHost,
-    type ViewerSettingTarget,
 } from './host-ports';
 import type { ResourceUriLike } from './resource-identity';
 import {
@@ -55,11 +54,6 @@ export const vscode_file_system_port: FileSystemPort = {
     },
 };
 
-const setting_query: Record<ViewerSettingTarget, string> = {
-    maxFileSizeMiB: '@id:tableViewer.maxFileSizeMiB',
-    csvMaxRows: '@id:tableViewer.csvMaxRows',
-};
-
 export const vscode_host_ui_port: HostUiPort = {
     show_warning(message) {
         void vscode.window.showWarningMessage(message);
@@ -88,7 +82,7 @@ export const vscode_host_ui_port: HostUiPort = {
     async open_setting(target): Promise<void> {
         await vscode.commands.executeCommand(
             'workbench.action.openSettings',
-            setting_query[target],
+            `@id:tableViewer.${target}`,
         );
     },
 };

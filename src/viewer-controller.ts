@@ -652,12 +652,16 @@ export function plan_csv_save(input: SavePlanInput): SavePlan {
     return { observed_bases: [observed_bases], produce: () => bytes };
 }
 
+export function csv_source_builder(config?: ConfigPort): ViewerProfile['build_source'] {
+    return (raw, file_path, _state, options) =>
+        build_csv_source(raw, file_path, config?.csv_max_rows(), options);
+}
+
 export function csv_table_profile(config?: ConfigPort): ViewerProfile {
     return {
         editing: true,
         plan_save: plan_csv_save,
-        build_source: (raw, file_path, _state, options) =>
-            build_csv_source(raw, file_path, config?.csv_max_rows(), options),
+        build_source: csv_source_builder(config),
     };
 }
 
