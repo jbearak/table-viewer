@@ -333,10 +333,10 @@ test('viewer windows follow the OS light/dark setting', async () => {
     }
 });
 
-// The appearance preference overrides the OS setting, so this exercises the
+// The color scheme preference overrides the OS setting, so this exercises the
 // whole path: the Preferences select → settings file → nativeTheme.themeSource →
 // the palette every open window is holding.
-test('the appearance preference pins light/dark, and System restores OS following', async () => {
+test('the color scheme preference pins light/dark, and System restores OS following', async () => {
     const viewer = viewer_pages()[0];
     expect(viewer).toBeTruthy();
     await viewer.locator(GRID_CANVAS).first().waitFor({ state: 'visible' });
@@ -368,7 +368,7 @@ test('the appearance preference pins light/dark, and System restores OS followin
         await expect(color_theme).toHaveValue('light');
 
         // Flipping the OS while Preferences is open must retarget the dropdown
-        // live — under Appearance=System its meaning *is* the current mode.
+        // live — under Color scheme=System its meaning *is* the current mode.
         // No reload: the list is rebuilt from the theme payload it already gets.
         await app.evaluate(({ nativeTheme }) => { nativeTheme.themeSource = 'dark'; });
         await expect.poll(option_ids, { timeout: 15_000 })

@@ -71,7 +71,7 @@ export interface DesktopSettings {
     fontFamily: string;
     /** Font size in px, applied to the whole app (viewer windows, welcome, prefs). */
     fontSize: number;
-    /** Appearance: follow the OS, or pin light / dark. */
+    /** Color scheme: follow the OS, or pin light / dark. */
     theme: ThemeSetting;
     /** Which theme paints light mode, and which paints dark mode. Two slots,
      *  not one: switching appearance back and forth must not lose the theme

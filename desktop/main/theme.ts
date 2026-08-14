@@ -6,7 +6,7 @@
 // attribute re-reads the Glide theme whenever these are re-applied.
 //
 // Pure module (no electron import) so it is unit-testable; main.ts feeds it a
-// `ThemeId` resolved by `resolve_theme_id` — the appearance preference decides
+// `ThemeId` resolved by `resolve_theme_id` — the color scheme preference decides
 // the *mode*, and the per-mode theme settings decide which theme paints it.
 // The registry of shipped themes lives in desktop/main/theme-definitions.ts.
 import {
@@ -30,7 +30,7 @@ export {
     type ThemeDefinition,
 } from './theme-definitions';
 
-/** The user's appearance preference. `system` follows the OS (the default) and is
+/** The user's color scheme preference. `system` follows the OS (the default) and is
  *  fed straight to Electron's `nativeTheme.themeSource`, which then decides
  *  `shouldUseDarkColors` for us — so the rest of the theming path is unchanged. */
 export type ThemeSetting = 'system' | 'light' | 'dark';

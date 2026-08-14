@@ -585,7 +585,7 @@ export interface ThemeSlots {
  * Which theme is active right now. The ONLY place this is computed — every
  * background color, page palette, and IPC payload goes through it, so the
  * "which mode" decision (already made by Electron's nativeTheme, which the
- * Appearance preference feeds) and the "which theme for that mode" decision can
+ * Color scheme preference feeds) and the "which theme for that mode" decision can
  * never drift apart.
  */
 export function resolve_theme_id(slots: ThemeSlots, os_dark: boolean): ThemeId {

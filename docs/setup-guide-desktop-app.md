@@ -99,7 +99,7 @@ You can repeat the replacement while keeping the file open—handy when a script
 - Sorts and filters follow column names, so Table Viewer may discard them if a revised workbook no longer has a compatible column structure.
 - Highlights are positional annotations. They will reappear when temporarily missing rows, columns, or worksheets return, so you do not lose that time and effort.
 - CSV and TSV files also open directly in Table Viewer with an optional edit mode. In VS Code, the extension can show a file's raw text beside the grid with synchronized scrolling; that pane is VS Code's own text editor, so it belongs to the extension rather than being something the standalone app lacks.
-- Choose **Preferences…** to change the app's appearance, color theme, font, default worksheet-tab orientation, or new-window size. On macOS, Preferences is in the Table Viewer app menu; on Windows, it is in the File menu.
+- Choose **Preferences…** to change the app's color scheme, color theme, font, default worksheet-tab orientation, or new-window size. On macOS, Preferences is in the Table Viewer app menu; on Windows, it is in the File menu.
 
 ## Troubleshooting
 

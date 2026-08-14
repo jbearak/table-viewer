@@ -36,7 +36,7 @@ const automatically_check_for_updates = document.getElementById(
 
 /** The kind the color-theme select is currently offering themes for. Tracked
  *  from the theme payload rather than from the settings, because under
- *  Appearance=System the answer is the OS's and can change while this window is
+ *  Color scheme=System the answer is the OS's and can change while this window is
  *  open — the payload is the one stream that already carries that. */
 let current_kind: ThemeKind = 'light';
 
@@ -58,7 +58,7 @@ function apply_theme(payload: ThemePayload): void {
  * Driven off the theme payload — which arrives on startup via get_theme() and on
  * every appearance or palette change — rather than off DesktopSettings, so the
  * dynamic behavior falls out for free (an OS light↔dark flip under
- * Appearance=System rebuilds the list live) and only one code path ever owns
+ * Color scheme=System rebuilds the list live) and only one code path ever owns
  * this element's value.
  */
 function populate_color_themes(payload: ThemePayload): void {
@@ -446,7 +446,7 @@ theme.addEventListener('change', () => save({ theme: theme.value as ThemeSetting
 //
 // Read from the element's own dataset rather than from `current_kind`, which is
 // module state sampled at *dispatch* time: a theme payload with a flipped kind
-// (an OS light↔dark flip under Appearance=System) landing between the user
+// (an OS light↔dark flip under Color scheme=System) landing between the user
 // committing a selection and this event firing would rebuild the list, flip
 // `current_kind`, and make this write e.g. `solarized-light` into darkThemeId —
 // which `sanitize_theme_id` silently rejects, so the click appears to do nothing.

@@ -532,7 +532,7 @@ protocol.registerSchemesAsPrivileged([
     },
 ]);
 
-/** The theme to paint with right now: the appearance preference has already been
+/** The theme to paint with right now: the color scheme preference has already been
  *  handed to Electron (`apply_theme_source`), so `shouldUseDarkColors` is the
  *  resolved mode, and the settings hold one theme per mode. Every theme lookup
  *  in this file goes through here — a call site that recomputes the mode itself
@@ -1147,7 +1147,7 @@ function broadcast_theme(): void {
     }
 }
 
-/** Hand the appearance preference to Electron: `system` restores OS following,
+/** Hand the color scheme preference to Electron: `system` restores OS following,
  *  the other two pin `shouldUseDarkColors`, which is what the whole theming path
  *  already reads. */
 function apply_theme_source(theme: ThemeSetting): void {
@@ -1156,7 +1156,7 @@ function apply_theme_source(theme: ThemeSetting): void {
 
 /** Keep the app chrome (welcome, Preferences, About, and Stored File State windows) on the
  *  configured font, matching how the extension's font settings style its entire
- *  UI, and keep every window's palette in step with the appearance preference
+ *  UI, and keep every window's palette in step with the color scheme preference
  *  and the two per-mode theme slots.
  *
  *  Sent to every window rather than a tracked chrome list: only the chrome
@@ -1345,7 +1345,7 @@ if (!got_lock) {
      * Bring the app up, in two stages.
      *
      * Everything that does not need a state backend comes first — the settings
-     * store, the appearance preference, the protocol handler, the IPC channels,
+     * store, the color scheme preference, the protocol handler, the IPC channels,
      * the settings watcher, the menu, and the nativeTheme listener. That order is
      * load-bearing: a recovery modal below may be the very first thing the user
      * sees, and it has to be shown by an app that is already themed and otherwise

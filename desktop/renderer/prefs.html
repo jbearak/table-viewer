@@ -78,7 +78,7 @@
   <span class="hint">Text size used throughout the app.</span>
 </div>
 <div class="field">
-  <label for="theme">Appearance</label>
+  <label for="theme">Color scheme</label>
   <select id="theme">
     <option value="system">System</option>
     <option value="light">Light</option>
@@ -92,20 +92,9 @@
        currently showing light or dark, so it cannot be static markup. -->
   <select id="colorTheme"></select>
   <span class="hint">Themes for the mode the app is in right now. Light and dark
-    remember separate themes, so switching Appearance brings back the theme you
+    remember separate themes, so switching color schemes brings back the theme you
     picked for that mode.</span>
 </div>
-<h2 class="section-title">Updates</h2>
-<div class="field checkbox-row">
-  <input id="automaticallyCheckForUpdates" type="checkbox" aria-describedby="updateCheckHint">
-  <div class="checkbox-copy">
-    <label for="automaticallyCheckForUpdates">Automatically check for updates</label>
-    <span class="hint" id="updateCheckHint">Checks once when you open Table Viewer. Downloads and restarts
-      always require your approval. If you skip a version, it stays skipped until a
-      newer version is released.</span>
-  </div>
-</div>
-<h2 class="section-title">Files and windows</h2>
 <div class="field">
   <label for="tabOrientation">Worksheet tab orientation</label>
   <select id="tabOrientation">
@@ -134,6 +123,7 @@
     <input id="windowHeight" type="number" step="1">
   </div>
 </div>
+<h2 class="section-title">Files</h2>
 <div class="field">
   <label for="csvMaxRows">Max CSV/TSV rows</label>
   <input id="csvMaxRows" type="number" min="1" step="1">
@@ -146,6 +136,16 @@
        back from saving as it is typed (see prefs.ts). -->
   <input id="maxFileSizeMiB" type="number" min="1" step="any">
   <span class="hint">Larger files (xlsx, xls, csv, tsv) are refused instead of opened.</span>
+</div>
+<h2 class="section-title">Updates</h2>
+<div class="field checkbox-row">
+  <input id="automaticallyCheckForUpdates" type="checkbox" aria-describedby="updateCheckHint">
+  <div class="checkbox-copy">
+    <label for="automaticallyCheckForUpdates">Automatically check for updates</label>
+    <span class="hint" id="updateCheckHint">Checks once when you open Table Viewer. Downloads and restarts
+      always require your approval. If you skip a version, it stays skipped until a
+      newer version is released.</span>
+  </div>
 </div>
 <script src="./prefs.js"></script>
 </body>
