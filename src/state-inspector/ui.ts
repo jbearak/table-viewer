@@ -88,6 +88,21 @@ function element<K extends keyof HTMLElementTagNameMap>(
     return node;
 }
 
+/** A small current-colour refresh glyph, shared by both host renderers. */
+function refresh_icon(): SVGSVGElement {
+    const namespace = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(namespace, 'svg');
+    svg.setAttribute('viewBox', '0 0 16 16');
+    svg.setAttribute('aria-hidden', 'true');
+    const path = document.createElementNS(namespace, 'path');
+    path.setAttribute(
+        'd',
+        'M13.15 3.85A6 6 0 1 0 14 9h-1.5a4.5 4.5 0 1 1-.68-2.38L9.5 8.25H15V2.5l-1.85 1.35Z',
+    );
+    svg.append(path);
+    return svg;
+}
+
 /**
  * How notable an entry's status is, for sorting the Status column.
  *
@@ -144,6 +159,13 @@ export function mount_state_inspector(
 
     const header = element('header');
     const heading = element('h1', undefined, 'Stored File State');
+    const refreshButton = element('button', 'header-refresh');
+    refreshButton.type = 'button';
+    refreshButton.title = 'Refresh stored file state';
+    refreshButton.setAttribute('aria-label', 'Refresh stored file state');
+    refreshButton.append(refresh_icon());
+    const headingRow = element('div', 'heading-row');
+    headingRow.append(heading, refreshButton);
     // Standing text, not just dialog copy. The buttons below say "Clear", and
     // someone reading them cold has no way to know whether that reaches their
     // spreadsheets — so the answer is on screen before they press anything.
@@ -170,7 +192,7 @@ export function mount_state_inspector(
         + 'Clearing frees the entries, so the file itself shrinks by less.',
     );
     const databasePath = element('p', 'database-path');
-    header.append(heading, explanation, summary, sizeNote, databasePath);
+    header.append(headingRow, explanation, summary, sizeNote, databasePath);
 
     const toolbar = element('div', 'toolbars');
     const filterInput = element('input', 'filter-input');
@@ -271,10 +293,15 @@ export function mount_state_inspector(
 
     function set_busy(busy: boolean): void {
         state.busy = busy;
-        for (const button of [clearButton, chipMissing, chipStale, dismiss]) {
+        for (const button of [refreshButton, clearButton, chipMissing, chipStale, dismiss]) {
             button.disabled = busy;
         }
         if (!busy) render_toolbar();
+    }
+
+    function set_refreshing(refreshing: boolean): void {
+        refreshButton.classList.toggle('loading', refreshing);
+        refreshButton.setAttribute('aria-busy', refreshing ? 'true' : 'false');
     }
 
     function render_header(): void {
@@ -546,18 +573,19 @@ export function mount_state_inspector(
         }
     }
 
-    async function reload(): Promise<void> {
+    async function reload(): Promise<boolean> {
         const inventory = await request_or_report(
             { kind: 'inspect' },
             (response) => response.kind === 'inventory' ? response.inventory : undefined,
         );
-        if (!inventory) return;
+        if (!inventory) return false;
         state.inventory = inventory;
         // Drop selections for entries that no longer exist, so a stale tick
         // cannot be carried into the next delete.
         const live = new Set(inventory.entries.map((entry) => entry.path));
         for (const path of [...state.selected]) if (!live.has(path)) state.selected.delete(path);
         render();
+        return true;
     }
 
     async function run_trim(selection: StoredFileStateTrimSelection): Promise<void> {
@@ -668,10 +696,22 @@ export function mount_state_inspector(
         void run_trim({ kind: 'paths', paths: [...state.selected] });
     });
     dismiss.addEventListener('click', exit_review);
+    refreshButton.addEventListener('click', () => {
+        set_busy(true);
+        set_refreshing(true);
+        void reload().then((refreshed) => {
+            if (refreshed) set_status('Updated just now.');
+        }).finally(() => {
+            set_refreshing(false);
+            set_busy(false);
+        });
+    });
 
     render();
     set_busy(true);
+    set_refreshing(true);
     void reload().finally(() => {
+        set_refreshing(false);
         set_busy(false);
         if (!state.status) set_status('');
     });

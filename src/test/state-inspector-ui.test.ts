@@ -180,6 +180,19 @@ describe('the inspector listing', () => {
         expect(rows(root)).toHaveLength(1);
         expect(requests.filter((request) => request.kind !== 'inspect')).toEqual([]);
     });
+
+    it('refreshes the whole inventory from the header and reports freshness', async () => {
+        const { root, requests } = await mount();
+        const refresh = root.querySelector<HTMLButtonElement>('.header-refresh')!;
+
+        expect(refresh.getAttribute('aria-label')).toBe('Refresh stored file state');
+        await click(refresh);
+
+        expect(requests.filter((request) => request.kind === 'inspect')).toHaveLength(2);
+        expect(root.querySelector('.status-bar')?.textContent).toBe('Updated just now.');
+        expect(refresh.disabled).toBe(false);
+        expect(refresh.getAttribute('aria-busy')).toBe('false');
+    });
 });
 
 describe('deleting a selection', () => {

@@ -30,7 +30,32 @@ header {
   padding: 16px 20px 12px;
   border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
 }
-h1 { margin: 0 0 4px; font-size: 1.15em; font-weight: 600; }
+.heading-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+h1 { margin: 0; font-size: 1.15em; font-weight: 600; }
+.header-refresh {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 3px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--vscode-foreground, #3b3b3b);
+}
+.header-refresh:hover:not(:disabled) {
+  background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.18));
+}
+.header-refresh svg { width: 16px; height: 16px; fill: currentColor; }
+.header-refresh.loading svg { animation: inspector-refresh-spin 0.8s linear infinite; }
+@keyframes inspector-refresh-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .header-refresh.loading svg { animation: none; }
+}
 .summary { color: var(--vscode-descriptionForeground, #717171); }
 .explanation {
   margin: 6px 0 8px;
