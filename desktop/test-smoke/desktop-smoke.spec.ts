@@ -430,6 +430,28 @@ function stored_setting(key: string): unknown {
     return JSON.parse(fs.readFileSync(file, 'utf8'))[key];
 }
 
+test('automatic update checking is explained and saved immediately', async () => {
+    const prefs = await open_preferences(app);
+    const control = prefs.locator('#automaticallyCheckForUpdates');
+    try {
+        await expect(control).toBeChecked();
+        await expect(control.locator('xpath=following-sibling::div').locator('.hint'))
+            .toContainText('Checks once when you open Table Viewer');
+        await control.uncheck();
+        await expect.poll(
+            () => stored_setting('automaticallyCheckForUpdates'),
+            { timeout: 15_000 },
+        ).toBe(false);
+        await control.check();
+        await expect.poll(
+            () => stored_setting('automaticallyCheckForUpdates'),
+            { timeout: 15_000 },
+        ).toBe(true);
+    } finally {
+        await close_preferences(app);
+    }
+});
+
 // Switching to Match last window has to adopt whatever is on screen: while Fixed
 // size was selected the app deliberately ignored every resize, so without this
 // the stored size is the number last typed, and the first window opened after

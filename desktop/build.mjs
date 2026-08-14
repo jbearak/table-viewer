@@ -83,6 +83,7 @@ await build({
         join(desktop_dir, 'preload', 'prefs-preload.ts'),
         join(desktop_dir, 'preload', 'about-preload.ts'),
         join(desktop_dir, 'preload', 'state-inspector-preload.ts'),
+        join(desktop_dir, 'preload', 'app-update-preload.ts'),
     ],
 });
 
@@ -101,10 +102,13 @@ await build({
         join(desktop_dir, 'renderer', 'prefs.ts'),
         join(desktop_dir, 'renderer', 'about.ts'),
         join(desktop_dir, 'renderer', 'state-inspector.ts'),
+        join(desktop_dir, 'renderer', 'app-update.ts'),
     ],
 });
 
 // Static pages.
-for (const file of ['welcome.html', 'prefs.html', 'about.html', 'state-inspector.html']) {
+for (const file of [
+    'welcome.html', 'prefs.html', 'about.html', 'state-inspector.html', 'app-update.html',
+]) {
     await copyFile(join(desktop_dir, 'renderer', file), join(out_dir, file));
 }

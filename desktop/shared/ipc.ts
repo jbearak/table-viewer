@@ -61,6 +61,11 @@ export const CHANNEL_PREFS_SET_SYNC = 'prefs:setSync';
  *  the app chrome can follow the configured font. */
 export const CHANNEL_SETTINGS_CHANGED = 'settings:changed';
 
+/** Non-modal application-update window channels. */
+export const CHANNEL_APP_UPDATE_GET_STATE = 'appUpdate:getState';
+export const CHANNEL_APP_UPDATE_STATE_CHANGED = 'appUpdate:stateChanged';
+export const CHANNEL_APP_UPDATE_ACTION = 'appUpdate:action';
+
 /** About window channels. */
 export const CHANNEL_ABOUT_GET_INFO = 'about:getInfo';
 export const CHANNEL_ABOUT_OPEN_LINK = 'about:openLink';

@@ -52,11 +52,21 @@
   .pair { flex-direction: row; gap: 12px; }
   .pair > div { display: flex; flex-direction: column; gap: 4px; }
   .pair input { max-width: 100px; }
+  .section-title {
+    margin: 20px 0 10px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--prefs-border, #cecece);
+    font-size: calc(var(--prefs-font-size) * 1.05);
+  }
+  .checkbox-row { flex-direction: row; align-items: flex-start; gap: 8px; }
+  .checkbox-row input { margin: 2px 0 0; }
+  .checkbox-copy { display: flex; flex-direction: column; gap: 4px; }
 </style>
 </head>
 <body>
 <h1>Table Viewer Preferences</h1>
 <p class="subtitle">Changes save as you make them.</p>
+<h2 class="section-title">Appearance</h2>
 <div class="field">
   <label for="fontFamily">Font family</label>
   <input id="fontFamily" type="text" placeholder="System default">
@@ -85,6 +95,17 @@
     remember separate themes, so switching Appearance brings back the theme you
     picked for that mode.</span>
 </div>
+<h2 class="section-title">Updates</h2>
+<div class="field checkbox-row">
+  <input id="automaticallyCheckForUpdates" type="checkbox" aria-describedby="updateCheckHint">
+  <div class="checkbox-copy">
+    <label for="automaticallyCheckForUpdates">Automatically check for updates</label>
+    <span class="hint" id="updateCheckHint">Checks once when you open Table Viewer. Downloads and restarts
+      always require your approval. If you skip a version, it stays skipped until a
+      newer version is released.</span>
+  </div>
+</div>
+<h2 class="section-title">Files and windows</h2>
 <div class="field">
   <label for="tabOrientation">Worksheet tab orientation</label>
   <select id="tabOrientation">

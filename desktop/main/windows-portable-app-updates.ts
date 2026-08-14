@@ -8,7 +8,7 @@ import {
 import { basename, dirname, join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Readable, Transform } from 'node:stream';
-import type { AppUpdateEngine, UpdateInfo } from './app-updates';
+import type { AppUpdateEngine, UpdateInfo, UpdateProgress } from './app-updates';
 import {
     PORTABLE_UPDATE_HELPER_NAME,
     compare_release_versions,
@@ -29,6 +29,7 @@ interface PortableUpdateListeners {
     available: ((info: UpdateInfo) => void)[];
     unavailable: (() => void)[];
     downloaded: ((info: UpdateInfo) => void)[];
+    progress: ((progress: UpdateProgress) => void)[];
     error: ((error: unknown) => void)[];
 }
 
@@ -49,7 +50,7 @@ export function create_windows_portable_update_engine(
     options: WindowsPortableUpdateOptions,
 ): AppUpdateEngine {
     const listeners: PortableUpdateListeners = {
-        available: [], unavailable: [], downloaded: [], error: [],
+        available: [], unavailable: [], downloaded: [], progress: [], error: [],
     };
     const fetch_url = options.fetch ?? fetch;
     let available: PortableUpdateInfo | undefined;
@@ -91,7 +92,14 @@ export function create_windows_portable_update_engine(
                 if (!available) {
                     throw portable_update_error('ERR_UPDATER_INVALID_UPDATE_INFO', 'No portable update is available');
                 }
-                prepared = await prepare_portable_update(available, options, fetch_url);
+                prepared = await prepare_portable_update(
+                    available,
+                    options,
+                    fetch_url,
+                    (progress) => {
+                        for (const listener of listeners.progress) listener(progress);
+                    },
+                );
                 for (const listener of listeners.downloaded) listener({ version: available.version });
             } catch (error) {
                 emit_error(error);
@@ -123,6 +131,7 @@ export function create_windows_portable_update_engine(
         on_update_available: (listener) => { listeners.available.push(listener); },
         on_update_not_available: (listener) => { listeners.unavailable.push(listener); },
         on_update_downloaded: (listener) => { listeners.downloaded.push(listener); },
+        on_download_progress: (listener) => { listeners.progress.push(listener); },
         on_error: (listener) => { listeners.error.push(listener); },
     };
 }
@@ -131,6 +140,7 @@ async function prepare_portable_update(
     info: PortableUpdateInfo,
     options: WindowsPortableUpdateOptions,
     fetch_url: typeof fetch,
+    on_progress: (progress: UpdateProgress) => void,
 ): Promise<{ transaction_path: string; helper_path: string }> {
     const transaction_id = portable_update_transaction_id();
     const transaction_dir = join(options.user_data_dir, 'portable-updates', transaction_id);
@@ -150,6 +160,8 @@ async function prepare_portable_update(
 
         const digest = createHash('sha512');
         let received = 0;
+        let reported_percent = -1;
+        const started_at = Date.now();
         const verify = new Transform({
             transform(chunk: Buffer, _encoding, callback) {
                 received += chunk.length;
@@ -158,6 +170,18 @@ async function prepare_portable_update(
                     return;
                 }
                 digest.update(chunk);
+                const elapsed_seconds = Math.max((Date.now() - started_at) / 1_000, 0.001);
+                const percent = Math.min(100, received / info.size * 100);
+                const rounded_down = Math.floor(percent);
+                if (rounded_down !== reported_percent) {
+                    reported_percent = rounded_down;
+                    on_progress({
+                        percent,
+                        transferred: received,
+                        total: info.size,
+                        bytesPerSecond: received / elapsed_seconds,
+                    });
+                }
                 callback(null, chunk);
             },
         });

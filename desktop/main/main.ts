@@ -74,6 +74,13 @@ import {
     create_app_update_coordinator,
     type AppUpdateCoordinator,
 } from './app-updates';
+import {
+    create_app_update_window_presenter,
+    open_manual_update_page,
+    type AppUpdateWindowAction,
+    type AppUpdateWindowPresenter,
+    type AppUpdateWindowState,
+} from './app-update-window';
 import { app_update_failure_dialog } from './app-update-failure';
 import {
     acknowledge_windows_portable_update,
@@ -100,6 +107,9 @@ import {
     CHANNEL_ABOUT_GET_INFO,
     CHANNEL_ABOUT_OPEN_LINK,
     CHANNEL_ABOUT_OPEN_NOTICES,
+    CHANNEL_APP_UPDATE_ACTION,
+    CHANNEL_APP_UPDATE_GET_STATE,
+    CHANNEL_APP_UPDATE_STATE_CHANGED,
     CHANNEL_GET_THEME,
     CHANNEL_PREFS_GET,
     CHANNEL_PREFS_SET,
@@ -159,10 +169,16 @@ const WELCOME_PRELOAD = path.join(DESKTOP_DIST_DIR, 'welcome-preload.js');
 const PREFS_PRELOAD = path.join(DESKTOP_DIST_DIR, 'prefs-preload.js');
 const ABOUT_PRELOAD = path.join(DESKTOP_DIST_DIR, 'about-preload.js');
 const STATE_INSPECTOR_PRELOAD = path.join(DESKTOP_DIST_DIR, 'state-inspector-preload.js');
+const APP_UPDATE_PRELOAD = path.join(DESKTOP_DIST_DIR, 'app-update-preload.js');
+const UPDATE_SMOKE_READY = 'table-viewer:test-update-ready';
+const UPDATE_SMOKE_GATE_MARKER = '.update-startup-gate-evaluated';
 
 let config_store: DesktopConfigStore;
 let viewer_windows: ViewerWindowManager | undefined;
 let app_updates: AppUpdateCoordinator | undefined;
+let app_update_presenter: AppUpdateWindowPresenter;
+let app_update_window: BrowserWindow | undefined;
+let app_quit_requested = false;
 let prefs_window: BrowserWindow | undefined;
 let about_window: BrowserWindow | undefined;
 let state_inspector_window: BrowserWindow | undefined;
@@ -193,6 +209,103 @@ const state_backend = create_desktop_state_backend<OpenedSqliteFileStateStore>(
     () => viewer_windows?.stop_admission(),
     () => viewer_windows?.resume_admission(),
 );
+
+/** The update conversation is its own ordinary top-level window: never parented,
+ *  modal, or always-on-top, so every spreadsheet remains independently visible
+ *  and usable. Closing download progress only hides it; a manual check brings it
+ *  back without starting another download. */
+function create_update_window_presenter(): AppUpdateWindowPresenter {
+    let focus_when_ready = false;
+    const height_for = (state: AppUpdateWindowState) => state.kind === 'available' ? 270 : 220;
+    const present = (state: AppUpdateWindowState, focus: boolean): void => {
+        let window = app_update_window;
+        if (!window || window.isDestroyed()) {
+            focus_when_ready = focus;
+            const created = new BrowserWindow({
+                width: 520,
+                height: height_for(state),
+                resizable: false,
+                minimizable: true,
+                maximizable: false,
+                fullscreenable: false,
+                modal: false,
+                alwaysOnTop: false,
+                show: false,
+                title: 'Table Viewer Update',
+                ...TITLEBAR_WINDOW_OPTIONS,
+                backgroundColor: window_background_color(current_theme_id()),
+                webPreferences: {
+                    preload: APP_UPDATE_PRELOAD,
+                    contextIsolation: true,
+                    nodeIntegration: false,
+                },
+            });
+            window = created;
+            app_update_window = created;
+            created.once('ready-to-show', () => {
+                if (created.isDestroyed()) return;
+                if (focus_when_ready) {
+                    created.show();
+                    created.focus();
+                } else {
+                    created.showInactive();
+                }
+            });
+            created.once('closed', () => {
+                if (app_update_window === created) app_update_window = undefined;
+                app_update_presenter.handle_window_closed(!app_quit_requested);
+            });
+            void created.loadFile(path.join(DESKTOP_DIST_DIR, 'app-update.html'));
+        } else {
+            if (focus) focus_when_ready = true;
+            const target_height = height_for(state);
+            const [width, height] = window.getSize();
+            if (width !== 520 || height !== target_height) {
+                window.setSize(520, target_height, false);
+            }
+            if (focus) {
+                if (window.isMinimized()) window.restore();
+                window.show();
+                window.focus();
+            }
+        }
+        if (!window.webContents.isDestroyed()) {
+            window.webContents.send(CHANNEL_APP_UPDATE_STATE_CHANGED, state);
+        }
+    };
+
+    return create_app_update_window_presenter({
+        present,
+        close: () => {
+            const window = app_update_window;
+            if (window && !window.isDestroyed()) window.close();
+        },
+    });
+}
+
+/** Real-Electron smoke seam. It is available only to an unpackaged app using an
+ *  explicit isolated user-data directory, so it cannot affect a shipped build
+ *  or an ordinary developer launch. The smoke test advances the download by
+ *  emitting UPDATE_SMOKE_READY in the main process. */
+function start_update_smoke_preview(): boolean {
+    if (app.isPackaged
+        || !custom_user_data
+        || process.env.TABLE_VIEWER_TEST_UPDATE_PREVIEW !== 'downloading') {
+        return false;
+    }
+    setImmediate(() => {
+        app_update_presenter.show_downloading('2.0.0');
+        app_update_presenter.update_download_progress({
+            percent: 46,
+            transferred: 38_000_000,
+            total: 82_000_000,
+        });
+        ipcMain.once(UPDATE_SMOKE_READY, () => {
+            void app_update_presenter.offer_restart('2.0.0');
+        });
+    });
+    return true;
+}
 
 function create_packaged_app_updates(portable_executable: string | undefined): AppUpdateCoordinator | undefined {
     if (!app.isPackaged || !['darwin', 'win32'].includes(process.platform)) return undefined;
@@ -249,6 +362,19 @@ function create_packaged_app_updates(portable_executable: string | undefined): A
                 on_update_downloaded: (listener: (info: { version: string }) => void) => {
                     autoUpdater.on('update-downloaded', (info) => listener({ version: info.version }));
                 },
+                on_download_progress: (listener: (progress: {
+                    percent: number;
+                    transferred: number;
+                    total: number;
+                    bytesPerSecond: number;
+                }) => void) => {
+                    autoUpdater.on('download-progress', (progress) => listener({
+                        percent: progress.percent,
+                        transferred: progress.transferred,
+                        total: progress.total,
+                        bytesPerSecond: progress.bytesPerSecond,
+                    }));
+                },
                 on_error: (listener: (error: unknown) => void) => {
                     autoUpdater.on('error', (error) => listener(error));
                 },
@@ -264,51 +390,29 @@ function create_packaged_app_updates(portable_executable: string | undefined): A
             : dialog.showMessageBox(options);
     };
 
-    const confirm_update = async (
-        message: string,
-        detail: string,
-        affirmative_label: string,
-    ): Promise<boolean> => {
-        const result = await show_update_message_box({
-            type: 'info',
-            message,
-            detail,
-            buttons: [affirmative_label, 'Later'],
-            defaultId: 0,
-            cancelId: 1,
-        });
-        return result.response === 0;
-    };
-
     return create_app_update_coordinator(
         engine,
         {
-            offer_download: async (version, install_updates) => {
-                if (!install_updates) {
-                    const result = await show_update_message_box({
-                        type: 'info',
-                        message: `Table Viewer ${version} is available.`,
-                        detail: 'This unsigned local build cannot install updates automatically. Download the latest release from GitHub, then replace this app manually.',
-                        buttons: ['Open GitHub Releases', 'OK'],
-                        defaultId: 1,
-                        cancelId: 1,
-                    });
-                    if (result.response === 0) {
-                        await shell.openExternal(`${REPOSITORY_URL}/releases`);
-                    }
-                    return false;
-                }
-                return confirm_update(
-                    `Table Viewer ${version} is available.`,
-                    'Would you like to download it now?',
-                    'Download',
+            offer_download: async (version, install_updates, focus) => {
+                const choice = await app_update_presenter.offer_download(
+                    version,
+                    install_updates,
+                    focus,
                 );
+                if (!install_updates && choice === 'accept') {
+                    return open_manual_update_page(
+                        () => shell.openExternal(`${REPOSITORY_URL}/releases`),
+                        () => app_update_presenter.dismiss(),
+                    );
+                }
+                return choice;
             },
-            offer_restart: (version) => confirm_update(
-                `Table Viewer ${version} is ready to install.`,
-                'Restart Table Viewer to finish installing the update.',
-                'Restart and Install',
-            ),
+            show_downloading: (version) => app_update_presenter.show_downloading(version),
+            update_download_progress: (progress) => {
+                app_update_presenter.update_download_progress(progress);
+            },
+            offer_restart: (version) => app_update_presenter.offer_restart(version),
+            show_update_available: () => app_update_presenter.show_update_available(),
             show_up_to_date: async () => {
                 await show_update_message_box({
                     type: 'info',
@@ -331,17 +435,17 @@ function create_packaged_app_updates(portable_executable: string | undefined): A
                     await shell.openExternal(`${REPOSITORY_URL}/releases`);
                 }
             },
-            show_download_in_progress: async () => {
-                await show_update_message_box({
-                    type: 'info',
-                    message: 'Table Viewer is downloading an update.',
-                    detail: 'You will be asked before the app restarts to install it.',
-                    buttons: ['OK'],
-                });
-            },
+            show_download_in_progress: () => app_update_presenter.show_download_in_progress(),
+            dismiss: () => app_update_presenter.dismiss(),
         },
         () => app.quit(),
-        { install_updates: __INSTALL_APP_UPDATES__ },
+        {
+            install_updates: __INSTALL_APP_UPDATES__,
+            dismissed_version: () => config_store.settings().dismissedUpdateVersion,
+            dismiss_version: (version) => {
+                config_store.update({ dismissedUpdateVersion: version });
+            },
+        },
     );
 }
 
@@ -384,11 +488,23 @@ const quit_shutdown: AppQuitShutdownPort = {
 let quitting_viewer_files: string[] = [];
 const coordinate_app_quit = create_app_quit_coordinator(
     () => {
+        app_quit_requested = true;
+        app_updates?.begin_shutdown();
         quitting_viewer_files = viewer_windows?.open_file_paths() ?? [];
         return close_desktop_windows(
             () => viewer_windows?.close_all() ?? Promise.resolve(true),
             () => BrowserWindow.getAllWindows(),
-        );
+        ).then((closed) => {
+            if (!closed) {
+                app_quit_requested = false;
+                app_updates?.cancel_install_request();
+            }
+            return closed;
+        }, (error) => {
+            app_quit_requested = false;
+            app_updates?.cancel_install_request();
+            throw error;
+        });
     },
     () => {
         try {
@@ -934,6 +1050,17 @@ function register_ipc(): void {
         void show_open_dialog(BrowserWindow.fromWebContents(event.sender) ?? undefined);
     });
     ipcMain.on(CHANNEL_WELCOME_OPEN_PREFERENCES, () => show_preferences_window());
+    ipcMain.on(CHANNEL_APP_UPDATE_GET_STATE, (event) => {
+        event.returnValue = BrowserWindow.fromWebContents(event.sender) === app_update_window
+            ? app_update_presenter.state
+            : undefined;
+    });
+    ipcMain.on(CHANNEL_APP_UPDATE_ACTION, (event, action: unknown) => {
+        if (BrowserWindow.fromWebContents(event.sender) !== app_update_window) return;
+        if (action === 'primary' || action === 'secondary') {
+            app_update_presenter.handle_action(action as AppUpdateWindowAction);
+        }
+    });
     ipcMain.handle(CHANNEL_PREFS_GET, () => config_store.settings());
     ipcMain.handle(CHANNEL_PREFS_SET, (_event, partial: unknown) => update_settings(partial));
     // The closing Preferences window's last write; see CHANNEL_PREFS_SET_SYNC.
@@ -1011,6 +1138,7 @@ function broadcast_theme(): void {
         prefs_window,
         about_window,
         state_inspector_window,
+        app_update_window,
     ]) {
         if (window && !window.isDestroyed()) window.setBackgroundColor(background);
     }
@@ -1246,6 +1374,7 @@ if (!got_lock) {
         );
         // Before any window is created, so first paint uses the right palette.
         apply_theme_source(config_store.settings().theme);
+        app_update_presenter = create_update_window_presenter();
         register_app_protocol();
         register_ipc();
         watch_window_activation();
@@ -1339,7 +1468,23 @@ if (!got_lock) {
         void clean_windows_portable_update_transactions(user_data_dir);
         // Detached from startup: update service/network failures must never turn
         // into a fatal state-backend startup failure.
-        setImmediate(() => app_updates?.check_automatically());
+        const automatically_check = config_store.settings().automaticallyCheckForUpdates;
+        if (automatically_check) {
+            if (!start_update_smoke_preview()) {
+                setImmediate(() => app_updates?.check_automatically());
+            }
+        }
+        if (!app.isPackaged && custom_user_data
+            && process.env.TABLE_VIEWER_TEST_UPDATE_PREVIEW === 'downloading') {
+            // Scheduled after the preview/check callback, so the smoke suite can
+            // poll this observable before making a negative window assertion.
+            setImmediate(() => {
+                fs.writeFileSync(
+                    path.join(custom_user_data, UPDATE_SMOKE_GATE_MARKER),
+                    automatically_check ? 'enabled' : 'disabled',
+                );
+            });
+        }
     }
 
     /**
