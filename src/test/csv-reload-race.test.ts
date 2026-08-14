@@ -16,7 +16,8 @@ import { versioned_state_store } from './helpers/versioned-state-store';
 import * as vscode_mock from './mocks/vscode';
 import { fake_viewer_host } from './mocks/host-ports';
 import { with_in_memory_authority_transactions } from '../state-authority';
-import type { WorkbookSnapshotIdentity } from '../viewer-snapshot';
+import type { WorkbookSnapshot } from '../viewer-snapshot';
+import type { HostMessage } from '../types';
 import { sheet_cells, sheet_edits } from './pending-edits-helper';
 
 /**
@@ -84,23 +85,10 @@ function view_column(column: number): vscode.ViewColumn {
     return column as vscode.ViewColumn;
 }
 
-interface CsvSnapshot {
-    type: 'workbookSnapshot';
-    snapshot: {
-        presentation: 'initial' | 'refresh';
-        reason: string;
-        generation: number;
-        sourceGeneration: number;
-        previewMode?: boolean;
-        configuration: { previewMode: boolean };
-        capabilities: { csvEditable: boolean; csvEditingSupported: boolean };
-        meta: { sheets: { rowCount: number }[] };
-        state: Record<string, unknown>;
-        identity: WorkbookSnapshotIdentity;
-    };
-}
+type WorkbookSnapshotMessage = Extract<HostMessage, { type: 'workbookSnapshot' }>;
+type TestWorkbookSnapshot = WorkbookSnapshot & { readonly previewMode: boolean };
 
-function workbook_snapshots(panel: { __messages: unknown[] }): CsvSnapshot['snapshot'][] {
+function workbook_snapshots(panel: { __messages: unknown[] }): TestWorkbookSnapshot[] {
     return panel.__messages.flatMap((message) => (
         typeof message === 'object'
         && message !== null
@@ -108,8 +96,9 @@ function workbook_snapshots(panel: { __messages: unknown[] }): CsvSnapshot['snap
         && message.type === 'workbookSnapshot'
         && 'snapshot' in message
             ? [{
-                ...(message as CsvSnapshot).snapshot,
-                previewMode: (message as CsvSnapshot).snapshot.configuration.previewMode,
+                ...(message as WorkbookSnapshotMessage).snapshot,
+                previewMode: (message as WorkbookSnapshotMessage)
+                    .snapshot.configuration.previewMode,
             }]
             : []
     ));
@@ -136,6 +125,41 @@ beforeEach(() => {
 });
 
 describe('CSV reload races', () => {
+    it('opens the row-limit setting and loads all rows for this viewer', async () => {
+        const bytes = enc.encode('h\na\nb\nc\nd\n');
+        vscode_mock.__setConfigurationValue('tableViewer.csvMaxRows', 2);
+        vscode_mock.__setStatImplementation(async () => ({
+            size: bytes.byteLength,
+            mtime: 1,
+        }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        const open_setting = vi.spyOn(fake_viewer_host.ui, 'open_setting');
+        const panel = open_csv_table(
+            uri('/tmp/truncated-load-all.csv'),
+            undefined,
+            csv_table_profile(fake_viewer_host.config),
+        );
+
+        await panel.__receive({ type: 'ready' });
+        await flush_promises();
+        expect(initial_snapshots(panel).at(-1)).toMatchObject({
+            truncationMessage: 'Showing 2 of 4 rows',
+            capabilities: { csvEditable: false },
+            meta: { sheets: [{ rowCount: 2 }] },
+        });
+
+        await panel.__receive({ type: 'openCsvRowLimitSetting' });
+        expect(open_setting).toHaveBeenCalledWith('csvMaxRows');
+
+        await panel.__receive({ type: 'loadAllCsvRows' });
+        await flush_promises();
+        expect(refresh_snapshots(panel).at(-1)).toMatchObject({
+            truncationMessage: null,
+            capabilities: { csvEditable: true },
+            meta: { sheets: [{ rowCount: 4 }] },
+        });
+    });
+
     it('opens a file above the configured threshold when the user confirms once', async () => {
         const bytes = enc.encode('h\na\n');
         let reads = 0;
@@ -244,17 +268,14 @@ describe('CSV reload races', () => {
         vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
         vi.spyOn(vscode_mock.window, 'showWarningMessage')
             .mockResolvedValue('Change Limit' as never);
-        const execute = vi.spyOn(vscode_mock.commands, 'executeCommand');
+        const open_setting = vi.spyOn(fake_viewer_host.ui, 'open_setting');
         const panel = open_csv_table(uri('/tmp/oversized-configure.csv'));
         const close = vi.spyOn(panel, 'dispose');
 
         await panel.__receive({ type: 'ready' });
         await flush_promises();
 
-        expect(execute).toHaveBeenCalledWith(
-            'workbench.action.openSettings',
-            '@id:tableViewer.maxFileSizeMiB',
-        );
+        expect(open_setting).toHaveBeenCalledWith('maxFileSizeMiB');
         expect(close).toHaveBeenCalledOnce();
         expect(initial_snapshots(panel)).toHaveLength(0);
     });

@@ -9,6 +9,7 @@ import type {
     FileSystemPort,
     HostUiPort,
     SaveDialogChoice,
+    ViewerSettingTarget,
 } from '../../src/host-ports';
 import type { ResourceUriLike } from '../../src/resource-identity';
 
@@ -39,7 +40,7 @@ export interface DesktopUiDialogs {
     show_file_size_limit_dialog(
         details: FileSizeLimitDialogDetails,
     ): Promise<FileSizeLimitDialogChoice>;
-    open_file_size_limit_setting(): Promise<void>;
+    open_setting(target: ViewerSettingTarget): Promise<void>;
 }
 
 export function create_desktop_ui_port(dialogs: DesktopUiDialogs): HostUiPort {
@@ -49,6 +50,6 @@ export function create_desktop_ui_port(dialogs: DesktopUiDialogs): HostUiPort {
         show_save_discard_dialog: () => dialogs.show_save_discard_dialog(),
         show_file_size_limit_dialog: (details) =>
             dialogs.show_file_size_limit_dialog(details),
-        open_file_size_limit_setting: () => dialogs.open_file_size_limit_setting(),
+        open_setting: (target) => dialogs.open_setting(target),
     };
 }

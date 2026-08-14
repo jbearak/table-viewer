@@ -4441,6 +4441,12 @@ export function App(): React.JSX.Element {
                 edit_disabled={
                     save_lifecycle.state === 'active'
                     || editing_status?.save_in_flight === true
+                    // `csvEditable` is also false while another panel owns the
+                    // workbook session, where pressing Edit is how this panel asks
+                    // for ownership. Truncation is different: no request can make a
+                    // partial source editable, so its visible banner is the narrow
+                    // condition that makes this control genuinely disabled.
+                    || (!!truncation_message && !csv_editable)
                     // The session covers the whole workbook, so a session open on
                     // another worksheet no longer disables this sheet's Edit
                     // button — pressing it continues the same session here. Only
@@ -4455,6 +4461,8 @@ export function App(): React.JSX.Element {
                     save_lifecycle.state === 'active'
                     || editing_status?.save_in_flight
                         ? 'Saving changes.'
+                        : truncation_message && !csv_editable
+                        ? 'Editing is disabled until all rows are loaded.'
                         : edit_session_pending
                         ? 'Waiting to enter edit mode.'
                         // Transform work in flight is the only disabler left.
@@ -4480,7 +4488,37 @@ export function App(): React.JSX.Element {
                 />
             )}
             {truncation_message && (
-                <div className="truncation-banner">{truncation_message}{csv_editing_supported && !csv_editable ? '. Editing is disabled for truncated files.' : ''}</div>
+                <div className="truncation-banner">
+                    <div className="truncation-banner-copy">
+                        <div>{truncation_message}</div>
+                        <div className="truncation-banner-detail">
+                            {csv_editing_supported && !csv_editable
+                                ? 'Editing is disabled until all rows are loaded.'
+                                : 'Additional rows were not loaded.'}
+                        </div>
+                    </div>
+                    <div className="truncation-banner-actions">
+                        <button
+                            type="button"
+                            className="truncation-setting-action"
+                            title="Change the CSV/TSV row limit in settings, then reload the file."
+                            onClick={() => host_bridge.postMessage({
+                                type: 'openCsvRowLimitSetting',
+                            })}
+                        >
+                            Change row limit
+                        </button>
+                        <button
+                            type="button"
+                            className="truncation-load-action"
+                            onClick={() => host_bridge.postMessage({
+                                type: 'loadAllCsvRows',
+                            })}
+                        >
+                            Load all rows
+                        </button>
+                    </div>
+                </div>
             )}
             {show_stale_view_banner && (
                 // Informational only. Deliberately no "Resort"/"Refilter"/"Refresh"

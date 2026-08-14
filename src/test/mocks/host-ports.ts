@@ -61,12 +61,7 @@ export const fake_host_ui_port: HostUiPort = {
                 ? 'configure'
                 : 'cancel';
     },
-    async open_file_size_limit_setting(): Promise<void> {
-        await vscode_mock.commands.executeCommand(
-            'workbench.action.openSettings',
-            '@id:tableViewer.maxFileSizeMiB',
-        );
-    },
+    async open_setting(): Promise<void> {},
 };
 
 function config_value<T>(key: string, fallback: T): T {

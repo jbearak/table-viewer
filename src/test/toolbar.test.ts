@@ -7,6 +7,15 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Toolbar } from '../webview/toolbar';
 
+let webview_css: string | undefined;
+
+function get_webview_css(): string {
+    return webview_css ??= readFileSync(
+        resolve(process.cwd(), 'src/webview/styles.css'),
+        'utf8',
+    );
+}
+
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
 
@@ -68,17 +77,24 @@ function render_toolbar(props?: Partial<React.ComponentProps<typeof Toolbar>>) {
 
 describe('toolbar toggle colors', () => {
     it('keeps active button hover colors on the button palette', () => {
-        const css = readFileSync(
-            resolve(process.cwd(), 'src/webview/styles.css'),
-            'utf8',
-        );
-
-        expect(css).toContain(
+        expect(get_webview_css()).toContain(
             '.toggle:not(.active):not([aria-disabled="true"]):hover',
         );
-        expect(css).toMatch(
+        expect(get_webview_css()).toMatch(
             /\.toggle\.active:not\(\.has-unsaved\):not\(\[aria-disabled="true"\]\):hover\s*\{[^}]*--vscode-button-hoverBackground[^}]*\}/,
         );
+    });
+
+    it('removes the active fill and hover color from disabled toggles', () => {
+        expect(get_webview_css()).toMatch(
+            /\.toggle\.active:disabled[\s\S]*?background:\s*transparent[\s\S]*?--vscode-disabledForeground/,
+        );
+        const hover_rule = /\.toggle\[aria-disabled="true"\]:hover\s*\{([^}]*)\}/
+            .exec(get_webview_css())?.[1];
+        expect(hover_rule).toBeDefined();
+        expect(hover_rule).toMatch(/background:\s*transparent/);
+        expect(hover_rule).toMatch(/--vscode-disabledForeground/);
+        expect(hover_rule).toMatch(/opacity:\s*0\.45/);
     });
 
     it('paints the scope divider as a 1px rule despite its spacing', () => {
@@ -86,12 +102,7 @@ describe('toolbar toggle colors', () => {
         // as a boundary rather than one more crowded item. That room is padding, so
         // without clipping the background to the content box the 1px line would paint
         // 5px wide. Asserted against the stylesheet because jsdom computes no layout.
-        const css = readFileSync(
-            resolve(process.cwd(), 'src/webview/styles.css'),
-            'utf8',
-        );
-
-        const rule = /\.toolbar-actions-divider\s*\{([^}]*)\}/.exec(css)?.[1];
+        const rule = /\.toolbar-actions-divider\s*\{([^}]*)\}/.exec(get_webview_css())?.[1];
         expect(rule).toBeDefined();
         expect(rule).toMatch(/padding:\s*0\s+2px/);
         expect(rule).toMatch(/background-clip:\s*content-box/);
@@ -177,10 +188,7 @@ function make_rect({
 function apply_webview_styles(): void {
     const style = document.createElement('style');
     style.dataset.webviewStyles = 'true';
-    style.textContent = readFileSync(
-        resolve(process.cwd(), 'src/webview/styles.css'),
-        'utf8',
-    );
+    style.textContent = get_webview_css();
     document.head.appendChild(style);
 }
 

@@ -95,19 +95,36 @@ body {
 
 .toggle[aria-disabled="true"] {
     cursor: not-allowed;
-    opacity: 0.5;
+    color: var(--vscode-disabledForeground, rgba(204, 204, 204, 0.5));
+    border-color: var(--vscode-panel-border, #444);
+    background: transparent;
+    opacity: 0.45;
 }
 
 .toggle:disabled {
     cursor: not-allowed;
-    opacity: 0.5;
     pointer-events: none;
+    color: var(--vscode-disabledForeground, rgba(204, 204, 204, 0.5));
+    border-color: var(--vscode-panel-border, #444);
+    background: transparent;
+    opacity: 0.45;
 }
 
 .toggle.active {
     background: var(--vscode-button-background, #0e639c);
     color: var(--vscode-button-foreground, #fff);
     border-color: var(--vscode-button-background, #0e639c);
+}
+
+/* Keep the disabled palette after `.toggle.active`: otherwise an edit session
+   disabled by a truncated reload retains the saturated active-blue fill. */
+.toggle.active:disabled,
+.toggle.active[aria-disabled="true"],
+.toggle[aria-disabled="true"]:hover {
+    background: transparent;
+    color: var(--vscode-disabledForeground, rgba(204, 204, 204, 0.5));
+    border-color: var(--vscode-panel-border, #444);
+    opacity: 0.45;
 }
 
 .toggle.active:not(.has-unsaved):not([aria-disabled="true"]):hover {
@@ -772,13 +789,75 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
 }
 
 .truncation-banner {
-    padding: 4px 8px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 20px;
+    padding: 7px 10px;
     background: var(--vscode-editorInfo-background, rgba(0, 122, 204, 0.1));
     color: var(--vscode-editorInfo-foreground, var(--vscode-foreground, #ccc));
     border-bottom: 1px solid var(--vscode-panel-border, #444);
     font-size: var(--tv-font-size-md);
     flex-shrink: 0;
-    text-align: center;
+}
+
+.truncation-banner-copy {
+    min-width: 0;
+    line-height: 1.35;
+}
+
+.truncation-banner-detail {
+    color: var(--vscode-descriptionForeground, #aaa);
+}
+
+.truncation-banner-actions {
+    display: flex;
+    align-items: center;
+    flex: 0 0 auto;
+    gap: 12px;
+}
+
+.truncation-banner-actions button {
+    border-radius: 3px;
+    font: inherit;
+    cursor: pointer;
+}
+
+.truncation-setting-action {
+    padding: 3px 2px;
+    border: 0;
+    background: transparent;
+    color: var(--vscode-textLink-foreground, #3794ff);
+}
+
+.truncation-setting-action:hover {
+    color: var(--vscode-textLink-activeForeground, #4daafc);
+    text-decoration: underline;
+}
+
+.truncation-load-action {
+    padding: 4px 10px;
+    border: 1px solid var(--vscode-button-background, #0e639c);
+    background: var(--vscode-button-background, #0e639c);
+    color: var(--vscode-button-foreground, #fff);
+}
+
+.truncation-load-action:hover {
+    border-color: var(--vscode-button-hoverBackground, #1177bb);
+    background: var(--vscode-button-hoverBackground, #1177bb);
+}
+
+.truncation-banner-actions button:focus-visible {
+    outline: 2px solid var(--vscode-focusBorder, #007acc);
+    outline-offset: 2px;
+}
+
+@media (max-width: 620px) {
+    .truncation-banner {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 6px;
+    }
 }
 
 /*
@@ -1477,4 +1556,3 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     cursor: default;
     opacity: 0.5;
 }
-

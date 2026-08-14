@@ -48,6 +48,7 @@ import {
     type DesktopHostMessageEnvelope,
     type PendingEditAcknowledgementReceipt,
 } from '../shared/ipc';
+import type { PreferencesTarget } from '../shared/ipc';
 import { TITLEBAR_WINDOW_OPTIONS } from '../shared/titlebar';
 import { viewer_url } from './viewer-html';
 import {
@@ -355,7 +356,7 @@ export class ViewerWindowManager {
         private readonly config_store: DesktopConfigStore,
         private readonly viewer_preload_path: string,
         private readonly viewer_panel_deadline_scheduler?: ViewerPanelDeadlineScheduler,
-        private readonly open_preferences: () => void = () => {},
+        private readonly open_preferences: (target: PreferencesTarget) => void = () => {},
     ) {}
 
     /**
@@ -1187,7 +1188,7 @@ export class ViewerWindowManager {
                             ? 'configure'
                             : 'cancel';
                 },
-                open_file_size_limit_setting: async () => this.open_preferences(),
+                open_setting: async (target) => this.open_preferences(target),
             }),
             config: this.config_store.config_port(),
             refreshWatcherFactory: node_file_refresh_watcher_factory,

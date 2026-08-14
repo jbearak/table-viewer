@@ -203,12 +203,17 @@ export interface ViewerController extends Disposable {
     drain(): Promise<void>;
 }
 
+export interface ViewerSourceBuildOptions {
+    readonly loadAllRows?: boolean;
+}
+
 interface ViewerProfileBase {
     /** Build a DataSource from freshly-read bytes. Throws are surfaced as errors. */
     build_source(
         raw: Uint8Array,
         file_path: string,
         state: PerFileState,
+        options?: ViewerSourceBuildOptions,
     ): Promise<DataSource>;
     /** Sets previewMode on the meta envelope (read-only synced preview). */
     previewMode?: boolean;
@@ -552,17 +557,25 @@ function excel_profile(file_path: string): ViewerProfile {
 
 /** Build the editable CSV/TSV DataSource shared by the table and preview hosts.
  *  `csv_max_rows` comes from the host's ConfigPort; it is normalized to a
- *  finite non-negative integer and clamped to the hard safety cap either way,
- *  since CsvDataSource uses it as an array length. */
+ *  finite non-negative integer. Non-finite host values fall back to the default,
+ *  but a valid configured value is otherwise respected exactly. */
 export function build_csv_source(
     raw: Uint8Array,
     file_path: string,
     csv_max_rows: number = MAX_CSV_ROWS,
+    options?: ViewerSourceBuildOptions,
 ): Promise<CsvDataSource> {
     const requested_max_rows = Number.isFinite(csv_max_rows)
         ? Math.floor(csv_max_rows)
         : MAX_CSV_ROWS;
-    const max_rows = Math.max(0, Math.min(requested_max_rows, MAX_CSV_ROWS));
+    // The banner's explicit "Load all rows" action is a per-view override: the
+    // user has chosen to pay the cost for this file, without silently changing
+    // the preference for every later file. Otherwise use the configured limit
+    // verbatim; silently re-clamping it here makes the banner's settings action
+    // ineffective as soon as the user asks for more than the default.
+    const max_rows = options?.loadAllRows
+        ? Number.MAX_SAFE_INTEGER
+        : Math.max(0, requested_max_rows);
     // CSV/TSV files conventionally carry column names in their first row, so the
     // grid promotes it to the column header rather than showing letters.
     return CsvDataSource.create(raw, get_delimiter(file_path), max_rows, {
@@ -639,12 +652,16 @@ export function plan_csv_save(input: SavePlanInput): SavePlan {
     return { observed_bases: [observed_bases], produce: () => bytes };
 }
 
+export function csv_source_builder(config?: ConfigPort): ViewerProfile['build_source'] {
+    return (raw, file_path, _state, options) =>
+        build_csv_source(raw, file_path, config?.csv_max_rows(), options);
+}
+
 export function csv_table_profile(config?: ConfigPort): ViewerProfile {
     return {
         editing: true,
         plan_save: plan_csv_save,
-        build_source: (raw, file_path) =>
-            build_csv_source(raw, file_path, config?.csv_max_rows()),
+        build_source: csv_source_builder(config),
     };
 }
 
@@ -777,6 +794,9 @@ export function attach_viewer(
         state: NormalizedPerFileState;
     } | undefined;
     let reload_retry_attempts = 0;
+    // Per-view, deliberately not persisted. A later physical refresh stays fully
+    // loaded; reopening the file returns to the configured limit.
+    let load_all_csv_rows = false;
     let reload_retry_timer: ReturnType<typeof setTimeout> | undefined;
     let refresh_retry_wait: {
         timer: ReturnType<typeof setTimeout>;
@@ -3145,7 +3165,12 @@ export function attach_viewer(
             digest: content_digest(raw),
         };
         return new SourceCandidate(
-            await profile.build_source(raw, file_path, state),
+            await profile.build_source(
+                raw,
+                file_path,
+                state,
+                load_all_csv_rows ? { loadAllRows: true } : undefined,
+            ),
             observation,
         );
     }
@@ -3175,7 +3200,7 @@ export function attach_viewer(
                 };
             }
             if (choice === 'configure') {
-                await host.ui.open_file_size_limit_setting();
+                await host.ui.open_setting('maxFileSizeMiB');
                 if (!load_is_current(request.seq, request.refreshEvent)) return { type: 'stale' };
             }
             if (initial) await options.requestClose?.();
@@ -6283,6 +6308,20 @@ export function attach_viewer(
                 return;
             case 'showWarning':
                 host.ui.show_warning(msg.message);
+                return;
+            case 'openCsvRowLimitSetting':
+                await host.ui.open_setting('csvMaxRows');
+                return;
+            case 'loadAllCsvRows':
+                // Only a currently truncated CSV-like profile can make this do
+                // useful work. The source check also makes duplicate clicks after
+                // the replacement snapshot a no-op.
+                if (!source?.truncationMessage || load_all_csv_rows) return;
+                load_all_csv_rows = true;
+                if (!await refresh_panel_source(true, 'recovery')) {
+                    // A failed refresh must leave the action retryable.
+                    load_all_csv_rows = false;
+                }
                 return;
             case 'saveCsv':
                 if (profile.editing) {

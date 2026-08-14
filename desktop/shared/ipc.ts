@@ -1,5 +1,6 @@
 // IPC channel names shared between the electron main process and the
 // preload scripts. Keep in one place so both bundles agree.
+import type { ViewerSettingTarget } from '../../src/host-ports';
 
 /** Webview → host viewer protocol messages (WebviewMessage payloads). */
 export const CHANNEL_WEBVIEW_MESSAGE = 'tableViewer:webviewMessage';
@@ -51,7 +52,10 @@ export const CHANNEL_WELCOME_OPEN_FILES = 'welcome:openFiles';
 export const CHANNEL_WELCOME_OPEN_PREFERENCES = 'welcome:openPreferences';
 
 /** Preferences window channels. */
-export type PreferencesTarget = 'maxFileSizeMiB';
+export type PreferencesTarget = Extract<
+    ViewerSettingTarget,
+    'maxFileSizeMiB' | 'csvMaxRows'
+>;
 export const CHANNEL_PREFS_FOCUS_TARGET = 'prefs:focusTarget';
 export const CHANNEL_PREFS_GET = 'prefs:get';
 export const CHANNEL_PREFS_SET = 'prefs:set';

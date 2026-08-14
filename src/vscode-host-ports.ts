@@ -79,10 +79,10 @@ export const vscode_host_ui_port: HostUiPort = {
                 ? 'configure'
                 : 'cancel';
     },
-    async open_file_size_limit_setting(): Promise<void> {
+    async open_setting(target): Promise<void> {
         await vscode.commands.executeCommand(
             'workbench.action.openSettings',
-            '@id:tableViewer.maxFileSizeMiB',
+            `@id:tableViewer.${target}`,
         );
     },
 };

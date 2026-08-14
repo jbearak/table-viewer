@@ -3,7 +3,7 @@ import * as vscode from 'vscode';
 import { CsvDataSource } from './data-source/csv-source';
 import {
     attach_viewer,
-    build_csv_source,
+    csv_source_builder,
     type ViewerController,
     type ViewerProfile,
 } from './viewer-controller';
@@ -188,11 +188,7 @@ function setup_preview(
     const profile: ViewerProfile = {
         editing: false,
         previewMode: true,
-        build_source: (raw, file_path) => build_csv_source(
-            raw,
-            file_path,
-            vscode_viewer_host.config.csv_max_rows(),
-        ),
+        build_source: csv_source_builder(vscode_viewer_host.config),
         on_source_adopted(ds) {
             line_map = (ds as CsvDataSource).lineMap();
         },

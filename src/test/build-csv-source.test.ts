@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { CsvDataSource } from '../data-source/csv-source';
 import { build_csv_source } from '../viewer-controller';
 
 const enc = new TextEncoder();
@@ -17,6 +18,23 @@ describe('build_csv_source max-row normalization', () => {
         source.close();
     });
 
+    it('respects a configured limit above the historical default', async () => {
+        const create = vi.spyOn(CsvDataSource, 'create')
+            .mockResolvedValue({} as CsvDataSource);
+        try {
+            await build_csv_source(csv, '/tmp/rows.csv', 1_250_000);
+
+            expect(create).toHaveBeenCalledWith(
+                csv,
+                ',',
+                1_250_000,
+                { firstRowIsHeader: true },
+            );
+        } finally {
+            create.mockRestore();
+        }
+    });
+
     it('clamps negative and infinite values to the safe range', async () => {
         const negative = await build_csv_source(csv, '/tmp/rows.csv', -5);
         expect(negative.meta().sheets[0].rowCount).toBe(0);
@@ -25,5 +43,18 @@ describe('build_csv_source max-row normalization', () => {
         const infinite = await build_csv_source(csv, '/tmp/rows.csv', Infinity);
         expect(infinite.meta().sheets[0].rowCount).toBe(3);
         infinite.close();
+    });
+
+    it('loads every row for an explicit per-view override', async () => {
+        const source = await build_csv_source(
+            csv,
+            '/tmp/rows.csv',
+            2,
+            { loadAllRows: true },
+        );
+
+        expect(source.meta().sheets[0].rowCount).toBe(3);
+        expect(source.truncationMessage).toBeUndefined();
+        source.close();
     });
 });

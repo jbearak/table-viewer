@@ -26,6 +26,7 @@ export interface FileSystemPort {
 
 export type SaveDialogChoice = 'save' | 'discard' | 'cancel';
 export type FileSizeLimitDialogChoice = 'openAnyway' | 'configure' | 'cancel';
+export type ViewerSettingTarget = 'maxFileSizeMiB' | 'csvMaxRows';
 
 export interface FileSizeLimitDialogDetails {
     readonly actualBytes: number;
@@ -48,7 +49,8 @@ export interface HostUiPort {
     show_file_size_limit_dialog(
         details: FileSizeLimitDialogDetails,
     ): Promise<FileSizeLimitDialogChoice>;
-    open_file_size_limit_setting(): Promise<void>;
+    /** Open the requested viewer preference, focused on that field. */
+    open_setting(target: ViewerSettingTarget): Promise<void>;
 }
 
 /** Viewer configuration reads (replaces direct viewer-config/vscode reads). */
