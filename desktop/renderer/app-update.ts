@@ -112,7 +112,9 @@ primary.addEventListener('click', () => update_api.perform('primary'));
 apply_theme(update_api.get_theme());
 update_api.on_theme_changed(apply_theme);
 update_api.on_settings_changed(apply_fonts);
-void update_api.get_settings().then(apply_fonts);
+void update_api.get_settings().then(apply_fonts, (error: unknown) => {
+    console.error('failed to read settings for the update window', error);
+});
 update_api.on_state_changed(render);
 const initial_state = update_api.get_state();
 if (initial_state) render(initial_state);

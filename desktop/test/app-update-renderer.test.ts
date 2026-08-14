@@ -68,6 +68,10 @@ describe('application update renderer', () => {
             progress: { percent: 47, transferred: 39_000_000, total: 82_000_000 },
         });
         expect(document.getElementById('heading')?.firstChild).toBe(downloading_heading);
+        state_listener?.({ kind: 'downloading', version: '2.5.0' });
+        expect(document.getElementById('progressBar')?.hasAttribute('value')).toBe(false);
+        expect(document.getElementById('progressAmount')?.textContent)
+            .toBe('Starting download…');
 
         state = { kind: 'ready', version: '2.5.0' };
         state_listener?.(state);
@@ -75,5 +79,39 @@ describe('application update renderer', () => {
         expect(document.getElementById('primary')?.textContent).toBe('Restart and install');
         (document.getElementById('primary') as HTMLButtonElement).click();
         expect(perform).toHaveBeenCalledWith('primary');
+        (document.getElementById('secondary') as HTMLButtonElement).click();
+        expect(perform).toHaveBeenCalledWith('secondary');
+    });
+
+    it('contains a settings read failure', async () => {
+        const failure = new Error('settings unavailable');
+        const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
+        Object.defineProperty(window, 'appUpdateApi', {
+            configurable: true,
+            value: {
+                titlebar_inset: 0,
+                titlebar_active: () => true,
+                on_titlebar_active: () => {},
+                titlebar_zoom: () => 1,
+                on_titlebar_zoom: () => {},
+                get_state: () => undefined,
+                perform: () => {},
+                on_state_changed: () => {},
+                get_theme: () => theme_payload('light'),
+                on_theme_changed: () => {},
+                get_settings: async () => { throw failure; },
+                on_settings_changed: () => {},
+            },
+        });
+
+        try {
+            await import('../renderer/app-update');
+            await vi.waitFor(() => expect(logged).toHaveBeenCalledWith(
+                'failed to read settings for the update window',
+                failure,
+            ));
+        } finally {
+            logged.mockRestore();
+        }
     });
 });

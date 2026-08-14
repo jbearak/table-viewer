@@ -48,13 +48,15 @@ export function displayed_update_percent(percent: number): number {
 export async function open_manual_update_page(
     open: () => Promise<unknown>,
     dismiss: () => void,
-): Promise<'dismiss'> {
+): Promise<'closed'> {
     try {
         await open();
     } finally {
         dismiss();
     }
-    return 'dismiss';
+    // The user accepted the manual-download handoff; this is not the same as
+    // choosing Skip, so the coordinator must not persist the version as dismissed.
+    return 'closed';
 }
 
 export function create_app_update_window_presenter(

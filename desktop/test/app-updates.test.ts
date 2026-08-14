@@ -471,18 +471,21 @@ describe('desktop app updates', () => {
 
     it('keeps an approved install armed when shutdown closes a re-opened prompt', async () => {
         const value = fixture();
+        const reopened = deferred<AppUpdatePromptChoice>();
         vi.mocked(value.dialogs.offer_download).mockResolvedValue('accept');
         vi.mocked(value.dialogs.offer_restart)
             .mockResolvedValueOnce('accept')
-            .mockResolvedValueOnce('closed');
+            .mockReturnValueOnce(reopened.promise);
         value.updates.check_manually();
         value.listeners.available({ version: '2.0.0' });
         await vi.waitFor(() => expect(value.engine.download_update).toHaveBeenCalledOnce());
         value.listeners.downloaded({ version: '2.0.0' });
         await vi.waitFor(() => expect(value.request_quit).toHaveBeenCalledOnce());
-        value.updates.begin_shutdown();
         value.updates.check_manually();
-        expect(value.dialogs.offer_restart).toHaveBeenCalledOnce();
+        expect(value.dialogs.offer_restart).toHaveBeenCalledTimes(2);
+        value.updates.begin_shutdown();
+        reopened.resolve('closed');
+        await reopened.promise;
 
         expect(value.updates.install_if_requested()).toBe('started');
     });

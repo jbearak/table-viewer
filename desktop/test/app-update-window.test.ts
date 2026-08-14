@@ -113,4 +113,10 @@ describe('application update window', () => {
         )).rejects.toThrow('browser unavailable');
         expect(dismiss).toHaveBeenCalledOnce();
     });
+
+    it('closes an accepted manual-download prompt without reporting a skip', async () => {
+        const dismiss = vi.fn();
+        await expect(open_manual_update_page(async () => {}, dismiss)).resolves.toBe('closed');
+        expect(dismiss).toHaveBeenCalledOnce();
+    });
 });
