@@ -120,7 +120,7 @@ Table Viewer uses VS Code's editor font (`editor.fontFamily` and `editor.fontSiz
 | `tableViewer.csvMaxRows` | `1000000` | Maximum rows to display for CSV/TSV files. Excess rows are truncated with a banner. |
 | `tableViewer.maxFileSizeMiB` | `256` | Maximum file size in MiB. Applies to all supported file types. |
 
-## Standalone desktop app (experimental)
+## Standalone desktop app
 
 Table Viewer also runs as a standalone Electron desktop app that reuses the same viewer, grid, and persistence code — no VS Code required. See [desktop/README.md](desktop/README.md) for build, run, packaging, and testing instructions.
 
