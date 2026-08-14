@@ -236,6 +236,22 @@ describe('host-bridge', () => {
             'session:1', 0, 'People')).toBe(true);
     });
 
+    it('recognizes an authoritative echo of the latest unacknowledged payload', async () => {
+        const { pending_edit_durability } = await setup_pending_edit_durability();
+        const edits = { '0:0': { value: 'P', base: 'p' } };
+        const sequence = pending_edit_durability.publish(
+            'session:echo', edits, 0, 'People');
+
+        expect(pending_edit_durability.unacknowledged_payload_matches(
+            'session:echo', edits, 0, 'People')).toBe(true);
+        expect(pending_edit_durability.unacknowledged_payload_matches(
+            'session:echo', null, 0, 'People')).toBe(false);
+
+        pending_edit_durability.acknowledge('session:echo', sequence);
+        expect(pending_edit_durability.unacknowledged_payload_matches(
+            'session:echo', edits, 0, 'People')).toBe(false);
+    });
+
     it('prefers an injected global bridge over acquireVsCodeApi', async () => {
         const injected = { postMessage: vi.fn() };
         (globalThis as { __tableViewerHostBridge?: unknown })

@@ -1,4 +1,4 @@
-import { worksheet_target_key } from '../types';
+import { type SheetPendingEditCells, worksheet_target_key } from '../types';
 
 /**
  * Host bridge: a narrow abstraction over the channel the webview uses to talk
@@ -204,6 +204,25 @@ export const pending_edit_durability = {
         return publication !== undefined
             && channel !== undefined
             && channel.unacknowledgedSequences.has(publication.sequence);
+    },
+    unacknowledged_payload_matches(
+        editSessionId: string,
+        edits: SheetPendingEditCells | null,
+        sheetIndex: number,
+        sheetName: string | undefined,
+        worksheetId?: string,
+    ): boolean {
+        const channel = pending_edit_channels.get(editSessionId);
+        const publication = latest_pending_edit_publication(
+            editSessionId,
+            sheetIndex,
+            sheetName,
+            worksheetId,
+        );
+        return publication !== undefined
+            && channel !== undefined
+            && channel.unacknowledgedSequences.has(publication.sequence)
+            && publication.payload === JSON.stringify(edits);
     },
     acknowledge(editSessionId: string, sequence: number): void {
         const channel = pending_edit_channels.get(editSessionId);

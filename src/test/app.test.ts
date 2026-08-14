@@ -5392,6 +5392,39 @@ describe('edit mode save exit', () => {
         expect(posted()[0]).toMatchObject({ sheetName: 'Inventory' });
     });
 
+    it('does not retry an unacknowledged empty payload already present in a refresh', async () => {
+        const meta = make_meta(['People'], false);
+        const capabilities = {
+            csvEditable: true,
+            csvEditingSupported: true,
+            csvEditSessionId: 'echo-session',
+        };
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities,
+        }));
+        const { pending_edit_durability } = await import('../webview/host-bridge');
+
+        post_message.mockClear();
+        const pending_posts = () => post_message.mock.calls
+            .map(([message]) => message)
+            .filter((message) => message?.type === 'pendingEditsChanged');
+        pending_edit_durability.publish('echo-session', null, 0, 'People');
+        await vi.waitUntil(() => pending_posts().length === 1);
+
+        post_message.mockClear();
+        for (let delivery = 0; delivery < 3; delivery += 1) {
+            await dispatch_host_message(refresh_snapshot_message(meta, {
+                capabilities,
+            }));
+        }
+
+        // The host delivers its committed snapshot before the explicit
+        // pendingEditsAcknowledged message. Re-publishing the same map here makes
+        // each snapshot generate the next write/snapshot pair forever.
+        expect(pending_posts()).toHaveLength(0);
+    });
+
     it('holds the worksheet tabs while a save dialog is open', async () => {
         // The dialog asks about one worksheet, and the answer is applied against the
         // *active* sheet's store. Switching tabs while it was open pointed the answer
