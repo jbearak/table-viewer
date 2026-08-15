@@ -1,0 +1,16 @@
+{
+  "name": "@glideapps/glide-data-grid",
+  "version": "6.0.3",
+  "license": "MIT",
+  "homepage": "https://github.com/glideapps/glide-data-grid",
+  "vendoredFrom": "node_modules/@glideapps/glide-data-grid/src (the npm package ships its TypeScript source)",
+  "vendoredOn": "2026-08-15",
+  "modifications": [
+    "Trimmed cell renderers to marker/new-row/boolean/loading/text; dropped image, markdown, number, bubble, drilldown, uri, protected and row-id renderers plus their private overlay editors, markdown-div, and the marked / react-number-format / react-responsive-carousel dependencies.",
+    "Replaced lodash imports (clamp, range, uniq, flatten, debounce, throttle, groupBy, has) with common/collection-utils.ts.",
+    "Stripped @linaria styled components: each became a plain element with a semantic gdg-* class; rules live in styles.css (imported by the app instead of dist/index.css).",
+    "OverlayImageEditorProps kept as a standalone type (internal/data-grid-overlay-editor/overlay-image-editor-props.ts) because the editor-callback contract references it.",
+    "index.ts re-created as the trimmed public facade; docs, stories and unused entry points omitted.",
+    "Subsequent commits add native merged-cell support; see git history of this directory."
+  ]
+}

@@ -6,7 +6,7 @@ import React, {
     useMemo,
     useRef,
 } from 'react';
-import type { DataEditorRef, Theme } from '@glideapps/glide-data-grid';
+import type { DataEditorRef, Theme } from './glide-data-grid';
 import type { RenderedCell } from '../data-source/interface';
 import type { MergeIndex } from './merge-index';
 import { HEADER_HEIGHT_PX } from './grid-model';

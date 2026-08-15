@@ -24,7 +24,7 @@ import {
     type Item,
     type ProvideEditorCallback,
     type Rectangle,
-} from '@glideapps/glide-data-grid';
+} from './glide-data-grid';
 import type { RenderedCell, SheetMeta } from '../data-source/interface';
 import {
     EMPTY_TRANSFORM,
@@ -156,7 +156,7 @@ import { use_row_loader } from './use-row-loader';
 import { theme_font_size_px, use_vscode_theme } from './vscode-theme';
 import { host_bridge, pending_edit_durability } from './host-bridge';
 import { scroll_preview_to_row } from './preview-scroll';
-import '@glideapps/glide-data-grid/dist/index.css';
+import './glide-data-grid/styles.css';
 
 /**
  * Editing snapshot reported up to {@link App} so it can drive the toolbar dirty

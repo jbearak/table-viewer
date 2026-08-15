@@ -1,4 +1,4 @@
-import type { GridSelection, Rectangle } from '@glideapps/glide-data-grid';
+import type { GridSelection, Rectangle } from './glide-data-grid';
 import type {
     CellHighlightColor,
     CellHighlightSelection,

@@ -1,4 +1,4 @@
-import { CompactSelection, type GridSelection } from '@glideapps/glide-data-grid';
+import { CompactSelection, type GridSelection } from '../webview/glide-data-grid';
 import { describe, expect, it, vi } from 'vitest';
 import { plan_cell_highlight_mutation } from '../cell-highlight-command';
 import { create_column_projection } from '../webview/column-projection';

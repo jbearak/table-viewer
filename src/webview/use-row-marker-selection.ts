@@ -11,7 +11,7 @@ import {
     type GridMouseEventArgs,
     type GridSelection,
     type Item,
-} from '@glideapps/glide-data-grid';
+} from './glide-data-grid';
 import type { DisplayRowInterval } from '../types';
 import {
     grid_selection_contains_row,

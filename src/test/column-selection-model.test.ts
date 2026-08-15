@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { CompactSelection, type GridSelection } from '@glideapps/glide-data-grid';
+import { CompactSelection, type GridSelection } from '../webview/glide-data-grid';
 import {
     grid_selection_contains_column,
     header_drag_columns,

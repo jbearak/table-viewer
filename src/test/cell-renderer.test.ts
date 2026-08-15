@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { GridCellKind } from '@glideapps/glide-data-grid';
+import { GridCellKind } from '../webview/glide-data-grid';
 import { build_grid_cell, font_style } from '../webview/cell-renderer';
 import { MergeIndex } from '../webview/merge-index';
 import type { RenderedCell } from '../data-source/interface';
