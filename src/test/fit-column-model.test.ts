@@ -58,6 +58,14 @@ describe('fit_column_width', () => {
         expect(out).toBe(130 + COLUMN_PADDING);
     });
 
+    it('fits multiline cells to their widest visual line', () => {
+        const out = fit_column_width(
+            [cell('first line\r\nthis line is widest\nlast')],
+            fake_measure,
+        );
+        expect(out).toBe('this line is widest'.length * 10 + COLUMN_PADDING);
+    });
+
     it('measures bold cells at their heavier width', () => {
         // bold "abcd" → 40 + 50 = 90, beats plain "abcdef" → 60.
         const out = fit_column_width(

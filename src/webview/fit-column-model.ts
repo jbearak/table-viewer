@@ -39,8 +39,11 @@ export function canvas_font(
 }
 
 /**
- * Fitted width for one column: the widest measured cell plus padding, never
- * below {@link MIN_COLUMN_WIDTH}. An empty column collapses to the minimum.
+ * Fitted width for one column: the widest measured visual line plus padding,
+ * never below {@link MIN_COLUMN_WIDTH}. Measuring lines independently mirrors
+ * Glide's column-border auto-size rule for wrapped text; passing a whole
+ * multiline string to canvas `measureText` would instead size the column as if
+ * its lines were laid out side by side. An empty column collapses to the minimum.
  */
 export function fit_column_width(
     cells: readonly MeasurableCell[],
@@ -50,8 +53,12 @@ export function fit_column_width(
 ): number {
     let max = 0;
     for (const cell of cells) {
-        const w = measure(cell);
-        if (w > max) max = w;
+        // XLSX text commonly uses CRLF while edits made in the webview use LF.
+        // Treat either (and a standalone CR) as the same hard visual break.
+        for (const line of cell.text.split(/\r\n?|\n/)) {
+            const w = measure({ ...cell, text: line });
+            if (w > max) max = w;
+        }
     }
     if (max === 0) return min_width;
     return Math.max(min_width, max + padding);
