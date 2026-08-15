@@ -253,21 +253,23 @@ export function isInnerOnlyCell(cell: InnerGridCell): cell is InnerOnlyGridCell 
 
 /** @category Cells */
 export function isReadWriteCell(cell: GridCell): cell is ReadWriteGridCell {
-    if (!isEditableGridCell(cell) || cell.kind === GridCellKind.Image) return false;
+    if (!isEditableGridCell(cell)) return false;
 
-    if (
-        cell.kind === GridCellKind.Text ||
-        cell.kind === GridCellKind.Number ||
-        cell.kind === GridCellKind.Markdown ||
-        cell.kind === GridCellKind.Uri ||
-        cell.kind === GridCellKind.Custom ||
-        cell.kind === GridCellKind.Boolean
-    ) {
-        return cell.readonly !== true;
+    // Exhaustive switch (rather than upstream's if-chain + assertNever on the
+    // leftover union) so adding an editable kind fails to compile here.
+    switch (cell.kind) {
+        case GridCellKind.Image:
+            return false;
+        case GridCellKind.Text:
+        case GridCellKind.Number:
+        case GridCellKind.Markdown:
+        case GridCellKind.Uri:
+        case GridCellKind.Custom:
+        case GridCellKind.Boolean:
+            return cell.readonly !== true;
+        default:
+            return assertNever(cell, "A cell was passed with an invalid kind");
     }
-    // Upstream used assertNever here; TS 5.9 no longer narrows the
-    // ValidatedGridCell intersection to never, so the cast keeps the guard.
-    return assertNever(cell as never, "A cell was passed with an invalid kind");
 }
 
 /** @category Cells */

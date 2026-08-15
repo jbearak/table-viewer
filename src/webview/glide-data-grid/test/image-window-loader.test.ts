@@ -175,11 +175,12 @@ describe("ImageWindowLoaderImpl", () => {
             vi.runAllTimers();
 
             vi.useRealTimers();
-            await new Promise(r => setTimeout(r, 100));
+            // Poll for the observable result instead of sleeping: the rAF
+            // callback's await chain (load → decode) is a few microtasks.
+            await vi.waitFor(() => expect((loader as any).cache[key].img).toBe(img));
 
             // Assert: Ensure `decode` was called and the image data is updated in the cache
             expect(img.decode).toHaveBeenCalled();
-            expect((loader as any).cache[key].img).toBe(img);
 
             // Cleanup: Restore the spies
             spyConstructor.mockRestore();
@@ -202,10 +203,12 @@ describe("ImageWindowLoaderImpl", () => {
             vi.runAllTimers();
 
             vi.useRealTimers();
-            await new Promise(r => setTimeout(r, 100));
+            // Poll until decode has been reached, then drain the (settled)
+            // rejection chain — a bounded microtask yield, not a fixed sleep.
+            await vi.waitFor(() => expect(img.decode).toHaveBeenCalled());
+            for (let i = 0; i < 10; i++) await Promise.resolve();
 
             // Assert: Ensure `decode` was called and the image data remains undefined in the cache
-            expect(img.decode).toHaveBeenCalled();
             expect((loader as any).cache[key].img).toBeUndefined();
 
             // Cleanup: Restore the spies

@@ -25,14 +25,6 @@ export const DataGridOverlayEditorStyle = React.forwardRef<HTMLElement, Props>((
         ...style,
     };
     const cls = "gdg-overlay-editor " + (className ?? "");
-    return as === "label" ? (
-        <label ref={ref as React.Ref<HTMLLabelElement>} className={cls} style={dynamicStyle} {...rest}>
-            {children}
-        </label>
-    ) : (
-        <div ref={ref as React.Ref<HTMLDivElement>} className={cls} style={dynamicStyle} {...rest}>
-            {children}
-        </div>
-    );
+    return React.createElement(as ?? "div", { ...rest, ref, className: cls, style: dynamicStyle }, children);
 });
 DataGridOverlayEditorStyle.displayName = "DataGridOverlayEditorStyle";

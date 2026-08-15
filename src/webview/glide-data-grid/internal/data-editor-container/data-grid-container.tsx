@@ -1,26 +1,19 @@
 // De-Linaria'd: upstream used a @linaria/react styled wrapper; the static
 // rules live in ../../styles.css (.gdg-wrapper) and the dynamic width/height
-// become inline styles.
+// become inline styles (React renders bare numbers as px).
 import * as React from "react";
 
-interface WrapperProps {
+interface Props extends React.HTMLAttributes<HTMLDivElement> {
     inWidth: number | string;
     inHeight: number | string;
 }
 
-function toCss(x: number | string) {
-    if (typeof x === "string") return x;
-    return `${x}px`;
-}
-
-interface Props extends WrapperProps, React.HTMLAttributes<HTMLDivElement> {}
-
-export const DataEditorContainer: React.FunctionComponent<React.PropsWithChildren<Props>> = p => {
+export const DataEditorContainer: React.FC<Props> = p => {
     const { inWidth, inHeight, children, style, className, ...rest } = p;
     return (
         <div
             className={"gdg-wrapper " + (className ?? "")}
-            style={{ ...style, width: toCss(inWidth), height: toCss(inHeight) }}
+            style={{ ...style, width: inWidth, height: inHeight }}
             {...rest}>
             {children}
         </div>

@@ -16,8 +16,7 @@ interface Props {
 export const GroupRename: React.FC<Props> = p => {
     const { bounds, group, onClose, canvasBounds, onFinish } = p;
 
-    const [value, setValue] = React.useState(group);
-
+    // Uncontrolled: the DOM input already holds the value; read it on Enter.
     return (
         <ClickOutsideContainer
             style={{
@@ -33,13 +32,12 @@ export const GroupRename: React.FC<Props> = p => {
                 className="gdg-group-rename-input"
                 style={{ minHeight: Math.max(16, bounds.height - 10) }}
                 data-testid="group-rename-input"
-                value={value}
+                defaultValue={group}
                 onBlur={onClose}
-                onFocus={e => e.target.setSelectionRange(0, value.length)}
-                onChange={e => setValue(e.target.value)}
+                onFocus={e => e.currentTarget.select()}
                 onKeyDown={e => {
                     if (e.key === "Enter") {
-                        onFinish(value);
+                        onFinish(e.currentTarget.value);
                     } else if (e.key === "Escape") {
                         onClose();
                     }

@@ -27,27 +27,6 @@ export default defineConfig({
           environment: 'jsdom',
           setupFiles: ['src/webview/glide-data-grid/test/vitest.setup.ts'],
           clearMocks: true,
-          fakeTimers: {
-            toFake: [
-              'setTimeout',
-              'clearTimeout',
-              'setInterval',
-              'clearInterval',
-              'setImmediate',
-              'clearImmediate',
-              'Date',
-              'performance',
-              'requestAnimationFrame',
-              'cancelAnimationFrame',
-            ],
-          },
-          deps: {
-            optimizer: {
-              web: {
-                include: ['vitest-canvas-mock'],
-              },
-            },
-          },
         },
       },
     ],

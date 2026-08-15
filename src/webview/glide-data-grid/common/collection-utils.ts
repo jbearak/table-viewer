@@ -4,7 +4,9 @@
 // not general lodash re-implementations.
 
 export function clamp(value: number, lower: number, upper: number): number {
-    return Math.min(Math.max(value, lower), upper);
+    // Upper bound first, lower bound last (lodash order): when the bounds
+    // cross (e.g. rows === 0 → clamp(row, 0, -1)) the lower bound wins.
+    return Math.max(Math.min(value, upper), lower);
 }
 
 export function range(end: number): number[];
@@ -32,20 +34,17 @@ export function uniq<T>(values: readonly T[]): T[] {
     return [...new Set(values)];
 }
 
-export function flatten<T>(values: readonly (T | readonly T[])[]): T[] {
-    const result: T[] = [];
-    for (const v of values) {
-        if (Array.isArray(v)) {
-            result.push(...v);
-        } else {
-            result.push(v as T);
-        }
-    }
-    return result;
+// One level deep, arrays-of-arrays only (all this tree passes). Array#flat
+// rather than push(...inner): spreading a huge inner array (e.g. a range over
+// a very wide span) would overflow the call stack.
+export function flatten<T>(values: readonly (readonly T[])[]): T[] {
+    return values.flat() as T[];
 }
 
 export function groupBy<T>(values: readonly T[], iteratee: (value: T) => string | number): Record<string, T[]> {
-    const result: Record<string, T[]> = {};
+    // Null prototype: keys are arbitrary strings (e.g. theme colors), and a
+    // key like "constructor" must not resolve to an inherited member.
+    const result: Record<string, T[]> = Object.create(null);
     for (const v of values) {
         const key = String(iteratee(v));
         (result[key] ??= []).push(v);
@@ -71,32 +70,27 @@ export function debounce<Args extends unknown[]>(fn: (...args: Args) => void, wa
 }
 
 // Leading + trailing throttle, matching lodash/throttle defaults for the
-// image-window-loader's sendLoaded batching.
-export function throttle<Args extends unknown[]>(fn: (...args: Args) => void, wait: number): (...args: Args) => void {
+// image-window-loader's sendLoaded batching. Zero-argument only — the sole
+// call site takes no arguments, so no argument buffering.
+export function throttle(fn: () => void, wait: number): () => void {
     let last = 0;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    let pendingArgs: Args | undefined;
-    const invoke = (args: Args) => {
+    const invoke = () => {
         last = Date.now();
-        fn(...args);
+        fn();
     };
-    return (...args: Args) => {
+    return () => {
         const remaining = wait - (Date.now() - last);
         if (remaining <= 0) {
             if (timer !== undefined) {
                 clearTimeout(timer);
                 timer = undefined;
             }
-            invoke(args);
+            invoke();
         } else {
-            pendingArgs = args;
             timer ??= setTimeout(() => {
                 timer = undefined;
-                if (pendingArgs !== undefined) {
-                    const a = pendingArgs;
-                    pendingArgs = undefined;
-                    invoke(a);
-                }
+                invoke();
             }, remaining);
         }
     };
