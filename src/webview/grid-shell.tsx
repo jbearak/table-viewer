@@ -1640,10 +1640,11 @@ export function GridShell({
             if (!text) return;
 
             const flags = font_flags_for_cell(display_column, row);
-            // build_grid_cell always sets allowWrapping, so the overflow estimate
-            // models every cell as wrapping — the question is purely whether the
-            // wrapped layout fits the row height.
-            const wrapping = true;
+            // Mirror build_grid_cell's allowWrapping rule (hard break, or a row
+            // grown past the default) so the overflow estimate matches how Glide
+            // actually painted the cell.
+            const wrapping = has_line_break(text)
+                || cell_bounds.height > default_row_height;
             const overflows = text_overflows_cell(
                 text,
                 cell_bounds.width,
@@ -1682,6 +1683,7 @@ export function GridShell({
             font_flags_for_cell,
             font_size_px,
             measure_line_width,
+            default_row_height,
         ],
     );
 
@@ -1768,6 +1770,25 @@ export function GridShell({
         return color ? highlight_rgba(color, high_contrast) : undefined;
     }, [cell_highlights, high_contrast]);
 
+    const get_row_height = useCallback(
+        (row: number) => {
+            if (
+                row_resize_preview
+                && (
+                    row_resize_preview.row === row
+                    || row_resize_preview.preview_rows?.hasIndex(row)
+                )
+            ) return row_resize_preview.height;
+            return resolved_row_height(
+                row_heights,
+                row_height_overlay,
+                row,
+                default_row_height,
+            );
+        },
+        [default_row_height, row_heights, row_height_overlay, row_resize_preview],
+    );
+
     const get_cell_content = useCallback(
         (cell: Item): GridCell => {
             const [display_column, row] = cell;
@@ -1844,6 +1865,10 @@ export function GridShell({
                 show_formatting,
                 overlay,
                 font_size_px,
+                // Rows taller than the default get soft wrapping — the only rows
+                // where wrapping can reveal anything — so default-height rows keep
+                // Glide's cheap single-line paint (see text_cell's comment).
+                get_row_height(row) > default_row_height,
             );
         },
         // version: bumps when a page lands so the closure (and the redraw effect) refresh.
@@ -1857,6 +1882,8 @@ export function GridShell({
             get_source_row,
             get_highlight_background,
             store,
+            get_row_height,
+            default_row_height,
             // A theme switch re-derives the tints, so the callback must close
             // over the new ones (the full-region repaint effect below then
             // damages the cells already painted with the old ones).
@@ -2035,25 +2062,6 @@ export function GridShell({
             return { editor: tracking_editor, disablePadding: true, disableStyling: true };
         },
         [editable_cells, save_in_flight_ref, tracking_editor],
-    );
-
-    const get_row_height = useCallback(
-        (row: number) => {
-            if (
-                row_resize_preview
-                && (
-                    row_resize_preview.row === row
-                    || row_resize_preview.preview_rows?.hasIndex(row)
-                )
-            ) return row_resize_preview.height;
-            return resolved_row_height(
-                row_heights,
-                row_height_overlay,
-                row,
-                default_row_height,
-            );
-        },
-        [default_row_height, row_heights, row_height_overlay, row_resize_preview],
     );
 
     // Arm/clear the row-resize strip as the pointer nears a row border. Glide's

@@ -85,11 +85,16 @@ describe('build_grid_cell — plain cells', () => {
         });
     });
 
-    it('wraps single-line content too — wrapping is unconditional', () => {
+    it('does not enable wrapping for single-line content in a default-height row', () => {
+        expect((cell(1) as { allowWrapping?: boolean }).allowWrapping).toBeUndefined();
+    });
+
+    it('soft-wraps single-line content when the row is taller than the default', () => {
         // Deliberately more eager than Excel (which wraps only wrapText-styled
-        // cells): a taller row must always reveal more content, so long
+        // cells): a grown row must always reveal more content, so long
         // single-line values soft-wrap to the column width instead of clipping.
-        expect((cell(1) as { allowWrapping?: boolean }).allowWrapping).toBe(true);
+        const c = build_grid_cell(1, row, true, undefined, undefined, true);
+        expect((c as { allowWrapping?: boolean }).allowWrapping).toBe(true);
     });
 
     it('wraps and normalizes CRLF and bare CR displayed text, preserving raw data (#202)', () => {

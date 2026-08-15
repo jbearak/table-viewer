@@ -89,6 +89,7 @@ function text_cell(
     show_formatting: boolean,
     overlay?: CellEditOverlay,
     font_size_px: number = DEFAULT_CELL_FONT_SIZE_PX,
+    soft_wrap = false,
 ): GridCell {
     const style = show_formatting
         ? font_style(c.bold, c.italic, font_size_px)
@@ -115,17 +116,17 @@ function text_cell(
         data: overlay?.dirty_value ?? (c.raw ?? ''),
         displayData: display,
         allowOverlay: overlay?.editable ?? false,
-        // Always wrap, deliberately more eager than Excel: Excel wraps only cells
-        // styled with wrapText, but here a taller row should always reveal more of
-        // its content, so soft wrapping is unconditional rather than gated on the
-        // source style (which the parsers do not even read). With allowWrapping,
-        // Glide soft-wraps long lines to the column width and renders hard line
-        // breaks as separate lines; without it, everything past the column width
-        // is clipped no matter how tall the row is. Wrapped output beyond the row
-        // height is still clipped, so a default-height row looks single-line as
-        // before. Cost is fine: empty cells never reach the draw call, and the
-        // wrap layout (canvas-hypertxt) memoizes per text/font/width.
-        allowWrapping: true,
+        // Wrap on a hard line break, or whenever the caller says the row is tall
+        // enough for wrapping to show (`soft_wrap`: row height above the default).
+        // Deliberately more eager than Excel, which wraps only wrapText-styled
+        // cells — here a taller row should always reveal more of its content, so
+        // the source style is not consulted (the parsers do not even read it).
+        // Not unconditional, though: with allowWrapping Glide routes the draw
+        // through canvas-hypertxt's wrap layout, whose 500-entry cache a wide
+        // viewport churns every frame, so a default-height row — where wrapping
+        // could only ever show one line anyway — keeps the cheap truncating
+        // single-line path.
+        ...(display.includes('\n') || soft_wrap ? { allowWrapping: true } : {}),
         // Belt and braces with `allowOverlay: false`. Glide's paste path
         // (`pasteToCell` in data-editor.js) does not consult `allowOverlay` at all
         // — it gates on `isReadWriteCell`, which for a Text cell checks only
@@ -149,7 +150,8 @@ function text_cell(
  * Build the `GridCell` for a column of the given row. `cells` is the row's data
  * (from the paged loader), or undefined while the page is still loading. A
  * missing cell renders blank — still editable in edit mode (the overlay's
- * dirty value / tint apply), read-only otherwise.
+ * dirty value / tint apply), read-only otherwise. `soft_wrap` marks the row as
+ * taller than the default, which turns on soft wrapping for its cells.
  */
 export function build_grid_cell(
     col: number,
@@ -157,8 +159,9 @@ export function build_grid_cell(
     show_formatting: boolean,
     overlay?: CellEditOverlay,
     font_size_px: number = DEFAULT_CELL_FONT_SIZE_PX,
+    soft_wrap = false,
 ): GridCell {
     const c = cells?.[col];
     if (!c && !overlay) return BLANK;
-    return text_cell(c ?? EMPTY_CELL, show_formatting, overlay, font_size_px);
+    return text_cell(c ?? EMPTY_CELL, show_formatting, overlay, font_size_px, soft_wrap);
 }
