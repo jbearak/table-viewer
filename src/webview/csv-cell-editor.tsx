@@ -5,6 +5,7 @@ import {
     insert_newline,
     type EditorCommitNavigation,
 } from './csv-cell-editor-model';
+import { count_lines, has_line_break } from './line-breaks';
 
 /** Glide movement delta: `[deltaCol, deltaRow]`, each clamped to -1/0/+1. */
 type Movement = readonly [-1 | 0 | 1, -1 | 0 | 1];
@@ -45,7 +46,7 @@ export function CsvCellEditor({
 }: CsvCellEditorProps): React.JSX.Element {
     const initial = cell_text(value);
     const [text, set_text] = useState(initial);
-    const [is_multiline, set_is_multiline] = useState(initial.includes('\n'));
+    const [is_multiline, set_is_multiline] = useState(has_line_break(initial));
     const input_ref = useRef<HTMLInputElement | HTMLTextAreaElement | null>(null);
     const mounted_ref = useRef(false);
     const cursor_pos_ref = useRef<number | null>(null);
@@ -138,7 +139,7 @@ export function CsvCellEditor({
         return (
             <textarea
                 ref={input_ref as React.RefObject<HTMLTextAreaElement>}
-                rows={text.split('\n').length}
+                rows={count_lines(text)}
                 {...shared}
             />
         );

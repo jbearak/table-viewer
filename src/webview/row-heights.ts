@@ -14,6 +14,7 @@
  */
 
 import type { DisplayRowInterval } from '../types';
+import { count_lines } from './line-breaks';
 
 /** Default row height; matches Glide's Phase C constant. */
 export const DEFAULT_ROW_HEIGHT_PX = 24;
@@ -138,7 +139,7 @@ export const DEFAULT_ROW_PADDING_PX = 6;
 
 /**
  * Natural height needed to display `text` given its explicit line breaks.
- * Counts `\n`-separated lines (empty text is one line) and returns
+ * Counts visual lines (LF, CRLF, or bare CR; empty text is one line) and returns
  * `lines * line_height + padding`, floored at {@link DEFAULT_ROW_HEIGHT_PX} so a
  * single line keeps the standard height. Soft wrapping of long single lines is
  * not modeled — only hard newlines (the Shift+Alt+Enter editing case) grow rows.
@@ -149,7 +150,7 @@ export function natural_row_height(
     padding = DEFAULT_ROW_PADDING_PX,
     default_height = DEFAULT_ROW_HEIGHT_PX,
 ): number {
-    const lines = text.length === 0 ? 1 : text.split('\n').length;
+    const lines = text.length === 0 ? 1 : count_lines(text);
     return Math.max(default_height, lines * line_height + padding);
 }
 
