@@ -1,4 +1,4 @@
-import { GridCellKind, type GridCell } from '@glideapps/glide-data-grid';
+import { GridCellKind, type GridCell } from './glide-data-grid';
 import type { RenderedCell } from '../data-source/interface';
 import type { MergeIndex } from './merge-index';
 

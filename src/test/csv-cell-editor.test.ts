@@ -2,7 +2,7 @@
 
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { GridCellKind, type GridCell } from '@glideapps/glide-data-grid';
+import { GridCellKind, type GridCell } from '../webview/glide-data-grid';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CsvCellEditor } from '../webview/csv-cell-editor';
 

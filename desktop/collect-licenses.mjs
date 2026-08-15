@@ -65,6 +65,17 @@ for (const [pkg_path, info] of Object.entries(lock.packages)) {
     }
 }
 
+// Vendored source trees are not in the lockfile but ship in the bundles all
+// the same. Each carries an UPSTREAM.json (provenance) + LICENSE next to it.
+const vendored_dirs = [join(repo_dir, 'src', 'webview', 'glide-data-grid')];
+for (const dir of vendored_dirs) {
+    const upstream = JSON.parse(await readFile(join(dir, 'UPSTREAM.json'), 'utf8'));
+    const text = await license_text(dir);
+    if (!text) throw new Error(`vendored tree missing LICENSE: ${dir}`);
+    const header = `${upstream.name}@${upstream.version} (${upstream.license}, vendored and modified)`;
+    sections.push(`${header}\n${'-'.repeat(header.length)}\n${text.trim()}\n`);
+}
+
 sections.sort();
 missing.sort();
 

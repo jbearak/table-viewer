@@ -1,4 +1,4 @@
-import type { SizedGridColumn } from '@glideapps/glide-data-grid';
+import type { SizedGridColumn } from './glide-data-grid';
 
 /**
  * Pure grid-geometry helpers for the Glide renderer (Phase C). No DOM, no

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { GridCellKind, type GridCell } from '@glideapps/glide-data-grid';
+import { GridCellKind, type GridCell } from './glide-data-grid';
 import {
     editor_key_intent,
     insert_newline,

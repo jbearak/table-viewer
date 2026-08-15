@@ -1,0 +1,274 @@
+/*
+ * Static stylesheet for the vendored glide-data-grid fork.
+ *
+ * Upstream authored these rules as @linaria/react styled components,
+ * extracted to hashed class names at build time. This fork has no Linaria
+ * toolchain: each styled component became a plain element with a semantic
+ * gdg-* class, and its rules live here. Values that upstream interpolated
+ * from props are inline styles (or modifier classes) at the call sites.
+ * Only Chromium renders this (VS Code webview / Electron), so the -webkit-
+ * and -ms- fallbacks from the extracted CSS are dropped.
+ */
+
+/* internal/data-editor-container/data-grid-container.tsx (width/height inline) */
+.gdg-wrapper {
+    position: relative;
+    min-width: 10px;
+    min-height: 10px;
+    max-width: 100%;
+    max-height: 100%;
+    overflow: hidden;
+    overflow: clip;
+    direction: ltr;
+}
+.gdg-wrapper > :first-child {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+}
+
+/* internal/scrolling-data-grid/infinite-scroller.tsx (Safari → modifier class) */
+.gdg-scroll-region .dvn-scroller {
+    overflow: auto;
+    transform: translate3d(0, 0, 0);
+}
+.gdg-scroll-region-safari .dvn-scroller {
+    overflow: scroll;
+}
+.gdg-scroll-region .dvn-hidden {
+    visibility: hidden;
+}
+.gdg-scroll-region .dvn-scroll-inner {
+    display: flex;
+    pointer-events: none;
+}
+.gdg-scroll-region .dvn-scroll-inner > * {
+    flex-shrink: 0;
+}
+.gdg-scroll-region .dvn-scroll-inner .dvn-spacer {
+    flex-grow: 1;
+}
+.gdg-scroll-region .dvn-scroll-inner .dvn-stack {
+    display: flex;
+    flex-direction: column;
+}
+.gdg-scroll-region .dvn-underlay > * {
+    position: absolute;
+    left: 0;
+    top: 0;
+}
+.gdg-scroll-region canvas {
+    outline: none;
+}
+.gdg-scroll-region canvas * {
+    height: 0;
+}
+
+/* internal/growing-entry/growing-entry-style.tsx */
+.gdg-input-box {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    width: 100%;
+    height: 100%;
+    border-radius: 0px;
+    resize: none;
+    white-space: pre-wrap;
+    min-width: 100%;
+    overflow: hidden;
+    border: 0;
+    background-color: transparent;
+    font-size: var(--gdg-editor-font-size);
+    line-height: 16px;
+    font-family: var(--gdg-font-family);
+    -webkit-text-fill-color: var(--gdg-text-dark);
+    color: var(--gdg-text-dark);
+    padding: 0;
+    margin: 0;
+}
+.gdg-input-box::placeholder {
+    color: var(--gdg-text-light);
+}
+.gdg-invalid .gdg-input-box {
+    text-decoration: underline;
+    text-decoration-color: #d60606;
+}
+.gdg-shadow-box {
+    visibility: hidden;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    width: max-content;
+    max-width: 100%;
+    min-width: 100%;
+    font-size: var(--gdg-editor-font-size);
+    line-height: 16px;
+    font-family: var(--gdg-font-family);
+    color: var(--gdg-text-dark);
+    padding: 0;
+    margin: 0;
+    padding-bottom: 2px;
+}
+.gdg-growing-entry-style {
+    position: relative;
+    margin-top: 6px;
+}
+
+/* internal/data-grid-overlay-editor/data-grid-overlay-editor-style.tsx
+   (left/top/min-width/min-height/max-height and the --overlay-top /
+   --gdg-overlay-pad custom properties are inline at the call site) */
+.gdg-overlay-editor {
+    position: absolute;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    box-sizing: border-box;
+    width: max-content;
+    max-width: 400px;
+    font-family: var(--gdg-font-family);
+    font-size: var(--gdg-editor-font-size);
+    text-align: start;
+}
+@keyframes gdg-glide-fade-in {
+    from {
+        opacity: 0%;
+    }
+    to {
+        opacity: 100%;
+    }
+}
+.gdg-overlay-editor.gdg-style {
+    border-radius: 2px;
+    background-color: var(--gdg-bg-cell);
+    box-shadow:
+        0 0 0 1px var(--gdg-accent-color),
+        0px 0px 1px rgba(62, 65, 86, 0.4),
+        0px 6px 12px rgba(62, 65, 86, 0.15);
+    animation: gdg-glide-fade-in 60ms 1;
+}
+.gdg-overlay-editor.gdg-pad {
+    padding: var(--gdg-overlay-pad) 8.5px 3px;
+}
+.gdg-overlay-editor .gdg-clip-region {
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    overflow-x: hidden;
+    border-radius: 2px;
+    flex-grow: 1;
+}
+.gdg-overlay-editor .gdg-clip-region .gdg-growing-entry {
+    height: 100%;
+}
+.gdg-overlay-editor .gdg-clip-region input.gdg-input {
+    width: 100%;
+    border: none;
+    border-width: 0;
+    outline: none;
+}
+.gdg-overlay-editor .gdg-clip-region textarea.gdg-input {
+    border: none;
+    border-width: 0;
+    outline: none;
+}
+
+/* internal/data-grid-search/data-grid-search-style.tsx */
+.gdg-search-wrapper {
+    position: absolute;
+    top: 4px;
+    right: 20px;
+    background-color: var(--gdg-bg-cell);
+    color: var(--gdg-text-dark);
+    padding: 8px;
+    border: 1px solid var(--gdg-border-color);
+    border-radius: 6px;
+    font-size: var(--gdg-editor-font-size);
+    animation: gdg-search-fadein 0.15s forwards;
+}
+.gdg-search-wrapper.out {
+    animation: gdg-search-fadeout 0.15s forwards;
+}
+.gdg-search-wrapper .gdg-search-bar-inner {
+    display: flex;
+}
+.gdg-search-wrapper .gdg-search-status {
+    padding-top: 4px;
+    font-size: 11px;
+}
+.gdg-search-wrapper .gdg-search-progress {
+    position: absolute;
+    height: 4px;
+    left: 0;
+    bottom: 0;
+    background-color: var(--gdg-text-light);
+}
+.gdg-search-wrapper input {
+    width: 220px;
+    color: var(--gdg-textDark);
+    background-color: var(--gdg-bg-cell);
+    border: none;
+    border-width: 0;
+    outline: none;
+}
+.gdg-search-wrapper button {
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: none;
+    outline: none;
+    background: none;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    cursor: pointer;
+    color: var(--gdg-text-medium);
+}
+.gdg-search-wrapper button:hover {
+    color: var(--gdg-text-dark);
+}
+.gdg-search-wrapper button .button-icon {
+    width: 16px;
+    height: 16px;
+}
+.gdg-search-wrapper button:disabled {
+    opacity: 0.4;
+    pointer-events: none;
+}
+@keyframes gdg-search-fadeout {
+    from {
+        transform: translateX(0);
+    }
+    to {
+        transform: translateX(400px);
+    }
+}
+@keyframes gdg-search-fadein {
+    from {
+        transform: translateX(400px);
+    }
+    to {
+        transform: translateX(0);
+    }
+}
+
+/* data-editor/group-rename.tsx (input min-height inline) */
+.gdg-group-rename {
+    padding: 0 8px;
+    display: flex;
+    align-items: center;
+    background-color: var(--gdg-bg-header);
+}
+.gdg-group-rename-input {
+    flex-grow: 1;
+    border: none;
+    outline: none;
+    background-color: var(--gdg-bg-header-has-focus);
+    border-radius: 9px;
+    padding: 0 8px;
+    box-shadow: 0 0 0 1px var(--gdg-border-color);
+    color: var(--gdg-text-group-header);
+    font: var(--gdg-header-font-style) var(--gdg-font-family);
+}

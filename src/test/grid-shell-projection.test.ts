@@ -94,7 +94,7 @@ const grid_mock = vi.hoisted(() => ({
     ] as any),
 }));
 
-vi.mock('@glideapps/glide-data-grid', () => {
+vi.mock('../webview/glide-data-grid', () => {
     const React = require('react') as typeof import('react');
     return {
         CompactSelection: {

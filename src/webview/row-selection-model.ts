@@ -1,4 +1,4 @@
-import type { CompactSelection, GridSelection } from '@glideapps/glide-data-grid';
+import type { CompactSelection, GridSelection } from './glide-data-grid';
 import {
     header_drag_columns,
     header_drag_state_for_selection,
