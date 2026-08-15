@@ -1,57 +1,42 @@
 import type { MergeRange } from '../types';
 
-/** A merge range with precomputed spans and a hint for the renderer. */
+/** A merge range in source coordinates (inclusive bounds). */
 export interface MergeEntry {
     startRow: number;
     startCol: number;
     endRow: number;
     endCol: number;
-    /** endRow - startRow + 1 */
-    rowSpan: number;
-    /** endCol - startCol + 1 */
-    colSpan: number;
-    /**
-     * True when the merge spans only columns (rowSpan === 1, colSpan > 1).
-     * These render exactly via Glide's native `GridCell.span`; merges with
-     * rowSpan > 1 need the overlay canvas (see Spike D0 in the plan).
-     */
-    horizontalOnly: boolean;
 }
 
 const key = (row: number, col: number): string => `${row}:${col}`;
 
 /**
- * Fast lookups over a sheet's merge ranges, used by the cell renderer (anchor
- * vs covered classification, native-span decision) and the merge overlay
- * (enumerating rowSpan > 1 blocks). Pure and synchronous.
+ * Fast lookups over a sheet's merge ranges. Rendering, hit-testing, and
+ * selection are handled natively by the vendored grid's own resolver; this
+ * index serves the application-owned paths that see merges before or without a
+ * grid round-trip — guarded copy (blanking covered cells), Tab traversal and
+ * editor commit navigation (skipping covered cells), and multiline auto-grow
+ * (measuring a vertical merge's whole block). Pure and synchronous.
  *
  * Anchors and covered cells are materialized into maps for O(1) per-cell
- * lookups — the hot path is `getCellContent`, called once per visible cell on
- * every draw. The materialized size is the sum of merge areas, which is bounded
+ * lookups. The materialized size is the sum of merge areas, which is bounded
  * by the per-sheet merge-count cap and typically tiny (spreadsheet merges are
  * small).
  */
 export class MergeIndex {
-    readonly entries: MergeEntry[];
+    private readonly size: number;
     private readonly anchors = new Map<string, MergeEntry>();
     private readonly cellToEntry = new Map<string, MergeEntry>();
 
     constructor(merges: MergeRange[]) {
-        this.entries = merges.map((m) => {
-            const rowSpan = m.endRow - m.startRow + 1;
-            const colSpan = m.endCol - m.startCol + 1;
-            return {
+        this.size = merges.length;
+        for (const m of merges) {
+            const e: MergeEntry = {
                 startRow: m.startRow,
                 startCol: m.startCol,
                 endRow: m.endRow,
                 endCol: m.endCol,
-                rowSpan,
-                colSpan,
-                horizontalOnly: rowSpan === 1 && colSpan > 1,
             };
-        });
-
-        for (const e of this.entries) {
             this.anchors.set(key(e.startRow, e.startCol), e);
             for (let r = e.startRow; r <= e.endRow; r++) {
                 for (let c = e.startCol; c <= e.endCol; c++) {
@@ -65,31 +50,15 @@ export class MergeIndex {
     is_anchor(row: number, col: number): MergeEntry | null {
         // Fast path for the common no-merge sheet (CSV, most xlsx): skip the
         // per-cell key-string allocation + map lookup that runs once per visible
-        // cell on every draw. See entry_at.
-        if (this.entries.length === 0) return null;
+        // cell on every draw.
+        if (this.size === 0) return null;
         return this.anchors.get(key(row, col)) ?? null;
-    }
-
-    /** The merge containing (row, col) — anchor or interior — or null. */
-    entry_at(row: number, col: number): MergeEntry | null {
-        // getCellContent calls this once per visible cell on every draw. On a
-        // sheet with no merges (the common case) the map is empty, so short-
-        // circuit before allocating a `${row}:${col}` key for a guaranteed miss.
-        if (this.entries.length === 0) return null;
-        return this.cellToEntry.get(key(row, col)) ?? null;
     }
 
     /** True when (row, col) is inside a merge but is not its anchor. */
     is_covered(row: number, col: number): boolean {
-        if (this.entries.length === 0) return false;
+        if (this.size === 0) return false;
         const e = this.cellToEntry.get(key(row, col));
         return e !== undefined && !(e.startRow === row && e.startCol === col);
-    }
-
-    /** The anchor coordinates for (row, col); the cell itself when unmerged. */
-    anchor_of(row: number, col: number): { row: number; col: number } {
-        if (this.entries.length === 0) return { row, col };
-        const e = this.cellToEntry.get(key(row, col));
-        return e ? { row: e.startRow, col: e.startCol } : { row, col };
     }
 }

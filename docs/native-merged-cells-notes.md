@@ -247,3 +247,17 @@ Delete or fold into a real design doc before the PR if stale.
 - Not done (deliberate): indexing offscreen_anchor_merge_damage by anchor key.
   The linear scan runs only on tint/highlight *transitions* (user edits,
   saves, discards), not per frame; 10k cheap comparisons per commit is noise.
+
+## Stage 6 (overlay removal) decisions (recorded 2026-08-15)
+
+- Deleted src/webview/merge-overlay.tsx, merge-overlay-model.ts, and their
+  tests; scrubbed the last comment references (cell-overflow-model inset).
+- MergeIndex trimmed to its live surface: is_anchor (multiline auto-grow's
+  block measurement) and is_covered (guarded copy blanking, Tab/editor commit
+  navigation). entry_at, anchor_of, entries, rowSpan/colSpan, and the
+  overlay-era horizontalOnly hint had no consumers left and are gone.
+- selection.ts (move_active_cell for hjkl, expand_range_for_merges /
+  resolve_merge_anchor / normalize_range under expand_glide_selection) and
+  selection-glide.ts stay: shell-originated controlled writes and the
+  highlight projection still need app-side merge awareness before any grid
+  round-trip.
