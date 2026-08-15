@@ -1,3 +1,5 @@
+import { cell_highlight_key } from '../cell-highlights';
+
 /**
  * The set of cell keys (`"row:col"`) whose dirty- or conflict-tint differs
  * between two renders — i.e. exactly the cells the grid must repaint when the
@@ -88,6 +90,63 @@ export function visible_source_key_damage(
         }
     }
     return out;
+}
+
+/**
+ * Damage for merged blocks whose *anchor* key changed while the anchor cell
+ * sits outside the viewport — above it, left of it, or both (an anchor is its
+ * block's top-left, so those are the only off-screen directions with the block
+ * still visible). `visible_source_key_damage` scans visible display cells, so
+ * it can never surface such an anchor — yet the grid paints the whole block
+ * from the anchor's content, tint, and highlight. Returns the block's first
+ * visible cell per affected merge; the grid's damage expansion repaints the
+ * whole block from any member cell.
+ *
+ * Merges are only supplied under an identity view (no transform, no hidden
+ * columns — see GridShell's `merged_ranges`), so source keys compare directly
+ * against display-space merge coordinates.
+ */
+export function offscreen_anchor_merge_damage(
+    changed: ReadonlySet<string>,
+    visible: { x: number; y: number; width: number; height: number },
+    merges: readonly { x: number; y: number; width: number; height: number }[],
+): VisibleCellDamage[] {
+    if (changed.size === 0 || visible.width <= 0 || visible.height <= 0) return [];
+    const out: VisibleCellDamage[] = [];
+    for (const m of merges) {
+        // Block on screen at all?
+        if (m.y >= visible.y + visible.height || m.y + m.height <= visible.y) continue;
+        if (m.x >= visible.x + visible.width || m.x + m.width <= visible.x) continue;
+        // Anchor itself visible → the visible-cell scan already damages it.
+        if (m.y >= visible.y && m.x >= visible.x) continue;
+        if (!changed.has(cell_highlight_key(m.y, m.x))) continue;
+        out.push({ cell: [Math.max(m.x, visible.x), Math.max(m.y, visible.y)] });
+    }
+    return out;
+}
+
+/**
+ * The full damage set for changed source keys: the visible-cell scan plus the
+ * off-screen-anchor merge repair. Both source-keyed repaint effects (dirty /
+ * conflict tints and cell highlights) must use the same pipeline, so it lives
+ * here rather than being assembled twice at the call sites.
+ */
+export function source_key_damage(
+    changed: ReadonlySet<string>,
+    visible: { x: number; y: number; width: number; height: number },
+    display_column_for_source: (source_column: number) => number | undefined,
+    get_source_row: (display_row: number) => number | undefined,
+    merges: readonly { x: number; y: number; width: number; height: number }[],
+): VisibleCellDamage[] {
+    return [
+        ...visible_source_key_damage(
+            changed,
+            visible,
+            display_column_for_source,
+            get_source_row,
+        ),
+        ...offscreen_anchor_merge_damage(changed, visible, merges),
+    ];
 }
 
 function add_symmetric_difference(

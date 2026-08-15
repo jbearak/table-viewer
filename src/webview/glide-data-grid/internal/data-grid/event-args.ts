@@ -25,6 +25,13 @@ export interface GridMouseCellEventArgs extends BaseGridMouseEventArgs, Position
     readonly location: Item;
     readonly bounds: Rectangle;
     readonly isFillHandle: boolean;
+    // Fork addition: when the hit lands inside a merged block, `location` and
+    // `bounds` are canonicalized to the anchor and the block's full bounds.
+    // These carry the physical cell actually under the pointer for consumers
+    // that need per-cell geometry (row resize, drag sweeps). Equal to
+    // `location`/`bounds` outside merges; absent on synthetic args.
+    readonly physicalLocation?: Item;
+    readonly physicalBounds?: Rectangle;
 }
 
 /** @category Types */

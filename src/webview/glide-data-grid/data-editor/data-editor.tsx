@@ -2674,7 +2674,13 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                 }
             }
 
-            onItemHovered?.({ ...args, location: [args.location[0] - rowMarkerOffset, args.location[1]] as any });
+            onItemHovered?.({
+                ...args,
+                location: [args.location[0] - rowMarkerOffset, args.location[1]] as any,
+                ...(args.kind === "cell" && args.physicalLocation !== undefined
+                    ? { physicalLocation: [args.physicalLocation[0] - rowMarkerOffset, args.physicalLocation[1]] as any }
+                    : {}),
+            });
         },
         [
             allowedFillDirections,
@@ -3054,6 +3060,10 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
             const editList: EditListItem[] = [];
             for (let x = r.x; x < r.x + r.width; x++) {
                 for (let y = r.y; y < r.y + r.height; y++) {
+                    // Fork addition: a merged block deletes as one cell — clear the
+                    // anchor, never the covered members (whose worksheet cells are
+                    // hidden by the merge and must not receive edits).
+                    if (mergedCells?.isCovered(x, y) === true) continue;
                     const cellValue = getCellContent([x - rowMarkerOffset, y]);
                     if (!cellValue.allowOverlay && cellValue.kind !== GridCellKind.Boolean) continue;
                     let newVal: InnerGridCell | undefined = undefined;
@@ -3080,7 +3090,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
             mangledOnCellsEdited(editList);
             gridRef.current?.damage(editList.map(x => ({ cell: x.location })));
         },
-        [focus, getCellContent, getCellRenderer, mangledOnCellsEdited, rowMarkerOffset]
+        [focus, getCellContent, getCellRenderer, mangledOnCellsEdited, rowMarkerOffset, mergedCells]
     );
 
     const overlayOpen = overlay !== undefined;

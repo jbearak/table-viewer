@@ -102,7 +102,6 @@ import {
     type MeasurableCell,
 } from './fit-column-model';
 import { CsvCellEditor, type CsvCellEditorProps } from './csv-cell-editor';
-import { MergeOverlay, type MergeOverlayHandle } from './merge-overlay';
 import {
     RowResizeOverlay,
     type RowResizeOverlayHandle,
@@ -118,7 +117,7 @@ interface LiveEdit {
 import {
     changed_highlight_keys,
     changed_tint_keys,
-    visible_source_key_damage,
+    source_key_damage,
 } from './grid-repaint-model';
 import { expand_glide_selection } from './selection-glide';
 import {
@@ -440,60 +439,16 @@ export function GridShell({
     const default_row_height = default_row_height_for_font(font_size_px);
     const grid_ref = useRef<DataEditorRef | null>(null);
     const grid_root_ref = useRef<HTMLDivElement | null>(null);
-    const overlay_ref = useRef<MergeOverlayHandle | null>(null);
     const row_resize_ref = useRef<RowResizeOverlayHandle | null>(null);
     const row_resize_preview_ref = useRef<RowResizePreview | null>(null);
     const [row_resize_preview, set_row_resize_preview] =
         useState<RowResizePreview | null>(null);
     const visible_ref = useRef<Rectangle>({ x: 0, y: 0, width: 0, height: 0 });
-    const overlay_repaint_frame_ref = useRef<number | null>(null);
-    const overlay_repaint_region_ref = useRef<Rectangle | null>(null);
-    const overlay_repaint_attempts_ref = useRef(0);
     const last_preview_row = useRef<number | null>(null);
     const applied_preview_sequence_ref = useRef<number | null>(null);
     const preview_restore_not_before_ref = useRef(0);
     const preview_restore_timer_ref = useRef<number | null>(null);
     const preview_restore_token_ref = useRef(0);
-
-    // Glide records a scroll in React state before invoking
-    // onVisibleRegionChanged; its imperative getBounds only reflects that
-    // state once React commits the re-render. That commit runs as a scheduled
-    // continuous-priority task, so a single one-frame deferral can still lose
-    // the race to the browser's next paint — the overlay then freezes one
-    // scroll event behind on whichever axis moved last (the bug this replaces
-    // fixed only sometimes, and only appeared to be horizontal). Repaint on
-    // every frame while scroll callbacks keep arriving, then for a few trailing
-    // frames after the last one, so the final paint is guaranteed to run after
-    // Glide's commit has landed on both axes.
-    const schedule_overlay_scroll_repaint = useCallback((range: Rectangle) => {
-        // Frames to keep repainting after the last scroll callback. The commit
-        // is a user-blocking task; it cannot starve for this many paints.
-        const TRAILING_FRAMES = 3;
-        overlay_repaint_region_ref.current = range;
-        overlay_repaint_attempts_ref.current = 0;
-        if (overlay_repaint_frame_ref.current !== null) return;
-        const tick = () => {
-            overlay_repaint_frame_ref.current = null;
-            const latest = overlay_repaint_region_ref.current;
-            if (!latest) return;
-            overlay_ref.current?.repaint(latest);
-            if (overlay_repaint_attempts_ref.current >= TRAILING_FRAMES) {
-                overlay_repaint_region_ref.current = null;
-                return;
-            }
-            overlay_repaint_attempts_ref.current += 1;
-            overlay_repaint_frame_ref.current = window.requestAnimationFrame(tick);
-        };
-        overlay_repaint_frame_ref.current = window.requestAnimationFrame(tick);
-    }, []);
-
-    useEffect(() => () => {
-        if (overlay_repaint_frame_ref.current !== null) {
-            window.cancelAnimationFrame(overlay_repaint_frame_ref.current);
-            overlay_repaint_frame_ref.current = null;
-        }
-        overlay_repaint_region_ref.current = null;
-    }, []);
 
     const focus_grid = useCallback((): boolean => {
         // Glide's ref can exist before its internal focus target is wired after a
@@ -596,6 +551,26 @@ export function GridShell({
     }, [show_sort_priority, sort_metadata, visible_source_columns]);
 
     const merge_index = useMemo(() => new MergeIndex(merges), [merges]);
+    // The vendored grid owns merge behavior (rendering, selection snapping,
+    // navigation, copy blanking) from this one prop, in display coordinates.
+    // App withholds merges (`merges={[]}`) whenever a transform or hidden
+    // column makes display differ from source, so source coordinates *are*
+    // display coordinates here — mapped 1:1, not projected. A partial
+    // projection would be worse than none: it could map an anchor column
+    // while leaving the width in source space.
+    const merged_ranges = useMemo<Rectangle[]>(() => merges.map((m) => ({
+        x: m.startCol,
+        y: m.startRow,
+        width: m.endCol - m.startCol + 1,
+        height: m.endRow - m.startRow + 1,
+    })), [merges]);
+    // Only multi-row merges can have an anchor row above the viewport; filter
+    // once so the per-scroll preload scan walks just these, not the (capped at
+    // 10k) full list.
+    const vertical_merged_ranges = useMemo(
+        () => merged_ranges.filter((m) => m.height > 1),
+        [merged_ranges],
+    );
     const source_column_for_display = useCallback(
         (display_column: number) => visible_source_columns[display_column],
         [visible_source_columns],
@@ -966,6 +941,12 @@ export function GridShell({
         set_grid_selection(selection);
     }, [source_column_for_display]);
     const select_active_display_cell = useCallback((target: Item) => {
+        // Merge snapping is required here: the vendored grid's canonicalization
+        // chokepoint (setGridSelection) covers selections *it* originates —
+        // mouse, keyboard, a11y — not controlled writes, which render as
+        // handed. It also keeps grid_selection_ref correct synchronously (the
+        // context menu and highlight paths read it before any grid
+        // round-trip).
         const { cell, range } = expand_glide_selection(
             target,
             { x: target[0], y: target[1], width: 1, height: 1 },
@@ -983,16 +964,19 @@ export function GridShell({
     const focus_grid_ref = useRef(focus_grid);
     const row_count_ref = useRef(row_count);
     const display_column_count_ref = useRef(display_column_count);
+    const merge_index_ref = useRef(merge_index);
     useLayoutEffect(() => {
         select_active_display_cell_ref.current = select_active_display_cell;
         focus_grid_ref.current = focus_grid;
         row_count_ref.current = row_count;
         display_column_count_ref.current = display_column_count;
+        merge_index_ref.current = merge_index;
     }, [
         select_active_display_cell,
         focus_grid,
         row_count,
         display_column_count,
+        merge_index,
     ]);
     const previous_projection_ref = useRef(column_projection);
     useEffect(() => {
@@ -1027,7 +1011,6 @@ export function GridShell({
             }
             if (cells.length > 0) grid.updateCells(cells);
         }
-        overlay_ref.current?.repaint();
     }, [column_projection, display_column_count, visible_source_columns, write_grid_selection]);
 
     const cancel_pending_preview_restore = useCallback(() => {
@@ -1339,6 +1322,7 @@ export function GridShell({
     const auto_grow_row_for_text = useCallback((
         display_row: number,
         text: string,
+        display_column?: number,
     ): boolean => {
         // A fast path, and said so rather than dressed up as the gate: probed by deleting
         // it, and nothing failed, because `natural_row_height` floors at the default so an
@@ -1360,23 +1344,49 @@ export function GridShell({
             undefined,
             default_row_height,
         ));
+        // A vertical merge paints its content across every row of the block, so the
+        // height that has to fit the text is the block's total, not the anchor row's.
+        // Comparing (and growing) only the anchor would inflate a block that is
+        // already tall enough. Merges are only supplied under an identity view, so
+        // the display coordinates here index merge_index's source space directly;
+        // with merges withheld the index is empty and this is the plain single row.
+        const entry = display_column === undefined
+            ? null
+            : merge_index.is_anchor(display_row, display_column);
+        let available = 0;
+        const last_row = entry ? entry.endRow : display_row;
+        for (let r = display_row; r <= last_row; r++) {
+            available += resolved_row_height(
+                row_heights,
+                row_height_overlay,
+                r,
+                default_row_height,
+            );
+        }
         // `<=`, so a row already at the needed height posts nothing. That is not a
         // micro-optimization: `natural_row_height` floors at the default, so an ordinary
         // one-line value measures *exactly* the default and a `<` here would post a resize
         // for every edit commit — which is a durable write and a delivery each time. It is
         // also the second half of the guard against the unbounded case above, where the
         // clamped `needed` and the stored height meet at the ceiling.
-        if (needed <= resolved_row_height(
+        if (needed <= available) return false;
+        // Grow only the anchor row, by the block's deficit: the covered rows keep
+        // their heights and the block's total lands exactly at `needed`.
+        const anchor_height = resolved_row_height(
             row_heights,
             row_height_overlay,
             display_row,
             default_row_height,
-        )) return false;
-        on_row_resize([{ start: display_row, end: display_row }], needed);
+        );
+        on_row_resize(
+            [{ start: display_row, end: display_row }],
+            clamp_row_height(anchor_height + (needed - available)),
+        );
         return true;
     }, [
         default_row_height,
         font_size_px,
+        merge_index,
         on_row_resize,
         row_heights,
         row_height_overlay,
@@ -1405,9 +1415,9 @@ export function GridShell({
         // replaying one resizes whatever rows have moved into those positions. The text is
         // committed either way. No repaint, unlike `on_cell_edited`: every caller of this
         // is about to remount or re-project the grid, which repaints everything.
-        const display_row = grid_selection_ref.current.current?.cell[1];
-        if (display_row !== undefined) {
-            auto_grow_row_for_text(display_row, live.value);
+        const active_cell = grid_selection_ref.current.current?.cell;
+        if (active_cell !== undefined) {
+            auto_grow_row_for_text(active_cell[1], live.value, active_cell[0]);
         }
         set_live_uncommitted(false);
     }, [
@@ -1558,25 +1568,17 @@ export function GridShell({
                 : store.get(`${source_row}:${source_column}`);
             if (dirty) return dirty.value;
 
-            const merge = merge_index.entry_at(row, source_column);
-            // Vertical / 2D merges paint via the overlay from the anchor cell.
-            if (merge && !merge.horizontalOnly) {
-                const anchor_row = get_row(merge.startRow);
-                const anchor = anchor_row?.[merge.startCol];
-                if (!anchor) return '';
-                return show_formatting ? anchor.formatted : (anchor.raw ?? '');
-            }
-            // Horizontal merges echo the anchor on every spanned cell.
-            const content_col = merge?.horizontalOnly ? merge.startCol : source_column;
+            // Merged blocks need no special case: the grid's hover hit-test
+            // reports the anchor's coordinates for any covered cell, so this is
+            // already the cell that holds the content.
             const cells = get_row(row);
-            const cell = cells?.[content_col];
+            const cell = cells?.[source_column];
             if (!cell) return '';
             return show_formatting ? cell.formatted : (cell.raw ?? '');
         },
         [
             get_row,
             get_source_row,
-            merge_index,
             show_formatting,
             source_column_for_display,
             store,
@@ -1602,45 +1604,15 @@ export function GridShell({
         (display_column: number, row: number): { bold: boolean; italic: boolean } => {
             const source_column = source_column_for_display(display_column);
             if (source_column === undefined) return { bold: false, italic: false };
-            const merge = merge_index.entry_at(row, source_column);
-            // Content (and its bold/italic) always lives on the merge anchor.
-            const content_row = merge && !merge.horizontalOnly ? merge.startRow : row;
-            const content_col = merge ? merge.startCol : source_column;
-            const cell = get_row(content_row)?.[content_col];
+            // Merged blocks arrive here as anchor coordinates (the grid's
+            // hit-test snaps covered cells), which is where the content lives.
+            const cell = get_row(row)?.[source_column];
             return {
                 bold: !!cell?.bold,
                 italic: !!cell?.italic,
             };
         },
-        [get_row, merge_index, source_column_for_display],
-    );
-
-    /** Expand hover bounds to the full painted merge block when needed. */
-    const tooltip_bounds_for_cell = useCallback(
-        (
-            display_column: number,
-            row: number,
-            cell_bounds: { x: number; y: number; width: number; height: number },
-        ): { x: number; y: number; width: number; height: number } => {
-            const source_column = source_column_for_display(display_column);
-            if (source_column === undefined) return cell_bounds;
-            const merge = merge_index.entry_at(row, source_column);
-            // Horizontal spans already report the full block via Glide's bounds.
-            if (!merge || merge.horizontalOnly) return cell_bounds;
-            const start_display = display_column_for_source(merge.startCol);
-            const end_display = display_column_for_source(merge.endCol);
-            if (start_display === undefined || end_display === undefined) return cell_bounds;
-            const top_left = grid_ref.current?.getBounds(start_display, merge.startRow);
-            const bottom_right = grid_ref.current?.getBounds(end_display, merge.endRow);
-            if (!top_left || !bottom_right) return cell_bounds;
-            return {
-                x: top_left.x,
-                y: top_left.y,
-                width: bottom_right.x + bottom_right.width - top_left.x,
-                height: bottom_right.y + bottom_right.height - top_left.y,
-            };
-        },
-        [display_column_for_source, merge_index, source_column_for_display],
+        [get_row, source_column_for_display],
     );
 
     const schedule_cell_tooltip = useCallback(
@@ -1666,15 +1638,14 @@ export function GridShell({
             const text = displayed_cell_text(display_column, row);
             if (!text) return;
 
-            const bounds = tooltip_bounds_for_cell(display_column, row, cell_bounds);
             const flags = font_flags_for_cell(display_column, row);
             const wrapping = text.includes('\n');
             const overflows = text_overflows_cell(
                 text,
-                bounds.width,
+                cell_bounds.width,
                 (line) => measure_line_width(line, flags.bold, flags.italic),
                 {
-                    cell_height: bounds.height,
+                    cell_height: cell_bounds.height,
                     line_height: line_height_for_font(font_size_px),
                     wrapping,
                 },
@@ -1692,10 +1663,10 @@ export function GridShell({
                     width: Math.min(360, Math.max(80, clamped.length * 7)),
                     height: 28 + (clamped.match(/\n/g)?.length ?? 0) * 16,
                 };
-                const pos = cell_tooltip_position(bounds, estimated);
+                const pos = cell_tooltip_position(cell_bounds, estimated);
                 set_cell_tooltip({
                     text: clamped,
-                    bounds,
+                    bounds: cell_bounds,
                     left: pos.left,
                     top: pos.top,
                 });
@@ -1707,7 +1678,6 @@ export function GridShell({
             font_flags_for_cell,
             font_size_px,
             measure_line_width,
-            tooltip_bounds_for_cell,
         ],
     );
 
@@ -1824,26 +1794,19 @@ export function GridShell({
             // immediately editable. It self-heals within one host round-trip, and
             // the alternative (editable now, silently discard the edit later) is
             // not acceptable.
+            // No merge resolution needed: the vendored grid redirects a merged
+            // block's paint (and its hit-tests) to the anchor's coordinates, so
+            // this callback answers for the cell it was actually asked about —
+            // the anchor's own content, highlight, and dirty state cover the
+            // whole block.
             const source_row = get_source_row(row);
             const key = source_row === undefined
                 ? undefined
                 : `${source_row}:${source_column}`;
             const dirty = key === undefined ? undefined : store.get(key);
-            const merge = merge_index.entry_at(row, source_column);
-            // Reuse the row's own resolution when there is no merge, which is the
-            // overwhelmingly common case: `entry_at` returns null on a sheet with no
-            // merges, and a second get_source_row for the identical row is a second
-            // `locate()` allocation per cell per frame.
-            const highlight_source_row = merge === null
-                ? source_row
-                : get_source_row(merge.startRow);
-            const highlight_source_column = merge?.startCol ?? source_column;
-            const highlight_bg = highlight_source_row === undefined
+            const highlight_bg = source_row === undefined
                 ? undefined
-                : get_highlight_background(
-                    highlight_source_row,
-                    highlight_source_column,
-                );
+                : get_highlight_background(source_row, source_column);
             // Tint + dirty text whenever an edit exists; open the overlay only in
             // edit mode and only where source identity resolved. A resident blank
             // cell stays editable so blanks can still be typed.
@@ -1872,10 +1835,8 @@ export function GridShell({
                 };
             }
             return build_grid_cell(
-                row,
                 source_column,
                 get_row(row),
-                merge_index,
                 show_formatting,
                 overlay,
                 font_size_px,
@@ -1886,7 +1847,6 @@ export function GridShell({
             get_row,
             show_formatting,
             version,
-            merge_index,
             editable_cells,
             font_size_px,
             source_column_for_display,
@@ -1927,7 +1887,7 @@ export function GridShell({
             commit_edit(source_row, source_column, text);
             // Auto-grow the row to fit hard line breaks (Shift+Alt+Enter),
             // mirroring the old renderer. Only ever grows a row, never shrinks a
-            // user-sized one; repaints the whole row + overlay at the new height.
+            // user-sized one; repaints the whole row at the new height.
             // The measurement and the resize live in `auto_grow_row_for_text` because
             // this is not the only path that commits a value — see there.
             //
@@ -1942,13 +1902,12 @@ export function GridShell({
             // like-for-like read at this row. This site *could* resolve `source_row` (it
             // did so just above, to key the edit) and deliberately does not: one
             // display→source mapper, host-side, is the invariant the design rests on.
-            if (auto_grow_row_for_text(row, text)) {
+            if (auto_grow_row_for_text(row, text, display_column)) {
                 const cells: { cell: Item }[] = [];
                 for (let display_column = 0; display_column < display_column_count; display_column++) {
                     cells.push({ cell: [display_column, row] });
                 }
                 grid_ref.current?.updateCells(cells);
-                overlay_ref.current?.repaint();
                 return;
             }
             grid_ref.current?.updateCells([{ cell: [display_column, row] }]);
@@ -2010,11 +1969,16 @@ export function GridShell({
                 pending_editor_navigation_ref.current = null;
                 const captured = open_overlay_row_ref.current;
                 if (!captured) return;
+                // Merge-aware like on_key_down's Tab path: without is_covered,
+                // Enter/Tab from a vertical or 2D merge would target a covered
+                // cell that selection canonicalization snaps back to the anchor,
+                // leaving the selection stuck on the merge just edited.
                 const target = move_sequential_cell(
                     captured.display_cell,
                     navigation,
                     row_count_ref.current,
                     display_column_count_ref.current,
+                    (r, c) => merge_index_ref.current.is_covered(r, c),
                 );
                 pending_editor_navigation_ref.current = [target[0], target[1]];
             };
@@ -2088,13 +2052,6 @@ export function GridShell({
         [default_row_height, row_heights, row_height_overlay, row_resize_preview],
     );
 
-    // Repaint merge geometry after live-preview and committed-height renders.
-    // Repainting inline with the pointer handler is too early: Glide has not yet
-    // applied the new rowHeight callback, leaving vertical/2D bounds one tick old.
-    useEffect(() => {
-        overlay_ref.current?.repaint();
-    }, [row_heights, row_height_overlay, row_resize_preview]);
-
     // Arm/clear the row-resize strip as the pointer nears a row border. Glide's
     // hover args give the cell's client `bounds` + in-cell `localEventY`.
     // Also drives the truncated-cell tooltip: dwell on an overflowing cell
@@ -2114,9 +2071,15 @@ export function GridShell({
                     (args.kind === 'header' || args.kind === 'cell')
                     && args.location[0] >= 0
                 ) {
+                    // Sweep to the physical column under the pointer: inside a
+                    // horizontal merge the canonicalized location snaps to the
+                    // anchor, which would yank the sweep to the merge's left edge.
+                    const hovered_column = args.kind === 'cell'
+                        ? (args.physicalLocation ?? args.location)[0]
+                        : args.location[0];
                     const columns = header_drag_columns(
                         drag,
-                        args.location[0],
+                        hovered_column,
                         display_column_count,
                     );
                     if (!columns.equals(grid_selection_ref.current.columns)) {
@@ -2158,12 +2121,20 @@ export function GridShell({
                 row_resize_ref.current?.set_target(null);
                 return;
             }
-            const row = args.location[1];
+            // Physical geometry, not the merge-canonicalized location/bounds:
+            // inside a vertical merge the event reports the anchor row and the
+            // block's full bounds, but the boundary under the pointer belongs to
+            // the physical row — dragging a merge's bottom edge must resize its
+            // last row, and interior boundaries must stay reachable.
+            const row = (args.physicalLocation ?? args.location)[1];
+            const bounds = args.physicalBounds ?? args.bounds;
             const hit = row_boundary_hit(
                 row,
-                args.bounds.y,
-                args.bounds.height,
-                args.localEventY,
+                bounds.y,
+                bounds.height,
+                // localEventY is relative to the canonicalized bounds; rebase it
+                // onto the physical cell.
+                args.localEventY + args.bounds.y - bounds.y,
                 ROW_RESIZE_TOLERANCE_PX,
             );
             row_resize_ref.current?.set_target(
@@ -2361,18 +2332,11 @@ export function GridShell({
                 return;
             }
             header_drag_ref.current = null;
-            const { cell, range } = expand_glide_selection(
-                sel.current.cell,
-                sel.current.range,
-                merges,
-            );
-            write_grid_selection({
-                columns: sel.columns,
-                rows: sel.rows,
-                current: { cell, range, rangeStack: sel.current.rangeStack },
-            });
+            // No merge snapping needed: the vendored grid canonicalizes every
+            // selection (anchor cell + whole-merge range) before echoing it here.
+            write_grid_selection(sel);
         },
-        [display_column_count, merges, row_markers, select_all, write_grid_selection],
+        [display_column_count, row_markers, select_all, write_grid_selection],
     );
 
     // --- Context menu: copy + select actions over the paged cache -------------
@@ -2732,9 +2696,9 @@ export function GridShell({
 
     const dismiss_context_menu = useCallback(() => set_context_menu(null), []);
 
-    // Controlled keyboard nav. Tab/Shift+Tab use row-major wrapping; merged-sheet
-    // arrows and view-mode hjkl retain the existing merge-aware movement. Other
-    // range extension and shortcut behavior stays native to Glide.
+    // Controlled keyboard nav. Tab/Shift+Tab use row-major wrapping and
+    // view-mode hjkl keeps merge-aware movement; arrows (and range extension,
+    // shortcuts) stay native to Glide, which steps past merges itself.
     const on_key_down = useCallback(
         (args: GridKeyEventArgs) => {
             const shortcut = transform_shortcut({
@@ -2828,7 +2792,6 @@ export function GridShell({
                 meta: args.metaKey,
                 alt: args.altKey,
                 editable: editable_cells,
-                has_merges: merges.length > 0,
             });
             if (!decision) return;
             const cur = grid_selection_ref.current.current?.cell;
@@ -2886,16 +2849,27 @@ export function GridShell({
             // Scroll moves cells under the cursor; drop any open tooltip so it
             // can't float over the wrong content mid-scroll.
             hide_cell_tooltip();
-            // Glide records the new visible region in React state before it
-            // invokes this callback. Its imperative getBounds still closes over
-            // the preceding render until that state commits, so repainting here
-            // synchronously leaves merged cells at the penultimate horizontal
-            // offset when scrolling stops. Paint on the next frame, coalescing
-            // rapid callbacks while retaining the final region.
-            schedule_overlay_scroll_repaint(range);
             const start = range.y;
             const end = range.y + range.height - 1;
             ensure_rows(start, end);
+            // A merged block can be visible while its anchor row sits above the
+            // viewport; the grid paints the block from the anchor's content, so
+            // that row's page must be resident too. ensure_rows_loaded requests
+            // without moving the loader's viewport (which tracks what Glide
+            // actually shows). Fire-and-forget: the version bump on landing
+            // repaints the block. One call per distinct anchor row, and only
+            // for merges actually on screen horizontally, so a scroll event
+            // costs one pass over the (capped) merge list and no redundant
+            // loader waiters.
+            let anchor_rows: Set<number> | undefined;
+            for (const m of vertical_merged_ranges) {
+                if (m.y >= start || m.y + m.height <= start) continue;
+                if (m.x >= range.x + range.width || m.x + m.width <= range.x) continue;
+                (anchor_rows ??= new Set()).add(m.y);
+            }
+            if (anchor_rows) {
+                for (const row of anchor_rows) void ensure_rows_loaded(row, row);
+            }
             const restored_preview = preview_mode && restore_pending_preview_row();
             // While a retained target is waiting for Glide readiness, its remount
             // callback commonly reports row 0. Keep that bootstrap viewport local;
@@ -2913,12 +2887,13 @@ export function GridShell({
         },
         [
             ensure_rows,
+            ensure_rows_loaded,
             hide_cell_tooltip,
             on_preview_visible_row_change,
             pending_preview_scroll,
             preview_mode,
             restore_pending_preview_row,
-            schedule_overlay_scroll_repaint,
+            vertical_merged_ranges,
         ],
     );
 
@@ -2934,10 +2909,6 @@ export function GridShell({
     // (each cell carries both in its theme override). A parent re-render alone
     // does not reliably invalidate Glide's per-cell cache, so damage explicitly.
     // (Sheet/merge changes remount via the grid key.)
-    //
-    // The merge overlay draws its own text, reading the size off the theme at
-    // paint time, and is only otherwise repainted by content/highlight changes —
-    // so repaint it here too, or merged cells keep the previous size.
     useEffect(() => {
         const grid = grid_ref.current;
         if (!grid) return;
@@ -2954,7 +2925,6 @@ export function GridShell({
             }
         }
         if (cells.length > 0) grid.updateCells(cells);
-        overlay_ref.current?.repaint();
     }, [
         version,
         show_formatting,
@@ -2991,48 +2961,48 @@ export function GridShell({
         const grid = grid_ref.current;
         if (!grid || changed.size === 0) return;
         // Dirty keys are source-keyed, so a changed key's row is a source row and
-        // cannot be used as a display coordinate. Reuse the shared visible-row scan
-        // the highlight effect already uses: it maps source → display over the
-        // visible range and handles one source row appearing at several display
-        // rows, which a reverse display lookup could not.
-        const cells = visible_source_key_damage(
+        // cannot be used as a display coordinate. source_key_damage maps source →
+        // display over the visible range (handling one source row appearing at
+        // several display rows) and repairs merges whose off-screen anchor holds
+        // the block's tint.
+        const cells = source_key_damage(
             changed,
             visible_ref.current,
             display_column_for_source,
             get_source_row,
+            merged_ranges,
         ).map(({ cell }) => ({ cell: cell as Item }));
         if (cells.length > 0) grid.updateCells(cells);
-    }, [dirty_cells, conflicted_keys, display_column_for_source, get_source_row]);
+    }, [
+        dirty_cells,
+        conflicted_keys,
+        display_column_for_source,
+        get_source_row,
+        merged_ranges,
+    ]);
 
     const previous_highlights_ref = useRef<SheetCellHighlightState['cells']>();
-    const [highlight_version, set_highlight_version] = useState(0);
     useEffect(() => {
         const previous = previous_highlights_ref.current;
         const next = cell_highlights?.cells;
         previous_highlights_ref.current = next;
         const changed = changed_highlight_keys(previous, next);
         if (changed.size === 0) return;
-        // Drives MergeOverlay's bounds-retry effect so highlight changes that
-        // land before Glide's first draw still paint (the one-shot repaint()
-        // below can lose that race).
-        set_highlight_version((n) => n + 1);
-        const cells = visible_source_key_damage(
+        // Same source-keyed pipeline as the tint effect above (visible-cell scan
+        // plus the off-screen-anchor merge repair).
+        const cells = source_key_damage(
             changed,
             visible_ref.current,
             display_column_for_source,
             get_source_row,
+            merged_ranges,
         ).map(({ cell }) => ({ cell: cell as Item }));
         if (cells.length > 0) grid_ref.current?.updateCells(cells);
-        // A vertical merge can remain visible while its anchor row is above the
-        // viewport, so anchor-key changes are not guaranteed to produce cell damage.
-        if (merge_index.entries.some((entry) => entry.rowSpan > 1)) {
-            overlay_ref.current?.repaint();
-        }
     }, [
         cell_highlights,
         display_column_for_source,
         get_source_row,
-        merge_index,
+        merged_ranges,
     ]);
 
     const handle_column_resize = useCallback(
@@ -3152,6 +3122,7 @@ export function GridShell({
                 height="100%"
                 rows={row_count}
                 columns={columns}
+                mergedRanges={merged_ranges}
                 getCellContent={get_cell_content}
                 rowHeight={get_row_height}
                 rowMarkers="clickable-number"
@@ -3172,18 +3143,6 @@ export function GridShell({
                 onCellContextMenu={on_cell_context_menu}
                 onKeyDown={on_key_down}
                 provideEditor={provide_editor}
-            />
-            <MergeOverlay
-                ref={overlay_ref}
-                grid_ref={grid_ref}
-                merge_index={merge_index}
-                theme={theme}
-                show_formatting={show_formatting}
-                get_row={get_row}
-                get_source_row={get_source_row}
-                get_cell_background={get_highlight_background}
-                version={version}
-                highlight_version={highlight_version}
             />
             {/*
               * Mounted unconditionally. It used to be withheld under a permutation,

@@ -1,9 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { GridCellKind } from '../webview/glide-data-grid';
 import { build_grid_cell, font_style } from '../webview/cell-renderer';
-import { MergeIndex } from '../webview/merge-index';
 import type { RenderedCell } from '../data-source/interface';
-import type { MergeRange } from '../types';
 
 const rc = (raw: string, bold = false, italic = false): RenderedCell => ({
     raw,
@@ -12,25 +10,13 @@ const rc = (raw: string, bold = false, italic = false): RenderedCell => ({
     italic,
 });
 
-// Mirrors merged.xlsx plus a synthetic 2D merge.
-const merges: MergeRange[] = [
-    { startRow: 0, startCol: 0, endRow: 0, endCol: 2 }, // horizontal "Merged Header"
-    { startRow: 2, startCol: 0, endRow: 3, endCol: 0 }, // vertical "Tall"
-    { startRow: 5, startCol: 1, endRow: 6, endCol: 2 }, // 2D "Box"
-];
+// Merged cells need no cases here any more: the vendored grid resolves merges
+// itself and only ever asks this callback for a merge's anchor coordinates, so
+// build_grid_cell simply returns each cell's own content.
+const row: (RenderedCell | null)[] = [rc('A', true), rc('B'), rc('C', false, true)];
 
-const rows: Record<number, (RenderedCell | null)[]> = {
-    0: [rc('Merged Header'), null, null],
-    1: [rc('A', true), rc('B'), rc('C', false, true)],
-    2: [rc('Tall'), rc('D'), rc('E')],
-    3: [null, rc('F'), rc('G')],
-    5: [rc('x'), rc('Box'), null],
-    6: [rc('y'), null, null],
-};
-
-const idx = new MergeIndex(merges);
-const cell = (row: number, col: number, show_formatting = true) =>
-    build_grid_cell(row, col, rows[row], idx, show_formatting);
+const cell = (col: number, show_formatting = true) =>
+    build_grid_cell(col, row, show_formatting);
 
 describe('font_style', () => {
     it('is undefined when neither bold nor italic', () => {
@@ -44,30 +30,63 @@ describe('font_style', () => {
 });
 
 describe('build_grid_cell — plain cells', () => {
-    it('returns text with raw/displayData and no span', () => {
-        const c = cell(1, 1);
+    it('returns text with raw/displayData', () => {
+        const c = cell(1);
         expect(c.kind).toBe(GridCellKind.Text);
         expect((c as { data: string }).data).toBe('B');
         expect((c as { displayData: string }).displayData).toBe('B');
-        expect((c as { span?: unknown }).span).toBeUndefined();
     });
 
     it('applies bold/italic via themeOverride when show_formatting', () => {
-        const bolded = cell(1, 0); // 'A', bold
+        const bolded = cell(0); // 'A', bold
         expect((bolded as { themeOverride?: { baseFontStyle?: string } }).themeOverride?.baseFontStyle).toContain('600');
-        const italicized = cell(1, 2); // 'C', italic
+        const italicized = cell(2); // 'C', italic
         expect((italicized as { themeOverride?: { baseFontStyle?: string } }).themeOverride?.baseFontStyle).toContain('italic');
     });
 
     it('omits themeOverride when show_formatting is off', () => {
-        const c = cell(1, 0, false);
+        const c = cell(0, false);
         expect((c as { themeOverride?: unknown }).themeOverride).toBeUndefined();
     });
 
     it('renders a null / out-of-range cell as blank text', () => {
-        const c = cell(3, 0); // null in data, but also covered — blank either way
+        const c = build_grid_cell(5, row, true);
         expect(c.kind).toBe(GridCellKind.Text);
         expect((c as { data: string }).data).toBe('');
+    });
+
+    it('renders an unloaded row (undefined cells) as blank text', () => {
+        const c = build_grid_cell(0, undefined, true);
+        expect(c.kind).toBe(GridCellKind.Text);
+        expect((c as { data: string }).data).toBe('');
+        expect((c as { allowOverlay: boolean }).allowOverlay).toBe(false);
+    });
+
+    it('reuses one shared blank cell when there is no content and no overlay', () => {
+        // getCellContent runs per visible cell per draw; the no-overlay blank
+        // must not allocate.
+        expect(build_grid_cell(0, undefined, true))
+            .toBe(build_grid_cell(5, row, false));
+    });
+
+    it('still synthesizes a distinct cell for a blank with an overlay', () => {
+        const a = build_grid_cell(0, undefined, true, { editable: true });
+        expect((a as { allowOverlay: boolean }).allowOverlay).toBe(true);
+        expect(a).not.toBe(build_grid_cell(0, undefined, true, { editable: true }));
+    });
+
+    it('wraps multiline content', () => {
+        const note = 'First paragraph.\n\nSecond paragraph.\nFinal line.';
+        const c = build_grid_cell(0, [rc(note)], true);
+        expect(c).toMatchObject({
+            data: note,
+            displayData: note,
+            allowWrapping: true,
+        });
+    });
+
+    it('does not enable wrapping for single-line content', () => {
+        expect((cell(1) as { allowWrapping?: boolean }).allowWrapping).toBeUndefined();
     });
 });
 
@@ -76,9 +95,8 @@ describe('build_grid_cell — formatting toggle (raw vs formatted)', () => {
     // number with a display format ('3.14') over its full precision ('3.14159').
     const num: RenderedCell = { raw: '3.14159', formatted: '3.14', bold: false, italic: false };
     const num_rows: (RenderedCell | null)[] = [num];
-    const plain_idx = new MergeIndex([]);
     const num_cell = (show_formatting: boolean) =>
-        build_grid_cell(0, 0, num_rows, plain_idx, show_formatting);
+        build_grid_cell(0, num_rows, show_formatting);
 
     it('displays the formatted value when show_formatting is on', () => {
         const c = num_cell(true);
@@ -96,73 +114,13 @@ describe('build_grid_cell — formatting toggle (raw vs formatted)', () => {
     });
 });
 
-describe('build_grid_cell — horizontal merges (native span)', () => {
-    it('anchor returns span across the merged columns with its content', () => {
-        const c = cell(0, 0);
-        expect((c as { span?: [number, number] }).span).toEqual([0, 2]);
-        expect((c as { data: string }).data).toBe('Merged Header');
-    });
-
-    it('applies the anchor visual background across the native span', () => {
-        for (const col of [0, 1, 2]) {
-            const c = build_grid_cell(
-                0,
-                col,
-                rows[0],
-                idx,
-                true,
-                { bg: 'rgba(255, 193, 7, 0.24)' },
-            );
-            expect((c as { themeOverride?: { bgCell?: string } }).themeOverride?.bgCell)
-                .toBe('rgba(255, 193, 7, 0.24)');
-        }
-    });
-
-    it('covered cells echo the anchor content AND the same span', () => {
-        // Critical: a covered column must return the anchor content + span so
-        // Glide neither repaints blank over the anchor nor draws an empty span
-        // when the anchor column is scrolled off-screen.
-        for (const col of [1, 2]) {
-            const c = cell(0, col);
-            expect((c as { span?: [number, number] }).span).toEqual([0, 2]);
-            expect((c as { data: string }).data).toBe('Merged Header');
-            expect((c as { displayData: string }).displayData).toBe('Merged Header');
-        }
-    });
-
-    it('wraps complete multiline content on the anchor and covered cells', () => {
-        const note = 'First paragraph.\n\nSecond paragraph.\nFinal line.';
-        const note_rows: (RenderedCell | null)[] = [null, rc(note), null, null, null];
-        const note_idx = new MergeIndex([
-            { startRow: 7, startCol: 1, endRow: 7, endCol: 4 },
-        ]);
-
-        for (const col of [1, 2, 3, 4]) {
-            const c = build_grid_cell(7, col, note_rows, note_idx, true);
-            expect(c).toMatchObject({
-                data: note,
-                displayData: note,
-                span: [1, 4],
-                allowWrapping: true,
-            });
-        }
-    });
-
-    it('does not enable wrapping for a single-line horizontal merge', () => {
-        for (const col of [0, 1, 2]) {
-            expect((cell(0, col) as { allowWrapping?: boolean }).allowWrapping).toBeUndefined();
-        }
-    });
-});
-
 describe('build_grid_cell — edit overlay (CSV edit mode)', () => {
-    const plain_idx = new MergeIndex([]);
     const plain_rows: (RenderedCell | null)[] = [rc('A', true), rc('B'), null];
     const ecell = (
         col: number,
-        overlay: Parameters<typeof build_grid_cell>[5],
+        overlay: Parameters<typeof build_grid_cell>[3],
         show_formatting = true,
-    ) => build_grid_cell(0, col, plain_rows, plain_idx, show_formatting, overlay);
+    ) => build_grid_cell(col, plain_rows, show_formatting, overlay);
 
     it('makes the cell editable when overlay.editable is set', () => {
         const c = ecell(1, { editable: true });
@@ -170,7 +128,7 @@ describe('build_grid_cell — edit overlay (CSV edit mode)', () => {
     });
 
     it('stays read-only (allowOverlay false) with no overlay', () => {
-        const c = build_grid_cell(0, 1, plain_rows, plain_idx, true);
+        const c = build_grid_cell(1, plain_rows, true);
         expect((c as { allowOverlay: boolean }).allowOverlay).toBe(false);
     });
 
@@ -224,7 +182,7 @@ describe('build_grid_cell — edit overlay (CSV edit mode)', () => {
     it('leaves a no-overlay read-only cell shape untouched', () => {
         // A read-only sheet passes no overlay at all; the conditional spread must
         // keep its cell shape (and every snapshot of it) exactly as before.
-        const c = build_grid_cell(0, 1, plain_rows, plain_idx, true);
+        const c = build_grid_cell(1, plain_rows, true);
         expect('readonly' in c).toBe(false);
     });
 
@@ -235,27 +193,5 @@ describe('build_grid_cell — edit overlay (CSV edit mode)', () => {
         expect(c.kind).toBe(GridCellKind.Text);
         expect((c as { data: string }).data).toBe('new');
         expect((c as { allowOverlay: boolean }).allowOverlay).toBe(true);
-    });
-});
-
-describe('build_grid_cell — vertical / 2D merges (overlay)', () => {
-    it('vertical merge anchor and covered cells are blank with no span', () => {
-        const anchor = cell(2, 0);
-        expect((anchor as { data: string }).data).toBe('');
-        expect((anchor as { span?: unknown }).span).toBeUndefined();
-
-        const covered = cell(3, 0);
-        expect((covered as { data: string }).data).toBe('');
-        expect((covered as { span?: unknown }).span).toBeUndefined();
-    });
-
-    it('2D merge anchor and covered cells are blank with no span', () => {
-        const anchor = cell(5, 1);
-        expect((anchor as { data: string }).data).toBe('');
-        expect((anchor as { span?: unknown }).span).toBeUndefined();
-
-        const covered = cell(6, 2);
-        expect((covered as { data: string }).data).toBe('');
-        expect((covered as { span?: unknown }).span).toBeUndefined();
     });
 });

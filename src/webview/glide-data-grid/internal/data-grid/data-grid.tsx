@@ -640,6 +640,12 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
                 const [cellCol, cellRow] = mergedCells?.anchorOf(col, row) ?? [col, row];
                 const bounds = getBoundsForItem(canvas, cellCol, cellRow);
                 assert(bounds !== undefined);
+                // The physical cell under the pointer, un-canonicalized, for
+                // consumers needing per-cell geometry (see event-args.ts). Only
+                // recomputed when the anchor snap actually moved the hit.
+                const isSnapped = cellCol !== col || cellRow !== row;
+                const physicalBounds = isSnapped ? getBoundsForItem(canvas, col, row) : bounds;
+                assert(physicalBounds !== undefined);
                 const isEdge = bounds !== undefined && bounds.x + bounds.width - posX < edgeDetectionBuffer;
 
                 let isFillHandle = false;
@@ -662,6 +668,8 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
                     kind: "cell",
                     location: [cellCol, cellRow],
                     bounds: bounds,
+                    physicalLocation: [col, row],
+                    physicalBounds,
                     isEdge,
                     shiftKey,
                     ctrlKey,

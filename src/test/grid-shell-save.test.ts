@@ -114,13 +114,6 @@ vi.mock('../webview/vscode-theme', () => ({
     theme_font_size_px: () => 13,
 }));
 
-vi.mock('../webview/merge-overlay', () => ({
-    MergeOverlay: React.forwardRef((_props: unknown, ref: React.ForwardedRef<unknown>) => {
-        React.useImperativeHandle(ref, () => ({ repaint: vi.fn() }));
-        return null;
-    }),
-}));
-
 vi.mock('../webview/row-resize-overlay', () => ({
     RowResizeOverlay: React.forwardRef((_props: unknown, ref: React.ForwardedRef<unknown>) => {
         React.useImperativeHandle(ref, () => ({ set_target: vi.fn() }));

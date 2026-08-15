@@ -188,6 +188,43 @@ describe("mergedRanges clipboard and accessibility", () => {
         expect(edited).toEqual([[2, 2]]);
     });
 
+    test("deleting a selection spanning a merge clears the anchor and skips covered cells", async () => {
+        const editSpy = vi.fn();
+        vi.useFakeTimers();
+        render(
+            <EventedDataEditor
+                {...(basicProps as DataEditorProps)}
+                mergedRanges={MERGES}
+                onCellsEdited={editSpy}
+            />,
+            { wrapper: Context }
+        );
+        prep();
+        const canvas = screen.getByTestId("data-grid-canvas");
+
+        // Select the merge (cols 2-3, rows 2-4) plus one extra column and row:
+        // cols 2-4, rows 2-5. Delete must clear the anchor and the cells
+        // outside the merge, never the five covered members.
+        sendClick(canvas, cellCenter([2, 2]));
+        sendClick(canvas, { ...cellCenter([4, 5]), shiftKey: true });
+        fireEvent.keyDown(canvas, { key: "Delete" });
+        await vi.waitFor(() => expect(editSpy).toHaveBeenCalled());
+
+        const edited = (editSpy.mock.calls[0][0] as { location: Item }[]).map(i => i.location);
+        expect(edited).toEqual(
+            expect.arrayContaining([
+                [2, 2],
+                [4, 2],
+                [4, 3],
+                [4, 4],
+                [2, 5],
+                [3, 5],
+                [4, 5],
+            ])
+        );
+        expect(edited).toHaveLength(7);
+    });
+
     test("accessibility tree renders one spanning td per merge", () => {
         vi.useFakeTimers();
         render(<DataEditor {...(basicProps as DataEditorProps)} mergedRanges={MERGES} />, {
