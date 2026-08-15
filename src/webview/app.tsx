@@ -36,6 +36,7 @@ import {
     type SheetViewRecord,
     type TransformIntent,
     type ViewBasis,
+    type WorksheetTarget,
 } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
 import {
@@ -1389,6 +1390,40 @@ export function App(): React.JSX.Element {
                             )
                             : undefined
                     );
+                    const authoritative_refresh_edits_for_target = (
+                        target: WorksheetTarget,
+                    ): SheetPendingEditCells | undefined => {
+                        if (snapshot.presentation !== 'refresh') return undefined;
+                        const pending = refresh_authoritative_state?.pendingEdits;
+                        const direct = pending_edits_for_sheet(
+                            pending,
+                            target.sheetIndex,
+                            target.sheetName,
+                            target.worksheetId,
+                        );
+                        if (direct !== undefined || !pending) return direct;
+
+                        // Removed worksheets are retained as parked stores, and
+                        // their durable slot may have moved away from the captured
+                        // index. Search by identity rather than reading whichever
+                        // live worksheet now occupies that position.
+                        const identified_index = pending.findIndex((slot) => {
+                            if (!slot) return false;
+                            return slot.worksheetId !== undefined
+                                ? target.worksheetId !== undefined
+                                    && slot.worksheetId === target.worksheetId
+                                : slot.sheetName !== undefined
+                                    && slot.sheetName === target.sheetName;
+                        });
+                        return identified_index === -1
+                            ? undefined
+                            : pending_edits_for_sheet(
+                                pending,
+                                identified_index,
+                                target.sheetName,
+                                target.worksheetId,
+                            );
+                    };
                     // Reconcile the registry at the snapshot itself, not in
                     // install_edit_session: a refresh that advances the session
                     // id makes `refresh_editing_current_session` false and skips
@@ -1457,20 +1492,22 @@ export function App(): React.JSX.Element {
                             for (const { target, store } of
                                 reconciliation.retryPublications) {
                                 const store_snapshot = store.snapshot();
+                                const current_edits = store_snapshot.size > 0
+                                    ? Object.fromEntries(store_snapshot)
+                                    : null;
                                 const authoritative_edits =
-                                    refresh_edits_for_sheet(target.sheetIndex);
+                                    authoritative_refresh_edits_for_target(target);
                                 if (pending_edit_durability.unacknowledged_payload_matches(
                                     edit_session_id,
                                     authoritative_edits ?? null,
+                                    current_edits,
                                     target.sheetIndex,
                                     target.sheetName,
                                     target.worksheetId,
                                 )) continue;
                                 pending_edit_durability.publish(
                                     edit_session_id,
-                                    store_snapshot.size > 0
-                                        ? Object.fromEntries(store_snapshot)
-                                        : null,
+                                    current_edits,
                                     target.sheetIndex,
                                     target.sheetName,
                                     true,

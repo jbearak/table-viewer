@@ -67,6 +67,17 @@ interface PendingEditSessionChannel {
 
 const pending_edit_channels = new Map<string, PendingEditSessionChannel>();
 
+function pending_edit_payload(edits: SheetPendingEditCells | null): string {
+    if (edits === null) return 'null';
+    const canonical: SheetPendingEditCells = {};
+    for (const [key, entry] of Object.entries(edits)) {
+        canonical[key] = typeof entry === 'string'
+            ? entry
+            : { value: entry.value, base: entry.base };
+    }
+    return JSON.stringify(canonical);
+}
+
 function pending_edit_channel(session_id: string): PendingEditSessionChannel {
     let channel = pending_edit_channels.get(session_id);
     if (!channel) {
@@ -133,7 +144,10 @@ export const pending_edit_durability = {
         worksheetId?: string,
     ): number {
         const channel = pending_edit_channel(editSessionId);
-        const payload = JSON.stringify(edits);
+        // DirtyEntry carries renderer-only `base_pending` while a legacy value's
+        // source page is unavailable. Snapshot normalization deliberately strips
+        // that flag, so durability identity is the wire-level value/base map.
+        const payload = pending_edit_payload(edits);
         const dedupe_key = worksheet_target_key({
             sheetIndex,
             sheetName,
@@ -207,7 +221,8 @@ export const pending_edit_durability = {
     },
     unacknowledged_payload_matches(
         editSessionId: string,
-        edits: SheetPendingEditCells | null,
+        authoritativeEdits: SheetPendingEditCells | null,
+        currentEdits: SheetPendingEditCells | null,
         sheetIndex: number,
         sheetName: string | undefined,
         worksheetId?: string,
@@ -222,7 +237,8 @@ export const pending_edit_durability = {
         return publication !== undefined
             && channel !== undefined
             && channel.unacknowledgedSequences.has(publication.sequence)
-            && publication.payload === JSON.stringify(edits);
+            && publication.payload === pending_edit_payload(authoritativeEdits)
+            && publication.payload === pending_edit_payload(currentEdits);
     },
     acknowledge(editSessionId: string, sequence: number): void {
         const channel = pending_edit_channels.get(editSessionId);

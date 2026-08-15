@@ -243,13 +243,34 @@ describe('host-bridge', () => {
             'session:echo', edits, 0, 'People');
 
         expect(pending_edit_durability.unacknowledged_payload_matches(
-            'session:echo', edits, 0, 'People')).toBe(true);
+            'session:echo', edits, edits, 0, 'People')).toBe(true);
         expect(pending_edit_durability.unacknowledged_payload_matches(
-            'session:echo', null, 0, 'People')).toBe(false);
+            'session:echo', null, edits, 0, 'People')).toBe(false);
+        expect(pending_edit_durability.unacknowledged_payload_matches(
+            'session:echo', edits, null, 0, 'People')).toBe(false);
 
         pending_edit_durability.acknowledge('session:echo', sequence);
         expect(pending_edit_durability.unacknowledged_payload_matches(
-            'session:echo', edits, 0, 'People')).toBe(false);
+            'session:echo', edits, edits, 0, 'People')).toBe(false);
+    });
+
+    it('matches an echo after renderer-only pending-base metadata is normalized', async () => {
+        const { injected, pending_edit_durability } =
+            await setup_pending_edit_durability();
+        const local = {
+            '0:0': { value: 'P', base: '', base_pending: true },
+        };
+        const authoritative = {
+            '0:0': { value: 'P', base: '' },
+        };
+        const sequence = pending_edit_durability.publish(
+            'session:legacy', local, 0, 'People');
+
+        expect(pending_edit_durability.unacknowledged_payload_matches(
+            'session:legacy', authoritative, local, 0, 'People')).toBe(true);
+        expect(pending_edit_durability.publish(
+            'session:legacy', authoritative, 0, 'People')).toBe(sequence);
+        expect(injected.postMessage).toHaveBeenCalledTimes(1);
     });
 
     it('prefers an injected global bridge over acquireVsCodeApi', async () => {
