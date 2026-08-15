@@ -349,6 +349,20 @@ export class ViewerPanelCore {
     }
 
     /**
+     * The installed transform, preserving absence after a source adoption.
+     *
+     * `transform_state` deliberately projects absence as the natural empty view for
+     * callers that only need row behaviour. Header planning needs the distinction:
+     * after an Excel projection adopts the source, saved transforms have not yet been
+     * restored, and treating that transient absence as an installed empty transform
+     * would erase a manual header candidate derived from durable hidden rows.
+     */
+    installed_transform_state(sheet_index: number): SheetTransformState | undefined {
+        const state = this.transform_states.get(sheet_index);
+        return state === undefined ? undefined : clone_transform(state);
+    }
+
+    /**
      * The core generation at which this sheet's display->source mapping last moved.
      *
      * `generation` is core-wide but a permutation is per sheet: `handle_set_transform`

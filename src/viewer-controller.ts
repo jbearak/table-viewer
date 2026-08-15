@@ -5366,10 +5366,15 @@ export function attach_viewer(
                     fail('The selected worksheet no longer matches this request.');
                     return;
                 }
-                source.set_hidden_rows(
-                    msg.sheetName,
-                    core.transform_state(msg.sheetIndex).hiddenRows,
+                const installed_transform = core.installed_transform_state(
+                    msg.sheetIndex,
                 );
+                if (installed_transform !== undefined) {
+                    source.set_hidden_rows(
+                        msg.sheetName,
+                        installed_transform.hiddenRows,
+                    );
+                }
                 const header = source.meta().sheets[msg.sheetIndex]
                     ?.excelFirstRowHeader;
                 if (!header) {
@@ -5443,6 +5448,7 @@ export function attach_viewer(
                 const command_source = source;
                 const expected_physical_revision = source_authority.physicalRevision;
                 const expected_physical_digest = source_authority.physicalDigest;
+                const planning_input = command_source.planning_input();
                 const result = await file_coordinator.commit_excel_header({
                     requestId: msg.requestId,
                     sheetIndex: msg.sheetIndex,
@@ -5451,7 +5457,7 @@ export function attach_viewer(
                     originToken: excel_header_subscriber_token,
                     expectedPhysicalRevision: expected_physical_revision,
                     expectedPhysicalDigest: expected_physical_digest,
-                    planningInput: command_source.planning_input(),
+                    planningInput: planning_input,
                     clearHiddenRows: msg.unhideAll === true,
                     headerSourceRow: header_source_row,
                     targetPlanningInput: target_planning_input,
@@ -5469,7 +5475,23 @@ export function attach_viewer(
                     if (
                         result.error
                             === 'The selected worksheet no longer matches this request.'
-                    ) schedule_header_refresh();
+                    ) {
+                        const planning_sheet = planning_input.sheets[msg.sheetIndex];
+                        console.warn('Excel header planning rejected a current request', {
+                            requestId: msg.requestId,
+                            sheetIndex: msg.sheetIndex,
+                            requestedMode: msg.enabled ? 'on' : 'off',
+                            requestedHeaderRow: msg.headerRow ?? null,
+                            clearHiddenRows: msg.unhideAll === true,
+                            installedTransform: installed_transform !== undefined,
+                            installedHiddenRowCount:
+                                installed_transform?.hiddenRows?.length ?? null,
+                            plannedManualHeaderSourceRow:
+                                planning_sheet?.manualHeaderSourceRow ?? null,
+                            activeHeaderSourceRow: header.sourceRow ?? null,
+                        });
+                        schedule_header_refresh();
+                    }
                 }
                 return;
             }
