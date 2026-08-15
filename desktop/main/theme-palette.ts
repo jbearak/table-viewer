@@ -50,7 +50,11 @@ export interface SemanticPalette {
     /** Selected-cell / selected-row fill. Drawn over `bg`, with `fg` text on
      *  top, so it must stay legible rather than maximally visible. */
     readonly selection: string;
-    /** Row/control hover fill. */
+    /** Row/control hover fill. Must differ from `bgAlt` and `bgElevated`:
+     *  hover fills paint over both surfaces (toolbar toggles and popover rows
+     *  sit on `bgAlt`; secondary buttons rest at `bgElevated`), and a fill
+     *  equal to the surface under it is an invisible hover state. Enforced by
+     *  the hover-visibility test in desktop-modules.test.ts. */
     readonly hover: string;
     /** Hyperlinks. */
     readonly link: string;
