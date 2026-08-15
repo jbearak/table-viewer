@@ -1689,13 +1689,20 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
             const visibleRows = makeRange(cellYOffset, Math.min(rows, cellYOffset + accessibilityHeight));
 
             // Maintain focus within grid if we own it but focused cell is outside visible viewport
-            // and not rendered.
+            // and not rendered. Fork addition: a focused merge anchor counts
+            // as rendered while any of its cells is visible — a stand-in td
+            // carries the focus ref then.
             if (
                 fCol !== undefined &&
                 fRow !== undefined &&
                 !(visibleCols.includes(fCol) && visibleRows.includes(fRow))
             ) {
-                focusElement(null);
+                const focusedMerge = mergedCells?.getRange(fCol, fRow);
+                const mergeVisible =
+                    focusedMerge !== undefined &&
+                    visibleCols.some(c => c >= focusedMerge.x && c < focusedMerge.x + focusedMerge.width) &&
+                    visibleRows.some(r => r >= focusedMerge.y && r < focusedMerge.y + focusedMerge.height);
+                if (!mergeVisible) focusElement(null);
             }
 
             return (
@@ -1733,7 +1740,31 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
                                 {effectiveCols.map(c => {
                                     const col = c.sourceIndex;
                                     const key = packColRowToNumber(col, row);
-                                    const focused = fCol === col && fRow === row;
+                                    // Fork addition: a merge is one gridcell.
+                                    // The anchor spans the whole merge and
+                                    // covered cells are omitted; when the
+                                    // anchor is scrolled out of the
+                                    // accessibility window, the first
+                                    // visible covered cell stands in for it
+                                    // so the merge stays readable.
+                                    const mergeRange = mergedCells?.getRange(col, row);
+                                    let location: Item = [col, row];
+                                    let rowSpan = 1;
+                                    let colSpan = 1;
+                                    if (mergeRange !== undefined) {
+                                        const anchorVisible =
+                                            visibleCols.includes(mergeRange.x) && visibleRows.includes(mergeRange.y);
+                                        const isAnchor = col === mergeRange.x && row === mergeRange.y;
+                                        const isStandIn =
+                                            !anchorVisible &&
+                                            col === Math.max(mergeRange.x, visibleCols[0]) &&
+                                            row === Math.max(mergeRange.y, visibleRows[0]);
+                                        if (!isAnchor && !isStandIn) return null;
+                                        location = [mergeRange.x, mergeRange.y];
+                                        rowSpan = mergeRange.y + mergeRange.height - row;
+                                        colSpan = mergeRange.x + mergeRange.width - col;
+                                    }
+                                    const focused = fCol === location[0] && fRow === location[1];
                                     const selected =
                                         range !== undefined &&
                                         col >= range.x &&
@@ -1741,7 +1772,6 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
                                         row >= range.y &&
                                         row < range.y + range.height;
                                     const id = `glide-cell-${col}-${row}`;
-                                    const location: Item = [col, row];
                                     const cellContent = getCellContent(location, true);
                                     return (
                                         <td
@@ -1752,13 +1782,15 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
                                             aria-readonly={
                                                 isInnerOnlyCell(cellContent) || !isReadWriteCell(cellContent)
                                             }
+                                            rowSpan={rowSpan === 1 ? undefined : rowSpan}
+                                            colSpan={colSpan === 1 ? undefined : colSpan}
                                             id={id}
                                             data-testid={id}
                                             onClick={() => {
                                                 const canvas = canvasRef?.current;
                                                 if (canvas === null || canvas === undefined) return;
                                                 return onKeyDown?.({
-                                                    bounds: getBoundsForItem(canvas, col, row),
+                                                    bounds: getBoundsForItem(canvas, location[0], location[1]),
                                                     cancel: () => undefined,
                                                     preventDefault: () => undefined,
                                                     stopPropagation: () => undefined,
@@ -1775,8 +1807,8 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
                                             onFocusCapture={e => {
                                                 if (
                                                     e.target === focusRef.current ||
-                                                    (lastFocusedSubdomNode.current?.[0] === col &&
-                                                        lastFocusedSubdomNode.current?.[1] === row)
+                                                    (lastFocusedSubdomNode.current?.[0] === location[0] &&
+                                                        lastFocusedSubdomNode.current?.[1] === location[1])
                                                 )
                                                     return;
                                                 lastFocusedSubdomNode.current = location;
@@ -1810,6 +1842,7 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
             onKeyDown,
             getBoundsForItem,
             onCellFocused,
+            mergedCells,
         ],
         200
     );

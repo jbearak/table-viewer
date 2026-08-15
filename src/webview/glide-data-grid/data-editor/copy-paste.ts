@@ -108,10 +108,13 @@ function createBufferFromGridCells(
     cells: readonly (readonly GridCell[])[],
     columnIndexes: readonly number[]
 ): CopyBuffer {
-    const copyBuffer: CopyBuffer = cells.map((row, index) => {
-        const mappedIndex = columnIndexes[index];
-        return row.map(cell => {
-            if (cell.span !== undefined && cell.span[0] !== mappedIndex)
+    // Fork fix (upstream bug): columnIndexes maps each CELL in a row to its
+    // grid column, but upstream indexed it with the ROW index, so the
+    // span-blanking comparison targeted the wrong column on all but the
+    // coincidentally-aligned rows.
+    const copyBuffer: CopyBuffer = cells.map(row => {
+        return row.map((cell, cellIndex) => {
+            if (cell.span !== undefined && cell.span[0] !== columnIndexes[cellIndex])
                 return {
                     formatted: "",
                     rawValue: "",
