@@ -7,7 +7,7 @@
  * here (no DOM) lets it unit-test without a canvas or Glide runtime.
  */
 
-/** Mirrors Glide's default `cellHorizontalPadding` and the merge-overlay inset. */
+/** Mirrors Glide's default `cellHorizontalPadding`. */
 export const CELL_TOOLTIP_HORIZONTAL_PADDING_PX = 8;
 
 /**

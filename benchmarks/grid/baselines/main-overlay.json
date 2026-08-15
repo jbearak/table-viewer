@@ -1,0 +1,27 @@
+{
+  "meta": {
+    "date": "2026-08-15T12:16:35.671Z",
+    "node": "v26.7.0",
+    "platform": "darwin",
+    "arch": "arm64",
+    "label": "baseline-overlay"
+  },
+  "scenarios": {
+    "csv-200k": {
+      "open_canvas_ms": 504,
+      "open_first_cell_ms": 791,
+      "scroll_p50_ms": 16.7,
+      "scroll_p95_ms": 18.2,
+      "scroll_long_frames": 1,
+      "scroll_total_ms": 12123.1
+    },
+    "xlsx-merged-5k": {
+      "open_canvas_ms": 502,
+      "open_first_cell_ms": 790,
+      "scroll_p50_ms": 16.7,
+      "scroll_p95_ms": 18.2,
+      "scroll_long_frames": 0,
+      "scroll_total_ms": 11954.6
+    }
+  }
+}

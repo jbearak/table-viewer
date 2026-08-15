@@ -1,4 +1,4 @@
-import { CompactSelection, type GridSelection } from '@glideapps/glide-data-grid';
+import { CompactSelection, type GridSelection } from './glide-data-grid';
 
 /** Columns selected at the moment a header drag begins. */
 export interface HeaderDragState {

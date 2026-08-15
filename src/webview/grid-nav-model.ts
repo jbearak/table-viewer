@@ -21,7 +21,13 @@ export function move_sequential_cell(
     if (row_count <= 0 || column_count <= 0) return cell;
     const [col, row] = cell;
     if (navigation === 'below') {
-        return row < row_count - 1 ? [col, row + 1] : cell;
+        // Skip covered rows so Enter from a vertical merge lands below the
+        // block instead of on a covered member (which selection
+        // canonicalization would snap straight back to the anchor).
+        for (let next = row + 1; next < row_count; next++) {
+            if (!is_covered(next, col)) return [col, next];
+        }
+        return cell;
     }
 
     const current = row * column_count + col;
@@ -44,17 +50,7 @@ export interface NavInput {
     alt: boolean;
     /** True when cells are editable (edit mode) — keep type-to-edit working. */
     editable: boolean;
-    /** True when the sheet has merge ranges (vertical/2D merges need merge-aware
-     *  nav; plain sheets keep Glide's native, fully-featured arrow handling). */
-    has_merges: boolean;
 }
-
-const ARROW_DIRECTIONS: Record<string, Direction> = {
-    ArrowUp: 'up',
-    ArrowDown: 'down',
-    ArrowLeft: 'left',
-    ArrowRight: 'right',
-};
 
 const VIM_DIRECTIONS: Record<string, Direction> = {
     k: 'up',
@@ -68,16 +64,14 @@ const VIM_DIRECTIONS: Record<string, Direction> = {
  * controlled move itself (or return null to defer to Glide).
  *
  * Glide's native keyboard handling is rich (range extension, Ctrl+A, Home/End,
- * paging), so we intercept as little as possible:
+ * paging) and merge-aware (the vendored grid steps past merged blocks itself),
+ * so we intercept as little as possible:
  *
  * - Tab/Shift+Tab use application-owned row-major traversal with wrapping.
  * - Other modifier combos defer — copy, select-all, and range extension stay
  *   native.
- * - Plain arrows are intercepted **only** when the sheet has merges, where
- *   Glide otherwise gets stuck stepping into overlay-covered cells that snap
- *   back to the same anchor. On plain sheets, native arrow nav is correct.
- * - hjkl (vim nav) is intercepted in view mode regardless of merges, but never
- *   while editing, so typing a letter into an editable cell still works.
+ * - hjkl (vim nav) is intercepted in view mode, but never while editing, so
+ *   typing a letter into an editable cell still works.
  */
 /**
  * True for the copy shortcut (Ctrl+C / Cmd+C, no Shift/Alt). GridShell
@@ -103,11 +97,6 @@ export function resolve_nav(input: NavInput): GridNavigationDecision | null {
         };
     }
     if (input.shift) return null;
-
-    const arrow = ARROW_DIRECTIONS[input.key];
-    if (arrow) {
-        return input.has_merges ? { kind: 'direction', direction: arrow } : null;
-    }
 
     const vim = VIM_DIRECTIONS[input.key];
     if (vim) {

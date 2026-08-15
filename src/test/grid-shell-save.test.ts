@@ -29,7 +29,7 @@ const grid_mock = vi.hoisted(() => ({
     text_for_source_row: null as null | ((source_row: number) => readonly string[]),
 }));
 
-vi.mock('@glideapps/glide-data-grid', () => {
+vi.mock('../webview/glide-data-grid', () => {
     const React = require('react') as typeof import('react');
     return {
         CompactSelection: { empty: () => ({}) },
@@ -112,13 +112,6 @@ vi.mock('../webview/vscode-theme', () => ({
         conflictBg: 'rgba(229, 75, 75, 0.22)',
     }),
     theme_font_size_px: () => 13,
-}));
-
-vi.mock('../webview/merge-overlay', () => ({
-    MergeOverlay: React.forwardRef((_props: unknown, ref: React.ForwardedRef<unknown>) => {
-        React.useImperativeHandle(ref, () => ({ repaint: vi.fn() }));
-        return null;
-    }),
 }));
 
 vi.mock('../webview/row-resize-overlay', () => ({

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import type { Theme } from '@glideapps/glide-data-grid';
+import type { Theme } from './glide-data-grid';
 
 /**
  * Builds a Glide `Partial<Theme>` from VS Code's `--vscode-*` CSS variables so
