@@ -273,6 +273,27 @@ describe('host-bridge', () => {
         expect(injected.postMessage).toHaveBeenCalledTimes(1);
     });
 
+    it('matches equivalent edit maps inserted in reverse key order', async () => {
+        const { injected, pending_edit_durability } =
+            await setup_pending_edit_durability();
+        const published = {
+            '2:1': { value: 'A', base: 'a' },
+            '10:3': { value: 'B', base: 'b' },
+        };
+        const echoed = {
+            '10:3': { value: 'B', base: 'b' },
+            '2:1': { value: 'A', base: 'a' },
+        };
+        const sequence = pending_edit_durability.publish(
+            'session:key-order', published, 0, 'People');
+
+        expect(pending_edit_durability.unacknowledged_payload_matches(
+            'session:key-order', echoed, published, 0, 'People')).toBe(true);
+        expect(pending_edit_durability.publish(
+            'session:key-order', echoed, 0, 'People')).toBe(sequence);
+        expect(injected.postMessage).toHaveBeenCalledTimes(1);
+    });
+
     it('prefers an injected global bridge over acquireVsCodeApi', async () => {
         const injected = { postMessage: vi.fn() };
         (globalThis as { __tableViewerHostBridge?: unknown })

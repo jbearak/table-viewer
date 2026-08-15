@@ -70,7 +70,8 @@ const pending_edit_channels = new Map<string, PendingEditSessionChannel>();
 function pending_edit_payload(edits: SheetPendingEditCells | null): string {
     if (edits === null) return 'null';
     const canonical: SheetPendingEditCells = {};
-    for (const [key, entry] of Object.entries(edits)) {
+    for (const key of Object.keys(edits).sort()) {
+        const entry = edits[key];
         canonical[key] = typeof entry === 'string'
             ? entry
             : { value: entry.value, base: entry.base };
