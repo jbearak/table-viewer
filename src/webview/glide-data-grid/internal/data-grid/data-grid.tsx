@@ -880,16 +880,17 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
     }, []);
 
     // Fork addition: damaging any cell of a merge must repaint the whole
-    // merge (the anchor's content spans the covered cells). Ref keeps
-    // damageInternal identity-stable while tracking the current resolver.
-    const mergedCellsRef = React.useRef(mergedCells);
-    mergedCellsRef.current = mergedCells;
-
-    const damageInternal = React.useCallback((locations: CellSet) => {
-        damageRegion.current = mergedCellsRef.current?.expandDamage(locations) ?? locations;
-        lastDrawRef.current();
-        damageRegion.current = undefined;
-    }, []);
+    // merge (the anchor's content spans the covered cells). Consumers track
+    // the latest callback (useAnimationQueue via ref, imageLoader via
+    // setCallback each render), so identity may change with the resolver.
+    const damageInternal = React.useCallback(
+        (locations: CellSet) => {
+            damageRegion.current = mergedCells?.expandDamage(locations) ?? locations;
+            lastDrawRef.current();
+            damageRegion.current = undefined;
+        },
+        [mergedCells]
+    );
 
     const enqueue = useAnimationQueue(damageInternal);
     enqueueRef.current = enqueue;

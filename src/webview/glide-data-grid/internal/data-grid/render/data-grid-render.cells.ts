@@ -121,6 +121,32 @@ export function drawCells(
         freezeTrailingRows > 0 ? getFreezeTrailingHeight(rows, freezeTrailingRows, getRowHeight) : 0;
     let result: Rectangle[] | undefined;
     let handledSpans: Set<string> | undefined = undefined;
+    // Merged ranges dedup by the resolver's stable Rectangle identity — no
+    // per-cell string keys in the hot loop. Sticky and scrollable panes draw
+    // separately, so each gets its own set.
+    let handledMerges: Set<Rectangle> | undefined = undefined;
+    let handledStickyMerges: Set<Rectangle> | undefined = undefined;
+
+    // Shared between the merge and span branches: clip the canvas to the
+    // multi-cell area and record it as a painted region.
+    const beginMultiCellClip = (area: Rectangle, clipX: number, clipTop: number, clipHIn: number): void => {
+        ctx.restore();
+        ctx.save();
+        ctx.beginPath();
+        const d = Math.max(0, clipX - area.x);
+        const clipH = Math.max(0, clipHIn);
+        ctx.rect(area.x + d, clipTop, area.width - d, clipH);
+        if (result === undefined) {
+            result = [];
+        }
+        result.push({
+            x: area.x + d,
+            y: clipTop,
+            width: area.width - d,
+            height: clipH,
+        });
+        ctx.clip();
+    };
 
     const skipPoint = getSkipPoint(drawRegions);
 
@@ -235,52 +261,54 @@ export function drawCells(
                             ? undefined
                             : mergedCells.getRange(c.sourceIndex, row);
                     if (mergeRange !== undefined) {
-                        const mergeKey = `m${mergeRange.y},${mergeRange.x},${c.sticky}`; //alloc
-                        if (handledSpans === undefined) handledSpans = new Set();
-                        if (handledSpans.has(mergeKey)) {
+                        let handled = c.sticky ? handledStickyMerges : handledMerges;
+                        if (handled?.has(mergeRange) === true) {
                             toDraw--;
                             return;
                         }
-                        // Walk from the visited row back up to the anchor row
-                        // (which may sit above the viewport) and sum the
-                        // merge's row heights.
+                        if (handled === undefined) {
+                            handled = new Set();
+                            if (c.sticky) handledStickyMerges = handled;
+                            else handledMerges = handled;
+                        }
+                        // Walk the merge's rows once, summing its height and
+                        // backing drawY up to the anchor row (which may sit
+                        // above the viewport).
                         let mergeY = drawY;
-                        for (let r = mergeRange.y; r < row; r++) mergeY -= getRowHeight(r);
                         let mergeH = 0;
                         for (let r = mergeRange.y; r < mergeRange.y + mergeRange.height; r++) {
-                            mergeH += getRowHeight(r);
+                            const rowH = getRowHeight(r);
+                            mergeH += rowH;
+                            if (r < row) mergeY -= rowH;
                         }
-                        const mergeSpan: Item = [mergeRange.x, mergeRange.x + mergeRange.width - 1]; //alloc
-                        const areas = getSpanBounds(mergeSpan, drawX, mergeY, c.width, mergeH, c, allColumns);
-                        const area = c.sticky ? areas[0] : areas[1];
-                        if (!c.sticky && areas[0] !== undefined) {
-                            skipContents = true;
+                        let area: Rectangle | undefined;
+                        if (mergeRange.width === 1) {
+                            // Single-column (vertical) merge: the bounds are
+                            // this column's. getSpanBounds cannot express a
+                            // one-column span sitting exactly on the first
+                            // non-sticky column, so compute directly.
+                            area = { x: drawX, y: mergeY, width: c.width, height: mergeH }; //alloc
+                        } else {
+                            const mergeSpan: Item = [mergeRange.x, mergeRange.x + mergeRange.width - 1]; //alloc
+                            const areas = getSpanBounds(mergeSpan, drawX, mergeY, c.width, mergeH, c, allColumns);
+                            area = c.sticky ? areas[0] : areas[1];
+                            if (!c.sticky && areas[0] !== undefined) {
+                                skipContents = true;
+                            }
                         }
                         if (area !== undefined) {
                             cellX = area.x;
                             cellWidth = area.width;
-                            handledSpans.add(mergeKey);
-                            ctx.restore();
+                            handled.add(mergeRange);
                             prepResult = undefined;
-                            ctx.save();
-                            ctx.beginPath();
-                            const d = Math.max(0, clipX - area.x);
-                            // Clip top stays inside the column viewport so a
-                            // merge whose anchor is scrolled off-screen never
-                            // paints over the header.
+                            // Clip stays inside the column viewport: a merge
+                            // whose anchor is scrolled off-screen never paints
+                            // over the header, and a merge reaching into the
+                            // freeze-trailing band stops at the band (the
+                            // sticky rows draw their own cells over it).
                             const clipTop = Math.max(area.y, colDrawY);
-                            const clipH = area.height - (clipTop - area.y);
-                            ctx.rect(area.x + d, clipTop, area.width - d, clipH);
-                            if (result === undefined) {
-                                result = [];
-                            }
-                            result.push({
-                                x: area.x + d,
-                                y: clipTop,
-                                width: area.width - d,
-                                height: clipH,
-                            });
-                            ctx.clip();
+                            const clipBottom = Math.min(area.y + area.height, height - freezeTrailingRowsHeight);
+                            beginMultiCellClip(area, clipX, clipTop, clipBottom - clipTop);
                             drawingSpan = true;
                             cellY = area.y;
                             cellHeight = area.height;
@@ -310,22 +338,8 @@ export function drawCells(
                                 cellX = area.x;
                                 cellWidth = area.width;
                                 handledSpans.add(spanKey);
-                                ctx.restore();
                                 prepResult = undefined;
-                                ctx.save();
-                                ctx.beginPath();
-                                const d = Math.max(0, clipX - area.x);
-                                ctx.rect(area.x + d, drawY, area.width - d, rh);
-                                if (result === undefined) {
-                                    result = [];
-                                }
-                                result.push({
-                                    x: area.x + d,
-                                    y: drawY,
-                                    width: area.width - d,
-                                    height: rh,
-                                });
-                                ctx.clip();
+                                beginMultiCellClip(area, clipX, drawY, rh);
                                 drawingSpan = true;
                             }
                         } else {

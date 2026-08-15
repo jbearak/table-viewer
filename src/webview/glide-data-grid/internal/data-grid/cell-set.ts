@@ -29,6 +29,14 @@ export class CellSet {
         return this.cells.size;
     }
 
+    // Fork addition: copy without round-tripping every packed key through an
+    // unpacked [col, row] tuple.
+    public clone(): CellSet {
+        const result = new CellSet();
+        for (const cell of this.cells) result.cells.add(cell);
+        return result;
+    }
+
     public hasHeader(): boolean {
         for (const cellNumber of this.cells) {
             const row = unpackRow(cellNumber);

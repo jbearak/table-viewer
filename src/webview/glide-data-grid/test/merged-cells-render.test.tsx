@@ -60,13 +60,13 @@ function prep() {
 }
 
 describe("mergedRanges rendering", () => {
-    afterEach(async () => {
-        await act(async () => {
+    afterEach(() => {
+        act(() => {
             cleanup();
         });
     });
 
-    test("renders without crashing with 2D merges in view", async () => {
+    test("renders without crashing with 2D merges in view", () => {
         vi.useFakeTimers();
         render(
             <DataEditor
@@ -83,7 +83,7 @@ describe("mergedRanges rendering", () => {
         expect(document.body.contains(canvas)).toBe(true);
     });
 
-    test("renders a merge whose anchor is above the viewport", async () => {
+    test("renders a merge whose anchor is above the viewport", () => {
         vi.useFakeTimers();
         render(
             <DataEditor
@@ -109,7 +109,7 @@ describe("mergedRanges rendering", () => {
         expect(document.body.contains(canvas)).toBe(true);
     });
 
-    test("damage draw repaints merges without crashing", async () => {
+    test("damage draw repaints merges without crashing", () => {
         vi.useFakeTimers();
         const ref = React.createRef<DataEditorRef>();
         render(
@@ -128,7 +128,7 @@ describe("mergedRanges rendering", () => {
         expect(document.body.contains(canvas)).toBe(true);
     });
 
-    test("merge-free grids accept and ignore an empty mergedRanges array", async () => {
+    test("merge-free grids accept and ignore an empty mergedRanges array", () => {
         vi.useFakeTimers();
         render(<DataEditor {...basicProps} mergedRanges={[]} />, { wrapper: Context });
         prep();

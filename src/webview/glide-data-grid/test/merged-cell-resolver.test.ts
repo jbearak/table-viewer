@@ -14,15 +14,9 @@ describe("MergedCellResolver", () => {
         expect(r.getRange(1, 5)).toBeUndefined();
     });
 
-    test("isCovered and anchorOf", () => {
+    test("returns one stable Rectangle identity per merge", () => {
         const r = new MergedCellResolver([{ x: 1, y: 1, width: 2, height: 2 }]);
-        expect(r.isCovered(1, 1)).toBe(false);
-        expect(r.isCovered(2, 1)).toBe(true);
-        expect(r.isCovered(1, 2)).toBe(true);
-        expect(r.isCovered(2, 2)).toBe(true);
-        expect(r.isCovered(0, 0)).toBe(false);
-        expect(r.anchorOf(2, 2)).toEqual([1, 1]);
-        expect(r.anchorOf(5, 5)).toEqual([5, 5]);
+        expect(r.getRange(1, 1)).toBe(r.getRange(2, 2));
     });
 
     test("applies column offset (row markers)", () => {
@@ -42,16 +36,33 @@ describe("MergedCellResolver", () => {
         expect(r.getRange(0, 0)).toBeUndefined();
     });
 
+    test("drops ranges extending past the grid bounds", () => {
+        const r = new MergedCellResolver(
+            [
+                { x: 8, y: 0, width: 3, height: 2 },
+                { x: 0, y: 98, width: 2, height: 5 },
+                { x: 0, y: 0, width: 2, height: 2 },
+            ],
+            0,
+            10,
+            100
+        );
+        expect(r.getRange(8, 0)).toBeUndefined();
+        expect(r.getRange(0, 98)).toBeUndefined();
+        expect(r.getRange(0, 0)).toEqual({ x: 0, y: 0, width: 2, height: 2 });
+    });
+
     test("drops overlapping ranges, first listed wins", () => {
         const r = new MergedCellResolver([
             { x: 0, y: 0, width: 3, height: 3 },
             { x: 2, y: 2, width: 3, height: 3 },
             { x: 5, y: 5, width: 2, height: 1 },
         ]);
-        expect(r.ranges).toEqual([
-            { x: 0, y: 0, width: 3, height: 3 },
-            { x: 5, y: 5, width: 2, height: 1 },
-        ]);
+        expect(r.getRange(0, 0)).toEqual({ x: 0, y: 0, width: 3, height: 3 });
+        expect(r.getRange(5, 5)).toEqual({ x: 5, y: 5, width: 2, height: 1 });
+        // The overlapping second range was dropped entirely, including its
+        // non-overlapping corner.
+        expect(r.getRange(4, 4)).toBeUndefined();
         expect(r.getRange(3, 3)).toBeUndefined();
     });
 
@@ -87,5 +98,17 @@ describe("MergedCellResolver", () => {
         expect(expanded.has([7, 9])).toBe(true);
         expect(expanded.has([2, 1])).toBe(true);
         expect(expanded.size).toBe(3);
+    });
+
+    test("expandDamage handles many members of one merge", () => {
+        const r = new MergedCellResolver([{ x: 0, y: 0, width: 3, height: 3 }]);
+        const expanded = r.expandDamage(
+            new CellSet([
+                [0, 0],
+                [1, 1],
+                [2, 2],
+            ])
+        );
+        expect(expanded.size).toBe(9);
     });
 });

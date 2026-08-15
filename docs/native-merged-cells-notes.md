@@ -107,3 +107,24 @@ Delete or fold into a real design doc before the PR if stale.
 - Compatibility contracts: `.gdg-clip-region`, `#portal`,
   `#glide-cell-<col>-<row>`, `[data-testid="data-grid-canvas"]`,
   `.dvn-scroller`, 36px header.
+
+## Stage 2 review decisions (recorded 2026-08-15)
+
+- Selection/hover accents on merges: rendering redirects covered cells to the
+  anchor, so clicking/hovering a covered cell doesn't accent the merge until
+  Stage 3 canonicalizes mouse args + selection to the anchor. Known, deferred
+  by design (Stage 2 is rendering-only; app doesn't pass mergedRanges yet).
+- Freeze-trailing rows: merges are not resolved in sticky rows; a merge
+  reaching into the freeze band is clipped at the band and the sticky rows
+  draw their own cells. Merges wholly inside the band render as plain cells.
+  Table-viewer never freezes trailing rows; acceptable fork limitation.
+- Column DnD: merge bounds use source order; a merge dragged apart is wrong
+  mid-drag. App doesn't use column reordering; not worth the complexity.
+- Image loader keys off the anchor row, which can sit outside the visible
+  window; Stage 5 handles anchor-row preloading (app side already plans it).
+- Resolver stores one Map entry per covered cell (O(area) build/memory) as a
+  deliberate trade for allocation-free O(1) hot-loop lookups.
+- Kept the merge branch in drawCells separate from the upstream cell.span
+  branch: merges resolve before getCellContent (anchor redirect), spans after
+  (span comes from the fetched cell); dedup semantics differ (per-merge vs
+  per-row). Shared piece extracted: beginMultiCellClip.
