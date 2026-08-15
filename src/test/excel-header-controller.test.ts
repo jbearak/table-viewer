@@ -1,7 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import type * as vscode from 'vscode';
 import { attach_viewer, type ViewerProfile } from '../viewer-controller';
 import { ExcelHeaderDataSource } from '../data-source/excel-header-source';
+import { XlsxDataSource } from '../data-source/xlsx-source';
 import type {
     DataSource,
     RenderedCell,
@@ -465,6 +468,141 @@ describe('Excel workbook snapshot controller', () => {
         expect(promoted.state.excelFirstRowHeaders).toEqual({ People: 'on' });
         expect(state.value().transforms?.[0]?.hiddenRows).toEqual([0, 1]);
     });
+
+    it('turns off every header after manual row-nine promotions in the survey workbook', async () => {
+        const bytes = new Uint8Array(readFileSync(join(
+            __dirname,
+            'fixtures',
+            'undesa_pd_2024_wcu_country_data_survey-based.xlsx',
+        )));
+        const state = mutable_state_store();
+        const profile: ViewerProfile = {
+            editing: false,
+            async build_source(_raw, _path, saved) {
+                const physical = await XlsxDataSource.create(bytes);
+                return new ExcelHeaderDataSource(
+                    physical,
+                    saved.excelFirstRowHeaders,
+                    physical.meta().sheets.map(
+                        (_sheet, index) => saved.transforms?.[index]?.hiddenRows,
+                    ),
+                );
+            },
+        };
+        const panel = open_excel('/survey-header-queue.xlsx', state.store, profile);
+        let basis = await ready(panel);
+        let generation = basis.generation;
+        let source_generation = basis.sourceGeneration;
+        expect(basis.meta.sheets.map((sheet) => sheet.name)).toEqual([
+            'INFORMATION NOTE',
+            'Database Field Descriptions',
+            'By methods',
+            'By marital status and age',
+        ]);
+
+        for (const sheet_index of [2, 3]) {
+            const sheet_name = basis.meta.sheets[sheet_index].name;
+            const request_id = `promote:${sheet_name}`;
+            await panel.__receive({
+                type: 'setExcelFirstRowHeader',
+                sheetIndex: sheet_index,
+                sheetName: sheet_name,
+                enabled: true,
+                headerRow: 8,
+                requestId: request_id,
+                generation,
+                sourceGeneration: source_generation,
+            });
+            await vi.waitFor(() => expect(snapshots(panel).some((snapshot) => (
+                snapshot.commandResult?.requestId === request_id
+            ))).toBe(true));
+            basis = snapshots(panel).find((snapshot) => (
+                snapshot.commandResult?.requestId === request_id
+            ))!;
+            expect(basis.commandResult).toMatchObject({ outcome: 'applied' });
+            generation = basis.generation;
+            source_generation = basis.sourceGeneration;
+            await panel.__receive({
+                type: 'snapshotApplied',
+                identity: basis.identity,
+                disposition: 'applied',
+            });
+
+            const transform = basis.state.transforms?.[sheet_index];
+            expect(transform?.hiddenRows).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+            const restore_id = `restore:${sheet_name}`;
+            await panel.__receive({
+                type: 'setTransform',
+                sheetIndex: sheet_index,
+                state: transform!,
+                requestId: restore_id,
+                generation,
+                sourceGeneration: source_generation,
+                intent: 'restore',
+            });
+            await vi.waitFor(() => expect(messages_of(panel, 'transformInstalled').some(
+                (message) => message.requestId === restore_id,
+            )).toBe(true));
+            const installed = messages_of(panel, 'transformInstalled').find(
+                (message) => message.requestId === restore_id,
+            )!;
+            generation = installed.view.basis.generation;
+            source_generation = installed.view.basis.sourceGeneration;
+        }
+
+        for (const [sheet_index, sheet] of basis.meta.sheets.entries()) {
+            const latest = snapshots(panel).at(-1)!;
+            generation = latest.generation;
+            source_generation = latest.sourceGeneration;
+            const request_id = `disable:${sheet.name}`;
+            await panel.__receive({
+                type: 'setExcelFirstRowHeader',
+                sheetIndex: sheet_index,
+                sheetName: sheet.name,
+                enabled: false,
+                requestId: request_id,
+                generation,
+                sourceGeneration: source_generation,
+            });
+            await vi.waitFor(() => expect(snapshots(panel).some((snapshot) => (
+                snapshot.commandResult?.requestId === request_id
+            ))).toBe(true));
+            basis = snapshots(panel).find((snapshot) => (
+                snapshot.commandResult?.requestId === request_id
+            ))!;
+            expect(
+                basis.commandResult,
+                `${sheet_index}:${sheet.name}:${JSON.stringify({
+                    result: basis.commandResult,
+                    generation,
+                    installs: messages_of(panel, 'transformInstalled').map(
+                        (message) => [message.requestId, message.view.basis.generation],
+                    ),
+                    snapshots: snapshots(panel).map((snapshot) => [
+                        snapshot.reason,
+                        snapshot.commandResult?.requestId,
+                        snapshot.generation,
+                    ]),
+                })}`,
+            ).toMatchObject({
+                outcome: 'applied',
+            });
+            generation = basis.generation;
+            source_generation = basis.sourceGeneration;
+            await panel.__receive({
+                type: 'snapshotApplied',
+                identity: basis.identity,
+                disposition: 'applied',
+            });
+        }
+
+        expect(state.value().excelFirstRowHeaders).toEqual({
+            'INFORMATION NOTE': 'off',
+            'Database Field Descriptions': 'off',
+            'By methods': 'off',
+            'By marital status and age': 'off',
+        });
+    }, 30_000);
 
     it('refreshes after another writer changes the hidden header candidate', async () => {
         const state = mutable_state_store({
