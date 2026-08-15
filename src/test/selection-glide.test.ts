@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import type { MergeRange } from '../types';
 import { expand_glide_selection } from '../webview/selection-glide';
 
-// Standard fixture shared with merge-index / merge-overlay-model tests.
+// Standard fixture shared with the merge-index tests.
 const merges: MergeRange[] = [
     { startRow: 0, startCol: 0, endRow: 0, endCol: 2 }, // horizontal (rowSpan 1)
     { startRow: 2, startCol: 0, endRow: 3, endCol: 0 }, // vertical (rowSpan 2)
