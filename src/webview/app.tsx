@@ -2906,6 +2906,11 @@ export function App(): React.JSX.Element {
             (installed_rules?.sort.length ?? 0) > 0
             || installed_rules?.filters.some((filter) => filter.enabled)
         ) return true;
+        // A terminal refusal adopts the view already on screen and deliberately
+        // stops restoration for this row basis. With no installed sort or active
+        // filter above, that view is safe to address by display row even though the
+        // durable rules no longer reconcile with it.
+        if (restore_abandoned_ref.current[target_sheet_index]) return false;
         const durable = sanitize_transform_state(
             state_ref.current.transforms?.[target_sheet_index],
             sheet.columnCount,
@@ -2936,6 +2941,10 @@ export function App(): React.JSX.Element {
         if (
             edit_mode
             || edit_mode_ref.current
+            || (
+                header_row !== undefined
+                && (preview_mode || preview_mode_ref.current)
+            )
             || pending_excel_header_ref.current
             || header_waits_for_transform(
                 target_sheet_index,
@@ -2968,7 +2977,13 @@ export function App(): React.JSX.Element {
             sourceGeneration: source_generation_ref.current,
         });
         return 'posted';
-    }, [active_sheet_index, edit_mode, header_waits_for_transform, meta]);
+    }, [
+        active_sheet_index,
+        edit_mode,
+        header_waits_for_transform,
+        meta,
+        preview_mode,
+    ]);
 
     const handle_toggle_excel_header = useCallback(() => {
         const header = meta?.sheets[active_sheet_index]?.excelFirstRowHeader;
@@ -4571,7 +4586,7 @@ export function App(): React.JSX.Element {
             on_hide_columns={handle_hide_columns}
             on_hide_rows={handle_hide_rows}
             can_promote_row_to_header={
-                excel_header !== undefined && !excel_header_disabled
+                excel_header !== undefined && !excel_header_disabled && !preview_mode
                     && !header_waits_for_transform(active_sheet_index, true)
             }
             on_promote_row_to_header={handle_promote_row_to_header}

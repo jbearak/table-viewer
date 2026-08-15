@@ -2156,6 +2156,64 @@ describe('Excel first-row header toggle', () => {
             .some((message) => message.type === 'setExcelFirstRowHeader')).toBe(false);
     });
 
+    it('promotes from the adopted natural view after a terminal restore refusal', async () => {
+        const { post_message } = await render_app();
+        const meta = excel_meta(false, 'off');
+        meta.sheets[0].sourceRowCount = 12;
+        const transform: SheetTransformState = {
+            sort: [],
+            filters: [],
+            hiddenRows: [0, 1, 2, 3, 4, 5, 6, 7],
+            schema: transform_schema_for_sheet(meta.sheets[0]),
+        };
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            state: { transforms: [transform] },
+        }));
+        const restore = latest_transform_request(post_message);
+
+        await dispatch_host_message({
+            type: 'transformRefused',
+            sheetIndex: restore.sheetIndex,
+            requestId: restore.requestId,
+            intent: restore.intent,
+            reason: 'The saved table view no longer matches this sheet.',
+            terminal: true,
+        });
+
+        expect(grid_shell_mock.latest_props?.transform_pending).toBe(false);
+        expect(grid_shell_mock.latest_props?.can_promote_row_to_header).toBe(true);
+        post_message.mockClear();
+        await act(async () => {
+            const promote = grid_shell_mock.latest_props?.on_promote_row_to_header as
+                ((display_row: number) => void);
+            promote(2);
+        });
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'setExcelFirstRowHeader',
+            sheetIndex: 0,
+            headerRow: 2,
+        }));
+    });
+
+    it('keeps row promotion blocked at the command boundary in preview', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            excel_meta(false, 'off'),
+            { configuration: { previewMode: true } },
+        ));
+
+        expect(grid_shell_mock.latest_props?.can_promote_row_to_header).toBe(false);
+        post_message.mockClear();
+        await act(async () => {
+            const promote = grid_shell_mock.latest_props?.on_promote_row_to_header as
+                ((display_row: number) => void);
+            promote(2);
+        });
+        expect(post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .some((message) => message.type === 'setExcelFirstRowHeader')).toBe(false);
+    });
+
     it('retains an all-sheets header item while a transform changes generation', async () => {
         const { post_message } = await render_app();
         const initial = excel_meta_multi([false, false]);
