@@ -1752,14 +1752,20 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
                                     let rowSpan = 1;
                                     let colSpan = 1;
                                     if (mergeRange !== undefined) {
-                                        const anchorVisible =
-                                            visibleCols.includes(mergeRange.x) && visibleRows.includes(mergeRange.y);
-                                        const isAnchor = col === mergeRange.x && row === mergeRange.y;
-                                        const isStandIn =
-                                            !anchorVisible &&
-                                            col === Math.max(mergeRange.x, visibleCols[0]) &&
-                                            row === Math.max(mergeRange.y, visibleRows[0]);
-                                        if (!isAnchor && !isStandIn) return null;
+                                        // The first rendered cell of the
+                                        // merge represents it (the anchor
+                                        // when visible). visibleCols may be
+                                        // non-contiguous with frozen
+                                        // columns, so intersect rather than
+                                        // assume the window starts at the
+                                        // merge edge.
+                                        const repCol = visibleCols.find(
+                                            c => c >= mergeRange.x && c < mergeRange.x + mergeRange.width
+                                        );
+                                        const repRow = visibleRows.find(
+                                            r => r >= mergeRange.y && r < mergeRange.y + mergeRange.height
+                                        );
+                                        if (col !== repCol || row !== repRow) return null;
                                         location = [mergeRange.x, mergeRange.y];
                                         rowSpan = mergeRange.y + mergeRange.height - row;
                                         colSpan = mergeRange.x + mergeRange.width - col;

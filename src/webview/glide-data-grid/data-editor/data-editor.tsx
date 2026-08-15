@@ -3547,6 +3547,11 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
 
                 const [targetCol, targetRow] = target;
 
+                // Fork addition: covered merge cells are not editable —
+                // reachable here via column/row selections whose first cell
+                // is covered (current-cell selections always sit on anchors).
+                if (mergedCells?.isCovered(targetCol, targetRow) === true && onPaste === undefined) return;
+
                 const editList: EditListItem[] = [];
                 do {
                     if (onPaste === undefined) {
@@ -3585,15 +3590,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                             // Fork addition: covered merge cells are not
                             // editable — only the value landing on the
                             // anchor position writes into a merge.
-                            if (mergedCells !== undefined) {
-                                const mergeRange = mergedCells.getRange(writeCol, writeRow);
-                                if (
-                                    mergeRange !== undefined &&
-                                    (mergeRange.x !== writeCol || mergeRange.y !== writeRow)
-                                ) {
-                                    continue;
-                                }
-                            }
+                            if (mergedCells?.isCovered(writeCol, writeRow) === true) continue;
                             const cellData = getMangledCellContent(index);
                             const newVal = pasteToCell(cellData, index, dataItem.rawValue, dataItem.formatted);
                             if (newVal !== undefined) {
@@ -3657,9 +3654,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                 if (mergedCells === undefined) return cells;
                 return cells.map((rowCells, r) =>
                     rowCells.map((cell, c) => {
-                        const mergeRange = mergedCells.getRange(originCol + c, originRow + r);
-                        if (mergeRange === undefined) return cell;
-                        if (mergeRange.x === originCol + c && mergeRange.y === originRow + r) return cell;
+                        if (!mergedCells.isCovered(originCol + c, originRow + r)) return cell;
                         return {
                             kind: GridCellKind.Text,
                             data: "",

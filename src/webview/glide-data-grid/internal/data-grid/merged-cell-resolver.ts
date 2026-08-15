@@ -88,6 +88,12 @@ export class MergedCellResolver {
         return range === undefined ? [col, row] : [range.x, range.y];
     }
 
+    /** True when (col, row) is inside a merge but is not its anchor. */
+    public isCovered(col: number, row: number): boolean {
+        const range = this.cellToRange.get(packColRowToNumber(col, row));
+        return range !== undefined && (range.x !== col || range.y !== row);
+    }
+
     /**
      * Grows a rectangle until it fully contains every merge it touches
      * (fixpoint — growing over one merge can reach another). Returns the
