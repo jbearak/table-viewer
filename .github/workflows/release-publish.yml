@@ -29,11 +29,15 @@ env:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # Check both identities because a rerun keeps the original actor's privileges
+    # while recording the person who requested the rerun separately.
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.conclusion == 'success' &&
-       startsWith(github.event.workflow_run.head_branch, 'v'))
+      github.actor == github.repository_owner &&
+      github.triggering_actor == github.repository_owner &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        startsWith(github.event.workflow_run.head_branch, 'v')))
     environment: release
 
     steps:

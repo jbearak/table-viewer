@@ -24,11 +24,15 @@ jobs:
   # successful independent CI run for some other commit from vouching for the
   # release, and prevents release-publish from racing ahead of a Windows failure.
   windows-validation:
+    # `actor` is the original triggerer; `triggering_actor` may differ on a rerun.
+    # Requiring both prevents another writer from dispatching or replaying a release.
+    if: >-
+      github.actor == github.repository_owner &&
+      github.triggering_actor == github.repository_owner
     runs-on: windows-latest
 
     steps:
-      - name: Resolve immutable tag commit
-        id: release
+      - name: Validate immutable tag commit
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -58,19 +62,21 @@ jobs:
             echo "ERROR: release tag does not resolve to the immutable event commit" >&2
             exit 1
           fi
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
       - name: Checkout tag commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          ref: ${{ steps.release.outputs.sha }}
+          # The validation above proves the tag resolves to this immutable event
+          # commit. Referencing it directly keeps user-derived step output out of
+          # the checkout's security boundary.
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
 
       - name: Verify checkout matches tag commit
         shell: bash
         env:
-          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+          RELEASE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           if [[ "$(git rev-parse HEAD)" != "$RELEASE_SHA" ]]; then
@@ -127,12 +133,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   build:
+    if: >-
+      github.actor == github.repository_owner &&
+      github.triggering_actor == github.repository_owner
     needs: windows-validation
     runs-on: ubuntu-latest
 
     steps:
-      - name: Resolve immutable tag commit
-        id: release
+      - name: Validate immutable tag commit
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -162,12 +170,11 @@ jobs:
             echo "ERROR: release tag does not resolve to the immutable event commit" >&2
             exit 1
           fi
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
       - name: Checkout tag commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          ref: ${{ steps.release.outputs.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
 
@@ -182,7 +189,7 @@ jobs:
         shell: bash
         env:
           THE_TAG: ${{ inputs.tag || github.ref_name }}
-          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+          RELEASE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
 
@@ -243,6 +250,9 @@ jobs:
   # artifact, and so a desktop packaging failure is distinguishable from a
   # broken .vsix.
   desktop:
+    if: >-
+      github.actor == github.repository_owner &&
+      github.triggering_actor == github.repository_owner
     runs-on: macos-latest
     # The Apple signing secrets live in the `release` environment, so this job
     # must run in it to read them. Note the consequence: if that environment
@@ -252,8 +262,7 @@ jobs:
     environment: release
 
     steps:
-      - name: Resolve immutable tag commit
-        id: release
+      - name: Validate immutable tag commit
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -283,12 +292,11 @@ jobs:
             echo "ERROR: release tag does not resolve to the immutable event commit" >&2
             exit 1
           fi
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
       - name: Checkout tag commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          ref: ${{ steps.release.outputs.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
 
@@ -302,7 +310,7 @@ jobs:
         shell: bash
         env:
           THE_TAG: ${{ inputs.tag || github.ref_name }}
-          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+          RELEASE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
 
@@ -431,6 +439,9 @@ jobs:
   # for x64 and arm64. A failure here fails Release Build, so the publisher cannot
   # silently create a release without its Windows downloads.
   desktop-windows:
+    if: >-
+      github.actor == github.repository_owner &&
+      github.triggering_actor == github.repository_owner
     needs: windows-validation
     runs-on: windows-latest
 
