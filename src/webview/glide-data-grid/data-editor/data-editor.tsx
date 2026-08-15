@@ -937,6 +937,20 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                     abortControllerRef.current
                 );
             }
+            // Fork addition: a selection range never cuts a merge in half —
+            // grow it (fixpoint) until every touched merge is fully inside.
+            if (mergedCells !== undefined && newVal.current !== undefined) {
+                const expandedRange = mergedCells.expandRange(newVal.current.range);
+                if (expandedRange !== newVal.current.range) {
+                    newVal = {
+                        ...newVal,
+                        current: {
+                            ...newVal.current,
+                            range: expandedRange,
+                        },
+                    };
+                }
+            }
             if (onGridSelectionChange !== undefined) {
                 expectedExternalGridSelection.current = shiftSelection(newVal, -rowMarkerOffset);
                 onGridSelectionChange(expectedExternalGridSelection.current);
@@ -944,7 +958,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                 setGridSelectionInner(newVal);
             }
         },
-        [onGridSelectionChange, getCellsForSelection, rowMarkerOffset, spanRangeBehavior]
+        [onGridSelectionChange, getCellsForSelection, rowMarkerOffset, spanRangeBehavior, mergedCells]
     );
 
     const onColumnResize = whenDefined(
@@ -2719,6 +2733,18 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                         // motion down
                         if (top < row) {
                             top++;
+                            // Fork addition: a shrinking edge may not cut a
+                            // merge — step past it (setGridSelection would
+                            // otherwise re-grow the range, freezing the edge).
+                            if (mergedCells !== undefined) {
+                                let m: Rectangle | undefined;
+                                while (
+                                    top < row &&
+                                    (m = mergedCells.mergeCrossingRowLine(top, left, right)) !== undefined
+                                ) {
+                                    top = Math.min(m.y + m.height, row);
+                                }
+                            }
                             scrollTo(0, top, "vertical");
                         } else {
                             bottom = Math.min(rows, bottom + 1);
@@ -2731,6 +2757,16 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                         // motion up
                         if (bottom > row + 1) {
                             bottom--;
+                            // Fork addition: see motion down.
+                            if (mergedCells !== undefined) {
+                                let m: Rectangle | undefined;
+                                while (
+                                    bottom > row + 1 &&
+                                    (m = mergedCells.mergeCrossingRowLine(bottom, left, right)) !== undefined
+                                ) {
+                                    bottom = Math.max(m.y, row + 1);
+                                }
+                            }
                             scrollTo(0, bottom, "vertical");
                         } else {
                             top = Math.max(0, top - 1);
@@ -2787,6 +2823,17 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                                 left++;
                                 done = true;
                             }
+                            // Fork addition: a shrinking edge may not cut a
+                            // merge (vertical analog of getSpanStops).
+                            if (done && mergedCells !== undefined) {
+                                let m: Rectangle | undefined;
+                                while (
+                                    left < col &&
+                                    (m = mergedCells.mergeCrossingColLine(left, top, bottom)) !== undefined
+                                ) {
+                                    left = Math.min(m.x + m.width, col);
+                                }
+                            }
                             if (done) scrollTo(left, 0, "horizontal");
                         }
                         if (!done) {
@@ -2808,6 +2855,16 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                             } else {
                                 right--;
                                 done = true;
+                            }
+                            // Fork addition: see motion right.
+                            if (done && mergedCells !== undefined) {
+                                let m: Rectangle | undefined;
+                                while (
+                                    right > col + 1 &&
+                                    (m = mergedCells.mergeCrossingColLine(right, top, bottom)) !== undefined
+                                ) {
+                                    right = Math.max(m.x, col + 1);
+                                }
                             }
                             if (done) scrollTo(right - rowMarkerOffset, 0, "horizontal");
                         }
@@ -2836,7 +2893,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                 "keyboard-select"
             );
         },
-        [getCellsForSelection, gridSelection, mangledCols.length, rowMarkerOffset, rows, scrollTo, setCurrent]
+        [getCellsForSelection, gridSelection, mangledCols.length, rowMarkerOffset, rows, scrollTo, setCurrent, mergedCells]
     );
 
     const updateSelectedCell = React.useCallback(
@@ -2844,6 +2901,35 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
             const rowMax = mangledRows - (fromEditingTrailingRow ? 0 : 1);
             col = clamp(col, rowMarkerOffset, columns.length - 1 + rowMarkerOffset);
             row = clamp(row, 0, rowMax);
+
+            // Fork addition: navigation treats a merge as one cell. A step
+            // that lands inside the merge the active cell already occupies
+            // continues past the merge in the direction of travel; any cell
+            // of a merge canonicalizes to its anchor. Mirrors the app's
+            // move_active_cell oracle.
+            if (mergedCells !== undefined) {
+                const [curCol, curRow] = currentCell ?? [col, row];
+                let range = mergedCells.getRange(col, row);
+                if (
+                    range !== undefined &&
+                    curCol >= range.x &&
+                    curCol < range.x + range.width &&
+                    curRow >= range.y &&
+                    curRow < range.y + range.height
+                ) {
+                    if (row > curRow) row = range.y + range.height;
+                    else if (row < curRow) row = range.y - 1;
+                    if (col > curCol) col = range.x + range.width;
+                    else if (col < curCol) col = range.x - 1;
+                    col = clamp(col, rowMarkerOffset, columns.length - 1 + rowMarkerOffset);
+                    row = clamp(row, 0, rowMax);
+                    range = mergedCells.getRange(col, row);
+                }
+                if (range !== undefined) {
+                    col = range.x;
+                    row = range.y;
+                }
+            }
 
             if (col === currentCell?.[0] && row === currentCell?.[1]) return false;
             if (freeMove && gridSelection.current !== undefined) {
@@ -2891,6 +2977,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
             scrollTo,
             setGridSelection,
             setCurrent,
+            mergedCells,
         ]
     );
 

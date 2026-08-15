@@ -438,23 +438,38 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
 
             const scale = rect.width / width;
 
-            const result = computeBounds(
-                col,
-                row,
-                width,
-                height,
-                groupHeaderHeight,
-                totalHeaderHeight,
-                cellXOffset,
-                cellYOffset,
-                translateX,
-                translateY,
-                rows,
-                freezeColumns,
-                freezeTrailingRows,
-                mappedColumns,
-                rowHeight
-            );
+            const boundsFor = (c: number, r: number): Rectangle =>
+                computeBounds(
+                    c,
+                    r,
+                    width,
+                    height,
+                    groupHeaderHeight,
+                    totalHeaderHeight,
+                    cellXOffset,
+                    cellYOffset,
+                    translateX,
+                    translateY,
+                    rows,
+                    freezeColumns,
+                    freezeTrailingRows,
+                    mappedColumns,
+                    rowHeight
+                );
+
+            let result: Rectangle;
+            // Fork addition: any cell of a merge reports the union rect of
+            // the whole merge — the overlay editor, fill handle, and a11y
+            // focus all consume these bounds.
+            const mergeRange = row >= 0 ? mergedCells?.getRange(col, row) : undefined;
+            if (mergeRange === undefined) {
+                result = boundsFor(col, row);
+            } else {
+                result = boundsFor(mergeRange.x, mergeRange.y);
+                const last = boundsFor(mergeRange.x + mergeRange.width - 1, mergeRange.y + mergeRange.height - 1);
+                result.width = last.x + last.width - result.x;
+                result.height = last.y + last.height - result.y;
+            }
 
             if (scale !== 1) {
                 result.x *= scale;
@@ -482,6 +497,7 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
             freezeTrailingRows,
             mappedColumns,
             rowHeight,
+            mergedCells,
         ]
     );
 
@@ -614,7 +630,21 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
                     };
                 }
             } else {
-                const bounds = getBoundsForItem(canvas, col, row);
+                // Fork addition: a hit anywhere inside a merge reports the
+                // anchor's coordinates (and, via getBoundsForItem, the full
+                // merged bounds), so every consumer sees the merge as one
+                // cell. Freeze-trailing rows render unmerged, so they stay
+                // unmangled here too.
+                let cellCol = col;
+                let cellRow = row;
+                if (mergedCells !== undefined && row < rows - freezeTrailingRows) {
+                    const mergeRange = mergedCells.getRange(col, row);
+                    if (mergeRange !== undefined) {
+                        cellCol = mergeRange.x;
+                        cellRow = mergeRange.y;
+                    }
+                }
+                const bounds = getBoundsForItem(canvas, cellCol, cellRow);
                 assert(bounds !== undefined);
                 const isEdge = bounds !== undefined && bounds.x + bounds.width - posX < edgeDetectionBuffer;
 
@@ -636,7 +666,7 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
 
                 result = {
                     kind: "cell",
-                    location: [col, row],
+                    location: [cellCol, cellRow],
                     bounds: bounds,
                     isEdge,
                     shiftKey,
@@ -671,6 +701,7 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
             fillHandle,
             selection,
             totalHeaderHeight,
+            mergedCells,
         ]
     );
 

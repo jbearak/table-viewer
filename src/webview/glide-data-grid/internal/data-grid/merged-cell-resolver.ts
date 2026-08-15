@@ -14,13 +14,17 @@
 // The Rectangle stored for a merge is a single stable object, so callers may
 // use it as an identity key.
 import { packColRowToNumber } from "../../common/render-state-provider.js";
-import type { Rectangle } from "./data-grid-types.js";
+import type { Item, Rectangle } from "./data-grid-types.js";
 import type { CellSet } from "./cell-set.js";
 
 export class MergedCellResolver {
     private readonly cellToRange: Map<number, Rectangle>;
+    // Accepted ranges, kept for range-level scans (expandRange); per-cell
+    // lookups always go through the map.
+    private readonly acceptedRanges: readonly Rectangle[];
 
     constructor(ranges: readonly Rectangle[], colOffset: number = 0, colCount: number = Infinity, rowCount: number = Infinity) {
+        const accepted: Rectangle[] = [];
         const map = new Map<number, Rectangle>();
         for (const raw of ranges) {
             // Degenerate (empty or single-cell), negative, and out-of-grid
@@ -50,8 +54,10 @@ export class MergedCellResolver {
                     map.set(packColRowToNumber(c, r), range);
                 }
             }
+            accepted.push(range);
         }
         this.cellToRange = map;
+        this.acceptedRanges = accepted;
     }
 
     public get isEmpty(): boolean {
@@ -61,6 +67,77 @@ export class MergedCellResolver {
     /** The merge containing (col, row) — anchor or covered — or undefined. */
     public getRange(col: number, row: number): Rectangle | undefined {
         return this.cellToRange.get(packColRowToNumber(col, row));
+    }
+
+    /** The anchor for (col, row); the cell itself when unmerged. */
+    public anchorOf(col: number, row: number): Item {
+        const range = this.cellToRange.get(packColRowToNumber(col, row));
+        return range === undefined ? [col, row] : [range.x, range.y];
+    }
+
+    /**
+     * Grows a rectangle until it fully contains every merge it touches
+     * (fixpoint — growing over one merge can reach another). Returns the
+     * input rectangle (same identity) when nothing grows. Mirrors the app's
+     * expand_range_for_merges oracle.
+     */
+    public expandRange(range: Rectangle): Rectangle {
+        if (this.acceptedRanges.length === 0) return range;
+        let x = range.x;
+        let y = range.y;
+        let right = range.x + range.width;
+        let bottom = range.y + range.height;
+        let changed = true;
+        while (changed) {
+            changed = false;
+            for (const m of this.acceptedRanges) {
+                if (m.x < right && m.x + m.width > x && m.y < bottom && m.y + m.height > y) {
+                    if (m.x < x) {
+                        x = m.x;
+                        changed = true;
+                    }
+                    if (m.y < y) {
+                        y = m.y;
+                        changed = true;
+                    }
+                    if (m.x + m.width > right) {
+                        right = m.x + m.width;
+                        changed = true;
+                    }
+                    if (m.y + m.height > bottom) {
+                        bottom = m.y + m.height;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if (x === range.x && y === range.y && right === range.x + range.width && bottom === range.y + range.height) {
+            return range;
+        }
+        return { x, y, width: right - x, height: bottom - y };
+    }
+
+    /**
+     * A merge spanning both sides of the horizontal grid line above `line`
+     * (rows line-1 and line) within columns [left, right), or undefined.
+     * Selection edges must not sit on such a line.
+     */
+    public mergeCrossingRowLine(line: number, left: number, right: number): Rectangle | undefined {
+        for (const m of this.acceptedRanges) {
+            if (m.y < line && m.y + m.height > line && m.x < right && m.x + m.width > left) return m;
+        }
+        return undefined;
+    }
+
+    /**
+     * A merge spanning both sides of the vertical grid line left of `line`
+     * (columns line-1 and line) within rows [top, bottom), or undefined.
+     */
+    public mergeCrossingColLine(line: number, top: number, bottom: number): Rectangle | undefined {
+        for (const m of this.acceptedRanges) {
+            if (m.x < line && m.x + m.width > line && m.y < bottom && m.y + m.height > top) return m;
+        }
+        return undefined;
     }
 
     /**

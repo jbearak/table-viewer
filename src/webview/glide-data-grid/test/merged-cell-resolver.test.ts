@@ -100,6 +100,47 @@ describe("MergedCellResolver", () => {
         expect(expanded.size).toBe(3);
     });
 
+    test("anchorOf resolves covered cells and passes through unmerged cells", () => {
+        const r = new MergedCellResolver([{ x: 1, y: 1, width: 2, height: 2 }]);
+        expect(r.anchorOf(2, 2)).toEqual([1, 1]);
+        expect(r.anchorOf(1, 1)).toEqual([1, 1]);
+        expect(r.anchorOf(5, 5)).toEqual([5, 5]);
+    });
+
+    test("expandRange grows to cover touched merges (fixpoint)", () => {
+        const r = new MergedCellResolver([
+            { x: 0, y: 0, width: 2, height: 2 },
+            { x: 2, y: 1, width: 2, height: 2 },
+        ]);
+        // Row 0 across columns 0-2 touches the first merge, growing to rows
+        // 0-1; the grown rect now covers (2,1) inside the second merge,
+        // growing to columns 0-3 and rows 0-2.
+        expect(r.expandRange({ x: 0, y: 0, width: 3, height: 1 })).toEqual({ x: 0, y: 0, width: 4, height: 3 });
+    });
+
+    test("expandRange returns the same rect when nothing grows", () => {
+        const r = new MergedCellResolver([{ x: 5, y: 5, width: 2, height: 2 }]);
+        const input = { x: 0, y: 0, width: 2, height: 2 };
+        expect(r.expandRange(input)).toBe(input);
+        const containing = { x: 4, y: 4, width: 4, height: 4 };
+        expect(r.expandRange(containing)).toBe(containing);
+    });
+
+    test("mergeCrossingRowLine and mergeCrossingColLine detect straddling merges", () => {
+        const r = new MergedCellResolver([{ x: 1, y: 1, width: 2, height: 3 }]);
+        // Lines strictly inside the merge cross it...
+        expect(r.mergeCrossingRowLine(2, 1, 3)).toBeDefined();
+        expect(r.mergeCrossingColLine(2, 1, 4)).toBeDefined();
+        // ...its boundary lines do not.
+        expect(r.mergeCrossingRowLine(1, 1, 3)).toBeUndefined();
+        expect(r.mergeCrossingRowLine(4, 1, 3)).toBeUndefined();
+        expect(r.mergeCrossingColLine(1, 1, 4)).toBeUndefined();
+        expect(r.mergeCrossingColLine(3, 1, 4)).toBeUndefined();
+        // Column window that misses the merge sees no crossing.
+        expect(r.mergeCrossingRowLine(2, 5, 9)).toBeUndefined();
+        expect(r.mergeCrossingColLine(2, 6, 9)).toBeUndefined();
+    });
+
     test("expandDamage handles many members of one merge", () => {
         const r = new MergedCellResolver([{ x: 0, y: 0, width: 3, height: 3 }]);
         const expanded = r.expandDamage(
