@@ -5392,6 +5392,86 @@ describe('edit mode save exit', () => {
         expect(posted()[0]).toMatchObject({ sheetName: 'Inventory' });
     });
 
+    it('does not retry an unacknowledged empty payload already present in a refresh', async () => {
+        const meta = make_meta(['People'], false);
+        const capabilities = {
+            csvEditable: true,
+            csvEditingSupported: true,
+            csvEditSessionId: 'echo-session',
+        };
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities,
+        }));
+        const { pending_edit_durability } = await import('../webview/host-bridge');
+
+        post_message.mockClear();
+        const pending_posts = () => post_message.mock.calls
+            .map(([message]) => message)
+            .filter((message) => message?.type === 'pendingEditsChanged');
+        pending_edit_durability.publish('echo-session', null, 0, 'People');
+        await vi.waitUntil(() => pending_posts().length === 1);
+
+        post_message.mockClear();
+        for (let delivery = 0; delivery < 3; delivery += 1) {
+            await dispatch_host_message(refresh_snapshot_message(meta, {
+                capabilities,
+            }));
+        }
+
+        // The host delivers its committed snapshot before the explicit
+        // pendingEditsAcknowledged message. Re-publishing the same map here makes
+        // each snapshot generate the next write/snapshot pair forever.
+        expect(pending_posts()).toHaveLength(0);
+    });
+
+    it('retries when only local save hydration matches an unacknowledged payload', async () => {
+        const meta = make_meta(['People'], false);
+        const edits = { '0:0': { value: 'Bob', base: 'Alice' } };
+        const operation: CsvSaveOperation = {
+            editSessionId: 'save-session',
+            saveRequestId: 'save-in-flight',
+            worksheets: [{
+                sheetIndex: 0,
+                sheetName: 'People',
+                edits: { '0:0': 'Bob' },
+                dirtyEdits: edits,
+            }],
+        };
+        const capabilities = {
+            csvEditable: true,
+            csvEditingSupported: true,
+            csvEditSessionId: 'save-session',
+            csvSaveLifecycle: { revision: 1, state: 'active' as const, operation },
+        };
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities,
+        }));
+        const { pending_edit_durability } = await import('../webview/host-bridge');
+
+        post_message.mockClear();
+        pending_edit_durability.publish('save-session', edits, 0, 'People');
+        await vi.waitUntil(() => post_message.mock.calls.some(
+            ([message]) => message?.type === 'pendingEditsChanged',
+        ));
+        post_message.mockClear();
+
+        // The save projection restores `edits` into the UI, but the actual
+        // authoritative pending-edit leaf is empty. A refresh can abort the
+        // earlier write, so this must retry rather than treating the local save
+        // operation as proof that the host persisted it.
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            capabilities,
+        }));
+
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'pendingEditsChanged',
+            editSessionId: 'save-session',
+            edits,
+        }));
+    });
+
     it('holds the worksheet tabs while a save dialog is open', async () => {
         // The dialog asks about one worksheet, and the answer is applied against the
         // *active* sheet's store. Switching tabs while it was open pointed the answer

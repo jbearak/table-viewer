@@ -36,6 +36,7 @@ import {
     type SheetViewRecord,
     type TransformIntent,
     type ViewBasis,
+    type WorksheetTarget,
 } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
 import {
@@ -1372,6 +1373,57 @@ export function App(): React.JSX.Element {
                     }
                     const snapshot_edit_session_id =
                         snapshot.capabilities.csvEditSessionId;
+                    const refresh_edits_for_sheet = (sheet_index: number) => (
+                        snapshot.presentation === 'refresh'
+                            ? resolve_csv_save_hydration(
+                                applied_save_transition.next,
+                                snapshot_edit_session_id,
+                                sheet_index,
+                                snapshot.meta.sheets[sheet_index]?.name,
+                                snapshot.meta.sheets[sheet_index]?.worksheetId,
+                                pending_edits_for_sheet(
+                                    refresh_authoritative_state?.pendingEdits,
+                                    sheet_index,
+                                    snapshot.meta.sheets[sheet_index]?.name,
+                                    snapshot.meta.sheets[sheet_index]?.worksheetId,
+                                ),
+                            )
+                            : undefined
+                    );
+                    const authoritative_refresh_edits_for_target = (
+                        target: WorksheetTarget,
+                    ): SheetPendingEditCells | undefined => {
+                        if (snapshot.presentation !== 'refresh') return undefined;
+                        const pending = refresh_authoritative_state?.pendingEdits;
+                        const direct = pending_edits_for_sheet(
+                            pending,
+                            target.sheetIndex,
+                            target.sheetName,
+                            target.worksheetId,
+                        );
+                        if (direct !== undefined || !pending) return direct;
+
+                        // Removed worksheets are retained as parked stores, and
+                        // their durable slot may have moved away from the captured
+                        // index. Search by identity rather than reading whichever
+                        // live worksheet now occupies that position.
+                        const identified_index = pending.findIndex((slot) => {
+                            if (!slot) return false;
+                            return slot.worksheetId !== undefined
+                                ? target.worksheetId !== undefined
+                                    && slot.worksheetId === target.worksheetId
+                                : slot.sheetName !== undefined
+                                    && slot.sheetName === target.sheetName;
+                        });
+                        return identified_index === -1
+                            ? undefined
+                            : pending_edits_for_sheet(
+                                pending,
+                                identified_index,
+                                target.sheetName,
+                                target.worksheetId,
+                            );
+                    };
                     // Reconcile the registry at the snapshot itself, not in
                     // install_edit_session: a refresh that advances the session
                     // id makes `refresh_editing_current_session` false and skips
@@ -1428,15 +1480,34 @@ export function App(): React.JSX.Element {
                         // Retry each retained store's complete truth, including an
                         // explicit null after the last edit was cleared. Returned
                         // stores are already reattached, so there is only one owner.
+                        //
+                        // A snapshot that already contains the latest publication is
+                        // proof that this particular write crossed the durable boundary.
+                        // Its explicit acknowledgement is queued behind the snapshot, so
+                        // force-publishing here would create a feedback loop: every retry
+                        // commits another snapshot before its own acknowledgement arrives.
+                        // Keep the local store retained until the acknowledgement, but do
+                        // not retry truth the host has just projected back verbatim.
                         if (edit_session_id) {
                             for (const { target, store } of
                                 reconciliation.retryPublications) {
                                 const store_snapshot = store.snapshot();
+                                const current_edits = store_snapshot.size > 0
+                                    ? Object.fromEntries(store_snapshot)
+                                    : null;
+                                const authoritative_edits =
+                                    authoritative_refresh_edits_for_target(target);
+                                if (pending_edit_durability.unacknowledged_payload_matches(
+                                    edit_session_id,
+                                    authoritative_edits ?? null,
+                                    current_edits,
+                                    target.sheetIndex,
+                                    target.sheetName,
+                                    target.worksheetId,
+                                )) continue;
                                 pending_edit_durability.publish(
                                     edit_session_id,
-                                    store_snapshot.size > 0
-                                        ? Object.fromEntries(store_snapshot)
-                                        : null,
+                                    current_edits,
                                     target.sheetIndex,
                                     target.sheetName,
                                     true,
@@ -1489,23 +1560,6 @@ export function App(): React.JSX.Element {
                         edit_mode_ref.current = false;
                         set_edit_mode(false);
                     }
-                    const refresh_edits_for_sheet = (sheet_index: number) => (
-                        snapshot.presentation === 'refresh'
-                            ? resolve_csv_save_hydration(
-                                applied_save_transition.next,
-                                snapshot_edit_session_id,
-                                sheet_index,
-                                snapshot.meta.sheets[sheet_index]?.name,
-                                snapshot.meta.sheets[sheet_index]?.worksheetId,
-                                pending_edits_for_sheet(
-                                    refresh_authoritative_state?.pendingEdits,
-                                    sheet_index,
-                                    snapshot.meta.sheets[sheet_index]?.name,
-                                    snapshot.meta.sheets[sheet_index]?.worksheetId,
-                                ),
-                            )
-                            : undefined
-                    );
                     const refresh_edits = refresh_edits_for_sheet(snapshot_edit_sheet_index);
                     if (refresh_editing_current_session) {
                         if (!locally_retained_sheet_indices.has(snapshot_edit_sheet_index)) {
