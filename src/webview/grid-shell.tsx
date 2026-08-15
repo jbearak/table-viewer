@@ -1640,7 +1640,10 @@ export function GridShell({
             if (!text) return;
 
             const flags = font_flags_for_cell(display_column, row);
-            const wrapping = has_line_break(text);
+            // build_grid_cell always sets allowWrapping, so the overflow estimate
+            // models every cell as wrapping — the question is purely whether the
+            // wrapped layout fits the row height.
+            const wrapping = true;
             const overflows = text_overflows_cell(
                 text,
                 cell_bounds.width,

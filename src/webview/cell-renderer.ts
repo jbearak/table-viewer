@@ -115,9 +115,17 @@ function text_cell(
         data: overlay?.dirty_value ?? (c.raw ?? ''),
         displayData: display,
         allowOverlay: overlay?.editable ?? false,
-        // Render hard line breaks across multiple lines so a grown row's content
-        // is visible (rows auto-grow after a multiline edit in grid-shell).
-        ...(display.includes('\n') ? { allowWrapping: true } : {}),
+        // Always wrap, deliberately more eager than Excel: Excel wraps only cells
+        // styled with wrapText, but here a taller row should always reveal more of
+        // its content, so soft wrapping is unconditional rather than gated on the
+        // source style (which the parsers do not even read). With allowWrapping,
+        // Glide soft-wraps long lines to the column width and renders hard line
+        // breaks as separate lines; without it, everything past the column width
+        // is clipped no matter how tall the row is. Wrapped output beyond the row
+        // height is still clipped, so a default-height row looks single-line as
+        // before. Cost is fine: empty cells never reach the draw call, and the
+        // wrap layout (canvas-hypertxt) memoizes per text/font/width.
+        allowWrapping: true,
         // Belt and braces with `allowOverlay: false`. Glide's paste path
         // (`pasteToCell` in data-editor.js) does not consult `allowOverlay` at all
         // — it gates on `isReadWriteCell`, which for a Text cell checks only
