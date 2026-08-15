@@ -22,7 +22,9 @@ describe("use-auto-scroll", () => {
             } as any)
         );
 
-        vi.advanceTimersByTime(100);
+        // With a [0, 0] direction the hook schedules nothing; run whatever is
+        // pending rather than encoding a wall-clock duration.
+        vi.runAllTimers();
         expect(scrollBy).not.toBeCalled();
     });
 

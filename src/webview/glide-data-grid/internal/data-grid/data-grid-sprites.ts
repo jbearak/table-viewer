@@ -43,6 +43,7 @@ export class SpriteManager {
     private spriteMap: Map<string, HTMLCanvasElement> = new Map();
     private headerIcons: SpriteMap;
     private inFlight = 0;
+    private failedSprites: Set<string> = new Set();
 
     constructor(
         headerIcons: SpriteMap | undefined,
@@ -65,6 +66,7 @@ export class SpriteManager {
         const rSize = size * Math.ceil(window.devicePixelRatio);
         const key = `${bgColor}_${fgColor}_${rSize}_${sprite}`;
 
+        if (this.failedSprites.has(key)) return;
         let spriteCanvas = this.spriteMap.get(key);
         if (spriteCanvas === undefined) {
             const spriteCb = this.headerIcons[sprite];
@@ -87,6 +89,14 @@ export class SpriteManager {
             promise
                 .then(() => {
                     spriteCtx.drawImage(imgSource, 0, 0, rSize, rSize);
+                })
+                .catch(() => {
+                    // Fork fix: a failed decode must not cache a permanently
+                    // blank canvas — drop the entry. Remember the failure so a
+                    // deterministically-bad sprite (invalid SVG) doesn't loop
+                    // decode → onSettled redraw → decode forever.
+                    this.spriteMap.delete(key);
+                    this.failedSprites.add(key);
                 })
                 .finally(() => {
                     this.inFlight--;

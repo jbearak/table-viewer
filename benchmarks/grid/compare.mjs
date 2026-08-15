@@ -40,22 +40,47 @@ try {
     process.exit(2);
 }
 
-let failed = false;
-for (const [scenario, base_values] of Object.entries(baseline.scenarios ?? {})) {
-    const cand_values = candidate.scenarios?.[scenario];
-    if (!cand_values) {
-        console.error(`MISSING scenario in candidate: ${scenario}`);
-        failed = true;
-        continue;
+// Shape validation before any gate comparison. An empty baseline would make
+// the gate loop run zero times and "pass"; a non-numeric baseline metric would
+// yield NaN comparisons that never fail. These are input errors (exit 2), not
+// performance regressions (exit 1).
+const scenario_entries = Object.entries(baseline?.scenarios ?? {});
+if (scenario_entries.length === 0) {
+    console.error(`SHAPE ERROR: baseline has no scenarios: ${baseline_path}`);
+    process.exit(2);
+}
+const is_plain_object = (v) => typeof v === 'object' && v !== null && !Array.isArray(v);
+for (const [scenario, base_values] of scenario_entries) {
+    if (!is_plain_object(base_values) || Object.keys(base_values).length === 0) {
+        console.error(`SHAPE ERROR: baseline scenario ${scenario} has no metrics`);
+        process.exit(2);
     }
+    for (const [metric, base] of Object.entries(base_values)) {
+        if (typeof base !== 'number' || !Number.isFinite(base)) {
+            console.error(`SHAPE ERROR: baseline ${scenario}.${metric} is not a finite number`);
+            process.exit(2);
+        }
+    }
+    const cand_values = candidate?.scenarios?.[scenario];
+    if (!is_plain_object(cand_values)) {
+        console.error(`SHAPE ERROR: candidate is missing scenario: ${scenario}`);
+        process.exit(2);
+    }
+    for (const metric of Object.keys(base_values)) {
+        const cand = cand_values[metric];
+        if (typeof cand !== 'number' || !Number.isFinite(cand)) {
+            console.error(`SHAPE ERROR: candidate ${scenario}.${metric} is not a finite number`);
+            process.exit(2);
+        }
+    }
+}
+
+let failed = false;
+for (const [scenario, base_values] of scenario_entries) {
+    const cand_values = candidate.scenarios[scenario];
     console.log(`\n${scenario}`);
     for (const [metric, base] of Object.entries(base_values)) {
         const cand = cand_values[metric];
-        if (typeof cand !== 'number') {
-            console.error(`  MISSING metric: ${metric}`);
-            failed = true;
-            continue;
-        }
         const delta = cand - base;
         const pct = base === 0 ? 0 : (delta / base) * 100;
         let verdict = 'ok';

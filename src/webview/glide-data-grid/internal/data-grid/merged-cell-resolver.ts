@@ -18,6 +18,13 @@ import { combineRects, rectContains } from "../../common/math.js";
 import type { Item, Rectangle } from "./data-grid-types.js";
 import type { CellSet } from "./cell-set.js";
 
+// Ceilings on materialized cell count — per merge and across the whole sheet.
+// No real merge approaches these: they exist purely so a malformed file cannot
+// make the covered-cell map allocate per-cell entries without bound (neither
+// via one huge range nor via many large ones).
+const MAX_MERGE_AREA = 1_000_000;
+const MAX_TOTAL_MERGE_AREA = 5_000_000;
+
 export class MergedCellResolver {
     private readonly cellToRange: Map<number, Rectangle>;
     // Accepted ranges, kept for range-level scans (expandRange); per-cell
@@ -45,6 +52,14 @@ export class MergedCellResolver {
             // positions, so no single rectangle can represent it.
             if (raw.width < 1 || raw.height < 1 || raw.width * raw.height <= 1) continue;
             if (raw.x < 0 || raw.y < 0) continue;
+            // The per-covered-cell map allocates one entry per cell of the
+            // merge, so an absurdly large range (a whole-column "merge" in a
+            // million-row sheet) would balloon memory. Real spreadsheet merges
+            // are tiny; drop anything past a generous ceiling, and stop
+            // accepting once the sheet-wide budget is spent (many large merges
+            // are as hostile as one huge one).
+            if (raw.width * raw.height > MAX_MERGE_AREA) continue;
+            if (map.size + raw.width * raw.height > MAX_TOTAL_MERGE_AREA) continue;
             const range: Rectangle =
                 colOffset === 0 ? raw : { x: raw.x + colOffset, y: raw.y, width: raw.width, height: raw.height };
             if (range.x + range.width > colCount || range.y + range.height > rowCount) continue;

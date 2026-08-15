@@ -100,7 +100,7 @@
 .gdg-shadow-box {
     visibility: hidden;
     white-space: pre-wrap;
-    word-wrap: break-word;
+    overflow-wrap: break-word;
     width: max-content;
     max-width: 100%;
     min-width: 100%;

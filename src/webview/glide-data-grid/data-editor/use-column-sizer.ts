@@ -137,6 +137,14 @@ export function useColumnSizer(
             width: columns.length,
             height: 1,
         };
+        // Fork fix: overlapping runs of this effect (columns identity changed
+        // while a slow getCells was in flight) could land out of order and let
+        // a stale measurement overwrite the newer one. The cleanup flag makes
+        // superseded runs drop their result. The superseded fetch itself keeps
+        // running: abortController is a shared prop (aborting it here would
+        // cancel unrelated consumers), and this one-shot ~10-row measurement
+        // isn't worth plumbing a per-run controller for.
+        let cancelled = false;
         const fn = async () => {
             const getResult = getCells(computeArea, abortController.signal);
             const tailGetResult = tailRows > 0 ? getCells(tailComputeArea, abortController.signal) : undefined;
@@ -155,10 +163,14 @@ export function useColumnSizer(
                     toSet = [...toSet, ...(await resolveCellsThunk(tailGetResult))];
                 }
             }
+            if (cancelled) return;
             lastColumns.current = columns;
             setSelectionData(toSet);
         };
         void fn();
+        return () => {
+            cancelled = true;
+        };
     }, [abortController.signal, columns]);
 
     return React.useMemo(() => {

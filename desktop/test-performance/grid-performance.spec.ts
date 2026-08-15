@@ -57,8 +57,10 @@ test.afterAll(() => {
     fs.rmSync(fixtures_dir, { recursive: true, force: true });
 });
 
-async function launch_with(file: string): Promise<ElectronApplication> {
-    const user_data = fs.mkdtempSync(path.join(os.tmpdir(), 'tv-perf-data-'));
+async function launch_with(
+    file: string,
+    user_data: string,
+): Promise<ElectronApplication> {
     return electron.launch({
         args: [main_js, file],
         cwd: repo_dir,
@@ -67,9 +69,11 @@ async function launch_with(file: string): Promise<ElectronApplication> {
 }
 
 async function run_scenario(name: string, file: string): Promise<void> {
-    const launch_started = Date.now();
-    const app = await launch_with(file);
+    const user_data = fs.mkdtempSync(path.join(os.tmpdir(), 'tv-perf-data-'));
+    let app: ElectronApplication | undefined;
     try {
+        const launch_started = Date.now();
+        app = await launch_with(file, user_data);
         const page = await app.firstWindow();
         await page.locator(GRID_CANVAS).first().waitFor({ state: 'visible', timeout: 120_000 });
         const canvas_visible_ms = Date.now() - launch_started;
@@ -89,7 +93,13 @@ async function run_scenario(name: string, file: string): Promise<void> {
             scroll_total_ms: scroll.total_ms,
         });
     } finally {
-        await app.close();
+        // Close and rm independently: a failed launch leaves no app, and a
+        // failed close must not leak the temp profile dir.
+        try {
+            await app?.close();
+        } finally {
+            fs.rmSync(user_data, { recursive: true, force: true });
+        }
     }
 }
 

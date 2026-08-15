@@ -199,14 +199,17 @@ describe("ImageWindowLoaderImpl", () => {
 
             // Act: Load an image and simulate its successful loading but decoding failure
             (loader as any).loadImage(url, col, row, key);
+            // The cache entry exists synchronously; spy on its cancel before
+            // yielding so the rejection handler (which runs on a microtask
+            // after decode() rejects) is observed. Polling for this call is
+            // the observable outcome — no fixed microtask count.
+            const cancelSpy = vi.spyOn((loader as any).cache[key], "cancel");
 
             vi.runAllTimers();
 
             vi.useRealTimers();
-            // Poll until decode has been reached, then drain the (settled)
-            // rejection chain — a bounded microtask yield, not a fixed sleep.
             await vi.waitFor(() => expect(img.decode).toHaveBeenCalled());
-            for (let i = 0; i < 10; i++) await Promise.resolve();
+            await vi.waitFor(() => expect(cancelSpy).toHaveBeenCalled());
 
             // Assert: Ensure `decode` was called and the image data remains undefined in the cache
             expect((loader as any).cache[key].img).toBeUndefined();

@@ -9,4 +9,5 @@ import "vitest-canvas-mock";
     disconnect() {}
 };
 
-Image.prototype.decode = () => new Promise(resolve => window.setTimeout(resolve, 10));
+// Resolved (not timer-delayed) so tests never wait wall-clock time on decode.
+Image.prototype.decode = () => Promise.resolve();

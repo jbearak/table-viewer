@@ -37,7 +37,8 @@ describe("resizeDetector", () => {
 
     test("Smoke test", () => {
         const { result } = renderHook(() => useResizeDetector());
-        expect(result.current.width === undefined && result.current.height === undefined);
+        expect(result.current.width).toBeUndefined();
+        expect(result.current.height).toBeUndefined();
     });
 });
 

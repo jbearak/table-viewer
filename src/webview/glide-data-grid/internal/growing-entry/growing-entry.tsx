@@ -41,7 +41,13 @@ export const GrowingEntry: React.FunctionComponent<Props> = (props: Props) => {
 
     React.useLayoutEffect(() => {
         if (validatedSelection !== undefined) {
-            const range = typeof validatedSelection === "number" ? [validatedSelection, null] : validatedSelection;
+            // A numeric selection is a caret position. Web IDL coerces a null
+            // `end` to 0, which would select [n, 0] instead of placing the
+            // caret — pass the same offset for both ends.
+            const range =
+                typeof validatedSelection === "number"
+                    ? [validatedSelection, validatedSelection]
+                    : validatedSelection;
             inputRef.current?.setSelectionRange(range[0], range[1]);
         }
     }, [validatedSelection]);

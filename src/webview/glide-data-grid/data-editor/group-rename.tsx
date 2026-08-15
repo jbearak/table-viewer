@@ -30,6 +30,7 @@ export const GroupRename: React.FC<Props> = p => {
             onClickOutside={onClose}>
             <input
                 className="gdg-group-rename-input"
+                aria-label={`Rename group ${group}`}
                 style={{ minHeight: Math.max(16, bounds.height - 10) }}
                 data-testid="group-rename-input"
                 defaultValue={group}

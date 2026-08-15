@@ -261,3 +261,32 @@ Delete or fold into a real design doc before the PR if stale.
   selection-glide.ts stay: shell-originated controlled writes and the
   highlight projection still need app-side merge awareness before any grid
   round-trip.
+
+## PR #205 review-response round 2 decisions (recorded 2026-08-15)
+
+Scoped /code-review of the first round of comment fixes surfaced eight
+findings; six fixed, one deliberate skip, one comment-only documentation.
+
+- Fixed: search cancellation race. beginSearch cancels first, captures its own
+  AbortController, ticks read that captured controller (never the ref), and
+  bail after the async cell fetch when aborted — a cancelled search can no
+  longer publish stale matches or adopt its replacement's signal.
+- Fixed: accessibility colSpan after column reorder. A merge's members can be
+  non-adjacent in DOM order (drag, frozen columns); HTML colSpan swallows
+  whatever is adjacent, so each contiguous DOM run of members now renders as
+  its own gridcell instead of one span counting all members.
+- Fixed: compare.mjs rejects a baseline scenario with zero metrics and
+  non-object scenario values (SHAPE ERROR, exit 2) instead of vacuously
+  passing / throwing.
+- Fixed: perf spec cleanup — user_data temp dir is created by run_scenario and
+  removed even when electron.launch or app.close rejects.
+- Fixed: sprite decode failures drop the cached canvas *and* blacklist the key
+  (failedSprites) so an invalid SVG cannot loop decode → onSettled redraw →
+  decode forever. Theme/DPR changes produce a new key, so recovery paths that
+  matter still exist.
+- Fixed: MergedCellResolver caps total merged area (5M cells) in addition to
+  the per-range cap, bounding worst-case map memory from adversarial inputs.
+- Documented skip: use-column-sizer's superseded measurement fetch keeps
+  running. The abort controller is a shared prop (aborting it would cancel
+  unrelated consumers) and the fetch is a one-shot ~10-row measurement; the
+  cancelled flag already prevents the stale write.

@@ -429,7 +429,9 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
 
     // row: -1 === columnHeader, -2 === groupHeader
     const getBoundsForItem = React.useCallback(
-        (canvas: HTMLCanvasElement, col: number, row: number): Rectangle | undefined => {
+        // Fork addition: `resolveMerges: false` returns the single physical
+        // cell's rect even inside a merge (per-cell geometry consumers).
+        (canvas: HTMLCanvasElement, col: number, row: number, resolveMerges: boolean = true): Rectangle | undefined => {
             const rect = canvas.getBoundingClientRect();
 
             if (col >= mappedColumns.length || row >= rows) {
@@ -463,7 +465,7 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
             // focus all consume these bounds. The resolver never contains
             // merges crossing a freeze boundary, so the anchor and last cell
             // always live in the same pane and their union is the merge.
-            const mergeRange = row >= 0 ? mergedCells?.getRange(col, row) : undefined;
+            const mergeRange = resolveMerges && row >= 0 ? mergedCells?.getRange(col, row) : undefined;
             if (mergeRange === undefined) {
                 result = boundsFor(col, row);
             } else {
@@ -640,11 +642,13 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
                 const [cellCol, cellRow] = mergedCells?.anchorOf(col, row) ?? [col, row];
                 const bounds = getBoundsForItem(canvas, cellCol, cellRow);
                 assert(bounds !== undefined);
-                // The physical cell under the pointer, un-canonicalized, for
-                // consumers needing per-cell geometry (see event-args.ts). Only
-                // recomputed when the anchor snap actually moved the hit.
-                const isSnapped = cellCol !== col || cellRow !== row;
-                const physicalBounds = isSnapped ? getBoundsForItem(canvas, col, row) : bounds;
+                // The physical cell under the pointer, un-canonicalized and
+                // merge-unresolved, for consumers needing per-cell geometry
+                // (see event-args.ts). Only recomputed when the hit is inside a
+                // merge (anchor hits included: their resolved bounds are the
+                // whole block, not the anchor's own cell).
+                const inMerge = mergedCells?.getRange(col, row) !== undefined;
+                const physicalBounds = inMerge ? getBoundsForItem(canvas, col, row, false) : bounds;
                 assert(physicalBounds !== undefined);
                 const isEdge = bounds !== undefined && bounds.x + bounds.width - posX < edgeDetectionBuffer;
 
@@ -1745,7 +1749,7 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
                                 aria-selected={selection.rows.hasIndex(row)}
                                 key={row}
                                 aria-rowindex={row + 2}>
-                                {effectiveCols.map(c => {
+                                {effectiveCols.map((c, domIdx) => {
                                     const col = c.sourceIndex;
                                     const key = packColRowToNumber(col, row);
                                     // Fork addition: a merge is one gridcell.
@@ -1759,26 +1763,41 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
                                     let location: Item = [col, row];
                                     let rowSpan = 1;
                                     let colSpan = 1;
+                                    let isMergeRep = false;
                                     if (mergeRange !== undefined) {
-                                        // The first rendered cell of the
-                                        // merge represents it (the anchor
-                                        // when visible). visibleCols may be
-                                        // non-contiguous with frozen
-                                        // columns, so intersect rather than
-                                        // assume the window starts at the
-                                        // merge edge.
-                                        const repCol = visibleCols.find(
-                                            c => c >= mergeRange.x && c < mergeRange.x + mergeRange.width
-                                        );
+                                        const isMember = (sc: number) =>
+                                            sc >= mergeRange.x && sc < mergeRange.x + mergeRange.width;
+                                        // Rows are contiguous (makeRange), so
+                                        // one rowSpan covers them; the first
+                                        // visible row represents the merge.
                                         const repRow = visibleRows.find(
                                             r => r >= mergeRange.y && r < mergeRange.y + mergeRange.height
                                         );
-                                        if (col !== repCol || row !== repRow) return null;
+                                        if (row !== repRow) return null;
+                                        // Columns are in DOM order and a drag
+                                        // (or frozen columns) can interleave
+                                        // non-members between members. An HTML
+                                        // colSpan swallows whatever is
+                                        // adjacent in the DOM, so each
+                                        // contiguous DOM run of members
+                                        // renders as its own gridcell rather
+                                        // than one span counting all members.
+                                        if (domIdx > 0 && isMember(visibleCols[domIdx - 1])) return null;
+                                        let run = 1;
+                                        while (domIdx + run < visibleCols.length && isMember(visibleCols[domIdx + run])) {
+                                            run++;
+                                        }
+                                        colSpan = run;
+                                        rowSpan = visibleRows.filter(
+                                            r => r >= mergeRange.y && r < mergeRange.y + mergeRange.height
+                                        ).length;
                                         location = [mergeRange.x, mergeRange.y];
-                                        rowSpan = mergeRange.y + mergeRange.height - row;
-                                        colSpan = mergeRange.x + mergeRange.width - col;
+                                        isMergeRep = visibleCols.findIndex(isMember) === domIdx;
                                     }
-                                    const focused = fCol === location[0] && fRow === location[1];
+                                    const focused =
+                                        fCol === location[0] &&
+                                        fRow === location[1] &&
+                                        (mergeRange === undefined || isMergeRep);
                                     const selected =
                                         range !== undefined &&
                                         col >= range.x &&

@@ -45,11 +45,11 @@ describe("useKineticScroll", () => {
 
         act(() => {
             targetScroller.current.dispatchEvent(new Event("touchstart"));
-            vi.advanceTimersByTime(1000);
             fireEvent.touchEnd(targetScroller.current, {
                 touches: [],
             });
-            vi.advanceTimersByTime(1000 / 120);
+            // Run the interval touchend scheduled without encoding its delay.
+            vi.advanceTimersToNextTimer();
         });
 
         expect(callback).toHaveBeenCalled();

@@ -236,10 +236,13 @@ export function getCopyBufferContents(
 }
 
 export function decodeHTML(html: string): CopyBuffer | undefined {
-    const fragment = document.createElement("html");
-    // we dont want to retain the pasted non-breaking spaces
-    fragment.innerHTML = html.replace(/&nbsp;/g, " ");
-    const tableEl = fragment.querySelector("table");
+    // Fork change: parse into an inert document via DOMParser instead of
+    // assigning clipboard HTML to a live element's innerHTML. The parsed
+    // document never executes scripts or loads subresources, so hostile
+    // clipboard content cannot run in the webview (CodeQL js/xss).
+    // We don't want to retain the pasted non-breaking spaces.
+    const doc = new DOMParser().parseFromString(html.replace(/&nbsp;/g, " "), "text/html");
+    const tableEl = doc.querySelector("table");
     if (tableEl === null) return undefined;
     const walkEl: Element[] = [tableEl];
     const result: CellBuffer[][] = [];

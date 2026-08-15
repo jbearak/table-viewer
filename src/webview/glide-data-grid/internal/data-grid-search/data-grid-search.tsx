@@ -153,6 +153,10 @@ const DataGridSearch: React.FunctionComponent<DataGridSearchProps> = p => {
             window.cancelAnimationFrame(searchHandle.current);
             searchHandle.current = undefined;
             abortControllerRef.current.abort();
+            // Fork fix: an AbortController is single-use. Without a fresh one,
+            // every search after the first cancel would hand an already-aborted
+            // signal to getCellsForSelection and return no results.
+            abortControllerRef.current = new AbortController();
         }
     }, []);
 
@@ -160,6 +164,13 @@ const DataGridSearch: React.FunctionComponent<DataGridSearchProps> = p => {
     cellYOffsetRef.current = cellYOffset;
     const beginSearch = React.useCallback(
         (str: string) => {
+            // Fork fix: cancel first, then capture this search's controller.
+            // The ref is replaced on every cancel, so a tick that read the ref
+            // lazily could adopt a *later* search's signal after resuming from
+            // an await and publish stale matches into it.
+            cancelSearch();
+            const controller = abortControllerRef.current;
+
             const regex = new RegExp(str.replace(/([$()*+.?[\\\]^{|}-])/g, "\\$1"), "i");
 
             let startY = cellYOffsetRef.current;
@@ -187,12 +198,18 @@ const DataGridSearch: React.FunctionComponent<DataGridSearchProps> = p => {
                         width: columns.length,
                         height: Math.min(searchStride, rowsLeft, rows - startY),
                     },
-                    abortControllerRef.current.signal
+                    controller.signal
                 );
 
                 if (typeof data === "function") {
                     data = await data();
                 }
+
+                // Fork fix: this search may have been cancelled while awaiting
+                // the cell thunk. Bail before publishing results or scheduling
+                // another frame — otherwise a stale search keeps running
+                // alongside (and clobbering) its replacement.
+                if (controller.signal.aborted) return;
 
                 let added = false;
                 for (const [row, d] of data.entries()) {
@@ -263,7 +280,6 @@ const DataGridSearch: React.FunctionComponent<DataGridSearchProps> = p => {
                 }
             };
 
-            cancelSearch();
             searchHandle.current = window.requestAnimationFrame(tick);
         },
         [cancelSearch, columns.length, getCellsForSelection, onSearchResultsChanged, rows]

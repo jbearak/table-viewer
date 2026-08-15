@@ -88,5 +88,5 @@ export const textCellRenderer: InternalCellRenderer<TextCell> = {
     onPaste: (toPaste, cell, details) =>
         toPaste === cell.data
             ? undefined
-            : { ...cell, data: toPaste, displayData: details.formattedString ?? cell.displayData },
+            : { ...cell, data: toPaste, displayData: details.formattedString ?? toPaste },
 };

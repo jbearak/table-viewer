@@ -2106,6 +2106,10 @@ export function GridShell({
                 // Primary button down (drag-select / resize) — no tooltip.
                 hide_cell_tooltip();
             } else {
+                // Deliberately the merge-resolved bounds, not physicalBounds: a
+                // merge paints its text across the whole block, so that block is
+                // the rectangle overflow must be measured against — a covered
+                // cell's own width would pop tooltips for text that fits fine.
                 schedule_cell_tooltip(
                     args.location[0],
                     args.location[1],
