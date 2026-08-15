@@ -126,19 +126,41 @@ describe("MergedCellResolver", () => {
         expect(r.expandRange(containing)).toBe(containing);
     });
 
-    test("mergeCrossingRowLine and mergeCrossingColLine detect straddling merges", () => {
+    test("drops merges crossing the frozen-column boundary", () => {
+        const r = new MergedCellResolver(
+            [
+                { x: 1, y: 0, width: 3, height: 2 }, // straddles the boundary at column 2
+                { x: 0, y: 5, width: 2, height: 2 }, // fully frozen
+                { x: 4, y: 5, width: 2, height: 2 }, // fully scrollable
+            ],
+            0,
+            10,
+            100,
+            2
+        );
+        expect(r.getRange(1, 0)).toBeUndefined();
+        expect(r.getRange(0, 5)).toEqual({ x: 0, y: 5, width: 2, height: 2 });
+        expect(r.getRange(4, 5)).toEqual({ x: 4, y: 5, width: 2, height: 2 });
+    });
+
+    test("adjustRowBoundary and adjustColBoundary step shrinking edges off merges", () => {
         const r = new MergedCellResolver([{ x: 1, y: 1, width: 2, height: 3 }]);
-        // Lines strictly inside the merge cross it...
-        expect(r.mergeCrossingRowLine(2, 1, 3)).toBeDefined();
-        expect(r.mergeCrossingColLine(2, 1, 4)).toBeDefined();
-        // ...its boundary lines do not.
-        expect(r.mergeCrossingRowLine(1, 1, 3)).toBeUndefined();
-        expect(r.mergeCrossingRowLine(4, 1, 3)).toBeUndefined();
-        expect(r.mergeCrossingColLine(1, 1, 4)).toBeUndefined();
-        expect(r.mergeCrossingColLine(3, 1, 4)).toBeUndefined();
-        // Column window that misses the merge sees no crossing.
-        expect(r.mergeCrossingRowLine(2, 5, 9)).toBeUndefined();
-        expect(r.mergeCrossingColLine(2, 6, 9)).toBeUndefined();
+        // A top edge moving down (stop below) jumps to the merge bottom...
+        expect(r.adjustRowBoundary(2, 1, 3, 9)).toBe(4);
+        // ...clamped at stop.
+        expect(r.adjustRowBoundary(2, 1, 3, 3)).toBe(3);
+        // A bottom edge moving up (stop above) jumps to the merge top.
+        expect(r.adjustRowBoundary(3, 1, 3, 0)).toBe(1);
+        // Boundary lines of the merge are already valid.
+        expect(r.adjustRowBoundary(1, 1, 3, 9)).toBe(1);
+        expect(r.adjustRowBoundary(4, 1, 3, 0)).toBe(4);
+        // A column window missing the merge never moves.
+        expect(r.adjustRowBoundary(2, 5, 9, 9)).toBe(2);
+        // Column-line analogs.
+        expect(r.adjustColBoundary(2, 1, 4, 9)).toBe(3);
+        expect(r.adjustColBoundary(2, 1, 4, 0)).toBe(1);
+        expect(r.adjustColBoundary(1, 1, 4, 9)).toBe(1);
+        expect(r.adjustColBoundary(2, 6, 9, 9)).toBe(2);
     });
 
     test("expandDamage handles many members of one merge", () => {

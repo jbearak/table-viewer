@@ -128,3 +128,31 @@ Delete or fold into a real design doc before the PR if stale.
   branch: merges resolve before getCellContent (anchor redirect), spans after
   (span comes from the fetched cell); dedup semantics differ (per-merge vs
   per-row). Shared piece extracted: beginMultiCellClip.
+
+## Stage 3 review decisions (recorded 2026-08-15)
+
+- Frozen-area merges now excluded at the source: the resolver drops merges
+  reaching into frozen trailing rows (rowCount = rows - freezeTrailingRows)
+  or crossing the frozen-column boundary (their halves occupy unrelated
+  screen positions, so no single rect can describe hit bounds). This makes
+  rendering, hit-testing, bounds, selection, and navigation consistent
+  without per-consumer exclusion logic. Merges wholly inside the frozen
+  column band still work.
+- getBoundsForItem uses combineRects for the merged union (extrema-based, no
+  monotonic-position assumption); with boundary-crossing merges dropped, the
+  anchor and last cell always share a pane.
+- setGridSelection is the invariant chokepoint: it canonicalizes the active
+  cell to the merge anchor AND fixpoint-expands the range, so every ingress
+  (mouse, keyboard, controlled selection, a11y) holds the invariants.
+- updateSelectedCell only steps PAST a merge when the caller passes
+  stepPastMerges (keyboard movement, edit-finish movement); absolute jumps
+  (search, context menu) just canonicalize to the anchor.
+- adjustSelection's horizontal shrink alternates merge-boundary jumps with
+  getSpanStops rechecks to a fixpoint (both move toward the active cell, so
+  it terminates); vertical edges have no span interaction.
+- Copy-pasted edge loops consolidated into resolver adjustRowBoundary /
+  adjustColBoundary; mergeCrossing*Line became private.
+- Not done (deliberate): per-event resolver double-lookup in hit-test +
+  getBoundsForItem (two Map hits per pointer event — measured harmless,
+  perf gate green); boundsFor closure churn in getBoundsForItem (mirrors
+  upstream style, not a hot loop).

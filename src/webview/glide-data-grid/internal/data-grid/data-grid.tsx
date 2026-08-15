@@ -49,7 +49,7 @@ import {
     headerKind,
     mouseEventArgsAreEqual,
 } from "./event-args.js";
-import { pointInRect } from "../../common/math.js";
+import { combineRects, pointInRect } from "../../common/math.js";
 import {
     type GroupDetailsCallback,
     type GetRowThemeCallback,
@@ -460,15 +460,17 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
             let result: Rectangle;
             // Fork addition: any cell of a merge reports the union rect of
             // the whole merge — the overlay editor, fill handle, and a11y
-            // focus all consume these bounds.
+            // focus all consume these bounds. The resolver never contains
+            // merges crossing a freeze boundary, so the anchor and last cell
+            // always live in the same pane and their union is the merge.
             const mergeRange = row >= 0 ? mergedCells?.getRange(col, row) : undefined;
             if (mergeRange === undefined) {
                 result = boundsFor(col, row);
             } else {
-                result = boundsFor(mergeRange.x, mergeRange.y);
-                const last = boundsFor(mergeRange.x + mergeRange.width - 1, mergeRange.y + mergeRange.height - 1);
-                result.width = last.x + last.width - result.x;
-                result.height = last.y + last.height - result.y;
+                result = combineRects(
+                    boundsFor(mergeRange.x, mergeRange.y),
+                    boundsFor(mergeRange.x + mergeRange.width - 1, mergeRange.y + mergeRange.height - 1)
+                );
             }
 
             if (scale !== 1) {
@@ -633,17 +635,9 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
                 // Fork addition: a hit anywhere inside a merge reports the
                 // anchor's coordinates (and, via getBoundsForItem, the full
                 // merged bounds), so every consumer sees the merge as one
-                // cell. Freeze-trailing rows render unmerged, so they stay
-                // unmangled here too.
-                let cellCol = col;
-                let cellRow = row;
-                if (mergedCells !== undefined && row < rows - freezeTrailingRows) {
-                    const mergeRange = mergedCells.getRange(col, row);
-                    if (mergeRange !== undefined) {
-                        cellCol = mergeRange.x;
-                        cellRow = mergeRange.y;
-                    }
-                }
+                // cell. The resolver never contains merges in frozen
+                // trailing rows or crossing the frozen-column boundary.
+                const [cellCol, cellRow] = mergedCells?.anchorOf(col, row) ?? [col, row];
                 const bounds = getBoundsForItem(canvas, cellCol, cellRow);
                 assert(bounds !== undefined);
                 const isEdge = bounds !== undefined && bounds.x + bounds.width - posX < edgeDetectionBuffer;

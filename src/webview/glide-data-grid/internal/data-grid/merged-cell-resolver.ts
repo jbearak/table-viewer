@@ -14,6 +14,7 @@
 // The Rectangle stored for a merge is a single stable object, so callers may
 // use it as an identity key.
 import { packColRowToNumber } from "../../common/render-state-provider.js";
+import { combineRects, rectContains } from "../../common/math.js";
 import type { Item, Rectangle } from "./data-grid-types.js";
 import type { CellSet } from "./cell-set.js";
 
@@ -23,19 +24,31 @@ export class MergedCellResolver {
     // lookups always go through the map.
     private readonly acceptedRanges: readonly Rectangle[];
 
-    constructor(ranges: readonly Rectangle[], colOffset: number = 0, colCount: number = Infinity, rowCount: number = Infinity) {
+    constructor(
+        ranges: readonly Rectangle[],
+        colOffset: number = 0,
+        colCount: number = Infinity,
+        rowCount: number = Infinity,
+        freezeColumns: number = 0
+    ) {
         const accepted: Rectangle[] = [];
         const map = new Map<number, Rectangle>();
         for (const raw of ranges) {
             // Degenerate (empty or single-cell), negative, and out-of-grid
             // ranges are silently dropped: a 1x1 "merge" is just a cell,
             // negative coordinates can never be walked, and a range past the
-            // grid edge would index columns that do not exist.
+            // grid edge would index columns that do not exist. Callers pass
+            // the row count of the non-frozen area, so merges never reach
+            // into frozen trailing rows (which render unmerged). A merge
+            // crossing the frozen-column boundary is dropped too — its
+            // frozen and scrollable halves occupy unrelated screen
+            // positions, so no single rectangle can represent it.
             if (raw.width < 1 || raw.height < 1 || raw.width * raw.height <= 1) continue;
             if (raw.x < 0 || raw.y < 0) continue;
             const range: Rectangle =
                 colOffset === 0 ? raw : { x: raw.x + colOffset, y: raw.y, width: raw.width, height: raw.height };
             if (range.x + range.width > colCount || range.y + range.height > rowCount) continue;
+            if (range.x < freezeColumns && range.x + range.width > freezeColumns) continue;
 
             // First listed wins: a range overlapping an accepted one is dropped.
             let overlaps = false;
@@ -82,39 +95,70 @@ export class MergedCellResolver {
      * expand_range_for_merges oracle.
      */
     public expandRange(range: Rectangle): Rectangle {
-        if (this.acceptedRanges.length === 0) return range;
-        let x = range.x;
-        let y = range.y;
-        let right = range.x + range.width;
-        let bottom = range.y + range.height;
+        let result = range;
         let changed = true;
         while (changed) {
             changed = false;
             for (const m of this.acceptedRanges) {
-                if (m.x < right && m.x + m.width > x && m.y < bottom && m.y + m.height > y) {
-                    if (m.x < x) {
-                        x = m.x;
-                        changed = true;
-                    }
-                    if (m.y < y) {
-                        y = m.y;
-                        changed = true;
-                    }
-                    if (m.x + m.width > right) {
-                        right = m.x + m.width;
-                        changed = true;
-                    }
-                    if (m.y + m.height > bottom) {
-                        bottom = m.y + m.height;
-                        changed = true;
-                    }
+                const intersects =
+                    m.x < result.x + result.width &&
+                    m.x + m.width > result.x &&
+                    m.y < result.y + result.height &&
+                    m.y + m.height > result.y;
+                if (intersects && !rectContains(result, m)) {
+                    result = combineRects(result, m);
+                    changed = true;
                 }
             }
         }
-        if (x === range.x && y === range.y && right === range.x + range.width && bottom === range.y + range.height) {
-            return range;
+        return result;
+    }
+
+    /**
+     * Moves a shrinking horizontal selection edge at row `boundary` off any
+     * merge it would cut (within columns [left, right)), stepping in the
+     * shrink direction but never past `stop`. `stop > boundary` means the
+     * top edge is moving down; `stop < boundary` means the bottom edge is
+     * moving up (`boundary` and `stop` are exclusive row lines).
+     */
+    public adjustRowBoundary(boundary: number, left: number, right: number, stop: number): number {
+        let m: Rectangle | undefined;
+        if (stop > boundary) {
+            while (boundary < stop && (m = this.mergeCrossingRowLine(boundary, left, right)) !== undefined) {
+                boundary = Math.min(m.y + m.height, stop);
+            }
+        } else {
+            while (boundary > stop && (m = this.mergeCrossingRowLine(boundary, left, right)) !== undefined) {
+                boundary = Math.max(m.y, stop);
+            }
         }
-        return { x, y, width: right - x, height: bottom - y };
+        return boundary;
+    }
+
+    /**
+     * A merge spanning both sides of the vertical grid line left of `line`
+     * (columns line-1 and line) within rows [top, bottom), or undefined.
+     */
+    private mergeCrossingColLine(line: number, top: number, bottom: number): Rectangle | undefined {
+        for (const m of this.acceptedRanges) {
+            if (m.x < line && m.x + m.width > line && m.y < bottom && m.y + m.height > top) return m;
+        }
+        return undefined;
+    }
+
+    /** Vertical-edge analog of {@link adjustRowBoundary} (column lines). */
+    public adjustColBoundary(boundary: number, top: number, bottom: number, stop: number): number {
+        let m: Rectangle | undefined;
+        if (stop > boundary) {
+            while (boundary < stop && (m = this.mergeCrossingColLine(boundary, top, bottom)) !== undefined) {
+                boundary = Math.min(m.x + m.width, stop);
+            }
+        } else {
+            while (boundary > stop && (m = this.mergeCrossingColLine(boundary, top, bottom)) !== undefined) {
+                boundary = Math.max(m.x, stop);
+            }
+        }
+        return boundary;
     }
 
     /**
@@ -122,20 +166,9 @@ export class MergedCellResolver {
      * (rows line-1 and line) within columns [left, right), or undefined.
      * Selection edges must not sit on such a line.
      */
-    public mergeCrossingRowLine(line: number, left: number, right: number): Rectangle | undefined {
+    private mergeCrossingRowLine(line: number, left: number, right: number): Rectangle | undefined {
         for (const m of this.acceptedRanges) {
             if (m.y < line && m.y + m.height > line && m.x < right && m.x + m.width > left) return m;
-        }
-        return undefined;
-    }
-
-    /**
-     * A merge spanning both sides of the vertical grid line left of `line`
-     * (columns line-1 and line) within rows [top, bottom), or undefined.
-     */
-    public mergeCrossingColLine(line: number, top: number, bottom: number): Rectangle | undefined {
-        for (const m of this.acceptedRanges) {
-            if (m.x < line && m.x + m.width > line && m.y < bottom && m.y + m.height > top) return m;
         }
         return undefined;
     }
