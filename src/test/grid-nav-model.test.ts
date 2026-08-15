@@ -12,35 +12,17 @@ const base = {
     meta: false,
     alt: false,
     editable: false,
-    has_merges: false,
 };
 
 describe('resolve_nav', () => {
-    it('maps arrow keys to directions when the sheet has merges', () => {
-        expect(resolve_nav({ ...base, key: 'ArrowUp', has_merges: true })).toEqual({
-            kind: 'direction',
-            direction: 'up',
-        });
-        expect(resolve_nav({ ...base, key: 'ArrowDown', has_merges: true })).toEqual({
-            kind: 'direction',
-            direction: 'down',
-        });
-        expect(resolve_nav({ ...base, key: 'ArrowLeft', has_merges: true })).toEqual({
-            kind: 'direction',
-            direction: 'left',
-        });
-        expect(resolve_nav({ ...base, key: 'ArrowRight', has_merges: true })).toEqual({
-            kind: 'direction',
-            direction: 'right',
-        });
+    it('ignores arrow keys (native Glide nav is merge-aware)', () => {
+        expect(resolve_nav({ ...base, key: 'ArrowUp' })).toBeNull();
+        expect(resolve_nav({ ...base, key: 'ArrowDown' })).toBeNull();
+        expect(resolve_nav({ ...base, key: 'ArrowLeft' })).toBeNull();
+        expect(resolve_nav({ ...base, key: 'ArrowRight' })).toBeNull();
     });
 
-    it('ignores arrow keys on a plain sheet (native Glide nav is correct)', () => {
-        expect(resolve_nav({ ...base, key: 'ArrowDown', has_merges: false })).toBeNull();
-        expect(resolve_nav({ ...base, key: 'ArrowRight', has_merges: false })).toBeNull();
-    });
-
-    it('maps hjkl to directions in view mode regardless of merges', () => {
+    it('maps hjkl to directions in view mode', () => {
         expect(resolve_nav({ ...base, key: 'k' })).toEqual({ kind: 'direction', direction: 'up' });
         expect(resolve_nav({ ...base, key: 'j' })).toEqual({ kind: 'direction', direction: 'down' });
         expect(resolve_nav({ ...base, key: 'h' })).toEqual({ kind: 'direction', direction: 'left' });
@@ -52,31 +34,15 @@ describe('resolve_nav', () => {
         expect(resolve_nav({ ...base, key: 'l', editable: true })).toBeNull();
     });
 
-    it('still maps arrow keys while editing when the sheet has merges', () => {
-        // editable + has_merges never co-occur in practice (CSV is editable but
-        // has no merges), but arrows should remain merge-aware regardless.
-        expect(
-            resolve_nav({ ...base, key: 'ArrowDown', editable: true, has_merges: true }),
-        ).toEqual({ kind: 'direction', direction: 'down' });
-    });
-
     it('defers to Glide for shift (range extension)', () => {
-        expect(
-            resolve_nav({ ...base, key: 'ArrowDown', shift: true, has_merges: true }),
-        ).toBeNull();
+        expect(resolve_nav({ ...base, key: 'ArrowDown', shift: true })).toBeNull();
         expect(resolve_nav({ ...base, key: 'j', shift: true })).toBeNull();
     });
 
     it('defers to Glide for ctrl/meta/alt (copy, select-all, etc.)', () => {
-        expect(
-            resolve_nav({ ...base, key: 'ArrowDown', ctrl: true, has_merges: true }),
-        ).toBeNull();
-        expect(
-            resolve_nav({ ...base, key: 'ArrowDown', meta: true, has_merges: true }),
-        ).toBeNull();
-        expect(
-            resolve_nav({ ...base, key: 'ArrowDown', alt: true, has_merges: true }),
-        ).toBeNull();
+        expect(resolve_nav({ ...base, key: 'ArrowDown', ctrl: true })).toBeNull();
+        expect(resolve_nav({ ...base, key: 'ArrowDown', meta: true })).toBeNull();
+        expect(resolve_nav({ ...base, key: 'ArrowDown', alt: true })).toBeNull();
     });
 
     it('intercepts Tab and Shift+Tab for row-major traversal', () => {
@@ -97,8 +63,8 @@ describe('resolve_nav', () => {
     });
 
     it('returns null for unrelated keys', () => {
-        expect(resolve_nav({ ...base, key: 'a', has_merges: true })).toBeNull();
-        expect(resolve_nav({ ...base, key: 'Enter', has_merges: true })).toBeNull();
+        expect(resolve_nav({ ...base, key: 'a' })).toBeNull();
+        expect(resolve_nav({ ...base, key: 'Enter' })).toBeNull();
     });
 });
 
@@ -121,6 +87,18 @@ describe('move_sequential_cell', () => {
 
     it('moves down without changing columns', () => {
         expect(move_sequential_cell([1, 0], 'below', 3, 3)).toEqual([1, 1]);
+    });
+
+    it('skips covered rows when moving below (Enter past a vertical merge)', () => {
+        // Rows 1-2 of column 1 are covered by a merge anchored at [1, 0].
+        const covered = (row: number, col: number) =>
+            col === 1 && (row === 1 || row === 2);
+        expect(move_sequential_cell([1, 0], 'below', 4, 3, covered)).toEqual([1, 3]);
+    });
+
+    it('retains the cell when everything below is covered', () => {
+        const covered = (row: number, col: number) => col === 1 && row > 0;
+        expect(move_sequential_cell([1, 0], 'below', 4, 3, covered)).toEqual([1, 0]);
     });
 
     it('retains the current cell at every outer boundary', () => {

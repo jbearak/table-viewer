@@ -65,7 +65,6 @@ const grid_mock = vi.hoisted(() => ({
     props: null as null | Record<string, unknown>,
     row_resize_props: null as null | Record<string, unknown>,
     row_resize_set_target: vi.fn(),
-    overlay_repaint: vi.fn(),
     update_cells: vi.fn(),
     scroll_to: vi.fn(),
     focus: vi.fn(),
@@ -185,13 +184,6 @@ vi.mock('../webview/vscode-theme', () => ({
         conflictBg: 'rgba(229, 75, 75, 0.22)',
     }),
     theme_font_size_px: () => 13,
-}));
-
-vi.mock('../webview/merge-overlay', () => ({
-    MergeOverlay: React.forwardRef((_props: unknown, ref: React.ForwardedRef<unknown>) => {
-        React.useImperativeHandle(ref, () => ({ repaint: grid_mock.overlay_repaint }));
-        return React.createElement('div', { className: 'merge-overlay-stub' });
-    }),
 }));
 
 vi.mock('../webview/row-resize-overlay', () => ({
@@ -320,7 +312,6 @@ afterEach(() => {
     grid_mock.source_row_for_display = null;
     grid_mock.row_resize_props = null;
     grid_mock.row_resize_set_target.mockReset();
-    grid_mock.overlay_repaint.mockReset();
     grid_mock.update_cells.mockReset();
     grid_mock.scroll_to.mockReset();
     grid_mock.focus.mockReset();
@@ -346,55 +337,6 @@ afterEach(() => {
     vi.unstubAllGlobals();
     Reflect.deleteProperty(navigator, 'clipboard');
     vi.useRealTimers();
-});
-
-describe('GridShell merge overlay scroll synchronization', () => {
-    it('keeps repainting merged cells for trailing frames after the last scroll', async () => {
-        let paint_frame: FrameRequestCallback | undefined;
-        const request_frame = vi.fn((callback: FrameRequestCallback) => {
-            paint_frame = callback;
-            return 17;
-        });
-        vi.stubGlobal('requestAnimationFrame', request_frame);
-        vi.stubGlobal('cancelAnimationFrame', vi.fn());
-        await render_grid(props());
-        grid_mock.overlay_repaint.mockClear();
-
-        const on_visible_region_changed = grid_mock.props!.onVisibleRegionChanged as
-            (range: { x: number; y: number; width: number; height: number }) => void;
-        const scrolled_right = { x: 8, y: 0, width: 2, height: 20 };
-        const returned_left = { x: 0, y: 0, width: 2, height: 20 };
-        act(() => {
-            on_visible_region_changed(scrolled_right);
-            on_visible_region_changed(returned_left);
-        });
-
-        // Glide updates the bounds read by MergeOverlay through React state, and
-        // that commit can land a frame or more after this callback. Painting only
-        // synchronously (or on exactly one deferred frame) can capture the
-        // penultimate scroll position on either axis. The repaint must instead
-        // run across several frames after the last scroll callback so the final
-        // paint sees Glide's committed bounds.
-        expect(grid_mock.overlay_repaint).not.toHaveBeenCalled();
-        expect(request_frame).toHaveBeenCalledOnce();
-
-        // First frame paints, then trailing frames keep painting the same final
-        // region until the loop exhausts itself; every paint uses the latest
-        // region, never the stale one.
-        let frames = 0;
-        while (paint_frame && frames < 10) {
-            const frame = paint_frame;
-            paint_frame = undefined;
-            act(() => frame(0));
-            frames += 1;
-        }
-        expect(frames).toBeGreaterThanOrEqual(2);
-        expect(frames).toBeLessThan(10);
-        expect(grid_mock.overlay_repaint).toHaveBeenCalledTimes(frames);
-        for (const call of grid_mock.overlay_repaint.mock.calls) {
-            expect(call[0]).toEqual(returned_left);
-        }
-    });
 });
 
 describe('GridShell column projection', () => {
@@ -710,7 +652,7 @@ describe('GridShell column projection', () => {
         });
     });
 
-    it('retargets shortcuts after programmatic vim and merge-aware navigation', async () => {
+    it('retargets shortcuts after programmatic vim and native arrow navigation', async () => {
         const on_transform_change = vi.fn();
         await render_grid(props({
             row_count: 2,
@@ -745,15 +687,20 @@ describe('GridShell column projection', () => {
         });
 
         on_transform_change.mockClear();
+        // Arrow keys defer to Glide (which is merge-aware natively); the moved
+        // selection arrives back through onGridSelectionChange and must retarget
+        // the focused column exactly like an interception used to.
+        const arrow_args = key_args('ArrowRight');
+        await act(async () => on_key_down(arrow_args));
+        expect(arrow_args.cancel).not.toHaveBeenCalled();
         await act(async () => on_selection_change({
             columns: compact([]), rows: compact([]),
             current: {
-                cell: [0, 0],
-                range: { x: 0, y: 0, width: 1, height: 1 },
+                cell: [1, 0],
+                range: { x: 1, y: 0, width: 1, height: 1 },
                 rangeStack: [],
             },
         }));
-        await act(async () => on_key_down(key_args('ArrowRight')));
         on_key_down({
             ...key_args('D', 'KeyD'), altKey: true, shiftKey: true,
         });
@@ -2196,7 +2143,6 @@ describe('GridShell column projection', () => {
         expect(container!.querySelector('[role="status"]')?.textContent)
             .toContain('All columns are hidden');
         expect(container!.querySelector('.data-editor-stub')).toBeNull();
-        expect(container!.querySelector('.merge-overlay-stub')).toBeNull();
         expect(container!.querySelector('.row-resize-overlay-stub')).toBeNull();
         expect(grid_mock.loader_enabled.at(-1)).toBe(false);
         expect(grid_mock.ensure_rows).not.toHaveBeenCalled();
@@ -2943,7 +2889,6 @@ describe('GridShell row resizing', () => {
             (row: number, height: number) => void;
         const on_resize_end = grid_mock.row_resize_props!.on_resize_end as
             (row: number, height: number) => void;
-        grid_mock.overlay_repaint.mockClear();
         act(() => on_resize_start(3, 24));
         act(() => on_resize(3, 52));
 
@@ -2958,7 +2903,6 @@ describe('GridShell row resizing', () => {
         expect(grid_mock.update_cells).toHaveBeenCalledWith([
             { cell: [0, 3] }, { cell: [1, 3] },
         ]);
-        expect(grid_mock.overlay_repaint).toHaveBeenCalled();
         act(() => on_resize_end(3, 52));
         expect(on_row_resize).toHaveBeenCalledOnce();
         // Coalesced into display-row intervals: 1 alone, then 3–4.
@@ -3084,20 +3028,5 @@ describe('GridShell row resizing', () => {
         // row numbers: the request that crosses to the host is the size of the gesture,
         // not of the selection.
         expect(on_row_resize.mock.calls[0][0]).toEqual([{ start: 0, end: 9_999 }]);
-    });
-
-    it('repaints merge geometry after committed row heights render', async () => {
-        const initial = props({ row_heights: { 1: 24 } });
-        const GridShell = await render_grid(initial);
-        grid_mock.overlay_repaint.mockClear();
-
-        await act(async () => {
-            root!.render(React.createElement(GridShell, {
-                ...initial,
-                row_heights: { 1: 52, 3: 52 },
-            }));
-        });
-
-        expect(grid_mock.overlay_repaint).toHaveBeenCalled();
     });
 });

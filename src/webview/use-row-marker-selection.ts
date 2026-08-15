@@ -140,7 +140,14 @@ export function use_row_marker_selection({
             return false;
         }
         if (args.kind !== 'cell' || args.location[1] < 0) return false;
-        const rows = marker_drag_rows(drag, args.location[1], row_count);
+        // Sweep to the physical row under the pointer: inside a vertical merge
+        // the canonicalized location snaps to the anchor, which would stall the
+        // sweep at the merge's top row.
+        const rows = marker_drag_rows(
+            drag,
+            (args.physicalLocation ?? args.location)[1],
+            row_count,
+        );
         if (!rows.equals(selection_ref.current.rows)) {
             set_selection({ columns: CompactSelection.empty(), rows });
         }

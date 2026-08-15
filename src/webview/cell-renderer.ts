@@ -1,23 +1,14 @@
 import { GridCellKind, type GridCell } from './glide-data-grid';
 import type { RenderedCell } from '../data-source/interface';
-import type { MergeIndex } from './merge-index';
 
 /**
- * Cell-content construction for the Glide grid (Phase D). Pure (no canvas, no
- * Glide runtime beyond the erased-at-build enum/type), so it is unit-tested
- * directly. The hybrid merge mechanism from Spike D0:
+ * Cell-content construction for the Glide grid. Pure (no canvas, no Glide
+ * runtime beyond the erased-at-build enum/type), so it is unit-tested directly.
  *
- *  - **Horizontal-only merges** (rowSpan === 1): every cell in the span — anchor
- *    and covered — returns the anchor's content plus `span: [startCol, endCol]`.
- *    Glide draws one block and clips interior vertical gridlines out. Echoing the
- *    content on covered cells is required: otherwise a covered column repaints
- *    blank over the anchor, and a span whose anchor column is scrolled off draws
- *    empty.
- *  - **Vertical / 2D merges** (rowSpan > 1): the anchor and all covered cells
- *    render blank with no span; the transparent overlay canvas paints the block
- *    (content + border that covers the interior horizontal gridlines Glide can't
- *    suppress for multi-row spans).
- *  - **Plain cells**: text with raw/formatted + optional bold/italic font.
+ * Merged cells need no handling here: the vendored grid resolves merges
+ * internally from the `mergedRanges` prop — its draw loop asks this callback
+ * for the *anchor's* coordinates and paints one block at the merge's full
+ * bounds, so every cell simply returns its own content.
  */
 
 /**
@@ -50,26 +41,10 @@ export function font_style(
     return font_shorthand(bold, italic, size_px);
 }
 
-const BLANK: GridCell = {
-    kind: GridCellKind.Text,
-    data: '',
-    displayData: '',
-    allowOverlay: false,
-};
-
 /**
  * Per-cell editing state, supplied by the grid shell whenever the sheet is
  * editable, an edit exists, or a highlight applies. Colors are theme-resolved by
  * the caller to keep this module canvas/theme-free.
- *
- * Where it is honoured, by cell shape:
- *  - plain cells, and horizontal (`rowSpan === 1`) merges: fully — dirty value,
- *    tint, and `editable`.
- *  - `rowSpan > 1` merges, anchor and covered alike: not at all. Those blocks are
- *    painted by the merge overlay canvas rather than by the Glide cell, so this
- *    returns a blank non-overlay cell and the user cannot open an editor on one.
- *    Read-only was the whole story while editing was CSV-only; with worksheet
- *    editing it is a gap, tracked separately, not a rule.
  */
 export interface CellEditOverlay {
     /** When set, display this dirty value instead of the persisted content. */
@@ -94,10 +69,23 @@ const EMPTY_CELL: RenderedCell = {
     italic: false,
 };
 
+/**
+ * Shared cell for the no-content, no-overlay case (an unloaded page, a null
+ * cell on a read-only sheet). getCellContent runs once per visible cell per
+ * draw with no caching above it, so returning one immutable object instead of
+ * synthesizing a fresh GridCell keeps scrolling an unloaded region
+ * allocation-free.
+ */
+const BLANK: GridCell = {
+    kind: GridCellKind.Text,
+    data: '',
+    displayData: '',
+    allowOverlay: false,
+};
+
 function text_cell(
     c: RenderedCell,
     show_formatting: boolean,
-    span?: [number, number],
     overlay?: CellEditOverlay,
     font_size_px: number = DEFAULT_CELL_FONT_SIZE_PX,
 ): GridCell {
@@ -118,8 +106,7 @@ function text_cell(
         displayData: display,
         allowOverlay: overlay?.editable ?? false,
         // Render hard line breaks across multiple lines so a grown row's content
-        // is visible (rows auto-grow after a multiline edit in grid-shell). Glide
-        // supports wrapping while retaining a horizontal merge's native span.
+        // is visible (rows auto-grow after a multiline edit in grid-shell).
         ...(display.includes('\n') ? { allowWrapping: true } : {}),
         // Belt and braces with `allowOverlay: false`. Glide's paste path
         // (`pasteToCell` in data-editor.js) does not consult `allowOverlay` at all
@@ -137,52 +124,23 @@ function text_cell(
         // user coloured it.
         ...(overlay?.refused ? { readonly: true } : {}),
         ...(has_override ? { themeOverride: theme_override } : {}),
-        ...(span ? { span } : {}),
     };
 }
 
 /**
- * Build the `GridCell` for (row, col). `cells` is the current row's data (from
- * the paged loader), or undefined while the page is still loading.
+ * Build the `GridCell` for a column of the given row. `cells` is the row's data
+ * (from the paged loader), or undefined while the page is still loading. A
+ * missing cell renders blank — still editable in edit mode (the overlay's
+ * dirty value / tint apply), read-only otherwise.
  */
 export function build_grid_cell(
-    row: number,
     col: number,
     cells: (RenderedCell | null)[] | undefined,
-    merge_index: MergeIndex,
     show_formatting: boolean,
     overlay?: CellEditOverlay,
     font_size_px: number = DEFAULT_CELL_FONT_SIZE_PX,
 ): GridCell {
-    const entry = merge_index.entry_at(row, col);
-
-    if (entry) {
-        if (entry.horizontalOnly) {
-            // Anchor lives in the same row; echo its content + span on every
-            // cell of the span.
-            const anchor_cell = cells ? cells[entry.startCol] : undefined;
-            if (!anchor_cell) return { ...BLANK, span: [entry.startCol, entry.endCol] };
-            return text_cell(
-                anchor_cell,
-                show_formatting,
-                [entry.startCol, entry.endCol],
-                overlay,
-                font_size_px,
-            );
-        }
-        // rowSpan > 1: the overlay canvas paints content, so the Glide cell stays
-        // blank — which also drops `overlay.editable`, leaving these blocks
-        // non-editable. See the `CellEditOverlay` doc comment.
-        return BLANK;
-    }
-
-    const c = cells ? cells[col] : undefined;
-    if (!c) {
-        // In edit mode an empty cell can still be edited or hold a dirty value,
-        // so synthesize a blank editable cell; otherwise it's read-only.
-        return overlay
-            ? text_cell(EMPTY_CELL, show_formatting, undefined, overlay, font_size_px)
-            : BLANK;
-    }
-    return text_cell(c, show_formatting, undefined, overlay, font_size_px);
+    const c = cells?.[col];
+    if (!c && !overlay) return BLANK;
+    return text_cell(c ?? EMPTY_CELL, show_formatting, overlay, font_size_px);
 }

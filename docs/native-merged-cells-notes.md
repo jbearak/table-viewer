@@ -173,3 +173,77 @@ Delete or fold into a real design doc before the PR if stale.
   copy-paste.ts (span blanking is per-cell data, merge blanking needs grid
   coords); copies are user-triggered, so the extra map over the copied
   range is not hot.
+
+## Stage 5 (app cutover) decisions (recorded 2026-08-15)
+
+- MergeOverlay canvas unmounted from GridShell: no overlay ref, no
+  scroll-repaint RAF machinery, no highlight_version tick. Merges reach the
+  grid as `mergedRanges` (a direct 1:1 map of App's `merges`, which App
+  already withholds under any non-identity view — sort/filter/hidden
+  rows/columns — so display space == source space whenever ranges are
+  supplied; a partial projection would be worse than none).
+- cell-renderer lost its merge branches entirely: the vendored draw loop
+  redirects covered cells to the anchor before calling getCellContent, so
+  every cell just returns its own content.
+- Arrow keys defer to Glide (merge-aware stepPastMerges); the shell still
+  intercepts Tab (application row-major order needs is_covered) and hjkl
+  (view-mode vim nav via merge-aware move_active_cell).
+- Selection normalization split: grid-originated selections are already
+  canonicalized by the vendored setGridSelection chokepoint, so
+  onGridSelectionChange writes through directly; shell-originated writes
+  (select_active_display_cell, context menu) bypass that chokepoint and
+  grid_selection_ref is read synchronously, so they still run
+  expand_glide_selection themselves.
+- Off-screen merge anchors: onVisibleRegionChanged preloads anchor rows of
+  merges straddling the viewport top via ensure_rows_loaded (viewport
+  untouched); both source-key repaint effects (tints and highlights) append
+  offscreen_anchor_merge_damage, which damages one covered cell per merge
+  whose *anchor key* changed — the grid's expandDamage repaints the whole
+  block from any member cell.
+- Not done (deliberate): RowLoader-level anchor residency/pinning (the
+  ensure_rows_loaded request dedupe already avoids network churn; an anchor
+  evicted after its waiter resolves self-heals on the next scroll tick);
+  sharing one merge resolver between the app's MergeIndex and the vendored
+  resolver (MergeIndex is still needed for guarded copy and Tab; overlap
+  shrinks in Stage 6 when the overlay modules are deleted).
+
+## Stage 5 /code-review decisions (recorded 2026-08-15)
+
+- Fixed: native Delete/Cut (deleteRange in the vendored data-editor) iterated
+  every coordinate of the selection and would have recorded empty edits for
+  covered members of a merge; it now skips isCovered cells so a merged block
+  deletes as one cell (anchor only). Covered by a new vendor test.
+- Fixed: editor commit navigation (Enter/Tab out of the custom CSV editor)
+  called move_sequential_cell without the covered predicate, so leaving a
+  vertical/2D merge could target a covered cell that selection
+  canonicalization snapped straight back to the anchor. It now passes
+  merge_index.is_covered (via a ref), and move_sequential_cell's 'below' arm
+  skips covered rows too.
+- Fixed: hit-test canonicalization (anchor location + full block bounds)
+  starved consumers that need per-cell geometry. The vendored cell event args
+  now also carry physicalLocation/physicalBounds (the un-snapped cell);
+  row-resize boundary detection, header drag-sweep, and row-marker drag-sweep
+  read those, so a merge's interior/bottom boundaries resize the right row and
+  drags sweep past merges instead of yanking to the anchor.
+- Fixed: multiline auto-grow measured only the anchor row; a vertical merge
+  paints across the whole block, so it now compares the needed height against
+  the block's total and grows the anchor by the deficit only.
+- Fixed: offscreen_anchor_merge_damage handled only anchors above the
+  viewport; it now also repairs blocks whose anchor is left of the viewport
+  (horizontal and 2D merges). Both repaint effects share the pipeline via
+  source_key_damage, and the anchor key is built with cell_highlight_key
+  rather than a second hand-rolled `${row}:${col}`.
+- Fixed: restored the shared immutable BLANK fast path in build_grid_cell for
+  the no-content/no-overlay case (getCellContent is per-visible-cell,
+  per-draw; the rewrite had made every unloaded blank allocate).
+- Fixed: the per-scroll anchor preload scan now walks a memoized
+  vertical-merges-only list instead of filtering the full (10k-capped) list on
+  every visible-region callback.
+- Not done (deliberate): select_row/select_column writing rectangles that cut
+  a merge (a one-row selection across a vertical merge). This matches
+  spreadsheet convention — selecting row 3 in Excel does not balloon to every
+  merge the row crosses — and matches main's behavior; guarded copy of such a
+  row correctly emits a blank for the covered member.
+- Not done (deliberate): indexing offscreen_anchor_merge_damage by anchor key.
+  The linear scan runs only on tint/highlight *transitions* (user edits,
+  saves, discards), not per frame; 10k cheap comparisons per commit is noise.
