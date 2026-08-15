@@ -2197,17 +2197,20 @@ describe('Excel first-row header toggle', () => {
 
     it('keeps row promotion blocked at the command boundary in preview', async () => {
         const { post_message } = await render_app();
-        await dispatch_host_message(initial_snapshot_message(
-            excel_meta(false, 'off'),
-            { configuration: { previewMode: true } },
-        ));
+        const meta = excel_meta(false, 'off');
+        await dispatch_host_message(initial_snapshot_message(meta));
+        expect(grid_shell_mock.latest_props?.can_promote_row_to_header).toBe(true);
+        const stale_promote = grid_shell_mock.latest_props
+            ?.on_promote_row_to_header as (display_row: number) => void;
+
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            configuration: { previewMode: true },
+        }));
 
         expect(grid_shell_mock.latest_props?.can_promote_row_to_header).toBe(false);
         post_message.mockClear();
         await act(async () => {
-            const promote = grid_shell_mock.latest_props?.on_promote_row_to_header as
-                ((display_row: number) => void);
-            promote(2);
+            stale_promote(2);
         });
         expect(post_message.mock.calls
             .map((call) => call[0] as WebviewMessage)
