@@ -339,6 +339,38 @@ afterEach(() => {
     vi.useRealTimers();
 });
 
+describe('GridShell cell wrapping', () => {
+    it('uses a vertical merge full height when deciding whether to soft-wrap', async () => {
+        grid_mock.get_row.mockImplementation(() => [
+            {
+                raw: 'a long single-line value that needs the second merged row',
+                formatted: 'a long single-line value that needs the second merged row',
+                bold: false,
+                italic: false,
+            },
+            { raw: 'hidden-b', formatted: 'hidden-b', bold: false, italic: false },
+            { raw: 'source-c', formatted: 'source-c', bold: false, italic: false },
+        ] as any);
+        const merge = { startRow: 0, startCol: 0, endRow: 1, endCol: 0 };
+        await render_grid(props({
+            row_count: 2,
+            merges: [merge],
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 2,
+                sourceRowCount: 2,
+                merges: [merge],
+            },
+        }));
+
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => { allowWrapping?: boolean };
+        expect(get_cell_content([0, 0]).allowWrapping).toBe(true);
+        // The neighboring ordinary cell is still only one default row high.
+        expect(get_cell_content([1, 0]).allowWrapping).toBeUndefined();
+    });
+});
+
 describe('GridShell column projection', () => {
     it('builds displayed columns and reads/resizes canonical source columns', async () => {
         const on_column_resize = vi.fn();

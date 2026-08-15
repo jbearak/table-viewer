@@ -78,7 +78,11 @@ import {
 } from './grid-nav-model';
 import { move_active_cell } from './selection';
 import { MergeIndex } from './merge-index';
-import { build_grid_cell, type CellEditOverlay } from './cell-renderer';
+import {
+    build_grid_cell,
+    cell_allows_wrapping,
+    type CellEditOverlay,
+} from './cell-renderer';
 import {
     CELL_TOOLTIP_SHOW_DELAY_MS,
     cell_tooltip_position,
@@ -1640,11 +1644,12 @@ export function GridShell({
             if (!text) return;
 
             const flags = font_flags_for_cell(display_column, row);
-            // Mirror build_grid_cell's allowWrapping rule (hard break, or a row
-            // grown past the default) so the overflow estimate matches how Glide
-            // actually painted the cell.
-            const wrapping = has_line_break(text)
-                || cell_bounds.height > default_row_height;
+            // Use the same wrapping rule as build_grid_cell. `cell_bounds` is the
+            // full painted rectangle, including a vertical merge's covered rows.
+            const wrapping = cell_allows_wrapping(
+                text,
+                cell_bounds.height > default_row_height,
+            );
             const overflows = text_overflows_cell(
                 text,
                 cell_bounds.width,
@@ -1770,24 +1775,46 @@ export function GridShell({
         return color ? highlight_rgba(color, high_contrast) : undefined;
     }, [cell_highlights, high_contrast]);
 
-    const get_row_height = useCallback(
-        (row: number) => {
-            if (
+    const get_row_height = useMemo(() => {
+        // Glide walks the visible rows once per column and getCellContent runs for
+        // every cell. Keep row-height layer searches at roughly once per row, as
+        // row-heights.ts budgets, without retaining an unbounded sheet-sized map.
+        const cache = new Map<number, number>();
+        return (row: number): number => {
+            const cached = cache.get(row);
+            if (cached !== undefined) return cached;
+            const height = (
                 row_resize_preview
                 && (
                     row_resize_preview.row === row
                     || row_resize_preview.preview_rows?.hasIndex(row)
                 )
-            ) return row_resize_preview.height;
-            return resolved_row_height(
-                row_heights,
-                row_height_overlay,
-                row,
-                default_row_height,
-            );
-        },
-        [default_row_height, row_heights, row_height_overlay, row_resize_preview],
-    );
+            )
+                ? row_resize_preview.height
+                : resolved_row_height(
+                    row_heights,
+                    row_height_overlay,
+                    row,
+                    default_row_height,
+                );
+            // A 512-row viewport is already over 12,000px at the minimum row
+            // height. Clear rather than let non-paint consumers grow this forever.
+            if (cache.size >= 512) cache.clear();
+            cache.set(row, height);
+            return height;
+        };
+    }, [default_row_height, row_heights, row_height_overlay, row_resize_preview]);
+
+    const get_cell_height = useCallback((row: number, display_column: number): number => {
+        // Glide requests a merged block at its anchor coordinates, but paints it
+        // across every covered row. Its effective height is therefore the sum of
+        // the span, not merely the anchor row's height.
+        const entry = merge_index.is_anchor(row, display_column);
+        const last_row = entry?.endRow ?? row;
+        let height = 0;
+        for (let r = row; r <= last_row; r++) height += get_row_height(r);
+        return height;
+    }, [get_row_height, merge_index]);
 
     const get_cell_content = useCallback(
         (cell: Item): GridCell => {
@@ -1819,8 +1846,9 @@ export function GridShell({
             // immediately editable. It self-heals within one host round-trip, and
             // the alternative (editable now, silently discard the edit later) is
             // not acceptable.
-            // No merge resolution needed: the vendored grid redirects a merged
-            // block's paint (and its hit-tests) to the anchor's coordinates, so
+            // No merge resolution is needed for content identity: the vendored
+            // grid redirects a merged block's paint (and its hit-tests) to the
+            // anchor's coordinates, so
             // this callback answers for the cell it was actually asked about —
             // the anchor's own content, highlight, and dirty state cover the
             // whole block.
@@ -1865,10 +1893,10 @@ export function GridShell({
                 show_formatting,
                 overlay,
                 font_size_px,
-                // Rows taller than the default get soft wrapping — the only rows
-                // where wrapping can reveal anything — so default-height rows keep
-                // Glide's cheap single-line paint (see text_cell's comment).
-                get_row_height(row) > default_row_height,
+                // Cells taller than one default row get soft wrapping — including
+                // vertical merges whose constituent rows remain at default height.
+                // One-line-high cells keep Glide's cheap single-line paint.
+                get_cell_height(row, display_column) > default_row_height,
             );
         },
         // version: bumps when a page lands so the closure (and the redraw effect) refresh.
@@ -1882,7 +1910,7 @@ export function GridShell({
             get_source_row,
             get_highlight_background,
             store,
-            get_row_height,
+            get_cell_height,
             default_row_height,
             // A theme switch re-derives the tints, so the callback must close
             // over the new ones (the full-region repaint effect below then

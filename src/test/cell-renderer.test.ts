@@ -15,8 +15,8 @@ const rc = (raw: string, bold = false, italic = false): RenderedCell => ({
 // build_grid_cell simply returns each cell's own content.
 const row: (RenderedCell | null)[] = [rc('A', true), rc('B'), rc('C', false, true)];
 
-const cell = (col: number, show_formatting = true) =>
-    build_grid_cell(col, row, show_formatting);
+const cell = (col: number, show_formatting = true, soft_wrap = false) =>
+    build_grid_cell(col, row, show_formatting, undefined, undefined, soft_wrap);
 
 describe('font_style', () => {
     it('is undefined when neither bold nor italic', () => {
@@ -93,7 +93,7 @@ describe('build_grid_cell — plain cells', () => {
         // Deliberately more eager than Excel (which wraps only wrapText-styled
         // cells): a grown row must always reveal more content, so long
         // single-line values soft-wrap to the column width instead of clipping.
-        const c = build_grid_cell(1, row, true, undefined, undefined, true);
+        const c = cell(1, true, true);
         expect((c as { allowWrapping?: boolean }).allowWrapping).toBe(true);
     });
 

@@ -1,6 +1,6 @@
 import { GridCellKind, type GridCell } from './glide-data-grid';
 import type { RenderedCell } from '../data-source/interface';
-import { normalize_line_breaks } from './line-breaks';
+import { has_line_break, normalize_line_breaks } from './line-breaks';
 
 /**
  * Cell-content construction for the Glide grid. Pure (no canvas, no Glide
@@ -84,6 +84,13 @@ const BLANK: GridCell = {
     allowOverlay: false,
 };
 
+/** Shared rendering/measurement rule: hard breaks always wrap; otherwise only
+ * cells with enough effective vertical space take Glide's wrapping path. Put
+ * the known boolean first so tall cells skip the text scan on every draw. */
+export function cell_allows_wrapping(text: string, soft_wrap = false): boolean {
+    return soft_wrap || has_line_break(text);
+}
+
 function text_cell(
     c: RenderedCell,
     show_formatting: boolean,
@@ -126,7 +133,7 @@ function text_cell(
         // viewport churns every frame, so a default-height row — where wrapping
         // could only ever show one line anyway — keeps the cheap truncating
         // single-line path.
-        ...(display.includes('\n') || soft_wrap ? { allowWrapping: true } : {}),
+        ...(cell_allows_wrapping(display, soft_wrap) ? { allowWrapping: true } : {}),
         // Belt and braces with `allowOverlay: false`. Glide's paste path
         // (`pasteToCell` in data-editor.js) does not consult `allowOverlay` at all
         // — it gates on `isReadWriteCell`, which for a Text cell checks only
