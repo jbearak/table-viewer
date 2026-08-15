@@ -156,3 +156,20 @@ Delete or fold into a real design doc before the PR if stale.
   getBoundsForItem (two Map hits per pointer event — measured harmless,
   perf gate green); boundsFor closure churn in getBoundsForItem (mirrors
   upstream style, not a hot loop).
+
+## Stage 4 review decisions (recorded 2026-08-15)
+
+- Fixed: default (onPaste undefined) single-cell paste into a covered cell —
+  reachable via column/row selections whose first cell is covered — now
+  no-ops rather than editing the covered cell.
+- Fixed: a11y stand-in cell used Math.max(merge edge, window start), which
+  breaks when visibleCols is non-contiguous (frozen columns). Now the first
+  rendered cell of the merge (intersection of visibleCols/visibleRows with
+  the merge) represents it.
+- Added resolver isCovered(col,row); copy blanking and both paste paths use
+  it instead of hand-rolled anchor comparisons.
+- Not done (deliberate): folding merge blanking into
+  createBufferFromGridCells would push resolver knowledge into
+  copy-paste.ts (span blanking is per-cell data, merge blanking needs grid
+  coords); copies are user-triggered, so the extra map over the copied
+  range is not hot.

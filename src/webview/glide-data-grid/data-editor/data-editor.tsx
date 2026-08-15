@@ -3547,6 +3547,11 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
 
                 const [targetCol, targetRow] = target;
 
+                // Fork addition: covered merge cells are not editable —
+                // reachable here via column/row selections whose first cell
+                // is covered (current-cell selections always sit on anchors).
+                if (mergedCells?.isCovered(targetCol, targetRow) === true && onPaste === undefined) return;
+
                 const editList: EditListItem[] = [];
                 do {
                     if (onPaste === undefined) {
@@ -3582,6 +3587,10 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                             const [writeCol, writeRow] = index;
                             if (writeCol >= mangledCols.length) continue;
                             if (writeRow >= mangledRows) continue;
+                            // Fork addition: covered merge cells are not
+                            // editable — only the value landing on the
+                            // anchor position writes into a merge.
+                            if (mergedCells?.isCovered(writeCol, writeRow) === true) continue;
                             const cellData = getMangledCellContent(index);
                             const newVal = pasteToCell(cellData, index, dataItem.rawValue, dataItem.formatted);
                             if (newVal !== undefined) {
@@ -3613,6 +3622,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
             onPaste,
             rowMarkerOffset,
             rows,
+            mergedCells,
         ]
     );
 
@@ -3631,6 +3641,29 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
 
             const selectedColumns = gridSelection.columns;
             const selectedRows = gridSelection.rows;
+
+            // Fork addition: covered merge cells copy as blanks (the anchor
+            // keeps the content), matching how a spreadsheet pastes a merge.
+            // Each fetch below is a rectangle, so the origin maps cells back
+            // to grid coordinates.
+            const blankCoveredCells = (
+                cells: readonly (readonly GridCell[])[],
+                originCol: number,
+                originRow: number
+            ): readonly (readonly GridCell[])[] => {
+                if (mergedCells === undefined) return cells;
+                return cells.map((rowCells, r) =>
+                    rowCells.map((cell, c) => {
+                        if (!mergedCells.isCovered(originCol + c, originRow + r)) return cell;
+                        return {
+                            kind: GridCellKind.Text,
+                            data: "",
+                            displayData: "",
+                            allowOverlay: false,
+                        };
+                    })
+                );
+            };
 
             const copyToClipboardWithHeaders = (
                 cells: readonly (readonly GridCell[])[],
@@ -3656,7 +3689,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                         thunk = await thunk();
                     }
                     copyToClipboardWithHeaders(
-                        thunk,
+                        blankCoveredCells(thunk, gridSelection.current.range.x, gridSelection.current.range.y),
                         range(
                             gridSelection.current.range.x - rowMarkerOffset,
                             gridSelection.current.range.x + gridSelection.current.range.width - rowMarkerOffset
@@ -3679,11 +3712,13 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                         }
                         return thunk().then(v => v[0]);
                     });
+                    const blankRows = (settled: readonly (readonly GridCell[])[]) =>
+                        settled.map((rowCells, i) => blankCoveredCells([rowCells], rowMarkerOffset, toCopy[i])[0]);
                     if (cells.some(x => x instanceof Promise)) {
                         const settled = await Promise.all(cells);
-                        copyToClipboardWithHeaders(settled, range(columnsIn.length));
+                        copyToClipboardWithHeaders(blankRows(settled), range(columnsIn.length));
                     } else {
-                        copyToClipboardWithHeaders(cells as (readonly GridCell[])[], range(columnsIn.length));
+                        copyToClipboardWithHeaders(blankRows(cells as (readonly GridCell[])[]), range(columnsIn.length));
                     }
                 } else if (selectedColumns.length > 0) {
                     const results: (readonly (readonly GridCell[])[])[] = [];
@@ -3701,7 +3736,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                         if (typeof thunk !== "object") {
                             thunk = await thunk();
                         }
-                        results.push(thunk);
+                        results.push(blankCoveredCells(thunk, col, 0));
                         cols.push(col - rowMarkerOffset);
                     }
                     if (results.length === 1) {
@@ -3714,7 +3749,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                 }
             }
         },
-        [columnsIn, getCellsForSelection, gridSelection, keybindings.copy, rowMarkerOffset, rows, copyHeaders]
+        [columnsIn, getCellsForSelection, gridSelection, keybindings.copy, rowMarkerOffset, rows, copyHeaders, mergedCells]
     );
 
     useEventListener("copy", onCopy, safeWindow, false, false);
