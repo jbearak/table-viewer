@@ -17,6 +17,7 @@ import type {
 import type { CellSet } from "../cell-set.js";
 import type { EnqueueCallback } from "../use-animation-queue.js";
 import type { ImageWindowLoader } from "../image-window-loader-interface.js";
+import type { MergedCellResolver } from "../merged-cell-resolver.js";
 import type { GroupDetailsCallback, GetRowThemeCallback, Highlight } from "./data-grid-render.cells.js";
 
 export type HoverInfo = readonly [Item, Item];
@@ -78,4 +79,6 @@ export interface DrawGridArg {
     readonly renderStateProvider: RenderStateProvider;
     readonly getCellRenderer: GetCellRendererCallback;
     readonly minimumCellWidth: number;
+    /** Fork addition: merged-range resolver, undefined when the grid has no merges. */
+    readonly mergedCells: MergedCellResolver | undefined;
 }

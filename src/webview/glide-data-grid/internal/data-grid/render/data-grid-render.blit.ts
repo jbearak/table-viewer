@@ -250,7 +250,10 @@ export function computeCanBlit(current: DrawGridArg, last: DrawGridArg | undefin
         current.dragAndDropState !== last.dragAndDropState ||
         current.prelightCells !== last.prelightCells ||
         current.touchMode !== last.touchMode ||
-        current.maxScaleFactor !== last.maxScaleFactor
+        current.maxScaleFactor !== last.maxScaleFactor ||
+        // Fork addition: identity-stable via deep-memo at the editor layer, so
+        // this only breaks blitting when the merge set actually changes.
+        current.mergedCells !== last.mergedCells
     ) {
         return false;
     }

@@ -40,7 +40,8 @@ import {
     mergeAndRealizeTheme,
 } from "../common/styles.js";
 import type { DataGridRef } from "../internal/data-grid/data-grid.js";
-import { getScrollBarWidth, useEventListener, useStateWithReactiveInput, whenDefined } from "../common/utils.js";
+import { getScrollBarWidth, useDeepMemo, useEventListener, useStateWithReactiveInput, whenDefined } from "../common/utils.js";
+import { MergedCellResolver } from "../internal/data-grid/merged-cell-resolver.js";
 import {
     isGroupEqual,
     itemsAreEqual,
@@ -125,6 +126,7 @@ type Props = Partial<
         | "imageWindowLoader"
         | "lockColumns"
         | "maxColumnWidth"
+        | "mergedCells"
         | "minColumnWidth"
         | "nonGrowWidth"
         | "onCanvasBlur"
@@ -193,6 +195,15 @@ export interface DataEditorProps extends Props, Pick<DataGridSearchProps, "image
      * @group Editing
      */
     readonly onDelete?: (selection: GridSelection) => boolean | GridSelection;
+    /**
+     * Fork addition: merged cell ranges in cell coordinates (x = column,
+     * y = row, width = column span, height = row span). Each range renders as
+     * a single cell showing its anchor (top-left) cell's content. Ranges are
+     * deep-memoized internally, so a new array with equal contents does not
+     * defeat blitting. Overlapping and single-cell ranges are ignored.
+     * @group Data
+     */
+    readonly mergedRanges?: readonly Rectangle[];
     /** Emitted whenever a cell edit is completed.
      * @group Editing
      */
@@ -757,6 +768,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
         onColumnMoved,
         validateCell: validateCellIn,
         highlightRegions: highlightRegionsIn,
+        mergedRanges: mergedRangesIn,
         rangeSelect = "rect",
         columnSelect = "multi",
         rowSelect = "multi",
@@ -872,6 +884,17 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
             setShowSearchInner(false);
         }
     }, [onSearchCloseIn]);
+
+    // Fork addition: build the merged-range resolver in mangled (inner)
+    // coordinates. Deep-memo the ranges first so callers passing a fresh but
+    // content-equal array every render keep a stable resolver identity —
+    // computeCanBlit compares it by reference.
+    const mergedRanges = useDeepMemo(mergedRangesIn);
+    const mergedCells = React.useMemo(() => {
+        if (mergedRanges === undefined || mergedRanges.length === 0) return undefined;
+        const resolver = new MergedCellResolver(mergedRanges, rowMarkerOffset);
+        return resolver.isEmpty ? undefined : resolver;
+    }, [mergedRanges, rowMarkerOffset]);
 
     const gridSelectionOuterMangled: GridSelection | undefined = React.useMemo((): GridSelection | undefined => {
         return gridSelectionOuter === undefined ? undefined : shiftSelection(gridSelectionOuter, rowMarkerOffset);
@@ -3938,6 +3961,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                     showSearch={showSearch}
                     onSearchClose={onSearchClose}
                     highlightRegions={highlightRegions}
+                    mergedCells={mergedCells}
                     getCellsForSelection={getCellsForSelection}
                     getGroupDetails={mangledGetGroupDetails}
                     headerHeight={headerHeight}
