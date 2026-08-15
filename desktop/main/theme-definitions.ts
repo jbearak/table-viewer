@@ -182,7 +182,9 @@ const LIGHT: Record<string, string> = {
 // no distinct tone for a role, an in-family tone is reused rather than inventing
 // a color; the exceptions are the `accentHover` shades, which upstream themes
 // simply do not define and which are hand-darkened (light kinds) or
-// hand-lightened (dark kinds) from `accent`.
+// hand-lightened (dark kinds) from `accent` — and a few `hover` fills, hand-mixed
+// where upstream's hover tone equals a surface the fill must read against (the
+// `hover` invariant on SemanticPalette; the surfaces themselves stay faithful).
 
 /* Solarized — (c) 2011 Ethan Schoonover, MIT. base03..base3 + accents.
    Solarized has only a few surface tones by design, so `border`,
@@ -199,7 +201,9 @@ const SOLARIZED_LIGHT: SemanticPalette = {
     accentHover: '#1f74ad', // hand-darkened blue
     accentFg: '#fdf6e3',    // base3
     selection: '#ddd6c1',
-    hover: '#eee8d5',       // base2
+    // Upstream's hover is base2 = `bgAlt`, an invisible fill on the toolbar
+    // and popovers; hand-darkened below `bgElevated` so it reads on both.
+    hover: '#cdc5ae',
     link: '#268bd2',        // blue
     error: '#dc322f',       // red
     warning: '#b58900',     // yellow
@@ -218,7 +222,10 @@ const SOLARIZED_DARK: SemanticPalette = {
     accentHover: '#3fa0e0', // hand-lightened blue
     accentFg: '#fdf6e3',    // base3
     selection: '#005a6f',
-    hover: '#073642',       // base02
+    // Upstream's hover is base02 = `bgAlt`, an invisible fill on the toolbar
+    // and popovers; hand-lightened toward `selection` so it reads on both
+    // `bgAlt` and `bgElevated` while staying dimmer than a selected row.
+    hover: '#0e4756',
     link: '#268bd2',
     error: '#dc322f',
     warning: '#b58900',
@@ -241,7 +248,9 @@ const CATPPUCCIN_LATTE: SemanticPalette = {
     accentHover: '#1a56d0', // hand-darkened blue
     accentFg: '#eff1f5',    // base
     selection: '#acb0be',   // surface2
-    hover: '#ccd0da',       // surface0
+    // surface1, not surface0: surface0 is `bgElevated`, so secondary buttons
+    // would show no hover change (the `hover` invariant on SemanticPalette).
+    hover: '#bcc0cc',       // surface1
     link: '#1e66f5',        // blue
     error: '#d20f39',       // red
     warning: '#df8e1d',     // yellow
@@ -260,7 +269,9 @@ const CATPPUCCIN_FRAPPE: SemanticPalette = {
     accentHover: '#9fbaf2', // hand-lightened blue
     accentFg: '#232634',    // crust
     selection: '#626880',   // surface2
-    hover: '#414559',       // surface0
+    // surface1, not surface0: surface0 is `bgElevated`, so secondary buttons
+    // would show no hover change (the `hover` invariant on SemanticPalette).
+    hover: '#51576d',       // surface1
     link: '#8caaee',        // blue
     error: '#e78284',       // red
     warning: '#e5c890',     // yellow
@@ -279,7 +290,9 @@ const CATPPUCCIN_MACCHIATO: SemanticPalette = {
     accentHover: '#9dbcf7', // hand-lightened blue
     accentFg: '#181926',    // crust
     selection: '#5b6078',   // surface2
-    hover: '#363a4f',       // surface0
+    // surface1, not surface0: surface0 is `bgElevated`, so secondary buttons
+    // would show no hover change (the `hover` invariant on SemanticPalette).
+    hover: '#494d64',       // surface1
     link: '#8aadf4',        // blue
     error: '#ed8796',       // red
     warning: '#eed49f',     // yellow
@@ -298,7 +311,9 @@ const CATPPUCCIN_MOCHA: SemanticPalette = {
     accentHover: '#9dc0fb', // hand-lightened blue
     accentFg: '#11111b',    // crust
     selection: '#585b70',   // surface2
-    hover: '#313244',       // surface0
+    // surface1, not surface0: surface0 is `bgElevated`, so secondary buttons
+    // would show no hover change (the `hover` invariant on SemanticPalette).
+    hover: '#45475a',       // surface1
     link: '#89b4fa',        // blue
     error: '#f38ba8',       // red
     warning: '#f9e2af',     // yellow
@@ -364,7 +379,10 @@ const GRUVBOX_DARK_MEDIUM: SemanticPalette = {
     accentHover: '#9ab5a8', // hand-lightened bright_blue
     accentFg: '#1d2021',    // dark0_hard
     selection: '#665c54',   // dark3
-    hover: '#3c3836',       // dark1
+    // Hand-mixed dark1..dark2 midpoint: dark1 is `bgAlt` and dark2 is
+    // `bgElevated`, so either verbatim would be an invisible hover fill on
+    // one of the surfaces it paints over (the `hover` invariant).
+    hover: '#46403d',
     link: '#83a598',        // bright_blue
     error: '#fb4934',       // bright_red
     warning: '#fabd2f',     // bright_yellow
@@ -390,7 +408,10 @@ const GRUVBOX_LIGHT_MEDIUM: SemanticPalette = {
     accentHover: '#054f5d', // hand-darkened faded_blue
     accentFg: '#fbf1c7',    // light0
     selection: '#bdae93',   // light3
-    hover: '#ebdbb2',       // light1
+    // Hand-mixed light1..light2 midpoint: light1 is `bgAlt` and light2 is
+    // `bgElevated`, so either verbatim would be an invisible hover fill on
+    // one of the surfaces it paints over (the `hover` invariant).
+    hover: '#e0cfa9',
     link: '#076678',        // faded_blue
     error: '#9d0006',       // faded_red
     warning: '#b57614',     // faded_yellow

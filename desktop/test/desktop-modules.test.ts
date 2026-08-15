@@ -1128,6 +1128,32 @@ describe('theme', () => {
         expect(resolve_theme_id(slots, true)).toBe('synthwave-84');
     });
 
+    // A hover fill equal to the surface it paints over is a hover state that
+    // never shows — the ported Solarized/Gruvbox/Catppuccin palettes all
+    // shipped that way, because upstream reuses one tone for both roles.
+    // Pairs are (fill, surface) as styles.css actually stacks them:
+    //   list-hoverBackground fills toolbar toggles (on the tabs background)
+    //   and rows in popovers/menus (on the widget/menu backgrounds);
+    //   button-secondaryHoverBackground replaces button-secondaryBackground;
+    //   button-hoverBackground replaces button-background.
+    it('gives every hover fill a color distinct from the surface under it', () => {
+        const pairs: ReadonlyArray<readonly [string, string]> = [
+            ['--vscode-list-hoverBackground', '--vscode-editorGroupHeader-tabsBackground'],
+            ['--vscode-list-hoverBackground', '--vscode-editorHoverWidget-background'],
+            ['--vscode-list-hoverBackground', '--vscode-editorWidget-background'],
+            ['--vscode-list-hoverBackground', '--vscode-menu-background'],
+            ['--vscode-button-secondaryHoverBackground', '--vscode-button-secondaryBackground'],
+            ['--vscode-button-hoverBackground', '--vscode-button-background'],
+        ];
+        for (const id of THEME_IDS) {
+            const vars = theme_payload(id).variables;
+            for (const [fill, surface] of pairs) {
+                expect(vars[fill].toLowerCase(), `${id}: ${fill} is invisible on ${surface}`)
+                    .not.toBe(vars[surface].toLowerCase());
+            }
+        }
+    });
+
     it('never lets a theme override the app font', () => {
         // Fonts are an app-wide preference; every theme must carry the same ones.
         for (const id of THEME_IDS) {
