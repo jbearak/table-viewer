@@ -567,6 +567,10 @@ jobs:
             echo "ERROR: timed out waiting for Homebrew tests / test check" >&2
             exit 1
           }
+          # The immutable-SHA checkout does not create origin/main, but gh
+          # checks out the base branch while deleting the local PR branch.
+          git fetch --no-tags origin \
+            refs/heads/main:refs/remotes/origin/main
           gh pr merge "$BRANCH" --squash --delete-branch
 
       - name: Report Open VSX publication failure
