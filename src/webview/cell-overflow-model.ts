@@ -6,6 +6,7 @@
  * displayed value overflows the painted cell bounds. Keeping the overflow rule
  * here (no DOM) lets it unit-test without a canvas or Glide runtime.
  */
+import { has_line_break, split_lines } from './line-breaks';
 
 /** Mirrors Glide's default `cellHorizontalPadding`. */
 export const CELL_TOOLTIP_HORIZONTAL_PADDING_PX = 8;
@@ -54,8 +55,8 @@ export function text_overflows_cell(
     const available_width = Math.max(0, cell_width - padding * 2);
     if (available_width <= 0) return true;
 
-    const wrapping = options.wrapping ?? text.includes('\n');
-    const lines = text.split('\n');
+    const wrapping = options.wrapping ?? has_line_break(text);
+    const lines = split_lines(text);
     // Without wrapping Glide draws a single clipped line — any hard break or
     // wide line means content is not fully visible.
     if (!wrapping) {
@@ -80,7 +81,7 @@ export function text_overflows_cell(
     if (cell_height === undefined) {
         // No height budget: any wrap beyond a single visual line is truncated
         // in the default single-row cell, so treat multi-line layout as overflow.
-        return total_lines > 1 || measure(text.replace(/\n/g, ' ')) > available_width + 0.5;
+        return total_lines > 1 || measure(split_lines(text).join(' ')) > available_width + 0.5;
     }
 
     const line_height = options.line_height ?? CELL_TOOLTIP_LINE_HEIGHT_PX;

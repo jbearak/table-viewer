@@ -8,6 +8,7 @@
 import type { RenderedCell } from '../data-source/interface';
 import { font_shorthand } from './cell-renderer';
 import { MIN_COLUMN_WIDTH_PX } from './grid-model';
+import { split_lines } from './line-breaks';
 
 /** Smallest width a fitted column may take. Aliases the grid's clamp floor
  *  ({@link MIN_COLUMN_WIDTH_PX}) so the fit rule and manual-resize clamp share
@@ -54,8 +55,9 @@ export function fit_column_width(
     let max = 0;
     for (const cell of cells) {
         // XLSX text commonly uses CRLF while edits made in the webview use LF.
-        // Treat either (and a standalone CR) as the same hard visual break.
-        for (const line of cell.text.split(/\r\n?|\n/)) {
+        // Treat either (and a standalone CR) as the same hard visual break —
+        // the canonical rule every layout model shares (see line-breaks.ts).
+        for (const line of split_lines(cell.text)) {
             const w = measure({ ...cell, text: line });
             if (w > max) max = w;
         }

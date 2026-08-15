@@ -66,6 +66,26 @@ describe('fit_column_width', () => {
         expect(out).toBe('this line is widest'.length * 10 + COLUMN_PADDING);
     });
 
+    it('fits LF, CRLF, and bare CR breaks to the same width (#202)', () => {
+        const expected = fit_column_width(
+            [cell('short\nthe widest line here')],
+            fake_measure,
+        );
+        expect(expected).toBe('the widest line here'.length * 10 + COLUMN_PADDING);
+        expect(fit_column_width([cell('short\r\nthe widest line here')], fake_measure)).toBe(expected);
+        expect(fit_column_width([cell('short\rthe widest line here')], fake_measure)).toBe(expected);
+    });
+
+    it('never measures a CR as part of a visual line', () => {
+        // Both lines are 9 chars; a CR surviving the split would make the
+        // first measure 10 fake characters and inflate the fit.
+        const out = fit_column_width(
+            [cell('123456789\r\n987654321')],
+            fake_measure,
+        );
+        expect(out).toBe(9 * 10 + COLUMN_PADDING);
+    });
+
     it('measures bold cells at their heavier width', () => {
         // bold "abcd" → 40 + 50 = 90, beats plain "abcdef" → 60.
         const out = fit_column_width(

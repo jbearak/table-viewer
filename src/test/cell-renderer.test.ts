@@ -88,6 +88,29 @@ describe('build_grid_cell — plain cells', () => {
     it('does not enable wrapping for single-line content', () => {
         expect((cell(1) as { allowWrapping?: boolean }).allowWrapping).toBeUndefined();
     });
+
+    it('wraps and normalizes CRLF and bare CR displayed text, preserving raw data (#202)', () => {
+        // Glide's renderer and measurer split on `\n` only, so the displayed
+        // text is canonicalized to LF at this boundary; `data` keeps the source
+        // bytes so edits and copies do not silently rewrite the value.
+        for (const raw of ['a\r\nb', 'a\rb']) {
+            const c = build_grid_cell(0, [rc(raw)], true);
+            expect(c).toMatchObject({
+                data: raw,
+                displayData: 'a\nb',
+                allowWrapping: true,
+            });
+        }
+    });
+
+    it('normalizes a dirty overlay value for display without touching data', () => {
+        const c = build_grid_cell(0, [rc('x')], true, { dirty_value: 'a\rb' });
+        expect(c).toMatchObject({
+            data: 'a\rb',
+            displayData: 'a\nb',
+            allowWrapping: true,
+        });
+    });
 });
 
 describe('build_grid_cell — formatting toggle (raw vs formatted)', () => {

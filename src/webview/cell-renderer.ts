@@ -1,5 +1,6 @@
 import { GridCellKind, type GridCell } from './glide-data-grid';
 import type { RenderedCell } from '../data-source/interface';
+import { normalize_line_breaks } from './line-breaks';
 
 /**
  * Cell-content construction for the Glide grid. Pure (no canvas, no Glide
@@ -99,7 +100,16 @@ function text_cell(
     // The Formatting toggle switches the *displayed* text between the formatted
     // value (e.g. '3.14') and the raw underlying value (e.g. '3.14159'). `data`
     // always holds the raw value so editing and copy work off the source text.
-    const display = overlay?.dirty_value ?? (show_formatting ? c.formatted : (c.raw ?? ''));
+    //
+    // Only the displayed text has its line breaks normalized: Glide's renderer,
+    // wrapper, and column measurer split on `\n` alone, so a CRLF or bare CR
+    // (CHAR(13) / vbCr in Excel, either in CSV fields) would render and measure
+    // as one line while the app's fit/overflow/row-height models treat it as a
+    // break. Normalizing `data` too would silently rewrite the value on the
+    // next edit or copy.
+    const display = normalize_line_breaks(
+        overlay?.dirty_value ?? (show_formatting ? c.formatted : (c.raw ?? '')),
+    );
     return {
         kind: GridCellKind.Text,
         data: overlay?.dirty_value ?? (c.raw ?? ''),

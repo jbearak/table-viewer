@@ -85,6 +85,7 @@ import {
     clamp_tooltip_text,
     text_overflows_cell,
 } from './cell-overflow-model';
+import { count_lines, has_line_break } from './line-breaks';
 import { use_editing, type DirtyEntry } from './use-editing';
 import {
     create_edit_session_store,
@@ -1331,7 +1332,7 @@ export function GridShell({
         // true, and that claim is pinned by removing both. Kept because it is the cheaper
         // of the two and because it says what this affordance is for: hard line breaks, not
         // text length.
-        if (!text.includes('\n')) return false;
+        if (!has_line_break(text)) return false;
         // Clamped because this comparison is the loop guard. `lines * line_height +
         // padding` is unbounded in the number of hard newlines a cell holds, and the
         // height that gets stored is clamped — so an unclamped `needed` would stay
@@ -1639,7 +1640,7 @@ export function GridShell({
             if (!text) return;
 
             const flags = font_flags_for_cell(display_column, row);
-            const wrapping = text.includes('\n');
+            const wrapping = has_line_break(text);
             const overflows = text_overflows_cell(
                 text,
                 cell_bounds.width,
@@ -1661,7 +1662,7 @@ export function GridShell({
                 // re-centers once the real tooltip box is measured.
                 const estimated = {
                     width: Math.min(360, Math.max(80, clamped.length * 7)),
-                    height: 28 + (clamped.match(/\n/g)?.length ?? 0) * 16,
+                    height: 28 + (count_lines(clamped) - 1) * 16,
                 };
                 const pos = cell_tooltip_position(cell_bounds, estimated);
                 set_cell_tooltip({

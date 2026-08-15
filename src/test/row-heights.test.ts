@@ -98,6 +98,12 @@ describe('row-heights', () => {
             expect(natural_row_height('a\n', 18, 6)).toBe(2 * 18 + 6);
         });
 
+        it('grows identically for LF, CRLF, and bare CR breaks (#202)', () => {
+            expect(natural_row_height('a\r\nb', 18, 6)).toBe(2 * 18 + 6);
+            expect(natural_row_height('a\rb', 18, 6)).toBe(2 * 18 + 6);
+            expect(natural_row_height('a\rb\nc\r\nd', 18, 6)).toBe(4 * 18 + 6);
+        });
+
         it('honors custom line height and padding', () => {
             expect(natural_row_height('a\nb', 30, 10)).toBe(2 * 30 + 10);
         });

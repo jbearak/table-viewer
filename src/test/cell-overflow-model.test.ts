@@ -54,6 +54,29 @@ describe('text_overflows_cell', () => {
         })).toBe(false);
     });
 
+    it('treats LF, CRLF, and bare CR breaks identically (#202)', () => {
+        // Hard break without wrapping → overflow, whatever the break style.
+        for (const text of ['a\nb', 'a\r\nb', 'a\rb']) {
+            expect(text_overflows_cell(text, 200, measure, { wrapping: false })).toBe(true);
+        }
+        // Two short lines in a two-line-tall cell fit, whatever the break style.
+        for (const text of ['a\nb', 'a\r\nb', 'a\rb']) {
+            expect(text_overflows_cell(text, 200, measure, {
+                cell_height: CELL_TOOLTIP_LINE_HEIGHT_PX * 2 + CELL_TOOLTIP_HORIZONTAL_PADDING_PX,
+            })).toBe(false);
+        }
+    });
+
+    it('never measures a CR as part of a line', () => {
+        // Inner width exactly fits the one-character lines; a surviving CR
+        // would make the first CRLF line measure 2px and report a wrap.
+        const cell_width = CELL_TOOLTIP_HORIZONTAL_PADDING_PX * 2 + 1;
+        expect(text_overflows_cell('a\r\nb', cell_width, measure, {
+            wrapping: true,
+            cell_height: CELL_TOOLTIP_LINE_HEIGHT_PX * 2 + CELL_TOOLTIP_HORIZONTAL_PADDING_PX,
+        })).toBe(false);
+    });
+
     it('detects multi-line content that exceeds the default single-row height', () => {
         const cell_width = 200;
         const height = CELL_TOOLTIP_LINE_HEIGHT_PX + 4;
