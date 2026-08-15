@@ -18,6 +18,7 @@
     "shared/**/*",
     "test/**/*",
     "test-smoke/**/*",
+    "test-performance/**/*",
     "build-windows-portable-update-helper.d.mts",
     "after-pack.d.mts"
   ]

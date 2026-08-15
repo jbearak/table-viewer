@@ -205,6 +205,8 @@
     "desktop:package:win": "npm run desktop:prepackage && node scripts/package-desktop-windows.mjs",
     "test:desktop-smoke": "npm run desktop:prepackage && playwright test --config=desktop/test-smoke/playwright.config.ts",
     "test:desktop-smoke:relaunch": "npm run desktop:prepackage && playwright test --config=desktop/test-smoke/playwright.config.ts desktop/test-smoke/state-relaunch.spec.ts",
+    "test:desktop-perf": "npm run desktop:prepackage && playwright test --config=desktop/test-performance/playwright.config.ts",
+    "perf:compare": "node benchmarks/grid/compare.mjs",
     "watch": "tsc -watch -p ./",
     "package": "vsce package --no-dependencies"
   },
