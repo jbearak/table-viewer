@@ -2878,6 +2878,43 @@ export function App(): React.JSX.Element {
         );
     }, [meta, update_show_formatting]);
 
+    /**
+     * Whether a header request would race a display projection.
+     *
+     * Every transform install can advance the workbook generation, including one
+     * on a sibling sheet. A row promotion has the additional requirement that its
+     * target sheet's durable rules are installed: `headerRow` is display-keyed, so
+     * sending it against the natural view while a hidden-row restore is still owed
+     * names a different source row at the host.
+     */
+    const header_waits_for_transform = useCallback((
+        target_sheet_index: number,
+        display_keyed: boolean,
+    ) => {
+        if (
+            pending_transform_request_ids_ref.current.some(Boolean)
+            || pending_transforms.some(Boolean)
+        ) return true;
+        if (!display_keyed) return false;
+        const sheet = meta?.sheets[target_sheet_index];
+        if (!sheet) return false;
+        const installed = sheet_views[target_sheet_index];
+        const installed_rules = installed?.permuted
+            ? installed.rules
+            : undefined;
+        if (
+            (installed_rules?.sort.length ?? 0) > 0
+            || installed_rules?.filters.some((filter) => filter.enabled)
+        ) return true;
+        const durable = sanitize_transform_state(
+            state_ref.current.transforms?.[target_sheet_index],
+            sheet.columnCount,
+            transform_schema_for_sheet(sheet),
+            sheet.sourceRowCount,
+        );
+        return transform_reconciliation_required(durable, installed);
+    }, [meta, pending_transforms, sheet_views, transforms]);
+
     const request_excel_header = useCallback((
         enabled: boolean,
         unhide_all = false,
@@ -2895,12 +2932,16 @@ export function App(): React.JSX.Element {
         // command reaches the host, invalidating the generation it was posted with.
         // Keep this guard at the shared command boundary as well as disabling each
         // visible affordance, so a stale callback or a queue cannot bypass it.
+        if (!sheet || !header) return 'skip';
         if (
-            !sheet
-            || !header
+            edit_mode
             || edit_mode_ref.current
             || pending_excel_header_ref.current
-        ) return;
+            || header_waits_for_transform(
+                target_sheet_index,
+                header_row !== undefined,
+            )
+        ) return 'wait';
         const request_id = `header:${excel_header_request_prefix_ref.current}:${
             ++excel_header_request_seq_ref.current
         }`;
@@ -2926,7 +2967,8 @@ export function App(): React.JSX.Element {
             generation: generation_ref.current,
             sourceGeneration: source_generation_ref.current,
         });
-    }, [active_sheet_index, meta]);
+        return 'posted';
+    }, [active_sheet_index, edit_mode, header_waits_for_transform, meta]);
 
     const handle_toggle_excel_header = useCallback(() => {
         const header = meta?.sheets[active_sheet_index]?.excelFirstRowHeader;
@@ -2950,13 +2992,23 @@ export function App(): React.JSX.Element {
         if (!excel_header_queue || pending_excel_header !== null) return;
         const [next_sheet, ...rest] = excel_header_queue.sheets;
         if (next_sheet === undefined) return set_excel_header_queue(null);
-        set_excel_header_queue({ ...excel_header_queue, sheets: rest });
-        request_excel_header(excel_header_queue.enabled, false, undefined, next_sheet);
+        const result = request_excel_header(
+            excel_header_queue.enabled,
+            false,
+            undefined,
+            next_sheet,
+        );
+        if (result !== 'wait') {
+            set_excel_header_queue({ ...excel_header_queue, sheets: rest });
+        }
     }, [excel_header_queue, pending_excel_header, request_excel_header]);
 
     /** Queue every sheet that is not already in `enabled`, for the chevron menu. */
     const set_excel_header_all_sheets = useCallback((enabled: boolean) => {
-        if (edit_mode_ref.current) return;
+        if (
+            edit_mode_ref.current
+            || header_waits_for_transform(active_sheet_index, false)
+        ) return;
         const sheets = (meta?.sheets ?? [])
             .map((sheet, index) => ({ sheet, index }))
             .filter(({ sheet }) => {
@@ -2966,11 +3018,11 @@ export function App(): React.JSX.Element {
             })
             .map(({ index }) => index);
         if (sheets.length > 0) set_excel_header_queue({ enabled, sheets });
-    }, [meta]);
+    }, [active_sheet_index, header_waits_for_transform, meta]);
 
     const handle_promote_row_to_header = useCallback((display_row: number) => {
         request_excel_header(true, false, display_row);
-    }, [request_excel_header]);
+    }, [active_sheet_index, request_excel_header]);
 
     const handle_toggle_edit_mode = useCallback(() => {
         const entering = !edit_mode;
@@ -4127,6 +4179,7 @@ export function App(): React.JSX.Element {
                 {
                     label: `Use first row as header on ${all_sheets}`,
                     disabled: edit_mode_on_active_sheet
+                        || pending_transforms.some(Boolean)
                         || header_capable_sheets.every((sheet) =>
                             sheet.excelFirstRowHeader!.mode === 'on'
                             || sheet.excelFirstRowHeader!.active),
@@ -4135,6 +4188,7 @@ export function App(): React.JSX.Element {
                 {
                     label: `Show first row as data on ${all_sheets}`,
                     disabled: edit_mode_on_active_sheet
+                        || pending_transforms.some(Boolean)
                         || header_capable_sheets.every((sheet) =>
                             !(sheet.excelFirstRowHeader!.mode === 'on'
                                 || sheet.excelFirstRowHeader!.active)),
@@ -4517,7 +4571,8 @@ export function App(): React.JSX.Element {
             on_hide_columns={handle_hide_columns}
             on_hide_rows={handle_hide_rows}
             can_promote_row_to_header={
-                excel_header !== undefined && !edit_mode_on_active_sheet
+                excel_header !== undefined && !excel_header_disabled
+                    && !header_waits_for_transform(active_sheet_index, true)
             }
             on_promote_row_to_header={handle_promote_row_to_header}
             on_focus_columns={focus_columns_trigger}
