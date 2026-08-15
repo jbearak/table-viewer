@@ -49,7 +49,7 @@ import {
     headerKind,
     mouseEventArgsAreEqual,
 } from "./event-args.js";
-import { pointInRect } from "../../common/math.js";
+import { combineRects, pointInRect } from "../../common/math.js";
 import {
     type GroupDetailsCallback,
     type GetRowThemeCallback,
@@ -438,23 +438,40 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
 
             const scale = rect.width / width;
 
-            const result = computeBounds(
-                col,
-                row,
-                width,
-                height,
-                groupHeaderHeight,
-                totalHeaderHeight,
-                cellXOffset,
-                cellYOffset,
-                translateX,
-                translateY,
-                rows,
-                freezeColumns,
-                freezeTrailingRows,
-                mappedColumns,
-                rowHeight
-            );
+            const boundsFor = (c: number, r: number): Rectangle =>
+                computeBounds(
+                    c,
+                    r,
+                    width,
+                    height,
+                    groupHeaderHeight,
+                    totalHeaderHeight,
+                    cellXOffset,
+                    cellYOffset,
+                    translateX,
+                    translateY,
+                    rows,
+                    freezeColumns,
+                    freezeTrailingRows,
+                    mappedColumns,
+                    rowHeight
+                );
+
+            let result: Rectangle;
+            // Fork addition: any cell of a merge reports the union rect of
+            // the whole merge — the overlay editor, fill handle, and a11y
+            // focus all consume these bounds. The resolver never contains
+            // merges crossing a freeze boundary, so the anchor and last cell
+            // always live in the same pane and their union is the merge.
+            const mergeRange = row >= 0 ? mergedCells?.getRange(col, row) : undefined;
+            if (mergeRange === undefined) {
+                result = boundsFor(col, row);
+            } else {
+                result = combineRects(
+                    boundsFor(mergeRange.x, mergeRange.y),
+                    boundsFor(mergeRange.x + mergeRange.width - 1, mergeRange.y + mergeRange.height - 1)
+                );
+            }
 
             if (scale !== 1) {
                 result.x *= scale;
@@ -482,6 +499,7 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
             freezeTrailingRows,
             mappedColumns,
             rowHeight,
+            mergedCells,
         ]
     );
 
@@ -614,7 +632,13 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
                     };
                 }
             } else {
-                const bounds = getBoundsForItem(canvas, col, row);
+                // Fork addition: a hit anywhere inside a merge reports the
+                // anchor's coordinates (and, via getBoundsForItem, the full
+                // merged bounds), so every consumer sees the merge as one
+                // cell. The resolver never contains merges in frozen
+                // trailing rows or crossing the frozen-column boundary.
+                const [cellCol, cellRow] = mergedCells?.anchorOf(col, row) ?? [col, row];
+                const bounds = getBoundsForItem(canvas, cellCol, cellRow);
                 assert(bounds !== undefined);
                 const isEdge = bounds !== undefined && bounds.x + bounds.width - posX < edgeDetectionBuffer;
 
@@ -636,7 +660,7 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
 
                 result = {
                     kind: "cell",
-                    location: [col, row],
+                    location: [cellCol, cellRow],
                     bounds: bounds,
                     isEdge,
                     shiftKey,
@@ -671,6 +695,7 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
             fillHandle,
             selection,
             totalHeaderHeight,
+            mergedCells,
         ]
     );
 
