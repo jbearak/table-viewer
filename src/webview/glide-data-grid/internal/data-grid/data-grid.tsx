@@ -38,6 +38,7 @@ import { assert } from "../../common/support.js";
 import type { CellRenderer, GetCellRendererCallback } from "../../cells/cell-types.js";
 import type { DrawGridArg } from "./render/draw-grid-arg.js";
 import type { ImageWindowLoader } from "./image-window-loader-interface.js";
+import type { MergedCellResolver } from "./merged-cell-resolver.js";
 import {
     type GridMouseEventArgs,
     type GridKeyEventArgs,
@@ -127,6 +128,13 @@ export interface DataGridProps {
 
     readonly selection: GridSelection;
     readonly prelightCells: readonly Item[] | undefined;
+    /**
+     * Fork addition: resolver for merged cell ranges (2D merges). Undefined
+     * when the grid has no merges; must be identity-stable across renders
+     * (deep-memo at the DataEditor layer) or blitting is defeated.
+     * @group Data
+     */
+    readonly mergedCells: MergedCellResolver | undefined;
     /**
      * Highlight regions provide hints to users about relations between cells and selections.
      * @group Selection
@@ -369,6 +377,7 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
         smoothScrollY = false,
         experimental,
         getCellRenderer,
+        mergedCells,
     } = p;
     const translateX = p.translateX ?? 0;
     const translateY = p.translateY ?? 0;
@@ -785,6 +794,7 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
             renderStrategy: experimental?.renderStrategy ?? (browserIsSafari.value ? "double-buffer" : "single-buffer"),
             getCellRenderer,
             minimumCellWidth,
+            mergedCells,
         };
 
         // This confusing bit of code due to some poor design. Long story short, the damage property is only used
@@ -850,6 +860,7 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
         renderStateProvider,
         getCellRenderer,
         minimumCellWidth,
+        mergedCells,
     ]);
 
     const lastDrawRef = React.useRef(draw);
@@ -868,11 +879,18 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
         void fn();
     }, []);
 
-    const damageInternal = React.useCallback((locations: CellSet) => {
-        damageRegion.current = locations;
-        lastDrawRef.current();
-        damageRegion.current = undefined;
-    }, []);
+    // Fork addition: damaging any cell of a merge must repaint the whole
+    // merge (the anchor's content spans the covered cells). Consumers track
+    // the latest callback (useAnimationQueue via ref, imageLoader via
+    // setCallback each render), so identity may change with the resolver.
+    const damageInternal = React.useCallback(
+        (locations: CellSet) => {
+            damageRegion.current = mergedCells?.expandDamage(locations) ?? locations;
+            lastDrawRef.current();
+            damageRegion.current = undefined;
+        },
+        [mergedCells]
+    );
 
     const enqueue = useAnimationQueue(damageInternal);
     enqueueRef.current = enqueue;

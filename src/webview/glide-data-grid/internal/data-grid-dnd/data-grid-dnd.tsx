@@ -402,6 +402,7 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
             onKeyDown={p.onKeyDown}
             onKeyUp={p.onKeyUp}
             onMouseMove={p.onMouseMove}
+            mergedCells={p.mergedCells}
             prelightCells={p.prelightCells}
             rowHeight={p.rowHeight}
             rows={p.rows}

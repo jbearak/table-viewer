@@ -12,6 +12,7 @@ const basicProps: DataGridProps = {
     cellXOffset: 0,
     cellYOffset: 0,
     headerIcons: undefined,
+    mergedCells: undefined,
     isDraggable: undefined,
     onCanvasBlur: () => undefined,
     onCanvasFocused: () => undefined,

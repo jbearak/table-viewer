@@ -32,6 +32,7 @@ import type { RenderStateProvider } from "../../../common/render-state-provider.
 import type { ImageWindowLoader } from "../image-window-loader-interface.js";
 import { intersectRect } from "../../../common/math.js";
 import type { GridMouseGroupHeaderEventArgs } from "../event-args.js";
+import type { MergedCellResolver } from "../merged-cell-resolver.js";
 import { getSkipPoint, getSpanBounds, walkColumns, walkRowsInCol } from "./data-grid-render.walk.js";
 
 const loadingCell: InnerGridCell = {
@@ -107,7 +108,8 @@ export function drawCells(
     renderStateProvider: RenderStateProvider,
     getCellRenderer: GetCellRendererCallback,
     overrideCursor: (cursor: React.CSSProperties["cursor"]) => void,
-    minimumCellWidth: number
+    minimumCellWidth: number,
+    mergedCells: MergedCellResolver | undefined
 ): Rectangle[] | undefined {
     let toDraw = damage?.size ?? Number.MAX_SAFE_INTEGER;
     const frameTime = performance.now();
@@ -119,6 +121,32 @@ export function drawCells(
         freezeTrailingRows > 0 ? getFreezeTrailingHeight(rows, freezeTrailingRows, getRowHeight) : 0;
     let result: Rectangle[] | undefined;
     let handledSpans: Set<string> | undefined = undefined;
+    // Merged ranges dedup by the resolver's stable Rectangle identity — no
+    // per-cell string keys in the hot loop. Sticky and scrollable panes draw
+    // separately, so each gets its own set.
+    let handledMerges: Set<Rectangle> | undefined = undefined;
+    let handledStickyMerges: Set<Rectangle> | undefined = undefined;
+
+    // Shared between the merge and span branches: clip the canvas to the
+    // multi-cell area and record it as a painted region.
+    const beginMultiCellClip = (area: Rectangle, clipX: number, clipTop: number, clipHIn: number): void => {
+        ctx.restore();
+        ctx.save();
+        ctx.beginPath();
+        const d = Math.max(0, clipX - area.x);
+        const clipH = Math.max(0, clipHIn);
+        ctx.rect(area.x + d, clipTop, area.width - d, clipH);
+        if (result === undefined) {
+            result = [];
+        }
+        result.push({
+            x: area.x + d,
+            y: clipTop,
+            width: area.width - d,
+            height: clipH,
+        });
+        ctx.clip();
+    };
 
     const skipPoint = getSkipPoint(drawRegions);
 
@@ -214,16 +242,89 @@ export function drawCells(
                         if (!found) return;
                     }
 
-                    const rowSelected = selection.rows.hasIndex(row);
-                    const rowDisabled = disabledRows.hasIndex(row);
-
-                    const cell: InnerGridCell = row < rows ? getCellContent(cellIndex) : loadingCell;
-
                     let cellX = drawX;
                     let cellWidth = c.width;
+                    let cellY = drawY;
+                    let cellHeight = rh;
                     let drawingSpan = false;
                     let skipContents = false;
-                    if (cell.span !== undefined) {
+
+                    // Fork addition: merged ranges. A merge draws once per
+                    // frame (dedup like spans below) at its full 2D bounds
+                    // using the anchor's content; every other cell of the
+                    // merge is skipped. Redirect cellIndex to the anchor so
+                    // content, selection, and hover all read the anchor.
+                    // Sticky (freeze-trailing) rows draw bottom-anchored, so
+                    // merges are not resolved there.
+                    const mergeRange =
+                        mergedCells === undefined || isSticky || isTrailingRow
+                            ? undefined
+                            : mergedCells.getRange(c.sourceIndex, row);
+                    if (mergeRange !== undefined) {
+                        let handled = c.sticky ? handledStickyMerges : handledMerges;
+                        if (handled?.has(mergeRange) === true) {
+                            toDraw--;
+                            return;
+                        }
+                        if (handled === undefined) {
+                            handled = new Set();
+                            if (c.sticky) handledStickyMerges = handled;
+                            else handledMerges = handled;
+                        }
+                        // Walk the merge's rows once, summing its height and
+                        // backing drawY up to the anchor row (which may sit
+                        // above the viewport).
+                        let mergeY = drawY;
+                        let mergeH = 0;
+                        for (let r = mergeRange.y; r < mergeRange.y + mergeRange.height; r++) {
+                            const rowH = getRowHeight(r);
+                            mergeH += rowH;
+                            if (r < row) mergeY -= rowH;
+                        }
+                        let area: Rectangle | undefined;
+                        if (mergeRange.width === 1) {
+                            // Single-column (vertical) merge: the bounds are
+                            // this column's. getSpanBounds cannot express a
+                            // one-column span sitting exactly on the first
+                            // non-sticky column, so compute directly.
+                            area = { x: drawX, y: mergeY, width: c.width, height: mergeH }; //alloc
+                        } else {
+                            const mergeSpan: Item = [mergeRange.x, mergeRange.x + mergeRange.width - 1]; //alloc
+                            const areas = getSpanBounds(mergeSpan, drawX, mergeY, c.width, mergeH, c, allColumns);
+                            area = c.sticky ? areas[0] : areas[1];
+                            if (!c.sticky && areas[0] !== undefined) {
+                                skipContents = true;
+                            }
+                        }
+                        if (area !== undefined) {
+                            cellX = area.x;
+                            cellWidth = area.width;
+                            handled.add(mergeRange);
+                            prepResult = undefined;
+                            // Clip stays inside the column viewport: a merge
+                            // whose anchor is scrolled off-screen never paints
+                            // over the header, and a merge reaching into the
+                            // freeze-trailing band stops at the band (the
+                            // sticky rows draw their own cells over it).
+                            const clipTop = Math.max(area.y, colDrawY);
+                            const clipBottom = Math.min(area.y + area.height, height - freezeTrailingRowsHeight);
+                            beginMultiCellClip(area, clipX, clipTop, clipBottom - clipTop);
+                            drawingSpan = true;
+                            cellY = area.y;
+                            cellHeight = area.height;
+                        }
+                        cellIndex[0] = mergeRange.x;
+                        cellIndex[1] = mergeRange.y;
+                    }
+                    const drawCol = cellIndex[0];
+                    const drawRow = cellIndex[1];
+
+                    const rowSelected = selection.rows.hasIndex(drawRow);
+                    const rowDisabled = disabledRows.hasIndex(drawRow);
+
+                    const cell: InnerGridCell = drawRow < rows ? getCellContent(cellIndex) : loadingCell;
+
+                    if (mergeRange === undefined && cell.span !== undefined) {
                         const [startCol, endCol] = cell.span;
                         const spanKey = `${row},${startCol},${endCol},${c.sticky}`; //alloc
                         if (handledSpans === undefined) handledSpans = new Set();
@@ -237,22 +338,8 @@ export function drawCells(
                                 cellX = area.x;
                                 cellWidth = area.width;
                                 handledSpans.add(spanKey);
-                                ctx.restore();
                                 prepResult = undefined;
-                                ctx.save();
-                                ctx.beginPath();
-                                const d = Math.max(0, clipX - area.x);
-                                ctx.rect(area.x + d, drawY, area.width - d, rh);
-                                if (result === undefined) {
-                                    result = [];
-                                }
-                                result.push({
-                                    x: area.x + d,
-                                    y: drawY,
-                                    width: area.width - d,
-                                    height: rh,
-                                });
-                                ctx.clip();
+                                beginMultiCellClip(area, clipX, drawY, rh);
                                 drawingSpan = true;
                             }
                         } else {
@@ -261,7 +348,7 @@ export function drawCells(
                         }
                     }
 
-                    const rowTheme = getRowThemeOverride?.(row);
+                    const rowTheme = getRowThemeOverride?.(drawRow);
                     const trailingTheme =
                         isTrailingRow && c.trailingRowOptions?.themeOverride !== undefined
                             ? c.trailingRowOptions?.themeOverride
@@ -308,7 +395,7 @@ export function drawCells(
                         }
                     } else if (prelightCells !== undefined) {
                         for (const pre of prelightCells) {
-                            if (pre[0] === c.sourceIndex && pre[1] === row) {
+                            if (pre[0] === drawCol && pre[1] === drawRow) {
                                 fill = blend(theme.bgSearchResult, fill);
                                 break;
                             }
@@ -321,10 +408,10 @@ export function drawCells(
                             const r = region.range;
                             if (
                                 region.style !== "solid-outline" &&
-                                r.x <= c.sourceIndex &&
-                                c.sourceIndex < r.x + r.width &&
-                                r.y <= row &&
-                                row < r.y + r.height
+                                r.x <= drawCol &&
+                                drawCol < r.x + r.width &&
+                                r.y <= drawRow &&
+                                drawRow < r.y + r.height
                             ) {
                                 fill = blend(region.color, fill);
                             }
@@ -336,15 +423,15 @@ export function drawCells(
                         // we want to clip each cell individually rather than form a super clip region. The reason for
                         // this is passing too many clip regions to the GPU at once can cause a performance hit. This
                         // allows us to damage a large number of cells at once without issue.
-                        const top = drawY + 1;
+                        const top = cellY + 1;
                         const bottom = isSticky
-                            ? top + rh - 1
-                            : Math.min(top + rh - 1, height - freezeTrailingRowsHeight);
+                            ? top + cellHeight - 1
+                            : Math.min(top + cellHeight - 1, height - freezeTrailingRowsHeight);
                         const h = bottom - top;
 
                         // however, not clipping at all is even better. We want to clip if we are the left most col
                         // or overlapping the bottom clip area.
-                        if (h !== rh - 1 || cellX + 1 <= clipX) {
+                        if (h !== cellHeight - 1 || cellX + 1 <= clipX) {
                             didDamageClip = true;
                             ctx.save();
                             ctx.beginPath();
@@ -369,12 +456,12 @@ export function drawCells(
                             // because technically the bottom right corner of the outline are on other cells.
                             ctx.fillRect(
                                 cellX + 1,
-                                drawY + 1,
+                                cellY + 1,
                                 cellWidth - (isLastColumn ? 2 : 1),
-                                rh - (isLastRow ? 2 : 1)
+                                cellHeight - (isLastRow ? 2 : 1)
                             );
                         } else {
-                            ctx.fillRect(cellX, drawY, cellWidth, rh);
+                            ctx.fillRect(cellX, cellY, cellWidth, cellHeight);
                         }
                     }
 
@@ -385,7 +472,7 @@ export function drawCells(
                     let hoverValue: HoverValues[number] | undefined;
                     for (let i = 0; i < hoverValues.length; i++) {
                         const hv = hoverValues[i];
-                        if (hv.item[0] === c.sourceIndex && hv.item[1] === row) {
+                        if (hv.item[0] === drawCol && hv.item[1] === drawRow) {
                             hoverValue = hv;
                             break;
                         }
@@ -400,14 +487,14 @@ export function drawCells(
                         prepResult = drawCell(
                             ctx,
                             cell,
-                            c.sourceIndex,
-                            row,
+                            drawCol,
+                            drawRow,
                             isLastColumn,
                             isLastRow,
                             cellX,
-                            drawY,
+                            cellY,
                             cellWidth,
-                            rh,
+                            cellHeight,
                             accentCount > 0,
                             theme,
                             fill ?? theme.bgCell,

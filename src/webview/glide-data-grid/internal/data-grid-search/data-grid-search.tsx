@@ -497,6 +497,7 @@ const DataGridSearch: React.FunctionComponent<DataGridSearchProps> = p => {
                 lockColumns={p.lockColumns}
                 maxColumnWidth={p.maxColumnWidth}
                 minColumnWidth={p.minColumnWidth}
+                mergedCells={p.mergedCells}
                 onHeaderMenuClick={p.onHeaderMenuClick}
                 onMouseMove={p.onMouseMove}
                 onVisibleRegionChanged={p.onVisibleRegionChanged}
