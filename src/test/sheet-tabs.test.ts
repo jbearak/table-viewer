@@ -1,5 +1,7 @@
 // @vitest-environment jsdom
 
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -30,7 +32,7 @@ function render_tabs(vertical: boolean, sheets = ['One', 'Two', 'Three']) {
     container = document.createElement('div');
     document.body.appendChild(container);
     root = createRoot(container);
-    act(() => root!.render(React.createElement(SheetTabs, {
+    const props: React.ComponentProps<typeof SheetTabs> = {
         sheets,
         active_sheet_index: 0,
         on_select,
@@ -38,8 +40,20 @@ function render_tabs(vertical: boolean, sheets = ['One', 'Two', 'Three']) {
         on_strip_context_menu,
         on_toggle_orientation,
         vertical,
-    })));
-    return { on_select, on_context_menu, on_strip_context_menu, on_toggle_orientation };
+    };
+    act(() => root!.render(React.createElement(SheetTabs, props)));
+    return {
+        on_select,
+        on_context_menu,
+        on_strip_context_menu,
+        on_toggle_orientation,
+        rerender(next_vertical: boolean) {
+            act(() => root!.render(React.createElement(SheetTabs, {
+                ...props,
+                vertical: next_vertical,
+            })));
+        },
+    };
 }
 
 function tabs(): HTMLButtonElement[] {
@@ -93,6 +107,30 @@ describe('SheetTabs', () => {
         expect(on_context_menu).toHaveBeenCalledWith(0, 5, 6);
     });
 
+    it('uses one intrinsic-width track for all vertically scrolling tab chrome', () => {
+        render_tabs(true, ['Short', 'Database Field Descriptions']);
+        const track = document.querySelector('.sheet-tabs-vertical-track');
+        expect(track).not.toBeNull();
+        expect(Array.from(track!.children)).toEqual([
+            ...tabs(),
+            orientation_button(),
+        ]);
+
+        // jsdom does not calculate intrinsic/flex layout, so assert the rule that
+        // makes the longest label set a shared width while preserving a full-width
+        // rail when all names are short.
+        const css = readFileSync(
+            resolve(process.cwd(), 'src/webview/styles.css'),
+            'utf8',
+        );
+        const rule = /\.sheet-tabs-vertical-track\s*\{([^}]*)\}/.exec(css)?.[1];
+        expect(rule).toBeDefined();
+        expect(rule).toMatch(/display:\s*flex/);
+        expect(rule).toMatch(/flex-direction:\s*column/);
+        expect(rule).toMatch(/width:\s*max-content/);
+        expect(rule).toMatch(/min-width:\s*100%/);
+    });
+
     it('toggles orientation from a control on the strip itself', () => {
         const { on_toggle_orientation, on_select } = render_tabs(false);
         act(() => orientation_button()!.dispatchEvent(
@@ -100,6 +138,20 @@ describe('SheetTabs', () => {
         ));
         expect(on_toggle_orientation).toHaveBeenCalledOnce();
         expect(on_select).not.toHaveBeenCalled();
+    });
+
+    it('keeps focus on the orientation control when its layout changes', () => {
+        const { rerender } = render_tabs(false);
+        const button = orientation_button()!;
+        button.focus();
+
+        rerender(true);
+        expect(orientation_button()).toBe(button);
+        expect(document.activeElement).toBe(button);
+
+        rerender(false);
+        expect(orientation_button()).toBe(button);
+        expect(document.activeElement).toBe(button);
     });
 
     it('names the destination rather than the current state', () => {
@@ -137,6 +189,21 @@ describe('SheetTabs', () => {
         expect(event.defaultPrevented).toBe(true);
         expect(on_strip_context_menu).toHaveBeenCalledWith(300, 12);
         // A click on the background names no sheet, so the per-sheet handler stays out.
+        expect(on_context_menu).not.toHaveBeenCalled();
+    });
+
+    it('offers sheet actions for empty space on the vertical track', () => {
+        const { on_strip_context_menu, on_context_menu } = render_tabs(true);
+        const track = document.querySelector('.sheet-tabs-vertical-track')!;
+        const event = new MouseEvent('contextmenu', {
+            bubbles: true,
+            cancelable: true,
+            clientX: 40,
+            clientY: 120,
+        });
+        act(() => track.dispatchEvent(event));
+        expect(event.defaultPrevented).toBe(true);
+        expect(on_strip_context_menu).toHaveBeenCalledWith(40, 120);
         expect(on_context_menu).not.toHaveBeenCalled();
     });
 

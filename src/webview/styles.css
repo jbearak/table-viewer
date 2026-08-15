@@ -515,6 +515,13 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     overflow-x: auto;
 }
 
+/* Keep one wrapper mounted as the strip changes orientation so its focused control
+   is not reparented. Horizontally it contributes no box, preserving the tabs' direct
+   participation in the strip's flex layout. */
+.sheet-tabs-horizontal-track {
+    display: contents;
+}
+
 .sheet-tab {
     padding: 6px 14px;
     border-right: 1px solid var(--vscode-panel-border, #444);
@@ -542,14 +549,23 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
 }
 
 .sheet-tabs-vertical {
-    display: flex;
-    flex-direction: column;
     border-right: 1px solid var(--vscode-panel-border, #444);
     background: var(--vscode-editorGroupHeader-tabsBackground, #252526);
-    overflow-y: auto;
+    overflow: auto;
     flex-shrink: 0;
     min-width: 100px;
     max-width: 200px;
+}
+
+/* The rail is capped at 200px, but a worksheet name may be wider. One shared
+   max-content track makes every tab span that overflow width, so its background and
+   bottom border continue behind the label when the rail is scrolled horizontally. */
+.sheet-tabs-vertical-track {
+    display: flex;
+    flex-direction: column;
+    width: max-content;
+    min-width: 100%;
+    min-height: 100%;
 }
 
 .sheet-tabs-vertical .sheet-tab {

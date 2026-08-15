@@ -37,17 +37,21 @@ export function SheetTabs({
         ? 'sheet-tabs-vertical'
         : 'sheet-tabs-horizontal';
 
-    return (
-        <div
-            className={class_name}
-            onContextMenu={(event) => {
-                // Only a right-click on the strip's own background. A click on a tab
-                // is handled by the tab, and its handler stops here.
-                if (event.target !== event.currentTarget) return;
-                event.preventDefault();
-                on_strip_context_menu(event.clientX, event.clientY);
-            }}
-        >
+    const handle_strip_context_menu = (event: React.MouseEvent<HTMLDivElement>) => {
+        // In the vertical arrangement the intrinsic-width track fills the strip's
+        // background. Treat its empty space as strip space, while leaving tabs and
+        // the orientation control to handle (or ignore) their own context menus.
+        if (
+            event.target !== event.currentTarget
+            && !(event.target instanceof Element
+                && event.target.classList.contains('sheet-tabs-vertical-track'))
+        ) return;
+        event.preventDefault();
+        on_strip_context_menu(event.clientX, event.clientY);
+    };
+
+    const controls = (
+        <>
             {sheets.map((name, index) => (
                 <button
                     key={`${index}:${name}`}
@@ -85,6 +89,20 @@ export function SheetTabs({
                 <OrientationIcon vertical={vertical} />
                 {vertical && <span className="sheet-tabs-orientation-label">Tabs on top</span>}
             </button>
+        </>
+    );
+
+    return (
+        <div
+            className={class_name}
+            onContextMenu={handle_strip_context_menu}
+        >
+            <div className={vertical
+                ? 'sheet-tabs-track sheet-tabs-vertical-track'
+                : 'sheet-tabs-track sheet-tabs-horizontal-track'}
+            >
+                {controls}
+            </div>
         </div>
     );
 }
