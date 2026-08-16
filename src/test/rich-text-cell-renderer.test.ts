@@ -171,3 +171,62 @@ describe('rich_text_cell_renderer.measure', () => {
         expect(rich_text_cell_renderer.measure!(ctx, cell, theme)).toBe(66);
     });
 });
+
+describe('rich_text_cell_renderer.draw — code-review regressions', () => {
+    it('restores the base font after a cell ending in a styled run', () => {
+        const stub = stub_ctx();
+        const cell = make_cell([[{ text: 'end bold', style: { bold: true } }]]);
+        rich_text_cell_renderer.draw(
+            {
+                ctx: stub.ctx,
+                theme,
+                rect: { x: 0, y: 0, width: 200, height: 30 },
+                cell,
+                col: 0,
+                row: 0,
+                highlighted: false,
+                hoverAmount: 0,
+                hoverX: undefined,
+                hoverY: undefined,
+                cellFillColor: '#fff',
+                imageLoader: undefined as never,
+                spriteManager: undefined as never,
+                hyperWrapping: false,
+                requestAnimationFrame: () => {},
+                drawState: [undefined, () => {}],
+                frameTime: 0,
+                overrideCursor: undefined,
+            },
+            cell,
+        );
+        // Glide's draw loop tracks the canvas font and skips resetting it
+        // between cells, so draw must leave the base font behind.
+        expect((stub.ctx as unknown as { font: string }).font).toBe(theme.baseFontFull);
+    });
+
+    it('stops the line after a truncated segment instead of misplacing followers', () => {
+        // 200px cell → max_chars = 50; first segment is 60 chars.
+        const { calls } = draw(make_cell([[
+            { text: 'x'.repeat(60) },
+            { text: 'AFTER', style: { bold: true } },
+        ]]));
+        expect(calls).toHaveLength(1);
+        expect(calls[0].text).toBe('x'.repeat(50));
+    });
+
+    it('lays RTL segments out from the right edge', () => {
+        const cell: RichTextGridCell = {
+            ...make_cell([[{ text: 'אב' }, { text: 'גד', style: { bold: true } }]]),
+        };
+        const rtl_cell: RichTextGridCell = {
+            ...cell,
+            data: { ...cell.data, rtl: true },
+        };
+        const { calls } = draw(rtl_cell);
+        expect(calls).toHaveLength(2);
+        // First segment anchors at the right padding edge; the next continues
+        // leftward (each segment is 2 chars * 10px wide).
+        expect(calls[0].x).toBe(200 - 8);
+        expect(calls[1].x).toBe(200 - 8 - 20);
+    });
+});

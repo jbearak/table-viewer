@@ -81,6 +81,7 @@ import { MergeIndex } from './merge-index';
 import {
     build_grid_cell,
     cell_allows_wrapping,
+    rich_cell_display_data,
     type CellEditOverlay,
 } from './cell-renderer';
 import { rich_text_cell_renderer } from './rich-text-cell-renderer';
@@ -89,6 +90,7 @@ import {
     CELL_TOOLTIP_SHOW_DELAY_MS,
     cell_tooltip_content,
     cell_tooltip_position,
+    rich_text_overflows_cell,
     clamp_tooltip_text,
     text_overflows_cell,
 } from './cell-overflow-model';
@@ -1662,23 +1664,55 @@ export function GridShell({
             const link = cell_hyperlink(display_column, row);
             if (!text && !link) return;
 
-            const flags = font_flags_for_cell(display_column, row);
-            // Use the same wrapping rule as build_grid_cell. `cell_bounds` is the
-            // full painted rectangle, including a vertical merge's covered rows.
-            const wrapping = cell_allows_wrapping(
-                text,
-                cell_bounds.height > default_row_height,
-            );
-            const overflows = text !== '' && text_overflows_cell(
-                text,
-                cell_bounds.width,
-                (line) => measure_line_width(line, flags.bold, flags.italic),
-                {
-                    cell_height: cell_bounds.height,
-                    line_height: line_height_for_font(font_size_px),
-                    wrapping,
-                },
-            );
+            // A dirty value paints through the Text path even on a rich cell,
+            // so only an undirtied rich cell measures with the rich rule.
+            const source_column = source_column_for_display(display_column);
+            const source_row = get_source_row(row);
+            const dirty = source_row !== undefined && source_column !== undefined
+                && store.get(`${source_row}:${source_column}`) !== undefined;
+            const loaded = source_column === undefined
+                ? null
+                : get_row(row)?.[source_column] ?? null;
+            const rich_data = !dirty && loaded
+                ? rich_cell_display_data(loaded, show_formatting, font_size_px)
+                : undefined;
+
+            let overflows: boolean;
+            if (rich_data) {
+                // The rich renderer draws hard breaks only and uses per-run
+                // fonts; the overflow check must match or the tooltip lies.
+                overflows = rich_text_overflows_cell(
+                    rich_data.lines,
+                    cell_bounds.width,
+                    (segment, style) => measure_line_width(
+                        segment,
+                        style?.bold ?? false,
+                        style?.italic ?? false,
+                    ),
+                    {
+                        cell_height: cell_bounds.height,
+                        line_height: line_height_for_font(font_size_px),
+                    },
+                );
+            } else {
+                const flags = font_flags_for_cell(display_column, row);
+                // Use the same wrapping rule as build_grid_cell. `cell_bounds` is
+                // the full painted rectangle, including a vertical merge's rows.
+                const wrapping = cell_allows_wrapping(
+                    text,
+                    cell_bounds.height > default_row_height,
+                );
+                overflows = text !== '' && text_overflows_cell(
+                    text,
+                    cell_bounds.width,
+                    (line) => measure_line_width(line, flags.bold, flags.italic),
+                    {
+                        cell_height: cell_bounds.height,
+                        line_height: line_height_for_font(font_size_px),
+                        wrapping,
+                    },
+                );
+            }
             const content = cell_tooltip_content(text, overflows, link);
             if (content === null) return;
 
@@ -1710,6 +1744,11 @@ export function GridShell({
             measure_line_width,
             default_row_height,
             cell_hyperlink,
+            get_row,
+            get_source_row,
+            show_formatting,
+            source_column_for_display,
+            store,
         ],
     );
 

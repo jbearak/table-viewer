@@ -21,6 +21,7 @@ export {
     getEmHeight,
     getMiddleCenterBias,
 } from "./internal/data-grid/render/data-grid-lib.js";
+export { direction } from "./common/utils.js";
 
 export type { DataEditorRef } from "./data-editor/data-editor.js";
 export { DataEditorAll as DataEditor } from "./data-editor-all.js";

@@ -90,6 +90,11 @@ export const rich_text_cell_renderer: CustomRenderer<RichTextGridCell> = {
             ctx.clip();
         }
         ctx.fillStyle = linked ? theme.linkColor : theme.textDark;
+        // RTL text lays out from the right edge, mirroring the built-in Text
+        // cell's whole-string heuristic; ctx.direction handles glyph order
+        // inside each segment, the pen direction handles segment order.
+        const rtl = data.rtl === true;
+        if (rtl) ctx.direction = 'rtl';
 
         const variants = font_variants(data.font_size_px, theme.fontFamily);
         const left = x + theme.cellHorizontalPadding + 0.5;
@@ -97,18 +102,17 @@ export const rich_text_cell_renderer: CustomRenderer<RichTextGridCell> = {
         const optimal_y = y + h / 2 - actual_height / 2;
         let draw_y = Math.max(y + theme.cellVerticalPadding, optimal_y);
         // Longest run of glyphs that can possibly fit; the same 4px/char floor
-        // Glide's truncateString uses, applied per segment below (per-segment
-        // rather than whole-string, since only the segments up to the clip
-        // edge are drawn at all).
+        // Glide's truncateString uses, applied per segment below.
         const max_chars = Math.ceil(w / 4);
         let last_font: string | null = null;
 
         for (const line of data.lines) {
             const text_y = draw_y + em_height / 2 + bias;
-            let pen_x = left;
+            let pen_x = rtl ? right : left;
             for (const segment of line) {
-                if (pen_x >= right) break;
-                const text = segment.text.length > max_chars
+                if (rtl ? pen_x <= left : pen_x >= right) break;
+                const truncated = segment.text.length > max_chars;
+                const text = truncated
                     ? segment.text.slice(0, max_chars)
                     : segment.text;
                 const font = variant_of(variants, segment.style);
@@ -116,26 +120,44 @@ export const rich_text_cell_renderer: CustomRenderer<RichTextGridCell> = {
                     ctx.font = font;
                     last_font = font;
                 }
-                ctx.fillText(text, pen_x, text_y);
                 const seg_w = measureTextCached(text, ctx, font).width;
+                // With ctx.direction='rtl' and the default 'start' alignment,
+                // fillText anchors at the segment's RIGHT edge — so the rtl
+                // pen holds that edge and moves leftward.
+                const seg_left = rtl ? pen_x - seg_w : pen_x;
+                ctx.fillText(text, pen_x, text_y);
                 if (segment.style?.strikethrough) {
-                    ctx.fillRect(pen_x, Math.round(text_y) - 0.5, seg_w, 1);
+                    ctx.fillRect(seg_left, Math.round(text_y) - 0.5, seg_w, 1);
                 }
                 if (linked || segment.style?.underline) {
                     ctx.fillRect(
-                        pen_x,
+                        seg_left,
                         Math.round(text_y + em_height / 2) + 0.5,
                         seg_w,
                         1,
                     );
                 }
-                pen_x += seg_w;
+                // A truncated slice's width understates the full segment, so
+                // any following segment would land at a fabricated position;
+                // everything after it is off-cell anyway — stop the line.
+                if (truncated) break;
+                pen_x = rtl ? pen_x - seg_w : pen_x + seg_w;
             }
             draw_y += line_height;
             if (draw_y > y + h) break;
         }
 
-        if (must_clip) ctx.restore();
+        if (rtl) ctx.direction = 'inherit';
+        if (must_clip) {
+            // restore() also puts the entry font back.
+            ctx.restore();
+        } else if (last_font !== null) {
+            // Glide's draw loop tracks the canvas font and skips resetting it
+            // between cells; leave it exactly as we found it (the loop set
+            // baseFontFull before calling draw) or a bold/italic final run
+            // would leak into the next plain cell.
+            ctx.font = theme.baseFontFull;
+        }
     },
     measure: (ctx, cell, theme) => {
         const variants = font_variants(cell.data.font_size_px, theme.fontFamily);

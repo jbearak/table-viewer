@@ -34,6 +34,9 @@ export interface RichCellData {
     /** The grid's configured cell font size; per-segment fonts rebuild the
      *  cell font shorthand around it, so it must match the theme. */
     readonly font_size_px: number;
+    /** Right-to-left cell text (Glide's whole-string heuristic): segments lay
+     *  out from the right edge, like the built-in Text cell's RTL path. */
+    readonly rtl?: true;
 }
 
 /**

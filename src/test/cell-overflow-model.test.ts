@@ -5,6 +5,7 @@ import {
     cell_tooltip_content,
     cell_tooltip_position,
     clamp_tooltip_text,
+    rich_text_overflows_cell,
     text_overflows_cell,
 } from '../webview/cell-overflow-model';
 
@@ -152,5 +153,51 @@ describe('cell_tooltip_content', () => {
 
     it('appends the link line to overflowing text', () => {
         expect(cell_tooltip_content('long text', true, link)).toBe('long text\nGo');
+    });
+});
+
+describe('rich_text_overflows_cell', () => {
+    // 1px per char; bold counts double, so per-style fonts matter.
+    const rich_measure = (text: string, style?: { bold?: true }): number =>
+        text.length * (style?.bold ? 2 : 1);
+
+    it('fits when the widest line fits', () => {
+        expect(rich_text_overflows_cell(
+            [[{ text: 'abc' }]],
+            3 + 2 * CELL_TOOLTIP_HORIZONTAL_PADDING_PX + 1,
+            rich_measure,
+        )).toBe(false);
+    });
+
+    it('overflows when a bold run pushes past the width plain text would fit', () => {
+        const width = 8 + 2 * CELL_TOOLTIP_HORIZONTAL_PADDING_PX;
+        expect(rich_text_overflows_cell(
+            [[{ text: 'abcd' }, { text: 'efgh' }]],
+            width, rich_measure,
+        )).toBe(false);
+        expect(rich_text_overflows_cell(
+            [[{ text: 'abcd' }, { text: 'efgh', style: { bold: true } }]],
+            width, rich_measure,
+        )).toBe(true);
+    });
+
+    it('treats extra hard lines as overflow without a height budget (no soft wrap)', () => {
+        expect(rich_text_overflows_cell(
+            [[{ text: 'a' }], [{ text: 'b' }]],
+            100, rich_measure,
+        )).toBe(true);
+    });
+
+    it('fits multiple lines inside a sufficient height budget', () => {
+        expect(rich_text_overflows_cell(
+            [[{ text: 'a' }], [{ text: 'b' }]],
+            100, rich_measure,
+            { cell_height: 3 * CELL_TOOLTIP_LINE_HEIGHT_PX, line_height: CELL_TOOLTIP_LINE_HEIGHT_PX },
+        )).toBe(false);
+        expect(rich_text_overflows_cell(
+            [[{ text: 'a' }], [{ text: 'b' }], [{ text: 'c' }], [{ text: 'd' }]],
+            100, rich_measure,
+            { cell_height: 3 * CELL_TOOLTIP_LINE_HEIGHT_PX, line_height: CELL_TOOLTIP_LINE_HEIGHT_PX },
+        )).toBe(true);
     });
 });

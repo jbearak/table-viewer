@@ -312,3 +312,68 @@ describe('build_grid_cell — rich cells', () => {
         expect(c.themeOverride?.bgCell).toBe('#123456');
     });
 });
+
+describe('build_grid_cell — rich cells, code-review regressions', () => {
+    const linked_date: (RenderedCell | null)[] = [{
+        raw: '45123',
+        formatted: '7/16/2023',
+        bold: false,
+        italic: false,
+        hyperlink: { kind: 'external', target: 'https://example.com/' },
+    }];
+
+    it('displays the formatted value on a rich cell without source runs', () => {
+        const c = build_grid_cell(0, linked_date, true) as unknown as {
+            data: { lines: { text: string }[][] };
+        };
+        expect(c.data.lines).toEqual([[{ text: '7/16/2023' }]]);
+    });
+
+    it('keeps the link presentation when formatting is off (raw text, plain runs)', () => {
+        const c = build_grid_cell(0, linked_date, false) as unknown as {
+            kind: unknown;
+            cursor?: string;
+            data: { lines: { text: string }[][]; hyperlink?: unknown };
+        };
+        expect(c.kind).toBe(GridCellKind.Custom);
+        expect(c.cursor).toBe('pointer');
+        expect(c.data.hyperlink).toBeDefined();
+        expect(c.data.lines).toEqual([[{ text: '45123' }]]);
+    });
+
+    it('drops run styling when formatting is off on an unlinked rich cell', () => {
+        const styled: (RenderedCell | null)[] = [{
+            raw: 'ab',
+            formatted: 'ab',
+            bold: false,
+            italic: false,
+            richText: { runs: [{ text: 'a' }, { text: 'b', style: { bold: true } }] },
+        }];
+        const c = build_grid_cell(0, styled, false);
+        expect(c.kind).toBe(GridCellKind.Text);
+    });
+
+    it('sets the pointer cursor on linked cells only', () => {
+        const c = build_grid_cell(0, linked_date, true) as { cursor?: string };
+        expect(c.cursor).toBe('pointer');
+        const unlinked: (RenderedCell | null)[] = [{
+            raw: 'u', formatted: 'u', bold: false, italic: false, underline: true,
+        }];
+        expect((build_grid_cell(0, unlinked, true) as { cursor?: string }).cursor)
+            .toBeUndefined();
+    });
+
+    it('marks RTL display text', () => {
+        const rtl_row: (RenderedCell | null)[] = [{
+            raw: 'שלום',
+            formatted: 'שלום',
+            bold: false,
+            italic: false,
+            underline: true,
+        }];
+        const c = build_grid_cell(0, rtl_row, true) as unknown as { data: { rtl?: true } };
+        expect(c.data.rtl).toBe(true);
+        const ltr = build_grid_cell(0, linked_date, true) as unknown as { data: { rtl?: true } };
+        expect(ltr.data.rtl).toBeUndefined();
+    });
+});
