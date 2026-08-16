@@ -126,6 +126,7 @@ function rich_cell(
     show_formatting: boolean,
     overlay: CellEditOverlay | undefined,
     font_size_px: number,
+    link_modifier_held = false,
 ): GridCell {
     const cached = rich_cell_cache.get(c);
     let cell = cached !== undefined
@@ -172,15 +173,21 @@ function rich_cell(
             // gate); keep Glide's paste path closed the same way `refused`
             // does for Text.
             readonly: true,
-            // The grid reads `cursor` straight off the hovered cell — no
-            // needsHover animation involved. Signals Ctrl/Cmd+click.
-            ...(c.hyperlink ? { cursor: 'pointer' as const } : {}),
         };
         rich_cell_cache.set(c, { font_size_px, show_formatting, cell });
     }
-    // The tint is per-view state, not cell content — apply outside the cache.
-    return overlay?.bg
-        ? { ...cell, themeOverride: { bgCell: overlay.bg } }
+    // Per-view state, not cell content — applied outside the cache. The
+    // pointer cursor appears only while the open gesture is actually
+    // available (Ctrl/Cmd held over an external link): a bare hover keeps
+    // the normal cell cursor, since a plain click selects, not opens. The
+    // grid reads `cursor` straight off the hovered cell.
+    const pointer = link_modifier_held && c.hyperlink?.kind === 'external';
+    return overlay?.bg || pointer
+        ? {
+            ...cell,
+            ...(pointer ? { cursor: 'pointer' as const } : {}),
+            ...(overlay?.bg ? { themeOverride: { bgCell: overlay.bg } } : {}),
+        }
         : cell;
 }
 
@@ -286,6 +293,7 @@ export function build_grid_cell(
     overlay?: CellEditOverlay,
     font_size_px: number = DEFAULT_CELL_FONT_SIZE_PX,
     soft_wrap = false,
+    link_modifier_held = false,
 ): GridCell {
     const c = cells?.[col];
     if (!c && !overlay) return BLANK;
@@ -304,7 +312,7 @@ export function build_grid_cell(
         && !overlay?.editable
         && overlay?.dirty_value === undefined
     ) {
-        return rich_cell(c, show_formatting, overlay, font_size_px);
+        return rich_cell(c, show_formatting, overlay, font_size_px, link_modifier_held);
     }
     return text_cell(c ?? EMPTY_CELL, show_formatting, overlay, font_size_px, soft_wrap);
 }

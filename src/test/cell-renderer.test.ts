@@ -332,11 +332,9 @@ describe('build_grid_cell — rich cells, code-review regressions', () => {
     it('keeps the link presentation when formatting is off (raw text, plain runs)', () => {
         const c = build_grid_cell(0, linked_date, false) as unknown as {
             kind: unknown;
-            cursor?: string;
             data: { lines: { text: string }[][]; hyperlink?: unknown };
         };
         expect(c.kind).toBe(GridCellKind.Custom);
-        expect(c.cursor).toBe('pointer');
         expect(c.data.hyperlink).toBeDefined();
         expect(c.data.lines).toEqual([[{ text: '45123' }]]);
     });
@@ -353,14 +351,22 @@ describe('build_grid_cell — rich cells, code-review regressions', () => {
         expect(c.kind).toBe(GridCellKind.Text);
     });
 
-    it('sets the pointer cursor on linked cells only', () => {
-        const c = build_grid_cell(0, linked_date, true) as { cursor?: string };
-        expect(c.cursor).toBe('pointer');
+    it('sets the pointer cursor only while the open modifier is held over a link', () => {
+        // Bare hover: plain click selects, so no pointer.
+        const bare = build_grid_cell(0, linked_date, true) as { cursor?: string };
+        expect(bare.cursor).toBeUndefined();
+        // Ctrl/Cmd held: the open gesture is live.
+        const held = build_grid_cell(
+            0, linked_date, true, undefined, undefined, false, true,
+        ) as { cursor?: string };
+        expect(held.cursor).toBe('pointer');
+        // The modifier over an unlinked rich cell changes nothing.
         const unlinked: (RenderedCell | null)[] = [{
             raw: 'u', formatted: 'u', bold: false, italic: false, underline: true,
         }];
-        expect((build_grid_cell(0, unlinked, true) as { cursor?: string }).cursor)
-            .toBeUndefined();
+        expect((build_grid_cell(
+            0, unlinked, true, undefined, undefined, false, true,
+        ) as { cursor?: string }).cursor).toBeUndefined();
     });
 
     it('marks RTL display text', () => {

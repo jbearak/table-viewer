@@ -113,4 +113,17 @@ describe('Open link', () => {
         action(items, 'Open link').on_click({} as never);
         expect(on_open_link).toHaveBeenCalledTimes(1);
     });
+
+    it('offers Copy link directly below Open link and fires its callback', () => {
+        const on_open_link = vi.fn();
+        const on_copy_link = vi.fn();
+        const items = cell_context_menu_items({ ...base(), on_open_link, on_copy_link });
+        const labels = items
+            .filter((item) => item.kind === undefined)
+            .map((item) => (item as { label: string }).label);
+        expect(labels.indexOf('Copy link')).toBe(labels.indexOf('Open link') + 1);
+        action(items, 'Copy link').on_click({} as never);
+        expect(on_copy_link).toHaveBeenCalledTimes(1);
+        expect(on_open_link).not.toHaveBeenCalled();
+    });
 });

@@ -5,6 +5,7 @@ import {
     cell_tooltip_content,
     cell_tooltip_position,
     clamp_tooltip_text,
+    link_open_hint,
     rich_text_overflows_cell,
     text_overflows_cell,
 } from '../webview/cell-overflow-model';
@@ -153,6 +154,30 @@ describe('cell_tooltip_content', () => {
 
     it('appends the link line to overflowing text', () => {
         expect(cell_tooltip_content('long text', true, link)).toBe('long text\nGo');
+    });
+
+    it('appends the platform open hint to external links only', () => {
+        expect(cell_tooltip_content('short', false, link, link_open_hint(true)))
+            .toBe('Go\nCmd+click to open link');
+        expect(cell_tooltip_content('long text', true, link, link_open_hint(false)))
+            .toBe('long text\nGo\nCtrl+click to open link');
+        // Internal links aren't openable, so no gesture to teach.
+        expect(cell_tooltip_content(
+            'short',
+            false,
+            { kind: 'internal', location: 'Sheet2!A1' },
+            link_open_hint(false),
+        )).toBe('Sheet2!A1');
+        // Plain overflow tooltips stay hint-free.
+        expect(cell_tooltip_content('long text', true, undefined, link_open_hint(true)))
+            .toBe('long text');
+    });
+});
+
+describe('link_open_hint', () => {
+    it('names the platform modifier', () => {
+        expect(link_open_hint(true)).toBe('Cmd+click to open link');
+        expect(link_open_hint(false)).toBe('Ctrl+click to open link');
     });
 });
 
