@@ -9,6 +9,7 @@ import {
     type ParsedRichString,
 } from '../xlsx-rich-text';
 import { parse_relationships, rels_path_for_part } from '../ooxml-relationships';
+import { write_xlsx_workbook_cell_edits } from '../xlsx-package';
 import { ColumnarStore } from '../data-source/columnar-store';
 import type { CellData } from '../types';
 
@@ -351,6 +352,151 @@ describe('parse_xlsx rich text and hyperlinks', () => {
         expect(b2.raw).toBe('Go there');
         expect(b2.formatted).toBe('Go there');
         expect(b2.hyperlink).toEqual({ kind: 'internal', location: 'Sheet2!A1' });
+    });
+
+    it('keeps a link-only cell\'s display text when the link is cleared', async () => {
+        // The text lives *only* in the `display` attribute the clear removes, so
+        // without promoting it to a real cell value the cell reads back blank.
+        const sheet = worksheet(`<sheetData/>
+        <hyperlinks><hyperlink ref="B2" location="Sheet2!A1" display="Go there"/></hyperlinks>`);
+        const cleared = write_xlsx_workbook_cell_edits(build_xlsx({ sheet_xml: sheet }), [
+            { sheetIndex: 0, edits: [], link_edits: [{ row: 1, col: 1, link: null }] },
+        ]);
+        const { data } = await parse_xlsx(cleared);
+        const b2 = data.sheets[0].rows[1][1] as CellData;
+        expect(b2.raw).toBe('Go there');
+        expect(b2.hyperlink).toBeUndefined();
+    });
+
+    it('does not overwrite a value the same save is writing to that cell', async () => {
+        // The user's own edit is the newer intent; promoting the display text
+        // over it would resurrect text they just replaced.
+        const sheet = worksheet(`<sheetData/>
+        <hyperlinks><hyperlink ref="B2" location="Sheet2!A1" display="Go there"/></hyperlinks>`);
+        const saved = write_xlsx_workbook_cell_edits(build_xlsx({ sheet_xml: sheet }), [{
+            sheetIndex: 0,
+            edits: [{ row: 1, col: 1, value: 'typed' }],
+            link_edits: [{ row: 1, col: 1, link: null }],
+        }]);
+        const { data } = await parse_xlsx(saved);
+        expect((data.sheets[0].rows[1][1] as CellData).raw).toBe('typed');
+    });
+
+    it('leaves a cell that has its own value untouched by the clear', async () => {
+        // `display` is not the text here — the `<v>` is — so there is nothing to
+        // promote and the cell must come back exactly as it was, style included.
+        const sheet = worksheet(`<sheetData><row r="2">
+            <c r="B2" t="inlineStr"><is><t>own value</t></is></c>
+        </row></sheetData>
+        <hyperlinks><hyperlink ref="B2" location="Sheet2!A1" display="Go there"/></hyperlinks>`);
+        const raw = build_xlsx({ sheet_xml: sheet });
+        const cleared = write_xlsx_workbook_cell_edits(raw, [
+            { sheetIndex: 0, edits: [], link_edits: [{ row: 1, col: 1, link: null }] },
+        ]);
+        const { data } = await parse_xlsx(cleared);
+        const b2 = data.sheets[0].rows[1][1] as CellData;
+        expect(b2.raw).toBe('own value');
+        expect(b2.hyperlink).toBeUndefined();
+        // A link-only save still leaves the worksheet body alone.
+        const body = (bytes: Uint8Array) => Buffer.from(
+            CFB.find(CFB.read(bytes, { type: 'buffer' }), '/xl/worksheets/sheet1.xml')!
+                .content as Uint8Array,
+        ).toString('utf8');
+        expect(body(cleared)).toContain('<c r="B2" t="inlineStr"><is><t>own value</t></is></c>');
+    });
+
+    it('keeps a numeric-looking display text a string, exactly as it read before', async () => {
+        // The promoted text was never typed by anyone — it is what the file
+        // already held — so type inference must not reinterpret it. `1e3` read
+        // as the string "1e3" before the clear and was stored as a number that
+        // read back as 1000 after it.
+        for (const display of ['1e3', '123', '0042']) {
+            const sheet = worksheet(`<sheetData/>
+            <hyperlinks><hyperlink ref="B2" location="Sheet2!A1" display="${display}"/></hyperlinks>`);
+            const raw = build_xlsx({ sheet_xml: sheet });
+            const { data: before } = await parse_xlsx(raw);
+            expect((before.sheets[0].rows[1][1] as CellData).raw).toBe(display);
+            const cleared = write_xlsx_workbook_cell_edits(raw, [
+                { sheetIndex: 0, edits: [], link_edits: [{ row: 1, col: 1, link: null }] },
+            ]);
+            const { data: after } = await parse_xlsx(cleared);
+            expect((after.sheets[0].rows[1][1] as CellData).raw).toBe(display);
+        }
+    });
+
+    it('promotes the FIRST duplicate link element\'s display, which is the one shown', async () => {
+        // Nothing forbids two `<hyperlink>` elements naming one ref. The reader
+        // synthesizes the cell from the first and a later duplicate only
+        // replaces the cell's link, never its text — so promoting the last
+        // would change the visible text on a clear.
+        const sheet = worksheet(`<sheetData/><hyperlinks>
+            <hyperlink ref="B2" location="Sheet2!A1" display="first"/>
+            <hyperlink ref="B2" location="Sheet3!A1" display="second"/>
+        </hyperlinks>`);
+        const raw = build_xlsx({ sheet_xml: sheet });
+        expect(((await parse_xlsx(raw)).data.sheets[0].rows[1][1] as CellData).raw).toBe('first');
+        const cleared = write_xlsx_workbook_cell_edits(raw, [
+            { sheetIndex: 0, edits: [], link_edits: [{ row: 1, col: 1, link: null }] },
+        ]);
+        const { data } = await parse_xlsx(cleared);
+        expect((data.sheets[0].rows[1][1] as CellData).raw).toBe('first');
+    });
+
+    it('invents nothing when the shown duplicate carries no display at all', async () => {
+        // The first element has no display, so the cell reads blank; the second
+        // element's text was never on screen and must not appear now.
+        const sheet = worksheet(`<sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>anchor</t></is></c></row></sheetData>
+        <hyperlinks>
+            <hyperlink ref="B2" location="Sheet2!A1"/>
+            <hyperlink ref="B2" location="Sheet3!A1" display="second"/>
+        </hyperlinks>`);
+        const raw = build_xlsx({ sheet_xml: sheet });
+        expect(((await parse_xlsx(raw)).data.sheets[0].rows[1][1] as CellData).raw).toBeNull();
+        const cleared = write_xlsx_workbook_cell_edits(raw, [
+            { sheetIndex: 0, edits: [], link_edits: [{ row: 1, col: 1, link: null }] },
+        ]);
+        const body = Buffer.from(
+            CFB.find(CFB.read(cleared, { type: 'buffer' }), '/xl/worksheets/sheet1.xml')!
+                .content as Uint8Array,
+        ).toString('utf8');
+        expect(body).not.toContain('second');
+    });
+
+    it('does not invent text for a styled-but-empty cell, which never showed the display', async () => {
+        // The reader falls back to `display` only for a coordinate with NO `<c>`
+        // — a `<c r="B2" s="1"/>` reads as blank both before and after. Promoting
+        // into it would put text on screen that the file never displayed.
+        const sheet = worksheet(`<sheetData><row r="2"><c r="B2" s="1"/></row></sheetData>
+        <hyperlinks><hyperlink ref="B2" location="Sheet2!A1" display="Go there"/></hyperlinks>`);
+        const raw = build_xlsx({ sheet_xml: sheet, styles_xml: UNDERLINE_STRIKE_STYLES });
+        // Baseline: blank before the save, so blank after it is preservation.
+        const { data: before } = await parse_xlsx(raw);
+        expect((before.sheets[0].rows[1][1] as CellData).raw).toBeNull();
+        const cleared = write_xlsx_workbook_cell_edits(raw, [
+            { sheetIndex: 0, edits: [], link_edits: [{ row: 1, col: 1, link: null }] },
+        ]);
+        const { data } = await parse_xlsx(cleared);
+        const b2 = data.sheets[0].rows[1][1] as CellData;
+        expect(b2.raw).toBeNull();
+        expect(b2.hyperlink).toBeUndefined();
+    });
+
+    it('does not overwrite a formula cell that has no cached value', async () => {
+        // `<f>` with no `<v>` has no text of its own, but it is still a `<c>`, so
+        // the reader never showed the display — and promoting would replace a
+        // live formula with a literal.
+        const sheet = worksheet(`<sheetData><row r="2"><c r="B2"><f>1+1</f></c></row></sheetData>
+        <hyperlinks><hyperlink ref="B2" location="Sheet2!A1" display="Go there"/></hyperlinks>`);
+        const raw = build_xlsx({ sheet_xml: sheet });
+        const cleared = write_xlsx_workbook_cell_edits(raw, [
+            { sheetIndex: 0, edits: [], link_edits: [{ row: 1, col: 1, link: null }] },
+        ]);
+        const body = Buffer.from(
+            CFB.find(CFB.read(cleared, { type: 'buffer' }), '/xl/worksheets/sheet1.xml')!
+                .content as Uint8Array,
+        ).toString('utf8');
+        expect(body).toContain('<f>1+1</f>');
+        expect(body).not.toContain('Go there');
     });
 
     it('ignores an r:id pointing at a non-hyperlink relationship', async () => {

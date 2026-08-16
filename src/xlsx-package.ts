@@ -1,8 +1,8 @@
 import CFB from 'cfb';
 import {
     apply_cell_edits,
+    cells_present,
     element_close,
-    element_content,
     formula_count,
     live_tags_in,
     widen_dimension,
@@ -20,7 +20,11 @@ import {
 } from './parse-xlsx';
 import type { XfEntry, DateMode } from './spreadsheet-format';
 import { rels_path_for_part } from './ooxml-relationships';
-import { apply_hyperlink_edits, type XlsxHyperlinkEdit } from './xlsx-hyperlink-write';
+import {
+    apply_hyperlink_edits,
+    cleared_display_texts,
+    type XlsxHyperlinkEdit,
+} from './xlsx-hyperlink-write';
 
 /**
  * Package-level (.xlsx container) side of `putexcel`-style saving.
@@ -374,17 +378,51 @@ export function write_xlsx_workbook_cell_edits(
         const sheet_xml = read_part_text(cfb_file, path);
         if (sheet_xml === null) throw new Error('Could not read a worksheet to save');
 
-        let updated = edits.length > 0
-            ? apply_cell_edits(sheet_xml, edits, {
+        // A `<hyperlink display="…">` about to be cleared may be the only place
+        // the cell's visible text lives — parse-xlsx falls back to `display` for
+        // a coordinate with no `<c>` at all — so it is promoted to a real cell
+        // value before the link element goes. Composed here rather than in the
+        // hyperlink writer because the promotion IS a cell edit: it has to go
+        // through `apply_cell_edits` to pick up the cell's style, the inlineStr
+        // rules and the duplicate-coordinate handling, and that pass runs first.
+        //
+        // Only a coordinate the sheet has no `<c>` for is promoted, because only
+        // there is `display` what the reader shows. A styled-but-empty
+        // `<c r="B2" s="3"/>` reads as blank today, and promoting into it would
+        // invent text the user never saw.
+        const cleared_displays = link_edits && link_edits.length > 0
+            ? cleared_display_texts(sheet_xml, link_edits)
+            : [];
+        // One batched scan for the whole set: asking per coordinate re-walked
+        // the worksheet once per cleared link.
+        const present = cleared_displays.length > 0
+            ? cells_present(sheet_xml, cleared_displays)
+            : new Set<string>();
+        const promotions: XlsxCellEdit[] = [];
+        for (const { row, col, text } of cleared_displays) {
+            if (present.has(`${row}:${col}`)) continue;
+            // `force_text`: this is text the file already held, not something a
+            // user typed, so inference must not reinterpret it — a display of
+            // `1e3` is the string `1e3` to the reader and would otherwise be
+            // stored as a number that reads back as 1000.
+            promotions.push({ row, col, value: text, force_text: true });
+        }
+        // Promotions go FIRST so `canonical_edits`' last-wins rule lets a value
+        // the user typed into the same cell override the promoted text — their
+        // edit is the newer intent.
+        const all_edits = promotions.length > 0 ? [...promotions, ...edits] : edits;
+
+        let updated = all_edits.length > 0
+            ? apply_cell_edits(sheet_xml, all_edits, {
                 datemode,
                 is_date_style,
                 cell_font_style,
                 run_font_base,
             })
             : sheet_xml;
-        if (edits.length > 0) {
+        if (all_edits.length > 0) {
             let min_row = Infinity, min_col = Infinity, max_row = 0, max_col = 0;
-            for (const edit of edits) {
+            for (const edit of all_edits) {
                 if (edit.row < min_row) min_row = edit.row;
                 if (edit.col < min_col) min_col = edit.col;
                 if (edit.row > max_row) max_row = edit.row;
@@ -410,8 +448,9 @@ export function write_xlsx_workbook_cell_edits(
         }
         // Only a cell write can drop a formula; a hyperlink splice touches the
         // `<hyperlinks>` section and the rels, never a `<c>`. Skipping the two
-        // whole-sheet scans keeps a link-only save off the worksheet body.
-        if (edits.length > 0) {
+        // whole-sheet scans keeps a link-only save off the worksheet body — and
+        // a save that only promotes a display text is a cell write, so it counts.
+        if (all_edits.length > 0) {
             removed_formula ||= formula_count(updated) < formula_count(sheet_xml);
         }
         replacements.push({ path, xml: updated });
