@@ -1997,3 +1997,146 @@ describe('write_xlsx_cell_edits', () => {
             .toThrow(/valid \.xlsx/);
     });
 });
+
+describe('rich inline strings', () => {
+    const doc = (body: string) =>
+        `<worksheet><dimension ref="A1:C3"/><sheetData>${body}</sheetData><pageMargins/></worksheet>`;
+    const cell = '<row r="1"><c r="A1"><v>1</v></c></row>';
+
+    it('writes styled runs as a rich inline string, off flags absent', () => {
+        const out = apply_cell_edits(
+            doc(cell),
+            [{
+                row: 0, col: 0, value: 'plain bold',
+                runs: [
+                    { text: 'plain ' },
+                    { text: 'bold', style: { bold: true } },
+                ],
+            }],
+            OPTS,
+        );
+        expect(out).toContain(
+            '<c r="A1" t="inlineStr"><is>'
+            + '<r><t xml:space="preserve">plain </t></r>'
+            + '<r><rPr><b/></rPr><t xml:space="preserve">bold</t></r>'
+            + '</is></c>',
+        );
+    });
+
+    it('emits flags in b/i/strike/u order and only the flags that are on', () => {
+        const out = apply_cell_edits(
+            doc(cell),
+            [{
+                row: 0, col: 0, value: 'x',
+                runs: [{ text: 'x', style: { bold: true, italic: true, underline: true, strikethrough: true } }],
+            }],
+            OPTS,
+        );
+        expect(out).toContain('<rPr><b/><i/><strike/><u/></rPr>');
+    });
+
+    it('omits rPr on a run whose style equals the cell font, so it inherits everything', () => {
+        // The cell font is itself bold: the bold run carries no information the
+        // `s=` style doesn't, and MUST inherit rather than replace — an explicit
+        // `<rPr><b/></rPr>` would reset the cell's name/size/color to defaults.
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A1" s="1"><v>1</v></c></row>'),
+            [{
+                row: 0, col: 0, value: 'boldplain',
+                runs: [
+                    { text: 'bold', style: { bold: true } },
+                    { text: 'plain' },
+                ],
+            }],
+            { ...OPTS, cell_font_style: () => ({ bold: true }) },
+        );
+        expect(out).toContain('<r><t xml:space="preserve">bold</t></r>');
+        // The plain run diverges from the bold cell font, so it gets an explicit
+        // (empty-of-flags) rPr that REPLACES the font — that is what "not bold" is.
+        expect(out).toContain('<r><rPr></rPr><t xml:space="preserve">plain</t></r>');
+    });
+
+    it('starts every explicit rPr from the cell font base so styled runs keep name/size/color', () => {
+        const base = '<rFont val="Cambria"/><sz val="14"/>';
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A1" s="2"><v>1</v></c></row>'),
+            [{
+                row: 0, col: 0, value: 'big',
+                runs: [{ text: 'big', style: { italic: true } }],
+            }],
+            { ...OPTS, run_font_base: (xf) => (xf === 2 ? base : '') },
+        );
+        expect(out).toContain(`<rPr>${base}<i/></rPr>`);
+    });
+
+    it('reduces runs that all match the cell font to the plain form', () => {
+        // A date typed with markup that resolves to exactly the cell font's own
+        // style carries no run-level information, so classification still runs:
+        // under a date style it stays a serial, not an inline string.
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A1" s="1"><v>1</v></c></row>'),
+            [{
+                row: 0, col: 0, value: '2024-01-15',
+                runs: [{ text: '2024-01-15', style: { bold: true } }],
+            }],
+            {
+                datemode: 0,
+                is_date_style: () => true,
+                cell_font_style: () => ({ bold: true }),
+            },
+        );
+        expect(out).toContain('<c r="A1" s="1"><v>45306</v></c>');
+        expect(out).not.toContain('inlineStr');
+    });
+
+    it('keeps styled date-looking text as text — styled text is text', () => {
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A1" s="1"><v>1</v></c></row>'),
+            [{
+                row: 0, col: 0, value: '2024-01-15',
+                runs: [{ text: '2024-01-15', style: { bold: true } }],
+            }],
+            { datemode: 0, is_date_style: () => true },
+        );
+        expect(out).toContain('t="inlineStr"');
+        expect(out).not.toContain('<v>45306</v>');
+    });
+
+    it('escapes run text like any other inline string', () => {
+        const out = apply_cell_edits(
+            doc(cell),
+            [{
+                row: 0, col: 0, value: 'a<b>&c',
+                runs: [{ text: 'a<b>&c', style: { bold: true } }],
+            }],
+            OPTS,
+        );
+        expect(out).toContain('<t xml:space="preserve">a&lt;b&gt;&amp;c</t>');
+    });
+
+    it('round-trips a rich edit through a real workbook back to the reader', async () => {
+        const raw = readFileSync(FORMATTED);
+        const out = write_xlsx_cell_edits(raw, 0, [{
+            row: 0, col: 0, value: 'plain bold',
+            runs: [
+                { text: 'plain ' },
+                { text: 'bold', style: { bold: true } },
+            ],
+        }]);
+        const { data } = await parse_xlsx(out);
+        const cell = data.sheets[0].rows[0][0]!;
+        expect(cell.raw).toBe('plain bold');
+        expect(cell.richText).toEqual({
+            runs: [
+                { text: 'plain ' },
+                { text: 'bold', style: { bold: true } },
+            ],
+        });
+        // The styled run's rPr carries the cell font's non-flag properties —
+        // Calibri in this fixture — so the bold run does not fall back to the
+        // default font (OOXML rPr replaces the cell font, never merges).
+        const sheet = part(out, '/xl/worksheets/sheet1.xml')!.toString('utf8');
+        expect(sheet).toContain('<rFont val="Calibri"/>');
+        expect(sheet).not.toContain('<u val="none"/>');
+    });
+});

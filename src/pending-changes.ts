@@ -13,7 +13,7 @@
  * the host can refuse a save whose source moved underneath it.
  */
 
-import { is_plain_record } from './types';
+import { is_plain_record } from './plain-record';
 import {
     hyperlinks_equal,
     rich_text_equal,

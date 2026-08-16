@@ -8,8 +8,10 @@ import {
     widen_dimension,
     type XlsxCellEdit,
 } from './xlsx-cell-write';
-import { is_date_format } from './spreadsheet-format';
-import { decode_xml } from './ooxml-xml';
+import { get_style, is_date_format } from './spreadsheet-format';
+import { decode_xml, get_text, iter_elements } from './ooxml-xml';
+import { font_to_style } from './xlsx-rich-text';
+import type { CellTextStyle } from './cell-content';
 import {
     parse_styles,
     parse_workbook_xml,
@@ -223,6 +225,61 @@ function numeric_attr(tag: string, name: string): number | null {
 }
 
 /**
+ * Per-xf run-font context for rich inline strings: the cell font's four style
+ * flags (for the writer's uniform-style reduction) and its non-flag properties
+ * as `<rPr>`-ready inner XML (so a styled run on a Cambria-14 cell stays
+ * Cambria-14 — a present `<rPr>` REPLACES the cell font, never merges).
+ *
+ * The flags come from the reader's own `parse_styles`/`get_style`/
+ * `font_to_style`, for the usual reason: the writer deciding "this run just
+ * matches the cell font" must agree with the reader that resolved the run
+ * against that font in the first place. The raw base is a second walk over the
+ * same `<fonts>` section with the reader's `iter_elements`, so both see the
+ * same font list in the same order.
+ *
+ * The base transformation: drop the four flag tags (`<b>`, `<i>`, `<strike>`,
+ * `<u>` in any spelling — the writer re-emits per-run flags itself, and a
+ * leftover `<u val="none"/>` says nothing absence doesn't), and rename
+ * `<name …/>` to `<rFont …/>` — the one child whose tag differs between a
+ * styles-part `<font>` and a string-part `<rPr>`. `<rPr>`'s children are an
+ * unbounded xsd:choice, so the surviving order is legal as-is.
+ */
+function read_run_font_context(cfb_file: ReturnType<typeof CFB.read>): {
+    cell_font_style: (xf_index: number) => CellTextStyle | undefined;
+    run_font_base: (xf_index: number) => string;
+} {
+    const xml = read_part_text(cfb_file, '/xl/styles.xml');
+    if (!xml) {
+        return { cell_font_style: () => undefined, run_font_base: () => '' };
+    }
+    const { fonts, xfs } = parse_styles(xml);
+    const bases: string[] = [];
+    const fonts_section = get_text(xml, 'fonts');
+    if (fonts_section) {
+        iter_elements(fonts_section, 'font', (_open, inner) => {
+            bases.push(
+                inner
+                    .replace(/<(?:b|i|u|strike)\b[^>]*\/?>/g, '')
+                    .replace(/<\/(?:b|i|u|strike)>/g, '')
+                    .replace(/<name\b/g, '<rFont'),
+            );
+        });
+    }
+    const font_index = (xf_index: number): number | undefined => {
+        if (!Number.isInteger(xf_index) || xf_index < 0 || xf_index >= xfs.length) return undefined;
+        const idx = xfs[xf_index].font_index;
+        return Number.isInteger(idx) && idx >= 0 && idx < fonts.length ? idx : undefined;
+    };
+    return {
+        cell_font_style: (xf_index) => font_to_style(get_style(xf_index, xfs, fonts)),
+        run_font_base: (xf_index) => {
+            const idx = font_index(xf_index);
+            return idx === undefined ? '' : bases[idx] ?? '';
+        },
+    };
+}
+
+/**
  * The workbook's date epoch, read exactly as `parse_xlsx` reads it.
  *
  * Shared for the same reason as {@link read_style_date_predicate}. This module's
@@ -273,6 +330,7 @@ export function write_xlsx_workbook_cell_edits(
 
     const parts = worksheet_part_paths_from_package(cfb_file);
     const is_date_style = read_style_date_predicate(cfb_file);
+    const { cell_font_style, run_font_base } = read_run_font_context(cfb_file);
     const datemode = read_datemode(cfb_file);
     let removed_formula = false;
     const replacements: Array<{ path: string; xml: string }> = [];
@@ -284,7 +342,12 @@ export function write_xlsx_workbook_cell_edits(
         const sheet_xml = read_part_text(cfb_file, path);
         if (sheet_xml === null) throw new Error('Could not read a worksheet to save');
 
-        let updated = apply_cell_edits(sheet_xml, edits, { datemode, is_date_style });
+        let updated = apply_cell_edits(sheet_xml, edits, {
+            datemode,
+            is_date_style,
+            cell_font_style,
+            run_font_base,
+        });
         let min_row = Infinity, min_col = Infinity, max_row = 0, max_col = 0;
         for (const edit of edits) {
             if (edit.row < min_row) min_row = edit.row;

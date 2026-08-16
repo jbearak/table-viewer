@@ -444,6 +444,8 @@ export function App(): React.JSX.Element {
     const [preview_mode, set_preview_mode] = useState(false);
     const [csv_editable, set_csv_editable] = useState(false);
     const [csv_editing_supported, set_csv_editing_supported] = useState(false);
+    // 'markdown' on xlsx: cell text edits as inline markup (see cell-edit-model).
+    const [edit_syntax, set_edit_syntax] = useState<'plain' | 'markdown'>('plain');
     const [csv_edit_session_id, set_csv_edit_session_id_state] = useState<string>();
     const csv_edit_session_id_ref = useRef<string>();
     /**
@@ -2134,6 +2136,7 @@ export function App(): React.JSX.Element {
                     set_csv_editing_supported(
                         snapshot.capabilities.csvEditingSupported,
                     );
+                    set_edit_syntax(snapshot.capabilities.editSyntax ?? 'plain');
 
                     // Acknowledge the exact delivered identity before an optional
                     // corrective CAS write.
@@ -4554,6 +4557,7 @@ export function App(): React.JSX.Element {
             preview_mode={preview_mode}
             edit_mode={edit_mode_on_active_sheet}
             csv_editable={csv_editable}
+            edit_syntax={edit_syntax}
             edit_session_id={csv_edit_session_id}
             // Save lifecycle is workbook-scoped so it fences every grid; edit
             // stores remain worksheet-scoped so cell keys never cross sheets.

@@ -658,3 +658,98 @@ describe('hoisted store installs', () => {
         });
     });
 });
+
+describe('use_editing — markdown syntax', () => {
+    // A sheet whose A1 carries resolved rich runs ("plain **bold**"), B1 a
+    // whole-cell italic, and C1 plain text with a markdown-special character.
+    const rich_rows: (CellData | null)[][] = [[
+        {
+            raw: 'plain bold',
+            formatted: 'plain bold',
+            bold: false,
+            italic: false,
+            richText: { runs: [{ text: 'plain ' }, { text: 'bold', style: { bold: true } }] },
+        },
+        { raw: 'lean', formatted: 'lean', bold: false, italic: true },
+        { raw: '2*3', formatted: '2*3', bold: false, italic: false },
+    ]];
+
+    function MarkdownHarness({ rows }: { rows: (CellData | null)[][] }) {
+        hook_result = use_editing(make_get_cell_raw(rows), 0, undefined, undefined, {
+            syntax: 'markdown',
+            get_cell: (r, c) => {
+                const row = rows[r];
+                if (row === undefined) return undefined;
+                return row[c] ?? null;
+            },
+        });
+        return null;
+    }
+
+    async function render_markdown(rows: (CellData | null)[][] = rich_rows) {
+        container = document.createElement('div');
+        document.body.appendChild(container);
+        root = createRoot(container);
+        await act(async () => {
+            root!.render(React.createElement(MarkdownHarness, { rows }));
+        });
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+    }
+
+    it('opens the editor with the cell\'s markup', async () => {
+        await render_markdown();
+        await act(async () => { hook_result!.start_editing(0, 0); });
+        expect(hook_result!.editing_cell?.value).toBe('plain **bold**');
+        await act(async () => { hook_result!.start_editing(0, 1); });
+        expect(hook_result!.editing_cell?.value).toBe('*lean*');
+        // Plain text opens escaped, so committing it back unchanged is a revert.
+        await act(async () => { hook_result!.start_editing(0, 2); });
+        expect(hook_result!.editing_cell?.value).toBe('2\\*3');
+    });
+
+    it('retyping the cell\'s own markup is a revert, not an edit', async () => {
+        await render_markdown();
+        await act(async () => { hook_result!.commit_edit(0, 0, 'plain **bold**'); });
+        expect(hook_result!.is_dirty).toBe(false);
+        await act(async () => { hook_result!.commit_edit(0, 2, '2\\*3'); });
+        expect(hook_result!.is_dirty).toBe(false);
+    });
+
+    it('deleting the markup is a formatting edit with runs and baseRuns', async () => {
+        await render_markdown();
+        await act(async () => { hook_result!.commit_edit(0, 0, 'plain bold'); });
+        expect(hook_result!.dirty_cells.get('0:0')).toEqual({
+            value: 'plain bold',
+            base: 'plain bold',
+            baseRuns: { runs: [{ text: 'plain ' }, { text: 'bold', style: { bold: true } }] },
+        });
+    });
+
+    it('adding markup to a plain cell stores the plain projection plus runs', async () => {
+        await render_markdown();
+        await act(async () => { hook_result!.commit_edit(0, 2, '**6**'); });
+        expect(hook_result!.dirty_cells.get('0:2')).toEqual({
+            value: '6',
+            base: '2*3',
+            valueRuns: { runs: [{ text: '6', style: { bold: true } }] },
+        });
+    });
+
+    it('a dirty cell re-opens showing its committed runs as markup', async () => {
+        await render_markdown();
+        await act(async () => { hook_result!.commit_edit(0, 2, '**6**'); });
+        await act(async () => { hook_result!.start_editing(0, 2); });
+        expect(hook_result!.editing_cell?.value).toBe('**6**');
+        // …and committing that spelling back keeps the same entry (no churn).
+        await act(async () => { hook_result!.confirm_edit('**6**'); });
+        expect(hook_result!.dirty_cells.get('0:2')?.value).toBe('6');
+    });
+
+    it('falls back to plain text when the loaded cell is unavailable', async () => {
+        // Row 1 is not resident: get_cell returns undefined, so the base is the
+        // raw reader's text (also undefined → ''), and commits still work.
+        await render_markdown();
+        await act(async () => { hook_result!.commit_edit(5, 0, 'X'); });
+        expect(hook_result!.dirty_cells.get('5:0')).toEqual({ value: 'X', base: '' });
+    });
+});

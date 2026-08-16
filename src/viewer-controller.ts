@@ -89,6 +89,7 @@ import {
     worksheet_target_matches,
     type ActiveCsvSaveLifecycle,
     type CsvDirtyMap,
+    sanitized_dirty_entry,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
     type CsvSaveOperationRequest,
@@ -149,6 +150,13 @@ export interface SavePlanWorksheetInput {
     /** Source-keyed `row:col` → new text, exactly the cells the user changed. */
     readonly edits: Readonly<Record<string, string>>;
     readonly wanted_bases: ReadonlySet<string>;
+    /**
+     * The full dirty entries behind `edits`, for planners that write more than
+     * the plain-text projection — the xlsx planner reads `valueRuns` from here
+     * so a styled edit reaches the package as rich runs. CSV ignores it: its
+     * serializer is text-only by design.
+     */
+    readonly dirty_edits?: CsvDirtyMap;
 }
 
 export interface SavePlanInput {
@@ -240,6 +248,9 @@ export type ViewerProfile = ViewerProfileBase & (
         readonly editing: true;
         /** Harvest conflict bases now; produce the bytes to write at write time. */
         plan_save(input: SavePlanInput): SavePlan;
+        /** How cell text is edited (WorkbookSnapshotCapabilities.editSyntax).
+         *  'markdown' for xlsx, whose planner writes styled runs; absent = plain. */
+        readonly edit_syntax?: 'markdown';
     }
 );
 
@@ -519,13 +530,18 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
     // Every worksheet is fully planned before bytes are produced. The package
     // writer likewise computes every replacement before mutating the container,
     // so one invalid worksheet rejects the workbook save atomically.
-    const planned = input.worksheets.map(({ sheet_index, edits, wanted_bases }) => {
+    const planned = input.worksheets.map(({ sheet_index, edits, wanted_bases, dirty_edits }) => {
         const observed_bases = harvest_source_bases(src, sheet_index, wanted_bases);
         const cell_edits: XlsxCellEdit[] = [];
         for (const [key, value] of Object.entries(edits)) {
             const [row, col] = key.split(':').map(Number);
             if (!Number.isInteger(row) || !Number.isInteger(col)) continue;
-            cell_edits.push({ row, col, value });
+            // A styled edit carries its runs through to the package writer.
+            // `validate_edit_cells` already required the runs' concatenated text
+            // to equal `value`, so the plain projection and the rich form cannot
+            // disagree by the time they get here.
+            const runs = dirty_edits?.[key]?.valueRuns?.runs;
+            cell_edits.push(runs && runs.length > 0 ? { row, col, value, runs } : { row, col, value });
         }
         return { observed_bases, sheetIndex: sheet_index, edits: cell_edits };
     });
@@ -552,7 +568,7 @@ function excel_profile(file_path: string): ViewerProfile {
     // .xls is out of scope for editing: the writer above is an OOXML package
     // splice, and the binary BIFF container shares nothing with it.
     return file_path.toLowerCase().endsWith('.xlsx')
-        ? { ...base, editing: true, plan_save: plan_xlsx_save }
+        ? { ...base, editing: true, plan_save: plan_xlsx_save, edit_syntax: 'markdown' as const }
         : { ...base, editing: false };
 }
 
@@ -3572,6 +3588,9 @@ export function attach_viewer(
                                 ...(owns_edit_session() && active_edit_session_id
                                     ? { csvEditSessionId: active_edit_session_id }
                                     : {}),
+                                ...(profile.editing && profile.edit_syntax
+                                    ? { editSyntax: profile.edit_syntax }
+                                    : {}),
                             },
                             stateSnapshot: adoption_state,
                         }),
@@ -3813,6 +3832,9 @@ export function attach_viewer(
                                         csvSaveLifecycle: projected_save_lifecycle(),
                                         ...(owns_edit_session() && active_edit_session_id
                                             ? { csvEditSessionId: active_edit_session_id }
+                                            : {}),
+                                        ...(profile.editing && profile.edit_syntax
+                                            ? { editSyntax: profile.edit_syntax }
                                             : {}),
                                     },
                                     stateSnapshot: project_state_for_panel(
@@ -4450,7 +4472,11 @@ export function attach_viewer(
             const dirty_edits = Object.fromEntries(
                 Object.entries(worksheet.dirtyEdits).map(([key, entry]) => [
                     key,
-                    Object.freeze({ value: entry.value, base: entry.base }),
+                    // Wire runs are untrusted; the sanitizer keeps a run side
+                    // only when its text equals the plain projection, so the
+                    // planner can hand runs to the xlsx writer without
+                    // re-checking.
+                    Object.freeze(sanitized_dirty_entry(entry)),
                 ]),
             );
             const sheet_index = worksheet.sheetIndex ?? 0;
@@ -4516,7 +4542,7 @@ export function attach_viewer(
                     Object.fromEntries(
                         Object.entries(worksheet.dirtyEdits).map(([key, entry]) => [
                             key,
-                            { value: entry.value, base: entry.base },
+                            sanitized_dirty_entry(entry),
                         ]),
                     ),
                     target.sheetName,
@@ -4621,6 +4647,7 @@ export function attach_viewer(
                     sheet_index: worksheet.sheetIndex,
                     edits: worksheet.edits,
                     wanted_bases: new Set(Object.keys(worksheet.dirtyEdits)),
+                    dirty_edits: worksheet.dirtyEdits,
                 })),
             });
         } catch (error) {
@@ -6412,7 +6439,18 @@ export function attach_viewer(
                 }
                 const receiver_epoch = session.current_receiver_epoch;
                 const edit_session_id = msg.editSessionId;
-                const edits = msg.edits ? structuredClone(msg.edits) : null;
+                // Wire entries are untrusted and go durable below, where
+                // `validate_edit_cells` rejects the whole `pendingEdits` leaf on
+                // one malformed run side. Sanitizing here keeps a bad optional
+                // field from poisoning every sheet's drafts at the next decode.
+                const edits = msg.edits
+                    ? Object.fromEntries(
+                        Object.entries(msg.edits).map(([key, entry]) => [
+                            key,
+                            sanitized_dirty_entry(entry),
+                        ]),
+                    )
+                    : null;
                 const admission = Symbol(edit_session_id);
                 pending_edit_admissions.add(admission);
                 // The sheet the post names. Writes land in that slot only, so a

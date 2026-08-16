@@ -1,4 +1,4 @@
-import { type SheetPendingEditCells, worksheet_target_key } from '../types';
+import { type CsvDirtyEntry, type SheetPendingEditCells, worksheet_target_key } from '../types';
 
 /**
  * Host bridge: a narrow abstraction over the channel the webview uses to talk
@@ -72,9 +72,19 @@ function pending_edit_payload(edits: SheetPendingEditCells | null): string {
     const canonical: SheetPendingEditCells = {};
     for (const key of Object.keys(edits).sort()) {
         const entry = edits[key];
+        // Runs are part of durability identity: a formatting-only change has
+        // equal value/base strings, and canonicalizing them away would dedupe
+        // the post that carries the new formatting. Field order is pinned by
+        // this literal (runs were normalized at commit), so JSON equality is
+        // semantic equality here just as it is for the string sides.
         canonical[key] = typeof entry === 'string'
             ? entry
-            : { value: entry.value, base: entry.base };
+            : {
+                value: entry.value,
+                base: entry.base,
+                ...(entry.valueRuns ? { valueRuns: entry.valueRuns } : {}),
+                ...(entry.baseRuns ? { baseRuns: entry.baseRuns } : {}),
+            };
     }
     return JSON.stringify(canonical);
 }
@@ -138,7 +148,7 @@ function latest_pending_edit_publication(
 export const pending_edit_durability = {
     publish(
         editSessionId: string,
-        edits: Record<string, { value: string; base: string }> | null,
+        edits: Record<string, CsvDirtyEntry> | null,
         sheetIndex: number,
         sheetName: string | undefined,
         force = false,

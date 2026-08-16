@@ -96,6 +96,7 @@ import {
 } from './cell-overflow-model';
 import { count_lines, has_line_break } from './line-breaks';
 import { use_editing, type DirtyEntry } from './use-editing';
+import { cell_edit_text, edit_display_text, type EditSyntax } from '../cell-edit-model';
 import {
     create_edit_session_store,
     type EditSessionStore,
@@ -310,6 +311,8 @@ export interface GridShellProps {
     // only possible when csv_editable.
     edit_mode?: boolean;
     csv_editable?: boolean;
+    /** How this sheet's cells are edited ('markdown' for xlsx). Default 'plain'. */
+    edit_syntax?: EditSyntax;
     edit_session_id?: string;
     /** App-owned operation survives generation-keyed GridShell remounts. */
     save_operation?: CsvSaveOperation;
@@ -399,6 +402,7 @@ export function GridShell({
     preview_mode = false,
     edit_mode = false,
     csv_editable = false,
+    edit_syntax = 'plain',
     edit_session_id,
     save_operation,
     save_lifecycle = { revision: 0, state: 'idle' },
@@ -601,6 +605,7 @@ export function GridShell({
         get_row,
         get_source_row,
         get_cell_raw_for_source,
+        get_cell_for_source,
         sample_loaded_rows,
         version,
     } = loader;
@@ -673,6 +678,8 @@ export function GridShell({
     get_row_ref.current = get_row;
     const get_cell_raw_for_source_ref = useRef(get_cell_raw_for_source);
     get_cell_raw_for_source_ref.current = get_cell_raw_for_source;
+    const get_cell_for_source_ref = useRef(get_cell_for_source);
+    get_cell_for_source_ref.current = get_cell_for_source;
     // First parameter is a **canonical source row**, not a display row: durable
     // edit keys are source-keyed, and the store hands the row component of a key
     // straight to this reader (is_entry_conflicted / resolve_pending_bases).
@@ -703,7 +710,16 @@ export function GridShell({
         replace_dirty,
         clear_dirty_keys,
         discard_conflicted,
-    } = use_editing(get_cell_raw, generation, edit_session_id, store);
+    } = use_editing(get_cell_raw, generation, edit_session_id, store, {
+        syntax: edit_syntax,
+        // Same identity discipline as get_cell_raw: rebinds with `version` so
+        // freshly-loaded pages refresh markdown edit text and bases.
+        get_cell: useCallback(
+            (source_row: number, col: number) =>
+                get_cell_for_source_ref.current(source_row, col),
+            [version],
+        ),
+    });
 
     // Tint set = what the webview can derive ∪ what the host named. The union is
     // what everything downstream consumes (the paint callback's ref, the targeted
@@ -1928,10 +1944,28 @@ export function GridShell({
             // this closure's identity doesn't churn per edit; the targeted repaint
             // effect damages the cells whose tint actually changed.
             const editable = editable_cells && source_row !== undefined;
+            // On a markdown sheet the overlay editor must open with markup, not
+            // the plain projection: a dirty cell re-opens showing its committed
+            // runs, a clean cell its effective rich content. Only computed when
+            // the cell can actually open an editor — this is Glide's per-cell
+            // paint callback.
+            let edit_value: string | undefined;
+            if (edit_syntax === 'markdown' && editable && source_row !== undefined) {
+                if (dirty) {
+                    edit_value = edit_display_text(
+                        { text: dirty.value, rich: dirty.valueRuns },
+                        edit_syntax,
+                    );
+                } else {
+                    const loaded = get_row(row)?.[source_column];
+                    if (loaded) edit_value = cell_edit_text(loaded, edit_syntax);
+                }
+            }
             let overlay: CellEditOverlay | undefined;
             if (editable_cells || dirty || highlight_bg) {
                 overlay = {
                     editable,
+                    ...(edit_value !== undefined ? { edit_value } : {}),
                     // `refused` is narrower than `!editable` on purpose: it means
                     // "editing is on here and we are refusing this cell", which is
                     // the only situation where Glide's paste path needs closing. A
@@ -1965,6 +1999,7 @@ export function GridShell({
             show_formatting,
             version,
             editable_cells,
+            edit_syntax,
             font_size_px,
             source_column_for_display,
             get_source_row,

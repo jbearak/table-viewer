@@ -52,6 +52,13 @@ export function font_style(
 export interface CellEditOverlay {
     /** When set, display this dirty value instead of the persisted content. */
     dirty_value?: string;
+    /**
+     * What the edit overlay opens with, when it differs from the displayed
+     * text — the markdown serialization of the cell's effective rich content
+     * (or of the dirty entry's runs) on sheets that edit as markdown. Absent
+     * on plain sheets, where the editor opens with the raw text as before.
+     */
+    edit_value?: string;
     /** themeOverride background tint for dirty / conflicted cells. */
     bg?: string;
     /** Open Glide's edit overlay on this cell. */
@@ -222,8 +229,18 @@ function text_cell(
     );
     return {
         kind: GridCellKind.Text,
-        data: overlay?.dirty_value ?? (c.raw ?? ''),
+        // `edit_value` first: on a markdown sheet the overlay editor must open
+        // with the cell's markup, not the plain projection — deleting the `**`
+        // around a bold cell's text is how the user un-bolds it, so the field
+        // has to open with the `**` present.
+        data: overlay?.edit_value ?? overlay?.dirty_value ?? (c.raw ?? ''),
         displayData: display,
+        // Copy stays the plain text even when `data` is markup: Ctrl+C on an
+        // editable markdown cell must put the cell's value on the clipboard,
+        // not its edit-field spelling.
+        ...(overlay?.edit_value !== undefined
+            ? { copyData: overlay?.dirty_value ?? (c.raw ?? '') }
+            : {}),
         allowOverlay: overlay?.editable ?? false,
         // Wrap on a hard line break, or whenever the caller says the row is tall
         // enough for wrapping to show (`soft_wrap`: row height above the default).

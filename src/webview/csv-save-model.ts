@@ -34,7 +34,14 @@ export function collect_save_payload(
             });
         }
         edits[key] = entry.value;
-        exact[key] = Object.freeze({ value: entry.value, base: entry.base });
+        // Runs ride along: the xlsx save plan reads `valueRuns` off the exact
+        // entry to write styled inline strings; string-only consumers ignore it.
+        exact[key] = Object.freeze({
+            value: entry.value,
+            base: entry.base,
+            ...(entry.valueRuns ? { valueRuns: entry.valueRuns } : {}),
+            ...(entry.baseRuns ? { baseRuns: entry.baseRuns } : {}),
+        });
     }
     return Object.freeze({
         status: 'ready',
