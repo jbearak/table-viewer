@@ -19,6 +19,7 @@ export interface CsvCellEditorProps {
     onChange: (newValue: GridCell) => void;
     onFinishedEditing: (newValue?: GridCell, movement?: Movement) => void;
     onCommitNavigation?: (navigation: EditorCommitNavigation) => void;
+    initialValue?: string;
 }
 
 function cell_text(cell: GridCell): string {
@@ -43,6 +44,7 @@ export function CsvCellEditor({
     onChange,
     onFinishedEditing,
     onCommitNavigation,
+    initialValue,
 }: CsvCellEditorProps): React.JSX.Element {
     const initial = cell_text(value);
     const [text, set_text] = useState(initial);
@@ -61,8 +63,15 @@ export function CsvCellEditor({
             el.setSelectionRange(pos, pos);
             cursor_pos_ref.current = null;
         } else {
-            // Initial mount: select all so a keystroke replaces the cell.
-            el.select();
+            if (initialValue === undefined) {
+                // Mouse/Enter activation starts with the existing cell selected.
+                el.select();
+            } else {
+                // Type-to-edit has already placed the initiating text in `value`.
+                // Leave it intact so the next character appends instead of
+                // replacing it through the browser's selected-text behavior.
+                el.setSelectionRange(el.value.length, el.value.length);
+            }
             mounted_ref.current = true;
         }
     }, [is_multiline]);
