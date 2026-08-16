@@ -39,6 +39,24 @@ export type CellHyperlink =
     | { readonly kind: 'external'; readonly target: string; readonly tooltip?: string }
     | { readonly kind: 'internal'; readonly location: string; readonly tooltip?: string };
 
+/** The rich-content fields shared by the parser's CellData and the webview's
+ *  RenderedCell — declared once so a new field cannot be added to one model
+ *  and forgotten on the other. All sparse: absent = plain cell. */
+export interface RichCellFields {
+    /** Whole-cell underline from the cell's font. Absent = false. */
+    underline?: boolean;
+    /** Whole-cell strikethrough from the cell's font. Absent = false. */
+    strikethrough?: boolean;
+    /**
+     * Character-level runs, present only when the source string carries them.
+     * Run styles are EFFECTIVE (inheritance against the cell font already
+     * resolved by the parser); concatenated run text equals the raw text.
+     */
+    richText?: RichText;
+    /** The cell's hyperlink (Excel: at most one per cell). */
+    hyperlink?: CellHyperlink;
+}
+
 const STYLE_KEYS = ['bold', 'italic', 'underline', 'strikethrough'] as const;
 
 /** Drop false/absent fields; return undefined for an all-plain style. */
@@ -64,20 +82,6 @@ export function text_styles_equal(
 }
 
 /** Union of two styles: any property true in either is true in the result. */
-export function merge_text_styles(
-    base: CellTextStyle | undefined,
-    override: CellTextStyle | undefined,
-): CellTextStyle | undefined {
-    if (!base) return normalize_text_style(override);
-    if (!override) return normalize_text_style(base);
-    return normalize_text_style({
-        ...(base.bold || override.bold ? { bold: true } : {}),
-        ...(base.italic || override.italic ? { italic: true } : {}),
-        ...(base.underline || override.underline ? { underline: true } : {}),
-        ...(base.strikethrough || override.strikethrough ? { strikethrough: true } : {}),
-    });
-}
-
 /** Enforce the RichText invariants: remove empty runs, normalize styles, and
  *  merge adjacent runs whose styles are equal. */
 export function normalize_rich_text(value: RichText): RichText {

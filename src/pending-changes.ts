@@ -13,9 +13,11 @@
  * the host can refuse a save whose source moved underneath it.
  */
 
+import { is_plain_record } from './types';
 import {
     hyperlinks_equal,
     rich_text_equal,
+    rich_text_from_plain,
     rich_text_plain_text,
     type CellHyperlink,
     type RichText,
@@ -66,8 +68,7 @@ export function editable_values_equal(
     }
     const plain = left.kind === 'plain' ? left : (right as Extract<EditableCellValue, { kind: 'plain' }>);
     const rich = left.kind === 'richText' ? left : (right as Extract<EditableCellValue, { kind: 'richText' }>);
-    if (rich.value.runs.some((run) => run.style !== undefined)) return false;
-    return rich_text_plain_text(rich.value) === plain.text;
+    return rich_text_equal(rich.value, rich_text_from_plain(plain.text));
 }
 
 export function hyperlink_changes_equal(
@@ -82,12 +83,8 @@ export function hyperlink_changes_equal(
 const MAX_RUNS_PER_CELL = 4096;
 const MAX_HYPERLINK_LENGTH = 8 * 1024;
 
-function is_plain_object(value: unknown): value is Record<string, unknown> {
-    return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
 function is_valid_style(value: unknown): boolean {
-    if (!is_plain_object(value)) return false;
+    if (!is_plain_record(value)) return false;
     for (const [key, flag] of Object.entries(value)) {
         if (key !== 'bold' && key !== 'italic' && key !== 'underline' && key !== 'strikethrough') {
             return false;
@@ -98,24 +95,24 @@ function is_valid_style(value: unknown): boolean {
 }
 
 export function is_valid_rich_text(value: unknown): value is RichText {
-    if (!is_plain_object(value) || !Array.isArray(value.runs)) return false;
+    if (!is_plain_record(value) || !Array.isArray(value.runs)) return false;
     if (value.runs.length > MAX_RUNS_PER_CELL) return false;
     for (const run of value.runs) {
-        if (!is_plain_object(run) || typeof run.text !== 'string') return false;
+        if (!is_plain_record(run) || typeof run.text !== 'string') return false;
         if (run.style !== undefined && !is_valid_style(run.style)) return false;
     }
     return true;
 }
 
 export function is_valid_editable_value(value: unknown): value is EditableCellValue {
-    if (!is_plain_object(value)) return false;
+    if (!is_plain_record(value)) return false;
     if (value.kind === 'plain') return typeof value.text === 'string';
     if (value.kind === 'richText') return is_valid_rich_text(value.value);
     return false;
 }
 
 export function is_valid_hyperlink(value: unknown): value is CellHyperlink {
-    if (!is_plain_object(value)) return false;
+    if (!is_plain_record(value)) return false;
     if (value.tooltip !== undefined
         && (typeof value.tooltip !== 'string' || value.tooltip.length > MAX_HYPERLINK_LENGTH)) {
         return false;
@@ -134,7 +131,7 @@ export function is_valid_hyperlink(value: unknown): value is CellHyperlink {
 }
 
 export function is_valid_hyperlink_change(value: unknown): value is HyperlinkChange {
-    if (!is_plain_object(value)) return false;
+    if (!is_plain_record(value)) return false;
     const ok = (side: unknown): boolean => side === null || is_valid_hyperlink(side);
     return ok(value.value) && ok(value.base);
 }

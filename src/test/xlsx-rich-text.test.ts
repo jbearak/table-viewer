@@ -2,10 +2,11 @@ import { describe, it, expect } from 'vitest';
 import CFB from 'cfb';
 import { parse_xlsx, parse_xlsx_streaming } from '../parse-xlsx';
 import {
-    parse_run_properties,
+    parse_font_properties,
     parse_xlsx_string_item,
     font_to_style,
     resolve_rich_text_runs,
+    type ParsedRichString,
 } from '../xlsx-rich-text';
 import { parse_relationships, rels_path_for_part } from '../ooxml-relationships';
 import { ColumnarStore } from '../data-source/columnar-store';
@@ -13,50 +14,51 @@ import type { CellData } from '../types';
 
 // --- Unit: run-property parsing ---
 
-describe('parse_run_properties', () => {
+describe('parse_font_properties', () => {
     it('parses the four supported properties', () => {
-        expect(parse_run_properties('<b/><i/><u/><strike/>')).toEqual({
+        expect(parse_font_properties('<b/><i/><u/><strike/>')).toEqual({
             bold: true, italic: true, underline: true, strikethrough: true,
         });
     });
 
     it('returns undefined for a plain rPr', () => {
-        expect(parse_run_properties('<sz val="11"/><color theme="1"/>')).toBeUndefined();
+        expect(parse_font_properties('<sz val="11"/><color theme="1"/>')).toBeUndefined();
     });
 
     it('honors explicit-false values', () => {
-        expect(parse_run_properties('<b val="0"/><i val="false"/>')).toBeUndefined();
+        expect(parse_font_properties('<b val="0"/><i val="false"/>')).toBeUndefined();
     });
 
     it('treats u val="none" as off and other u values as on', () => {
-        expect(parse_run_properties('<u val="none"/>')).toBeUndefined();
-        expect(parse_run_properties('<u val="double"/>')).toEqual({ underline: true });
-        expect(parse_run_properties('<u val="singleAccounting"/>')).toEqual({ underline: true });
+        expect(parse_font_properties('<u val="none"/>')).toBeUndefined();
+        expect(parse_font_properties('<u val="double"/>')).toEqual({ underline: true });
+        expect(parse_font_properties('<u val="singleAccounting"/>')).toEqual({ underline: true });
     });
 });
 
 // --- Unit: string-item parsing ---
 
 describe('parse_xlsx_string_item', () => {
-    it('parses a plain <t> string', () => {
-        expect(parse_xlsx_string_item('<t>hello &amp; bye</t>')).toEqual({ text: 'hello & bye' });
+    it('parses a plain <t> string to a bare string', () => {
+        expect(parse_xlsx_string_item('<t>hello &amp; bye</t>')).toBe('hello & bye');
     });
 
-    it('parses rich runs with and without rPr', () => {
+    it('parses rich runs: absent style inherits, explicit empty rPr is null', () => {
         const parsed = parse_xlsx_string_item(
-            '<r><t>plain </t></r><r><rPr><b/></rPr><t>bold</t></r>'
-        );
-        expect(parsed.text).toBe('plain bold');
+            '<r><t>plain </t></r><r><rPr><b/></rPr><t>bold</t></r><r><rPr><sz val="11"/></rPr><t>reset</t></r>'
+        ) as ParsedRichString;
+        expect(parsed.text).toBe('plain boldreset');
         expect(parsed.runs).toEqual([
-            { text: 'plain ', inherits_cell_font: true },
-            { text: 'bold', style: { bold: true }, inherits_cell_font: false },
+            { text: 'plain ' },
+            { text: 'bold', style: { bold: true } },
+            { text: 'reset', style: null },
         ]);
     });
 
     it('skips <rPh> phonetic runs', () => {
         const parsed = parse_xlsx_string_item(
             '<r><t>漢字</t></r><rPh sb="0" eb="2"><t>かんじ</t></rPh>'
-        );
+        ) as ParsedRichString;
         expect(parsed.text).toBe('漢字');
         expect(parsed.runs).toHaveLength(1);
     });
@@ -67,7 +69,7 @@ describe('parse_xlsx_string_item', () => {
 describe('resolve_rich_text_runs', () => {
     const parsed = parse_xlsx_string_item(
         '<r><t>plain </t></r><r><rPr><b/></rPr><t>bold</t></r>'
-    );
+    ) as ParsedRichString;
 
     it('binds inheriting runs to the cell font', () => {
         const rich = resolve_rich_text_runs(parsed, font_to_style({ bold: false, italic: true }));
@@ -78,17 +80,23 @@ describe('resolve_rich_text_runs', () => {
     });
 
     it('returns undefined when every run equals the cell style', () => {
-        const all_bold = parse_xlsx_string_item('<r><rPr><b/></rPr><t>x</t></r>');
+        const all_bold = parse_xlsx_string_item('<r><rPr><b/></rPr><t>x</t></r>') as ParsedRichString;
         expect(resolve_rich_text_runs(all_bold, { bold: true })).toBeUndefined();
-        const all_inherit = parse_xlsx_string_item('<r><t>a</t></r><r><t>b</t></r>');
+        const all_inherit = parse_xlsx_string_item('<r><t>a</t></r><r><t>b</t></r>') as ParsedRichString;
         expect(resolve_rich_text_runs(all_inherit, { bold: true })).toBeUndefined();
     });
 
     it('a present rPr REPLACES the cell font rather than merging', () => {
         // Bold cell font; the run's rPr says only italic — the run is italic, NOT bold+italic.
-        const one_run = parse_xlsx_string_item('<r><rPr><i/></rPr><t>x</t></r>');
+        const one_run = parse_xlsx_string_item('<r><rPr><i/></rPr><t>x</t></r>') as ParsedRichString;
         const rich = resolve_rich_text_runs(one_run, { bold: true });
         expect(rich?.runs).toEqual([{ text: 'x', style: { italic: true } }]);
+        // Explicit plain rPr on a bold cell: the run resets to plain.
+        const reset = parse_xlsx_string_item('<r><t>a</t></r><r><rPr><sz val="1"/></rPr><t>b</t></r>') as ParsedRichString;
+        expect(resolve_rich_text_runs(reset, { bold: true })?.runs).toEqual([
+            { text: 'a', style: { bold: true } },
+            { text: 'b' },
+        ]);
     });
 });
 
@@ -101,7 +109,7 @@ describe('ooxml-relationships', () => {
             <Relationship Id="rId2" Type="t/image" Target="../media/image1.png"/>
         </Relationships>`);
         expect(rels.get('rId1')).toEqual({
-            id: 'rId1', type: 't/hyperlink', target: 'https://example.com', external: true,
+            type: 't/hyperlink', target: 'https://example.com', external: true,
         });
         expect(rels.get('rId2')?.external).toBe(false);
     });
@@ -343,7 +351,6 @@ describe('parse_xlsx rich text and hyperlinks', () => {
         const builder = new ColumnarStore.Builder(meta.rowCount, meta.columnCount);
         meta.fill(builder);
         const store = builder.build();
-        expect(store.extrasSize).toBe(1);
         const cell = store.read_window(0, 1)[0][0];
         expect(cell?.richText?.runs).toEqual([
             { text: 'a' },

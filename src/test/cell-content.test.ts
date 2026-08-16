@@ -1,7 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
     hyperlinks_equal,
-    merge_text_styles,
     normalize_rich_text,
     normalize_text_style,
     rich_text_equal,
@@ -34,15 +33,6 @@ describe('text_styles_equal', () => {
         expect(text_styles_equal({ bold: true }, { bold: true })).toBe(true);
         expect(text_styles_equal({ bold: true }, { italic: true })).toBe(false);
         expect(text_styles_equal({ underline: true }, undefined)).toBe(false);
-    });
-});
-
-describe('merge_text_styles', () => {
-    it('unions properties', () => {
-        expect(merge_text_styles({ bold: true }, { italic: true })).toEqual({ bold: true, italic: true });
-    });
-    it('returns undefined when both are plain', () => {
-        expect(merge_text_styles(undefined, {})).toBeUndefined();
     });
 });
 

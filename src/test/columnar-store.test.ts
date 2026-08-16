@@ -59,8 +59,6 @@ describe('ColumnarStore', () => {
         });
         b.set(0, 1, { raw: 'x', formatted: 'x', bold: true, italic: false, rawType: 'string' });
         const store = b.build();
-        expect(store.extrasSize).toBe(1);
-
         const [row] = store.read_window(0, 1);
         expect(row[0]?.underline).toBe(true);
         expect(row[0]?.strikethrough).toBe(true);
@@ -80,7 +78,6 @@ describe('ColumnarStore', () => {
         });
         b.set(0, 0, { raw: 'a', formatted: 'a', bold: false, italic: false, rawType: 'string' });
         const store = b.build();
-        expect(store.extrasSize).toBe(0);
         expect(store.read_window(0, 1)[0][0]?.hyperlink).toBeUndefined();
     });
     it('materializes only requested columns in compact requested order', () => {

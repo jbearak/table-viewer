@@ -2,7 +2,7 @@ import type { CellHyperlink, RichText } from '../cell-content';
 import type { RenderedCell } from './interface';
 
 const NULL_IDX = -1;
-const BOLD = 1, ITALIC = 2, UNDERLINE = 4, STRIKETHROUGH = 8;
+const BOLD = 1, ITALIC = 2, UNDERLINE = 4, STRIKETHROUGH = 8, HAS_EXTRAS = 16;
 const TYPE_STRING = 1, TYPE_NUMBER = 2, TYPE_BOOLEAN = 3, TYPE_EMPTY = 4, TYPE_DATE = 5;
 
 /** Sparse per-cell metadata that only exceptional cells carry. Immutable
@@ -29,8 +29,6 @@ export class ColumnarStore {
     get poolSize(): number { return this.pool.length; }
     get rowCount(): number { return this.rows; }
     get colCount(): number { return this.cols; }
-    /** Diagnostic: number of cells carrying sparse rich/link metadata. */
-    get extrasSize(): number { return this.extras.size; }
 
     read_window(start_row: number, count: number): (RenderedCell | null)[][] {
         const start = Math.max(0, Math.min(start_row, this.rows));
@@ -100,9 +98,13 @@ export class ColumnarStore {
         };
         if ((flags & UNDERLINE) !== 0) cell.underline = true;
         if ((flags & STRIKETHROUGH) !== 0) cell.strikethrough = true;
-        const extras = this.extras.size > 0 ? this.extras.get(index) : undefined;
-        if (extras?.richText) cell.richText = extras.richText;
-        if (extras?.hyperlink) cell.hyperlink = extras.hyperlink;
+        // The HAS_EXTRAS bit keeps plain-cell reads off the map entirely, so
+        // one linked cell doesn't turn every read into a hash probe.
+        if ((flags & HAS_EXTRAS) !== 0) {
+            const extras = this.extras.get(index);
+            if (extras?.richText) cell.richText = extras.richText;
+            if (extras?.hyperlink) cell.hyperlink = extras.hyperlink;
+        }
         return cell;
     }
 
@@ -134,16 +136,19 @@ export class ColumnarStore {
             if (r < 0 || r >= this.rows || c < 0 || c >= this.cols) {
                 throw new RangeError(`cell (${r},${c}) out of bounds for ${this.rows}x${this.cols} store`);
             }
+            // Overwrites are rare (fills write each index once), so only pay
+            // the map delete when this index actually held extras.
+            if ((this.flags[i] & HAS_EXTRAS) !== 0) this.extras.delete(i);
             if (cell === null) {
                 this.rawIdx[i] = NULL_IDX;
                 this.fmtIdx[i] = NULL_IDX;
-                this.extras.delete(i);
+                this.flags[i] = 0;
                 return;
             }
             // raw === null normalised to '' — consistent with interface's null = empty cell semantics
             this.rawIdx[i] = this.intern(cell.raw ?? '');
             this.fmtIdx[i] = this.intern(cell.formatted);
-            this.flags[i] = (cell.bold ? BOLD : 0)
+            let flags = (cell.bold ? BOLD : 0)
                 | (cell.italic ? ITALIC : 0)
                 | (cell.underline ? UNDERLINE : 0)
                 | (cell.strikethrough ? STRIKETHROUGH : 0);
@@ -151,13 +156,13 @@ export class ColumnarStore {
             if (cell.richText || cell.hyperlink) {
                 // Stored by reference: the parser hands over immutable objects
                 // (shared across cells that reuse one rich shared string).
-                this.extras.set(i, {
-                    ...(cell.richText ? { richText: cell.richText } : {}),
-                    ...(cell.hyperlink ? { hyperlink: cell.hyperlink } : {}),
-                });
-            } else {
-                this.extras.delete(i);
+                const extras: CellExtras = {};
+                if (cell.richText) extras.richText = cell.richText;
+                if (cell.hyperlink) extras.hyperlink = cell.hyperlink;
+                this.extras.set(i, extras);
+                flags |= HAS_EXTRAS;
             }
+            this.flags[i] = flags;
         }
 
         build(): ColumnarStore {

@@ -19,21 +19,24 @@ import {
 } from './cell-content';
 import type { FontEntry } from './spreadsheet-format';
 
-/** A run as it appears in the source, before cell-font inheritance resolves. */
+/** A run as it appears in the source, before cell-font inheritance resolves.
+ *  `style` is tri-state: absent = no `<rPr>`, the run inherits the cell font;
+ *  `null` = an explicit `<rPr>` with none of the supported properties (OOXML:
+ *  a present `<rPr>` REPLACES the cell font, so this run is plain); an object
+ *  = explicit formatting. */
 export interface ParsedSourceRun {
     readonly text: string;
-    /** Absent when the run had no `<rPr>` — it inherits the cell font. A
-     *  present `<rPr>` REPLACES the cell font (OOXML semantics), so missing
-     *  properties inside it are false, not inherited. */
-    readonly style?: CellTextStyle;
-    readonly inherits_cell_font: boolean;
+    readonly style?: CellTextStyle | null;
 }
 
-export interface ParsedXlsxString {
+/** A rich `<si>`/`<is>` — plain strings stay plain `string`s so a large
+ *  sharedStrings table doesn't allocate a wrapper per entry. */
+export interface ParsedRichString {
     readonly text: string;
-    /** Present only when the source string had `<r>` runs. */
-    readonly runs?: readonly ParsedSourceRun[];
+    readonly runs: readonly ParsedSourceRun[];
 }
+
+export type ParsedXlsxString = string | ParsedRichString;
 
 /** Parse boolean-ish OOXML property values: absent val = true. */
 function prop_on(inner: string, tag: string): boolean {
@@ -56,15 +59,19 @@ function underline_on(inner: string): boolean {
     return on;
 }
 
-/** Parse the four supported properties out of an `<rPr>` body. Unsupported
- *  properties (font, color, size, vertAlign, …) are ignored. */
-export function parse_run_properties(rpr_inner: string): CellTextStyle | undefined {
-    return normalize_text_style({
-        ...(prop_on(rpr_inner, 'b') ? { bold: true } : {}),
-        ...(prop_on(rpr_inner, 'i') ? { italic: true } : {}),
-        ...(underline_on(rpr_inner) ? { underline: true } : {}),
-        ...(prop_on(rpr_inner, 'strike') ? { strikethrough: true } : {}),
-    });
+/**
+ * Parse the four supported properties out of an OOXML font-property body —
+ * both `<rPr>` (run) and `<font>` (styles.xml) use the same child tags, so
+ * this is the single decoder for both. Unsupported properties (name, color,
+ * size, vertAlign, …) are ignored. Returns undefined when all four are off.
+ */
+export function parse_font_properties(inner: string): CellTextStyle | undefined {
+    let style: { -readonly [K in keyof CellTextStyle]?: true } | undefined;
+    if (prop_on(inner, 'b')) (style ??= {}).bold = true;
+    if (prop_on(inner, 'i')) (style ??= {}).italic = true;
+    if (underline_on(inner)) (style ??= {}).underline = true;
+    if (prop_on(inner, 'strike')) (style ??= {}).strikethrough = true;
+    return style;
 }
 
 /**
@@ -75,7 +82,7 @@ export function parse_run_properties(rpr_inner: string): CellTextStyle | undefin
 export function parse_xlsx_string_item(inner: string): ParsedXlsxString {
     if (inner.indexOf('<r>') === -1 && inner.indexOf('<r ') === -1) {
         const t = get_text(inner, 't');
-        return { text: t !== null ? decode_xml(t) : '' };
+        return t !== null ? decode_xml(t) : '';
     }
     const runs: ParsedSourceRun[] = [];
     let text = '';
@@ -86,14 +93,9 @@ export function parse_xlsx_string_item(inner: string): ParsedXlsxString {
         text += run_text;
         const rpr = get_text(r_inner, 'rPr');
         if (rpr === null) {
-            runs.push({ text: run_text, inherits_cell_font: true });
+            runs.push({ text: run_text });
         } else {
-            const style = parse_run_properties(rpr);
-            runs.push({
-                text: run_text,
-                ...(style ? { style } : {}),
-                inherits_cell_font: false,
-            });
+            runs.push({ text: run_text, style: parse_font_properties(rpr) ?? null });
         }
     });
     return { text, runs };
@@ -109,20 +111,29 @@ export function font_to_style(font: FontEntry): CellTextStyle | undefined {
     });
 }
 
+/** Compact cache key for a cell font's four flags. Lives here, next to
+ *  font_to_style, so a new CellTextStyle property extends both together. */
+export function font_style_bits(font: FontEntry): number {
+    return (font.bold ? 1 : 0) | (font.italic ? 2 : 0)
+        | (font.underline ? 4 : 0) | (font.strikethrough ? 8 : 0);
+}
+
+/** Number of distinct font_style_bits values — the cache-key stride. */
+export const FONT_STYLE_BITS_RANGE = 16;
+
 /**
- * Bind a parsed string's runs to a referencing cell's font, producing
+ * Bind a parsed rich string's runs to a referencing cell's font, producing
  * effective runs — or undefined when the result carries no information beyond
  * the whole-cell flags (every run resolves to exactly the cell style), so
  * plain strings stay cheap.
  */
 export function resolve_rich_text_runs(
-    parsed: ParsedXlsxString,
+    parsed: ParsedRichString,
     cell_style: CellTextStyle | undefined,
 ): RichText | undefined {
-    if (!parsed.runs) return undefined;
     let all_cell_style = true;
     const runs = parsed.runs.map((run) => {
-        const style = run.inherits_cell_font ? cell_style : run.style;
+        const style = run.style === undefined ? cell_style : run.style ?? undefined;
         if (!text_styles_equal(style, cell_style)) all_cell_style = false;
         return style ? { text: run.text, style } : { text: run.text };
     });

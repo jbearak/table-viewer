@@ -9,7 +9,6 @@
 import { get_attr, iter_elements } from './ooxml-xml';
 
 export interface OoxmlRelationship {
-    readonly id: string;
     readonly type: string;
     readonly target: string;
     /** True when TargetMode="External" — the target is a URI, not a package part. */
@@ -25,7 +24,7 @@ export function parse_relationships(xml: string): Map<string, OoxmlRelationship>
         const target = get_attr(open_tag, 'Target');
         if (!id || !type || target === null) return;
         const external = get_attr(open_tag, 'TargetMode') === 'External';
-        rels.set(id, { id, type, target, external });
+        rels.set(id, { type, target, external });
     });
     return rels;
 }

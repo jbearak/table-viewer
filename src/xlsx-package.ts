@@ -9,8 +9,8 @@ import {
     type XlsxCellEdit,
 } from './xlsx-cell-write';
 import { is_date_format } from './spreadsheet-format';
+import { decode_xml } from './ooxml-xml';
 import {
-    decode_xml,
     parse_styles,
     parse_workbook_xml,
     resolve_part_path,

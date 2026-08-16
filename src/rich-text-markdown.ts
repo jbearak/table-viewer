@@ -206,16 +206,35 @@ export function markdown_to_rich_text(markdown: string): RichText {
     }
     // Anything still on a stack (or with chars left) is literal via `left`.
 
-    // Assembly: walk tokens; a token's style is the union of spans that
-    // strictly contain it. Leftover delimiter characters become literal text.
+    // Assembly: walk tokens once; a token's style is the union of spans that
+    // strictly contain it, tracked with per-style active counters driven by
+    // open/close events indexed by token position (O(tokens + spans) rather
+    // than checking every span against every token). Leftover delimiter
+    // characters become literal text.
+    const opens_at = new Map<number, (keyof CellTextStyle)[]>();
+    const closes_at = new Map<number, (keyof CellTextStyle)[]>();
+    const push_event = (map: Map<number, (keyof CellTextStyle)[]>, at: number, style: keyof CellTextStyle) => {
+        const list = map.get(at);
+        if (list) list.push(style); else map.set(at, [style]);
+    };
+    for (const span of spans) {
+        push_event(opens_at, span.open, span.style);
+        push_event(closes_at, span.close, span.style);
+    }
+    const active: Record<keyof CellTextStyle, number> = {
+        bold: 0, italic: 0, underline: 0, strikethrough: 0,
+    };
     const runs: RichTextRun[] = [];
     for (let idx = 0; idx < tokens.length; idx++) {
+        // Containment is strict, so a close event takes effect AT its token
+        // and an open event only after its token.
+        for (const s of closes_at.get(idx) ?? []) active[s]--;
         const token = tokens[idx];
-        let text: string;
+        let text: string | undefined;
         if (token.kind === 'text') {
             text = token.text;
         } else if (token.left === 0) {
-            continue;
+            text = undefined;
         } else if (token.kind === 'star') {
             text = '*'.repeat(token.left);
         } else if (token.kind === 'tilde') {
@@ -223,12 +242,16 @@ export function markdown_to_rich_text(markdown: string): RichText {
         } else {
             text = token.kind === 'uopen' ? '<u>' : '</u>';
         }
-        const style: { -readonly [K in keyof CellTextStyle]?: true } = {};
-        for (const span of spans) {
-            if (span.open < idx && idx < span.close) style[span.style] = true;
+        if (text !== undefined) {
+            const style: { -readonly [K in keyof CellTextStyle]?: true } = {};
+            if (active.bold > 0) style.bold = true;
+            if (active.italic > 0) style.italic = true;
+            if (active.underline > 0) style.underline = true;
+            if (active.strikethrough > 0) style.strikethrough = true;
+            const normalized = normalize_text_style(style);
+            runs.push(normalized ? { text, style: normalized } : { text });
         }
-        const normalized = normalize_text_style(style);
-        runs.push(normalized ? { text, style: normalized } : { text });
+        for (const s of opens_at.get(idx) ?? []) active[s]++;
     }
     return normalize_rich_text({ runs });
 }

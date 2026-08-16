@@ -19,30 +19,19 @@ import type { FontEntry, XfEntry, DateMode } from './spreadsheet-format';
 import type { WorkbookData, SheetData, CellData, MergeRange } from './types';
 import type { CellHyperlink, RichText } from './cell-content';
 import {
+    font_style_bits,
     font_to_style,
+    FONT_STYLE_BITS_RANGE,
+    parse_font_properties,
     parse_xlsx_string_item,
     resolve_rich_text_runs,
     type ParsedXlsxString,
 } from './xlsx-rich-text';
 import { parse_relationships, rels_path_for_part, type OoxmlRelationship } from './ooxml-relationships';
 
-// --- XML Helpers ---
-//
-// The scanning primitives moved to ./ooxml-xml so the rich-text and hyperlink
-// parsers share the exact same scans; re-exported here because the writer and
-// tests import them from this module.
-
-import {
-    decode_xml,
-    find_tag_end,
-    get_attr,
-    get_text,
-    is_self_closing,
-    is_tag_boundary,
-    iter_elements,
-} from './ooxml-xml';
-
-export { decode_xml, find_tag_end, is_self_closing, is_tag_boundary };
+// The XML scanning primitives live in ./ooxml-xml so the rich-text and
+// hyperlink parsers (and the writer) share the exact same scans.
+import { decode_xml, get_attr, get_text, iter_elements } from './ooxml-xml';
 
 // --- ZIP / Entry Access ---
 
@@ -87,15 +76,10 @@ function parse_sheet_rels(cfb_file: ReturnType<typeof CFB.read>): Map<string, st
     const xml = get_entry_text(cfb_file, '/xl/_rels/workbook.xml.rels');
     if (!xml) return map;
 
-    iter_elements(xml, 'Relationship', (open_tag) => {
-        const type = get_attr(open_tag, 'Type');
-        if (!type || !type.endsWith('/worksheet')) return;
-        const id = get_attr(open_tag, 'Id');
-        const target = get_attr(open_tag, 'Target');
-        if (id && target) {
-            map.set(id, resolve_part_path(target));
-        }
-    });
+    for (const [id, rel] of parse_relationships(xml)) {
+        if (!rel.type.endsWith('/worksheet')) continue;
+        map.set(id, resolve_part_path(rel.target));
+    }
 
     return map;
 }
@@ -174,23 +158,14 @@ export function parse_styles(xml: string): { fonts: FontEntry[]; xfs: XfEntry[];
     const fonts_section = get_text(xml, 'fonts');
     if (fonts_section) {
         iter_elements(fonts_section, 'font', (_open, inner) => {
-            const has_b = /<b[\s/>]/.test(inner);
-            const bold = has_b && !/\bb val="0"/.test(inner);
-            const has_i = /<i[\s/>]/.test(inner);
-            const italic = has_i && !/\bi val="0"/.test(inner);
-            // Underline: <u/> = single; val of none/0/false = off; any other
-            // val (single, double, *Accounting) = on. Strike follows the same
-            // boolean rule as bold/italic.
-            const u_match = inner.match(/<u(?:\s+val="([^"]*)")?\s*\/?>/);
-            const underline = u_match !== null
-                && u_match[1] !== 'none' && u_match[1] !== '0' && u_match[1] !== 'false';
-            const has_s = /<strike[\s/>]/.test(inner);
-            const strikethrough = has_s && !/\bstrike val="(?:0|false)"/.test(inner);
+            // <font> and <rPr> share the same property tags, so both go
+            // through the one decoder in xlsx-rich-text.ts.
+            const style = parse_font_properties(inner);
             fonts.push({
-                bold,
-                italic,
-                ...(underline ? { underline: true as const } : {}),
-                ...(strikethrough ? { strikethrough: true as const } : {}),
+                bold: style?.bold === true,
+                italic: style?.italic === true,
+                ...(style?.underline ? { underline: true as const } : {}),
+                ...(style?.strikethrough ? { strikethrough: true as const } : {}),
             });
         });
     }
@@ -328,19 +303,19 @@ function parse_worksheet_core(
 ): WorksheetWorking {
     // Rich-run resolution cache: one shared string may be referenced by many
     // cells, but binding (run inheritance) depends only on the cell font, so
-    // (sst index, font bits) fully determines the resolved RichText object.
+    // (sst index, font-style bits) fully determines the resolved RichText.
     // Cache hits also mean referencing cells share ONE RichText by reference,
-    // which the columnar store's sparse extras map preserves.
-    const rich_cache = new Map<string, RichText | undefined>();
+    // which the columnar store's sparse extras map preserves. `null` marks a
+    // cached "resolves to plain" so misses need a single get().
+    const rich_cache = new Map<number, RichText | null>();
     const resolve_shared_rich = (idx: number, font: FontEntry): RichText | undefined => {
         const parsed = sst[idx];
-        if (!parsed.runs) return undefined;
-        const bits = (font.bold ? 1 : 0) | (font.italic ? 2 : 0)
-            | (font.underline ? 4 : 0) | (font.strikethrough ? 8 : 0);
-        const key = `${idx}:${bits}`;
-        if (rich_cache.has(key)) return rich_cache.get(key);
+        if (typeof parsed === 'string') return undefined;
+        const key = idx * FONT_STYLE_BITS_RANGE + font_style_bits(font);
+        const cached = rich_cache.get(key);
+        if (cached !== undefined) return cached ?? undefined;
         const rich = resolve_rich_text_runs(parsed, font_to_style(font));
-        rich_cache.set(key, rich);
+        rich_cache.set(key, rich ?? null);
         return rich;
     };
     // Parse dimension and validate row/col limits early before materializing cells
@@ -397,7 +372,8 @@ function parse_worksheet_core(
                     // Shared string (already decoded during SST parsing)
                     const idx = v_text !== null ? parseInt(v_text, 10) : -1;
                     if (idx >= 0 && idx < sst.length) {
-                        raw = sst[idx].text;
+                        const entry = sst[idx];
+                        raw = typeof entry === 'string' ? entry : entry.text;
                         richText = resolve_shared_rich(idx, style);
                     }
                     formatted = raw !== null ? String(raw) : '';
@@ -421,8 +397,12 @@ function parse_worksheet_core(
                     const is_elem = get_text(c_inner, 'is');
                     if (is_elem) {
                         const parsed = parse_xlsx_string_item(is_elem);
-                        raw = parsed.text;
-                        richText = resolve_rich_text_runs(parsed, font_to_style(style));
+                        if (typeof parsed === 'string') {
+                            raw = parsed;
+                        } else {
+                            raw = parsed.text;
+                            richText = resolve_rich_text_runs(parsed, font_to_style(style));
+                        }
                     }
                     formatted = raw !== null ? String(raw) : '';
                 } else if (t === 'd') {
@@ -451,10 +431,9 @@ function parse_worksheet_core(
                     }
                 }
 
-                cells.set(`${row}:${col}`, {
-                    raw, formatted, rawType, ...style,
-                    ...(richText ? { richText } : {}),
-                });
+                const cell: CellData = { raw, formatted, rawType, ...style };
+                if (richText) cell.richText = richText;
+                cells.set(`${row}:${col}`, cell);
                 // Defensive pre-check: bound the in-progress cell map during
                 // streaming parse so a single pathological sheet can't exhaust
                 // memory before the cumulative budget is enforced below. A lone
@@ -500,7 +479,7 @@ function parse_worksheet_core(
             const key = `${row}:${col}`;
             const existing = cells.get(key);
             if (existing) {
-                cells.set(key, { ...existing, hyperlink });
+                existing.hyperlink = hyperlink;
             } else {
                 cells.set(key, { raw: null, formatted: '', bold: false, italic: false, hyperlink });
                 if (row + 1 > max_row) max_row = row + 1;

@@ -1,22 +1,16 @@
 import type { MergeRange } from '../types';
-import type { CellHyperlink, RichText } from '../cell-content';
+import type { RichCellFields } from '../cell-content';
 
 /** Webview-facing cell. Identical shape to the old CellData so the renderer
  *  is format-agnostic. `raw` is the raw value rendered to string (numbers/bools
- *  become their string form — acceptable: copy + edit-base both String() it). */
-export interface RenderedCell {
+ *  become their string form — acceptable: copy + edit-base both String() it).
+ *  The rich fields are shared with CellData via RichCellFields; only Excel
+ *  sources set them, so CSV cells keep their exact legacy shape. */
+export interface RenderedCell extends RichCellFields {
     raw: string | null;       // null = empty cell
     formatted: string;        // display text (== raw for CSV)
     bold: boolean;
     italic: boolean;
-    /** Whole-cell underline/strikethrough. Absent = false; only Excel sources
-     *  set them, so CSV cells keep their exact legacy shape. */
-    underline?: boolean;
-    strikethrough?: boolean;
-    /** Character-level effective runs; present only for rich source strings. */
-    richText?: RichText;
-    /** The cell's hyperlink (Excel: at most one per cell). */
-    hyperlink?: CellHyperlink;
     /** Original scalar category retained for correct numeric sorting. */
     rawType?: 'string' | 'number' | 'boolean' | 'date' | 'empty';
 }
