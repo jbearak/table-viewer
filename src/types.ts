@@ -8,9 +8,13 @@ import type {
     WorkbookSnapshot,
     WorkbookSnapshotIdentity,
 } from './viewer-snapshot';
-import { rich_text_plain_text, type RichCellFields, type RichText } from './cell-content';
+import {
+    is_matching_rich_text,
+    rich_text_equal,
+    type RichCellFields,
+    type RichText,
+} from './cell-content';
 import { is_plain_record } from './plain-record';
-import { is_valid_rich_text } from './pending-changes';
 
 export interface WorkbookData {
     sheets: SheetData[];
@@ -751,17 +755,14 @@ function validate_edit_cells(value: unknown): Record<string, string | CsvDirtyEn
         // Optional styled-run sides of a rich edit. Rejected (not dropped) when
         // malformed, like every other field: silently stripping runs would turn
         // a formatting edit into a no-op that still overwrites the cell. The
-        // concatenated run text must equal its plain projection — the string
-        // side is what base validation and the CSV serializer see, so runs
-        // spelling different text would smuggle a value past both.
+        // text-agreement half of the predicate is the smuggling boundary — see
+        // `is_matching_rich_text`.
         for (const [runs, text] of [
             [entry.valueRuns, entry.value],
             [entry.baseRuns, entry.base],
         ] as const) {
             if (runs === undefined) continue;
-            if (!is_valid_rich_text(runs) || rich_text_plain_text(runs) !== text) {
-                invalid_leaf('pendingEdits');
-            }
+            if (!is_matching_rich_text(runs, text)) invalid_leaf('pendingEdits');
         }
     }
     return value as Record<string, string | CsvDirtyEntry>;
@@ -1301,17 +1302,34 @@ export interface CsvDirtyEntry {
 export type CsvDirtyMap = Readonly<Record<string, CsvDirtyEntry>>;
 
 /**
+ * The one constructor of the sparse dirty-entry shape: run sides present only
+ * when given, so plain edits keep their exact legacy `{value, base}` form.
+ * Every layer that copies an entry into an owned object (store commit, wire
+ * payload, save payload, durable persist) goes through here, so a future
+ * optional field is added in one place rather than per copy site.
+ */
+export function make_dirty_entry(
+    value: string,
+    base: string,
+    valueRuns?: RichText,
+    baseRuns?: RichText,
+): CsvDirtyEntry {
+    return {
+        value,
+        base,
+        ...(valueRuns !== undefined ? { valueRuns } : {}),
+        ...(baseRuns !== undefined ? { baseRuns } : {}),
+    };
+}
+
+/**
  * Copy an untrusted dirty entry into the exact owned shape, keeping a run side
- * only when it is well-formed AND its concatenated text equals the plain side.
- *
- * The text-agreement check is the security boundary, same as in
- * `validate_edit_cells`: base validation and the CSV serializer see the string
- * sides, but the xlsx writer writes the runs' text when styled — runs spelling
- * different text would smuggle a value past validation. Unlike the durable
- * validator this *drops* a bad run side rather than rejecting the entry: this
- * runs on the save path, where the plain projection is still the text the user
- * committed, so writing it unstyled is a correct save while refusing the whole
- * operation over one malformed optional field is not.
+ * only when `is_matching_rich_text` accepts it — the same smuggling boundary
+ * `validate_edit_cells` enforces. Unlike the durable validator this *drops* a
+ * bad run side rather than rejecting the entry: this runs on the save path,
+ * where the plain projection is still the text the user committed, so writing
+ * it unstyled is a correct save while refusing the whole operation over one
+ * malformed optional field is not.
  */
 export function sanitized_dirty_entry(entry: {
     readonly value: string;
@@ -1320,26 +1338,23 @@ export function sanitized_dirty_entry(entry: {
     readonly baseRuns?: unknown;
 }): CsvDirtyEntry {
     const keep = (runs: unknown, text: string): RichText | undefined => (
-        runs !== undefined && is_valid_rich_text(runs) && rich_text_plain_text(runs) === text
-            ? runs
-            : undefined
+        is_matching_rich_text(runs, text) ? runs : undefined
     );
-    const value_runs = keep(entry.valueRuns, entry.value);
-    const base_runs = keep(entry.baseRuns, entry.base);
-    return {
-        value: entry.value,
-        base: entry.base,
-        ...(value_runs !== undefined ? { valueRuns: value_runs } : {}),
-        ...(base_runs !== undefined ? { baseRuns: base_runs } : {}),
-    };
+    return make_dirty_entry(
+        entry.value,
+        entry.base,
+        keep(entry.valueRuns, entry.value),
+        keep(entry.baseRuns, entry.base),
+    );
 }
 
 /**
  * Durable identity of one dirty entry — the comparison every dedupe/no-op
  * guard on the edit path shares (store notification suppression, wire payload
- * dedupe, save-lifecycle operation matching). Runs compare structurally: they
- * are normalized at commit, so equal formatting is equal structure, and a
- * formatting-only difference must read as a real difference everywhere at once.
+ * dedupe, save-lifecycle operation matching). Runs compare via the canonical
+ * `rich_text_equal` (an absent side differs from a present one), so equal
+ * formatting is equal identity and a formatting-only difference reads as a
+ * real difference everywhere at once.
  */
 export function dirty_entries_equal(
     left: CsvDirtyEntry,
@@ -1357,19 +1372,7 @@ function optional_runs_equal(
 ): boolean {
     if (left === right) return true;
     if (left === undefined || right === undefined) return false;
-    if (left.runs.length !== right.runs.length) return false;
-    for (let i = 0; i < left.runs.length; i++) {
-        const a = left.runs[i];
-        const b = right.runs[i];
-        if (a.text !== b.text) return false;
-        if ((a.style?.bold ?? false) !== (b.style?.bold ?? false)
-            || (a.style?.italic ?? false) !== (b.style?.italic ?? false)
-            || (a.style?.underline ?? false) !== (b.style?.underline ?? false)
-            || (a.style?.strikethrough ?? false) !== (b.style?.strikethrough ?? false)) {
-            return false;
-        }
-    }
-    return true;
+    return rich_text_equal(left, right);
 }
 
 /** Why the host refused a save whose bases no longer match the file. Carried on

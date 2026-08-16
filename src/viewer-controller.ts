@@ -4536,15 +4536,13 @@ export function attach_viewer(
             let pending = current.pendingEdits;
             operation.identity.worksheets.forEach((worksheet, index) => {
                 const target = operation.durableTargets[index];
+                // Already sanitized: `operation.identity` is the clone built by
+                // `clone_save_operation`, whose entries went through
+                // `sanitized_dirty_entry` at ingress.
                 pending = with_pending_edits_for_sheet(
                     pending,
                     target.sheetIndex,
-                    Object.fromEntries(
-                        Object.entries(worksheet.dirtyEdits).map(([key, entry]) => [
-                            key,
-                            sanitized_dirty_entry(entry),
-                        ]),
-                    ),
+                    { ...worksheet.dirtyEdits },
                     target.sheetName,
                     target.worksheetId,
                 );

@@ -11,6 +11,8 @@
  * by rich-text-markdown.ts, never the stored value.
  */
 
+import { is_plain_record } from './plain-record';
+
 /** Effective visual style of a run or a whole cell. Sparse: absent = false. */
 export interface CellTextStyle {
     readonly bold?: true;
@@ -59,9 +61,11 @@ export interface RichCellFields {
 
 const STYLE_KEYS = ['bold', 'italic', 'underline', 'strikethrough'] as const;
 
-/** Drop false/absent fields; return undefined for an all-plain style. */
+/** Drop false/absent fields; return undefined for an all-plain style. Accepts
+ *  loose boolean flags (e.g. a cell's whole-cell font fields) since dropping
+ *  falsy fields is exactly this function's job. */
 export function normalize_text_style(
-    style: CellTextStyle | undefined,
+    style: { readonly [K in keyof CellTextStyle]?: boolean } | undefined,
 ): CellTextStyle | undefined {
     if (!style) return undefined;
     let out: { -readonly [K in keyof CellTextStyle]?: true } | undefined;
@@ -126,6 +130,43 @@ export function rich_text_from_plain(text: string, style?: CellTextStyle): RichT
 /** True when any run carries any style. */
 export function rich_text_has_styles(value: RichText): boolean {
     return value.runs.some((run) => normalize_text_style(run.style) !== undefined);
+}
+
+// --- Validation (durable state and wire payloads are untrusted) ---
+
+const MAX_RUNS_PER_CELL = 4096;
+
+function is_valid_style(value: unknown): boolean {
+    if (!is_plain_record(value)) return false;
+    for (const [key, flag] of Object.entries(value)) {
+        if (key !== 'bold' && key !== 'italic' && key !== 'underline' && key !== 'strikethrough') {
+            return false;
+        }
+        if (flag !== true) return false;
+    }
+    return true;
+}
+
+export function is_valid_rich_text(value: unknown): value is RichText {
+    if (!is_plain_record(value) || !Array.isArray(value.runs)) return false;
+    if (value.runs.length > MAX_RUNS_PER_CELL) return false;
+    for (const run of value.runs) {
+        if (!is_plain_record(run) || typeof run.text !== 'string') return false;
+        if (run.style !== undefined && !is_valid_style(run.style)) return false;
+    }
+    return true;
+}
+
+/**
+ * A well-formed rich-text value whose concatenated run text equals `text`.
+ *
+ * The text-agreement half is a security boundary shared by the durable
+ * validator and the wire sanitizer: base validation and the CSV serializer see
+ * an entry's string sides, but the xlsx writer writes the runs' text when
+ * styled — runs spelling different text would smuggle a value past both.
+ */
+export function is_matching_rich_text(value: unknown, text: string): value is RichText {
+    return is_valid_rich_text(value) && rich_text_plain_text(value) === text;
 }
 
 export function hyperlinks_equal(

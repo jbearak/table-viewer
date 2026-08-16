@@ -357,13 +357,8 @@ export class RowLoader {
      * distinction: `undefined` means "unknown", never "changed".
      */
     get_cell_raw_for_source(source_row: number, col: number): string | undefined {
-        const claim = this.source_to_page.get(source_row);
-        if (claim === undefined) return undefined;
-        const page = this.pages.get(claim.start);
-        if (page === undefined) return undefined;
-        const cells = page.rows[claim.offset];
-        if (cells === undefined) return undefined;
-        const cell = cells[col];
+        const cell = this.get_cell_for_source(source_row, col);
+        if (cell === undefined) return undefined;
         return cell ? String(cell.raw ?? '') : '';
     }
 

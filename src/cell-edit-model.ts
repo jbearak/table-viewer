@@ -22,9 +22,12 @@
  * bases from the parsed source at save time, and the two must be one function.
  */
 
+import { get_raw_cell_text } from './cell-display';
 import {
+    normalize_text_style,
     rich_text_from_plain,
     rich_text_has_styles,
+    rich_text_plain_text,
     type CellTextStyle,
     type RichText,
 } from './cell-content';
@@ -52,21 +55,14 @@ export interface EditableSourceCell {
 }
 
 /** The raw value as the text the editor and the dirty map hold — the same
- *  `String(raw ?? '')` stringification every editing consumer already applies
- *  (grid-shell's get_cell_raw, the host's base harvest). */
+ *  stringification every raw-text consumer applies (cell-display.ts). */
 function raw_text(cell: EditableSourceCell): string {
-    return cell.raw === null || cell.raw === undefined ? '' : String(cell.raw);
+    return get_raw_cell_text(cell.raw ?? null);
 }
 
 /** The whole-cell font flags as a sparse style, or undefined when plain. */
 export function cell_whole_style(cell: EditableSourceCell): CellTextStyle | undefined {
-    if (!cell.bold && !cell.italic && !cell.underline && !cell.strikethrough) return undefined;
-    return {
-        ...(cell.bold ? { bold: true as const } : {}),
-        ...(cell.italic ? { italic: true as const } : {}),
-        ...(cell.underline ? { underline: true as const } : {}),
-        ...(cell.strikethrough ? { strikethrough: true as const } : {}),
-    };
+    return normalize_text_style(cell);
 }
 
 /**
@@ -80,10 +76,12 @@ export function cell_effective_rich_text(cell: EditableSourceCell): RichText {
     return cell.richText ?? rich_text_from_plain(raw_text(cell), cell_whole_style(cell));
 }
 
-/** The text the editor field opens with. A blank cell is ''. */
+/** The text the editor field opens with. A blank cell is ''. Derived, not a
+ *  second serialization: what a loaded cell opens with must be exactly what
+ *  its edit base displays as, or retyping the field's own content would not
+ *  read as a revert. */
 export function cell_edit_text(cell: EditableSourceCell, syntax: EditSyntax): string {
-    if (syntax === 'plain') return raw_text(cell);
-    return rich_text_to_markdown(cell_effective_rich_text(cell));
+    return edit_display_text(cell_edit_base(cell), syntax);
 }
 
 /**
@@ -100,8 +98,7 @@ export interface ParsedCellEdit {
 export function parse_cell_edit(input: string, syntax: EditSyntax): ParsedCellEdit {
     if (syntax === 'plain') return { text: input };
     const rich = markdown_to_rich_text(input);
-    let text = '';
-    for (const run of rich.runs) text += run.text;
+    const text = rich_text_plain_text(rich);
     return rich_text_has_styles(rich) ? { text, rich } : { text };
 }
 

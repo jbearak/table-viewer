@@ -6,7 +6,7 @@ import {
     type EditSessionStore,
     type GetCellRaw,
 } from './edit-session-store';
-import type { CsvDirtyEntry } from '../types';
+import { make_dirty_entry, type CsvDirtyEntry } from '../types';
 import {
     cell_edit_base,
     cell_edits_equal,
@@ -134,15 +134,6 @@ export function use_editing(
         [get_cell_raw, get_cell, syntax],
     );
 
-    // What the editor field opens with, and what a committed input parses to.
-    const editor_text_at = useCallback(
-        (source_row: number, source_col: number): string => {
-            const base = edit_base_at(source_row, source_col);
-            return edit_display_text(base, syntax);
-        },
-        [edit_base_at, syntax],
-    );
-
     // Every coordinate below is a source coordinate. The store's keys, the
     // GetCellRaw reader and EditingCell all live in source space, so nothing on
     // this path converts — and a caller holding a display row must convert
@@ -168,10 +159,10 @@ export function use_editing(
             set_editing_cell({
                 source_row,
                 source_col,
-                value: editor_text_at(source_row, source_col),
+                value: edit_display_text(edit_base_at(source_row, source_col), syntax),
             });
         },
-        [editor_text_at, dirty_cells, syntax],
+        [edit_base_at, dirty_cells, syntax],
     );
 
     const start_editing = useCallback(
@@ -209,12 +200,11 @@ export function use_editing(
                 return;
             }
 
-            active_store.commit(session_id, key, {
-                value: parsed.text,
-                base: base.text,
-                ...(parsed.rich ? { valueRuns: parsed.rich } : {}),
-                ...(base.rich ? { baseRuns: base.rich } : {}),
-            });
+            active_store.commit(
+                session_id,
+                key,
+                make_dirty_entry(parsed.text, base.text, parsed.rich, base.rich),
+            );
         },
         [active_store, edit_base_at, session_id, syntax],
     );

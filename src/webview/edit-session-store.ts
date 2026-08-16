@@ -12,7 +12,7 @@
  * this file entirely.
  */
 
-import { dirty_entries_equal, type CsvDirtyEntry } from '../types';
+import { dirty_entries_equal, make_dirty_entry, type CsvDirtyEntry } from '../types';
 
 export interface DirtyEntry extends CsvDirtyEntry {
     // When true, `base` has not yet been captured against a resident page (an
@@ -52,11 +52,7 @@ export function clear_saved_dirty_entries(
         // knows, and a missing base side just means the next conflict check
         // compares plain text, which is what the host validates anyway.
         else {
-            next.set(key, {
-                value: entry.value,
-                base: value,
-                ...(entry.valueRuns ? { valueRuns: entry.valueRuns } : {}),
-            });
+            next.set(key, make_dirty_entry(entry.value, value, entry.valueRuns));
         }
     }
     return next;
@@ -357,12 +353,7 @@ export function create_edit_session_store(
         commit: (session_id, key, entry) => {
             if (!owns(session_id)) return;
             const next = new Map(state.entries);
-            next.set(key, {
-                value: entry.value,
-                base: entry.base,
-                ...(entry.valueRuns ? { valueRuns: entry.valueRuns } : {}),
-                ...(entry.baseRuns ? { baseRuns: entry.baseRuns } : {}),
-            });
+            next.set(key, make_dirty_entry(entry.value, entry.base, entry.valueRuns, entry.baseRuns));
             set_entries(next, state.pending_base);
         },
         remove: (session_id, key) => {
@@ -386,16 +377,13 @@ export function create_edit_session_store(
             let pending_base = false;
             const next = new Map<string, DirtyEntry>();
             for (const [key, entry] of Object.entries(entries)) {
-                const runs = {
-                    ...(entry.valueRuns ? { valueRuns: entry.valueRuns } : {}),
-                    ...(entry.baseRuns ? { baseRuns: entry.baseRuns } : {}),
-                };
+                const owned = make_dirty_entry(entry.value, entry.base, entry.valueRuns, entry.baseRuns);
                 if (entry.base_pending) {
                     pending_base = true;
-                    next.set(key, { value: entry.value, base: entry.base, ...runs, base_pending: true });
+                    next.set(key, { ...owned, base_pending: true });
                     continue;
                 }
-                next.set(key, { value: entry.value, base: entry.base, ...runs });
+                next.set(key, owned);
             }
             set_entries(next, pending_base);
         },
@@ -421,11 +409,7 @@ export function create_edit_session_store(
                     const [r, c] = key.split(':').map(Number);
                     const cur = get_cell_raw(r, c);
                     if (cur !== undefined) {
-                        next.set(key, {
-                            value: entry.value,
-                            base: cur,
-                            ...(entry.valueRuns ? { valueRuns: entry.valueRuns } : {}),
-                        });
+                        next.set(key, make_dirty_entry(entry.value, cur, entry.valueRuns));
                         changed = true;
                         continue;
                     }

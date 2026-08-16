@@ -1944,20 +1944,21 @@ export function GridShell({
             // this closure's identity doesn't churn per edit; the targeted repaint
             // effect damages the cells whose tint actually changed.
             const editable = editable_cells && source_row !== undefined;
+            const loaded_row = get_row(row);
             // On a markdown sheet the overlay editor must open with markup, not
             // the plain projection: a dirty cell re-opens showing its committed
             // runs, a clean cell its effective rich content. Only computed when
             // the cell can actually open an editor — this is Glide's per-cell
             // paint callback.
             let edit_value: string | undefined;
-            if (edit_syntax === 'markdown' && editable && source_row !== undefined) {
+            if (edit_syntax === 'markdown' && editable) {
                 if (dirty) {
                     edit_value = edit_display_text(
                         { text: dirty.value, rich: dirty.valueRuns },
                         edit_syntax,
                     );
                 } else {
-                    const loaded = get_row(row)?.[source_column];
+                    const loaded = loaded_row?.[source_column];
                     if (loaded) edit_value = cell_edit_text(loaded, edit_syntax);
                 }
             }
@@ -1983,7 +1984,7 @@ export function GridShell({
             }
             return build_grid_cell(
                 source_column,
-                get_row(row),
+                loaded_row,
                 show_formatting,
                 overlay,
                 font_size_px,
