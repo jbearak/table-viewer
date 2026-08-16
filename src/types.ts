@@ -8,6 +8,7 @@ import type {
     WorkbookSnapshot,
     WorkbookSnapshotIdentity,
 } from './viewer-snapshot';
+import type { CellHyperlink, RichText } from './cell-content';
 
 export interface WorkbookData {
     sheets: SheetData[];
@@ -29,6 +30,18 @@ export interface CellData {
     formatted: string;
     bold: boolean;
     italic: boolean;
+    /** Whole-cell underline from the cell's font. Absent = false. */
+    underline?: boolean;
+    /** Whole-cell strikethrough from the cell's font. Absent = false. */
+    strikethrough?: boolean;
+    /**
+     * Character-level runs, present only when the source string carries them.
+     * Run styles are EFFECTIVE (inheritance against the cell font already
+     * resolved by the parser); concatenated run text equals the raw text.
+     */
+    richText?: RichText;
+    /** The cell's hyperlink (Excel: at most one per cell). */
+    hyperlink?: CellHyperlink;
     rawType?: 'string' | 'number' | 'boolean' | 'date' | 'empty';
 }
 

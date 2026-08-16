@@ -17,131 +17,32 @@ import {
 import { serial_to_iso, is_date_format, is_valid_excel_date_serial, format_value, get_style } from './spreadsheet-format';
 import type { FontEntry, XfEntry, DateMode } from './spreadsheet-format';
 import type { WorkbookData, SheetData, CellData, MergeRange } from './types';
+import type { CellHyperlink, RichText } from './cell-content';
+import {
+    font_to_style,
+    parse_xlsx_string_item,
+    resolve_rich_text_runs,
+    type ParsedXlsxString,
+} from './xlsx-rich-text';
+import { parse_relationships, rels_path_for_part, type OoxmlRelationship } from './ooxml-relationships';
 
 // --- XML Helpers ---
+//
+// The scanning primitives moved to ./ooxml-xml so the rich-text and hyperlink
+// parsers share the exact same scans; re-exported here because the writer and
+// tests import them from this module.
 
-/** Expand the five predefined XML entities and numeric character references.
- *  Exported for `xlsx-package`, which reads `formatCode` attributes that mean
- *  nothing until they are decoded.
- *
- *  Numeric references belong here because a writer may emit any character that
- *  way — `Id="R1&#54;f42588"` is the same relationship id as `Id="R16f42588"`,
- *  and comparing the raw text made them different strings. `&amp;` is expanded
- *  last so `&amp;#60;`, which *means* the six characters `&#60;`, is not
- *  re-decoded into `<`. */
-export function decode_xml(s: string): string {
-    if (s.indexOf('&') === -1) return s;
-    return s
-        .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>')
-        .replace(/&quot;/g, '"')
-        .replace(/&apos;/g, "'")
-        .replace(/&#(?:x([0-9a-fA-F]+)|(\d+));/g, (whole, hex: string | undefined, dec: string | undefined) => {
-            const code = hex !== undefined ? parseInt(hex, 16) : Number(dec);
-            return Number.isFinite(code) && code >= 0 && code <= 0x10ffff
-                ? String.fromCodePoint(code)
-                : whole;
-        })
-        .replace(/&amp;/g, '&');
-}
+import {
+    decode_xml,
+    find_tag_end,
+    get_attr,
+    get_text,
+    is_self_closing,
+    is_tag_boundary,
+    iter_elements,
+} from './ooxml-xml';
 
-function get_attr(tag: string, attr: string): string | null {
-    const re = new RegExp(`\\b${attr}="([^"]*)"`, '');
-    const m = tag.match(re);
-    return m ? decode_xml(m[1]) : null;
-}
-
-/** Find the index of '>' that closes an opening tag, skipping '>' inside quoted attribute values. Returns -1 if not found. */
-export function find_tag_end(xml: string, start: number): number {
-    let in_quote: string | null = null;
-    for (let i = start; i < xml.length; i++) {
-        const ch = xml[i];
-        if (in_quote) {
-            if (ch === in_quote) in_quote = null;
-        } else if (ch === '"' || ch === "'") {
-            in_quote = ch;
-        } else if (ch === '>') {
-            return i;
-        }
-    }
-    return -1;
-}
-
-/** Check whether the character after a tag-name match is a valid tag delimiter. */
-export function is_tag_boundary(ch: string | undefined): boolean {
-    return ch === '>' || ch === ' ' || ch === '/' || ch === '\t' || ch === '\n' || ch === '\r';
-}
-
-/** Check whether the region between start and tag_end represents a self-closing tag (handles `<tag/>` and `<tag />`). */
-export function is_self_closing(xml: string, start: number, tag_end: number): boolean {
-    for (let i = tag_end - 1; i > start; i--) {
-        const ch = xml[i];
-        if (ch === '/') return true;
-        if (ch !== ' ' && ch !== '\t' && ch !== '\n' && ch !== '\r') return false;
-    }
-    return false;
-}
-
-/**
- * Iterate every occurrence of `<tag ...>...</tag>` or self-closing `<tag .../>`.
- * Calls `cb` with the full opening tag string and inner content (empty for self-closing).
- */
-function iter_elements(xml: string, tag: string, cb: (open_tag: string, inner: string) => void): void {
-    const open = `<${tag}`;
-    let pos = 0;
-    while (true) {
-        const start = xml.indexOf(open, pos);
-        if (start === -1) break;
-
-        // Verify full tag name match (not just a prefix)
-        if (!is_tag_boundary(xml[start + open.length])) {
-            pos = start + 1;
-            continue;
-        }
-
-        // Find end of opening tag
-        const tag_end = find_tag_end(xml, start);
-        if (tag_end === -1) break;
-
-        const open_tag = xml.substring(start, tag_end + 1);
-
-        if (is_self_closing(xml, start, tag_end)) {
-            // Self-closing
-            cb(open_tag, '');
-            pos = tag_end + 1;
-        } else {
-            const close = `</${tag}>`;
-            const close_pos = xml.indexOf(close, tag_end);
-            if (close_pos === -1) {
-                pos = tag_end + 1;
-                continue;
-            }
-            const inner = xml.substring(tag_end + 1, close_pos);
-            cb(open_tag, inner);
-            pos = close_pos + close.length;
-        }
-    }
-}
-
-function get_text(xml: string, tag: string): string | null {
-    const open = `<${tag}`;
-    let pos = 0;
-    while (true) {
-        const start = xml.indexOf(open, pos);
-        if (start === -1) return null;
-        if (!is_tag_boundary(xml[start + open.length])) {
-            pos = start + 1;
-            continue;
-        }
-        const tag_end = find_tag_end(xml, start);
-        if (tag_end === -1) return null;
-        if (is_self_closing(xml, start, tag_end)) return '';
-        const close = `</${tag}>`;
-        const close_pos = xml.indexOf(close, tag_end);
-        if (close_pos === -1) return null;
-        return xml.substring(tag_end + 1, close_pos);
-    }
-}
+export { decode_xml, find_tag_end, is_self_closing, is_tag_boundary };
 
 // --- ZIP / Entry Access ---
 
@@ -231,21 +132,10 @@ export function worksheet_part_paths(buffer: Uint8Array): string[] {
     return worksheet_part_paths_from_package(CFB.read(buffer, { type: 'buffer' }));
 }
 
-function parse_shared_strings(xml: string): string[] {
-    const sst: string[] = [];
+function parse_shared_strings(xml: string): ParsedXlsxString[] {
+    const sst: ParsedXlsxString[] = [];
     iter_elements(xml, 'si', (_open, inner) => {
-        // Check for rich text runs — match <r> or <r  but not <rPh>, <rPr>, etc.
-        if (inner.indexOf('<r>') !== -1 || inner.indexOf('<r ') !== -1) {
-            let text = '';
-            iter_elements(inner, 'r', (_r_open, r_inner) => {
-                const t = get_text(r_inner, 't');
-                if (t !== null) text += decode_xml(t);
-            });
-            sst.push(text);
-        } else {
-            const t = get_text(inner, 't');
-            sst.push(t !== null ? decode_xml(t) : '');
-        }
+        sst.push(parse_xlsx_string_item(inner));
     });
     return sst;
 }
@@ -288,7 +178,20 @@ export function parse_styles(xml: string): { fonts: FontEntry[]; xfs: XfEntry[];
             const bold = has_b && !/\bb val="0"/.test(inner);
             const has_i = /<i[\s/>]/.test(inner);
             const italic = has_i && !/\bi val="0"/.test(inner);
-            fonts.push({ bold, italic });
+            // Underline: <u/> = single; val of none/0/false = off; any other
+            // val (single, double, *Accounting) = on. Strike follows the same
+            // boolean rule as bold/italic.
+            const u_match = inner.match(/<u(?:\s+val="([^"]*)")?\s*\/?>/);
+            const underline = u_match !== null
+                && u_match[1] !== 'none' && u_match[1] !== '0' && u_match[1] !== 'false';
+            const has_s = /<strike[\s/>]/.test(inner);
+            const strikethrough = has_s && !/\bstrike val="(?:0|false)"/.test(inner);
+            fonts.push({
+                bold,
+                italic,
+                ...(underline ? { underline: true as const } : {}),
+                ...(strikethrough ? { strikethrough: true as const } : {}),
+            });
         });
     }
 
@@ -415,13 +318,31 @@ interface WorksheetWorking extends WorkingSet {
 
 function parse_worksheet_core(
     xml: string,
-    sst: string[],
+    sst: ParsedXlsxString[],
     xfs: XfEntry[],
     fonts: FontEntry[],
     format_map: Map<number, string>,
     datemode: DateMode,
-    budget: WorkbookBudget
+    budget: WorkbookBudget,
+    sheet_rels: Map<string, OoxmlRelationship>,
 ): WorksheetWorking {
+    // Rich-run resolution cache: one shared string may be referenced by many
+    // cells, but binding (run inheritance) depends only on the cell font, so
+    // (sst index, font bits) fully determines the resolved RichText object.
+    // Cache hits also mean referencing cells share ONE RichText by reference,
+    // which the columnar store's sparse extras map preserves.
+    const rich_cache = new Map<string, RichText | undefined>();
+    const resolve_shared_rich = (idx: number, font: FontEntry): RichText | undefined => {
+        const parsed = sst[idx];
+        if (!parsed.runs) return undefined;
+        const bits = (font.bold ? 1 : 0) | (font.italic ? 2 : 0)
+            | (font.underline ? 4 : 0) | (font.strikethrough ? 8 : 0);
+        const key = `${idx}:${bits}`;
+        if (rich_cache.has(key)) return rich_cache.get(key);
+        const rich = resolve_rich_text_runs(parsed, font_to_style(font));
+        rich_cache.set(key, rich);
+        return rich;
+    };
     // Parse dimension and validate row/col limits early before materializing cells
     const dim = parse_dimension(xml);
     if (dim && dim.row_count > 0 && dim.col_count > 0) {
@@ -470,11 +391,15 @@ function parse_worksheet_core(
                 let raw: string | number | boolean | null = null;
                 let formatted = '';
                 let rawType: CellData['rawType'];
+                let richText: RichText | undefined;
 
                 if (t === 's') {
                     // Shared string (already decoded during SST parsing)
                     const idx = v_text !== null ? parseInt(v_text, 10) : -1;
-                    raw = idx >= 0 && idx < sst.length ? sst[idx] : null;
+                    if (idx >= 0 && idx < sst.length) {
+                        raw = sst[idx].text;
+                        richText = resolve_shared_rich(idx, style);
+                    }
                     formatted = raw !== null ? String(raw) : '';
                 } else if (t === 'b') {
                     // Boolean
@@ -489,20 +414,15 @@ function parse_worksheet_core(
                     raw = v_text !== null ? decode_xml(v_text) : null;
                     formatted = raw !== null ? String(raw) : '';
                 } else if (t === 'inlineStr') {
-                    // Inline string
+                    // Inline string — same rich-run parsing as shared strings.
+                    // Note the legacy plain path returned null for an <is> with
+                    // no <t>; parse_xlsx_string_item returns '' there, and an
+                    // empty string densifies identically to a blank cell.
                     const is_elem = get_text(c_inner, 'is');
                     if (is_elem) {
-                        if (is_elem.indexOf('<r>') !== -1 || is_elem.indexOf('<r ') !== -1) {
-                            let text = '';
-                            iter_elements(is_elem, 'r', (_r, r_inner) => {
-                                const rt = get_text(r_inner, 't');
-                                if (rt !== null) text += decode_xml(rt);
-                            });
-                            raw = text;
-                        } else {
-                            const it = get_text(is_elem, 't');
-                            raw = it !== null ? decode_xml(it) : null;
-                        }
+                        const parsed = parse_xlsx_string_item(is_elem);
+                        raw = parsed.text;
+                        richText = resolve_rich_text_runs(parsed, font_to_style(style));
                     }
                     formatted = raw !== null ? String(raw) : '';
                 } else if (t === 'd') {
@@ -531,7 +451,10 @@ function parse_worksheet_core(
                     }
                 }
 
-                cells.set(`${row}:${col}`, { raw, formatted, rawType, ...style });
+                cells.set(`${row}:${col}`, {
+                    raw, formatted, rawType, ...style,
+                    ...(richText ? { richText } : {}),
+                });
                 // Defensive pre-check: bound the in-progress cell map during
                 // streaming parse so a single pathological sheet can't exhaust
                 // memory before the cumulative budget is enforced below. A lone
@@ -544,6 +467,45 @@ function parse_worksheet_core(
                     );
                 }
             });
+        });
+    }
+
+    // Attach hyperlinks. Excel's model is one link per cell; refs that are
+    // ranges are skipped (deferred), and a link on a cell with no data entry
+    // synthesizes a blank cell so the link still renders and extends the grid.
+    const hyperlinks_section = get_text(xml, 'hyperlinks');
+    if (hyperlinks_section) {
+        iter_elements(hyperlinks_section, 'hyperlink', (open_tag) => {
+            const ref = get_attr(open_tag, 'ref');
+            if (!ref) return;
+            const cell_ref = parse_cell_ref(ref);
+            if (!cell_ref) return; // range ref or malformed — skipped in v1
+            const tooltip = get_attr(open_tag, 'tooltip') ?? undefined;
+            let hyperlink: CellHyperlink;
+            const r_id = get_attr(open_tag, 'r:id');
+            if (r_id !== null) {
+                const rel = sheet_rels.get(r_id);
+                if (!rel || !rel.external) return; // dangling or internal-part rel
+                // The optional location attribute is a fragment within the
+                // external target (e.g. a bookmark); append it Excel-style.
+                const location = get_attr(open_tag, 'location');
+                const target = location ? `${rel.target}#${location}` : rel.target;
+                hyperlink = { kind: 'external', target, ...(tooltip !== undefined ? { tooltip } : {}) };
+            } else {
+                const location = get_attr(open_tag, 'location');
+                if (!location) return;
+                hyperlink = { kind: 'internal', location, ...(tooltip !== undefined ? { tooltip } : {}) };
+            }
+            const { row, col } = cell_ref;
+            const key = `${row}:${col}`;
+            const existing = cells.get(key);
+            if (existing) {
+                cells.set(key, { ...existing, hyperlink });
+            } else {
+                cells.set(key, { raw: null, formatted: '', bold: false, italic: false, hyperlink });
+                if (row + 1 > max_row) max_row = row + 1;
+                if (col + 1 > max_col) max_col = col + 1;
+            }
         });
     }
 
@@ -620,7 +582,7 @@ interface OpenedXlsxWorkbook {
     cfb_file: ReturnType<typeof CFB.read>;
     sheet_entries: WorkbookSheetEntry[];
     rels: Map<string, string>;
-    sst: string[];
+    sst: ParsedXlsxString[];
     fonts: FontEntry[];
     xfs: XfEntry[];
     format_map: Map<number, string>;
@@ -660,6 +622,16 @@ function open_xlsx_workbook(buffer: Uint8Array): OpenedXlsxWorkbook {
     return { cfb_file, sheet_entries, rels, sst, fonts, xfs, format_map, datemode, budget };
 }
 
+/** Read and parse one worksheet's own `.rels` part (hyperlink targets live
+ *  there). Absent part -> empty map, which is the common case. */
+function worksheet_rels(
+    cfb_file: ReturnType<typeof CFB.read>,
+    sheet_path: string,
+): Map<string, OoxmlRelationship> {
+    const rels_xml = get_entry_text(cfb_file, `/${rels_path_for_part(sheet_path)}`);
+    return rels_xml ? parse_relationships(rels_xml) : new Map();
+}
+
 export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookData; warnings: string[] }> {
     const { cfb_file, sheet_entries, rels, sst, fonts, xfs, format_map, datemode, budget } =
         open_xlsx_workbook(buffer);
@@ -687,7 +659,8 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookDa
         }
 
         const working = parse_worksheet_core(
-            ws_xml, sst, xfs, fonts, format_map, datemode, budget
+            ws_xml, sst, xfs, fonts, format_map, datemode, budget,
+            worksheet_rels(cfb_file, sheet_path)
         );
         workings.push(working);
 
@@ -735,7 +708,10 @@ export async function parse_xlsx_streaming(buffer: Uint8Array): Promise<Streamin
             continue;
         }
 
-        const working = parse_worksheet_core(ws_xml, sst, xfs, fonts, format_map, datemode, budget);
+        const working = parse_worksheet_core(
+            ws_xml, sst, xfs, fonts, format_map, datemode, budget,
+            worksheet_rels(cfb_file, sheet_path)
+        );
         workings.push(working);
         sheets.push(make_streaming_sheet(entry.name, working, working.merges, entry.worksheetId));
     }

@@ -1,6 +1,13 @@
 import SSF from 'ssf';
 
-export interface FontEntry { bold: boolean; italic: boolean }
+export interface FontEntry {
+    bold: boolean;
+    italic: boolean;
+    /** Sparse: present (true) only when the font sets it, so cells without
+     *  these styles keep their exact legacy object shape. */
+    underline?: true;
+    strikethrough?: true;
+}
 export interface XfEntry { font_index: number; format_index: number }
 export type DateMode = 0 | 1;
 
@@ -96,7 +103,7 @@ export function format_value(
     }
 }
 
-export function get_style(xf_index: number, xfs: XfEntry[], fonts: FontEntry[]): { bold: boolean; italic: boolean } {
+export function get_style(xf_index: number, xfs: XfEntry[], fonts: FontEntry[]): FontEntry {
     if (!Number.isInteger(xf_index) || xf_index < 0 || xf_index >= xfs.length) return { bold: false, italic: false };
     const xf = xfs[xf_index];
     const font_idx = xf.font_index;

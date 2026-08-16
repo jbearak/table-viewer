@@ -96,6 +96,10 @@ function fill_store(working: WorkingSet, sink: CellSink): void {
                 formatted: cell.formatted,
                 bold: cell.bold,
                 italic: cell.italic,
+                ...(cell.underline ? { underline: true } : {}),
+                ...(cell.strikethrough ? { strikethrough: true } : {}),
+                ...(cell.richText ? { richText: cell.richText } : {}),
+                ...(cell.hyperlink ? { hyperlink: cell.hyperlink } : {}),
                 rawType: cell.raw === null
                     ? 'empty'
                     : cell.rawType === 'date'
@@ -169,7 +173,12 @@ export function working_has_formatting(workings: WorkingSet[]): boolean {
             if (cell.raw === null) continue;
             if (working.merged_cells.has(key)) continue; // densified -> null, skipped
             if (cell.formatted !== get_raw_cell_text(cell.raw)) return true;
-            if (cell.bold || cell.italic) return true;
+            if (cell.bold || cell.italic || cell.underline || cell.strikethrough) return true;
+            // A hyperlink alone deliberately does NOT flip the flag: link
+            // styling is semantic and stays visible with formatting off.
+            if (cell.richText && cell.richText.runs.some((run) => run.style !== undefined)) {
+                return true;
+            }
         }
     }
     return false;

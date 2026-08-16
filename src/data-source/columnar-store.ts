@@ -1,8 +1,17 @@
+import type { CellHyperlink, RichText } from '../cell-content';
 import type { RenderedCell } from './interface';
 
 const NULL_IDX = -1;
-const BOLD = 1, ITALIC = 2;
+const BOLD = 1, ITALIC = 2, UNDERLINE = 4, STRIKETHROUGH = 8;
 const TYPE_STRING = 1, TYPE_NUMBER = 2, TYPE_BOOLEAN = 3, TYPE_EMPTY = 4, TYPE_DATE = 5;
+
+/** Sparse per-cell metadata that only exceptional cells carry. Immutable
+ *  objects supplied by the parser are stored by reference and shared with
+ *  every materialized RenderedCell. */
+interface CellExtras {
+    richText?: RichText;
+    hyperlink?: CellHyperlink;
+}
 
 export class ColumnarStore {
     private constructor(
@@ -13,11 +22,15 @@ export class ColumnarStore {
         private readonly fmtIdx: Int32Array,
         private readonly flags: Uint8Array,
         private readonly types: Uint8Array,
+        /** Keyed by linear cell index (row * cols + col). */
+        private readonly extras: ReadonlyMap<number, CellExtras>,
     ) {}
 
     get poolSize(): number { return this.pool.length; }
     get rowCount(): number { return this.rows; }
     get colCount(): number { return this.cols; }
+    /** Diagnostic: number of cells carrying sparse rich/link metadata. */
+    get extrasSize(): number { return this.extras.size; }
 
     read_window(start_row: number, count: number): (RenderedCell | null)[][] {
         const start = Math.max(0, Math.min(start_row, this.rows));
@@ -26,16 +39,7 @@ export class ColumnarStore {
         for (let r = start; r < end; r++) {
             const row: (RenderedCell | null)[] = [];
             for (let c = 0; c < this.cols; c++) {
-                const i = r * this.cols + c;
-                if (this.rawIdx[i] === NULL_IDX) { row.push(null); continue; }
-                const f = this.flags[i];
-                row.push({
-                    raw: this.pool[this.rawIdx[i]],
-                    formatted: this.pool[this.fmtIdx[i]],
-                    bold: (f & BOLD) !== 0,
-                    italic: (f & ITALIC) !== 0,
-                    rawType: decode_type(this.types[i]),
-                });
+                row.push(this.read_cell(r, c));
             }
             out.push(row);
         }
@@ -87,13 +91,19 @@ export class ColumnarStore {
         const index = row * this.cols + column;
         if (this.rawIdx[index] === NULL_IDX) return null;
         const flags = this.flags[index];
-        return {
+        const cell: RenderedCell = {
             raw: this.pool[this.rawIdx[index]],
             formatted: this.pool[this.fmtIdx[index]],
             bold: (flags & BOLD) !== 0,
             italic: (flags & ITALIC) !== 0,
             rawType: decode_type(this.types[index]),
         };
+        if ((flags & UNDERLINE) !== 0) cell.underline = true;
+        if ((flags & STRIKETHROUGH) !== 0) cell.strikethrough = true;
+        const extras = this.extras.size > 0 ? this.extras.get(index) : undefined;
+        if (extras?.richText) cell.richText = extras.richText;
+        if (extras?.hyperlink) cell.hyperlink = extras.hyperlink;
+        return cell;
     }
 
     static Builder = class {
@@ -103,6 +113,7 @@ export class ColumnarStore {
         private readonly fmtIdx: Int32Array;
         private readonly flags: Uint8Array;
         private readonly types: Uint8Array;
+        private readonly extras = new Map<number, CellExtras>();
 
         constructor(private readonly rows: number, private readonly cols: number) {
             const n = rows * cols;
@@ -123,16 +134,37 @@ export class ColumnarStore {
             if (r < 0 || r >= this.rows || c < 0 || c >= this.cols) {
                 throw new RangeError(`cell (${r},${c}) out of bounds for ${this.rows}x${this.cols} store`);
             }
-            if (cell === null) { this.rawIdx[i] = NULL_IDX; this.fmtIdx[i] = NULL_IDX; return; }
+            if (cell === null) {
+                this.rawIdx[i] = NULL_IDX;
+                this.fmtIdx[i] = NULL_IDX;
+                this.extras.delete(i);
+                return;
+            }
             // raw === null normalised to '' — consistent with interface's null = empty cell semantics
             this.rawIdx[i] = this.intern(cell.raw ?? '');
             this.fmtIdx[i] = this.intern(cell.formatted);
-            this.flags[i] = (cell.bold ? BOLD : 0) | (cell.italic ? ITALIC : 0);
+            this.flags[i] = (cell.bold ? BOLD : 0)
+                | (cell.italic ? ITALIC : 0)
+                | (cell.underline ? UNDERLINE : 0)
+                | (cell.strikethrough ? STRIKETHROUGH : 0);
             this.types[i] = encode_type(cell.rawType);
+            if (cell.richText || cell.hyperlink) {
+                // Stored by reference: the parser hands over immutable objects
+                // (shared across cells that reuse one rich shared string).
+                this.extras.set(i, {
+                    ...(cell.richText ? { richText: cell.richText } : {}),
+                    ...(cell.hyperlink ? { hyperlink: cell.hyperlink } : {}),
+                });
+            } else {
+                this.extras.delete(i);
+            }
         }
 
         build(): ColumnarStore {
-            return new ColumnarStore(this.rows, this.cols, this.pool, this.rawIdx, this.fmtIdx, this.flags, this.types);
+            return new ColumnarStore(
+                this.rows, this.cols, this.pool,
+                this.rawIdx, this.fmtIdx, this.flags, this.types, this.extras,
+            );
         }
     };
 }
