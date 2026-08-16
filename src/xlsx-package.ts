@@ -19,6 +19,8 @@ import {
     worksheet_part_paths_from_package,
 } from './parse-xlsx';
 import type { XfEntry, DateMode } from './spreadsheet-format';
+import { rels_path_for_part } from './ooxml-relationships';
+import { apply_hyperlink_edits, type XlsxHyperlinkEdit } from './xlsx-hyperlink-write';
 
 /**
  * Package-level (.xlsx container) side of `putexcel`-style saving.
@@ -303,6 +305,9 @@ function read_datemode(cfb_file: ReturnType<typeof CFB.read>): DateMode {
 export interface XlsxWorksheetCellEdits {
     readonly sheetIndex: number;
     readonly edits: readonly XlsxCellEdit[];
+    /** Whole-cell hyperlink edits, applied to the worksheet's `<hyperlinks>`
+     *  section and its `.rels` part alongside the value edits. */
+    readonly link_edits?: readonly XlsxHyperlinkEdit[];
 }
 
 /**
@@ -316,7 +321,9 @@ export function write_xlsx_workbook_cell_edits(
     raw: Uint8Array,
     worksheets: readonly XlsxWorksheetCellEdits[],
 ): Uint8Array {
-    const active = worksheets.filter(({ edits }) => edits.length > 0);
+    const active = worksheets.filter(
+        ({ edits, link_edits }) => edits.length > 0 || (link_edits?.length ?? 0) > 0,
+    );
     if (active.length === 0) return raw;
 
     const indices = new Set<number>();
@@ -338,34 +345,60 @@ export function write_xlsx_workbook_cell_edits(
     const { is_date_style, cell_font_style, run_font_base } = read_style_write_context(cfb_file);
     const datemode = read_datemode(cfb_file);
     let removed_formula = false;
-    const replacements: Array<{ path: string; xml: string }> = [];
+    const replacements: Array<{ path: string; xml: string; created?: boolean }> = [];
 
-    for (const { sheetIndex, edits } of active) {
+    for (const { sheetIndex, edits, link_edits } of active) {
         const part = parts[sheetIndex];
         if (!part) throw new Error('Could not locate a worksheet to save');
         const path = `/${part}`;
         const sheet_xml = read_part_text(cfb_file, path);
         if (sheet_xml === null) throw new Error('Could not read a worksheet to save');
 
-        let updated = apply_cell_edits(sheet_xml, edits, {
-            datemode,
-            is_date_style,
-            cell_font_style,
-            run_font_base,
-        });
-        let min_row = Infinity, min_col = Infinity, max_row = 0, max_col = 0;
-        for (const edit of edits) {
-            if (edit.row < min_row) min_row = edit.row;
-            if (edit.col < min_col) min_col = edit.col;
-            if (edit.row > max_row) max_row = edit.row;
-            if (edit.col > max_col) max_col = edit.col;
+        let updated = edits.length > 0
+            ? apply_cell_edits(sheet_xml, edits, {
+                datemode,
+                is_date_style,
+                cell_font_style,
+                run_font_base,
+            })
+            : sheet_xml;
+        if (edits.length > 0) {
+            let min_row = Infinity, min_col = Infinity, max_row = 0, max_col = 0;
+            for (const edit of edits) {
+                if (edit.row < min_row) min_row = edit.row;
+                if (edit.col < min_col) min_col = edit.col;
+                if (edit.row > max_row) max_row = edit.row;
+                if (edit.col > max_col) max_col = edit.col;
+            }
+            updated = widen_dimension(updated, min_row, min_col, max_row, max_col);
         }
-        updated = widen_dimension(updated, min_row, min_col, max_row, max_col);
+        if (link_edits && link_edits.length > 0) {
+            // The `.rels` splice is planned here with everything else so a bad
+            // link edit rejects the whole save before any part is mutated.
+            const rels_path = `/${rels_path_for_part(part)}`;
+            const rels_xml = read_part_text(cfb_file, rels_path);
+            const link_result = apply_hyperlink_edits(updated, rels_xml, link_edits);
+            updated = link_result.sheet_xml;
+            if (link_result.rels_xml !== null) {
+                replacements.push({
+                    path: rels_path,
+                    xml: link_result.rels_xml,
+                    created: link_result.rels_created,
+                });
+            }
+        }
         removed_formula ||= formula_count(updated) < formula_count(sheet_xml);
         replacements.push({ path, xml: updated });
     }
 
-    for (const { path, xml } of replacements) {
+    for (const { path, xml, created } of replacements) {
+        if (created) {
+            // A sheet that never had relationships has no `.rels` part to
+            // replace; adding one needs no [Content_Types] change because the
+            // standard `Default Extension="rels"` already types it.
+            CFB.utils.cfb_add(cfb_file, path, Buffer.from(xml, 'utf8'));
+            continue;
+        }
         if (!write_part_text(cfb_file, path, xml)) {
             throw new Error('Could not update a worksheet to save');
         }

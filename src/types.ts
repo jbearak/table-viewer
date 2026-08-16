@@ -9,11 +9,14 @@ import type {
     WorkbookSnapshotIdentity,
 } from './viewer-snapshot';
 import {
+    hyperlinks_equal,
     is_matching_rich_text,
     rich_text_equal,
+    type CellHyperlink,
     type RichCellFields,
     type RichText,
 } from './cell-content';
+import { is_valid_hyperlink } from './pending-changes';
 import { is_plain_record } from './plain-record';
 
 export interface WorkbookData {
@@ -764,6 +767,17 @@ function validate_edit_cells(value: unknown): Record<string, string | CsvDirtyEn
             if (runs === undefined) continue;
             if (!is_matching_rich_text(runs, text)) invalid_leaf('pendingEdits');
         }
+        // The optional link dimension: both sides present together, each a
+        // structurally valid hyperlink or null. Rejected (not dropped) like
+        // the run sides — durable state is ours, so a malformed link there is
+        // corruption, not a compatibility case.
+        if ((entry.link === undefined) !== (entry.baseLink === undefined)) {
+            invalid_leaf('pendingEdits');
+        }
+        for (const side of [entry.link, entry.baseLink]) {
+            if (side === undefined || side === null) continue;
+            if (!is_valid_hyperlink(side)) invalid_leaf('pendingEdits');
+        }
     }
     return value as Record<string, string | CsvDirtyEntry>;
 }
@@ -1297,6 +1311,19 @@ export interface CsvDirtyEntry {
     readonly valueRuns?: RichText;
     /** Styled runs of `base`, when the cell's effective content did. */
     readonly baseRuns?: RichText;
+    /**
+     * Pending whole-cell hyperlink, when the user changed it: a link to write,
+     * or `null` to clear. ABSENT means "no link change" — the value dimension
+     * alone is dirty and the save leaves the cell's link untouched. A
+     * link-only entry carries `value === base` (the unedited text), which
+     * `collect_save_payload` must NOT emit as a text edit: rewriting an
+     * unedited cell's `<c>` would break the unedited-cells-keep-original-XML
+     * invariant.
+     */
+    readonly link?: CellHyperlink | null;
+    /** The link the change was made against (`null` = cell had none).
+     *  Present exactly when `link` is. */
+    readonly baseLink?: CellHyperlink | null;
 }
 
 export type CsvDirtyMap = Readonly<Record<string, CsvDirtyEntry>>;
@@ -1313,12 +1340,16 @@ export function make_dirty_entry(
     base: string,
     valueRuns?: RichText,
     baseRuns?: RichText,
+    link?: CellHyperlink | null,
+    baseLink?: CellHyperlink | null,
 ): CsvDirtyEntry {
     return {
         value,
         base,
         ...(valueRuns !== undefined ? { valueRuns } : {}),
         ...(baseRuns !== undefined ? { baseRuns } : {}),
+        ...(link !== undefined ? { link } : {}),
+        ...(baseLink !== undefined ? { baseLink } : {}),
     };
 }
 
@@ -1336,15 +1367,30 @@ export function sanitized_dirty_entry(entry: {
     readonly base: string;
     readonly valueRuns?: unknown;
     readonly baseRuns?: unknown;
+    readonly link?: unknown;
+    readonly baseLink?: unknown;
 }): CsvDirtyEntry {
     const keep = (runs: unknown, text: string): RichText | undefined => (
         is_matching_rich_text(runs, text) ? runs : undefined
     );
+    // The link dimension is kept whole or dropped whole: both sides must be a
+    // structurally valid hyperlink or `null`, and `link` requires `baseLink`
+    // (a change with no recorded base could never be conflict-checked).
+    // Dropping a malformed pair leaves the cell's link untouched on save,
+    // which is the safe failure for relationship metadata.
+    const link_side_ok = (side: unknown): side is CellHyperlink | null =>
+        side === null || is_valid_hyperlink(side);
+    const keep_link = entry.link !== undefined
+        && link_side_ok(entry.link)
+        && entry.baseLink !== undefined
+        && link_side_ok(entry.baseLink);
     return make_dirty_entry(
         entry.value,
         entry.base,
         keep(entry.valueRuns, entry.value),
         keep(entry.baseRuns, entry.base),
+        keep_link ? entry.link as CellHyperlink | null : undefined,
+        keep_link ? entry.baseLink as CellHyperlink | null : undefined,
     );
 }
 
@@ -1385,7 +1431,19 @@ export function dirty_entries_equal(
     return left.value === right.value
         && left.base === right.base
         && optional_runs_equal(left.valueRuns, right.valueRuns)
-        && optional_runs_equal(left.baseRuns, right.baseRuns);
+        && optional_runs_equal(left.baseRuns, right.baseRuns)
+        && optional_links_equal(left.link, right.link)
+        && optional_links_equal(left.baseLink, right.baseLink);
+}
+
+/** An absent link dimension ("no link change") differs from a present one —
+ *  including a present `null` ("clear the link"). */
+function optional_links_equal(
+    left: CellHyperlink | null | undefined,
+    right: CellHyperlink | null | undefined,
+): boolean {
+    if (left === undefined || right === undefined) return left === right;
+    return hyperlinks_equal(left, right);
 }
 
 function optional_runs_equal(
