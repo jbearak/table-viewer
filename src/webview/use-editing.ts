@@ -6,7 +6,13 @@ import {
     type EditSessionStore,
     type GetCellRaw,
 } from './edit-session-store';
-import { make_dirty_entry, type CsvDirtyEntry } from '../types';
+import {
+    copy_dirty_entry,
+    dirty_entry_value_changed,
+    make_dirty_entry,
+    type CsvDirtyEntry,
+} from '../types';
+import { hyperlinks_equal, type CellHyperlink } from '../cell-content';
 import {
     cell_edit_base,
     cell_edits_equal,
@@ -124,6 +130,24 @@ export function use_editing(
     // in-flight save's values over residency, which `get_cell` cannot see, so
     // the raw reader stays the authority on the *text* and the loaded cell
     // only contributes styling.
+    /**
+     * The cell's persisted link, for conflict detection. Only markdown-mode
+     * consumers supply `get_cell`, which is also the only place link edits can
+     * be made, so the reader is absent exactly when there are no links to
+     * check. `null` distinguishes a resident linkless cell from a
+     * non-resident row (`undefined`), which is what keeps an evicted page from
+     * reading as a conflict.
+     */
+    const get_cell_link = useMemo(
+        () => (get_cell
+            ? (source_row: number, col: number) => {
+                const cell = get_cell(source_row, col);
+                return cell === undefined ? undefined : cell?.hyperlink ?? null;
+            }
+            : undefined),
+        [get_cell],
+    );
+
     const edit_base_at = useCallback(
         (source_row: number, source_col: number): ParsedCellEdit => {
             const raw = get_cell_raw(source_row, source_col) ?? '';
@@ -191,11 +215,34 @@ export function use_editing(
             const key = `${source_row}:${source_col}`;
             const parsed = parse_cell_edit(input, syntax);
             const base = edit_base_at(source_row, source_col);
+            // A pending link change is its own dimension: a text revert must
+            // not discard it, and a text commit must carry it forward.
+            const pending = active_store.get(key);
+            const link_dimension = pending?.link !== undefined
+                ? { link: pending.link, baseLink: pending.baseLink ?? null }
+                : undefined;
 
             // The revert rule lives here rather than in the store: only the hook
             // can read the cell's persisted content.
             if (cell_edits_equal(parsed, base)) {
-                active_store.remove(session_id, key);
+                if (link_dimension === undefined) {
+                    active_store.remove(session_id, key);
+                } else {
+                    // Text reverted, link still pending: the entry survives as
+                    // link-only, its value dimension back at the base.
+                    active_store.commit(
+                        session_id,
+                        key,
+                        make_dirty_entry(
+                            base.text,
+                            base.text,
+                            base.rich,
+                            base.rich,
+                            link_dimension.link,
+                            link_dimension.baseLink,
+                        ),
+                    );
+                }
                 return;
             }
 
@@ -209,10 +256,72 @@ export function use_editing(
                     // base's markup — see committed_value_runs.
                     committed_value_runs(parsed, base),
                     base.rich,
+                    link_dimension?.link,
+                    link_dimension?.baseLink,
                 ),
             );
         },
         [active_store, edit_base_at, session_id, syntax],
+    );
+
+    /**
+     * Commit a whole-cell hyperlink change (dialog output): a link to set, or
+     * null to clear. Reverting to the cell's current link removes the link
+     * dimension — and the whole entry when no value change remains. The base
+     * recorded is the cell's LOADED link (or the already-pending baseLink),
+     * never the pending value, so a re-edit of the same cell keeps one honest
+     * conflict base.
+     */
+    const commit_hyperlink = useCallback(
+        (source_row: number, source_col: number, next: CellHyperlink | null) => {
+            const key = `${source_row}:${source_col}`;
+            const pending = active_store.get(key);
+            const loaded_link = get_cell?.(source_row, source_col)?.hyperlink ?? null;
+            const base_link = pending?.link !== undefined
+                ? pending.baseLink ?? null
+                : loaded_link;
+
+            const value_changed = pending !== undefined
+                && dirty_entry_value_changed(pending);
+
+            if (hyperlinks_equal(next, base_link)) {
+                // Link reverted. Drop the dimension, keep any value change.
+                if (!value_changed) {
+                    if (pending !== undefined) active_store.remove(session_id, key);
+                    return;
+                }
+                active_store.commit(
+                    session_id,
+                    key,
+                    copy_dirty_entry(pending, { link: undefined, baseLink: undefined }),
+                );
+                return;
+            }
+
+            if (pending !== undefined) {
+                active_store.commit(
+                    session_id,
+                    key,
+                    copy_dirty_entry(pending, { link: next, baseLink: base_link }),
+                );
+                return;
+            }
+            // Link-only entry: value dimension pinned at the base text.
+            const base = edit_base_at(source_row, source_col);
+            active_store.commit(
+                session_id,
+                key,
+                make_dirty_entry(
+                    base.text,
+                    base.text,
+                    base.rich,
+                    base.rich,
+                    next,
+                    base_link,
+                ),
+            );
+        },
+        [active_store, edit_base_at, get_cell, session_id],
     );
 
     const confirm_edit = useCallback(
@@ -292,16 +401,16 @@ export function use_editing(
             const active_entry = dirty_cells.get(active_key);
             if (
                 active_entry &&
-                is_entry_conflicted(active_key, active_entry, get_cell_raw)
+                is_entry_conflicted(active_key, active_entry, get_cell_raw, get_cell_link)
             ) {
                 set_editing_cell(null);
             }
         }
         active_store.retain(
             session_id,
-            (key, entry) => !is_entry_conflicted(key, entry, get_cell_raw),
+            (key, entry) => !is_entry_conflicted(key, entry, get_cell_raw, get_cell_link),
         );
-    }, [active_store, get_cell_raw, editing_cell, dirty_cells, session_id]);
+    }, [active_store, get_cell_raw, get_cell_link, editing_cell, dirty_cells, session_id]);
 
     // Resolve deferred bases for old-format restores: once a pending entry's page
     // becomes resident, capture its true on-disk value as the base. Runs whenever
@@ -327,12 +436,12 @@ export function use_editing(
     const conflicted_keys = useMemo(() => {
         const keys = new Set<string>();
         for (const [key, entry] of dirty_cells) {
-            if (is_entry_conflicted(key, entry, get_cell_raw)) {
+            if (is_entry_conflicted(key, entry, get_cell_raw, get_cell_link)) {
                 keys.add(key);
             }
         }
         return keys;
-    }, [dirty_cells, get_cell_raw]);
+    }, [dirty_cells, get_cell_raw, get_cell_link]);
 
     // Close any open editor when the data reloads (token bump) — whether from our
     // own save or an external change. Dirty edits are preserved either way so the
@@ -366,6 +475,7 @@ export function use_editing(
         force_start_editing,
         confirm_edit,
         commit_edit,
+        commit_hyperlink,
         cancel_edit,
         clear_dirty,
         replace_dirty,

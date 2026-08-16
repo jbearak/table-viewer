@@ -28,6 +28,7 @@ import {
 import type { RenderedCell, SheetMeta } from '../data-source/interface';
 import {
     EMPTY_TRANSFORM,
+    dirty_entry_value_changed,
     type CellHighlightColor,
     type CellHighlightMutation,
     type CellHighlightSelection,
@@ -86,6 +87,8 @@ import {
 } from './cell-renderer';
 import { rich_text_cell_renderer } from './rich-text-cell-renderer';
 import { parse_http_external_url } from '../external-url';
+import type { CellHyperlink } from '../cell-content';
+import { HyperlinkDialog } from './hyperlink-dialog';
 import {
     CELL_TOOLTIP_SHOW_DELAY_MS,
     cell_tooltip_content,
@@ -734,6 +737,7 @@ export function GridShell({
         replace_dirty,
         clear_dirty_keys,
         discard_conflicted,
+        commit_hyperlink,
     } = use_editing(get_cell_raw, generation, edit_session_id, store, {
         syntax: edit_syntax,
         // Same identity discipline as get_cell_raw: rebinds with `version` so
@@ -1684,16 +1688,26 @@ export function GridShell({
         [ensure_measure_ctx, font_family, font_size_px, show_formatting],
     );
 
-    /** The loaded cell's hyperlink at display coordinates. Merged blocks
-     *  arrive as anchor coordinates (Glide canonicalizes the hit), which is
-     *  where the content — and the link — lives. */
+    /** The cell's *effective* hyperlink at display coordinates: a pending link
+     *  edit if one exists, otherwise the loaded cell's own link. Everything
+     *  link-aware (tooltip, Ctrl/Cmd+click, the menu items, the dialog's
+     *  initial value) reads through here, so an uncommitted link edit behaves
+     *  exactly like a saved one. Merged blocks arrive as anchor coordinates
+     *  (Glide canonicalizes the hit), which is where the content — and the
+     *  link — lives. */
     const cell_hyperlink = useCallback(
-        (display_column: number, row: number) => {
+        (display_column: number, row: number): CellHyperlink | undefined => {
             const source_column = source_column_for_display(display_column);
             if (source_column === undefined) return undefined;
+            const source_row = get_source_row(row);
+            if (source_row !== undefined) {
+                // `link: null` is a pending *clear* — a real answer, not a miss.
+                const pending = store.get(`${source_row}:${source_column}`)?.link;
+                if (pending !== undefined) return pending ?? undefined;
+            }
             return get_row(row)?.[source_column]?.hyperlink;
         },
-        [get_row, source_column_for_display],
+        [get_row, get_source_row, source_column_for_display, store],
     );
 
     const font_flags_for_cell = useCallback(
@@ -2039,7 +2053,14 @@ export function GridShell({
                     // and it does reach this branch, via highlight_bg, which is
                     // plain view state independent of edit mode.
                     refused: editable_cells && source_row === undefined,
-                    dirty_value: dirty?.value,
+                    // Only a VALUE edit replaces the displayed text. A
+                    // link-only entry's `value` is the unedited cell's raw
+                    // text, and substituting it would swap a formatted
+                    // number/date for its raw form even though the save
+                    // deliberately emits no text edit for that cell.
+                    ...(dirty && dirty_entry_value_changed(dirty)
+                        ? { dirty_value: dirty.value }
+                        : {}),
                     bg: dirty
                         ? key !== undefined && conflicted_keys_ref.current.has(key)
                             ? conflict_bg
@@ -2735,6 +2756,68 @@ export function GridShell({
         [clear_dirty_keys, get_source_row, save_in_flight_ref],
     );
 
+    /** The cell whose hyperlink is being edited, snapshotted at menu-click time
+     *  along with the link the dialog opens with. Null when no dialog is up. */
+    const [hyperlink_dialog, set_hyperlink_dialog] = useState<{
+        row: number;
+        display_col: number;
+        source_col: number;
+        source_row: number;
+        initial: CellHyperlink | null;
+    } | null>(null);
+
+    const open_hyperlink_dialog = useCallback(
+        (row: number, display_col: number, source_col: number) => {
+            const source_row = get_source_row(row);
+            if (source_row === undefined) return;
+            set_hyperlink_dialog({
+                row,
+                display_col,
+                source_col,
+                source_row,
+                initial: cell_hyperlink(display_col, row) ?? null,
+            });
+        },
+        [cell_hyperlink, get_source_row],
+    );
+
+    const close_hyperlink_dialog = useCallback(() => {
+        set_hyperlink_dialog(null);
+        grid_ref.current?.focus();
+    }, []);
+
+    const apply_hyperlink = useCallback(
+        (next: CellHyperlink | null) => {
+            const target = hyperlink_dialog;
+            set_hyperlink_dialog(null);
+            grid_ref.current?.focus();
+            if (!target || save_in_flight_ref.current) return;
+            commit_hyperlink(target.source_row, target.source_col, next);
+            // Damage explicitly: a link change on an already-dirty cell leaves
+            // the dirty key set unchanged, so the tint effect below sees no
+            // transition and would never repaint the new link presentation.
+            // Through the same source-keyed pipeline as every other such
+            // repaint, so one source row showing at several display rows — and
+            // a merge whose anchor is off-screen — are handled here too.
+            const cells = source_key_damage(
+                new Set([`${target.source_row}:${target.source_col}`]),
+                visible_ref.current,
+                display_column_for_source,
+                get_source_row,
+                merged_ranges,
+            ).map(({ cell }) => ({ cell: cell as Item }));
+            if (cells.length > 0) grid_ref.current?.updateCells(cells);
+        },
+        [
+            commit_hyperlink,
+            display_column_for_source,
+            get_source_row,
+            hyperlink_dialog,
+            merged_ranges,
+            save_in_flight_ref,
+        ],
+    );
+
     const apply_column_sort = useCallback((
         source_column: number,
         direction: SortDirection,
@@ -3295,11 +3378,25 @@ export function GridShell({
         // remove, so hiding "Discard edit" is the consistent answer.
         const menu_source_row = get_source_row(row);
         const menu_link_url = external_link_url(display_col, row);
+        // Hyperlinks are a workbook concept: offered on the sheets that edit as
+        // markdown (Excel), never on CSV/TSV, and only where the cell is
+        // actually editable and its source identity resolved — the same gate
+        // the commit path needs to have a durable key.
+        const may_edit_hyperlink = editable_cells
+            && edit_syntax === 'markdown'
+            && menu_source_row !== undefined;
         cell_menu_items = cell_context_menu_items({
             ...(menu_link_url !== null
                 ? {
                     on_open_link: () => open_external_url(menu_link_url),
                     on_copy_link: () => void safe_write_to_clipboard(menu_link_url),
+                }
+                : {}),
+            ...(may_edit_hyperlink
+                ? {
+                    on_edit_hyperlink: () =>
+                        open_hyperlink_dialog(row, display_col, source_col),
+                    has_hyperlink: cell_hyperlink(display_col, row) !== undefined,
                 }
                 : {}),
             dirty: menu_source_row !== undefined
@@ -3425,6 +3522,16 @@ export function GridShell({
                 >
                     {cell_tooltip.text}
                 </div>
+            )}
+            {hyperlink_dialog && (
+                <HyperlinkDialog
+                    // Remount on a different cell so the draft state starts
+                    // from that cell's link rather than the previous one's.
+                    key={`${hyperlink_dialog.source_row}:${hyperlink_dialog.source_col}`}
+                    initial={hyperlink_dialog.initial}
+                    on_commit={apply_hyperlink}
+                    on_cancel={close_hyperlink_dialog}
+                />
             )}
             {context_menu?.kind === 'cell' && (
                 <ContextMenu

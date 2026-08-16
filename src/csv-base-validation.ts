@@ -32,8 +32,10 @@
  */
 
 import {
+    hyperlinks_equal,
     rich_text_equal,
     rich_text_from_plain,
+    type CellHyperlink,
     type RichText,
 } from './cell-content';
 import type { CsvDirtyMap } from './types';
@@ -72,6 +74,14 @@ export function validate_dirty_bases(
      * source (CSV) omit it, keeping their text-only contract intact.
      */
     read_rich?: (source_row: number, col: number) => RichText | undefined,
+    /**
+     * The source cell's hyperlink: a link, `null` for an observed linkless
+     * cell, `undefined` for a cell that was never observed. Consulted only for
+     * entries carrying a link change (`entry.link !== undefined`); a stale
+     * `baseLink` — or an unobservable cell — conflicts the key rather than
+     * letting the save overwrite a link nobody checked.
+     */
+    read_link?: (source_row: number, col: number) => CellHyperlink | null | undefined,
 ): BaseValidationOutcome {
     const removed_keys: string[] = [];
     const conflicted_keys: string[] = [];
@@ -119,6 +129,25 @@ export function validate_dirty_bases(
             && !base_formatting_equal(entry.baseRuns, read_rich(source_row, col), current)
         ) {
             conflicted_keys.push(key);
+            continue;
+        }
+        // A link change validates its own base independently: the link the
+        // edit was made against must still be the cell's link. Fail closed on
+        // both ways of not knowing — an unobserved cell (`undefined` from the
+        // reader) and a caller that supplied no reader at all. The latter is
+        // not a "text-only contract" case the way `read_rich` is: only a
+        // source that carries links can produce a link edit in the first
+        // place, so an entry with one and no observer means the two sides
+        // disagree about the format, and the safe answer is to refuse rather
+        // than write a link nobody checked.
+        if (entry.link !== undefined) {
+            const current_link = read_link?.(source_row, col);
+            if (
+                current_link === undefined
+                || !hyperlinks_equal(entry.baseLink ?? null, current_link)
+            ) {
+                conflicted_keys.push(key);
+            }
         }
     }
 

@@ -33,9 +33,15 @@ export function decode_xml(s: string): string {
 }
 
 export function get_attr(tag: string, attr: string): string | null {
-    const re = new RegExp(`\\b${attr}="([^"]*)"`, '');
+    // Both quote forms: XML 1.0 §3.1 allows either, and a writer that emits
+    // single quotes produces a perfectly legal part. Reading only one form
+    // made such an attribute invisible — benign in a reader that then skips
+    // the element, but silently destructive in a writer that rebuilds a
+    // section from what it could see.
+    const re = new RegExp(`\\b${attr}=(?:"([^"]*)"|'([^']*)')`, '');
     const m = tag.match(re);
-    return m ? decode_xml(m[1]) : null;
+    if (!m) return null;
+    return decode_xml(m[1] ?? m[2] ?? '');
 }
 
 /** Find the index of '>' that closes an opening tag, skipping '>' inside quoted attribute values. Returns -1 if not found. */
@@ -128,4 +134,41 @@ export function get_text(xml: string, tag: string): string | null {
         if (close_pos === -1) return null;
         return xml.substring(tag_end + 1, close_pos);
     }
+}
+
+/**
+ * Strip the characters XML 1.0 forbids outright — the C0 controls with no
+ * escape, the two non-characters, and unpaired surrogates. Shared by every
+ * writer because the policy must not differ between the parts of one file:
+ * a numeric reference would be just as invalid as the raw byte, so removal is
+ * the only option, and a single invisible character left in is the difference
+ * between a workbook that opens and one that does not. Both arrive the same
+ * unseen way — a paste from a terminal, a PDF, or a program that split a code
+ * point. Excel drops them on paste too.
+ */
+export function strip_illegal_xml_chars(s: string): string {
+    return s
+        // eslint-disable-next-line no-control-regex
+        .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g, '')
+        .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '');
+}
+
+/**
+ * Encode text for an XML **attribute value**: the markup-significant
+ * characters plus the double quote, then the whitespace an attribute-value
+ * normalization would otherwise flatten to spaces (XML 1.0 §3.3.3) — numeric
+ * references are exempt from that normalization, which is what makes them the
+ * only spelling of a deliberate tab/newline that round-trips.
+ */
+export function encode_xml_attr(s: string): string {
+    return strip_illegal_xml_chars(
+        s
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/\t/g, '&#9;')
+            .replace(/\r/g, '&#13;')
+            .replace(/\n/g, '&#10;'),
+    );
 }

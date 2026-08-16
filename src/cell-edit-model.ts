@@ -28,6 +28,7 @@ import {
     rich_text_from_plain,
     rich_text_has_styles,
     rich_text_plain_text,
+    type CellHyperlink,
     type CellTextStyle,
     type RichText,
 } from './cell-content';
@@ -52,6 +53,8 @@ export interface EditableSourceCell {
     readonly underline?: boolean;
     readonly strikethrough?: boolean;
     readonly richText?: RichText;
+    /** The cell's whole-cell link — the base a hyperlink edit is made against. */
+    readonly hyperlink?: CellHyperlink;
 }
 
 /** The raw value as the text the editor and the dirty map hold — the same

@@ -1599,3 +1599,18 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
     cursor: default;
     opacity: 0.5;
 }
+
+/* Whole-cell hyperlink editor. Reuses the filter popover's chrome (same
+   widget surface, fields, and buttons) and only overrides placement: this
+   one is a centered dialog rather than an anchored popover. */
+.hyperlink-dialog {
+    top: 50%;
+    left: 50%;
+    width: min(360px, calc(100vw - 16px));
+    transform: translate(-50%, -50%);
+}
+
+.hyperlink-dialog-hint {
+    color: var(--vscode-errorForeground, #f48771);
+    font-size: var(--tv-font-size-sm);
+}

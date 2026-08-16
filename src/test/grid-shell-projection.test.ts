@@ -167,6 +167,11 @@ vi.mock('../webview/use-row-loader', () => ({
                 const cell = grid_mock.get_row(display_row)?.[col];
                 return cell ? String(cell.raw ?? '') : '';
             },
+            get_cell_for_source: (source_row: number, col: number) => {
+                const display_row = resident_display_row(source_row);
+                if (display_row === undefined) return undefined;
+                return grid_mock.get_row(display_row)?.[col] ?? null;
+            },
             has_source_row: (source_row: number) => (
                 resident_display_row(source_row) !== undefined
             ),
@@ -2192,6 +2197,60 @@ describe('GridShell column projection', () => {
         expect(grid_mock.loader_enabled.at(-1)).toBe(true);
         expect(grid_mock.ensure_rows).toHaveBeenCalledWith(0, 40);
         expect(editing_ref.current?.has_uncommitted_changes()).toBe(true);
+    });
+});
+
+describe('GridShell link-only edits', () => {
+    it('keeps the formatted display when only the hyperlink changed', async () => {
+        // A link-only entry's `value` is the unedited cell's raw text, and the
+        // save deliberately emits no text edit for it — so substituting it for
+        // the display would swap a formatted number for its raw form on a cell
+        // whose value dimension was never touched.
+        grid_mock.get_row.mockImplementation(() => [
+            { raw: '1234.5', formatted: '1,234.50', bold: false, italic: false },
+            { raw: 'hidden-b', formatted: 'hidden-b', bold: false, italic: false },
+            { raw: 'source-c', formatted: 'source-c', bold: false, italic: false },
+        ] as any);
+        await render_grid(props({
+            show_formatting: true,
+            edit_mode: true,
+            csv_editable: true,
+            initial_edits: {
+                '0:0': {
+                    value: '1234.5',
+                    base: '1234.5',
+                    link: { kind: 'external', target: 'https://a.test/' },
+                    baseLink: null,
+                },
+            },
+        }));
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => { displayData: string };
+        expect(get_cell_content([0, 0]).displayData).toBe('1,234.50');
+    });
+
+    it('still substitutes the dirty text when the value itself changed', async () => {
+        grid_mock.get_row.mockImplementation(() => [
+            { raw: '1234.5', formatted: '1,234.50', bold: false, italic: false },
+            { raw: 'hidden-b', formatted: 'hidden-b', bold: false, italic: false },
+            { raw: 'source-c', formatted: 'source-c', bold: false, italic: false },
+        ] as any);
+        await render_grid(props({
+            show_formatting: true,
+            edit_mode: true,
+            csv_editable: true,
+            initial_edits: {
+                '0:0': {
+                    value: 'typed',
+                    base: '1234.5',
+                    link: { kind: 'external', target: 'https://a.test/' },
+                    baseLink: null,
+                },
+            },
+        }));
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => { displayData: string };
+        expect(get_cell_content([0, 0]).displayData).toBe('typed');
     });
 });
 

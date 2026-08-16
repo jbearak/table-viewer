@@ -12,7 +12,8 @@
  * this file entirely.
  */
 
-import { dirty_entries_equal, make_dirty_entry, type CsvDirtyEntry } from '../types';
+import { copy_dirty_entry, dirty_entries_equal, type CsvDirtyEntry } from '../types';
+import { hyperlinks_equal, type CellHyperlink } from '../cell-content';
 
 export interface DirtyEntry extends CsvDirtyEntry {
     // When true, `base` has not yet been captured against a resident page (an
@@ -50,18 +51,35 @@ export function clear_saved_dirty_entries(
         // Re-based on the plain text the save wrote. The kept side's runs come
         // along; the new base gets none — the saved string is all this path
         // knows, and a missing base side just means the next conflict check
-        // compares plain text, which is what the host validates anyway.
+        // compares plain text, which is what the host validates anyway. A
+        // pending link dimension survives untouched: its baseLink may now be
+        // stale (the save wrote an older link), which the next conflict check
+        // surfaces rather than this path guessing.
         else {
-            next.set(key, make_dirty_entry(entry.value, value, entry.valueRuns));
+            next.set(key, copy_dirty_entry(entry, { base: value, baseRuns: undefined }));
         }
     }
     return next;
 }
 
+/**
+ * A resident cell's current hyperlink, addressed by canonical source row like
+ * {@link GetCellRaw}: `null` for a cell that verifiably has none, `undefined`
+ * for a row that is not resident. The `undefined` case is "unknown", never a
+ * conflict — the same rule the raw reader follows, and deliberately unlike the
+ * host's save-time validator, where an unobserved cell fails closed because
+ * there the save is about to write it.
+ */
+export type GetCellLink = (
+    source_row: number,
+    col: number,
+) => CellHyperlink | null | undefined;
+
 export function is_entry_conflicted(
     key: string,
     entry: DirtyEntry,
     get_cell_raw: GetCellRaw,
+    get_cell_link?: GetCellLink,
 ): boolean {
     // Base not yet captured (old-format restore on a non-resident page): can't
     // judge a conflict yet, so never flag.
@@ -69,7 +87,21 @@ export function is_entry_conflicted(
     const [r, c] = key.split(':').map(Number);
     const cur = get_cell_raw(r, c);
     // `undefined` means the page isn't resident — unknown, not a conflict.
-    return cur !== undefined && cur !== entry.base;
+    if (cur !== undefined && cur !== entry.base) return true;
+    // A pending link edit conflicts on its own base, so a link-only entry —
+    // whose text sides are equal by construction — is still checked. Without
+    // this the cell is neither tinted nor reachable by "Discard conflicted",
+    // and the staleness only surfaces when the host refuses the save.
+    if (entry.link !== undefined && get_cell_link) {
+        const current_link = get_cell_link(r, c);
+        if (
+            current_link !== undefined
+            && !hyperlinks_equal(entry.baseLink ?? null, current_link)
+        ) {
+            return true;
+        }
+    }
+    return false;
 }
 
 export interface EditSessionIdentity {
@@ -353,7 +385,7 @@ export function create_edit_session_store(
         commit: (session_id, key, entry) => {
             if (!owns(session_id)) return;
             const next = new Map(state.entries);
-            next.set(key, make_dirty_entry(entry.value, entry.base, entry.valueRuns, entry.baseRuns));
+            next.set(key, copy_dirty_entry(entry));
             set_entries(next, state.pending_base);
         },
         remove: (session_id, key) => {
@@ -377,7 +409,7 @@ export function create_edit_session_store(
             let pending_base = false;
             const next = new Map<string, DirtyEntry>();
             for (const [key, entry] of Object.entries(entries)) {
-                const owned = make_dirty_entry(entry.value, entry.base, entry.valueRuns, entry.baseRuns);
+                const owned = copy_dirty_entry(entry);
                 if (entry.base_pending) {
                     pending_base = true;
                     next.set(key, { ...owned, base_pending: true });
@@ -409,7 +441,10 @@ export function create_edit_session_store(
                     const [r, c] = key.split(':').map(Number);
                     const cur = get_cell_raw(r, c);
                     if (cur !== undefined) {
-                        next.set(key, make_dirty_entry(entry.value, cur, entry.valueRuns));
+                        next.set(key, copy_dirty_entry(entry, {
+                            base: cur,
+                            baseRuns: undefined,
+                        }));
                         changed = true;
                         continue;
                     }

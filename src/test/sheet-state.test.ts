@@ -119,6 +119,49 @@ describe('sheet-state helpers', () => {
         });
     });
 
+    it('preserves a persisted entry\u2019s runs and hyperlink through normalization', () => {
+        // Normalization used to rebuild every entry as `{value, base}`, which
+        // silently dropped the other dimensions: a pending formatting or
+        // hyperlink edit vanished on the next restore.
+        const link = { kind: 'external' as const, target: 'https://a.test/' };
+        const runs = { runs: [{ text: 'v', style: { bold: true as const } }] };
+        const state: PerFileState = {
+            activeSheetIndex: 0,
+            pendingEdits: sheet_edits({
+                '0:0': { value: 'v', base: 'b', valueRuns: runs },
+                '0:1': { value: 'x', base: 'x', link, baseLink: null },
+            }) as PerFileState['pendingEdits'],
+        };
+
+        const normalized = normalize_per_file_state(state, ['Sheet1']);
+
+        expect(sheet_cells(normalized.pendingEdits)).toEqual({
+            '0:0': { value: 'v', base: 'b', valueRuns: runs },
+            '0:1': { value: 'x', base: 'x', link, baseLink: null },
+        });
+    });
+
+    it('drops a persisted entry that is not a well-formed value/base record', () => {
+        const state: PerFileState = {
+            activeSheetIndex: 0,
+            // Deliberately ill-typed: these are the shapes a corrupt or
+            // tampered stored state can present, which is what this normalizer
+            // exists to reject.
+            pendingEdits: sheet_edits({
+                '0:0': { value: 'v' },
+                '0:1': { value: 1, base: 'b' },
+                '0:2': null,
+                '0:3': { value: 'keep', base: 'b' },
+            } as never) as PerFileState['pendingEdits'],
+        };
+
+        const normalized = normalize_per_file_state(state, ['Sheet1']);
+
+        expect(sheet_cells(normalized.pendingEdits)).toEqual({
+            '0:3': { value: 'keep', base: 'b' },
+        });
+    });
+
     it('sanitizes persisted transforms and drops duplicate or out-of-range columns', () => {
         const sanitized = sanitize_transform_state({
             sort: [

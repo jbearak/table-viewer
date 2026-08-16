@@ -341,6 +341,187 @@ describe('xlsx edit sessions', () => {
         });
     });
 
+    it('writes a hyperlink-only edit without rewriting the cell', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const before = await parse_xlsx(bytes);
+        const base_text = String(before.data.sheets[0].rows[1][0]?.raw ?? '');
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                saveRequestId: 'save-link',
+                worksheets: [{
+                    sheetIndex: 0,
+                    sheetName: 'People',
+                    worksheetId: '1',
+                    // A link-only edit contributes no text edit at all: the
+                    // cell's own `<c>` element must survive untouched.
+                    edits: {},
+                    dirtyEdits: {
+                        '1:0': {
+                            value: base_text,
+                            base: base_text,
+                            link: { kind: 'external', target: 'https://example.com/a' },
+                            baseLink: null,
+                        },
+                    },
+                }],
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+        const after = await parse_xlsx(bytes);
+        const cell = after.data.sheets[0].rows[1][0];
+        expect(cell?.raw).toBe(base_text);
+        expect(cell?.hyperlink).toEqual({
+            kind: 'external',
+            target: 'https://example.com/a',
+        });
+    });
+
+    it('clears a hyperlink the workbook already carried', async () => {
+        // Seed the fixture with an internal link (no relationship part needed),
+        // so this exercises the clear against a link the *file* owns rather than
+        // one this same session just wrote.
+        const raw = read_fixture('basic.xlsx');
+        const file = CFB.read(raw, { type: 'buffer' });
+        const sheet = CFB.find(file, '/xl/worksheets/sheet1.xml')!;
+        const patched = Buffer.from(
+            Buffer.from(sheet.content as Uint8Array).toString('utf8').replace(
+                '</sheetData>',
+                '</sheetData><hyperlinks><hyperlink ref="A2" location="Inventory!A1"/></hyperlinks>',
+            ),
+            'utf8',
+        );
+        sheet.content = patched;
+        sheet.size = patched.length;
+        const written = CFB.write(file, { type: 'buffer', fileType: 'zip', compression: true });
+        bytes = written instanceof Uint8Array
+            ? written
+            : new Uint8Array(written as ArrayBufferLike);
+
+        const seeded = await parse_xlsx(bytes);
+        const base_link = seeded.data.sheets[0].rows[1][0]?.hyperlink;
+        expect(base_link).toEqual({ kind: 'internal', location: 'Inventory!A1' });
+        const base_text = String(seeded.data.sheets[0].rows[1][0]?.raw ?? '');
+
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                saveRequestId: 'save-clear',
+                worksheets: [{
+                    sheetIndex: 0,
+                    sheetName: 'People',
+                    worksheetId: '1',
+                    edits: {},
+                    dirtyEdits: {
+                        '1:0': {
+                            value: base_text,
+                            base: base_text,
+                            link: null,
+                            baseLink: base_link,
+                        },
+                    },
+                }],
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+        const after = await parse_xlsx(bytes);
+        expect(after.data.sheets[0].rows[1][0]?.hyperlink).toBeUndefined();
+        expect(after.data.sheets[0].rows[1][0]?.raw).toBe(base_text);
+    });
+
+    it('refuses a hyperlink whose base no longer matches the cell', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const base_text = String(
+            (await parse_xlsx(bytes)).data.sheets[0].rows[1][0]?.raw ?? '',
+        );
+        const untouched = bytes;
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                saveRequestId: 'save-stale',
+                worksheets: [{
+                    sheetIndex: 0,
+                    sheetName: 'People',
+                    worksheetId: '1',
+                    edits: {},
+                    dirtyEdits: {
+                        '1:0': {
+                            value: base_text,
+                            base: base_text,
+                            link: { kind: 'external', target: 'https://example.com/a' },
+                            // The cell has no link, so this base is stale.
+                            baseLink: { kind: 'external', target: 'https://was-here.test/' },
+                        },
+                    },
+                }],
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({
+            success: false,
+            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0 },
+        });
+        expect(bytes).toBe(untouched);
+    });
+
+    it('fails the save rather than writing a non-http hyperlink target', async () => {
+        // The webview validates before offering Save, so a target like this can
+        // only arrive from a stale or tampered renderer. The host re-validates
+        // and refuses: nothing unvalidated reaches the file, or later the OS
+        // opener that reads it back.
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const base_text = String(
+            (await parse_xlsx(bytes)).data.sheets[0].rows[1][0]?.raw ?? '',
+        );
+        const untouched = bytes;
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                saveRequestId: 'save-bad-url',
+                worksheets: [{
+                    sheetIndex: 0,
+                    sheetName: 'People',
+                    worksheetId: '1',
+                    edits: {},
+                    dirtyEdits: {
+                        '1:0': {
+                            value: base_text,
+                            base: base_text,
+                            link: { kind: 'external', target: 'javascript:alert(1)' },
+                            baseLink: null,
+                        },
+                    },
+                }],
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: false });
+        expect(bytes).toBe(untouched);
+    });
+
     it('drops wire runs whose text disagrees with the edit and writes the plain value', async () => {
         const panel = await open_ready_xlsx(file_path);
         await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
