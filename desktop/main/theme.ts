@@ -126,6 +126,7 @@ export interface ThemePayload {
      *  re-deriving them from `kind` (which would lose the selection). */
     readonly themeId: ThemeId;
     readonly kind: ThemeKind;
+    readonly highContrast: boolean;
     readonly variables: Record<string, string>;
 }
 
@@ -136,6 +137,7 @@ export function theme_payload(id: ThemeId): ThemePayload {
         // Derived from the registry, never passed in: `kind` and `themeId`
         // disagreeing is exactly the bug this refactor removes.
         kind: definition.kind,
+        highContrast: definition.highContrast === true,
         variables: { ...definition.variables },
     };
 }
@@ -162,5 +164,7 @@ export function apply_theme_to_document(doc: Document, payload: ThemePayload): v
     if (body) {
         body.classList.toggle('vscode-dark', payload.kind === 'dark');
         body.classList.toggle('vscode-light', payload.kind === 'light');
+        body.classList.toggle('vscode-high-contrast', payload.highContrast);
+        body.classList.toggle('vscode-high-contrast-light', false);
     }
 }
