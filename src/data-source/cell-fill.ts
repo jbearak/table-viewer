@@ -15,7 +15,9 @@
 // `../types`). No parser is imported here, so there is no import cycle.
 
 import { get_raw_cell_text } from '../cell-display';
+import { rich_text_has_styles } from '../cell-content';
 import type { CellData, MergeRange } from '../types';
+import type { RenderedCell } from './interface';
 
 /**
  * The sparse working set for one parsed worksheet, before densification.
@@ -91,7 +93,11 @@ function fill_store(working: WorkingSet, sink: CellSink): void {
     for (let r = 0; r < working.row_count; r++) {
         for (let c = 0; c < working.col_count; c++) {
             const cell = cell_at(working, r, c);
-            sink.set(r, c, cell === null ? null : {
+            if (cell === null) {
+                sink.set(r, c, null);
+                continue;
+            }
+            const rendered: RenderedCell = {
                 raw: cell.raw === null ? '' : String(cell.raw),
                 formatted: cell.formatted,
                 bold: cell.bold,
@@ -105,7 +111,12 @@ function fill_store(working: WorkingSet, sink: CellSink): void {
                         : typeof cell.raw === 'boolean'
                             ? 'boolean'
                             : 'string',
-            });
+            };
+            if (cell.underline) rendered.underline = true;
+            if (cell.strikethrough) rendered.strikethrough = true;
+            if (cell.richText) rendered.richText = cell.richText;
+            if (cell.hyperlink) rendered.hyperlink = cell.hyperlink;
+            sink.set(r, c, rendered);
         }
     }
 }
@@ -169,7 +180,10 @@ export function working_has_formatting(workings: WorkingSet[]): boolean {
             if (cell.raw === null) continue;
             if (working.merged_cells.has(key)) continue; // densified -> null, skipped
             if (cell.formatted !== get_raw_cell_text(cell.raw)) return true;
-            if (cell.bold || cell.italic) return true;
+            if (cell.bold || cell.italic || cell.underline || cell.strikethrough) return true;
+            // A hyperlink alone deliberately does NOT flip the flag: link
+            // styling is semantic and stays visible with formatting off.
+            if (cell.richText && rich_text_has_styles(cell.richText)) return true;
         }
     }
     return false;

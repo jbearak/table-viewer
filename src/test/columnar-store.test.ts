@@ -47,6 +47,39 @@ describe('ColumnarStore', () => {
         expect(w[0][0]).toBeNull();
         expect(w[1][0]).toEqual({ raw: '', formatted: '', bold: false, italic: false });
     });
+
+    it('round-trips underline/strikethrough flags and sparse extras', () => {
+        const rich = { runs: [{ text: 'a' }, { text: 'b', style: { bold: true as const } }] };
+        const link = { kind: 'external' as const, target: 'https://example.com/' };
+        const b = new ColumnarStore.Builder(1, 3);
+        b.set(0, 0, {
+            raw: 'ab', formatted: 'ab', bold: false, italic: false,
+            underline: true, strikethrough: true, richText: rich, hyperlink: link,
+            rawType: 'string',
+        });
+        b.set(0, 1, { raw: 'x', formatted: 'x', bold: true, italic: false, rawType: 'string' });
+        const store = b.build();
+        const [row] = store.read_window(0, 1);
+        expect(row[0]?.underline).toBe(true);
+        expect(row[0]?.strikethrough).toBe(true);
+        // Extras are stored and returned by reference, not cloned.
+        expect(row[0]?.richText).toBe(rich);
+        expect(row[0]?.hyperlink).toBe(link);
+        // Plain cells carry none of the optional fields.
+        expect(row[0] && 'raw' in row[0]).toBe(true);
+        expect(row[1]).toEqual({ raw: 'x', formatted: 'x', bold: true, italic: false, rawType: 'string' });
+        expect(row[2]).toBeNull();
+    });
+    it('overwriting a cell with a plain value clears its extras', () => {
+        const b = new ColumnarStore.Builder(1, 1);
+        b.set(0, 0, {
+            raw: 'a', formatted: 'a', bold: false, italic: false,
+            hyperlink: { kind: 'internal', location: 'Sheet1!A1' }, rawType: 'string',
+        });
+        b.set(0, 0, { raw: 'a', formatted: 'a', bold: false, italic: false, rawType: 'string' });
+        const store = b.build();
+        expect(store.read_window(0, 1)[0][0]?.hyperlink).toBeUndefined();
+    });
     it('materializes only requested columns in compact requested order', () => {
         const builder = new ColumnarStore.Builder(2, 1_000);
         builder.set(0, 2, {

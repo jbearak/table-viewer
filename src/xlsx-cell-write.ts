@@ -1,4 +1,4 @@
-import { find_tag_end, is_tag_boundary, is_self_closing } from './parse-xlsx';
+import { find_tag_end, is_tag_boundary, is_self_closing } from './ooxml-xml';
 
 /**
  * Surgical, `putexcel`-style cell writes into a worksheet's OOXML.

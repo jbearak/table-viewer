@@ -8,6 +8,7 @@ import type {
     WorkbookSnapshot,
     WorkbookSnapshotIdentity,
 } from './viewer-snapshot';
+import type { RichCellFields } from './cell-content';
 
 export interface WorkbookData {
     sheets: SheetData[];
@@ -24,7 +25,7 @@ export interface SheetData {
     rowCount: number;
 }
 
-export interface CellData {
+export interface CellData extends RichCellFields {
     raw: string | number | boolean | null;
     formatted: string;
     bold: boolean;
@@ -594,7 +595,7 @@ export interface LegacyPerFileState {
 }
 export type StoredPerFileState = PerFileState | LegacyPerFileState;
 
-function is_plain_record(value: unknown): value is Record<string, unknown> {
+export function is_plain_record(value: unknown): value is Record<string, unknown> {
     return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 

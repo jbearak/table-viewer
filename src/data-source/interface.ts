@@ -1,9 +1,12 @@
 import type { MergeRange } from '../types';
+import type { RichCellFields } from '../cell-content';
 
 /** Webview-facing cell. Identical shape to the old CellData so the renderer
  *  is format-agnostic. `raw` is the raw value rendered to string (numbers/bools
- *  become their string form — acceptable: copy + edit-base both String() it). */
-export interface RenderedCell {
+ *  become their string form — acceptable: copy + edit-base both String() it).
+ *  The rich fields are shared with CellData via RichCellFields; only Excel
+ *  sources set them, so CSV cells keep their exact legacy shape. */
+export interface RenderedCell extends RichCellFields {
     raw: string | null;       // null = empty cell
     formatted: string;        // display text (== raw for CSV)
     bold: boolean;
