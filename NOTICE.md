@@ -26,6 +26,9 @@ in its entry). Every one of them permits this use under GPL-3.0.
   declares MIT while the repository also ships a GPL-3.0 `LICENSE` file; the two
   disagree, but either grant permits this port, since this app is itself GPL-3.0
   (see [LICENSE](LICENSE) for the GPL-3.0 text).
+- **Red** — Copyright (c) Microsoft Corporation —
+  <https://github.com/microsoft/vscode/tree/1.101.0/extensions/theme-red>
+  (ported from VS Code 1.101's built-in `vscode.theme-red`).
 
 ## MIT License
 
