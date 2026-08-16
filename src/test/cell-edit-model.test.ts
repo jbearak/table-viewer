@@ -12,6 +12,7 @@ import {
     decode_stored_per_file_state,
     dirty_entries_equal,
     sanitized_dirty_entry,
+    sanitized_wire_dirty_entry,
     type PerFileState,
 } from '../types';
 
@@ -120,6 +121,22 @@ describe('sanitized_dirty_entry', () => {
         expect(sanitized_dirty_entry({ value: 'ab', base: 'c', valueRuns: evil }))
             .toEqual({ value: 'ab', base: 'c' });
         expect(sanitized_dirty_entry({ value: 'ab', base: 'c', valueRuns: 'junk' }))
+            .toEqual({ value: 'ab', base: 'c' });
+    });
+});
+
+describe('sanitized_wire_dirty_entry', () => {
+    it('drops entries that are not two-string records instead of throwing', () => {
+        for (const bad of [null, undefined, 'text', 42, [], { value: 'x' }, { value: 1, base: 'y' }]) {
+            expect(sanitized_wire_dirty_entry(bad)).toBeUndefined();
+        }
+    });
+
+    it('defers to the sanitizer for well-shaped entries', () => {
+        const good = { runs: [{ text: 'ab', style: { bold: true as const } }] };
+        expect(sanitized_wire_dirty_entry({ value: 'ab', base: 'c', valueRuns: good }))
+            .toEqual({ value: 'ab', base: 'c', valueRuns: good });
+        expect(sanitized_wire_dirty_entry({ value: 'ab', base: 'c', valueRuns: 'junk' }))
             .toEqual({ value: 'ab', base: 'c' });
     });
 });

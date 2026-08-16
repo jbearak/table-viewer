@@ -22,7 +22,8 @@ import {
     type CellHighlightMutation,
     type CellHighlightSelection,
     type CellHighlightState,
-    type CsvDirtyMap,
+    dirty_entries_equal,
+    type CsvDirtyEntry,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
     type CsvSaveWorksheetOperation,
@@ -601,7 +602,7 @@ export function App(): React.JSX.Element {
         sheet_index: number;
         sheet_name: string | undefined;
         worksheet_id: string | undefined;
-        entries: Record<string, { value: string; base: string }>;
+        entries: Record<string, CsvDirtyEntry>;
     } | null>(null);
 
     const state_ref = useRef<PerFileState>({});
@@ -3530,13 +3531,13 @@ export function App(): React.JSX.Element {
                         // already have moved on. `live_rejected_keys` compares against
                         // this so a key that came back with a different value or a
                         // re-read base is understood as a new, unjudged edit.
+                        // The full entry, runs included: a formatting-only
+                        // replacement is a new, unjudged edit, so identity must
+                        // cover the run sides too.
                         entries: Object.fromEntries(
                             msg.rejection.keys.map((key) => [
                                 key,
-                                {
-                                    value: submitted[key]?.value ?? '',
-                                    base: submitted[key]?.base ?? '',
-                                },
+                                submitted[key] ?? { value: '', base: '' },
                             ]),
                         ),
                     });
@@ -4132,12 +4133,13 @@ export function App(): React.JSX.Element {
                 // as a different edit — the user discards a rejected cell and types
                 // into it again, and the fresh entry's base is re-read from the file
                 // the host just changed. That edit has never been submitted, so
-                // claiming "save was cancelled" over it is a lie. Comparing both
-                // fields is deliberate: value alone misses a re-typed identical
-                // value over a new base (genuinely unjudged), and base alone misses
-                // a corrected value over the same stale base.
+                // claiming "save was cancelled" over it is a lie. Full durable
+                // identity is deliberate: value alone misses a re-typed identical
+                // value over a new base (genuinely unjudged), base alone misses
+                // a corrected value over the same stale base, and the run sides
+                // catch a formatting-only replacement.
                 const judged = save_rejection.entries[key];
-                return live.value === judged.value && live.base === judged.base;
+                return dirty_entries_equal(live, judged);
             });
         },
         [

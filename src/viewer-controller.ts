@@ -40,6 +40,8 @@ import { serialize_csv } from './serialize-csv';
 import { write_xlsx_workbook_cell_edits } from './xlsx-package';
 import type { XlsxCellEdit } from './xlsx-cell-write';
 import { validate_dirty_bases } from './csv-base-validation';
+import { cell_edit_base } from './cell-edit-model';
+import type { RichText } from './cell-content';
 import type {
     AuthorityFileStateStore,
     FileStateSnapshot,
@@ -89,7 +91,9 @@ import {
     worksheet_target_matches,
     type ActiveCsvSaveLifecycle,
     type CsvDirtyMap,
+    dirty_entries_equal,
     sanitized_dirty_entry,
+    sanitized_wire_dirty_entry,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
     type CsvSaveOperationRequest,
@@ -169,6 +173,14 @@ export interface SavePlan {
     /** Observed pre-edit raw text per worksheet, in input order. A missing key
      *  reads as "" downstream, matching a blank cell. */
     readonly observed_bases: readonly ReadonlyMap<string, string>[];
+    /**
+     * The same cells' effective rich content per worksheet, present only for
+     * planners whose source carries formatting (xlsx). Absent for CSV, whose
+     * validation contract stays text-only. Base validation reads this so a
+     * formatting-only external change conflicts a stale edit like a text
+     * change does.
+     */
+    readonly observed_rich?: readonly ReadonlyMap<string, RichText>[];
     /**
      * The bytes to write, given the file's current bytes.
      *
@@ -482,8 +494,13 @@ function harvest_source_bases(
     src: DataSource,
     sheet_index: number,
     wanted_bases: Iterable<string>,
-): Map<string, string> {
+): { texts: Map<string, string>; rich: Map<string, RichText> } {
     const observed_bases = new Map<string, string>();
+    // The same cells' *effective* rich content (runs, or the cell font as one
+    // run), present only where it carries styles — the exact derivation the
+    // webview used to record `baseRuns`, so text-equal bases whose formatting
+    // drifted read as conflicts rather than being silently overwritten.
+    const observed_rich = new Map<string, RichText>();
     const by_projected_row = new Map<number, { source_row: number; cols: number[] }>();
     for (const key of wanted_bases) {
         const [source_row, col] = key.split(':').map(Number);
@@ -504,14 +521,19 @@ function harvest_source_bases(
             for (const col of entry.cols) {
                 const cell = row[col];
                 if (cell === undefined) continue;
+                const cell_key = `${entry.source_row}:${col}`;
                 observed_bases.set(
-                    `${entry.source_row}:${col}`,
+                    cell_key,
                     cell === null ? '' : String(cell.raw ?? ''),
                 );
+                if (cell !== null) {
+                    const rich = cell_edit_base(cell).rich;
+                    if (rich) observed_rich.set(cell_key, rich);
+                }
             }
         });
     }
-    return observed_bases;
+    return { texts: observed_bases, rich: observed_rich };
 }
 
 /**
@@ -531,7 +553,7 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
     // writer likewise computes every replacement before mutating the container,
     // so one invalid worksheet rejects the workbook save atomically.
     const planned = input.worksheets.map(({ sheet_index, edits, wanted_bases, dirty_edits }) => {
-        const observed_bases = harvest_source_bases(src, sheet_index, wanted_bases);
+        const { texts: observed_bases, rich: observed_rich } = harvest_source_bases(src, sheet_index, wanted_bases);
         const cell_edits: XlsxCellEdit[] = [];
         for (const [key, value] of Object.entries(edits)) {
             const [row, col] = key.split(':').map(Number);
@@ -543,10 +565,11 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
             const runs = dirty_edits?.[key]?.valueRuns?.runs;
             cell_edits.push(runs && runs.length > 0 ? { row, col, value, runs } : { row, col, value });
         }
-        return { observed_bases, sheetIndex: sheet_index, edits: cell_edits };
+        return { observed_bases, observed_rich, sheetIndex: sheet_index, edits: cell_edits };
     });
     return {
         observed_bases: planned.map(({ observed_bases }) => observed_bases),
+        observed_rich: planned.map(({ observed_rich }) => observed_rich),
         produce: (raw) => write_xlsx_workbook_cell_edits(raw, planned),
     };
 }
@@ -2291,9 +2314,12 @@ export function attach_viewer(
         return Object.entries(cells).some(([key, pending]) => {
             const owned = operation.dirtyEdits[key];
             if (!owned) return false;
+            // Full durable identity, runs included (a formatting-only change
+            // is a different edit); legacy string entries carry no runs, so
+            // equal value is their whole identity.
             return typeof pending === 'string'
                 ? pending === owned.value
-                : pending.value === owned.value && pending.base === owned.base;
+                : dirty_entries_equal(pending, owned);
         });
     }
 
@@ -2306,9 +2332,12 @@ export function attach_viewer(
             Object.entries(pending_edits).filter(([key, pending]) => {
                 const owned = operation.dirtyEdits[key];
                 if (!owned) return true;
+                // Runs are part of the match: a pending entry whose formatting
+                // differs from what the operation carried is a newer
+                // formatting-only edit and must survive the strip.
                 return typeof pending === 'string'
                     ? pending !== owned.value
-                    : pending.value !== owned.value || pending.base !== owned.base;
+                    : !dirty_entries_equal(pending, owned);
             }),
         );
         return Object.keys(retained).length > 0 ? retained : undefined;
@@ -2627,7 +2656,8 @@ export function attach_viewer(
         const validation = validate_dirty_bases(
             dirty_edits,
             source_row_count,
-            (source_row, col) => observed_bases.get(`${source_row}:${col}`),
+            (source_row, col) => observed_bases.texts.get(`${source_row}:${col}`),
+            (source_row, col) => observed_bases.rich.get(`${source_row}:${col}`),
         );
         if (validation.type === 'valid') return undefined;
         return {
@@ -4475,7 +4505,9 @@ export function attach_viewer(
                     // Wire runs are untrusted; the sanitizer keeps a run side
                     // only when its text equals the plain projection, so the
                     // planner can hand runs to the xlsx writer without
-                    // re-checking.
+                    // re-checking. A non-record entry throws here, which fails
+                    // the save closed — dropping it instead would let its key
+                    // in `edits` be written with no base ever validated.
                     Object.freeze(sanitized_dirty_entry(entry)),
                 ]),
             );
@@ -4684,6 +4716,9 @@ export function attach_viewer(
                     worksheet.dirtyEdits,
                     sheet_meta.sourceRowCount,
                     (source_row, col) => plan.observed_bases[index]?.get(`${source_row}:${col}`),
+                    plan.observed_rich
+                        ? (source_row, col) => plan.observed_rich?.[index]?.get(`${source_row}:${col}`)
+                        : undefined,
                 )
                 : { type: 'baseMismatch' as const, keys: Object.keys(worksheet.dirtyEdits) };
             if (validation.type === 'valid') continue;
@@ -6441,12 +6476,15 @@ export function attach_viewer(
                 // `validate_edit_cells` rejects the whole `pendingEdits` leaf on
                 // one malformed run side. Sanitizing here keeps a bad optional
                 // field from poisoning every sheet's drafts at the next decode.
+                // The wire variant also guards the record shape itself: a
+                // renderer posting `null` or a non-record entry must not throw
+                // past the handler — that entry is dropped, the rest survive.
                 const edits = msg.edits
                     ? Object.fromEntries(
-                        Object.entries(msg.edits).map(([key, entry]) => [
-                            key,
-                            sanitized_dirty_entry(entry),
-                        ]),
+                        Object.entries(msg.edits).flatMap(([key, entry]) => {
+                            const sanitized = sanitized_wire_dirty_entry(entry);
+                            return sanitized ? [[key, sanitized] as const] : [];
+                        }),
                     )
                     : null;
                 const admission = Symbol(edit_session_id);

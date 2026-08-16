@@ -10,6 +10,7 @@ import { make_dirty_entry, type CsvDirtyEntry } from '../types';
 import {
     cell_edit_base,
     cell_edits_equal,
+    committed_value_runs,
     dirty_value_edit_text,
     edit_display_text,
     parse_cell_edit,
@@ -201,7 +202,14 @@ export function use_editing(
             active_store.commit(
                 session_id,
                 key,
-                make_dirty_entry(parsed.text, base.text, parsed.rich, base.rich),
+                make_dirty_entry(
+                    parsed.text,
+                    base.text,
+                    // Explicit plain runs when the user stripped a styled
+                    // base's markup — see committed_value_runs.
+                    committed_value_runs(parsed, base),
+                    base.rich,
+                ),
             );
         },
         [active_store, edit_base_at, session_id, syntax],

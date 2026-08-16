@@ -114,6 +114,24 @@ export function cell_edits_equal(left: ParsedCellEdit, right: ParsedCellEdit): b
 }
 
 /**
+ * The run side a committed edit stores. A styled parse keeps its runs. An
+ * *unstyled* parse over a styled base also gets runs — explicit plain ones —
+ * because deleting the `**` around a bold cell's text is how the user removes
+ * the bold: committed as a bare string, the writer would classify it plainly
+ * and the cell font would re-style it on the next open, silently undoing the
+ * edit. Explicit plain runs make the writer emit a font-replacing `<rPr>`.
+ * Empty text stores no runs — there is nothing left to style.
+ */
+export function committed_value_runs(
+    parsed: ParsedCellEdit,
+    base: ParsedCellEdit,
+): RichText | undefined {
+    if (parsed.rich) return parsed.rich;
+    if (base.rich && parsed.text !== '') return rich_text_from_plain(parsed.text);
+    return undefined;
+}
+
+/**
  * The conflict base of a loaded cell, in edit space: the plain raw text plus
  * the effective runs when they carry styles. Symmetric with ParsedCellEdit so
  * base-vs-current comparisons go through {@link cell_edits_equal}.

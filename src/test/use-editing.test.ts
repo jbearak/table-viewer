@@ -715,12 +715,16 @@ describe('use_editing — markdown syntax', () => {
         expect(hook_result!.is_dirty).toBe(false);
     });
 
-    it('deleting the markup is a formatting edit with runs and baseRuns', async () => {
+    it('deleting the markup is a formatting edit with explicit plain runs', async () => {
         await render_markdown();
         await act(async () => { hook_result!.commit_edit(0, 0, 'plain bold'); });
+        // valueRuns carries explicit plain runs, not nothing: a bare string
+        // would let the cell font re-style the text on save (see
+        // committed_value_runs), silently undoing the un-bolding.
         expect(hook_result!.dirty_cells.get('0:0')).toEqual({
             value: 'plain bold',
             base: 'plain bold',
+            valueRuns: { runs: [{ text: 'plain bold' }] },
             baseRuns: { runs: [{ text: 'plain ' }, { text: 'bold', style: { bold: true } }] },
         });
     });

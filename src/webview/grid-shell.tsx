@@ -167,6 +167,28 @@ const PREVIEW_RESTORE_MAX_ATTEMPTS = 8;
 const PREVIEW_RESTORE_RETRY_MS = 16;
 const PREVIEW_RESTORE_SETTLE_MS = 32;
 
+/**
+ * Markdown serialization cache for `get_cell_content`'s overlay `edit_value`.
+ * That callback is Glide's per-cell paint path, and re-serializing every
+ * visible editable cell's runs each frame is measurable on wide sheets. Both
+ * inputs — a dirty entry and a loaded cell — are immutable objects replaced
+ * wholesale on change, so object identity is a sound cache key; module-level
+ * because the WeakMap holds nothing alive. Markdown-only: plain sheets never
+ * compute an edit_value here.
+ */
+const markdown_edit_text_cache = new WeakMap<object, string>();
+
+function cached_markdown_edit_text(
+    source: object,
+    serialize: () => string,
+): string {
+    const hit = markdown_edit_text_cache.get(source);
+    if (hit !== undefined) return hit;
+    const text = serialize();
+    markdown_edit_text_cache.set(source, text);
+    return text;
+}
+
 import { use_row_loader } from './use-row-loader';
 import { theme_font_size_px, use_vscode_theme } from './vscode-theme';
 import { host_bridge, pending_edit_durability } from './host-bridge';
@@ -1991,10 +2013,18 @@ export function GridShell({
             let edit_value: string | undefined;
             if (edit_syntax === 'markdown' && editable) {
                 if (dirty) {
-                    edit_value = dirty_value_edit_text(dirty, edit_syntax);
+                    edit_value = cached_markdown_edit_text(
+                        dirty,
+                        () => dirty_value_edit_text(dirty, edit_syntax),
+                    );
                 } else {
                     const loaded = loaded_row?.[source_column];
-                    if (loaded) edit_value = cell_edit_text(loaded, edit_syntax);
+                    if (loaded) {
+                        edit_value = cached_markdown_edit_text(
+                            loaded,
+                            () => cell_edit_text(loaded, edit_syntax),
+                        );
+                    }
                 }
             }
             let overlay: CellEditOverlay | undefined;

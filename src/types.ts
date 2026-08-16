@@ -1349,6 +1349,28 @@ export function sanitized_dirty_entry(entry: {
 }
 
 /**
+ * `sanitized_dirty_entry` for a value straight off the wire, where even the
+ * `{value, base}` record shape is a claim: a stale or buggy renderer can post
+ * `null`, a string where an object belongs, or numbers in the text fields, and
+ * the sanitizer would throw on the first property read. Returns `undefined`
+ * for anything that is not a two-string record — the caller drops the entry —
+ * and otherwise defers to the sanitizer's run-side policy.
+ */
+export function sanitized_wire_dirty_entry(entry: unknown): CsvDirtyEntry | undefined {
+    if (
+        !is_plain_record(entry)
+        || typeof entry.value !== 'string'
+        || typeof entry.base !== 'string'
+    ) return undefined;
+    return sanitized_dirty_entry(entry as {
+        readonly value: string;
+        readonly base: string;
+        readonly valueRuns?: unknown;
+        readonly baseRuns?: unknown;
+    });
+}
+
+/**
  * Durable identity of one dirty entry — the comparison every dedupe/no-op
  * guard on the edit path shares (store notification suppression, wire payload
  * dedupe, save-lifecycle operation matching). Runs compare via the canonical
