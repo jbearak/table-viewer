@@ -87,6 +87,7 @@ import { rich_text_cell_renderer } from './rich-text-cell-renderer';
 import { parse_http_external_url } from '../external-url';
 import {
     CELL_TOOLTIP_SHOW_DELAY_MS,
+    cell_tooltip_content,
     cell_tooltip_position,
     clamp_tooltip_text,
     text_overflows_cell,
@@ -1610,6 +1611,18 @@ export function GridShell({
         [ensure_measure_ctx, font_family, font_size_px, show_formatting],
     );
 
+    /** The loaded cell's hyperlink at display coordinates. Merged blocks
+     *  arrive as anchor coordinates (Glide canonicalizes the hit), which is
+     *  where the content — and the link — lives. */
+    const cell_hyperlink = useCallback(
+        (display_column: number, row: number) => {
+            const source_column = source_column_for_display(display_column);
+            if (source_column === undefined) return undefined;
+            return get_row(row)?.[source_column]?.hyperlink;
+        },
+        [get_row, source_column_for_display],
+    );
+
     const font_flags_for_cell = useCallback(
         (display_column: number, row: number): { bold: boolean; italic: boolean } => {
             const source_column = source_column_for_display(display_column);
@@ -1646,19 +1659,8 @@ export function GridShell({
             set_cell_tooltip(null);
 
             const text = displayed_cell_text(display_column, row);
-            // A linked cell dwells into a tooltip even without overflow: Excel
-            // surfaces the link's tooltip (or its target) on hover, and with
-            // Ctrl/Cmd+click as the open gesture the user needs to see where a
-            // link goes before committing.
-            const source_column = source_column_for_display(display_column);
-            const link = source_column === undefined
-                ? undefined
-                : get_row(row)?.[source_column]?.hyperlink;
-            const link_text = link
-                ? link.tooltip
-                    ?? (link.kind === 'external' ? link.target : link.location)
-                : undefined;
-            if (!text && link_text === undefined) return;
+            const link = cell_hyperlink(display_column, row);
+            if (!text && !link) return;
 
             const flags = font_flags_for_cell(display_column, row);
             // Use the same wrapping rule as build_grid_cell. `cell_bounds` is the
@@ -1677,13 +1679,10 @@ export function GridShell({
                     wrapping,
                 },
             );
-            if (!overflows && link_text === undefined) return;
+            const content = cell_tooltip_content(text, overflows, link);
+            if (content === null) return;
 
-            const clamped = clamp_tooltip_text(
-                overflows && link_text !== undefined
-                    ? `${text}\n${link_text}`
-                    : link_text ?? text,
-            );
+            const clamped = clamp_tooltip_text(content);
             cell_tooltip_timer_ref.current = window.setTimeout(() => {
                 cell_tooltip_timer_ref.current = null;
                 // Drop if the pointer left this cell during the dwell.
@@ -1710,8 +1709,7 @@ export function GridShell({
             font_size_px,
             measure_line_width,
             default_row_height,
-            get_row,
-            source_column_for_display,
+            cell_hyperlink,
         ],
     );
 
@@ -2763,20 +2761,16 @@ export function GridShell({
 
     const dismiss_context_menu = useCallback(() => set_context_menu(null), []);
 
-    /** The loaded cell's external-link URL, pre-validated for immediate
-     *  feedback (the host re-validates before anything reaches the OS opener).
+    /** The cell's external-link URL, pre-validated for immediate feedback
+     *  (the host re-validates before anything reaches the OS opener).
      *  Internal links are render-only in v1, so they yield null here too. */
     const external_link_url = useCallback(
         (display_column: number, row: number): string | null => {
-            const source_column = source_column_for_display(display_column);
-            if (source_column === undefined) return null;
-            // Merged blocks arrive as anchor coordinates (Glide canonicalizes
-            // the hit), which is where the content — and the link — lives.
-            const link = get_row(row)?.[source_column]?.hyperlink;
+            const link = cell_hyperlink(display_column, row);
             if (link?.kind !== 'external') return null;
             return parse_http_external_url(link.target);
         },
-        [get_row, source_column_for_display],
+        [cell_hyperlink],
     );
 
     const open_external_url = useCallback((url: string) => {

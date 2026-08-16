@@ -7,6 +7,7 @@
  * here (no DOM) lets it unit-test without a canvas or Glide runtime.
  */
 import { has_line_break, split_lines } from './line-breaks';
+import type { CellHyperlink } from '../cell-content';
 
 /** Mirrors Glide's default `cellHorizontalPadding`. */
 export const CELL_TOOLTIP_HORIZONTAL_PADDING_PX = 8;
@@ -91,6 +92,29 @@ export function text_overflows_cell(
 }
 
 /** Clamp tooltip copy so a single pathological cell cannot flood the DOM. */
+/** What a hyperlink hover surfaces: the author's tooltip when set, else where
+ *  the link goes. Excel shows the same on hover. */
+export function hyperlink_tooltip_text(link: CellHyperlink): string {
+    return link.tooltip ?? (link.kind === 'external' ? link.target : link.location);
+}
+
+/**
+ * Content of the hover tooltip, or null for no tooltip. Overflowing text and a
+ * hyperlink each earn one; when both apply the link destination goes on its
+ * own final line. A linked cell shows a tooltip even without overflow: with
+ * Ctrl/Cmd+click as the open gesture, the user needs to see where a link goes
+ * before committing.
+ */
+export function cell_tooltip_content(
+    text: string,
+    overflows: boolean,
+    link: CellHyperlink | undefined,
+): string | null {
+    const link_text = link ? hyperlink_tooltip_text(link) : undefined;
+    if (link_text === undefined) return overflows ? text : null;
+    return overflows ? `${text}\n${link_text}` : link_text;
+}
+
 export function clamp_tooltip_text(
     text: string,
     max_chars: number = CELL_TOOLTIP_MAX_CHARS,

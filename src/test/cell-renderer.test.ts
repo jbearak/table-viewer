@@ -265,7 +265,7 @@ describe('build_grid_cell — rich cells', () => {
     });
 
     it('carries the runs as visual lines and the raw text as copyData', () => {
-        const c = rich(0) as { data: { lines: unknown[] }; copyData: string };
+        const c = rich(0) as unknown as { data: { lines: unknown[] }; copyData: string };
         expect(c.copyData).toBe('ab');
         expect(c.data.lines).toEqual([
             [{ text: 'a' }, { text: 'b', style: { bold: true } }],
@@ -273,7 +273,7 @@ describe('build_grid_cell — rich cells', () => {
     });
 
     it('synthesizes a whole-cell styled run for a link/underline-only cell', () => {
-        const c = rich(2) as { data: { lines: unknown[] } };
+        const c = rich(2) as unknown as { data: { lines: unknown[] } };
         expect(c.data.lines).toEqual([
             [{ text: 'u', style: { bold: true, underline: true } }],
         ]);

@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
     CELL_TOOLTIP_HORIZONTAL_PADDING_PX,
     CELL_TOOLTIP_LINE_HEIGHT_PX,
+    cell_tooltip_content,
     cell_tooltip_position,
     clamp_tooltip_text,
     text_overflows_cell,
@@ -124,5 +125,32 @@ describe('cell_tooltip_position', () => {
             { width: 200, height: 200 },
         );
         expect(pos.left).toBe(8);
+    });
+});
+
+describe('cell_tooltip_content', () => {
+    const link = { kind: 'external' as const, target: 'https://x.example/', tooltip: 'Go' };
+
+    it('is null with no overflow and no link', () => {
+        expect(cell_tooltip_content('short', false, undefined)).toBeNull();
+    });
+
+    it('shows the text alone on overflow', () => {
+        expect(cell_tooltip_content('long text', true, undefined)).toBe('long text');
+    });
+
+    it("shows the link's tooltip without overflow", () => {
+        expect(cell_tooltip_content('short', false, link)).toBe('Go');
+    });
+
+    it('falls back to the target / location when the link has no tooltip', () => {
+        expect(cell_tooltip_content('short', false, { kind: 'external', target: 'https://x.example/' }))
+            .toBe('https://x.example/');
+        expect(cell_tooltip_content('short', false, { kind: 'internal', location: 'Sheet2!A1' }))
+            .toBe('Sheet2!A1');
+    });
+
+    it('appends the link line to overflowing text', () => {
+        expect(cell_tooltip_content('long text', true, link)).toBe('long text\nGo');
     });
 });

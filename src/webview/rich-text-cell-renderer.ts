@@ -17,23 +17,12 @@ import {
     measureTextCached,
     type CustomCell,
     type CustomRenderer,
-    type FullTheme,
 } from './glide-data-grid';
-import type { CellHyperlink, CellTextStyle } from '../cell-content';
-import { font_shorthand } from './cell-renderer';
-import type { RichTextLine } from './rich-text-layout';
+import type { CellTextStyle } from '../cell-content';
+import { canvas_font } from './fit-column-model';
+import { rich_lines_max_width, type RichCellData } from './rich-text-layout';
 
-export interface RichCellData {
-    /** Discriminant for isMatch — Glide funnels every Custom cell here. */
-    readonly kind: 'rich-text';
-    /** Styled segments per visual line (see rich_text_lines). */
-    readonly lines: readonly RichTextLine[];
-    /** Present on linked cells: renders link-colored and underlined. */
-    readonly hyperlink?: CellHyperlink;
-    /** The grid's configured cell font size; per-segment fonts rebuild the
-     *  cell font shorthand around it, so it must match the theme. */
-    readonly font_size_px: number;
-}
+export type { RichCellData } from './rich-text-layout';
 
 export type RichTextGridCell = CustomCell<RichCellData>;
 
@@ -41,33 +30,30 @@ export function is_rich_text_cell(cell: CustomCell): cell is RichTextGridCell {
     return (cell.data as Partial<RichCellData> | undefined)?.kind === 'rich-text';
 }
 
-function segment_font(
-    style: CellTextStyle | undefined,
-    size_px: number,
-    family: string,
-): string {
-    return `${font_shorthand(style?.bold ?? false, style?.italic ?? false, size_px)} ${family}`;
+/** The four style-affecting font variants per family+size, built once instead
+ *  of per segment per frame (draw runs for every visible rich cell). */
+const font_variant_cache = new Map<string, [string, string, string, string]>();
+
+function font_variants(size_px: number, family: string): [string, string, string, string] {
+    const key = `${size_px}|${family}`;
+    let variants = font_variant_cache.get(key);
+    if (!variants) {
+        variants = [
+            canvas_font(false, false, family, size_px),
+            canvas_font(true, false, family, size_px),
+            canvas_font(false, true, family, size_px),
+            canvas_font(true, true, family, size_px),
+        ];
+        font_variant_cache.set(key, variants);
+    }
+    return variants;
 }
 
-/** Widest line of the cell, as drawn (per-segment fonts summed per line). */
-function content_width(
-    ctx: CanvasRenderingContext2D,
-    data: RichCellData,
-    theme: FullTheme,
-): number {
-    let max = 0;
-    for (const line of data.lines) {
-        let width = 0;
-        for (const segment of line) {
-            const font = segment_font(segment.style, data.font_size_px, theme.fontFamily);
-            // measureTextCached keys its cache on `font` but measures with the
-            // context's current font, so the two must be set together.
-            ctx.font = font;
-            width += measureTextCached(segment.text, ctx, font).width;
-        }
-        if (width > max) max = width;
-    }
-    return max;
+function variant_of(
+    variants: readonly [string, string, string, string],
+    style: CellTextStyle | undefined,
+): string {
+    return variants[(style?.bold ? 1 : 0) | (style?.italic ? 2 : 0)];
 }
 
 export const rich_text_cell_renderer: CustomRenderer<RichTextGridCell> = {
@@ -79,12 +65,12 @@ export const rich_text_cell_renderer: CustomRenderer<RichTextGridCell> = {
     needsHoverPosition: false,
     draw: (args) => {
         const { ctx, rect, theme, cell } = args;
-        if (cell.data.hyperlink !== undefined && args.hoverAmount > 0) {
-            args.overrideCursor?.('pointer');
-        }
         const data = cell.data;
         const { x, y, width: w, height: h } = rect;
         const linked = data.hyperlink !== undefined;
+        if (linked && args.hoverAmount > 0) {
+            args.overrideCursor?.('pointer');
+        }
 
         // Mirrors drawMultiLineText's vertical layout so a rich cell lines up
         // with its plain neighbours: em-box line metric from the base font,
@@ -100,14 +86,19 @@ export const rich_text_cell_renderer: CustomRenderer<RichTextGridCell> = {
         ctx.beginPath();
         ctx.rect(x, y, w, h);
         ctx.clip();
+        ctx.fillStyle = linked ? theme.linkColor : theme.textDark;
 
+        const variants = font_variants(data.font_size_px, theme.fontFamily);
         const left = x + theme.cellHorizontalPadding + 0.5;
         const right = x + w - theme.cellHorizontalPadding;
         const optimal_y = y + h / 2 - actual_height / 2;
         let draw_y = Math.max(y + theme.cellVerticalPadding, optimal_y);
         // Longest run of glyphs that can possibly fit; the same 4px/char floor
-        // Glide's truncateString uses, applied per segment below.
+        // Glide's truncateString uses, applied per segment below (per-segment
+        // rather than whole-string, since only the segments up to the clip
+        // edge are drawn at all).
         const max_chars = Math.ceil(w / 4);
+        let last_font: string | null = null;
 
         for (const line of data.lines) {
             const text_y = draw_y + em_height / 2 + bias;
@@ -117,9 +108,11 @@ export const rich_text_cell_renderer: CustomRenderer<RichTextGridCell> = {
                 const text = segment.text.length > max_chars
                     ? segment.text.slice(0, max_chars)
                     : segment.text;
-                const font = segment_font(segment.style, data.font_size_px, theme.fontFamily);
-                ctx.font = font;
-                ctx.fillStyle = linked ? theme.linkColor : theme.textDark;
+                const font = variant_of(variants, segment.style);
+                if (font !== last_font) {
+                    ctx.font = font;
+                    last_font = font;
+                }
                 ctx.fillText(text, pen_x, text_y);
                 const seg_w = measureTextCached(text, ctx, font).width;
                 if (segment.style?.strikethrough) {
@@ -141,7 +134,16 @@ export const rich_text_cell_renderer: CustomRenderer<RichTextGridCell> = {
 
         ctx.restore();
     },
-    measure: (ctx, cell, theme) =>
-        content_width(ctx, cell.data, theme) + 2 * theme.cellHorizontalPadding,
+    measure: (ctx, cell, theme) => {
+        const variants = font_variants(cell.data.font_size_px, theme.fontFamily);
+        const width = rich_lines_max_width(cell.data.lines, (text, style) => {
+            const font = variant_of(variants, style);
+            // measureTextCached keys its cache on `font` but measures with the
+            // context's current font, so the two must be set together.
+            ctx.font = font;
+            return measureTextCached(text, ctx, font).width;
+        });
+        return width + 2 * theme.cellHorizontalPadding;
+    },
     onPaste: () => undefined,
 };

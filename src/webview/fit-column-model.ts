@@ -10,7 +10,7 @@ import type { RichTextRun } from '../cell-content';
 import { font_shorthand } from './cell-renderer';
 import { MIN_COLUMN_WIDTH_PX } from './grid-model';
 import { split_lines } from './line-breaks';
-import { rich_text_lines } from './rich-text-layout';
+import { rich_lines_max_width, rich_text_lines } from './rich-text-layout';
 
 /** Smallest width a fitted column may take. Aliases the grid's clamp floor
  *  ({@link MIN_COLUMN_WIDTH_PX}) so the fit rule and manual-resize clamp share
@@ -60,19 +60,17 @@ export function fit_column_width(
     let max = 0;
     for (const cell of cells) {
         if (cell.runs) {
-            // Rich cells: sum each visual line's segments, each measured with
-            // its own style — matching what the rich renderer draws.
-            for (const line of rich_text_lines(cell.runs)) {
-                let w = 0;
-                for (const segment of line) {
-                    w += measure({
-                        text: segment.text,
-                        bold: segment.style?.bold ?? false,
-                        italic: segment.style?.italic ?? false,
-                    });
-                }
-                if (w > max) max = w;
-            }
+            // Rich cells: the renderer's width rule (per-segment styles summed
+            // per visual line), fed by this fitter's measurer.
+            const w = rich_lines_max_width(
+                rich_text_lines(cell.runs),
+                (text, style) => measure({
+                    text,
+                    bold: style?.bold ?? false,
+                    italic: style?.italic ?? false,
+                }),
+            );
+            if (w > max) max = w;
             continue;
         }
         // XLSX text commonly uses CRLF while edits made in the webview use LF.

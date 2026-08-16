@@ -110,7 +110,7 @@ describe('Open link', () => {
         expect(first.kind).toBeUndefined();
         expect(first.kind !== 'separator' && first.kind !== 'submenu' && first.label)
             .toBe('Open link');
-        action(items, 'Open link').on_click();
+        action(items, 'Open link').on_click({} as never);
         expect(on_open_link).toHaveBeenCalledTimes(1);
     });
 });

@@ -1,8 +1,8 @@
-import { GridCellKind, type GridCell } from './glide-data-grid';
+import { GridCellKind, type CustomCell, type GridCell } from './glide-data-grid';
 import type { RenderedCell } from '../data-source/interface';
+import { rich_text_from_plain, type CellTextStyle } from '../cell-content';
 import { has_line_break, normalize_line_breaks } from './line-breaks';
-import { rich_text_lines } from './rich-text-layout';
-import type { RichTextGridCell } from './rich-text-cell-renderer';
+import { rich_text_lines, type RichCellData } from './rich-text-layout';
 
 /**
  * Cell-content construction for the Glide grid. Pure (no canvas, no Glide
@@ -103,47 +103,55 @@ export function needs_rich_renderer(c: RenderedCell): boolean {
         || c.strikethrough === true;
 }
 
+/** Memoized rich cells: build_grid_cell is Glide's per-cell paint callback
+ *  (every visible cell, every frame, no caching above it), and splitting runs
+ *  into lines allocates. RenderedCells are immutable and shared by reference
+ *  from the row store, so the object is the cache key; font size is the one
+ *  other input that shapes the payload. Entries die with their cells. */
+const rich_cell_cache = new WeakMap<RenderedCell, { font_size_px: number; cell: CustomCell<RichCellData> }>();
+
 function rich_cell(
     c: RenderedCell,
     overlay: CellEditOverlay | undefined,
     font_size_px: number,
-): RichTextGridCell {
-    // Line breaks in the displayed text are normalized by splitting runs on the
-    // canonical hard-break rule inside rich_text_lines, mirroring the Text
-    // path's normalize_line_breaks.
-    const runs = c.richText?.runs ?? (
-        c.raw
-            ? [{
-                text: c.raw,
-                ...(c.bold || c.italic || c.underline || c.strikethrough
-                    ? {
-                        style: {
-                            ...(c.bold ? { bold: true as const } : {}),
-                            ...(c.italic ? { italic: true as const } : {}),
-                            ...(c.underline ? { underline: true as const } : {}),
-                            ...(c.strikethrough ? { strikethrough: true as const } : {}),
-                        },
-                    }
-                    : {}),
-            }]
-            : []
-    );
-    return {
-        kind: GridCellKind.Custom,
-        data: {
-            kind: 'rich-text',
-            lines: rich_text_lines(runs),
-            ...(c.hyperlink ? { hyperlink: c.hyperlink } : {}),
-            font_size_px,
-        },
-        // Copy takes the raw source text, exactly like the Text path's `data`.
-        copyData: c.raw ?? '',
-        allowOverlay: false,
-        // Not this cell's turn to accept edits (see build_grid_cell's gate);
-        // keep Glide's paste path closed the same way `refused` does for Text.
-        readonly: true,
-        ...(overlay?.bg ? { themeOverride: { bgCell: overlay.bg } } : {}),
-    };
+): GridCell {
+    const cached = rich_cell_cache.get(c);
+    let cell = cached?.font_size_px === font_size_px ? cached.cell : undefined;
+    if (!cell) {
+        // Whole-cell flags become one styled run for link/underline-only cells;
+        // line breaks are handled by rich_text_lines splitting runs on the
+        // canonical hard-break rule, mirroring the Text path's
+        // normalize_line_breaks.
+        const style: CellTextStyle = {
+            ...(c.bold ? { bold: true as const } : {}),
+            ...(c.italic ? { italic: true as const } : {}),
+            ...(c.underline ? { underline: true as const } : {}),
+            ...(c.strikethrough ? { strikethrough: true as const } : {}),
+        };
+        const runs = c.richText?.runs
+            ?? rich_text_from_plain(c.raw ?? '', style).runs;
+        cell = {
+            kind: GridCellKind.Custom,
+            data: {
+                kind: 'rich-text',
+                lines: rich_text_lines(runs),
+                ...(c.hyperlink ? { hyperlink: c.hyperlink } : {}),
+                font_size_px,
+            },
+            // Copy takes the raw source text, like the Text path's `data`.
+            copyData: c.raw ?? '',
+            allowOverlay: false,
+            // Not this cell's turn to accept edits (see build_grid_cell's
+            // gate); keep Glide's paste path closed the same way `refused`
+            // does for Text.
+            readonly: true,
+        };
+        rich_cell_cache.set(c, { font_size_px, cell });
+    }
+    // The tint is per-view state, not cell content — apply outside the cache.
+    return overlay?.bg
+        ? { ...cell, themeOverride: { bgCell: overlay.bg } }
+        : cell;
 }
 
 function text_cell(
