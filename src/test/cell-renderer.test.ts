@@ -226,3 +226,89 @@ describe('build_grid_cell — edit overlay (CSV edit mode)', () => {
         expect((c as { allowOverlay: boolean }).allowOverlay).toBe(true);
     });
 });
+
+describe('build_grid_cell — rich cells', () => {
+    const rich_row: (RenderedCell | null)[] = [
+        {
+            raw: 'ab',
+            formatted: 'ab',
+            bold: false,
+            italic: false,
+            richText: { runs: [{ text: 'a' }, { text: 'b', style: { bold: true } }] },
+        },
+        {
+            raw: 'link',
+            formatted: 'link',
+            bold: false,
+            italic: false,
+            hyperlink: { kind: 'external', target: 'https://example.com/' },
+        },
+        {
+            raw: 'u',
+            formatted: 'u',
+            bold: true,
+            italic: false,
+            underline: true,
+        },
+        rc('plain'),
+    ];
+
+    const rich = (col: number, show_formatting = true, overlay?: Parameters<typeof build_grid_cell>[3]) =>
+        build_grid_cell(col, rich_row, show_formatting, overlay);
+
+    it('emits a Custom cell for run-styled, linked, and underlined cells', () => {
+        for (const col of [0, 1, 2]) {
+            const c = rich(col);
+            expect(c.kind).toBe(GridCellKind.Custom);
+        }
+        expect(rich(3).kind).toBe(GridCellKind.Text);
+    });
+
+    it('carries the runs as visual lines and the raw text as copyData', () => {
+        const c = rich(0) as { data: { lines: unknown[] }; copyData: string };
+        expect(c.copyData).toBe('ab');
+        expect(c.data.lines).toEqual([
+            [{ text: 'a' }, { text: 'b', style: { bold: true } }],
+        ]);
+    });
+
+    it('synthesizes a whole-cell styled run for a link/underline-only cell', () => {
+        const c = rich(2) as { data: { lines: unknown[] } };
+        expect(c.data.lines).toEqual([
+            [{ text: 'u', style: { bold: true, underline: true } }],
+        ]);
+    });
+
+    it('carries the hyperlink into the cell data', () => {
+        const c = rich(1) as { data: { hyperlink?: { kind: string; target?: string } } };
+        expect(c.data.hyperlink).toEqual({ kind: 'external', target: 'https://example.com/' });
+    });
+
+    it('closes the paste path and the overlay on rich cells', () => {
+        const c = rich(0) as { allowOverlay: boolean; readonly?: boolean };
+        expect(c.allowOverlay).toBe(false);
+        expect(c.readonly).toBe(true);
+    });
+
+    it('falls back to Text when formatting is off', () => {
+        const c = rich(0, false);
+        expect(c.kind).toBe(GridCellKind.Text);
+        expect((c as { data: string }).data).toBe('ab');
+    });
+
+    it('falls back to Text when the cell is editable or dirty', () => {
+        expect(rich(0, true, { editable: true }).kind).toBe(GridCellKind.Text);
+        expect(rich(0, true, { dirty_value: 'X' }).kind).toBe(GridCellKind.Text);
+        const dirty = rich(0, true, { dirty_value: 'X' });
+        expect((dirty as { displayData: string }).displayData).toBe('X');
+    });
+
+    it('keeps the highlight tint on a rich cell', () => {
+        const c = rich(0, true, { bg: '#123456' }) as {
+            kind: unknown;
+            themeOverride?: { bgCell?: string };
+        };
+        expect(c.kind).toBe(GridCellKind.Custom);
+        expect(c.themeOverride?.bgCell).toBe('#123456');
+    });
+});

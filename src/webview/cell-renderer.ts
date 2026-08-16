@@ -1,6 +1,8 @@
 import { GridCellKind, type GridCell } from './glide-data-grid';
 import type { RenderedCell } from '../data-source/interface';
 import { has_line_break, normalize_line_breaks } from './line-breaks';
+import { rich_text_lines } from './rich-text-layout';
+import type { RichTextGridCell } from './rich-text-cell-renderer';
 
 /**
  * Cell-content construction for the Glide grid. Pure (no canvas, no Glide
@@ -91,6 +93,59 @@ export function cell_allows_wrapping(text: string, soft_wrap = false): boolean {
     return soft_wrap || has_line_break(text);
 }
 
+/** True when the cell carries content only the rich renderer can draw: run
+ *  styles, a hyperlink, or whole-cell underline/strikethrough (the Text cell's
+ *  font shorthand covers bold/italic only). */
+export function needs_rich_renderer(c: RenderedCell): boolean {
+    return c.richText !== undefined
+        || c.hyperlink !== undefined
+        || c.underline === true
+        || c.strikethrough === true;
+}
+
+function rich_cell(
+    c: RenderedCell,
+    overlay: CellEditOverlay | undefined,
+    font_size_px: number,
+): RichTextGridCell {
+    // Line breaks in the displayed text are normalized by splitting runs on the
+    // canonical hard-break rule inside rich_text_lines, mirroring the Text
+    // path's normalize_line_breaks.
+    const runs = c.richText?.runs ?? (
+        c.raw
+            ? [{
+                text: c.raw,
+                ...(c.bold || c.italic || c.underline || c.strikethrough
+                    ? {
+                        style: {
+                            ...(c.bold ? { bold: true as const } : {}),
+                            ...(c.italic ? { italic: true as const } : {}),
+                            ...(c.underline ? { underline: true as const } : {}),
+                            ...(c.strikethrough ? { strikethrough: true as const } : {}),
+                        },
+                    }
+                    : {}),
+            }]
+            : []
+    );
+    return {
+        kind: GridCellKind.Custom,
+        data: {
+            kind: 'rich-text',
+            lines: rich_text_lines(runs),
+            ...(c.hyperlink ? { hyperlink: c.hyperlink } : {}),
+            font_size_px,
+        },
+        // Copy takes the raw source text, exactly like the Text path's `data`.
+        copyData: c.raw ?? '',
+        allowOverlay: false,
+        // Not this cell's turn to accept edits (see build_grid_cell's gate);
+        // keep Glide's paste path closed the same way `refused` does for Text.
+        readonly: true,
+        ...(overlay?.bg ? { themeOverride: { bgCell: overlay.bg } } : {}),
+    };
+}
+
 function text_cell(
     c: RenderedCell,
     show_formatting: boolean,
@@ -170,5 +225,21 @@ export function build_grid_cell(
 ): GridCell {
     const c = cells?.[col];
     if (!c && !overlay) return BLANK;
+    // Rich rendering is a Formatting-on display concern, like bold/italic on
+    // the Text path. It steps aside whenever the cell must interact: an
+    // editable overlay or a dirty value needs the Text cell (Glide's overlay
+    // editor and paste path key off kind: Text), so in edit mode rich cells
+    // render plain — their raw text is what stage-2 editing operates on.
+    // Ctrl/Cmd+click link opening reads the loaded RenderedCell in the grid
+    // shell, not this GridCell, so it works either way.
+    if (
+        c
+        && show_formatting
+        && needs_rich_renderer(c)
+        && !overlay?.editable
+        && overlay?.dirty_value === undefined
+    ) {
+        return rich_cell(c, overlay, font_size_px);
+    }
     return text_cell(c ?? EMPTY_CELL, show_formatting, overlay, font_size_px, soft_wrap);
 }

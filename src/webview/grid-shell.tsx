@@ -83,6 +83,8 @@ import {
     cell_allows_wrapping,
     type CellEditOverlay,
 } from './cell-renderer';
+import { rich_text_cell_renderer } from './rich-text-cell-renderer';
+import { parse_http_external_url } from '../external-url';
 import {
     CELL_TOOLTIP_SHOW_DELAY_MS,
     cell_tooltip_position,
@@ -144,6 +146,9 @@ import {
 
 /** Pixel proximity to a row border that arms the resize strip. */
 const ROW_RESIZE_TOLERANCE_PX = 5;
+
+/** Module-level so the DataEditor prop is referentially stable. */
+const custom_renderers = [rich_text_cell_renderer];
 
 /** Resident-row cap sampled when auto-fitting columns (bounds the measure cost
  *  on huge sheets; we only ever measure already-loaded text, never force a
@@ -1641,7 +1646,19 @@ export function GridShell({
             set_cell_tooltip(null);
 
             const text = displayed_cell_text(display_column, row);
-            if (!text) return;
+            // A linked cell dwells into a tooltip even without overflow: Excel
+            // surfaces the link's tooltip (or its target) on hover, and with
+            // Ctrl/Cmd+click as the open gesture the user needs to see where a
+            // link goes before committing.
+            const source_column = source_column_for_display(display_column);
+            const link = source_column === undefined
+                ? undefined
+                : get_row(row)?.[source_column]?.hyperlink;
+            const link_text = link
+                ? link.tooltip
+                    ?? (link.kind === 'external' ? link.target : link.location)
+                : undefined;
+            if (!text && link_text === undefined) return;
 
             const flags = font_flags_for_cell(display_column, row);
             // Use the same wrapping rule as build_grid_cell. `cell_bounds` is the
@@ -1650,7 +1667,7 @@ export function GridShell({
                 text,
                 cell_bounds.height > default_row_height,
             );
-            const overflows = text_overflows_cell(
+            const overflows = text !== '' && text_overflows_cell(
                 text,
                 cell_bounds.width,
                 (line) => measure_line_width(line, flags.bold, flags.italic),
@@ -1660,9 +1677,13 @@ export function GridShell({
                     wrapping,
                 },
             );
-            if (!overflows) return;
+            if (!overflows && link_text === undefined) return;
 
-            const clamped = clamp_tooltip_text(text);
+            const clamped = clamp_tooltip_text(
+                overflows && link_text !== undefined
+                    ? `${text}\n${link_text}`
+                    : link_text ?? text,
+            );
             cell_tooltip_timer_ref.current = window.setTimeout(() => {
                 cell_tooltip_timer_ref.current = null;
                 // Drop if the pointer left this cell during the dwell.
@@ -1689,6 +1710,8 @@ export function GridShell({
             font_size_px,
             measure_line_width,
             default_row_height,
+            get_row,
+            source_column_for_display,
         ],
     );
 
@@ -2740,6 +2763,49 @@ export function GridShell({
 
     const dismiss_context_menu = useCallback(() => set_context_menu(null), []);
 
+    /** The loaded cell's external-link URL, pre-validated for immediate
+     *  feedback (the host re-validates before anything reaches the OS opener).
+     *  Internal links are render-only in v1, so they yield null here too. */
+    const external_link_url = useCallback(
+        (display_column: number, row: number): string | null => {
+            const source_column = source_column_for_display(display_column);
+            if (source_column === undefined) return null;
+            // Merged blocks arrive as anchor coordinates (Glide canonicalizes
+            // the hit), which is where the content — and the link — lives.
+            const link = get_row(row)?.[source_column]?.hyperlink;
+            if (link?.kind !== 'external') return null;
+            return parse_http_external_url(link.target);
+        },
+        [get_row, source_column_for_display],
+    );
+
+    const open_external_url = useCallback((url: string) => {
+        host_bridge.postMessage({ type: 'openExternal', url });
+    }, []);
+
+    // Ctrl/Cmd+click on a linked cell opens the link; everything else falls
+    // through to the row-marker click logic this wraps.
+    const on_cell_clicked = useCallback(
+        (cell: Item, event: CellClickedEventArgs) => {
+            const [display_column, row] = cell;
+            if (
+                display_column >= 0
+                && (event.ctrlKey || event.metaKey)
+                && !event.shiftKey
+                && event.button === 0
+            ) {
+                const url = external_link_url(display_column, row);
+                if (url !== null) {
+                    event.preventDefault();
+                    open_external_url(url);
+                    return;
+                }
+            }
+            row_markers.on_cell_clicked(cell, event);
+        },
+        [external_link_url, open_external_url, row_markers],
+    );
+
     // Controlled keyboard nav. Tab/Shift+Tab use row-major wrapping and
     // view-mode hjkl keeps merge-aware movement; arrows (and range extension,
     // shortcuts) stay native to Glide, which steps past merges itself.
@@ -3092,7 +3158,11 @@ export function GridShell({
         // than guessing: it is also the case where discard_edit would have no key to
         // remove, so hiding "Discard edit" is the consistent answer.
         const menu_source_row = get_source_row(row);
+        const menu_link_url = external_link_url(display_col, row);
         cell_menu_items = cell_context_menu_items({
+            ...(menu_link_url !== null
+                ? { on_open_link: () => open_external_url(menu_link_url) }
+                : {}),
             dirty: menu_source_row !== undefined
                 && dirty_cells.has(`${menu_source_row}:${source_col}`),
             is_multi_cell: !!range && range.width * range.height > 1,
@@ -3183,7 +3253,8 @@ export function GridShell({
                 onColumnResize={handle_column_resize}
                 onItemHovered={on_item_hovered}
                 onCellEdited={on_cell_edited}
-                onCellClicked={row_markers.on_cell_clicked}
+                onCellClicked={on_cell_clicked}
+                customRenderers={custom_renderers}
                 onCellContextMenu={on_cell_context_menu}
                 onKeyDown={on_key_down}
                 provideEditor={provide_editor}

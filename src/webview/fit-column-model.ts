@@ -6,9 +6,11 @@
  * unit-tested without a canvas.
  */
 import type { RenderedCell } from '../data-source/interface';
+import type { RichTextRun } from '../cell-content';
 import { font_shorthand } from './cell-renderer';
 import { MIN_COLUMN_WIDTH_PX } from './grid-model';
 import { split_lines } from './line-breaks';
+import { rich_text_lines } from './rich-text-layout';
 
 /** Smallest width a fitted column may take. Aliases the grid's clamp floor
  *  ({@link MIN_COLUMN_WIDTH_PX}) so the fit rule and manual-resize clamp share
@@ -22,6 +24,9 @@ export interface MeasurableCell {
     text: string;
     bold: boolean;
     italic: boolean;
+    /** Styled runs, when the cell renders rich: each segment is measured with
+     *  its own bold/italic font instead of the whole-cell flags. */
+    runs?: readonly RichTextRun[];
 }
 
 /**
@@ -54,6 +59,22 @@ export function fit_column_width(
 ): number {
     let max = 0;
     for (const cell of cells) {
+        if (cell.runs) {
+            // Rich cells: sum each visual line's segments, each measured with
+            // its own style — matching what the rich renderer draws.
+            for (const line of rich_text_lines(cell.runs)) {
+                let w = 0;
+                for (const segment of line) {
+                    w += measure({
+                        text: segment.text,
+                        bold: segment.style?.bold ?? false,
+                        italic: segment.style?.italic ?? false,
+                    });
+                }
+                if (w > max) max = w;
+            }
+            continue;
+        }
         // XLSX text commonly uses CRLF while edits made in the webview use LF.
         // Treat either (and a standalone CR) as the same hard visual break —
         // the canonical rule every layout model shares (see line-breaks.ts).
@@ -105,5 +126,10 @@ export function measurable_from_rendered(
         text: text ?? '',
         bold: show_formatting && cell.bold,
         italic: show_formatting && cell.italic,
+        // With formatting on, a rich cell draws per-run fonts; hand the runs
+        // over so the fitter measures what will actually paint.
+        ...(show_formatting && cell.richText
+            ? { runs: cell.richText.runs }
+            : {}),
     };
 }

@@ -1189,6 +1189,11 @@ export class ViewerWindowManager {
                             : 'cancel';
                 },
                 open_setting: async (target) => this.open_preferences(target),
+                // The controller has already run parse_http_external_url on
+                // webview-supplied URLs before this launches anything.
+                open_external: (url) => {
+                    void shell.openExternal(url);
+                },
             }),
             config: this.config_store.config_port(),
             refreshWatcherFactory: node_file_refresh_watcher_factory,
