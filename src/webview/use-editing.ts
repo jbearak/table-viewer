@@ -10,6 +10,7 @@ import { make_dirty_entry, type CsvDirtyEntry } from '../types';
 import {
     cell_edit_base,
     cell_edits_equal,
+    dirty_value_edit_text,
     edit_display_text,
     parse_cell_edit,
     type EditableSourceCell,
@@ -149,10 +150,7 @@ export function use_editing(
                 set_editing_cell({
                     source_row,
                     source_col,
-                    value: edit_display_text(
-                        { text: dirty_entry.value, rich: dirty_entry.valueRuns },
-                        syntax,
-                    ),
+                    value: dirty_value_edit_text(dirty_entry, syntax),
                 });
                 return;
             }

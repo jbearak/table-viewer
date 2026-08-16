@@ -96,7 +96,7 @@ import {
 } from './cell-overflow-model';
 import { count_lines, has_line_break } from './line-breaks';
 import { use_editing, type DirtyEntry } from './use-editing';
-import { cell_edit_text, edit_display_text, type EditSyntax } from '../cell-edit-model';
+import { cell_edit_text, dirty_value_edit_text, type EditSyntax } from '../cell-edit-model';
 import {
     create_edit_session_store,
     type EditSessionStore,
@@ -1953,10 +1953,7 @@ export function GridShell({
             let edit_value: string | undefined;
             if (edit_syntax === 'markdown' && editable) {
                 if (dirty) {
-                    edit_value = edit_display_text(
-                        { text: dirty.value, rich: dirty.valueRuns },
-                        edit_syntax,
-                    );
+                    edit_value = dirty_value_edit_text(dirty, edit_syntax);
                 } else {
                     const loaded = loaded_row?.[source_column];
                     if (loaded) edit_value = cell_edit_text(loaded, edit_syntax);

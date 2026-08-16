@@ -131,3 +131,14 @@ export function edit_display_text(edit: ParsedCellEdit, syntax: EditSyntax): str
     if (syntax === 'plain') return edit.text;
     return rich_text_to_markdown(edit.rich ?? rich_text_from_plain(edit.text));
 }
+
+/** The editor text a dirty entry's committed value re-opens with — shared by
+ *  the hook's begin_editing and the grid's overlay so the two editor paths
+ *  cannot drift. Structural on purpose: takes the entry's fields, not
+ *  CsvDirtyEntry itself, to keep this module a leaf. */
+export function dirty_value_edit_text(
+    entry: { readonly value: string; readonly valueRuns?: RichText },
+    syntax: EditSyntax,
+): string {
+    return edit_display_text({ text: entry.value, rich: entry.valueRuns }, syntax);
+}
