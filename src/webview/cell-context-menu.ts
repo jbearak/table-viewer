@@ -13,6 +13,16 @@ export interface CellContextMenuModelProps {
     selected_column_count: number;
     can_clear_highlight: boolean;
     highlight_cell_count: number;
+    /** Set when the cell carries a valid external hyperlink. */
+    on_open_link?: () => void;
+    /** Set alongside `on_open_link`: copy the link's URL to the clipboard. */
+    on_copy_link?: () => void;
+    /** Set when this cell's hyperlink is editable (Edit mode, resolved source
+     *  identity, a sheet whose format carries links). Opens the dialog. */
+    on_edit_hyperlink?: () => void;
+    /** True when the cell already has a link, which only changes the wording:
+     *  the dialog itself handles both adding and clearing. */
+    has_hyperlink?: boolean;
     on_discard_edit: () => void;
     on_copy_cell: () => void;
     on_copy_selection: () => void;
@@ -27,6 +37,20 @@ export interface CellContextMenuModelProps {
 
 export function cell_context_menu_items(props: CellContextMenuModelProps): MenuItem[] {
     const items: MenuItem[] = [];
+    const { on_open_link, on_copy_link } = props;
+    if (on_open_link) {
+        items.push({ label: 'Open link', on_click: () => on_open_link() });
+    }
+    if (on_copy_link) {
+        items.push({ label: 'Copy link', on_click: () => on_copy_link() });
+    }
+    if (props.on_edit_hyperlink) {
+        const on_edit_hyperlink = props.on_edit_hyperlink;
+        items.push({
+            label: props.has_hyperlink ? 'Edit hyperlink…' : 'Hyperlink…',
+            on_click: () => on_edit_hyperlink(),
+        });
+    }
     if (props.dirty) {
         items.push({ label: 'Discard edit', on_click: () => props.on_discard_edit() });
     }

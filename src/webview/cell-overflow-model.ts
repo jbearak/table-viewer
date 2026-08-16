@@ -7,6 +7,8 @@
  * here (no DOM) lets it unit-test without a canvas or Glide runtime.
  */
 import { has_line_break, split_lines } from './line-breaks';
+import type { CellHyperlink, CellTextStyle } from '../cell-content';
+import { rich_lines_max_width, type RichTextLine } from './rich-text-layout';
 
 /** Mirrors Glide's default `cellHorizontalPadding`. */
 export const CELL_TOOLTIP_HORIZONTAL_PADDING_PX = 8;
@@ -91,6 +93,64 @@ export function text_overflows_cell(
 }
 
 /** Clamp tooltip copy so a single pathological cell cannot flood the DOM. */
+/**
+ * Overflow rule for cells the rich renderer draws: hard line breaks only (no
+ * soft wrap), each segment measured with its own style. `measure` returns the
+ * width of one segment's text under one style — the same measurer the rich
+ * renderer and the column fitter use, so tooltip visibility matches what
+ * actually clips.
+ */
+export function rich_text_overflows_cell(
+    lines: readonly RichTextLine[],
+    cell_width: number,
+    measure: (text: string, style: CellTextStyle | undefined) => number,
+    options: Pick<CellOverflowOptions, 'cell_height' | 'line_height' | 'horizontal_padding'> = {},
+): boolean {
+    const padding = options.horizontal_padding ?? CELL_TOOLTIP_HORIZONTAL_PADDING_PX;
+    const available_width = Math.max(0, cell_width - padding * 2);
+    if (available_width <= 0) return lines.some((line) => line.length > 0);
+    if (rich_lines_max_width(lines, measure) > available_width + 0.5) return true;
+    if (lines.length <= 1) return false;
+    const cell_height = options.cell_height;
+    // No height budget: a default single-row cell clips past the first line.
+    if (cell_height === undefined) return true;
+    const line_height = options.line_height ?? CELL_TOOLTIP_LINE_HEIGHT_PX;
+    return lines.length * line_height > Math.max(0, cell_height - padding) + 0.5;
+}
+
+/** What a hyperlink hover surfaces: the author's tooltip when set, else where
+ *  the link goes. Excel shows the same on hover. */
+export function hyperlink_tooltip_text(link: CellHyperlink): string {
+    return link.tooltip ?? (link.kind === 'external' ? link.target : link.location);
+}
+
+/** The open-gesture hint appended to a linked cell's tooltip — the modifier is
+ *  platform-specific, so the discoverability line must name the right key. */
+export function link_open_hint(is_mac: boolean): string {
+    return is_mac ? 'Cmd+click to open link' : 'Ctrl+click to open link';
+}
+
+/**
+ * Content of the hover tooltip, or null for no tooltip. Overflowing text and a
+ * hyperlink each earn one; when both apply the link destination goes on its
+ * own final line. A linked cell shows a tooltip even without overflow: with
+ * Ctrl/Cmd+click as the open gesture, the user needs to see where a link goes
+ * before committing — and `open_hint` (see {@link link_open_hint}) teaches
+ * the gesture itself, since a plain click only selects.
+ */
+export function cell_tooltip_content(
+    text: string,
+    overflows: boolean,
+    link: CellHyperlink | undefined,
+    open_hint?: string,
+): string | null {
+    const link_text = link ? hyperlink_tooltip_text(link) : undefined;
+    if (link_text === undefined) return overflows ? text : null;
+    // The hint applies only to external links — internal ones aren't openable.
+    const hint = link?.kind === 'external' && open_hint ? `\n${open_hint}` : '';
+    return overflows ? `${text}\n${link_text}${hint}` : `${link_text}${hint}`;
+}
+
 export function clamp_tooltip_text(
     text: string,
     max_chars: number = CELL_TOOLTIP_MAX_CHARS,

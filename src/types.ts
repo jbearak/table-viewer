@@ -8,6 +8,16 @@ import type {
     WorkbookSnapshot,
     WorkbookSnapshotIdentity,
 } from './viewer-snapshot';
+import {
+    hyperlinks_equal,
+    is_matching_rich_text,
+    rich_text_equal,
+    type CellHyperlink,
+    type RichCellFields,
+    type RichText,
+} from './cell-content';
+import { is_valid_hyperlink } from './pending-changes';
+import { is_plain_record } from './plain-record';
 
 export interface WorkbookData {
     sheets: SheetData[];
@@ -24,7 +34,7 @@ export interface SheetData {
     rowCount: number;
 }
 
-export interface CellData {
+export interface CellData extends RichCellFields {
     raw: string | number | boolean | null;
     formatted: string;
     bold: boolean;
@@ -594,9 +604,7 @@ export interface LegacyPerFileState {
 }
 export type StoredPerFileState = PerFileState | LegacyPerFileState;
 
-function is_plain_record(value: unknown): value is Record<string, unknown> {
-    return !!value && typeof value === 'object' && !Array.isArray(value);
-}
+export { is_plain_record };
 
 function is_non_negative_integer(value: unknown): value is number {
     return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
@@ -746,6 +754,29 @@ function validate_edit_cells(value: unknown): Record<string, string | CsvDirtyEn
         if (typeof entry === 'string') continue;
         if (!is_plain_record(entry) || typeof entry.value !== 'string' || typeof entry.base !== 'string') {
             invalid_leaf('pendingEdits');
+        }
+        // Optional styled-run sides of a rich edit. Rejected (not dropped) when
+        // malformed, like every other field: silently stripping runs would turn
+        // a formatting edit into a no-op that still overwrites the cell. The
+        // text-agreement half of the predicate is the smuggling boundary — see
+        // `is_matching_rich_text`.
+        for (const [runs, text] of [
+            [entry.valueRuns, entry.value],
+            [entry.baseRuns, entry.base],
+        ] as const) {
+            if (runs === undefined) continue;
+            if (!is_matching_rich_text(runs, text)) invalid_leaf('pendingEdits');
+        }
+        // The optional link dimension: both sides present together, each a
+        // structurally valid hyperlink or null. Rejected (not dropped) like
+        // the run sides — durable state is ours, so a malformed link there is
+        // corruption, not a compatibility case.
+        if ((entry.link === undefined) !== (entry.baseLink === undefined)) {
+            invalid_leaf('pendingEdits');
+        }
+        for (const side of [entry.link, entry.baseLink]) {
+            if (side === undefined || side === null) continue;
+            if (!is_valid_hyperlink(side)) invalid_leaf('pendingEdits');
         }
     }
     return value as Record<string, string | CsvDirtyEntry>;
@@ -1265,13 +1296,212 @@ export function reconcile_pending_edit_sheets(
     return next.length === 0 ? undefined : next;
 }
 
-/** Exact conflict-preserving entry durably owned by the CSV edit session. */
+/** Exact conflict-preserving entry durably owned by the CSV edit session.
+ *
+ *  `value`/`base` are always the plain-text projection, which is what every
+ *  string-typed consumer (the CSV serializer, wire dedupe, legacy durable
+ *  entries) continues to see. The optional run fields are present only when
+ *  the corresponding side carries styles (Excel markdown editing): a plain
+ *  edit keeps its exact legacy shape, and semantic comparison composes
+ *  `{text, rich?}` through cell-edit-model.ts. */
 export interface CsvDirtyEntry {
     readonly value: string;
     readonly base: string;
+    /** Styled runs of `value`, when the committed edit carries styles. */
+    readonly valueRuns?: RichText;
+    /** Styled runs of `base`, when the cell's effective content did. */
+    readonly baseRuns?: RichText;
+    /**
+     * Pending whole-cell hyperlink, when the user changed it: a link to write,
+     * or `null` to clear. ABSENT means "no link change" — the value dimension
+     * alone is dirty and the save leaves the cell's link untouched. A
+     * link-only entry carries `value === base` (the unedited text), which
+     * `collect_save_payload` must NOT emit as a text edit: rewriting an
+     * unedited cell's `<c>` would break the unedited-cells-keep-original-XML
+     * invariant.
+     */
+    readonly link?: CellHyperlink | null;
+    /** The link the change was made against (`null` = cell had none).
+     *  Present exactly when `link` is. */
+    readonly baseLink?: CellHyperlink | null;
 }
 
 export type CsvDirtyMap = Readonly<Record<string, CsvDirtyEntry>>;
+
+/**
+ * The one constructor of the sparse dirty-entry shape: run sides present only
+ * when given, so plain edits keep their exact legacy `{value, base}` form.
+ * Every layer that copies an entry into an owned object (store commit, wire
+ * payload, save payload, durable persist) goes through here, so a future
+ * optional field is added in one place rather than per copy site.
+ */
+export function make_dirty_entry(
+    value: string,
+    base: string,
+    valueRuns?: RichText,
+    baseRuns?: RichText,
+    link?: CellHyperlink | null,
+    baseLink?: CellHyperlink | null,
+): CsvDirtyEntry {
+    return {
+        value,
+        base,
+        ...(valueRuns !== undefined ? { valueRuns } : {}),
+        ...(baseRuns !== undefined ? { baseRuns } : {}),
+        ...(link !== undefined ? { link } : {}),
+        ...(baseLink !== undefined ? { baseLink } : {}),
+    };
+}
+
+/**
+ * Copy an entry into a fresh owned object, optionally overriding some fields.
+ *
+ * This is what every *copy* site should use rather than re-listing the
+ * dimensions positionally through {@link make_dirty_entry}: a site that
+ * forgets one silently drops that dimension, which is not a type error and
+ * not visible until the metadata goes missing at save time. Overrides are
+ * applied by presence, so `{baseRuns: undefined}` clears the run side while
+ * an omitted key carries it across.
+ */
+export function copy_dirty_entry(
+    entry: CsvDirtyEntry,
+    overrides: Partial<CsvDirtyEntry> = {},
+): CsvDirtyEntry {
+    const merged = { ...entry, ...overrides };
+    return make_dirty_entry(
+        merged.value,
+        merged.base,
+        merged.valueRuns,
+        merged.baseRuns,
+        merged.link,
+        merged.baseLink,
+    );
+}
+
+/**
+ * Copy an untrusted dirty entry into the exact owned shape, keeping a run side
+ * only when `is_matching_rich_text` accepts it — the same smuggling boundary
+ * `validate_edit_cells` enforces. Unlike the durable validator this *drops* a
+ * bad run side rather than rejecting the entry: this runs on the save path,
+ * where the plain projection is still the text the user committed, so writing
+ * it unstyled is a correct save while refusing the whole operation over one
+ * malformed optional field is not.
+ */
+export function sanitized_dirty_entry(entry: {
+    readonly value: string;
+    readonly base: string;
+    readonly valueRuns?: unknown;
+    readonly baseRuns?: unknown;
+    readonly link?: unknown;
+    readonly baseLink?: unknown;
+}): CsvDirtyEntry {
+    const keep = (runs: unknown, text: string): RichText | undefined => (
+        is_matching_rich_text(runs, text) ? runs : undefined
+    );
+    // The link dimension is kept whole or dropped whole: both sides must be a
+    // structurally valid hyperlink or `null`, and `link` requires `baseLink`
+    // (a change with no recorded base could never be conflict-checked).
+    // Dropping a malformed pair leaves the cell's link untouched on save,
+    // which is the safe failure for relationship metadata.
+    const link_side_ok = (side: unknown): side is CellHyperlink | null =>
+        side === null || is_valid_hyperlink(side);
+    const keep_link = entry.link !== undefined
+        && link_side_ok(entry.link)
+        && entry.baseLink !== undefined
+        && link_side_ok(entry.baseLink);
+    return make_dirty_entry(
+        entry.value,
+        entry.base,
+        keep(entry.valueRuns, entry.value),
+        keep(entry.baseRuns, entry.base),
+        keep_link ? entry.link as CellHyperlink | null : undefined,
+        keep_link ? entry.baseLink as CellHyperlink | null : undefined,
+    );
+}
+
+/**
+ * `sanitized_dirty_entry` for a value straight off the wire, where even the
+ * `{value, base}` record shape is a claim: a stale or buggy renderer can post
+ * `null`, a string where an object belongs, or numbers in the text fields, and
+ * the sanitizer would throw on the first property read. Returns `undefined`
+ * for anything that is not a two-string record — the caller drops the entry —
+ * and otherwise defers to the sanitizer's run-side policy.
+ */
+export function sanitized_wire_dirty_entry(entry: unknown): CsvDirtyEntry | undefined {
+    if (
+        !is_plain_record(entry)
+        || typeof entry.value !== 'string'
+        || typeof entry.base !== 'string'
+    ) return undefined;
+    return sanitized_dirty_entry(entry as {
+        readonly value: string;
+        readonly base: string;
+        readonly valueRuns?: unknown;
+        readonly baseRuns?: unknown;
+        readonly link?: unknown;
+        readonly baseLink?: unknown;
+    });
+}
+
+/**
+ * Durable identity of one dirty entry — the comparison every dedupe/no-op
+ * guard on the edit path shares (store notification suppression, wire payload
+ * dedupe, save-lifecycle operation matching). Runs compare via the canonical
+ * `rich_text_equal` (an absent side differs from a present one), so equal
+ * formatting is equal identity and a formatting-only difference reads as a
+ * real difference everywhere at once.
+ */
+export function dirty_entries_equal(
+    left: CsvDirtyEntry,
+    right: CsvDirtyEntry,
+): boolean {
+    return left.value === right.value
+        && left.base === right.base
+        && optional_runs_equal(left.valueRuns, right.valueRuns)
+        && optional_runs_equal(left.baseRuns, right.baseRuns)
+        && optional_links_equal(left.link, right.link)
+        && optional_links_equal(left.baseLink, right.baseLink);
+}
+
+/**
+ * Whether the entry's VALUE dimension differs from its base. False for a
+ * link-only entry, whose text and runs are the unedited cell content — the
+ * save must not emit a text edit for it (rewriting an unedited cell's `<c>`
+ * breaks the unedited-cells-keep-original-XML invariant), and a text-identical
+ * echo must not read as a value revert.
+ */
+export function dirty_entry_value_changed(entry: CsvDirtyEntry): boolean {
+    if (entry.value !== entry.base) return true;
+    return !optional_runs_equal(entry.valueRuns, entry.baseRuns);
+}
+
+/** Whether the entry carries a link change whose value differs from its base.
+ *  (An entry constructed with `link` equal to `baseLink` should not exist —
+ *  commit paths drop the dimension on revert — but the save path must not
+ *  trust that.) */
+export function dirty_entry_link_changed(entry: CsvDirtyEntry): boolean {
+    if (entry.link === undefined) return false;
+    return !hyperlinks_equal(entry.link, entry.baseLink ?? null);
+}
+
+/** An absent link dimension ("no link change") differs from a present one —
+ *  including a present `null` ("clear the link"). */
+function optional_links_equal(
+    left: CellHyperlink | null | undefined,
+    right: CellHyperlink | null | undefined,
+): boolean {
+    if (left === undefined || right === undefined) return left === right;
+    return hyperlinks_equal(left, right);
+}
+
+function optional_runs_equal(
+    left: RichText | undefined,
+    right: RichText | undefined,
+): boolean {
+    if (left === right) return true;
+    if (left === undefined || right === undefined) return false;
+    return rich_text_equal(left, right);
+}
 
 /** Why the host refused a save whose bases no longer match the file. Carried on
  *  the failure result rather than a separate message so it cannot be delivered
@@ -1456,7 +1686,7 @@ export type WebviewMessage =
     // no sheet names to reorder (the CSV shape). The host validates the pair and
     // resolves the *name* at write time, so a post queued across an external
     // reorder still lands in the worksheet the user actually edited.
-    | { type: 'pendingEditsChanged'; edits: Record<string, { value: string; base: string }> | null; editSessionId: string; sequence: number; sheetIndex?: number; sheetName?: string; worksheetId?: string }
+    | { type: 'pendingEditsChanged'; edits: Record<string, CsvDirtyEntry> | null; editSessionId: string; sequence: number; sheetIndex?: number; sheetName?: string; worksheetId?: string }
     /** Renderer close/reload barrier response; zero means no map was produced. */
     | { type: 'pendingEditsFlush'; requestId: string; editSessionId?: string; highestProducedSequence: number }
     /** The renderer could not establish the requested close/reload barrier. */
@@ -1464,6 +1694,11 @@ export type WebviewMessage =
     // User-facing warning raised inside the webview (e.g. a clipped copy) that
     // the host surfaces via vscode.window.showWarningMessage.
     | { type: 'showWarning'; message: string }
+    // Ctrl/Cmd+click (or the context menu's "Open link") on a hyperlinked
+    // cell. The webview pre-validates for immediate feedback, but the host
+    // re-validates with parse_http_external_url before anything reaches the
+    // OS opener — workbook contents are untrusted input.
+    | { type: 'openExternal'; url: string }
     | { type: 'requestFilterHistogram'; sheetIndex: number; columnIndex: number; requestId: string; generation: number; sourceGeneration: number }
     | { type: 'cancelFilterHistogram'; requestId: string }
     | { type: 'setExcelFirstRowHeader'; sheetIndex: number; sheetName: string; enabled: boolean; unhideAll?: boolean; headerRow?: number; requestId: string; generation: number; sourceGeneration: number }

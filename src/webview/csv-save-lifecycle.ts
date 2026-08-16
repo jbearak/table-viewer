@@ -1,4 +1,5 @@
 import {
+    dirty_entries_equal,
     worksheet_target_matches,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
@@ -43,9 +44,9 @@ function dirty_maps_equal(
     return left_keys.every((key) => {
         const left_entry = left[key];
         const right_entry = right[key];
-        return right_entry !== undefined
-            && left_entry.value === right_entry.value
-            && left_entry.base === right_entry.base;
+        // Full durable identity, runs included: a formatting-only difference
+        // is a different operation, exactly as it is a different dirty entry.
+        return right_entry !== undefined && dirty_entries_equal(left_entry, right_entry);
     });
 }
 
@@ -83,9 +84,13 @@ function remove_operation_owned_pending_edits(
     let remaining = 0;
     for (const [key, pending] of Object.entries(pending_edits)) {
         const owned = worksheet.dirtyEdits[key];
+        // Runs are part of the match: a pending entry whose formatting differs
+        // from what the operation saved is a *newer* formatting-only edit and
+        // must survive the tombstone. (The legacy string form carries no runs,
+        // so equal value is the whole identity there.)
         const matches = owned !== undefined && (typeof pending === 'string'
             ? pending === owned.value
-            : pending.value === owned.value && pending.base === owned.base);
+            : dirty_entries_equal(pending, owned));
         if (matches) {
             retained ??= { ...pending_edits };
             delete retained[key];

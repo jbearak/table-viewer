@@ -245,6 +245,44 @@ describe('CSV save lifecycle projection', () => {
         expect(csv_save_operations_equal(workbook, changed)).toBe(false);
     });
 
+    it('treats runs as part of operation identity and tombstone matching', () => {
+        const bold = { runs: [{ text: 'saved', style: { bold: true as const } }] };
+        const plain_ws = worksheet('saved');
+        const rich_ws = {
+            ...plain_ws,
+            dirtyEdits: { '0:0': { ...plain_ws.dirtyEdits['0:0'], valueRuns: bold } },
+        };
+        // A formatting-only difference is a different operation…
+        expect(csv_save_operations_equal(
+            operation('same', 'edit-session', [plain_ws]),
+            operation('same', 'edit-session', [rich_ws]),
+        )).toBe(false);
+
+        // …and a pending entry whose formatting differs from what the
+        // succeeded operation saved is a newer edit the tombstone must keep.
+        const succeeded = operation('saved', 'saved-session', [plain_ws]);
+        const projection = {
+            authoritative: { revision: 8, state: 'succeeded', operation: succeeded } as const,
+        };
+        const newer_formatting = {
+            '0:0': { ...plain_ws.dirtyEdits['0:0'], valueRuns: bold },
+        };
+        expect(hydrate(projection, 'new-session', newer_formatting))
+            .toBe(newer_formatting);
+        // An exact match (runs and all) is still removed.
+        expect(hydrate(
+            {
+                authoritative: {
+                    revision: 9,
+                    state: 'succeeded',
+                    operation: operation('saved', 'saved-session', [rich_ws]),
+                } as const,
+            },
+            'new-session',
+            { '0:0': { ...plain_ws.dirtyEdits['0:0'], valueRuns: bold } },
+        )).toBeUndefined();
+    });
+
     it('allows a legacy index-only operation to match richer current identity', () => {
         const saved = operation('legacy');
         const failed = {

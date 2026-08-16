@@ -40,6 +40,9 @@ import { serialize_csv } from './serialize-csv';
 import { write_xlsx_workbook_cell_edits } from './xlsx-package';
 import type { XlsxCellEdit } from './xlsx-cell-write';
 import { validate_dirty_bases } from './csv-base-validation';
+import { cell_edit_base } from './cell-edit-model';
+import type { CellHyperlink, RichText } from './cell-content';
+import type { XlsxHyperlinkEdit } from './xlsx-hyperlink-write';
 import type {
     AuthorityFileStateStore,
     FileStateSnapshot,
@@ -55,6 +58,7 @@ import {
     normalize_host_state,
     plan_excel_candidate_state,
 } from './excel-header-plan';
+import { parse_http_external_url } from './external-url';
 import {
     acquire_file_coordinator,
     type ExcelHeaderOperationReceipt,
@@ -88,6 +92,10 @@ import {
     worksheet_target_matches,
     type ActiveCsvSaveLifecycle,
     type CsvDirtyMap,
+    dirty_entries_equal,
+    dirty_entry_link_changed,
+    sanitized_dirty_entry,
+    sanitized_wire_dirty_entry,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
     type CsvSaveOperationRequest,
@@ -148,6 +156,13 @@ export interface SavePlanWorksheetInput {
     /** Source-keyed `row:col` → new text, exactly the cells the user changed. */
     readonly edits: Readonly<Record<string, string>>;
     readonly wanted_bases: ReadonlySet<string>;
+    /**
+     * The full dirty entries behind `edits`, for planners that write more than
+     * the plain-text projection — the xlsx planner reads `valueRuns` from here
+     * so a styled edit reaches the package as rich runs. CSV ignores it: its
+     * serializer is text-only by design.
+     */
+    readonly dirty_edits?: CsvDirtyMap;
 }
 
 export interface SavePlanInput {
@@ -160,6 +175,20 @@ export interface SavePlan {
     /** Observed pre-edit raw text per worksheet, in input order. A missing key
      *  reads as "" downstream, matching a blank cell. */
     readonly observed_bases: readonly ReadonlyMap<string, string>[];
+    /**
+     * The same cells' effective rich content per worksheet, present only for
+     * planners whose source carries formatting (xlsx). Absent for CSV, whose
+     * validation contract stays text-only. Base validation reads this so a
+     * formatting-only external change conflicts a stale edit like a text
+     * change does.
+     */
+    readonly observed_rich?: readonly ReadonlyMap<string, RichText>[];
+    /**
+     * The cells' hyperlinks per worksheet, xlsx only. Every observed cell has
+     * an entry (`null` = linkless), so validation can distinguish "the cell
+     * verifiably has no link" from "the cell was never observed".
+     */
+    readonly observed_links?: readonly ReadonlyMap<string, CellHyperlink | null>[];
     /**
      * The bytes to write, given the file's current bytes.
      *
@@ -239,6 +268,9 @@ export type ViewerProfile = ViewerProfileBase & (
         readonly editing: true;
         /** Harvest conflict bases now; produce the bytes to write at write time. */
         plan_save(input: SavePlanInput): SavePlan;
+        /** How cell text is edited (WorkbookSnapshotCapabilities.editSyntax).
+         *  'markdown' for xlsx, whose planner writes styled runs; absent = plain. */
+        readonly edit_syntax?: 'markdown';
     }
 );
 
@@ -470,8 +502,22 @@ function harvest_source_bases(
     src: DataSource,
     sheet_index: number,
     wanted_bases: Iterable<string>,
-): Map<string, string> {
+): {
+    texts: Map<string, string>;
+    rich: Map<string, RichText>;
+    links: Map<string, CellHyperlink | null>;
+} {
     const observed_bases = new Map<string, string>();
+    // The same cells' *effective* rich content (runs, or the cell font as one
+    // run), present only where it carries styles — the exact derivation the
+    // webview used to record `baseRuns`, so text-equal bases whose formatting
+    // drifted read as conflicts rather than being silently overwritten.
+    const observed_rich = new Map<string, RichText>();
+    // The cells' hyperlinks. Unlike `rich`, absence must be observable — a
+    // link edit's base may legitimately be "no link" — so every observed cell
+    // records an entry, `null` for linkless, and only an unobserved cell reads
+    // as undefined.
+    const observed_links = new Map<string, CellHyperlink | null>();
     const by_projected_row = new Map<number, { source_row: number; cols: number[] }>();
     for (const key of wanted_bases) {
         const [source_row, col] = key.split(':').map(Number);
@@ -492,14 +538,20 @@ function harvest_source_bases(
             for (const col of entry.cols) {
                 const cell = row[col];
                 if (cell === undefined) continue;
+                const cell_key = `${entry.source_row}:${col}`;
                 observed_bases.set(
-                    `${entry.source_row}:${col}`,
+                    cell_key,
                     cell === null ? '' : String(cell.raw ?? ''),
                 );
+                if (cell !== null) {
+                    const rich = cell_edit_base(cell).rich;
+                    if (rich) observed_rich.set(cell_key, rich);
+                }
+                observed_links.set(cell_key, cell?.hyperlink ?? null);
             }
         });
     }
-    return observed_bases;
+    return { texts: observed_bases, rich: observed_rich, links: observed_links };
 }
 
 /**
@@ -518,18 +570,63 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
     // Every worksheet is fully planned before bytes are produced. The package
     // writer likewise computes every replacement before mutating the container,
     // so one invalid worksheet rejects the workbook save atomically.
-    const planned = input.worksheets.map(({ sheet_index, edits, wanted_bases }) => {
-        const observed_bases = harvest_source_bases(src, sheet_index, wanted_bases);
+    const planned = input.worksheets.map(({ sheet_index, edits, wanted_bases, dirty_edits }) => {
+        const {
+            texts: observed_bases,
+            rich: observed_rich,
+            links: observed_links,
+        } = harvest_source_bases(src, sheet_index, wanted_bases);
         const cell_edits: XlsxCellEdit[] = [];
         for (const [key, value] of Object.entries(edits)) {
             const [row, col] = key.split(':').map(Number);
             if (!Number.isInteger(row) || !Number.isInteger(col)) continue;
-            cell_edits.push({ row, col, value });
+            // A styled edit carries its runs through to the package writer.
+            // `validate_edit_cells` already required the runs' concatenated text
+            // to equal `value`, so the plain projection and the rich form cannot
+            // disagree by the time they get here.
+            const runs = dirty_edits?.[key]?.valueRuns?.runs;
+            cell_edits.push(runs && runs.length > 0 ? { row, col, value, runs } : { row, col, value });
         }
-        return { observed_bases, sheetIndex: sheet_index, edits: cell_edits };
+        // Link edits come from the exact dirty entries, not `edits`: a
+        // link-only change carries no text edit at all (see
+        // collect_save_payload), and a text edit may carry no link change.
+        const link_edits: XlsxHyperlinkEdit[] = [];
+        for (const [key, entry] of Object.entries(dirty_edits ?? {})) {
+            if (!dirty_entry_link_changed(entry)) continue;
+            const [row, col] = key.split(':').map(Number);
+            if (!Number.isInteger(row) || !Number.isInteger(col)) continue;
+            // The host is the authority on what an external target may be —
+            // the dialog validates for UX, but the wire is untrusted. Only the
+            // WRITTEN value is constrained to http(s); bases mirror whatever
+            // the file already holds. Fail the save closed rather than write a
+            // scheme the dialog could never have produced.
+            if (entry.link?.kind === 'external') {
+                const normalized = parse_http_external_url(entry.link.target);
+                if (normalized === null) {
+                    throw new Error('A hyperlink edit has an invalid or non-HTTP target.');
+                }
+                link_edits.push({
+                    row,
+                    col,
+                    link: { ...entry.link, target: normalized },
+                });
+                continue;
+            }
+            link_edits.push({ row, col, link: entry.link ?? null });
+        }
+        return {
+            observed_bases,
+            observed_rich,
+            observed_links,
+            sheetIndex: sheet_index,
+            edits: cell_edits,
+            link_edits,
+        };
     });
     return {
         observed_bases: planned.map(({ observed_bases }) => observed_bases),
+        observed_rich: planned.map(({ observed_rich }) => observed_rich),
+        observed_links: planned.map(({ observed_links }) => observed_links),
         produce: (raw) => write_xlsx_workbook_cell_edits(raw, planned),
     };
 }
@@ -551,7 +648,7 @@ function excel_profile(file_path: string): ViewerProfile {
     // .xls is out of scope for editing: the writer above is an OOXML package
     // splice, and the binary BIFF container shares nothing with it.
     return file_path.toLowerCase().endsWith('.xlsx')
-        ? { ...base, editing: true, plan_save: plan_xlsx_save }
+        ? { ...base, editing: true, plan_save: plan_xlsx_save, edit_syntax: 'markdown' as const }
         : { ...base, editing: false };
 }
 
@@ -2274,9 +2371,12 @@ export function attach_viewer(
         return Object.entries(cells).some(([key, pending]) => {
             const owned = operation.dirtyEdits[key];
             if (!owned) return false;
+            // Full durable identity, runs included (a formatting-only change
+            // is a different edit); legacy string entries carry no runs, so
+            // equal value is their whole identity.
             return typeof pending === 'string'
                 ? pending === owned.value
-                : pending.value === owned.value && pending.base === owned.base;
+                : dirty_entries_equal(pending, owned);
         });
     }
 
@@ -2289,9 +2389,12 @@ export function attach_viewer(
             Object.entries(pending_edits).filter(([key, pending]) => {
                 const owned = operation.dirtyEdits[key];
                 if (!owned) return true;
+                // Runs are part of the match: a pending entry whose formatting
+                // differs from what the operation carried is a newer
+                // formatting-only edit and must survive the strip.
                 return typeof pending === 'string'
                     ? pending !== owned.value
-                    : pending.value !== owned.value || pending.base !== owned.base;
+                    : !dirty_entries_equal(pending, owned);
             }),
         );
         return Object.keys(retained).length > 0 ? retained : undefined;
@@ -2610,7 +2713,9 @@ export function attach_viewer(
         const validation = validate_dirty_bases(
             dirty_edits,
             source_row_count,
-            (source_row, col) => observed_bases.get(`${source_row}:${col}`),
+            (source_row, col) => observed_bases.texts.get(`${source_row}:${col}`),
+            (source_row, col) => observed_bases.rich.get(`${source_row}:${col}`),
+            (source_row, col) => observed_bases.links.get(`${source_row}:${col}`),
         );
         if (validation.type === 'valid') return undefined;
         return {
@@ -3571,6 +3676,9 @@ export function attach_viewer(
                                 ...(owns_edit_session() && active_edit_session_id
                                     ? { csvEditSessionId: active_edit_session_id }
                                     : {}),
+                                ...(profile.editing && profile.edit_syntax
+                                    ? { editSyntax: profile.edit_syntax }
+                                    : {}),
                             },
                             stateSnapshot: adoption_state,
                         }),
@@ -3812,6 +3920,9 @@ export function attach_viewer(
                                         csvSaveLifecycle: projected_save_lifecycle(),
                                         ...(owns_edit_session() && active_edit_session_id
                                             ? { csvEditSessionId: active_edit_session_id }
+                                            : {}),
+                                        ...(profile.editing && profile.edit_syntax
+                                            ? { editSyntax: profile.edit_syntax }
                                             : {}),
                                     },
                                     stateSnapshot: project_state_for_panel(
@@ -4449,7 +4560,13 @@ export function attach_viewer(
             const dirty_edits = Object.fromEntries(
                 Object.entries(worksheet.dirtyEdits).map(([key, entry]) => [
                     key,
-                    Object.freeze({ value: entry.value, base: entry.base }),
+                    // Wire runs are untrusted; the sanitizer keeps a run side
+                    // only when its text equals the plain projection, so the
+                    // planner can hand runs to the xlsx writer without
+                    // re-checking. A non-record entry throws here, which fails
+                    // the save closed — dropping it instead would let its key
+                    // in `edits` be written with no base ever validated.
+                    Object.freeze(sanitized_dirty_entry(entry)),
                 ]),
             );
             const sheet_index = worksheet.sheetIndex ?? 0;
@@ -4509,15 +4626,13 @@ export function attach_viewer(
             let pending = current.pendingEdits;
             operation.identity.worksheets.forEach((worksheet, index) => {
                 const target = operation.durableTargets[index];
+                // Already sanitized: `operation.identity` is the clone built by
+                // `clone_save_operation`, whose entries went through
+                // `sanitized_dirty_entry` at ingress.
                 pending = with_pending_edits_for_sheet(
                     pending,
                     target.sheetIndex,
-                    Object.fromEntries(
-                        Object.entries(worksheet.dirtyEdits).map(([key, entry]) => [
-                            key,
-                            { value: entry.value, base: entry.base },
-                        ]),
-                    ),
+                    { ...worksheet.dirtyEdits },
                     target.sheetName,
                     target.worksheetId,
                 );
@@ -4620,6 +4735,7 @@ export function attach_viewer(
                     sheet_index: worksheet.sheetIndex,
                     edits: worksheet.edits,
                     wanted_bases: new Set(Object.keys(worksheet.dirtyEdits)),
+                    dirty_edits: worksheet.dirtyEdits,
                 })),
             });
         } catch (error) {
@@ -4658,6 +4774,12 @@ export function attach_viewer(
                     worksheet.dirtyEdits,
                     sheet_meta.sourceRowCount,
                     (source_row, col) => plan.observed_bases[index]?.get(`${source_row}:${col}`),
+                    plan.observed_rich
+                        ? (source_row, col) => plan.observed_rich?.[index]?.get(`${source_row}:${col}`)
+                        : undefined,
+                    plan.observed_links
+                        ? (source_row, col) => plan.observed_links?.[index]?.get(`${source_row}:${col}`)
+                        : undefined,
                 )
                 : { type: 'baseMismatch' as const, keys: Object.keys(worksheet.dirtyEdits) };
             if (validation.type === 'valid') continue;
@@ -6331,6 +6453,19 @@ export function attach_viewer(
             case 'showWarning':
                 host.ui.show_warning(msg.message);
                 return;
+            case 'openExternal': {
+                // Authoritative validation: the webview also validates for UX,
+                // but a compromised or buggy renderer must not be able to hand
+                // an arbitrary string to the OS opener.
+                const url = parse_http_external_url(msg.url);
+                if (url === null) {
+                    host.ui.show_warning(
+                        'Table Viewer blocked a link that is not a valid http(s) URL.');
+                    return;
+                }
+                host.ui.open_external(url);
+                return;
+            }
             case 'openCsvRowLimitSetting':
                 await host.ui.open_setting('csvMaxRows');
                 return;
@@ -6398,7 +6533,21 @@ export function attach_viewer(
                 }
                 const receiver_epoch = session.current_receiver_epoch;
                 const edit_session_id = msg.editSessionId;
-                const edits = msg.edits ? structuredClone(msg.edits) : null;
+                // Wire entries are untrusted and go durable below, where
+                // `validate_edit_cells` rejects the whole `pendingEdits` leaf on
+                // one malformed run side. Sanitizing here keeps a bad optional
+                // field from poisoning every sheet's drafts at the next decode.
+                // The wire variant also guards the record shape itself: a
+                // renderer posting `null` or a non-record entry must not throw
+                // past the handler — that entry is dropped, the rest survive.
+                const edits = msg.edits
+                    ? Object.fromEntries(
+                        Object.entries(msg.edits).flatMap(([key, entry]) => {
+                            const sanitized = sanitized_wire_dirty_entry(entry);
+                            return sanitized ? [[key, sanitized] as const] : [];
+                        }),
+                    )
+                    : null;
                 const admission = Symbol(edit_session_id);
                 pending_edit_admissions.add(admission);
                 // The sheet the post names. Writes land in that slot only, so a

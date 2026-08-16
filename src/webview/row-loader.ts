@@ -357,14 +357,26 @@ export class RowLoader {
      * distinction: `undefined` means "unknown", never "changed".
      */
     get_cell_raw_for_source(source_row: number, col: number): string | undefined {
+        const cell = this.get_cell_for_source(source_row, col);
+        if (cell === undefined) return undefined;
+        return cell ? String(cell.raw ?? '') : '';
+    }
+
+    /**
+     * The full loaded cell addressed by **canonical source row**, with the same
+     * residency contract as {@link get_cell_raw_for_source}: `null` for a
+     * resident-but-blank cell, `undefined` for a non-resident source row. The
+     * markdown edit path reads this to build edit text and conflict bases from
+     * the cell's effective rich content, not just its raw string.
+     */
+    get_cell_for_source(source_row: number, col: number): RenderedCell | null | undefined {
         const claim = this.source_to_page.get(source_row);
         if (claim === undefined) return undefined;
         const page = this.pages.get(claim.start);
         if (page === undefined) return undefined;
         const cells = page.rows[claim.offset];
         if (cells === undefined) return undefined;
-        const cell = cells[col];
-        return cell ? String(cell.raw ?? '') : '';
+        return cells[col] ?? null;
     }
 
     /** Whether a canonical source row is currently resident on some cached page. */

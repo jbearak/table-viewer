@@ -1,4 +1,12 @@
-import { find_tag_end, is_tag_boundary, is_self_closing } from './parse-xlsx';
+import {
+    find_tag_end,
+    ignorable_end,
+    ignorable_ranges,
+    is_tag_boundary,
+    is_self_closing,
+    strip_illegal_xml_chars,
+} from './ooxml-xml';
+import { text_styles_equal, type CellTextStyle, type RichTextRun } from './cell-content';
 
 /**
  * Surgical, `putexcel`-style cell writes into a worksheet's OOXML.
@@ -25,6 +33,15 @@ export interface XlsxCellEdit {
     readonly col: number;
     /** The raw text the user typed. Empty string clears the cell's value. */
     readonly value: string;
+    /**
+     * Styled runs of `value`, present when the edit carries character-level
+     * formatting. Concatenated run text must equal `value`. When every run's
+     * style equals the cell's own font style the writer reduces to the plain
+     * string form (the runs carry no information beyond the `s=` style, and a
+     * plain form keeps number/date/boolean classification working); otherwise
+     * the cell is written as a rich inline string.
+     */
+    readonly runs?: readonly RichTextRun[];
 }
 
 /** Strings written to the workbook go inline, so the writer never needs the shared string table. */
@@ -37,6 +54,22 @@ export interface XlsxWriteOptions {
      * serial (keeping the cell's date format) or a plain string.
      */
     readonly is_date_style: (xf_index: number, serial: number) => boolean;
+    /**
+     * The four style flags of the cell font behind an `s=` index, as the reader
+     * resolves them. Rich edits consult this for the uniform-style reduction
+     * above. Absent (legacy callers) reads as "no cell font style", which only
+     * forgoes the reduction — rich output stays correct, just less minimal.
+     */
+    readonly cell_font_style?: (xf_index: number) => CellTextStyle | undefined;
+    /**
+     * The cell font's non-flag properties (name, size, color, family, scheme…)
+     * as raw `<rPr>`-ready inner XML, for the `s=` index. OOXML run properties
+     * REPLACE the cell font rather than merging with it, so an `<rPr>` that
+     * carried only our four flags would silently reset a Cambria-14 cell's
+     * styled runs to the default font. Every emitted `<rPr>` starts from this
+     * base. Absent reads as '' — correct for default-font workbooks.
+     */
+    readonly run_font_base?: (xf_index: number) => string;
 }
 
 const MS_PER_DAY = 86400000;
@@ -44,31 +77,20 @@ const EXCEL_1900_EPOCH_MS = Date.UTC(1899, 11, 31);
 const EXCEL_1904_EPOCH_MS = Date.UTC(1904, 0, 1);
 
 function encode_xml(s: string): string {
-    return s
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        // A raw CR does not survive: XML 1.0 requires every parser to normalize
-        // `\r` and `\r\n` in content to a single `\n` before the application ever
-        // sees it, so a literal one is not "preserved as typed" — it is silently a
-        // line feed on the way back in, and `\r\n` loses a character outright. The
-        // numeric reference is exempt from that normalization, which is what makes
-        // it the only spelling that round-trips. Excel writes CRs this way too.
-        .replace(/\r/g, '&#13;')
-        // Control characters XML 1.0 forbids outright: they have no escape, so a
-        // numeric reference would be just as invalid as the raw byte. Excel drops
-        // them on paste too. A user pasting from a terminal or a PDF can carry
-        // one in without ever seeing it, and the result would be a worksheet part
-        // no reader accepts — a corrupt workbook from one invisible character.
-        // eslint-disable-next-line no-control-regex
-        .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g, '')
-        // An unpaired surrogate is no more a legal XML character than those, and it
-        // arrives the same way: a JavaScript string can hold one, so a paste from a
-        // program that split a code point carries it in unseen. Left in, it reaches
-        // the part as an unencodable half-character and the workbook stops opening --
-        // the same corrupt-from-one-invisible-character outcome the line above exists
-        // to prevent.
-        .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '');
+    return strip_illegal_xml_chars(
+        s
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            // A raw CR does not survive: XML 1.0 requires every parser to
+            // normalize `\r` and `\r\n` in content to a single `\n` before the
+            // application ever sees it, so a literal one is not "preserved as
+            // typed" — it is silently a line feed on the way back in, and
+            // `\r\n` loses a character outright. The numeric reference is
+            // exempt from that normalization, which is what makes it the only
+            // spelling that round-trips. Excel writes CRs this way too.
+            .replace(/\r/g, '&#13;'),
+    );
 }
 
 /** Convert a 0-based column index to its letter form (0 → A, 26 → AA). */
@@ -250,6 +272,34 @@ function boolean_literal(value: string): '1' | '0' | null {
 }
 
 /**
+ * One `<r>` run of a rich inline string.
+ *
+ * A present `<rPr>` REPLACES the referencing cell's font (OOXML inheritance
+ * rule, mirrored by the reader's `resolve_rich_text_runs`), so:
+ *  - a run whose style equals the cell font's own flags is written with *no*
+ *    `<rPr>` and inherits everything, including name/size/color;
+ *  - any other run gets `<rPr>` = the cell font's non-flag properties
+ *    (`font_base`, so a Cambria-14 cell's styled runs stay Cambria-14) plus a
+ *    tag per flag that is on. Off flags are simply absent — replacement
+ *    semantics make absence mean off, which is exactly how
+ *    `parse_font_properties` reads it back.
+ */
+function build_run_xml(
+    run: RichTextRun,
+    cell_style: CellTextStyle | undefined,
+    font_base: string,
+): string {
+    const text = `<t xml:space="preserve">${encode_xml(run.text)}</t>`;
+    if (text_styles_equal(run.style, cell_style)) return `<r>${text}</r>`;
+    const props = font_base
+        + (run.style?.bold ? '<b/>' : '')
+        + (run.style?.italic ? '<i/>' : '')
+        + (run.style?.strikethrough ? '<strike/>' : '')
+        + (run.style?.underline ? '<u/>' : '');
+    return `<r><rPr>${props}</rPr>${text}</r>`;
+}
+
+/**
  * Build the replacement `<c>` element for one cell.
  *
  * Strings are written as `t="inlineStr"` rather than appended to
@@ -263,14 +313,31 @@ function boolean_literal(value: string): '1' | '0' | null {
 function build_cell_xml(
     row: number,
     col: number,
-    value: string,
+    edit: XlsxCellEdit,
     xf_index: number | null,
     options: XlsxWriteOptions,
     was_boolean = false,
     was_iso_date = false,
 ): string {
+    const { value } = edit;
     const ref = `${col_index_to_letter(col)}${row + 1}`;
     const style_attr = xf_index !== null && xf_index !== 0 ? ` s="${xf_index}"` : '';
+    // A rich edit whose runs still carry styling beyond the cell's own font is
+    // written as a rich inline string — checked ahead of the scalar paths
+    // because styled text is text: `**2024-01-15**` must not become a serial.
+    // Runs that all match the cell font carry nothing the `s=` style doesn't
+    // already say, so they reduce to `value` and fall through to the ordinary
+    // classification below (string, number, date, boolean — unchanged).
+    if (edit.runs !== undefined && edit.runs.length > 0) {
+        const cell_style = options.cell_font_style?.(xf_index ?? 0);
+        if (!edit.runs.every((run) => text_styles_equal(run.style, cell_style))) {
+            const font_base = options.run_font_base?.(xf_index ?? 0) ?? '';
+            const runs = edit.runs
+                .map((run) => build_run_xml(run, cell_style, font_base))
+                .join('');
+            return `<c r="${ref}"${style_attr} t="inlineStr"><is>${runs}</is></c>`;
+        }
+    }
     // An ISO-date cell edited back to a date stays one, for the same reason a
     // boolean does. `t="d"` stores the date as text and the reader shows it
     // verbatim — no serial, no style consulted — so the user retypes what looks
@@ -389,69 +456,6 @@ function row_indexes_from_cells(
 }
 
 /** Locate every `<row>` element in `sheetData`, in document order. */
-/**
- * Ranges inside `[from, to)` whose contents are text, not markup: XML comments,
- * CDATA sections, and processing instructions.
- *
- * The scanners below match on raw `<row`/`<c` substrings, which is exact for real
- * markup and wrong for anything quoting it. A commented-out row — the shape a
- * generator leaves behind, and one Excel preserves on round-trip — looked like a
- * live row to `scan_rows`, so an edit to a cell it names spliced the new value
- * *into the comment*: the file stays valid, the save reports success, and the
- * cell on screen never changes. Skipping these ranges makes the writer agree with
- * an XML parser about what a row is, without needing one.
- *
- * A processing instruction is the third spelling of the same hazard. Everything
- * between `<?` and `?>` is opaque data to a parser and its content is
- * unconstrained, so element-shaped text in there is text — but reading it as
- * markup let an edit rewrite a cell *inside the PI* while the live cell of that
- * name kept its old value.
- */
-function ignorable_ranges(xml: string, from: number, to: number): Array<[number, number]> {
-    const out: Array<[number, number]> = [];
-    let pos = from;
-    while (pos < to) {
-        const at = earliest_of(xml, ['<!', '<?'], pos);
-        if (at === -1 || at >= to) break;
-        let end: number;
-        if (xml.startsWith('<!--', at)) {
-            const close = xml.indexOf('-->', at + 4);
-            end = close === -1 ? to : close + 3;
-        } else if (xml.startsWith('<![CDATA[', at)) {
-            const close = xml.indexOf(']]>', at + 9);
-            end = close === -1 ? to : close + 3;
-        } else if (xml.startsWith('<?', at)) {
-            const close = xml.indexOf('?>', at + 2);
-            end = close === -1 ? to : close + 2;
-        } else {
-            pos = at + 2;
-            continue;
-        }
-        out.push([at, end]);
-        pos = end;
-    }
-    return out;
-}
-
-/** The earliest occurrence at or after `from` of any of `needles`, or -1. */
-function earliest_of(xml: string, needles: readonly string[], from: number): number {
-    let best = -1;
-    for (const needle of needles) {
-        const at = xml.indexOf(needle, from);
-        if (at !== -1 && (best === -1 || at < best)) best = at;
-    }
-    return best;
-}
-
-/** Where to resume from if `at` falls inside an ignorable range, else undefined. */
-function ignorable_end(ranges: ReadonlyArray<[number, number]>, at: number): number | undefined {
-    for (const [start, end] of ranges) {
-        if (at < start) return undefined;
-        if (at < end) return end;
-    }
-    return undefined;
-}
-
 /**
  * Every real `<name …>` opening tag in `[from, to)`, as [offset, whole tag].
  *
@@ -1295,7 +1299,7 @@ export function apply_cell_edits(
             // Whole row absent: synthesize it, with its cells in column order.
             const cells = [...row_edits]
                 .sort((a, b) => a.col - b.col)
-                .map((e) => build_cell_xml(e.row, e.col, e.value, null, options))
+                .map((e) => build_cell_xml(e.row, e.col, e, null, options))
                 .join('');
             new_rows.push({ row, text: `<row r="${row + 1}">${cells}</row>` });
             continue;
@@ -1349,7 +1353,7 @@ export function apply_cell_edits(
                     text: build_cell_xml(
                         e.row,
                         e.col,
-                        e.value,
+                        e,
                         xf,
                         options,
                         /\bt="b"/.test(cell_span.open_tag),
@@ -1357,7 +1361,7 @@ export function apply_cell_edits(
                     ),
                 });
             } else {
-                inserts.push({ col: e.col, text: build_cell_xml(e.row, e.col, e.value, null, options) });
+                inserts.push({ col: e.col, text: build_cell_xml(e.row, e.col, e, null, options) });
             }
         }
 

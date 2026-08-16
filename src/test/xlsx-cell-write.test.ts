@@ -1487,17 +1487,19 @@ describe('write_xlsx_cell_edits', () => {
     });
 
     it('reads an xf numFmtId exactly as the reader does, single quotes included', async () => {
-        // `numFmtId='164'` is legal XML the reader's `get_attr` cannot see, so the
-        // style is General there and index 164 — a date format — to a both-quotes
-        // writer. The count guard cannot catch this one: both sides count the same
-        // number of `<xf>` elements and disagree only about what one of them says.
+        // `numFmtId='164'` is legal XML, and both sides read it through the same
+        // `get_attr` — so the style is the date format 164 to reader and writer
+        // alike. What matters is the agreement, not which way it goes: the typed
+        // date is stored as a serial under a date format and reads back as that
+        // date, never as a bare 45306.
         const bytes = patched_parts([
             ['/xl/styles.xml', 'formatCode="$#,##0.00"', 'formatCode="yyyy-mm-dd"'],
             ['/xl/styles.xml', '<xf numFmtId="164"', "<xf numFmtId='164'"],
         ]);
         const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '2024-01-15' }]);
         const { data } = await parse_xlsx(out);
-        expect(data.sheets[0].rows[0][0]!.raw).toBe('2024-01-15');
+        expect(String(data.sheets[0].rows[0][0]!.raw)).toContain('2024-01-15');
+        expect(data.sheets[0].rows[0][0]!.formatted).toBe('2024-01-15');
     });
 
     it('stores a long identifier as text rather than rounding it away', async () => {
@@ -1619,23 +1621,19 @@ describe('write_xlsx_cell_edits', () => {
             .toContain('2024-01-15');
     });
 
-    it('reads a formatCode exactly as the reader does, single quotes included', () => {
-        // Both quote styles are legal XML — but the reader's `get_attr` reads only
-        // `"…"`, so `formatCode='yyyy-mm-dd'` is a format it never sees, and a serial
-        // written under it would be displayed to the user as `45306`. This writer
-        // used to read it and store the serial for exactly that reason.
-        //
-        // Being more nearly correct about XML is not the requirement; agreeing with
-        // the side that renders the result is. Sharing `parse_styles` settles it:
-        // unreadable to the reader means not a date format to the writer either, so
-        // the typed date is stored as the text it was typed as.
+    it('reads a formatCode exactly as the reader does, single quotes included', async () => {
+        // Both quote styles are legal XML, and `get_attr` now reads either — so
+        // `formatCode='yyyy-mm-dd'` is a date format to reader and writer alike.
+        // Being more nearly correct about XML is not the requirement; agreeing
+        // with the side that renders the result is. Sharing `parse_styles`
+        // settles it: the serial is stored under a format that displays it as
+        // the date the user typed, never as a bare 45306.
         const bytes = patched_parts([
             ['/xl/styles.xml', /formatCode="([^"]*)"/, "formatCode='yyyy-mm-dd'"],
         ]);
         const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '2024-01-15' }]);
-        const sheet = part(out, '/xl/worksheets/sheet1.xml')!.toString('utf8');
-        expect(sheet).toContain('2024-01-15');
-        expect(sheet).not.toContain('<v>45306</v>');
+        const { data } = await parse_xlsx(out);
+        expect(data.sheets[0].rows[0][0]!.formatted).toBe('2024-01-15');
     });
 
     it('matches a relationship id spelled with a character reference', () => {
@@ -1995,5 +1993,171 @@ describe('write_xlsx_cell_edits', () => {
     it('refuses bytes that are not an .xlsx', () => {
         expect(() => write_xlsx_cell_edits(new Uint8Array([1, 2, 3]), 0, [{ row: 0, col: 0, value: 'x' }]))
             .toThrow(/valid \.xlsx/);
+    });
+});
+
+describe('rich inline strings', () => {
+    const doc = (body: string) =>
+        `<worksheet><dimension ref="A1:C3"/><sheetData>${body}</sheetData><pageMargins/></worksheet>`;
+    const cell = '<row r="1"><c r="A1"><v>1</v></c></row>';
+
+    it('writes styled runs as a rich inline string, off flags absent', () => {
+        const out = apply_cell_edits(
+            doc(cell),
+            [{
+                row: 0, col: 0, value: 'plain bold',
+                runs: [
+                    { text: 'plain ' },
+                    { text: 'bold', style: { bold: true } },
+                ],
+            }],
+            OPTS,
+        );
+        expect(out).toContain(
+            '<c r="A1" t="inlineStr"><is>'
+            + '<r><t xml:space="preserve">plain </t></r>'
+            + '<r><rPr><b/></rPr><t xml:space="preserve">bold</t></r>'
+            + '</is></c>',
+        );
+    });
+
+    it('emits flags in b/i/strike/u order and only the flags that are on', () => {
+        const out = apply_cell_edits(
+            doc(cell),
+            [{
+                row: 0, col: 0, value: 'x',
+                runs: [{ text: 'x', style: { bold: true, italic: true, underline: true, strikethrough: true } }],
+            }],
+            OPTS,
+        );
+        expect(out).toContain('<rPr><b/><i/><strike/><u/></rPr>');
+    });
+
+    it('omits rPr on a run whose style equals the cell font, so it inherits everything', () => {
+        // The cell font is itself bold: the bold run carries no information the
+        // `s=` style doesn't, and MUST inherit rather than replace — an explicit
+        // `<rPr><b/></rPr>` would reset the cell's name/size/color to defaults.
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A1" s="1"><v>1</v></c></row>'),
+            [{
+                row: 0, col: 0, value: 'boldplain',
+                runs: [
+                    { text: 'bold', style: { bold: true } },
+                    { text: 'plain' },
+                ],
+            }],
+            { ...OPTS, cell_font_style: () => ({ bold: true }) },
+        );
+        expect(out).toContain('<r><t xml:space="preserve">bold</t></r>');
+        // The plain run diverges from the bold cell font, so it gets an explicit
+        // (empty-of-flags) rPr that REPLACES the font — that is what "not bold" is.
+        expect(out).toContain('<r><rPr></rPr><t xml:space="preserve">plain</t></r>');
+    });
+
+    it('starts every explicit rPr from the cell font base so styled runs keep name/size/color', () => {
+        const base = '<rFont val="Cambria"/><sz val="14"/>';
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A1" s="2"><v>1</v></c></row>'),
+            [{
+                row: 0, col: 0, value: 'big',
+                runs: [{ text: 'big', style: { italic: true } }],
+            }],
+            { ...OPTS, run_font_base: (xf) => (xf === 2 ? base : '') },
+        );
+        expect(out).toContain(`<rPr>${base}<i/></rPr>`);
+    });
+
+    it('reduces runs that all match the cell font to the plain form', () => {
+        // A date typed with markup that resolves to exactly the cell font's own
+        // style carries no run-level information, so classification still runs:
+        // under a date style it stays a serial, not an inline string.
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A1" s="1"><v>1</v></c></row>'),
+            [{
+                row: 0, col: 0, value: '2024-01-15',
+                runs: [{ text: '2024-01-15', style: { bold: true } }],
+            }],
+            {
+                datemode: 0,
+                is_date_style: () => true,
+                cell_font_style: () => ({ bold: true }),
+            },
+        );
+        expect(out).toContain('<c r="A1" s="1"><v>45306</v></c>');
+        expect(out).not.toContain('inlineStr');
+    });
+
+    it('keeps styled date-looking text as text — styled text is text', () => {
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A1" s="1"><v>1</v></c></row>'),
+            [{
+                row: 0, col: 0, value: '2024-01-15',
+                runs: [{ text: '2024-01-15', style: { bold: true } }],
+            }],
+            { datemode: 0, is_date_style: () => true },
+        );
+        expect(out).toContain('t="inlineStr"');
+        expect(out).not.toContain('<v>45306</v>');
+    });
+
+    it('escapes run text like any other inline string', () => {
+        const out = apply_cell_edits(
+            doc(cell),
+            [{
+                row: 0, col: 0, value: 'a<b>&c',
+                runs: [{ text: 'a<b>&c', style: { bold: true } }],
+            }],
+            OPTS,
+        );
+        expect(out).toContain('<t xml:space="preserve">a&lt;b&gt;&amp;c</t>');
+    });
+
+    it('does not let a nested style element survive into a run base', () => {
+        // The base is the cell font minus its style flags — the flags come from
+        // the run's own style. Removing the flag elements in a single pass lets
+        // `<<b/>b/>` reconstitute a `<b/>`, so a crafted styles.xml could put
+        // bold back into a run the model believes is plain, and the saved file
+        // would not match what the user typed.
+        const file = CFB.read(readFileSync(FORMATTED), { type: 'buffer' });
+        CFB.utils.cfb_add(file, '/xl/styles.xml', Buffer.from(
+            '<?xml version="1.0"?><styleSheet>'
+            + '<fonts count="1"><font><name val="Cambria"/><<b/>b/></font></fonts>'
+            + '<cellXfs count="1"><xf numFmtId="0" fontId="0"/></cellXfs>'
+            + '</styleSheet>',
+        ));
+        const raw = new Uint8Array(CFB.write(file, { type: 'buffer', fileType: 'zip' }) as ArrayBuffer);
+        const out = write_xlsx_cell_edits(raw, 0, [{
+            row: 0, col: 0, value: 'x',
+            runs: [{ text: 'x', style: { italic: true } }],
+        }]);
+        const sheet = part(out, '/xl/worksheets/sheet1.xml')!.toString('utf8');
+        expect(sheet).toContain('<rPr>');
+        expect(sheet).not.toContain('<b/>');
+    });
+
+    it('round-trips a rich edit through a real workbook back to the reader', async () => {
+        const raw = readFileSync(FORMATTED);
+        const out = write_xlsx_cell_edits(raw, 0, [{
+            row: 0, col: 0, value: 'plain bold',
+            runs: [
+                { text: 'plain ' },
+                { text: 'bold', style: { bold: true } },
+            ],
+        }]);
+        const { data } = await parse_xlsx(out);
+        const cell = data.sheets[0].rows[0][0]!;
+        expect(cell.raw).toBe('plain bold');
+        expect(cell.richText).toEqual({
+            runs: [
+                { text: 'plain ' },
+                { text: 'bold', style: { bold: true } },
+            ],
+        });
+        // The styled run's rPr carries the cell font's non-flag properties —
+        // Calibri in this fixture — so the bold run does not fall back to the
+        // default font (OOXML rPr replaces the cell font, never merges).
+        const sheet = part(out, '/xl/worksheets/sheet1.xml')!.toString('utf8');
+        expect(sheet).toContain('<rFont val="Calibri"/>');
+        expect(sheet).not.toContain('<u val="none"/>');
     });
 });

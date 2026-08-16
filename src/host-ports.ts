@@ -51,6 +51,11 @@ export interface HostUiPort {
     ): Promise<FileSizeLimitDialogChoice>;
     /** Open the requested viewer preference, focused on that field. */
     open_setting(target: ViewerSettingTarget): Promise<void>;
+    /**
+     * Hand an already-validated http(s) URL to the OS opener. Callers must
+     * validate with parse_http_external_url first — this port only launches.
+     */
+    open_external(url: string): void;
 }
 
 /** Viewer configuration reads (replaces direct viewer-config/vscode reads). */

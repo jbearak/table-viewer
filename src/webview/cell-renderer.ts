@@ -1,6 +1,8 @@
-import { GridCellKind, type GridCell } from './glide-data-grid';
+import { GridCellKind, direction, type CustomCell, type GridCell } from './glide-data-grid';
 import type { RenderedCell } from '../data-source/interface';
+import { rich_text_from_plain, type CellTextStyle } from '../cell-content';
 import { has_line_break, normalize_line_breaks } from './line-breaks';
+import { rich_text_lines, type RichCellData } from './rich-text-layout';
 
 /**
  * Cell-content construction for the Glide grid. Pure (no canvas, no Glide
@@ -50,6 +52,13 @@ export function font_style(
 export interface CellEditOverlay {
     /** When set, display this dirty value instead of the persisted content. */
     dirty_value?: string;
+    /**
+     * What the edit overlay opens with, when it differs from the displayed
+     * text — the markdown serialization of the cell's effective rich content
+     * (or of the dirty entry's runs) on sheets that edit as markdown. Absent
+     * on plain sheets, where the editor opens with the raw text as before.
+     */
+    edit_value?: string;
     /** themeOverride background tint for dirty / conflicted cells. */
     bg?: string;
     /** Open Glide's edit overlay on this cell. */
@@ -91,6 +100,121 @@ export function cell_allows_wrapping(text: string, soft_wrap = false): boolean {
     return soft_wrap || has_line_break(text);
 }
 
+/** True when the cell carries content only the rich renderer can draw: run
+ *  styles, a hyperlink, or whole-cell underline/strikethrough (the Text cell's
+ *  font shorthand covers bold/italic only). */
+export function needs_rich_renderer(c: RenderedCell): boolean {
+    return c.richText !== undefined
+        || c.hyperlink !== undefined
+        || c.underline === true
+        || c.strikethrough === true;
+}
+
+/** Memoized rich cells: build_grid_cell is Glide's per-cell paint callback
+ *  (every visible cell, every frame, no caching above it), and splitting runs
+ *  into lines allocates. RenderedCells are immutable and shared by reference
+ *  from the row store, so the object is the cache key; font size and the
+ *  Formatting toggle are the other inputs that shape the payload. Entries die
+ *  with their cells. */
+const rich_cell_cache = new WeakMap<
+    RenderedCell,
+    { font_size_px: number; show_formatting: boolean; cell: CustomCell<RichCellData> }
+>();
+
+function rich_cell(
+    c: RenderedCell,
+    show_formatting: boolean,
+    overlay: CellEditOverlay | undefined,
+    font_size_px: number,
+    link_modifier_held = false,
+): GridCell {
+    const cached = rich_cell_cache.get(c);
+    let cell = cached !== undefined
+        && cached.font_size_px === font_size_px
+        && cached.show_formatting === show_formatting
+        ? cached.cell
+        : undefined;
+    if (!cell) {
+        // Same displayed-text rule as the Text path: the Formatting toggle
+        // switches between the formatted value and the raw one (a linked date
+        // cell must show '7/16/2023', not its serial). Line breaks are handled
+        // by rich_text_lines splitting runs on the canonical hard-break rule,
+        // mirroring the Text path's normalize_line_breaks.
+        const display = show_formatting ? c.formatted : (c.raw ?? '');
+        // Whole-cell flags become one styled run for link/underline-only
+        // cells. With formatting off only the link presentation survives
+        // (mirroring the Text path dropping bold/italic): plain runs, and the
+        // renderer's link color/underline keyed on `hyperlink`.
+        const style: CellTextStyle | undefined = show_formatting
+            ? {
+                ...(c.bold ? { bold: true as const } : {}),
+                ...(c.italic ? { italic: true as const } : {}),
+                ...(c.underline ? { underline: true as const } : {}),
+                ...(c.strikethrough ? { strikethrough: true as const } : {}),
+            }
+            : undefined;
+        const runs = show_formatting && c.richText
+            ? c.richText.runs
+            : rich_text_from_plain(display, style).runs;
+        cell = {
+            kind: GridCellKind.Custom,
+            data: {
+                kind: 'rich-text',
+                lines: rich_text_lines(runs),
+                ...(c.hyperlink ? { hyperlink: c.hyperlink } : {}),
+                font_size_px,
+                // Whole-string RTL heuristic, same as Glide's Text cell.
+                ...(direction(display) === 'rtl' ? { rtl: true as const } : {}),
+            },
+            // Copy takes the raw source text, like the Text path's `data`.
+            copyData: c.raw ?? '',
+            allowOverlay: false,
+            // Not this cell's turn to accept edits (see build_grid_cell's
+            // gate); keep Glide's paste path closed the same way `refused`
+            // does for Text.
+            readonly: true,
+        };
+        rich_cell_cache.set(c, { font_size_px, show_formatting, cell });
+    }
+    // Per-view state, not cell content — applied outside the cache. The
+    // pointer cursor appears only while the open gesture is actually
+    // available (Ctrl/Cmd held over an external link): a bare hover keeps
+    // the normal cell cursor, since a plain click selects, not opens. The
+    // grid reads `cursor` straight off the hovered cell.
+    const pointer = link_modifier_held && c.hyperlink?.kind === 'external';
+    return overlay?.bg || pointer
+        ? {
+            ...cell,
+            ...(pointer ? { cursor: 'pointer' as const } : {}),
+            ...(overlay?.bg ? { themeOverride: { bgCell: overlay.bg } } : {}),
+        }
+        : cell;
+}
+
+/**
+ * Whether this cell wants the rich renderer under the current Formatting
+ * toggle. Text styling is a Formatting-on concern; hyperlink presentation is
+ * semantic and survives the toggle. Shared so the painted cell and the
+ * tooltip payload cannot answer differently.
+ */
+function renders_rich(c: RenderedCell, show_formatting: boolean): boolean {
+    return show_formatting ? needs_rich_renderer(c) : c.hyperlink !== undefined;
+}
+
+/**
+ * The rich payload the grid would paint for this cell, or undefined when it
+ * renders as plain Text. Shares rich_cell's memoized build, so hover-time
+ * consumers (the overflow tooltip) see exactly the lines the renderer draws.
+ */
+export function rich_cell_display_data(
+    c: RenderedCell,
+    show_formatting: boolean,
+    font_size_px: number = DEFAULT_CELL_FONT_SIZE_PX,
+): RichCellData | undefined {
+    if (!renders_rich(c, show_formatting)) return undefined;
+    return (rich_cell(c, show_formatting, undefined, font_size_px) as CustomCell<RichCellData>).data;
+}
+
 function text_cell(
     c: RenderedCell,
     show_formatting: boolean,
@@ -120,8 +244,18 @@ function text_cell(
     );
     return {
         kind: GridCellKind.Text,
-        data: overlay?.dirty_value ?? (c.raw ?? ''),
+        // `edit_value` first: on a markdown sheet the overlay editor must open
+        // with the cell's markup, not the plain projection — deleting the `**`
+        // around a bold cell's text is how the user un-bolds it, so the field
+        // has to open with the `**` present.
+        data: overlay?.edit_value ?? overlay?.dirty_value ?? (c.raw ?? ''),
         displayData: display,
+        // Copy stays the plain text even when `data` is markup: Ctrl+C on an
+        // editable markdown cell must put the cell's value on the clipboard,
+        // not its edit-field spelling.
+        ...(overlay?.edit_value !== undefined
+            ? { copyData: overlay?.dirty_value ?? (c.raw ?? '') }
+            : {}),
         allowOverlay: overlay?.editable ?? false,
         // Wrap on a hard line break, or whenever the caller says the row is tall
         // enough for wrapping to show (`soft_wrap`: row height above the default).
@@ -167,8 +301,26 @@ export function build_grid_cell(
     overlay?: CellEditOverlay,
     font_size_px: number = DEFAULT_CELL_FONT_SIZE_PX,
     soft_wrap = false,
+    link_modifier_held = false,
 ): GridCell {
     const c = cells?.[col];
     if (!c && !overlay) return BLANK;
+    // Rich *text styling* is a Formatting-on display concern, like bold/italic
+    // on the Text path; the hyperlink presentation (link color, underline,
+    // pointer) is semantic and survives the toggle. Either way the rich
+    // renderer steps aside whenever the cell must interact: an editable
+    // overlay or a dirty value needs the Text cell (Glide's overlay editor and
+    // paste path key off kind: Text), so in edit mode rich cells render plain
+    // — their raw text is what stage-3 editing operates on. Ctrl/Cmd+click
+    // link opening reads the loaded RenderedCell in the grid shell, not this
+    // GridCell, so it works either way.
+    if (
+        c
+        && renders_rich(c, show_formatting)
+        && !overlay?.editable
+        && overlay?.dirty_value === undefined
+    ) {
+        return rich_cell(c, show_formatting, overlay, font_size_px, link_modifier_held);
+    }
     return text_cell(c ?? EMPTY_CELL, show_formatting, overlay, font_size_px, soft_wrap);
 }

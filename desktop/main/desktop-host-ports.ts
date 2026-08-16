@@ -41,6 +41,7 @@ export interface DesktopUiDialogs {
         details: FileSizeLimitDialogDetails,
     ): Promise<FileSizeLimitDialogChoice>;
     open_setting(target: ViewerSettingTarget): Promise<void>;
+    open_external(url: string): void;
 }
 
 export function create_desktop_ui_port(dialogs: DesktopUiDialogs): HostUiPort {
@@ -51,5 +52,6 @@ export function create_desktop_ui_port(dialogs: DesktopUiDialogs): HostUiPort {
         show_file_size_limit_dialog: (details) =>
             dialogs.show_file_size_limit_dialog(details),
         open_setting: (target) => dialogs.open_setting(target),
+        open_external: (url) => dialogs.open_external(url),
     };
 }

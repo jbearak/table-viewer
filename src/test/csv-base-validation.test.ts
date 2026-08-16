@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { validate_dirty_bases } from '../csv-base-validation';
+import type { CellHyperlink, RichText } from '../cell-content';
 import type { CsvDirtyMap } from '../types';
 
 /** A raw reader over a dense grid of source text, `undefined` past either edge — the
@@ -9,9 +10,12 @@ function reader(grid: readonly (readonly string[])[]) {
         grid[source_row]?.[col];
 }
 
-function edits(entries: Record<string, { value: string; base: string }>): CsvDirtyMap {
+function edits(entries: Record<string, { value: string; base: string; baseRuns?: RichText }>): CsvDirtyMap {
     return entries;
 }
+
+const bold = (text: string): RichText => ({ runs: [{ text, style: { bold: true } }] });
+const underlined = (text: string): RichText => ({ runs: [{ text, style: { underline: true } }] });
 
 describe('validate_dirty_bases', () => {
     it('accepts a map whose every base matches the source', () => {
@@ -139,5 +143,194 @@ describe('validate_dirty_bases', () => {
         );
         // removedRows outranks the mismatch, so the malformed key cannot be masked.
         expect(outcome).toEqual({ type: 'removedRows', keys: ['a:b'] });
+    });
+});
+
+describe('validate_dirty_bases formatting', () => {
+    /** A rich reader over sparse per-cell runs, undefined = plain. */
+    function rich_reader(cells: Record<string, RichText>) {
+        return (source_row: number, col: number): RichText | undefined =>
+            cells[`${source_row}:${col}`];
+    }
+    const grid = reader([['a', 'b'], ['c', 'd']]);
+
+    it('conflicts a text-equal base whose source formatting drifted', () => {
+        // The finding's exact scenario: the edit was based on bold 'a', an
+        // acknowledged refresh changed the cell to underlined 'a'. Text-only
+        // validation accepted this and overwrote the newer underline.
+        const outcome = validate_dirty_bases(
+            edits({ '0:0': { value: 'X', base: 'a', baseRuns: bold('a') } }),
+            2,
+            grid,
+            rich_reader({ '0:0': underlined('a') }),
+        );
+        expect(outcome).toEqual({ type: 'conflicts', keys: ['0:0'] });
+    });
+
+    it('conflicts a plain-based edit when the source gained formatting, and vice versa', () => {
+        const source_gained = validate_dirty_bases(
+            edits({ '0:0': { value: 'X', base: 'a' } }),
+            2,
+            grid,
+            rich_reader({ '0:0': bold('a') }),
+        );
+        expect(source_gained).toEqual({ type: 'conflicts', keys: ['0:0'] });
+
+        const source_lost = validate_dirty_bases(
+            edits({ '0:0': { value: 'X', base: 'a', baseRuns: bold('a') } }),
+            2,
+            grid,
+            rich_reader({}),
+        );
+        expect(source_lost).toEqual({ type: 'conflicts', keys: ['0:0'] });
+    });
+
+    it('accepts matching formatting, including a formally-rich but style-free side', () => {
+        const equal_rich = validate_dirty_bases(
+            edits({ '0:0': { value: 'X', base: 'a', baseRuns: bold('a') } }),
+            2,
+            grid,
+            rich_reader({ '0:0': bold('a') }),
+        );
+        expect(equal_rich).toEqual({ type: 'valid' });
+
+        // baseRuns present but carrying no styles is semantically plain: it must
+        // equal an absent rich side rather than conflict on sparseness alone.
+        const plain_runs = validate_dirty_bases(
+            edits({ '0:0': { value: 'X', base: 'a', baseRuns: { runs: [{ text: 'a' }] } } }),
+            2,
+            grid,
+            rich_reader({}),
+        );
+        expect(plain_runs).toEqual({ type: 'valid' });
+    });
+
+    it('keeps the text-only contract when no rich reader is supplied', () => {
+        const outcome = validate_dirty_bases(
+            edits({ '0:0': { value: 'X', base: 'a', baseRuns: bold('a') } }),
+            2,
+            grid,
+        );
+        expect(outcome).toEqual({ type: 'valid' });
+    });
+
+    it('does not double-report a key that already conflicted on text', () => {
+        const outcome = validate_dirty_bases(
+            edits({ '0:0': { value: 'X', base: 'stale', baseRuns: bold('stale') } }),
+            2,
+            grid,
+            rich_reader({ '0:0': underlined('a') }),
+        );
+        expect(outcome).toEqual({ type: 'conflicts', keys: ['0:0'] });
+    });
+});
+
+describe('validate_dirty_bases hyperlinks', () => {
+    const grid = reader([['a', 'b'], ['c', 'd']]);
+    const site: CellHyperlink = { kind: 'external', target: 'https://site.test/' };
+    const other: CellHyperlink = { kind: 'external', target: 'https://other.test/' };
+
+    /** A link reader over a dense record of observed cells: `null` is a real
+     *  observation (the cell has no link), `undefined` means unobserved — the
+     *  same contract harvest_source_bases' links map presents. */
+    function link_reader(cells: Record<string, CellHyperlink | null>) {
+        return (source_row: number, col: number): CellHyperlink | null | undefined =>
+            cells[`${source_row}:${col}`];
+    }
+
+    function link_edits(
+        entries: Record<string, { value: string; base: string;
+            link?: CellHyperlink | null; baseLink?: CellHyperlink | null }>,
+    ): CsvDirtyMap {
+        return entries as CsvDirtyMap;
+    }
+
+    it('accepts a link edit whose recorded base still matches the source', () => {
+        const outcome = validate_dirty_bases(
+            link_edits({ '0:0': { value: 'a', base: 'a', link: other, baseLink: site } }),
+            2,
+            grid,
+            undefined,
+            link_reader({ '0:0': site }),
+        );
+        expect(outcome).toEqual({ type: 'valid' });
+    });
+
+    it('conflicts when the source link changed under a pending link edit', () => {
+        const outcome = validate_dirty_bases(
+            link_edits({ '0:0': { value: 'a', base: 'a', link: other, baseLink: site } }),
+            2,
+            grid,
+            undefined,
+            link_reader({ '0:0': other }),
+        );
+        expect(outcome).toEqual({ type: 'conflicts', keys: ['0:0'] });
+    });
+
+    it('conflicts on a link gained or lost under a text-equal base', () => {
+        const source_gained = validate_dirty_bases(
+            link_edits({ '0:0': { value: 'a', base: 'a', link: site, baseLink: null } }),
+            2,
+            grid,
+            undefined,
+            link_reader({ '0:0': other }),
+        );
+        expect(source_gained).toEqual({ type: 'conflicts', keys: ['0:0'] });
+
+        const source_lost = validate_dirty_bases(
+            link_edits({ '0:0': { value: 'a', base: 'a', link: null, baseLink: site } }),
+            2,
+            grid,
+            undefined,
+            link_reader({ '0:0': null }),
+        );
+        expect(source_lost).toEqual({ type: 'conflicts', keys: ['0:0'] });
+    });
+
+    it('fails closed when the cell was never observed', () => {
+        // `undefined` is "unobserved", not "no link": accepting it would let a
+        // save overwrite whatever link the file actually holds.
+        const outcome = validate_dirty_bases(
+            link_edits({ '0:0': { value: 'a', base: 'a', link: site, baseLink: null } }),
+            2,
+            grid,
+            undefined,
+            link_reader({}),
+        );
+        expect(outcome).toEqual({ type: 'conflicts', keys: ['0:0'] });
+    });
+
+    it('ignores the link reader for entries carrying no link dimension', () => {
+        const outcome = validate_dirty_bases(
+            edits({ '0:0': { value: 'X', base: 'a' } }),
+            2,
+            grid,
+            undefined,
+            link_reader({ '0:0': site }),
+        );
+        expect(outcome).toEqual({ type: 'valid' });
+    });
+
+    it('fails closed when the caller supplied no link reader at all', () => {
+        // Unlike the rich reader, whose absence means "this source has no
+        // formatting", a link-bearing entry with no link observer means the
+        // two sides disagree about the format — refuse rather than write it.
+        const outcome = validate_dirty_bases(
+            link_edits({ '0:0': { value: 'a', base: 'a', link: site, baseLink: null } }),
+            2,
+            grid,
+        );
+        expect(outcome).toEqual({ type: 'conflicts', keys: ['0:0'] });
+    });
+
+    it('does not double-report a key that already conflicted on text', () => {
+        const outcome = validate_dirty_bases(
+            link_edits({ '0:0': { value: 'X', base: 'stale', link: site, baseLink: null } }),
+            2,
+            grid,
+            undefined,
+            link_reader({ '0:0': other }),
+        );
+        expect(outcome).toEqual({ type: 'conflicts', keys: ['0:0'] });
     });
 });

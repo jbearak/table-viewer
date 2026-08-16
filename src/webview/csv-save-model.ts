@@ -4,7 +4,12 @@
  * folding rule is unit-tested without Glide or the DOM.
  */
 
-import type { CsvDirtyEntry, CsvDirtyMap } from '../types';
+import {
+    dirty_entry_value_changed,
+    copy_dirty_entry,
+    type CsvDirtyEntry,
+    type CsvDirtyMap,
+} from '../types';
 
 export type CsvSavePayloadPreflight =
     | {
@@ -33,8 +38,13 @@ export function collect_save_payload(
                 reason: 'unresolvedBases',
             });
         }
-        edits[key] = entry.value;
-        exact[key] = Object.freeze({ value: entry.value, base: entry.base });
+        // A link-only entry contributes no text edit: its value equals its
+        // base, and emitting it would rewrite an unedited cell's `<c>`.
+        if (dirty_entry_value_changed(entry)) edits[key] = entry.value;
+        // Runs and the link dimension ride along: the xlsx save plan reads
+        // `valueRuns`/`link` off the exact entry; string-only consumers
+        // (the CSV serializer) ignore them.
+        exact[key] = Object.freeze(copy_dirty_entry(entry));
     }
     return Object.freeze({
         status: 'ready',

@@ -85,6 +85,9 @@ export const vscode_host_ui_port: HostUiPort = {
             `@id:tableViewer.${target}`,
         );
     },
+    open_external(url) {
+        void vscode.env.openExternal(vscode.Uri.parse(url));
+    },
 };
 
 export const vscode_config_port: ConfigPort = {

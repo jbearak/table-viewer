@@ -95,3 +95,64 @@ describe('cell context menu model', () => {
         expect(props.on_select_all).toHaveBeenCalledOnce();
     });
 });
+
+describe('Open link', () => {
+    it('is absent without a link callback', () => {
+        const items = cell_context_menu_items(base());
+        expect(items.some((item) => item.kind !== 'separator' && item.label === 'Open link'))
+            .toBe(false);
+    });
+
+    it('leads the menu and fires the callback on a linked cell', () => {
+        const on_open_link = vi.fn();
+        const items = cell_context_menu_items({ ...base(), on_open_link });
+        const first = items[0];
+        expect(first.kind).toBeUndefined();
+        expect(first.kind !== 'separator' && first.kind !== 'submenu' && first.label)
+            .toBe('Open link');
+        action(items, 'Open link').on_click({} as never);
+        expect(on_open_link).toHaveBeenCalledTimes(1);
+    });
+
+    it('offers Copy link directly below Open link and fires its callback', () => {
+        const on_open_link = vi.fn();
+        const on_copy_link = vi.fn();
+        const items = cell_context_menu_items({ ...base(), on_open_link, on_copy_link });
+        const labels = items
+            .filter((item) => item.kind === undefined)
+            .map((item) => (item as { label: string }).label);
+        expect(labels.indexOf('Copy link')).toBe(labels.indexOf('Open link') + 1);
+        action(items, 'Copy link').on_click({} as never);
+        expect(on_copy_link).toHaveBeenCalledTimes(1);
+        expect(on_open_link).not.toHaveBeenCalled();
+    });
+});
+
+describe('Hyperlink…', () => {
+    it('is absent without the edit callback', () => {
+        const items = cell_context_menu_items(base());
+        expect(items.some((item) => item.kind === undefined
+            && item.label.startsWith('Hyperlink'))).toBe(false);
+    });
+
+    it('offers "Hyperlink…" on a linkless cell and fires the callback', () => {
+        const on_edit_hyperlink = vi.fn();
+        const items = cell_context_menu_items({ ...base(), on_edit_hyperlink });
+        action(items, 'Hyperlink…').on_click({} as never);
+        expect(on_edit_hyperlink).toHaveBeenCalledTimes(1);
+    });
+
+    it('reads "Edit hyperlink…" when the cell already has a link, below Copy link', () => {
+        const items = cell_context_menu_items({
+            ...base(),
+            on_open_link: vi.fn(),
+            on_copy_link: vi.fn(),
+            on_edit_hyperlink: vi.fn(),
+            has_hyperlink: true,
+        });
+        const labels = items
+            .filter((item) => item.kind === undefined)
+            .map((item) => (item as { label: string }).label);
+        expect(labels.slice(0, 3)).toEqual(['Open link', 'Copy link', 'Edit hyperlink…']);
+    });
+});

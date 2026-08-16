@@ -12,6 +12,7 @@ import { matches_filter } from '../table-transform';
 import type { CsvSaveOperation, FilterEntry, SheetTransformState } from '../types';
 import { create_edit_session_store } from '../webview/edit-session-store';
 import { MAX_COLUMN_WIDTH_PX } from '../webview/grid-model';
+import { button, field, find_button, set_input_value } from './helpers/dom-interaction';
 import {
     MAX_ROW_HEIGHT_PX,
     default_row_height_for_font,
@@ -167,6 +168,11 @@ vi.mock('../webview/use-row-loader', () => ({
                 if (display_row === undefined) return undefined;
                 const cell = grid_mock.get_row(display_row)?.[col];
                 return cell ? String(cell.raw ?? '') : '';
+            },
+            get_cell_for_source: (source_row: number, col: number) => {
+                const display_row = resident_display_row(source_row);
+                if (display_row === undefined) return undefined;
+                return grid_mock.get_row(display_row)?.[col] ?? null;
             },
             has_source_row: (source_row: number) => (
                 resident_display_row(source_row) !== undefined
@@ -2198,6 +2204,60 @@ describe('GridShell column projection', () => {
     });
 });
 
+describe('GridShell link-only edits', () => {
+    it('keeps the formatted display when only the hyperlink changed', async () => {
+        // A link-only entry's `value` is the unedited cell's raw text, and the
+        // save deliberately emits no text edit for it — so substituting it for
+        // the display would swap a formatted number for its raw form on a cell
+        // whose value dimension was never touched.
+        grid_mock.get_row.mockImplementation(() => [
+            { raw: '1234.5', formatted: '1,234.50', bold: false, italic: false },
+            { raw: 'hidden-b', formatted: 'hidden-b', bold: false, italic: false },
+            { raw: 'source-c', formatted: 'source-c', bold: false, italic: false },
+        ] as any);
+        await render_grid(props({
+            show_formatting: true,
+            edit_mode: true,
+            csv_editable: true,
+            initial_edits: {
+                '0:0': {
+                    value: '1234.5',
+                    base: '1234.5',
+                    link: { kind: 'external', target: 'https://a.test/' },
+                    baseLink: null,
+                },
+            },
+        }));
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => { displayData: string };
+        expect(get_cell_content([0, 0]).displayData).toBe('1,234.50');
+    });
+
+    it('still substitutes the dirty text when the value itself changed', async () => {
+        grid_mock.get_row.mockImplementation(() => [
+            { raw: '1234.5', formatted: '1,234.50', bold: false, italic: false },
+            { raw: 'hidden-b', formatted: 'hidden-b', bold: false, italic: false },
+            { raw: 'source-c', formatted: 'source-c', bold: false, italic: false },
+        ] as any);
+        await render_grid(props({
+            show_formatting: true,
+            edit_mode: true,
+            csv_editable: true,
+            initial_edits: {
+                '0:0': {
+                    value: 'typed',
+                    base: '1234.5',
+                    link: { kind: 'external', target: 'https://a.test/' },
+                    baseLink: null,
+                },
+            },
+        }));
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => { displayData: string };
+        expect(get_cell_content([0, 0]).displayData).toBe('typed');
+    });
+});
+
 // Every test here installs a NON-IDENTITY display→source mapping. Under identity
 // a display-keyed and a source-keyed implementation are indistinguishable, so an
 // identity fixture would make each of these assertions vacuous.
@@ -3063,5 +3123,61 @@ describe('GridShell row resizing', () => {
         // row numbers: the request that crosses to the host is the size of the gesture,
         // not of the selection.
         expect(on_row_resize.mock.calls[0][0]).toEqual([{ start: 0, end: 9_999 }]);
+    });
+});
+
+describe('GridShell hyperlink dialog admission', () => {
+    // Opening the dialog: Edit mode on a markdown sheet, right-click a cell,
+    // click "Hyperlink…", then Save a valid target.
+    async function open_dialog() {
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([0, 0], {
+            preventDefault: vi.fn(),
+            bounds: { x: 0, y: 0, width: 40, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        const open = find_button((text) => text.startsWith('Hyperlink'));
+        expect(open).toBeDefined();
+        await act(async () => open!.click());
+    }
+
+    async function save_link() {
+        await act(async () => set_input_value(
+            field('hyperlink-target') as HTMLInputElement,
+            'https://link.test/',
+        ));
+        await act(async () => button('Save').click());
+    }
+
+    const link_props = (editing_ref: React.RefObject<EditingHandle | null>) => props({
+        edit_mode: true,
+        csv_editable: true,
+        edit_syntax: 'markdown',
+        editing_ref,
+        edit_session_id: 'session-1',
+    });
+
+    it('commits a hyperlink while edits are still admitted', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        await render_grid(link_props(editing_ref));
+        await open_dialog();
+        await save_link();
+        expect(editing_ref.current!.has_uncommitted_changes()).toBe(true);
+    });
+
+    it('refuses a hyperlink once the close barrier is raised', async () => {
+        // The barrier goes up while the dialog is already open — the one
+        // ordering the menu gate cannot catch. Past it `post_pending_edits`
+        // refuses to publish, so a link accepted here would sit in the store
+        // and never reach the host: a silently dropped edit rather than a
+        // refused one. Every other mutation path refuses at the same gate.
+        const editing_ref = React.createRef<EditingHandle | null>();
+        await render_grid(link_props(editing_ref));
+        await open_dialog();
+        await act(async () => editing_ref.current!.stop_edit_admission());
+        await save_link();
+        expect(editing_ref.current!.has_uncommitted_changes()).toBe(false);
     });
 });

@@ -89,6 +89,12 @@ interface ViewerWindow {
 
 const IS_MAC = process.platform === 'darwin';
 
+/** Windows' ShellExecute command-length cap, which `shell.openExternal` inherits
+ *  and rejects past. Applied on every platform so a link that opens here opens
+ *  on all of them — a workbook is shared, and a per-OS limit is a bug report
+ *  nobody can reproduce. */
+const MAX_OPEN_EXTERNAL_LENGTH = 2081;
+
 /** How long a drag has to settle before the new size is persisted. A resize
  *  fires continuously, and each write is a synchronous rewrite of the settings
  *  file. */
@@ -1189,6 +1195,34 @@ export class ViewerWindowManager {
                             : 'cancel';
                 },
                 open_setting: async (target) => this.open_preferences(target),
+                // The controller has already run parse_http_external_url on
+                // webview-supplied URLs before this launches anything; what is
+                // left here is the platform's own limit. Windows routes
+                // openExternal through ShellExecute, which caps the command at
+                // 2081 characters and *rejects* past it — and this call is
+                // fire-and-forget, so an unhandled rejection would take the
+                // main process down over a long link in a workbook. Refusing
+                // and catching both end the same way for the user (nothing
+                // opens), but neither crashes. Both say so: a link the user
+                // deliberately clicked that produces nothing at all reads as
+                // the app being broken, and a workbook can legitimately carry a
+                // URL that clears our 8 KiB validation and still exceeds this.
+                open_external: (url) => {
+                    const too_long = url.length > MAX_OPEN_EXTERNAL_LENGTH;
+                    const failed = () => {
+                        void message_box({
+                            type: 'warning',
+                            message: too_long
+                                ? 'This link is too long for the system to open.'
+                                : 'This link could not be opened.',
+                        });
+                    };
+                    if (too_long) {
+                        failed();
+                        return;
+                    }
+                    void shell.openExternal(url).catch(failed);
+                },
             }),
             config: this.config_store.config_port(),
             refreshWatcherFactory: node_file_refresh_watcher_factory,

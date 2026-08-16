@@ -2,8 +2,11 @@ import { describe, it, expect } from 'vitest';
 import {
     CELL_TOOLTIP_HORIZONTAL_PADDING_PX,
     CELL_TOOLTIP_LINE_HEIGHT_PX,
+    cell_tooltip_content,
     cell_tooltip_position,
     clamp_tooltip_text,
+    link_open_hint,
+    rich_text_overflows_cell,
     text_overflows_cell,
 } from '../webview/cell-overflow-model';
 
@@ -124,5 +127,102 @@ describe('cell_tooltip_position', () => {
             { width: 200, height: 200 },
         );
         expect(pos.left).toBe(8);
+    });
+});
+
+describe('cell_tooltip_content', () => {
+    const link = { kind: 'external' as const, target: 'https://x.example/', tooltip: 'Go' };
+
+    it('is null with no overflow and no link', () => {
+        expect(cell_tooltip_content('short', false, undefined)).toBeNull();
+    });
+
+    it('shows the text alone on overflow', () => {
+        expect(cell_tooltip_content('long text', true, undefined)).toBe('long text');
+    });
+
+    it("shows the link's tooltip without overflow", () => {
+        expect(cell_tooltip_content('short', false, link)).toBe('Go');
+    });
+
+    it('falls back to the target / location when the link has no tooltip', () => {
+        expect(cell_tooltip_content('short', false, { kind: 'external', target: 'https://x.example/' }))
+            .toBe('https://x.example/');
+        expect(cell_tooltip_content('short', false, { kind: 'internal', location: 'Sheet2!A1' }))
+            .toBe('Sheet2!A1');
+    });
+
+    it('appends the link line to overflowing text', () => {
+        expect(cell_tooltip_content('long text', true, link)).toBe('long text\nGo');
+    });
+
+    it('appends the platform open hint to external links only', () => {
+        expect(cell_tooltip_content('short', false, link, link_open_hint(true)))
+            .toBe('Go\nCmd+click to open link');
+        expect(cell_tooltip_content('long text', true, link, link_open_hint(false)))
+            .toBe('long text\nGo\nCtrl+click to open link');
+        // Internal links aren't openable, so no gesture to teach.
+        expect(cell_tooltip_content(
+            'short',
+            false,
+            { kind: 'internal', location: 'Sheet2!A1' },
+            link_open_hint(false),
+        )).toBe('Sheet2!A1');
+        // Plain overflow tooltips stay hint-free.
+        expect(cell_tooltip_content('long text', true, undefined, link_open_hint(true)))
+            .toBe('long text');
+    });
+});
+
+describe('link_open_hint', () => {
+    it('names the platform modifier', () => {
+        expect(link_open_hint(true)).toBe('Cmd+click to open link');
+        expect(link_open_hint(false)).toBe('Ctrl+click to open link');
+    });
+});
+
+describe('rich_text_overflows_cell', () => {
+    // 1px per char; bold counts double, so per-style fonts matter.
+    const rich_measure = (text: string, style?: { bold?: true }): number =>
+        text.length * (style?.bold ? 2 : 1);
+
+    it('fits when the widest line fits', () => {
+        expect(rich_text_overflows_cell(
+            [[{ text: 'abc' }]],
+            3 + 2 * CELL_TOOLTIP_HORIZONTAL_PADDING_PX + 1,
+            rich_measure,
+        )).toBe(false);
+    });
+
+    it('overflows when a bold run pushes past the width plain text would fit', () => {
+        const width = 8 + 2 * CELL_TOOLTIP_HORIZONTAL_PADDING_PX;
+        expect(rich_text_overflows_cell(
+            [[{ text: 'abcd' }, { text: 'efgh' }]],
+            width, rich_measure,
+        )).toBe(false);
+        expect(rich_text_overflows_cell(
+            [[{ text: 'abcd' }, { text: 'efgh', style: { bold: true } }]],
+            width, rich_measure,
+        )).toBe(true);
+    });
+
+    it('treats extra hard lines as overflow without a height budget (no soft wrap)', () => {
+        expect(rich_text_overflows_cell(
+            [[{ text: 'a' }], [{ text: 'b' }]],
+            100, rich_measure,
+        )).toBe(true);
+    });
+
+    it('fits multiple lines inside a sufficient height budget', () => {
+        expect(rich_text_overflows_cell(
+            [[{ text: 'a' }], [{ text: 'b' }]],
+            100, rich_measure,
+            { cell_height: 3 * CELL_TOOLTIP_LINE_HEIGHT_PX, line_height: CELL_TOOLTIP_LINE_HEIGHT_PX },
+        )).toBe(false);
+        expect(rich_text_overflows_cell(
+            [[{ text: 'a' }], [{ text: 'b' }], [{ text: 'c' }], [{ text: 'd' }]],
+            100, rich_measure,
+            { cell_height: 3 * CELL_TOOLTIP_LINE_HEIGHT_PX, line_height: CELL_TOOLTIP_LINE_HEIGHT_PX },
+        )).toBe(true);
     });
 });

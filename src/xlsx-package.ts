@@ -8,15 +8,19 @@ import {
     widen_dimension,
     type XlsxCellEdit,
 } from './xlsx-cell-write';
-import { is_date_format } from './spreadsheet-format';
+import { get_style, is_date_format } from './spreadsheet-format';
+import { decode_xml, get_text, iter_elements } from './ooxml-xml';
+import { font_to_style } from './xlsx-rich-text';
+import type { CellTextStyle } from './cell-content';
 import {
-    decode_xml,
     parse_styles,
     parse_workbook_xml,
     resolve_part_path,
     worksheet_part_paths_from_package,
 } from './parse-xlsx';
 import type { XfEntry, DateMode } from './spreadsheet-format';
+import { rels_path_for_part } from './ooxml-relationships';
+import { apply_hyperlink_edits, type XlsxHyperlinkEdit } from './xlsx-hyperlink-write';
 
 /**
  * Package-level (.xlsx container) side of `putexcel`-style saving.
@@ -143,7 +147,12 @@ function section_for_value(code: string, value: number): string {
 }
 
 /**
- * Answer "is this style index a date format, for this value?" from the styles part.
+ * Everything the writer needs from `/xl/styles.xml`, read and parsed once per
+ * save: the date predicate for serial classification, plus the per-xf run-font
+ * context for rich inline strings — the cell font's four style flags (for the
+ * writer's uniform-style reduction) and its non-flag properties as
+ * `<rPr>`-ready inner XML (so a styled run on a Cambria-14 cell stays
+ * Cambria-14 — a present `<rPr>` REPLACES the cell font, never merges).
  *
  * The parse is the *reader's* — `parse_styles`, imported, not a second scan
  * written to match it. This module had its own, quote-aware and comment-aware
@@ -161,13 +170,56 @@ function section_for_value(code: string, value: number): string {
  * ignores it. Teaching only this side about it would recreate exactly the
  * disagreement above. Both sides have to change together, and that is a reader
  * change this branch does not make.
+ *
+ * The run-font base transformation: drop the four flag tags (`<b>`, `<i>`,
+ * `<strike>`, `<u>` in any spelling — the writer re-emits per-run flags
+ * itself, and a leftover `<u val="none"/>` says nothing absence doesn't), and
+ * rename `<name …/>` to `<rFont …/>` — the one child whose tag differs between
+ * a styles-part `<font>` and a string-part `<rPr>`. `<rPr>`'s children are an
+ * unbounded xsd:choice, so the surviving order is legal as-is. The flags come
+ * from the reader's own `get_style`/`font_to_style`, and the base walk uses
+ * the reader's `iter_elements` over the same `<fonts>` section, so writer and
+ * reader see the same font list in the same order.
  */
-function read_style_date_predicate(
-    cfb_file: ReturnType<typeof CFB.read>,
-): (xf_index: number, serial: number) => boolean {
+/**
+ * A `<font>` element's inner XML with every style element removed, leaving the
+ * face/size/color properties that make a run's `<rPr>` base.
+ *
+ * Looped to a fixed point rather than replaced once. A single pass can put back
+ * what it removes: `<<b/>b/>` has the inner `<b/>` deleted and the outer halves
+ * close up into a live `<b/>`, so a crafted styles.xml could re-introduce a
+ * style into a base the model believes is unstyled — the run would come back
+ * bold from a workbook we never agreed was bold. Untrusted input, so the loop
+ * is also bounded; a part that will not converge is treated as having no usable
+ * base rather than being trusted.
+ */
+function strip_style_elements(inner: string): string {
+    const style_tags = /<(?:b|i|u|strike)\b[^>]*\/?>|<\/(?:b|i|u|strike)>/g;
+    let out = inner;
+    for (let pass = 0; pass < 8; pass++) {
+        const next = out.replace(style_tags, '');
+        if (next === out) return out;
+        out = next;
+    }
+    return '';
+}
+
+interface StyleWriteContext {
+    readonly is_date_style: (xf_index: number, serial: number) => boolean;
+    readonly cell_font_style: (xf_index: number) => CellTextStyle | undefined;
+    readonly run_font_base: (xf_index: number) => string;
+}
+
+function read_style_write_context(cfb_file: ReturnType<typeof CFB.read>): StyleWriteContext {
     const xml = read_part_text(cfb_file, '/xl/styles.xml');
-    if (!xml) return () => false;
-    const { xfs, format_map } = parse_styles(xml);
+    if (!xml) {
+        return {
+            is_date_style: () => false,
+            cell_font_style: () => undefined,
+            run_font_base: () => '',
+        };
+    }
+    const { xfs, fonts, format_map } = parse_styles(xml);
 
     // Narrowed to the section the serial about to be written will be *displayed*
     // by. `SSF.is_date` says true if any section of a format is a date, so
@@ -177,10 +229,43 @@ function read_style_date_predicate(
     // (`[>50000]yyyy-mm-dd;0`) picks by its own test — so the predicate takes the
     // candidate serial rather than answering for the format as a whole. Only the
     // reading side wants that whole-format answer.
-    return (xf_index: number, serial: number) => {
+    const is_date_style = (xf_index: number, serial: number) => {
         const scoped = new Map<number, string>();
         for (const [id, code] of format_map) scoped.set(id, section_for_value(code, serial));
         return is_date_format(xf_index, xfs, scoped);
+    };
+
+    // The <rPr> bases are only wanted when some edit actually carries runs, so
+    // the <fonts> walk is deferred to the first call — a plain-text save never
+    // pays for it.
+    let bases: string[] | undefined;
+    const font_bases = (): string[] => {
+        if (bases === undefined) {
+            bases = [];
+            const fonts_section = get_text(xml, 'fonts');
+            if (fonts_section) {
+                iter_elements(fonts_section, 'font', (_open, inner) => {
+                    bases!.push(
+                        strip_style_elements(inner).replace(/<name\b/g, '<rFont'),
+                    );
+                });
+            }
+        }
+        return bases;
+    };
+    const font_index = (xf_index: number): number | undefined => {
+        if (!Number.isInteger(xf_index) || xf_index < 0 || xf_index >= xfs.length) return undefined;
+        const idx = xfs[xf_index].font_index;
+        return Number.isInteger(idx) && idx >= 0 && idx < fonts.length ? idx : undefined;
+    };
+
+    return {
+        is_date_style,
+        cell_font_style: (xf_index) => font_to_style(get_style(xf_index, xfs, fonts)),
+        run_font_base: (xf_index) => {
+            const idx = font_index(xf_index);
+            return idx === undefined ? '' : font_bases()[idx] ?? '';
+        },
     };
 }
 
@@ -225,7 +310,7 @@ function numeric_attr(tag: string, name: string): number | null {
 /**
  * The workbook's date epoch, read exactly as `parse_xlsx` reads it.
  *
- * Shared for the same reason as {@link read_style_date_predicate}. This module's
+ * Shared for the same reason as {@link read_style_write_context}. This module's
  * own `workbookPr` scan skipped comments, so a commented-out
  * `<workbookPr date1904="1"/>` left the writer on the 1900 epoch while the reader
  * used 1904 — and the two are 1462 days apart, so a saved `2024-01-15` read back
@@ -240,6 +325,9 @@ function read_datemode(cfb_file: ReturnType<typeof CFB.read>): DateMode {
 export interface XlsxWorksheetCellEdits {
     readonly sheetIndex: number;
     readonly edits: readonly XlsxCellEdit[];
+    /** Whole-cell hyperlink edits, applied to the worksheet's `<hyperlinks>`
+     *  section and its `.rels` part alongside the value edits. */
+    readonly link_edits?: readonly XlsxHyperlinkEdit[];
 }
 
 /**
@@ -253,7 +341,9 @@ export function write_xlsx_workbook_cell_edits(
     raw: Uint8Array,
     worksheets: readonly XlsxWorksheetCellEdits[],
 ): Uint8Array {
-    const active = worksheets.filter(({ edits }) => edits.length > 0);
+    const active = worksheets.filter(
+        ({ edits, link_edits }) => edits.length > 0 || (link_edits?.length ?? 0) > 0,
+    );
     if (active.length === 0) return raw;
 
     const indices = new Set<number>();
@@ -272,32 +362,69 @@ export function write_xlsx_workbook_cell_edits(
     }
 
     const parts = worksheet_part_paths_from_package(cfb_file);
-    const is_date_style = read_style_date_predicate(cfb_file);
+    const { is_date_style, cell_font_style, run_font_base } = read_style_write_context(cfb_file);
     const datemode = read_datemode(cfb_file);
     let removed_formula = false;
-    const replacements: Array<{ path: string; xml: string }> = [];
+    const replacements: Array<{ path: string; xml: string; created?: boolean }> = [];
 
-    for (const { sheetIndex, edits } of active) {
+    for (const { sheetIndex, edits, link_edits } of active) {
         const part = parts[sheetIndex];
         if (!part) throw new Error('Could not locate a worksheet to save');
         const path = `/${part}`;
         const sheet_xml = read_part_text(cfb_file, path);
         if (sheet_xml === null) throw new Error('Could not read a worksheet to save');
 
-        let updated = apply_cell_edits(sheet_xml, edits, { datemode, is_date_style });
-        let min_row = Infinity, min_col = Infinity, max_row = 0, max_col = 0;
-        for (const edit of edits) {
-            if (edit.row < min_row) min_row = edit.row;
-            if (edit.col < min_col) min_col = edit.col;
-            if (edit.row > max_row) max_row = edit.row;
-            if (edit.col > max_col) max_col = edit.col;
+        let updated = edits.length > 0
+            ? apply_cell_edits(sheet_xml, edits, {
+                datemode,
+                is_date_style,
+                cell_font_style,
+                run_font_base,
+            })
+            : sheet_xml;
+        if (edits.length > 0) {
+            let min_row = Infinity, min_col = Infinity, max_row = 0, max_col = 0;
+            for (const edit of edits) {
+                if (edit.row < min_row) min_row = edit.row;
+                if (edit.col < min_col) min_col = edit.col;
+                if (edit.row > max_row) max_row = edit.row;
+                if (edit.col > max_col) max_col = edit.col;
+            }
+            updated = widen_dimension(updated, min_row, min_col, max_row, max_col);
         }
-        updated = widen_dimension(updated, min_row, min_col, max_row, max_col);
-        removed_formula ||= formula_count(updated) < formula_count(sheet_xml);
+        if (link_edits && link_edits.length > 0) {
+            // The `.rels` splice is planned here with everything else so a bad
+            // link edit rejects the whole save before any part is mutated.
+            const rels_path = `/${rels_path_for_part(part)}`;
+            const rels_xml = read_part_text(cfb_file, rels_path);
+            const link_result = apply_hyperlink_edits(updated, rels_xml, link_edits);
+            updated = link_result.sheet_xml;
+            if (link_result.rels_xml !== null) {
+                replacements.push({
+                    path: rels_path,
+                    xml: link_result.rels_xml,
+                    // A sheet that had no `.rels` part gets one created.
+                    created: rels_xml === null,
+                });
+            }
+        }
+        // Only a cell write can drop a formula; a hyperlink splice touches the
+        // `<hyperlinks>` section and the rels, never a `<c>`. Skipping the two
+        // whole-sheet scans keeps a link-only save off the worksheet body.
+        if (edits.length > 0) {
+            removed_formula ||= formula_count(updated) < formula_count(sheet_xml);
+        }
         replacements.push({ path, xml: updated });
     }
 
-    for (const { path, xml } of replacements) {
+    for (const { path, xml, created } of replacements) {
+        if (created) {
+            // A sheet that never had relationships has no `.rels` part to
+            // replace; adding one needs no [Content_Types] change because the
+            // standard `Default Extension="rels"` already types it.
+            CFB.utils.cfb_add(cfb_file, path, Buffer.from(xml, 'utf8'));
+            continue;
+        }
         if (!write_part_text(cfb_file, path, xml)) {
             throw new Error('Could not update a worksheet to save');
         }

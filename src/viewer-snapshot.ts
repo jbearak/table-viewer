@@ -83,6 +83,13 @@ export interface WorkbookSnapshotCapabilities {
     readonly csvEditSessionId?: string;
     /** Monotonic host projection for the complete panel save lifecycle. */
     readonly csvSaveLifecycle: CsvSaveLifecycle;
+    /**
+     * How cell text is edited: 'markdown' for xlsx (styled runs serialize to
+     * inline markup in the edit field and parse back on commit), 'plain' for
+     * everything else. Absent reads as 'plain' — older hosts never sent it,
+     * and a plain editor is always safe.
+     */
+    readonly editSyntax?: 'plain' | 'markdown';
 }
 
 /**
