@@ -29,6 +29,9 @@ in its entry). Every one of them permits this use under GPL-3.0.
 - **Red** — Copyright (c) Microsoft Corporation —
   <https://github.com/microsoft/vscode/tree/1.101.0/extensions/theme-red>
   (ported from VS Code 1.101's built-in `vscode.theme-red`).
+- **Dark High Contrast** — Copyright (c) Microsoft Corporation —
+  <https://github.com/microsoft/vscode/blob/1.101.0/extensions/theme-defaults/themes/hc_black.json>
+  (ported from VS Code 1.101's built-in `theme-defaults` extension).
 
 ## MIT License
 

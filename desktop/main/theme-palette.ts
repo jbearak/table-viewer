@@ -130,7 +130,7 @@ export function derive_theme_variables(palette: SemanticPalette): Record<string,
         '--vscode-button-secondaryForeground': p.fg,
         '--vscode-button-secondaryHoverBackground': p.hover,
         '--vscode-charts-blue': p.info,
-        // Only meaningful in high-contrast themes, which we do not ship.
+        // High-contrast themes override this derived default explicitly.
         '--vscode-contrastBorder': 'transparent',
         '--vscode-editorHoverWidget-background': p.bgAlt,
         '--vscode-editorHoverWidget-foreground': p.fg,

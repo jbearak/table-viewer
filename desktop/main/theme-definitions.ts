@@ -43,7 +43,8 @@ export type ThemeId =
     | 'gruvbox-dark-soft'
     | 'cyberpunk'
     | 'cyberpunk-scarlet'
-    | 'red';
+    | 'red'
+    | 'dark-high-contrast';
 
 export interface ThemeDefinition {
     readonly id: ThemeId;
@@ -52,6 +53,8 @@ export interface ThemeDefinition {
     readonly label: string;
     /** The full `--vscode-*` map this theme paints with. */
     readonly variables: Record<string, string>;
+    /** Enables the shared webview's high-contrast interaction treatment. */
+    readonly highContrast?: boolean;
 }
 
 // --- the two hand-tuned themes ---------------------------------------------
@@ -525,6 +528,45 @@ const RED: SemanticPalette = {
     info: '#db7e58',        // inputValidation.infoBorder
 };
 
+/* Dark High Contrast — Copyright (c) Microsoft Corporation, MIT. Ported from
+   VS Code 1.101's built-in `theme-defaults/themes/hc_black.json` and the
+   `hc-black` workbench defaults that accompany it.
+
+   The upstream file intentionally specifies only colors that differ from the
+   high-contrast workbench defaults. The semantic roles below combine those
+   explicit values (black/white editor, white selection, #383a49 toggled fill)
+   with the accompanying HC defaults for focus, links, and status colors. */
+const DARK_HIGH_CONTRAST_PALETTE: SemanticPalette = {
+    bg: '#000000',          // editor.background
+    bgAlt: '#0c0c0c',       // high-contrast secondary surface
+    bgElevated: '#1f1f1f',  // high-contrast raised control surface
+    fg: '#ffffff',          // editor.foreground
+    fgMuted: '#d4d4d4',
+    fgSubtle: '#7c7c7c',    // editorWhitespace.foreground
+    border: '#ffffff',
+    accent: '#f38518',      // hc-black focusBorder
+    accentHover: '#ff9a3d', // hand-lightened orange
+    accentFg: '#000000',
+    selection: '#ffffff',   // editor.selectionBackground
+    hover: '#383a49',       // actionBar.toggledBackground
+    link: '#21a6ff',        // hc-black textLink.foreground
+    error: '#f48771',
+    warning: '#ffd370',
+    info: '#3794ff',
+};
+
+const DARK_HIGH_CONTRAST: Record<string, string> = {
+    ...derive_theme_variables(DARK_HIGH_CONTRAST_PALETTE),
+    // Unlike ordinary themes, HC controls keep an explicit outline even when
+    // their fill already carries the shape.
+    '--vscode-button-border': '#6fc3df',
+    '--vscode-contrastBorder': '#6fc3df',
+    // `editor.selectionBackground` is white upstream, but list selections in
+    // hc-black remain black and are distinguished by the cyan contrast border.
+    // Reusing white here would paint inherited white labels white-on-white.
+    '--vscode-list-activeSelectionBackground': '#000000',
+};
+
 // --- the registry -----------------------------------------------------------
 
 export const THEME_DEFINITIONS: Record<ThemeId, ThemeDefinition> = {
@@ -593,6 +635,11 @@ export const THEME_DEFINITIONS: Record<ThemeId, ThemeDefinition> = {
     red: {
         id: 'red', kind: 'dark', label: 'Red',
         variables: derive_theme_variables(RED),
+    },
+    'dark-high-contrast': {
+        id: 'dark-high-contrast', kind: 'dark', label: 'Dark High Contrast',
+        variables: DARK_HIGH_CONTRAST,
+        highContrast: true,
     },
 };
 

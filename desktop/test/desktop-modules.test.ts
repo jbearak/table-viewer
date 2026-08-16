@@ -1080,7 +1080,7 @@ describe('theme', () => {
             'catppuccin-macchiato', 'catppuccin-mocha',
             'gruvbox-dark-hard', 'gruvbox-dark-medium', 'gruvbox-dark-soft',
             'synthwave-84', 'cyberpunk', 'cyberpunk-scarlet',
-            'red',
+            'red', 'dark-high-contrast',
         ]);
         // Every id belongs to exactly one kind's list.
         expect(list_themes('light').length + list_themes('dark').length)
@@ -1096,6 +1096,22 @@ describe('theme', () => {
         expect(vars['--vscode-list-hoverBackground']).toBe('#800000');
         expect(vars['--vscode-editorWidget-border']).toBe('#611414');
         expect(vars['--vscode-textLink-foreground']).toBe('#ffd0aa');
+    });
+
+    it('ports VS Code Dark High Contrast and marks its payload as high contrast', () => {
+        const payload = theme_payload('dark-high-contrast');
+        expect(payload.kind).toBe('dark');
+        expect(payload.highContrast).toBe(true);
+        expect(payload.variables['--vscode-editor-background']).toBe('#000000');
+        expect(payload.variables['--vscode-editor-foreground']).toBe('#ffffff');
+        expect(payload.variables['--vscode-editor-selectionBackground']).toBe('#ffffff');
+        expect(payload.variables['--vscode-list-hoverBackground']).toBe('#383a49');
+        expect(payload.variables['--vscode-list-activeSelectionBackground']).toBe('#000000');
+        expect(payload.variables['--vscode-textLink-foreground']).toBe('#21a6ff');
+        expect(payload.variables['--vscode-contrastBorder']).toBe('#6fc3df');
+        expect(payload.variables['--vscode-button-border']).toBe('#6fc3df');
+        expect(payload.variables['--vscode-editorWarning-foreground']).toBe('#ffd370');
+        expect(payload.variables['--vscode-editorInfo-foreground']).toBe('#3794ff');
     });
 
     it('rejects unknown AND wrong-kind theme ids', () => {
@@ -1255,11 +1271,11 @@ describe('theme × Glide grid theme', () => {
             dirty.add(tints.dirtyBg);
             conflict.add(tints.conflictBg);
         }
-        // 18 themes, 12 distinct values each. The collisions are all intended
+        // 19 themes, 12 distinct values each. The collisions are all intended
         // palette sharing: solarized-light and solarized-dark share one palette;
         // each gruvbox kind's three contrasts differ only in their background;
         // and the two Cyberpunk variants share their warning and error colors.
-        expect(dirty.size).toBe(12);
+        expect(dirty.size).toBe(13);
         expect(conflict.size).toBe(12);
         // A typo'd variable name would collapse every theme onto the fallback.
         // (`dark`'s warning genuinely IS #cca700 — the same rgb as the dirty
