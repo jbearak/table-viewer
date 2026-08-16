@@ -616,6 +616,44 @@ describe('GridShell CSV save', () => {
         });
     });
 
+    it('unlocks and restores its proposal after a correlated malformed-request failure', async () => {
+        const { post_message, editing_ref } = await render_grid();
+        await edit_cell('first');
+        post_message.mockClear();
+        expect(await request_save(editing_ref)).toBe(true);
+        const first = post_message.mock.calls.at(-1)?.[0].operation as CsvSaveOperation;
+        const sanitized = {
+            ...first,
+            worksheets: first.worksheets.map((worksheet) => ({
+                ...worksheet,
+                dirtyEdits: {},
+            })),
+        };
+
+        await act(async () => {
+            window.dispatchEvent(new MessageEvent('message', { data: {
+                type: 'saveResult',
+                success: false,
+                lifecycle: {
+                    revision: 1,
+                    state: 'failed',
+                    operation: sanitized,
+                    failure: 'malformedRequest',
+                },
+            } }));
+        });
+
+        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('first');
+        expect(await request_save(editing_ref)).toBe(true);
+        const saves = post_message.mock.calls
+            .map(([message]) => message)
+            .filter((message) => message?.type === 'saveCsv');
+        expect(saves).toHaveLength(2);
+        expect(saves[1].operation.worksheets[0].dirtyEdits).toEqual(
+            first.worksheets[0].dirtyEdits,
+        );
+    });
+
     it('keeps the exact dirty map locked through delayed idle before active acceptance', async () => {
         const failed: CsvSaveOperation = {
             editSessionId: 'older-session',

@@ -6655,6 +6655,56 @@ describe('edit mode save exit', () => {
         expect(grid_shell_mock.latest_props?.save_operation).toBeUndefined();
     });
 
+    it('restores and unlocks a local proposal after a malformed-request failure', async () => {
+        grid_shell_mock.is_dirty = true;
+        grid_shell_mock.has_uncommitted_changes = true;
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            { capabilities: { csvEditable: true, csvEditingSupported: true } },
+        ));
+        await enter_edit_mode(post_message);
+        const dirty = { '0:0': { value: 'draft', base: 'base' } };
+        await act(async () => seed_mounted_store(dirty));
+        await report_grid_editing(true, true, [], dirty);
+
+        post_message.mockClear();
+        await click_button('Edit');
+        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        const submitted = grid_shell_mock.latest_props?.save_operation as CsvSaveOperation;
+        expect(submitted).toBeDefined();
+        const sanitized: CsvSaveOperation = {
+            ...submitted,
+            worksheets: submitted.worksheets.map((worksheet) => ({
+                ...worksheet,
+                dirtyEdits: {},
+            })),
+        };
+
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 1,
+                state: 'failed',
+                operation: sanitized,
+                failure: 'malformedRequest',
+            },
+        });
+
+        expect(grid_shell_mock.latest_props?.save_operation).toBeUndefined();
+        expect(latest_store_edits()).toEqual(dirty);
+
+        post_message.mockClear();
+        await click_button('Edit');
+        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        const retry = grid_shell_mock.latest_props?.save_operation as CsvSaveOperation;
+        expect(retry).toBeDefined();
+        expect(retry.saveRequestId).not.toBe(submitted.saveRequestId);
+        expect(retry.worksheets[0].dirtyEdits).toEqual(dirty);
+        expect(post_message).toHaveBeenCalledWith({ type: 'saveCsv', operation: retry });
+    });
+
     it('keeps a local save locked through delayed idle before exact active acceptance', async () => {
         grid_shell_mock.is_dirty = true;
         grid_shell_mock.has_uncommitted_changes = true;

@@ -1979,6 +1979,71 @@ describe('CSV edit sessions', () => {
         }
     });
 
+    it('fails a malformed save lifecycle and accepts a later well-formed save', async () => {
+        const file_path = '/tmp/malformed-save-lifecycle.csv';
+        const versioned = state_store();
+        const written: Uint8Array[] = [];
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+        vscode_mock.__setWriteFileImplementation(async (_target, bytes) => {
+            written.push(bytes as Uint8Array);
+        });
+        const panel = open_csv_table(uri(file_path), versioned.store);
+        await panel.__receive({ type: 'ready' });
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit' });
+        const edit_session_id = latest_edit_session_message(panel)!.editSessionId!;
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: edit_session_id,
+                saveRequestId: 'malformed-save',
+                worksheets: [{
+                    sheetIndex: 0,
+                    edits: { '0:0': 'must-not-write' },
+                    dirtyEdits: { '0:0': null },
+                }],
+            },
+        } as never);
+
+        expect(written).toHaveLength(0);
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'saveResult',
+            success: false,
+            lifecycle: expect.objectContaining({
+                state: 'failed',
+                failure: 'malformedRequest',
+                operation: expect.objectContaining({
+                    saveRequestId: 'malformed-save',
+                }),
+            }),
+        }));
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: edit_session_id,
+                saveRequestId: 'valid-after-malformed',
+                worksheets: [{
+                    sheetIndex: 0,
+                    edits: { '0:0': 'saved' },
+                    dirtyEdits: { '0:0': { value: 'saved', base: 'a' } },
+                }],
+            },
+        });
+
+        expect(written).toHaveLength(1);
+        expect(new TextDecoder().decode(written[0])).toBe('h\nsaved\n');
+        expect(panel.__messages).toContainEqual(expect.objectContaining({
+            type: 'saveResult',
+            success: true,
+            lifecycle: expect.objectContaining({
+                operation: expect.objectContaining({
+                    saveRequestId: 'valid-after-malformed',
+                }),
+            }),
+        }));
+    });
+
     it('refuses a save whose base never matched the file, before writing any bytes', async () => {
         const file_path = '/tmp/base-mismatch-rejected.csv';
         const versioned = state_store();

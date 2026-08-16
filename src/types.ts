@@ -1549,7 +1549,15 @@ export type CsvSaveOperationRequest = CsvSaveOperation | LegacyCsvSaveOperationR
 export type CsvSaveLifecycle =
     | { readonly revision: number; readonly state: 'idle' }
     | { readonly revision: number; readonly state: 'active'; readonly operation: CsvSaveOperation }
-    | { readonly revision: number; readonly state: 'failed'; readonly operation: CsvSaveOperation }
+    | {
+        readonly revision: number;
+        readonly state: 'failed';
+        readonly operation: CsvSaveOperation;
+        /** The host could not safely echo the complete untrusted payload, so this
+         *  terminal settles only the renderer proposal with the same session and
+         *  request IDs. The renderer restores its own locked payload. */
+        readonly failure?: 'malformedRequest';
+    }
     | { readonly revision: number; readonly state: 'succeeded'; readonly operation: CsvSaveOperation };
 
 export type ActiveCsvSaveLifecycle = Extract<CsvSaveLifecycle, { state: 'active' }>;

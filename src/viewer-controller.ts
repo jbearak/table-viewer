@@ -94,7 +94,6 @@ import {
     type CsvDirtyMap,
     dirty_entries_equal,
     dirty_entry_link_changed,
-    sanitized_dirty_entry,
     sanitized_wire_dirty_entry,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
@@ -1792,6 +1791,7 @@ export function attach_viewer(
     function finish_save_lifecycle(
         operation: CsvSaveOperation,
         state: 'failed',
+        failure?: 'malformedRequest',
     ): Extract<CsvSaveLifecycle, { state: 'failed' }>;
     function finish_save_lifecycle(
         operation: CsvSaveOperation,
@@ -1800,11 +1800,13 @@ export function attach_viewer(
     function finish_save_lifecycle(
         operation: CsvSaveOperation,
         state: 'failed' | 'succeeded',
+        failure?: 'malformedRequest',
     ): Extract<CsvSaveLifecycle, { state: 'failed' | 'succeeded' }> {
         const lifecycle = Object.freeze({
             revision: save_lifecycle.revision + 1,
             state,
             operation,
+            ...(state === 'failed' && failure !== undefined ? { failure } : {}),
         });
         save_lifecycle = lifecycle;
         recapture_edit_capabilities();
@@ -3717,7 +3719,7 @@ export function attach_viewer(
                                     restored_sheet_index,
                                 );
                                 if (!validation) continue;
-                                const operation = clone_save_operation({
+                                const cloned = clone_save_operation({
                                     editSessionId: active_edit_session_id,
                                     saveRequestId: `rehydration:${seq}`,
                                     worksheets: [{
@@ -3730,8 +3732,11 @@ export function attach_viewer(
                                         dirtyEdits: validation.dirtyEdits,
                                     }],
                                 });
+                                if (cloned.hasMalformedDirtyEntry) {
+                                    throw new Error('Restored save operation held a malformed dirty entry.');
+                                }
                                 pending_rehydration_rejections.set(adoption, {
-                                    operation,
+                                    operation: cloned.operation,
                                     rejection: validation.rejection,
                                 });
                                 break;
@@ -4547,7 +4552,10 @@ export function attach_viewer(
         });
     }
 
-    function clone_save_operation(input: CsvSaveOperationRequest): CsvSaveOperation {
+    function clone_save_operation(input: CsvSaveOperationRequest): {
+        operation: CsvSaveOperation;
+        hasMalformedDirtyEntry: boolean;
+    } {
         const is_workbook_request = 'worksheets' in input
             && Array.isArray(input.worksheets);
         const requested_worksheets: readonly (
@@ -4556,18 +4564,25 @@ export function attach_viewer(
         )[] = is_workbook_request
             ? input.worksheets
             : [input];
+        let has_malformed_dirty_entry = false;
         const worksheets = requested_worksheets.map((worksheet) => {
             const dirty_edits = Object.fromEntries(
-                Object.entries(worksheet.dirtyEdits).map(([key, entry]) => [
-                    key,
+                Object.entries(worksheet.dirtyEdits).flatMap(([key, entry]) => {
                     // Wire runs are untrusted; the sanitizer keeps a run side
                     // only when its text equals the plain projection, so the
                     // planner can hand runs to the xlsx writer without
-                    // re-checking. A non-record entry throws here, which fails
-                    // the save closed — dropping it instead would let its key
-                    // in `edits` be written with no base ever validated.
-                    Object.freeze(sanitized_dirty_entry(entry)),
-                ]),
+                    // re-checking. A malformed required entry marks the whole
+                    // operation invalid. It is omitted only from this terminal
+                    // lifecycle identity; handle_save refuses the operation
+                    // before planning, so its matching `edits` value can never
+                    // be written without a validated base.
+                    const sanitized = sanitized_wire_dirty_entry(entry);
+                    if (!sanitized) {
+                        has_malformed_dirty_entry = true;
+                        return [];
+                    }
+                    return [[key, Object.freeze(sanitized)] as const];
+                }),
             );
             const sheet_index = worksheet.sheetIndex ?? 0;
             const sheet_name = worksheet.sheetName ?? (
@@ -4591,25 +4606,31 @@ export function attach_viewer(
             worksheets: Object.freeze(worksheets),
         };
         if (is_workbook_request) {
-            return Object.freeze(workbook_operation);
+            return {
+                operation: Object.freeze(workbook_operation),
+                hasMalformedDirtyEntry: has_malformed_dirty_entry,
+            };
         }
         // Old renderers compare the flat fields they proposed and ignore unknown
         // fields; current renderers compare `worksheets` and ignore these aliases.
         // One hybrid identity therefore settles both generations through every
         // lifecycle channel, including snapshots, without weakening either reducer.
         const worksheet = worksheets[0];
-        return Object.freeze({
-            ...workbook_operation,
-            sheetIndex: worksheet.sheetIndex,
-            ...(worksheet.sheetName !== undefined
-                ? { sheetName: worksheet.sheetName }
-                : {}),
-            ...(worksheet.worksheetId !== undefined
-                ? { worksheetId: worksheet.worksheetId }
-                : {}),
-            edits: worksheet.edits,
-            dirtyEdits: worksheet.dirtyEdits,
-        });
+        return {
+            operation: Object.freeze({
+                ...workbook_operation,
+                sheetIndex: worksheet.sheetIndex,
+                ...(worksheet.sheetName !== undefined
+                    ? { sheetName: worksheet.sheetName }
+                    : {}),
+                ...(worksheet.worksheetId !== undefined
+                    ? { worksheetId: worksheet.worksheetId }
+                    : {}),
+                edits: worksheet.edits,
+                dirtyEdits: worksheet.dirtyEdits,
+            }),
+            hasMalformedDirtyEntry: has_malformed_dirty_entry,
+        };
     }
 
     async function persist_accepted_save(operation: CsvSaveHostOperation): Promise<void> {
@@ -4628,7 +4649,7 @@ export function attach_viewer(
                 const target = operation.durableTargets[index];
                 // Already sanitized: `operation.identity` is the clone built by
                 // `clone_save_operation`, whose entries went through
-                // `sanitized_dirty_entry` at ingress.
+                // `sanitized_wire_dirty_entry` at ingress.
                 pending = with_pending_edits_for_sheet(
                     pending,
                     target.sheetIndex,
@@ -4647,8 +4668,23 @@ export function attach_viewer(
 
     async function handle_save(input: CsvSaveOperationRequest): Promise<void> {
         const receiver_epoch = session.current_receiver_epoch;
-        const identity = clone_save_operation(input);
         if (active_save_operation) return;
+        const cloned = clone_save_operation(input);
+        const identity = cloned.operation;
+        if (cloned.hasMalformedDirtyEntry) {
+            const active = begin_save_lifecycle(identity);
+            const lifecycle = finish_save_lifecycle(
+                active.operation,
+                'failed',
+                'malformedRequest',
+            );
+            void post_to_receiver({
+                type: 'saveResult',
+                success: false,
+                lifecycle,
+            }, receiver_epoch);
+            return;
+        }
         // The session covers the workbook, so the save names its own worksheet —
         // but the index is a caller-controlled wire number that reaches the
         // planner and the meta lookup below, so it is bounded against the live

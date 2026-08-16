@@ -5,6 +5,7 @@ import {
     propose_csv_save,
     reduce_csv_save_projection,
     resolve_csv_save_hydration,
+    terminal_csv_save_settles_operation,
     type CsvSaveProjection,
 } from '../webview/csv-save-lifecycle';
 
@@ -128,6 +129,32 @@ describe('CSV save lifecycle projection', () => {
         });
         expect(projection.operation).toEqual(local);
         expect(projection.authoritative).toEqual({ revision: 12, state: 'idle' });
+    });
+
+    it('settles only the correlated proposal for a malformed-request failure', () => {
+        const local = operation('local');
+        const sanitized = operation('local', local.editSessionId, [{
+            ...local.worksheets[0],
+            dirtyEdits: {},
+        }]);
+        const malformed_failure = {
+            revision: 11,
+            state: 'failed',
+            operation: sanitized,
+            failure: 'malformedRequest',
+        } as const;
+
+        expect(terminal_csv_save_settles_operation(malformed_failure, local)).toBe(true);
+        expect(terminal_csv_save_settles_operation(
+            malformed_failure,
+            operation('other-request'),
+        )).toBe(false);
+
+        const proposed = propose_csv_save({
+            authoritative: { revision: 10, state: 'idle' },
+        }, local);
+        expect(reduce_csv_save_projection(proposed, malformed_failure).operation)
+            .toBeUndefined();
     });
 
     it('keeps a proposal locked through failed r2, delayed idle r3, and exact active r4', () => {

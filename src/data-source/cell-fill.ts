@@ -37,7 +37,7 @@ export interface WorkingSet {
  * `set(r, c, cell)` calls. ColumnarStore.Builder satisfies this structurally.
  */
 export interface CellSink {
-    set(r: number, c: number, cell: CellData | null): void;
+    set(r: number, c: number, cell: RenderedCell | null): void;
 }
 
 /**

@@ -113,6 +113,7 @@ import {
     csv_save_operations_equal,
     resolve_csv_save_hydration,
     save_operation_worksheet,
+    terminal_csv_save_settles_operation,
 } from './csv-save-lifecycle';
 import {
     canvas_font,
@@ -822,10 +823,12 @@ export function GridShell({
                 : edit_session_id !== undefined
                     && lifecycle.operation.editSessionId !== edit_session_id
         ) return;
-        if (!csv_save_operations_equal(lifecycle.operation, operation)) return;
+        if (!terminal_csv_save_settles_operation(lifecycle, operation)) return;
 
         const restore = (resolve_csv_save_hydration(
-            { authoritative: lifecycle },
+            lifecycle.state === 'failed'
+                ? { authoritative: lifecycle, operation }
+                : { authoritative: lifecycle },
             edit_session_id,
             sheet_index,
             sheet_meta.name,

@@ -5,6 +5,7 @@ import {
     type CsvSaveOperation,
     type CsvSaveWorksheetOperation,
     type SheetPendingEditCells,
+    type TerminalCsvSaveLifecycle,
 } from '../types';
 
 export interface CsvSaveProjection {
@@ -73,6 +74,24 @@ export function csv_save_operations_equal(
         && left.worksheets.every((worksheet, index) => (
             worksheet_operations_equal(worksheet, right.worksheets[index])
         ));
+}
+
+/**
+ * Whether a terminal host lifecycle settles one locally locked proposal.
+ * Ordinary terminals require the full immutable payload. A malformed wire
+ * request cannot be echoed as a valid CsvSaveOperation, so that one explicit
+ * failure correlates by the renderer-generated session/request pair and leaves
+ * restoration to the renderer's own locked operation.
+ */
+export function terminal_csv_save_settles_operation(
+    lifecycle: TerminalCsvSaveLifecycle,
+    operation: CsvSaveOperation,
+): boolean {
+    if (csv_save_operations_equal(lifecycle.operation, operation)) return true;
+    return lifecycle.state === 'failed'
+        && lifecycle.failure === 'malformedRequest'
+        && lifecycle.operation.editSessionId === operation.editSessionId
+        && lifecycle.operation.saveRequestId === operation.saveRequestId;
 }
 
 function remove_operation_owned_pending_edits(
@@ -203,7 +222,10 @@ export function reduce_csv_save_projection(
             ...(incoming.state === 'active' ? { operation: incoming.operation } : {}),
         };
     }
-    if (!csv_save_operations_equal(current.operation, incoming.operation)) {
+    const matches = incoming.state === 'active'
+        ? csv_save_operations_equal(current.operation, incoming.operation)
+        : terminal_csv_save_settles_operation(incoming, current.operation);
+    if (!matches) {
         return {
             authoritative: incoming,
             operation: current.operation,

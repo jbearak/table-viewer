@@ -85,6 +85,7 @@ import {
     propose_csv_save,
     reduce_csv_save_projection,
     resolve_csv_save_hydration,
+    terminal_csv_save_settles_operation,
     type CsvSaveProjection,
 } from './csv-save-lifecycle';
 import {
@@ -1007,7 +1008,10 @@ export function App(): React.JSX.Element {
         }
 
         const current_session_id = csv_edit_session_id_ref.current;
-        const hydrate_and_install = (operation: CsvSaveOperation) => {
+        const hydrate_and_install = (
+            operation: CsvSaveOperation,
+            projection: Pick<CsvSaveProjection, 'authoritative' | 'operation'> = next,
+        ) => {
             const sheet_index_for = worksheet_target_lookup(meta_ref.current?.sheets ?? []);
             for (const worksheet of operation.worksheets) {
                 const sheet_index = sheet_index_for(worksheet);
@@ -1015,7 +1019,7 @@ export function App(): React.JSX.Element {
                 const entries = edit_session_registry_ref.current!
                     .for_sheet(sheet_index).snapshot();
                 const hydrated = resolve_csv_save_hydration(
-                    next,
+                    projection,
                     current_session_id,
                     sheet_index,
                     meta_ref.current?.sheets[sheet_index]?.name,
@@ -1032,21 +1036,27 @@ export function App(): React.JSX.Element {
             ) {
                 hydrate_and_install(incoming.operation);
             }
-        } else if (
-            incoming.state !== 'idle'
-            && (!previous.operation
-                || csv_save_operations_equal(previous.operation, incoming.operation))
-        ) {
+        } else if (incoming.state !== 'idle') {
+            const settled_operation = previous.operation
+                && terminal_csv_save_settles_operation(incoming, previous.operation)
+                ? previous.operation
+                : undefined;
+            if (previous.operation && !settled_operation) {
+                return { previous, next, changed: true };
+            }
             if (incoming.state === 'failed') {
                 if (
-                    previous.operation
+                    settled_operation
                     && incoming.operation.editSessionId === current_session_id
-                    && csv_save_operations_equal(
-                        previous.operation,
-                        incoming.operation,
-                    )
                 ) {
-                    hydrate_and_install(incoming.operation);
+                    // A malformed request lifecycle carries only a sanitized
+                    // host identity. Restore the exact renderer-owned proposal,
+                    // which is both the user's real dirty map and the only copy
+                    // that never crossed the untrusted wire boundary.
+                    hydrate_and_install(settled_operation, {
+                        authoritative: next.authoritative,
+                        operation: settled_operation,
+                    });
                     pending_exit_ref.current = false;
                 }
             } else if (
@@ -3494,7 +3504,7 @@ export function App(): React.JSX.Element {
                 // the verdict installed by a later accepted result.
                 if (!transition.changed) return;
                 const matching = !operation
-                    || csv_save_operations_equal(operation, msg.lifecycle.operation);
+                    || terminal_csv_save_settles_operation(msg.lifecycle, operation);
                 // Every accepted save result supersedes the previous one, including a
                 // success and including a rejection that named different keys. Clearing
                 // here, before the adoption block below re-records one, is what makes a
