@@ -36,10 +36,17 @@ describe('parse_http_external_url', () => {
         expect(parse_http_external_url('https://example.com/' + 'a'.repeat(8 * 1024))).toBeNull();
     });
 
-    it('rejects embedded control characters', () => {
+    it('rejects control characters anywhere, including at the ends', () => {
         expect(parse_http_external_url('https://exam\x00ple.com')).toBeNull();
         expect(parse_http_external_url('https://example.com/\x1fpath')).toBeNull();
         expect(parse_http_external_url('https://example.com/\x7f')).toBeNull();
         expect(parse_http_external_url('https://example.com/a\nb')).toBeNull();
+        expect(parse_http_external_url('\nhttps://example.com')).toBeNull();
+        expect(parse_http_external_url('https://example.com\t')).toBeNull();
+    });
+
+    it('rejects URLs whose normalized form exceeds the cap', () => {
+        // ~2.6k non-ASCII chars fit the 8KiB input cap but percent-encode to ~3x.
+        expect(parse_http_external_url('https://example.com/' + 'é'.repeat(6000))).toBeNull();
     });
 });

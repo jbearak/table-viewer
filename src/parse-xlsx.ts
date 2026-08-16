@@ -464,7 +464,10 @@ function parse_worksheet_core(
             const r_id = get_attr(open_tag, 'r:id');
             if (r_id !== null) {
                 const rel = sheet_rels.get(r_id);
-                if (!rel || !rel.external) return; // dangling or internal-part rel
+                // Untrusted input: only follow actual hyperlink relationships
+                // (an r:id could point at an image/OLE rel), and only external
+                // ones — a package-internal hyperlink target is malformed.
+                if (!rel || !rel.external || !rel.type.endsWith('/hyperlink')) return;
                 // The optional location attribute is a fragment within the
                 // external target (e.g. a bookmark); append it Excel-style.
                 const location = get_attr(open_tag, 'location');
@@ -481,7 +484,20 @@ function parse_worksheet_core(
             if (existing) {
                 existing.hyperlink = hyperlink;
             } else {
-                cells.set(key, { raw: null, formatted: '', bold: false, italic: false, hyperlink });
+                // Same in-progress ceiling as the cell loop above — hyperlink
+                // refs are attacker-controlled and must not bypass it.
+                if (cells.size >= MAX_WORKBOOK_CELLS) {
+                    throw new Error(
+                        `Spreadsheet has too many cells to open safely (max ${MAX_WORKBOOK_CELLS.toLocaleString()})`
+                    );
+                }
+                // The optional display attribute is the link's text when the
+                // cell has no value of its own.
+                const display = get_attr(open_tag, 'display');
+                const cell: CellData = display !== null && display !== ''
+                    ? { raw: display, formatted: display, bold: false, italic: false, hyperlink }
+                    : { raw: null, formatted: '', bold: false, italic: false, hyperlink };
+                cells.set(key, cell);
                 if (row + 1 > max_row) max_row = row + 1;
                 if (col + 1 > max_col) max_col = col + 1;
             }

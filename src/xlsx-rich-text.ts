@@ -80,10 +80,6 @@ export function parse_font_properties(inner: string): CellTextStyle | undefined 
  * by the boundary-aware `<r>` scan exactly as the legacy flattening did.
  */
 export function parse_xlsx_string_item(inner: string): ParsedXlsxString {
-    if (inner.indexOf('<r>') === -1 && inner.indexOf('<r ') === -1) {
-        const t = get_text(inner, 't');
-        return t !== null ? decode_xml(t) : '';
-    }
     const runs: ParsedSourceRun[] = [];
     let text = '';
     iter_elements(inner, 'r', (_open, r_inner) => {
@@ -98,6 +94,12 @@ export function parse_xlsx_string_item(inner: string): ParsedXlsxString {
             runs.push({ text: run_text, style: parse_font_properties(rpr) ?? null });
         }
     });
+    // No <r> runs (the boundary-aware scan also rejects <rPh>/<rPr> prefixes):
+    // the plain single-<t> form.
+    if (runs.length === 0) {
+        const t = get_text(inner, 't');
+        return t !== null ? decode_xml(t) : '';
+    }
     return { text, runs };
 }
 

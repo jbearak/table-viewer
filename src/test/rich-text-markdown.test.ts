@@ -145,6 +145,22 @@ describe('round-trip invariants', () => {
                 { text: 'all', style: { bold: true, italic: true, underline: true, strikethrough: true } },
             ],
         },
+        // Style transitions whose delimiters land adjacent: a**b*c*** must
+        // parse back as bold "b" + bold-italic "c", not bold "b*c".
+        {
+            runs: [
+                { text: 'a' },
+                { text: 'b', style: { bold: true } },
+                { text: 'c', style: { bold: true, italic: true } },
+            ],
+        },
+        {
+            runs: [
+                { text: 'a', style: { italic: true } },
+                { text: 'b', style: { bold: true, italic: true } },
+                { text: 'c', style: { bold: true } },
+            ],
+        },
     ];
 
     it('markdown_to_rich_text(rich_text_to_markdown(x)) === normalize(x)', () => {
@@ -158,6 +174,51 @@ describe('round-trip invariants', () => {
         for (const value of cases) {
             const md = rich_text_to_markdown(value);
             expect(rich_text_to_markdown(markdown_to_rich_text(md))).toBe(md);
+        }
+    });
+
+    it('boundary whitespace round-trips its text (styles move off the space)', () => {
+        // CommonMark flanking makes "** x**" unparseable, so the serializer
+        // emits boundary whitespace outside the delimiters. Text must be
+        // preserved exactly; bold moves off the spaces.
+        const value: RichText = { runs: [{ text: ' x ', style: { bold: true } }] };
+        const md = rich_text_to_markdown(value);
+        expect(md).toBe(' **x** ');
+        expect(markdown_to_rich_text(md)).toEqual({
+            runs: [{ text: ' ' }, { text: 'x', style: { bold: true } }, { text: ' ' }],
+        });
+    });
+
+    it('an all-whitespace styled run keeps its text', () => {
+        const value: RichText = {
+            runs: [{ text: 'a', style: { bold: true } }, { text: ' ' }, { text: 'b', style: { bold: true } }],
+        };
+        const md = rich_text_to_markdown(value);
+        expect(markdown_to_rich_text(md)).toEqual(normalize_rich_text(value));
+        const spaced: RichText = { runs: [{ text: '  ', style: { italic: true } }] };
+        expect(markdown_to_rich_text(rich_text_to_markdown(spaced))).toEqual({ runs: [{ text: '  ' }] });
+    });
+
+    it('exhaustive: every 3-run sequence over 5 styles round-trips', () => {
+        // Runs "a","b","c" each carrying one of: plain, bold, italic,
+        // bold+italic, strike — 125 sequences covering every adjacent style
+        // transition the serializer can emit (incl. merged star runs).
+        const styles = [
+            undefined,
+            { bold: true as const },
+            { italic: true as const },
+            { bold: true as const, italic: true as const },
+            { strikethrough: true as const },
+        ];
+        const texts = ['a', 'b', 'c'];
+        for (const s0 of styles) for (const s1 of styles) for (const s2 of styles) {
+            const value: RichText = {
+                runs: [s0, s1, s2].map((style, i) =>
+                    style ? { text: texts[i], style } : { text: texts[i] }),
+            };
+            const md = rich_text_to_markdown(value);
+            expect(markdown_to_rich_text(md), `via ${JSON.stringify(md)}`)
+                .toEqual(normalize_rich_text(value));
         }
     });
 

@@ -55,6 +55,12 @@ describe('parse_xlsx_string_item', () => {
         ]);
     });
 
+    it('detects <r> runs whose tag name is followed by tab or newline', () => {
+        const parsed = parse_xlsx_string_item('<r\n><t>a</t></r><r><t>b</t></r>') as ParsedRichString;
+        expect(parsed.text).toBe('ab');
+        expect(parsed.runs).toHaveLength(2);
+    });
+
     it('skips <rPh> phonetic runs', () => {
         const parsed = parse_xlsx_string_item(
             '<r><t>漢字</t></r><rPh sb="0" eb="2"><t>かんじ</t></rPh>'
@@ -306,6 +312,28 @@ describe('parse_xlsx rich text and hyperlinks', () => {
         const c = data.sheets[0].rows[0][2] as CellData;
         expect(c.raw).toBeNull();
         expect(c.hyperlink).toEqual({ kind: 'internal', location: 'Sheet1!A1' });
+    });
+
+    it('uses the display attribute as text for a link-only cell', async () => {
+        const sheet = worksheet(`<sheetData/>
+        <hyperlinks><hyperlink ref="B2" location="Sheet2!A1" display="Go there"/></hyperlinks>`);
+        const { data } = await parse_xlsx(build_xlsx({ sheet_xml: sheet }));
+        const b2 = data.sheets[0].rows[1][1] as CellData;
+        expect(b2.raw).toBe('Go there');
+        expect(b2.formatted).toBe('Go there');
+        expect(b2.hyperlink).toEqual({ kind: 'internal', location: 'Sheet2!A1' });
+    });
+
+    it('ignores an r:id pointing at a non-hyperlink relationship', async () => {
+        const sheet = worksheet(`<sheetData><row r="1">
+            <c r="A1" t="inlineStr"><is><t>x</t></is></c>
+        </row></sheetData>
+        <hyperlinks><hyperlink ref="A1" r:id="rId1"/></hyperlinks>`);
+        const sheet_rels = `<Relationships>
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="https://evil.example/x.png" TargetMode="External"/>
+</Relationships>`;
+        const { data } = await parse_xlsx(build_xlsx({ sheet_xml: sheet, sheet_rels_xml: sheet_rels }));
+        expect((data.sheets[0].rows[0][0] as CellData).hyperlink).toBeUndefined();
     });
 
     it('skips range refs, dangling rels, and internal-part rels', async () => {
