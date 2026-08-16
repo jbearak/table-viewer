@@ -132,7 +132,7 @@ export function HyperlinkDialog({
                     <div className="hyperlink-dialog-hint">
                         {target.trim().length > MAX_HYPERLINK_LENGTH
                             || tooltip.trim().length > MAX_HYPERLINK_LENGTH
-                            ? 'Too long — keep it under 8192 characters.'
+                            ? `Too long — keep it under ${MAX_HYPERLINK_LENGTH} characters.`
                             : kind === 'external'
                                 ? 'Enter a valid http(s) URL.'
                                 : 'Enter a workbook location.'}

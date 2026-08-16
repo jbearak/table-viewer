@@ -181,6 +181,29 @@ function section_for_value(code: string, value: number): string {
  * the reader's `iter_elements` over the same `<fonts>` section, so writer and
  * reader see the same font list in the same order.
  */
+/**
+ * A `<font>` element's inner XML with every style element removed, leaving the
+ * face/size/color properties that make a run's `<rPr>` base.
+ *
+ * Looped to a fixed point rather than replaced once. A single pass can put back
+ * what it removes: `<<b/>b/>` has the inner `<b/>` deleted and the outer halves
+ * close up into a live `<b/>`, so a crafted styles.xml could re-introduce a
+ * style into a base the model believes is unstyled — the run would come back
+ * bold from a workbook we never agreed was bold. Untrusted input, so the loop
+ * is also bounded; a part that will not converge is treated as having no usable
+ * base rather than being trusted.
+ */
+function strip_style_elements(inner: string): string {
+    const style_tags = /<(?:b|i|u|strike)\b[^>]*\/?>|<\/(?:b|i|u|strike)>/g;
+    let out = inner;
+    for (let pass = 0; pass < 8; pass++) {
+        const next = out.replace(style_tags, '');
+        if (next === out) return out;
+        out = next;
+    }
+    return '';
+}
+
 interface StyleWriteContext {
     readonly is_date_style: (xf_index: number, serial: number) => boolean;
     readonly cell_font_style: (xf_index: number) => CellTextStyle | undefined;
@@ -223,10 +246,7 @@ function read_style_write_context(cfb_file: ReturnType<typeof CFB.read>): StyleW
             if (fonts_section) {
                 iter_elements(fonts_section, 'font', (_open, inner) => {
                     bases!.push(
-                        inner
-                            .replace(/<(?:b|i|u|strike)\b[^>]*\/?>/g, '')
-                            .replace(/<\/(?:b|i|u|strike)>/g, '')
-                            .replace(/<name\b/g, '<rFont'),
+                        strip_style_elements(inner).replace(/<name\b/g, '<rFont'),
                     );
                 });
             }

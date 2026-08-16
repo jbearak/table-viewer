@@ -1,5 +1,7 @@
 import {
     find_tag_end,
+    ignorable_end,
+    ignorable_ranges,
     is_tag_boundary,
     is_self_closing,
     strip_illegal_xml_chars,
@@ -454,69 +456,6 @@ function row_indexes_from_cells(
 }
 
 /** Locate every `<row>` element in `sheetData`, in document order. */
-/**
- * Ranges inside `[from, to)` whose contents are text, not markup: XML comments,
- * CDATA sections, and processing instructions.
- *
- * The scanners below match on raw `<row`/`<c` substrings, which is exact for real
- * markup and wrong for anything quoting it. A commented-out row — the shape a
- * generator leaves behind, and one Excel preserves on round-trip — looked like a
- * live row to `scan_rows`, so an edit to a cell it names spliced the new value
- * *into the comment*: the file stays valid, the save reports success, and the
- * cell on screen never changes. Skipping these ranges makes the writer agree with
- * an XML parser about what a row is, without needing one.
- *
- * A processing instruction is the third spelling of the same hazard. Everything
- * between `<?` and `?>` is opaque data to a parser and its content is
- * unconstrained, so element-shaped text in there is text — but reading it as
- * markup let an edit rewrite a cell *inside the PI* while the live cell of that
- * name kept its old value.
- */
-function ignorable_ranges(xml: string, from: number, to: number): Array<[number, number]> {
-    const out: Array<[number, number]> = [];
-    let pos = from;
-    while (pos < to) {
-        const at = earliest_of(xml, ['<!', '<?'], pos);
-        if (at === -1 || at >= to) break;
-        let end: number;
-        if (xml.startsWith('<!--', at)) {
-            const close = xml.indexOf('-->', at + 4);
-            end = close === -1 ? to : close + 3;
-        } else if (xml.startsWith('<![CDATA[', at)) {
-            const close = xml.indexOf(']]>', at + 9);
-            end = close === -1 ? to : close + 3;
-        } else if (xml.startsWith('<?', at)) {
-            const close = xml.indexOf('?>', at + 2);
-            end = close === -1 ? to : close + 2;
-        } else {
-            pos = at + 2;
-            continue;
-        }
-        out.push([at, end]);
-        pos = end;
-    }
-    return out;
-}
-
-/** The earliest occurrence at or after `from` of any of `needles`, or -1. */
-function earliest_of(xml: string, needles: readonly string[], from: number): number {
-    let best = -1;
-    for (const needle of needles) {
-        const at = xml.indexOf(needle, from);
-        if (at !== -1 && (best === -1 || at < best)) best = at;
-    }
-    return best;
-}
-
-/** Where to resume from if `at` falls inside an ignorable range, else undefined. */
-function ignorable_end(ranges: ReadonlyArray<[number, number]>, at: number): number | undefined {
-    for (const [start, end] of ranges) {
-        if (at < start) return undefined;
-        if (at < end) return end;
-    }
-    return undefined;
-}
-
 /**
  * Every real `<name …>` opening tag in `[from, to)`, as [offset, whole tag].
  *

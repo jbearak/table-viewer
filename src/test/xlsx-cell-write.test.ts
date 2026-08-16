@@ -2112,6 +2112,29 @@ describe('rich inline strings', () => {
         expect(out).toContain('<t xml:space="preserve">a&lt;b&gt;&amp;c</t>');
     });
 
+    it('does not let a nested style element survive into a run base', () => {
+        // The base is the cell font minus its style flags — the flags come from
+        // the run's own style. Removing the flag elements in a single pass lets
+        // `<<b/>b/>` reconstitute a `<b/>`, so a crafted styles.xml could put
+        // bold back into a run the model believes is plain, and the saved file
+        // would not match what the user typed.
+        const file = CFB.read(readFileSync(FORMATTED), { type: 'buffer' });
+        CFB.utils.cfb_add(file, '/xl/styles.xml', Buffer.from(
+            '<?xml version="1.0"?><styleSheet>'
+            + '<fonts count="1"><font><name val="Cambria"/><<b/>b/></font></fonts>'
+            + '<cellXfs count="1"><xf numFmtId="0" fontId="0"/></cellXfs>'
+            + '</styleSheet>',
+        ));
+        const raw = new Uint8Array(CFB.write(file, { type: 'buffer', fileType: 'zip' }) as ArrayBuffer);
+        const out = write_xlsx_cell_edits(raw, 0, [{
+            row: 0, col: 0, value: 'x',
+            runs: [{ text: 'x', style: { italic: true } }],
+        }]);
+        const sheet = part(out, '/xl/worksheets/sheet1.xml')!.toString('utf8');
+        expect(sheet).toContain('<rPr>');
+        expect(sheet).not.toContain('<b/>');
+    });
+
     it('round-trips a rich edit through a real workbook back to the reader', async () => {
         const raw = readFileSync(FORMATTED);
         const out = write_xlsx_cell_edits(raw, 0, [{

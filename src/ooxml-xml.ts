@@ -116,6 +116,209 @@ export function iter_elements(xml: string, tag: string, cb: (open_tag: string, i
     }
 }
 
+/**
+ * The index of `needle` in `xml` at or after `from`, skipping any occurrence
+ * that falls inside a comment, a CDATA section, or a processing instruction —
+ * see {@link ignorable_ranges} for why those three and what goes wrong without
+ * them.
+ *
+ * Use this when you have one needle to find. When scanning repeatedly over the
+ * same text, hoist {@link ignorable_ranges} out of the loop and pair it with
+ * {@link ignorable_end} instead, so the ranges are computed once.
+ */
+export function index_of_markup(xml: string, needle: string, from = 0): number {
+    return index_of_markup_in(xml, needle, from, ignorable_ranges(xml, 0, xml.length));
+}
+
+/** {@link index_of_markup} against ranges the caller already computed. */
+function index_of_markup_in(
+    xml: string,
+    needle: string,
+    from: number,
+    ranges: ReadonlyArray<[number, number]>,
+): number {
+    let pos = from;
+    while (true) {
+        const at = xml.indexOf(needle, pos);
+        if (at === -1) return -1;
+        const skip_to = ignorable_end(ranges, at);
+        if (skip_to === undefined) return at;
+        pos = skip_to;
+    }
+}
+
+/** {@link String.lastIndexOf} with the same ignored-region rule. */
+export function last_index_of_markup(xml: string, needle: string): number {
+    let found = -1;
+    let pos = 0;
+    while (true) {
+        const hit = index_of_markup(xml, needle, pos);
+        if (hit === -1) return found;
+        found = hit;
+        pos = hit + needle.length;
+    }
+}
+
+/**
+ * {@link iter_elements}, but an element that begins inside a comment, a CDATA
+ * section, or a processing instruction is not reported — while ignored content
+ * *nested inside* a live element is passed through untouched, because `inner`
+ * is sliced from the original text.
+ *
+ * That second half is why this is not "strip the ignorable ranges, then scan":
+ * a writer that rebuilds a section from what it read would then drop a vendor
+ * `extLst` payload out of an element it never meant to touch. It also keeps
+ * offsets meaningful, since nothing is rewritten.
+ *
+ * Deliberately not the default inside {@link iter_elements}: that one runs over
+ * whole `<sheetData>` bodies, where the extra range scan would cost a full pass
+ * on every parse. Use this on the small sections whose scans are structural
+ * (`<hyperlinks>`, a `.rels` part), where reading a commented-out element is a
+ * correctness problem and the section is short.
+ */
+export function iter_elements_markup(
+    xml: string,
+    tag: string,
+    cb: (open_tag: string, inner: string) => void,
+): void {
+    const ranges = ignorable_ranges(xml, 0, xml.length);
+    if (ranges.length === 0) {
+        iter_elements(xml, tag, cb);
+        return;
+    }
+    const open = `<${tag}`;
+    let pos = 0;
+    while (true) {
+        const start = xml.indexOf(open, pos);
+        if (start === -1) return;
+        // Only the element's *start* is tested against the ranges: an ignorable
+        // range that opens inside a live element is that element's content.
+        const skip_to = ignorable_end(ranges, start);
+        if (skip_to !== undefined) {
+            pos = skip_to;
+            continue;
+        }
+        if (!is_tag_boundary(xml[start + open.length])) {
+            pos = start + 1;
+            continue;
+        }
+        const tag_end = find_tag_end(xml, start);
+        if (tag_end === -1) return;
+        const open_tag = xml.substring(start, tag_end + 1);
+        if (is_self_closing(xml, start, tag_end)) {
+            cb(open_tag, '');
+            pos = tag_end + 1;
+            continue;
+        }
+        const close = `</${tag}>`;
+        const close_pos = index_of_markup_in(xml, close, tag_end, ranges);
+        if (close_pos === -1) {
+            pos = tag_end + 1;
+            continue;
+        }
+        cb(open_tag, xml.substring(tag_end + 1, close_pos));
+        pos = close_pos + close.length;
+    }
+}
+
+/**
+ * The live `<tag>…</tag>` section: `[start, end)` over the whole element plus
+ * its verbatim inner text, or null when the XML declares none.
+ *
+ * Distinct from {@link get_text}, which matches the first literal `<tag`, live
+ * or not. Extracting the inner text first and filtering afterwards cannot
+ * recover this: the delimiters that would prove the section was commented out
+ * are outside the substring, so a wholly commented-out section reads as an
+ * empty live one. A reader and a writer that disagree on which section is live
+ * lose data silently, so both call this.
+ */
+export function find_element_section(
+    xml: string,
+    tag: string,
+): { start: number; end: number; inner: string } | null {
+    const open = `<${tag}`;
+    let pos = 0;
+    while (true) {
+        const start = index_of_markup(xml, open, pos);
+        if (start === -1) return null;
+        if (!is_tag_boundary(xml[start + open.length])) {
+            pos = start + 1;
+            continue;
+        }
+        const tag_end = find_tag_end(xml, start);
+        if (tag_end === -1) return null;
+        if (is_self_closing(xml, start, tag_end)) {
+            return { start, end: tag_end + 1, inner: '' };
+        }
+        const close = `</${tag}>`;
+        const close_pos = index_of_markup(xml, close, tag_end);
+        if (close_pos === -1) return null;
+        return {
+            start,
+            end: close_pos + close.length,
+            inner: xml.substring(tag_end + 1, close_pos),
+        };
+    }
+}
+
+/**
+ * Ranges inside `[from, to)` whose contents are text, not markup: XML comments,
+ * CDATA sections, and processing instructions.
+ *
+ * The surgical writers match on raw `<row`/`<c`/`<hyperlink` substrings, which is
+ * exact for real markup and wrong for anything quoting it. A commented-out row — the shape a
+ * generator leaves behind, and one Excel preserves on round-trip — looked like a
+ * live row to `scan_rows`, so an edit to a cell it names spliced the new value
+ * *into the comment*: the file stays valid, the save reports success, and the
+ * cell on screen never changes. Skipping these ranges makes the writer agree with
+ * an XML parser about what a row is, without needing one.
+ *
+ * A processing instruction is the third spelling of the same hazard. Everything
+ * between `<?` and `?>` is opaque data to a parser and its content is
+ * unconstrained, so element-shaped text in there is text — but reading it as
+ * markup let an edit rewrite a cell *inside the PI* while the live cell of that
+ * name kept its old value.
+ */
+export function ignorable_ranges(xml: string, from: number, to: number): Array<[number, number]> {
+    const out: Array<[number, number]> = [];
+    let pos = from;
+    // One monotonic scan on `<`, classifying by the characters that follow.
+    // Deliberately not a search per opener kind: with `indexOf` per kind, a
+    // part full of one kind (`<?x?><?x?>…`) re-scans the whole remaining
+    // string for the absent kinds on every iteration, which is quadratic in
+    // the part size — and these parts come from an untrusted workbook.
+    while (pos < to) {
+        const at = xml.indexOf('<', pos);
+        if (at === -1 || at >= to) break;
+        let end: number;
+        if (xml.startsWith('<!--', at)) {
+            const close = xml.indexOf('-->', at + 4);
+            end = close === -1 ? to : close + 3;
+        } else if (xml.startsWith('<![CDATA[', at)) {
+            const close = xml.indexOf(']]>', at + 9);
+            end = close === -1 ? to : close + 3;
+        } else if (xml.startsWith('<?', at)) {
+            const close = xml.indexOf('?>', at + 2);
+            end = close === -1 ? to : close + 2;
+        } else {
+            pos = at + 1;
+            continue;
+        }
+        out.push([at, Math.min(end, to)]);
+        pos = end;
+    }
+    return out;
+}
+
+/** Where to resume from if `at` falls inside an ignorable range, else undefined. */
+export function ignorable_end(ranges: ReadonlyArray<[number, number]>, at: number): number | undefined {
+    for (const [start, end] of ranges) {
+        if (at < start) return undefined;
+        if (at < end) return end;
+    }
+    return undefined;
+}
+
 export function get_text(xml: string, tag: string): string | null {
     const open = `<${tag}`;
     let pos = 0;

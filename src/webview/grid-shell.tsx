@@ -2791,7 +2791,15 @@ export function GridShell({
             const target = hyperlink_dialog;
             set_hyperlink_dialog(null);
             grid_ref.current?.focus();
-            if (!target || save_in_flight_ref.current) return;
+            // Same admission gate as every other mutation path here. Past the
+            // close barrier `post_pending_edits` refuses to publish, so a link
+            // committed after it would sit in the store and never reach the
+            // host — a silently dropped edit rather than a refused one.
+            if (
+                !target
+                || close_barrier_ref.current
+                || save_in_flight_ref.current
+            ) return;
             commit_hyperlink(target.source_row, target.source_col, next);
             // Damage explicitly: a link change on an already-dirty cell leaves
             // the dirty key set unchanged, so the tint effect below sees no

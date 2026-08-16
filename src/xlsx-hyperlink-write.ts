@@ -23,11 +23,15 @@
 
 import {
     encode_xml_attr,
+    find_element_section,
     find_tag_end,
     get_attr,
+    index_of_markup,
     is_self_closing,
     is_tag_boundary,
     iter_elements,
+    iter_elements_markup,
+    last_index_of_markup,
 } from './ooxml-xml';
 import { parse_relationships } from './ooxml-relationships';
 import type { CellHyperlink } from './cell-content';
@@ -83,7 +87,11 @@ interface ExistingHyperlink {
 /** Every `<hyperlink>` element of the current section, in document order. */
 function existing_hyperlinks(section_inner: string): ExistingHyperlink[] {
     const found: ExistingHyperlink[] = [];
-    iter_elements(section_inner, 'hyperlink', (open_tag, inner) => {
+    // Markup-aware: a commented-out `<hyperlink>` is not an element the sheet
+    // declares, so it must not be re-emitted as live markup. Ignored content
+    // *inside* a live element still comes through verbatim in `inner` — an
+    // untouched link's vendor `extLst` CDATA has to survive the rebuild.
+    iter_elements_markup(section_inner, 'hyperlink', (open_tag, inner) => {
         const ref = get_attr(open_tag, 'ref');
         if (!ref) return;
         found.push({
@@ -96,85 +104,6 @@ function existing_hyperlinks(section_inner: string): ExistingHyperlink[] {
         });
     });
     return found;
-}
-
-/**
- * The index of `needle` in `xml` at or after `from`, skipping any occurrence
- * that falls inside a comment, a CDATA section, or a processing instruction.
- *
- * Every scan in this module is a raw substring search, which is what keeps the
- * writer from deserializing the worksheet. That is safe for markup but not for
- * *text*: a sheet carrying `<!-- <hyperlinks> -->` would otherwise have its
- * edit spliced into ignored content — a save that reports success while Excel
- * sees no change at all.
- */
-function index_of_markup(xml: string, needle: string, from = 0): number {
-    const skips: readonly (readonly [string, string])[] = [
-        ['<!--', '-->'],
-        ['<![CDATA[', ']]>'],
-        ['<?', '?>'],
-    ];
-    let pos = from;
-    while (pos < xml.length) {
-        const hit = xml.indexOf(needle, pos);
-        if (hit === -1) return -1;
-        // The innermost ignored region that starts before the hit and has not
-        // closed by it swallows the hit; resume after that region.
-        let resume = -1;
-        for (const [open, close] of skips) {
-            const open_at = xml.lastIndexOf(open, hit);
-            if (open_at === -1) continue;
-            const close_at = xml.indexOf(close, open_at + open.length);
-            if (close_at !== -1 && close_at < hit) continue;
-            const after = close_at === -1 ? xml.length : close_at + close.length;
-            if (after > resume) resume = after;
-        }
-        if (resume === -1) return hit;
-        pos = resume;
-    }
-    return -1;
-}
-
-/** {@link String.lastIndexOf} with the same ignored-region rule. */
-function last_index_of_markup(xml: string, needle: string): number {
-    let found = -1;
-    let pos = 0;
-    while (true) {
-        const hit = index_of_markup(xml, needle, pos);
-        if (hit === -1) return found;
-        found = hit;
-        pos = hit + needle.length;
-    }
-}
-
-/** Locate the `<hyperlinks>` section: [start, end) of the whole element, and
- *  its inner text. Returns null when the sheet has none. */
-function find_hyperlinks_section(
-    xml: string,
-): { start: number; end: number; inner: string } | null {
-    const open = '<hyperlinks';
-    let pos = 0;
-    while (true) {
-        const start = index_of_markup(xml, open, pos);
-        if (start === -1) return null;
-        if (!is_tag_boundary(xml[start + open.length])) {
-            pos = start + 1;
-            continue;
-        }
-        const tag_end = find_tag_end(xml, start);
-        if (tag_end === -1) return null;
-        if (is_self_closing(xml, start, tag_end)) {
-            return { start, end: tag_end + 1, inner: '' };
-        }
-        const close = '</hyperlinks>';
-        const close_pos = index_of_markup(xml, close, tag_end);
-        if (close_pos === -1) return null;
-        return {
-            start,
-            end: close_pos + close.length,
-            inner: xml.substring(tag_end + 1, close_pos),
-        };
-    }
 }
 
 /**
@@ -226,9 +155,10 @@ function worksheet_declares_r_ns(xml: string): boolean {
 /** Add `xmlns:r` to the `<worksheet>` open tag. */
 function add_r_ns(xml: string): string {
     const start = index_of_markup(xml, '<worksheet');
+    if (start === -1) throw new Error('Worksheet has no worksheet element');
     const tag_end = find_tag_end(xml, start);
-    const insert = tag_end !== -1 && xml[tag_end - 1] === '/' ? tag_end - 1 : tag_end;
-    if (start === -1 || tag_end === -1) throw new Error('Worksheet has no worksheet element');
+    if (tag_end === -1) throw new Error('Worksheet has no worksheet element');
+    const insert = xml[tag_end - 1] === '/' ? tag_end - 1 : tag_end;
     return `${xml.slice(0, insert)} xmlns:r="${OFFICE_R_NS}"${xml.slice(insert)}`;
 }
 
@@ -236,6 +166,10 @@ function add_r_ns(xml: string): string {
  *  every existing one, not just hyperlinks). */
 function all_rel_ids(rels_xml: string): Set<string> {
     const ids = new Set<string>();
+    // Deliberately NOT markup-aware, unlike parse_relationships: this set only
+    // says which ids a new one must avoid, and steering clear of an id that
+    // exists solely in a comment costs nothing while colliding with one could
+    // resurrect it if the comment is ever restored.
     iter_elements(rels_xml, 'Relationship', (open_tag) => {
         const id = get_attr(open_tag, 'Id');
         if (id) ids.add(id);
@@ -282,7 +216,13 @@ function remove_relationships(rels_xml: string, ids: ReadonlySet<string>): strin
     const open = '<Relationship';
     let pos = 0;
     while (true) {
-        const start = out.indexOf(open, pos);
+        // Markup-aware: a `<Relationship>` that only exists inside a comment
+        // must not be spliced. Editing ignored content would leave the live
+        // rel in place, so the sheet would point at a target we believe we
+        // retired. Scanning a stripped copy is not an option here — these are
+        // offsets into the text we return, and stripping would also delete the
+        // part's `<?xml …?>` declaration.
+        const start = index_of_markup(out, open, pos);
         if (start === -1) break;
         if (!is_tag_boundary(out[start + open.length])) {
             pos = start + 1;
@@ -294,7 +234,7 @@ function remove_relationships(rels_xml: string, ids: ReadonlySet<string>): strin
         const id = get_attr(open_tag, 'Id');
         let end = tag_end + 1;
         if (!is_self_closing(out, start, tag_end)) {
-            const close_pos = out.indexOf('</Relationship>', tag_end);
+            const close_pos = index_of_markup(out, '</Relationship>', tag_end);
             if (close_pos === -1) break;
             end = close_pos + '</Relationship>'.length;
         }
@@ -332,7 +272,9 @@ export function apply_hyperlink_edits(
         by_ref.set(cell_ref(edit.row, edit.col), edit);
     }
 
-    const section = find_hyperlinks_section(sheet_xml);
+    // Same locator the reader uses, so the two cannot disagree about which
+    // `<hyperlinks>` section is the live one.
+    const section = find_element_section(sheet_xml, 'hyperlinks');
     const current = section ? existing_hyperlinks(section.inner) : [];
 
     // Relationship bookkeeping. Only *hyperlink* rels may ever be removed, and

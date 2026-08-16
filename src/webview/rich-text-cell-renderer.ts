@@ -161,6 +161,11 @@ export const rich_text_cell_renderer: CustomRenderer<RichTextGridCell> = {
     },
     measure: (ctx, cell, theme) => {
         const variants = font_variants(cell.data.font_size_px, theme.fontFamily);
+        // The column sizer reuses one offscreen context across every cell and
+        // the column title, and unlike the draw loop it never re-sets the font
+        // between them — so leaving it on the last run's variant would measure
+        // later plain cells in bold or italic. Same discipline as `draw`.
+        const entry_font = ctx.font;
         const width = rich_lines_max_width(cell.data.lines, (text, style) => {
             const font = variant_of(variants, style);
             // measureTextCached keys its cache on `font` but measures with the
@@ -168,6 +173,7 @@ export const rich_text_cell_renderer: CustomRenderer<RichTextGridCell> = {
             ctx.font = font;
             return measureTextCached(text, ctx, font).width;
         });
+        ctx.font = entry_font;
         return width + 2 * theme.cellHorizontalPadding;
     },
     onPaste: () => undefined,

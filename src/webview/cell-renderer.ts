@@ -192,6 +192,16 @@ function rich_cell(
 }
 
 /**
+ * Whether this cell wants the rich renderer under the current Formatting
+ * toggle. Text styling is a Formatting-on concern; hyperlink presentation is
+ * semantic and survives the toggle. Shared so the painted cell and the
+ * tooltip payload cannot answer differently.
+ */
+function renders_rich(c: RenderedCell, show_formatting: boolean): boolean {
+    return show_formatting ? needs_rich_renderer(c) : c.hyperlink !== undefined;
+}
+
+/**
  * The rich payload the grid would paint for this cell, or undefined when it
  * renders as plain Text. Shares rich_cell's memoized build, so hover-time
  * consumers (the overflow tooltip) see exactly the lines the renderer draws.
@@ -201,9 +211,7 @@ export function rich_cell_display_data(
     show_formatting: boolean,
     font_size_px: number = DEFAULT_CELL_FONT_SIZE_PX,
 ): RichCellData | undefined {
-    if (!(show_formatting ? needs_rich_renderer(c) : c.hyperlink !== undefined)) {
-        return undefined;
-    }
+    if (!renders_rich(c, show_formatting)) return undefined;
     return (rich_cell(c, show_formatting, undefined, font_size_px) as CustomCell<RichCellData>).data;
 }
 
@@ -308,7 +316,7 @@ export function build_grid_cell(
     // GridCell, so it works either way.
     if (
         c
-        && (show_formatting ? needs_rich_renderer(c) : c.hyperlink !== undefined)
+        && renders_rich(c, show_formatting)
         && !overlay?.editable
         && overlay?.dirty_value === undefined
     ) {

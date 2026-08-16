@@ -292,6 +292,35 @@ describe('parse_xlsx rich text and hyperlinks', () => {
         expect(data.hasFormatting).toBe(false);
     });
 
+    it('ignores a hyperlink that only exists inside a comment', async () => {
+        // A commented-out element is not a link the sheet declares. Attaching
+        // it would show the user a link Excel does not — and hand the writer a
+        // live element to rebuild the section from.
+        const sheet = worksheet(`<sheetData><row r="1">
+            <c r="A1" t="inlineStr"><is><t>go</t></is></c>
+        </row></sheetData>
+        <hyperlinks><!-- <hyperlink ref="A1" location="Sheet9!Z9"/> --></hyperlinks>`);
+        const { data } = await parse_xlsx(build_xlsx({ sheet_xml: sheet }));
+        expect((data.sheets[0].rows[0][0] as CellData).hyperlink).toBeUndefined();
+    });
+
+    it('ignores a whole hyperlinks section that is commented out', async () => {
+        // Extracting the inner text first and filtering afterwards cannot catch
+        // this: the comment delimiters are outside the substring. The writer
+        // locates the live section the same way, so a reader that read the
+        // ghost would show a link that no save could ever change.
+        const sheet = worksheet(`<sheetData><row r="1">
+            <c r="A1" t="inlineStr"><is><t>go</t></is></c>
+            <c r="B1" t="inlineStr"><is><t>real</t></is></c>
+        </row></sheetData>
+        <!-- <hyperlinks><hyperlink ref="A1" location="Ghost!A1"/></hyperlinks> -->
+        <hyperlinks><hyperlink ref="B1" location="Live!B1"/></hyperlinks>`);
+        const { data } = await parse_xlsx(build_xlsx({ sheet_xml: sheet }));
+        expect((data.sheets[0].rows[0][0] as CellData).hyperlink).toBeUndefined();
+        expect((data.sheets[0].rows[0][1] as CellData).hyperlink)
+            .toEqual({ kind: 'internal', location: 'Live!B1' });
+    });
+
     it('attaches internal location hyperlinks without any rel', async () => {
         const sheet = worksheet(`<sheetData><row r="1">
             <c r="A1" t="inlineStr"><is><t>go</t></is></c>

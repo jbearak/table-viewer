@@ -6,17 +6,25 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { CellHyperlink } from '../cell-content';
 import { HyperlinkDialog, draft_hyperlink } from '../webview/hyperlink-dialog';
 import { MAX_HYPERLINK_LENGTH } from '../pending-changes';
+import { button, field, set_input_value } from './helpers/dom-interaction';
 
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean })
     .IS_REACT_ACT_ENVIRONMENT = true;
 
-afterEach(() => {
+/** Tear down the mounted dialog. `field()`/`button()` query the whole
+ *  document, so a container left behind would make a second dialog's lookups
+ *  ambiguous — hence the remove, not just the unmount. */
+function teardown_dialog(): void {
     act(() => root?.unmount());
     container?.remove();
     root = null;
     container = null;
+}
+
+afterEach(() => {
+    teardown_dialog();
     vi.restoreAllMocks();
 });
 
@@ -34,29 +42,8 @@ function render_dialog(initial: CellHyperlink | null) {
     return { on_commit, on_cancel };
 }
 
-function field(id: string): HTMLInputElement | HTMLSelectElement {
-    const element = document.getElementById(id);
-    if (!element) throw new Error(`missing #${id}`);
-    return element as HTMLInputElement | HTMLSelectElement;
-}
-
-function button(label: string): HTMLButtonElement {
-    const match = Array.from(document.querySelectorAll('button'))
-        .find((candidate) => candidate.textContent === label);
-    if (!match) throw new Error(`missing "${label}" button`);
-    return match as HTMLButtonElement;
-}
-
 function type_into(id: string, value: string): void {
-    const input = field(id) as HTMLInputElement;
-    act(() => {
-        const setter = Object.getOwnPropertyDescriptor(
-            window.HTMLInputElement.prototype,
-            'value',
-        )?.set;
-        setter?.call(input, value);
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-    });
+    act(() => set_input_value(field(id) as HTMLInputElement, value));
 }
 
 describe('draft_hyperlink', () => {
@@ -134,7 +121,7 @@ describe('HyperlinkDialog', () => {
         render_dialog(null);
         expect(Array.from(document.querySelectorAll('button'))
             .some((candidate) => candidate.textContent === 'Remove link')).toBe(false);
-        act(() => root?.unmount());
+        teardown_dialog();
 
         const { on_commit } = render_dialog({ kind: 'external', target: 'https://a.test/' });
         act(() => button('Remove link').click());

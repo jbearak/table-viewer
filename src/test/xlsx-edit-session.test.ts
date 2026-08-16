@@ -487,6 +487,7 @@ describe('xlsx edit sessions', () => {
         // only arrive from a stale or tampered renderer. The host re-validates
         // and refuses: nothing unvalidated reaches the file, or later the OS
         // opener that reads it back.
+        const show_error = vi.spyOn(vscode_mock.window, 'showErrorMessage');
         const panel = await open_ready_xlsx(file_path);
         await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
         const session = latest_edit_session(panel)!.editSessionId!;
@@ -519,7 +520,14 @@ describe('xlsx edit sessions', () => {
         await wait_for_observable(() => save_results(panel).length > 0);
 
         expect(save_results(panel).at(-1)).toMatchObject({ success: false });
+        // Pin the cause: this guards a security control, so a save that failed
+        // for some unrelated plumbing regression must not pass as a refusal.
+        // The rejection reason is not on the wire message (the planner throws),
+        // so the user-facing error is where it surfaces.
+        expect(show_error.mock.calls.some(([message]) => /hyperlink/i.test(String(message))))
+            .toBe(true);
         expect(bytes).toBe(untouched);
+        show_error.mockRestore();
     });
 
     it('drops wire runs whose text disagrees with the edit and writes the plain value', async () => {

@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
     hyperlinks_equal,
+    is_matching_rich_text,
     normalize_rich_text,
     normalize_text_style,
     rich_text_equal,
@@ -136,5 +137,30 @@ describe('hyperlinks_equal', () => {
         expect(hyperlinks_equal(internal, ext('https://a'))).toBe(false);
         expect(hyperlinks_equal(internal, { kind: 'internal', location: 'Sheet2!A1' })).toBe(true);
         expect(hyperlinks_equal(internal, { kind: 'internal', location: 'Sheet3!A1' })).toBe(false);
+    });
+});
+
+describe('is_matching_rich_text', () => {
+    // The text-agreement half is the smuggling boundary: base validation and
+    // the CSV serializer see the entry's string sides, while the xlsx writer
+    // writes the runs' text — so runs spelling something else would be written
+    // past both checks.
+    it('requires the concatenated run text to equal the string side', () => {
+        expect(is_matching_rich_text({ runs: [{ text: 'ab' }] }, 'ab')).toBe(true);
+        expect(is_matching_rich_text({ runs: [{ text: 'ab' }] }, 'ac')).toBe(false);
+        expect(is_matching_rich_text(
+            { runs: [{ text: 'a' }, { text: 'b', style: { bold: true } }] },
+            'ab',
+        )).toBe(true);
+        expect(is_matching_rich_text({ runs: [] }, '')).toBe(true);
+    });
+
+    it('rejects a malformed value before ever comparing text', () => {
+        expect(is_matching_rich_text({ runs: 'x' }, '')).toBe(false);
+        expect(is_matching_rich_text(null, '')).toBe(false);
+        expect(is_matching_rich_text({ runs: [{ text: 'a', style: { bold: 1 } }] }, 'a'))
+            .toBe(false);
+        expect(is_matching_rich_text({ runs: [{ text: 'a', style: { huge: true } }] }, 'a'))
+            .toBe(false);
     });
 });

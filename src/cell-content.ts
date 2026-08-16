@@ -85,7 +85,6 @@ export function text_styles_equal(
     return true;
 }
 
-/** Union of two styles: any property true in either is true in the result. */
 /** Enforce the RichText invariants: remove empty runs, normalize styles, and
  *  merge adjacent runs whose styles are equal. */
 export function normalize_rich_text(value: RichText): RichText {

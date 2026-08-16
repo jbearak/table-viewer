@@ -89,6 +89,12 @@ interface ViewerWindow {
 
 const IS_MAC = process.platform === 'darwin';
 
+/** Windows' ShellExecute command-length cap, which `shell.openExternal` inherits
+ *  and rejects past. Applied on every platform so a link that opens here opens
+ *  on all of them — a workbook is shared, and a per-OS limit is a bug report
+ *  nobody can reproduce. */
+const MAX_OPEN_EXTERNAL_LENGTH = 2081;
+
 /** How long a drag has to settle before the new size is persisted. A resize
  *  fires continuously, and each write is a synchronous rewrite of the settings
  *  file. */
@@ -1190,9 +1196,17 @@ export class ViewerWindowManager {
                 },
                 open_setting: async (target) => this.open_preferences(target),
                 // The controller has already run parse_http_external_url on
-                // webview-supplied URLs before this launches anything.
+                // webview-supplied URLs before this launches anything; what is
+                // left here is the platform's own limit. Windows routes
+                // openExternal through ShellExecute, which caps the command at
+                // 2081 characters and *rejects* past it — and this call is
+                // fire-and-forget, so an unhandled rejection would take the
+                // main process down over a long link in a workbook. Refusing
+                // and catching both end the same way for the user (nothing
+                // opens), but neither crashes.
                 open_external: (url) => {
-                    void shell.openExternal(url);
+                    if (url.length > MAX_OPEN_EXTERNAL_LENGTH) return;
+                    void shell.openExternal(url).catch(() => { /* nothing to open */ });
                 },
             }),
             config: this.config_store.config_port(),

@@ -11,6 +11,7 @@ import type {
 import { matches_filter } from '../table-transform';
 import type { CsvSaveOperation, FilterEntry, SheetTransformState } from '../types';
 import { create_edit_session_store } from '../webview/edit-session-store';
+import { button, field, find_button, set_input_value } from './helpers/dom-interaction';
 import {
     MAX_ROW_HEIGHT_PX,
     default_row_height_for_font,
@@ -3119,5 +3120,61 @@ describe('GridShell row resizing', () => {
         // row numbers: the request that crosses to the host is the size of the gesture,
         // not of the selection.
         expect(on_row_resize.mock.calls[0][0]).toEqual([{ start: 0, end: 9_999 }]);
+    });
+});
+
+describe('GridShell hyperlink dialog admission', () => {
+    // Opening the dialog: Edit mode on a markdown sheet, right-click a cell,
+    // click "Hyperlink…", then Save a valid target.
+    async function open_dialog() {
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([0, 0], {
+            preventDefault: vi.fn(),
+            bounds: { x: 0, y: 0, width: 40, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        const open = find_button((text) => text.startsWith('Hyperlink'));
+        expect(open).toBeDefined();
+        await act(async () => open!.click());
+    }
+
+    async function save_link() {
+        await act(async () => set_input_value(
+            field('hyperlink-target') as HTMLInputElement,
+            'https://link.test/',
+        ));
+        await act(async () => button('Save').click());
+    }
+
+    const link_props = (editing_ref: React.RefObject<EditingHandle | null>) => props({
+        edit_mode: true,
+        csv_editable: true,
+        edit_syntax: 'markdown',
+        editing_ref,
+        edit_session_id: 'session-1',
+    });
+
+    it('commits a hyperlink while edits are still admitted', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        await render_grid(link_props(editing_ref));
+        await open_dialog();
+        await save_link();
+        expect(editing_ref.current!.has_uncommitted_changes()).toBe(true);
+    });
+
+    it('refuses a hyperlink once the close barrier is raised', async () => {
+        // The barrier goes up while the dialog is already open — the one
+        // ordering the menu gate cannot catch. Past it `post_pending_edits`
+        // refuses to publish, so a link accepted here would sit in the store
+        // and never reach the host: a silently dropped edit rather than a
+        // refused one. Every other mutation path refuses at the same gate.
+        const editing_ref = React.createRef<EditingHandle | null>();
+        await render_grid(link_props(editing_ref));
+        await open_dialog();
+        await act(async () => editing_ref.current!.stop_edit_admission());
+        await save_link();
+        expect(editing_ref.current!.has_uncommitted_changes()).toBe(false);
     });
 });

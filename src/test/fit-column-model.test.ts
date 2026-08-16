@@ -210,7 +210,8 @@ describe('rich-run measurement', () => {
     });
 
     it('takes the widest visual line of a multi-line rich cell', () => {
-        // Line 1: 'longer' bold = 60 + 50 = 110; line 2: 'x' plain = 10.
+        // The run styles the whole cell, so both lines are bold.
+        // Line 1: 'longer' = 60 + 50 = 110; line 2: 'x' = 10 + 50 = 60.
         const width = fit_column_width(
             [{
                 text: 'longer\nx',

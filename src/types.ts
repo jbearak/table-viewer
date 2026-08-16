@@ -1438,6 +1438,8 @@ export function sanitized_wire_dirty_entry(entry: unknown): CsvDirtyEntry | unde
         readonly base: string;
         readonly valueRuns?: unknown;
         readonly baseRuns?: unknown;
+        readonly link?: unknown;
+        readonly baseLink?: unknown;
     });
 }
 

@@ -170,6 +170,17 @@ describe('rich_text_cell_renderer.measure', () => {
         // Widest line: 5 chars * 10 = 50, plus 2 * padding (8) = 66.
         expect(rich_text_cell_renderer.measure!(ctx, cell, theme)).toBe(66);
     });
+
+    it('leaves the measurement font as it found it', () => {
+        // The column sizer reuses one offscreen context for every cell and the
+        // column title, and does not re-set the font between them — a leaked
+        // bold variant would measure later plain cells too wide.
+        const { ctx } = stub_ctx();
+        (ctx as unknown as { font: string }).font = theme.baseFontFull;
+        const cell = make_cell([[{ text: 'bold end', style: { bold: true } }]]);
+        rich_text_cell_renderer.measure!(ctx, cell, theme);
+        expect((ctx as unknown as { font: string }).font).toBe(theme.baseFontFull);
+    });
 });
 
 describe('rich_text_cell_renderer.draw — code-review regressions', () => {

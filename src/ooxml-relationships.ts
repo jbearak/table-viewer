@@ -6,7 +6,7 @@
  * their own scan because they also resolve targets against the package root.
  */
 
-import { get_attr, iter_elements } from './ooxml-xml';
+import { get_attr, iter_elements_markup } from './ooxml-xml';
 
 export interface OoxmlRelationship {
     readonly type: string;
@@ -18,7 +18,12 @@ export interface OoxmlRelationship {
 /** Parse a `.rels` part into a map keyed by relationship Id. */
 export function parse_relationships(xml: string): Map<string, OoxmlRelationship> {
     const rels = new Map<string, OoxmlRelationship>();
-    iter_elements(xml, 'Relationship', (open_tag) => {
+    // A `<Relationship>` inside a comment or CDATA is not one the package
+    // declares. Reading it would resolve an r:id to a target the sheet does
+    // not actually reference — and let a stale commented copy shadow the live
+    // element sharing its Id. A `.rels` part is small, unlike the sheet bodies
+    // iter_elements usually walks, so the extra pass is free here.
+    iter_elements_markup(xml, 'Relationship', (open_tag) => {
         const id = get_attr(open_tag, 'Id');
         const type = get_attr(open_tag, 'Type');
         const target = get_attr(open_tag, 'Target');

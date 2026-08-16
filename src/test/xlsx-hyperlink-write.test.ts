@@ -262,10 +262,10 @@ describe('apply_hyperlink_edits', () => {
             CFB.read(cleared, { type: 'buffer' }),
             '/xl/worksheets/_rels/sheet1.xml.rels',
         );
-        if (rels_entry?.content) {
-            const txt = Buffer.from(rels_entry.content as Uint8Array).toString('utf8');
-            expect(parse_relationships(txt).size).toBe(0);
-        }
+        // The part exists: this save wrote the sheet that carries the link.
+        expect(rels_entry?.content).toBeDefined();
+        const txt = Buffer.from(rels_entry!.content as Uint8Array).toString('utf8');
+        expect(parse_relationships(txt).size).toBe(0);
     });
 
     it('value edits and link edits on the same sheet compose in one save', async () => {
@@ -359,6 +359,83 @@ describe('apply_hyperlink_edits', () => {
         expect(out.sheet_xml).toContain(decoy);
         expect(out.sheet_xml.indexOf('<hyperlinks>'))
             .toBeGreaterThan(out.sheet_xml.indexOf(decoy) + decoy.length);
+    });
+
+    it('does not re-emit a commented-out element as live markup', () => {
+        // Same rule as the reader: the comment is not an element the sheet
+        // declares, so rebuilding the section must not resurrect it.
+        const xml = sheet(
+            '<sheetData/><hyperlinks><hyperlink ref="A1" location="B2"/>'
+            + '<!-- <hyperlink ref="C3" location="Z9"/> --></hyperlinks>',
+        );
+        const out = apply_hyperlink_edits(xml, null, [
+            { row: 0, col: 0, link: internal('D4') },
+        ]);
+        expect(out.sheet_xml).toContain('<hyperlink ref="A1" location="D4"/>');
+        expect(out.sheet_xml).not.toContain('ref="C3"');
+    });
+
+    it('scans a part dense with processing instructions in linear time', { timeout: 5000 }, () => {
+        // A workbook is untrusted input, and the ignorable-range scan runs over
+        // whole parts. Searching per opener kind made a part full of one kind
+        // re-scan the whole remaining string for the absent kinds every
+        // iteration — quadratic, so a modest file could pin the process. At
+        // 40k instructions the quadratic form takes minutes; this takes ms.
+        const noise = '<?x?>'.repeat(40_000);
+        const xml = sheet(`<sheetData/>${noise}<hyperlinks><hyperlink ref="A1" location="B2"/></hyperlinks>`);
+        const out = apply_hyperlink_edits(xml, null, [
+            { row: 0, col: 0, link: internal('D4') },
+        ]);
+        expect(out.sheet_xml).toContain('<hyperlink ref="A1" location="D4"/>');
+    });
+
+    it('keeps ignored content nested inside an untouched live element', () => {
+        // The rebuild re-emits untouched elements verbatim. Reading them from a
+        // stripped copy would delete a vendor extension payload out of a link
+        // this edit never named — silent corruption of someone else's data.
+        const payload = '<extLst><ext uri="vendor"><vendor:d><![CDATA[keep me]]></vendor:d></ext></extLst>';
+        const xml = sheet(
+            '<sheetData/><hyperlinks><hyperlink ref="A1" location="B2"/>'
+            + `<hyperlink ref="C3" location="D4">${payload}</hyperlink></hyperlinks>`,
+        );
+        const out = apply_hyperlink_edits(xml, null, [
+            { row: 0, col: 0, link: internal('Z9') },
+        ]);
+        expect(out.sheet_xml).toContain(payload);
+    });
+
+    it('writes into the live section, not a commented-out one before it', () => {
+        // A section that is *wholly* commented out is not one the sheet
+        // declares. The reader locates the live section the same way; if the
+        // two disagreed here, a save would land in a section the next load
+        // never reads, and the edit would look silently lost.
+        const ghost = '<!-- <hyperlinks><hyperlink ref="A1" location="Ghost!A1"/></hyperlinks> -->';
+        const xml = sheet(
+            `<sheetData/>${ghost}<hyperlinks><hyperlink ref="B1" location="Live!B1"/></hyperlinks>`,
+        );
+        const out = apply_hyperlink_edits(xml, null, [
+            { row: 0, col: 1, link: internal('Edited!B1') },
+        ]);
+        expect(out.sheet_xml).toContain(ghost);
+        expect(out.sheet_xml).toContain('<hyperlink ref="B1" location="Edited!B1"/>');
+        expect(out.sheet_xml).not.toContain('Live!B1');
+        // One live section, not a second one appended past the comment.
+        expect(out.sheet_xml.split('<hyperlinks>').length - 1).toBe(2);
+    });
+
+    it('never splices a Relationship that only exists inside a comment', () => {
+        // The live rId1 is what the cleared element referenced; a scan that saw
+        // the commented copy first would edit ignored text and leave the real
+        // relationship pointing at a target we believe we retired.
+        const xml = sheet('<sheetData/><hyperlinks><hyperlink ref="A1" r:id="rId1"/></hyperlinks>');
+        const rels_xml = rels(
+            `<!-- <Relationship Id="rId1" Type="${HYPERLINK_TYPE}" Target="https://stale.example" TargetMode="External"/> -->`
+            + `<Relationship Id="rId1" Type="${HYPERLINK_TYPE}" Target="https://live.example" TargetMode="External"/>`,
+        );
+        const out = apply_hyperlink_edits(xml, rels_xml, [{ row: 0, col: 0, link: null }]);
+        const parsed = parse_relationships(out.rels_xml!);
+        expect(parsed.has('rId1')).toBe(false);
+        expect(out.rels_xml).not.toContain('live.example');
     });
 
     it('preserves everything outside the spliced ranges verbatim', () => {

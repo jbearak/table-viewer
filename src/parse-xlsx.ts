@@ -31,7 +31,14 @@ import { parse_relationships, rels_path_for_part, type OoxmlRelationship } from 
 
 // The XML scanning primitives live in ./ooxml-xml so the rich-text and
 // hyperlink parsers (and the writer) share the exact same scans.
-import { decode_xml, get_attr, get_text, iter_elements } from './ooxml-xml';
+import {
+    decode_xml,
+    get_attr,
+    find_element_section,
+    get_text,
+    iter_elements,
+    iter_elements_markup,
+} from './ooxml-xml';
 
 // --- ZIP / Entry Access ---
 
@@ -452,9 +459,15 @@ function parse_worksheet_core(
     // Attach hyperlinks. Excel's model is one link per cell; refs that are
     // ranges are skipped (deferred), and a link on a cell with no data entry
     // synthesizes a blank cell so the link still renders and extends the grid.
-    const hyperlinks_section = get_text(xml, 'hyperlinks');
+    // Markup-aware on both levels: a `<hyperlink>` inside a comment or CDATA
+    // is not a link the sheet declares, and neither is a whole `<hyperlinks>`
+    // section that is itself commented out. Attaching one would show the user
+    // a link Excel does not — and, worse, disagree with the writer, which
+    // locates the live section the same way. The section is small, unlike the
+    // `<sheetData>` bodies iter_elements usually walks, so this is free here.
+    const hyperlinks_section = find_element_section(xml, 'hyperlinks');
     if (hyperlinks_section) {
-        iter_elements(hyperlinks_section, 'hyperlink', (open_tag) => {
+        iter_elements_markup(hyperlinks_section.inner, 'hyperlink', (open_tag) => {
             const ref = get_attr(open_tag, 'ref');
             if (!ref) return;
             const cell_ref = parse_cell_ref(ref);

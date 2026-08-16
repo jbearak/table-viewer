@@ -123,6 +123,27 @@ describe('sanitized_dirty_entry', () => {
         expect(sanitized_dirty_entry({ value: 'ab', base: 'c', valueRuns: 'junk' }))
             .toEqual({ value: 'ab', base: 'c' });
     });
+
+    it('keeps the link dimension only as a valid pair', () => {
+        const link = { kind: 'external' as const, target: 'https://a.test/' };
+        const base = { value: 'x', base: 'x' };
+        // Both sides present and each a valid hyperlink or null: kept whole.
+        expect(sanitized_dirty_entry({ ...base, link, baseLink: null }))
+            .toEqual({ ...base, link, baseLink: null });
+        expect(sanitized_dirty_entry({ ...base, link: null, baseLink: link }))
+            .toEqual({ ...base, link: null, baseLink: link });
+        // A change with no recorded base could never be conflict-checked, and a
+        // base with no change says nothing — dropped whole either way, which
+        // leaves the cell's existing link untouched on save.
+        expect(sanitized_dirty_entry({ ...base, link })).toEqual(base);
+        expect(sanitized_dirty_entry({ ...base, baseLink: link })).toEqual(base);
+        // Malformed on either side drops the pair, not just the bad half.
+        expect(sanitized_dirty_entry({ ...base, link: { kind: 'external' }, baseLink: null }))
+            .toEqual(base);
+        expect(sanitized_dirty_entry({ ...base, link, baseLink: 'junk' })).toEqual(base);
+        expect(sanitized_dirty_entry({ ...base, link: { kind: 'nope', target: 'x' }, baseLink: null }))
+            .toEqual(base);
+    });
 });
 
 describe('sanitized_wire_dirty_entry', () => {
@@ -138,6 +159,14 @@ describe('sanitized_wire_dirty_entry', () => {
             .toEqual({ value: 'ab', base: 'c', valueRuns: good });
         expect(sanitized_wire_dirty_entry({ value: 'ab', base: 'c', valueRuns: 'junk' }))
             .toEqual({ value: 'ab', base: 'c' });
+    });
+
+    it('carries a valid link pair across the wire and drops a malformed one', () => {
+        const link = { kind: 'external' as const, target: 'https://a.test/' };
+        expect(sanitized_wire_dirty_entry({ value: 'x', base: 'x', link, baseLink: null }))
+            .toEqual({ value: 'x', base: 'x', link, baseLink: null });
+        expect(sanitized_wire_dirty_entry({ value: 'x', base: 'x', link: 'junk', baseLink: null }))
+            .toEqual({ value: 'x', base: 'x' });
     });
 });
 
