@@ -63,30 +63,88 @@ function cell_ref(row: number, col: number): string {
 }
 
 interface ExistingHyperlink {
-    /** The verbatim `<hyperlink …/>` element text, kept for cells we don't touch. */
+    /** The verbatim element text — the whole element, including a close tag
+     *  when the source spelled it as a container. An untouched link is
+     *  re-emitted byte-for-byte from this, so re-emitting only the open tag
+     *  would turn `<hyperlink …></hyperlink>` into an unclosed child. */
     readonly element: string;
     /** The rel this element references, if external. */
     readonly r_id: string | null;
     readonly ref: string;
+    /**
+     * The element's `display` attribute, which is the cell's *text* when the
+     * cell carries no value of its own (see parse-xlsx.ts). A replacement
+     * must carry it across: dropping it on a link-only edit would erase the
+     * visible text of a cell whose value dimension was never touched.
+     */
+    readonly display: string | null;
 }
 
 /** Every `<hyperlink>` element of the current section, in document order. */
 function existing_hyperlinks(section_inner: string): ExistingHyperlink[] {
     const found: ExistingHyperlink[] = [];
-    iter_elements(section_inner, 'hyperlink', (open_tag) => {
+    iter_elements(section_inner, 'hyperlink', (open_tag, inner) => {
         const ref = get_attr(open_tag, 'ref');
         if (!ref) return;
         found.push({
-            // Elements are self-closing in practice; a hypothetical container
-            // form still round-trips because we re-emit open_tag self-closed
-            // only for elements we replace — untouched ones keep open_tag,
-            // which for a self-closing element IS the whole element.
-            element: open_tag,
+            element: is_self_closing(open_tag, 0, open_tag.length - 1)
+                ? open_tag
+                : `${open_tag}${inner}</hyperlink>`,
             r_id: get_attr(open_tag, 'r:id'),
             ref,
+            display: get_attr(open_tag, 'display'),
         });
     });
     return found;
+}
+
+/**
+ * The index of `needle` in `xml` at or after `from`, skipping any occurrence
+ * that falls inside a comment, a CDATA section, or a processing instruction.
+ *
+ * Every scan in this module is a raw substring search, which is what keeps the
+ * writer from deserializing the worksheet. That is safe for markup but not for
+ * *text*: a sheet carrying `<!-- <hyperlinks> -->` would otherwise have its
+ * edit spliced into ignored content — a save that reports success while Excel
+ * sees no change at all.
+ */
+function index_of_markup(xml: string, needle: string, from = 0): number {
+    const skips: readonly (readonly [string, string])[] = [
+        ['<!--', '-->'],
+        ['<![CDATA[', ']]>'],
+        ['<?', '?>'],
+    ];
+    let pos = from;
+    while (pos < xml.length) {
+        const hit = xml.indexOf(needle, pos);
+        if (hit === -1) return -1;
+        // The innermost ignored region that starts before the hit and has not
+        // closed by it swallows the hit; resume after that region.
+        let resume = -1;
+        for (const [open, close] of skips) {
+            const open_at = xml.lastIndexOf(open, hit);
+            if (open_at === -1) continue;
+            const close_at = xml.indexOf(close, open_at + open.length);
+            if (close_at !== -1 && close_at < hit) continue;
+            const after = close_at === -1 ? xml.length : close_at + close.length;
+            if (after > resume) resume = after;
+        }
+        if (resume === -1) return hit;
+        pos = resume;
+    }
+    return -1;
+}
+
+/** {@link String.lastIndexOf} with the same ignored-region rule. */
+function last_index_of_markup(xml: string, needle: string): number {
+    let found = -1;
+    let pos = 0;
+    while (true) {
+        const hit = index_of_markup(xml, needle, pos);
+        if (hit === -1) return found;
+        found = hit;
+        pos = hit + needle.length;
+    }
 }
 
 /** Locate the `<hyperlinks>` section: [start, end) of the whole element, and
@@ -97,7 +155,7 @@ function find_hyperlinks_section(
     const open = '<hyperlinks';
     let pos = 0;
     while (true) {
-        const start = xml.indexOf(open, pos);
+        const start = index_of_markup(xml, open, pos);
         if (start === -1) return null;
         if (!is_tag_boundary(xml[start + open.length])) {
             pos = start + 1;
@@ -109,7 +167,7 @@ function find_hyperlinks_section(
             return { start, end: tag_end + 1, inner: '' };
         }
         const close = '</hyperlinks>';
-        const close_pos = xml.indexOf(close, tag_end);
+        const close_pos = index_of_markup(xml, close, tag_end);
         if (close_pos === -1) return null;
         return {
             start,
@@ -139,7 +197,7 @@ function hyperlink_section_insert_pos(xml: string): number {
         const open = `<${tag}`;
         let pos = 0;
         while (true) {
-            const start = xml.indexOf(open, pos);
+            const start = index_of_markup(xml, open, pos);
             if (start === -1) break;
             if (!is_tag_boundary(xml[start + open.length])) {
                 pos = start + 1;
@@ -148,17 +206,17 @@ function hyperlink_section_insert_pos(xml: string): number {
             return start;
         }
     }
-    const close_sheet_data = xml.lastIndexOf('</sheetData>');
+    const close_sheet_data = last_index_of_markup(xml, '</sheetData>');
     if (close_sheet_data !== -1) return close_sheet_data + '</sheetData>'.length;
     // A wholly empty sheet writes <sheetData/>; insert right after it.
-    const empty_sheet_data = xml.indexOf('<sheetData/>');
+    const empty_sheet_data = index_of_markup(xml, '<sheetData/>');
     if (empty_sheet_data !== -1) return empty_sheet_data + '<sheetData/>'.length;
     throw new Error('Worksheet has no sheetData element');
 }
 
 /** True when the `<worksheet …>` open tag declares the `r` namespace. */
 function worksheet_declares_r_ns(xml: string): boolean {
-    const start = xml.indexOf('<worksheet');
+    const start = index_of_markup(xml, '<worksheet');
     if (start === -1) return false;
     const tag_end = find_tag_end(xml, start);
     if (tag_end === -1) return false;
@@ -167,7 +225,7 @@ function worksheet_declares_r_ns(xml: string): boolean {
 
 /** Add `xmlns:r` to the `<worksheet>` open tag. */
 function add_r_ns(xml: string): string {
-    const start = xml.indexOf('<worksheet');
+    const start = index_of_markup(xml, '<worksheet');
     const tag_end = find_tag_end(xml, start);
     const insert = tag_end !== -1 && xml[tag_end - 1] === '/' ? tag_end - 1 : tag_end;
     if (start === -1 || tag_end === -1) throw new Error('Worksheet has no worksheet element');
@@ -201,12 +259,12 @@ const EMPTY_RELS = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Re
 function append_relationships(rels_xml: string, additions: readonly string[]): string {
     if (additions.length === 0) return rels_xml;
     const close = '</Relationships>';
-    const close_pos = rels_xml.lastIndexOf(close);
+    const close_pos = last_index_of_markup(rels_xml, close);
     if (close_pos !== -1) {
         return rels_xml.slice(0, close_pos) + additions.join('') + rels_xml.slice(close_pos);
     }
     // Self-closing root: <Relationships …/>
-    const start = rels_xml.indexOf('<Relationships');
+    const start = index_of_markup(rels_xml, '<Relationships');
     const tag_end = start === -1 ? -1 : find_tag_end(rels_xml, start);
     if (start === -1 || tag_end === -1 || rels_xml[tag_end - 1] !== '/') {
         throw new Error('Malformed relationships part');
@@ -288,9 +346,14 @@ export function apply_hyperlink_edits(
     const kept: string[] = [];
     const kept_r_ids = new Set<string>();
     const displaced_r_ids = new Set<string>();
+    /** `display` of the element an edit replaces, so it survives the rebuild. */
+    const displaced_display = new Map<string, string>();
     for (const link of current) {
         if (by_ref.has(link.ref)) {
             if (link.r_id) displaced_r_ids.add(link.r_id);
+            if (link.display !== null && link.display !== '') {
+                displaced_display.set(link.ref, link.display);
+            }
         } else {
             kept.push(link.element);
             if (link.r_id) kept_r_ids.add(link.r_id);
@@ -301,15 +364,21 @@ export function apply_hyperlink_edits(
     const new_rel_elements: string[] = [];
     for (const [ref, edit] of by_ref) {
         if (edit.link === null) continue;
+        const previous_display = displaced_display.get(ref);
+        const display = previous_display !== undefined
+            ? ` display="${encode_xml_attr(previous_display)}"` : '';
         if (edit.link.kind === 'internal') {
             const tooltip = edit.link.tooltip !== undefined
                 ? ` tooltip="${encode_xml_attr(edit.link.tooltip)}"` : '';
-            added.push(`<hyperlink ref="${ref}" location="${encode_xml_attr(edit.link.location)}"${tooltip}/>`);
+            added.push(
+                `<hyperlink ref="${ref}" location="${encode_xml_attr(edit.link.location)}"`
+                + `${display}${tooltip}/>`,
+            );
         } else {
             const r_id = fresh_rel_id(used_ids);
             const tooltip = edit.link.tooltip !== undefined
                 ? ` tooltip="${encode_xml_attr(edit.link.tooltip)}"` : '';
-            added.push(`<hyperlink ref="${ref}" r:id="${r_id}"${tooltip}/>`);
+            added.push(`<hyperlink ref="${ref}" r:id="${r_id}"${display}${tooltip}/>`);
             new_rel_elements.push(
                 `<Relationship Id="${r_id}" Type="${HYPERLINK_REL_TYPE}" `
                 + `Target="${encode_xml_attr(edit.link.target)}" TargetMode="External"/>`,

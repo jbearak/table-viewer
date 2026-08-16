@@ -28,6 +28,7 @@ import {
 import type { RenderedCell, SheetMeta } from '../data-source/interface';
 import {
     EMPTY_TRANSFORM,
+    dirty_entry_value_changed,
     type CellHighlightColor,
     type CellHighlightMutation,
     type CellHighlightSelection,
@@ -2052,7 +2053,14 @@ export function GridShell({
                     // and it does reach this branch, via highlight_bg, which is
                     // plain view state independent of edit mode.
                     refused: editable_cells && source_row === undefined,
-                    dirty_value: dirty?.value,
+                    // Only a VALUE edit replaces the displayed text. A
+                    // link-only entry's `value` is the unedited cell's raw
+                    // text, and substituting it would swap a formatted
+                    // number/date for its raw form even though the save
+                    // deliberately emits no text edit for that cell.
+                    ...(dirty && dirty_entry_value_changed(dirty)
+                        ? { dirty_value: dirty.value }
+                        : {}),
                     bg: dirty
                         ? key !== undefined && conflicted_keys_ref.current.has(key)
                             ? conflict_bg

@@ -281,6 +281,86 @@ describe('apply_hyperlink_edits', () => {
         expect(cell.hyperlink).toEqual({ kind: 'external', target: 'https://example.com/renamed' });
     });
 
+    it('reads single-quoted attributes, so their ids and refs are not invisible', () => {
+        // A writer that only matches double quotes sees no ref (element dropped)
+        // and no r:id (rel orphaned, and rId1 free to be handed out again).
+        const xml = sheet(
+            "<sheetData/><hyperlinks><hyperlink ref='A1' r:id='rId1'/><hyperlink ref='C3' r:id='rId2'/></hyperlinks>",
+        );
+        const rels_xml = rels(
+            `<Relationship Id='rId1' Type="${HYPERLINK_TYPE}" Target="https://a.example" TargetMode="External"/>`
+            + `<Relationship Id='rId2' Type="${HYPERLINK_TYPE}" Target="https://b.example" TargetMode="External"/>`,
+        );
+        const out = apply_hyperlink_edits(xml, rels_xml, [
+            { row: 0, col: 0, link: external('https://new.example') },
+        ]);
+        // The untouched single-quoted element survives, and its rel with it.
+        expect(out.sheet_xml).toContain("<hyperlink ref='C3' r:id='rId2'/>");
+        const parsed = parse_relationships(out.rels_xml!);
+        expect(parsed.get('rId2')?.target).toBe('https://b.example');
+        // The replaced element's rel was retired, and the fresh id collides
+        // with neither existing id.
+        expect(parsed.has('rId1')).toBe(false);
+        const fresh = /r:id="(rId\d+)"/.exec(out.sheet_xml)?.[1];
+        expect(fresh).toBeDefined();
+        expect(fresh).not.toBe('rId2');
+        expect(parsed.get(fresh!)?.target).toBe('https://new.example');
+    });
+
+    it('re-emits a container-form element whole, close tag included', () => {
+        const container = '<hyperlink ref="C3" r:id="rId2"><extLst><ext uri="x"/></extLst></hyperlink>';
+        const xml = sheet(`<sheetData/><hyperlinks><hyperlink ref="A1" r:id="rId1"/>${container}</hyperlinks>`);
+        const rels_xml = rels(
+            `<Relationship Id="rId1" Type="${HYPERLINK_TYPE}" Target="https://a.example" TargetMode="External"/>`
+            + `<Relationship Id="rId2" Type="${HYPERLINK_TYPE}" Target="https://b.example" TargetMode="External"/>`,
+        );
+        const out = apply_hyperlink_edits(xml, rels_xml, [{ row: 0, col: 0, link: null }]);
+        expect(out.sheet_xml).toContain(container);
+        // No truncated open tag left behind unclosed.
+        expect(out.sheet_xml).not.toContain('<hyperlink ref="C3" r:id="rId2"/>');
+    });
+
+    it('carries a replaced element\'s display attribute across', () => {
+        // `display` is the cell's visible text when the cell has no value of
+        // its own; a link-only edit must not erase it.
+        const xml = sheet(
+            '<sheetData/><hyperlinks><hyperlink ref="A1" r:id="rId1" display="Click me"/></hyperlinks>',
+        );
+        const rels_xml = rels(
+            `<Relationship Id="rId1" Type="${HYPERLINK_TYPE}" Target="https://old.example" TargetMode="External"/>`,
+        );
+        const out = apply_hyperlink_edits(xml, rels_xml, [
+            { row: 0, col: 0, link: external('https://new.example') },
+        ]);
+        expect(out.sheet_xml).toContain('display="Click me"');
+    });
+
+    it('ignores markup that only appears inside comments and CDATA', () => {
+        // A raw indexOf would splice the edit into ignored content: a save that
+        // reports success while Excel sees nothing.
+        const decoy = '<!-- <hyperlinks><hyperlink ref="A1" r:id="rId9"/></hyperlinks> -->';
+        const xml = sheet(`<sheetData/>${decoy}`);
+        const out = apply_hyperlink_edits(xml, null, [
+            { row: 0, col: 0, link: internal('B2') },
+        ]);
+        expect(out.sheet_xml).toContain(decoy);
+        // The real section was appended, not merged into the comment.
+        expect(out.sheet_xml).toContain('<hyperlinks><hyperlink ref="A1" location="B2"/></hyperlinks>');
+        expect(out.sheet_xml.indexOf('<hyperlinks><hyperlink ref="A1" location="B2"/>'))
+            .toBe(out.sheet_xml.indexOf('<sheetData/>') + '<sheetData/>'.length);
+    });
+
+    it('ignores a </sheetData> that only appears inside a CDATA section', () => {
+        const decoy = '<f><![CDATA[</sheetData>]]></f>';
+        const xml = sheet(`<sheetData><row r="1"><c r="A1">${decoy}</c></row></sheetData>`);
+        const out = apply_hyperlink_edits(xml, null, [
+            { row: 0, col: 0, link: internal('B2') },
+        ]);
+        expect(out.sheet_xml).toContain(decoy);
+        expect(out.sheet_xml.indexOf('<hyperlinks>'))
+            .toBeGreaterThan(out.sheet_xml.indexOf(decoy) + decoy.length);
+    });
+
     it('preserves everything outside the spliced ranges verbatim', () => {
         const before = '<sheetPr filterMode="1"/><dimension ref="A1:C3"/><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><mergeCells count="1"><mergeCell ref="B2:C3"/></mergeCells>';
         const after = '<pageMargins left="0.7" right="0.7"/><extLst><ext uri="x"/></extLst>';

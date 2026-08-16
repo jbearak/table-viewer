@@ -33,9 +33,15 @@ export function decode_xml(s: string): string {
 }
 
 export function get_attr(tag: string, attr: string): string | null {
-    const re = new RegExp(`\\b${attr}="([^"]*)"`, '');
+    // Both quote forms: XML 1.0 §3.1 allows either, and a writer that emits
+    // single quotes produces a perfectly legal part. Reading only one form
+    // made such an attribute invisible — benign in a reader that then skips
+    // the element, but silently destructive in a writer that rebuilds a
+    // section from what it could see.
+    const re = new RegExp(`\\b${attr}=(?:"([^"]*)"|'([^']*)')`, '');
     const m = tag.match(re);
-    return m ? decode_xml(m[1]) : null;
+    if (!m) return null;
+    return decode_xml(m[1] ?? m[2] ?? '');
 }
 
 /** Find the index of '>' that closes an opening tag, skipping '>' inside quoted attribute values. Returns -1 if not found. */

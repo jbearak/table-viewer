@@ -87,7 +87,7 @@ export function hyperlink_changes_equal(
 
 // --- Validation (durable state and wire payloads are untrusted) ---
 
-const MAX_HYPERLINK_LENGTH = 8 * 1024;
+export const MAX_HYPERLINK_LENGTH = 8 * 1024;
 
 export function is_valid_editable_value(value: unknown): value is EditableCellValue {
     if (!is_plain_record(value)) return false;

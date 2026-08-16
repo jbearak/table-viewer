@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import type { CellHyperlink } from '../cell-content';
 import { parse_http_external_url } from '../external-url';
+import { MAX_HYPERLINK_LENGTH, is_valid_hyperlink } from '../pending-changes';
 import { use_dismiss } from './use-dismiss';
 
 export interface HyperlinkDialogProps {
@@ -33,14 +34,21 @@ export function draft_hyperlink(
 ): CellHyperlink | null {
     const tip = tooltip.trim();
     const with_tooltip = tip === '' ? {} : { tooltip: tip };
+    let draft: CellHyperlink;
     if (kind === 'external') {
         const normalized = parse_http_external_url(target.trim());
         if (normalized === null) return null;
-        return { kind: 'external', target: normalized, ...with_tooltip };
+        draft = { kind: 'external', target: normalized, ...with_tooltip };
+    } else {
+        const location = target.trim();
+        if (location === '') return null;
+        draft = { kind: 'internal', location, ...with_tooltip };
     }
-    const location = target.trim();
-    if (location === '') return null;
-    return { kind: 'internal', location, ...with_tooltip };
+    // The same predicate the durable validator and the save sanitizer apply.
+    // Accepting a draft they would reject means offering a Save that silently
+    // drops the link somewhere downstream, which is worse than refusing it in
+    // the field where the user can still see what they typed.
+    return is_valid_hyperlink(draft) ? draft : null;
 }
 
 /**
@@ -122,9 +130,12 @@ export function HyperlinkDialog({
                 />
                 {target.trim() !== '' && draft === null && (
                     <div className="hyperlink-dialog-hint">
-                        {kind === 'external'
-                            ? 'Enter a valid http(s) URL.'
-                            : 'Enter a workbook location.'}
+                        {target.trim().length > MAX_HYPERLINK_LENGTH
+                            || tooltip.trim().length > MAX_HYPERLINK_LENGTH
+                            ? 'Too long — keep it under 8192 characters.'
+                            : kind === 'external'
+                                ? 'Enter a valid http(s) URL.'
+                                : 'Enter a workbook location.'}
                     </div>
                 )}
                 <label className="filter-popover-field-label" htmlFor="hyperlink-tooltip">

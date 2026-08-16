@@ -5,6 +5,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { CellHyperlink } from '../cell-content';
 import { HyperlinkDialog, draft_hyperlink } from '../webview/hyperlink-dialog';
+import { MAX_HYPERLINK_LENGTH } from '../pending-changes';
 
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
@@ -81,6 +82,18 @@ describe('draft_hyperlink', () => {
             .toEqual({ kind: 'external', target: 'https://a.test/', tooltip: 'tip' });
         expect(draft_hyperlink('external', 'https://a.test', '   '))
             .toEqual({ kind: 'external', target: 'https://a.test/' });
+    });
+
+    it('rejects what host sanitation would strip, rather than accepting it', () => {
+        // is_valid_hyperlink bounds every field at 8 KiB; a draft over that is
+        // silently dropped downstream, so the dialog must refuse it here.
+        const long = 'x'.repeat(MAX_HYPERLINK_LENGTH + 1);
+        expect(draft_hyperlink('internal', long, '')).toBeNull();
+        expect(draft_hyperlink('internal', 'A1', long)).toBeNull();
+        expect(draft_hyperlink('external', `https://a.test/${long}`, '')).toBeNull();
+        // Exactly at the bound is still acceptable.
+        const at_bound = 'x'.repeat(MAX_HYPERLINK_LENGTH);
+        expect(draft_hyperlink('internal', at_bound, '')).not.toBeNull();
     });
 });
 

@@ -1487,17 +1487,19 @@ describe('write_xlsx_cell_edits', () => {
     });
 
     it('reads an xf numFmtId exactly as the reader does, single quotes included', async () => {
-        // `numFmtId='164'` is legal XML the reader's `get_attr` cannot see, so the
-        // style is General there and index 164 — a date format — to a both-quotes
-        // writer. The count guard cannot catch this one: both sides count the same
-        // number of `<xf>` elements and disagree only about what one of them says.
+        // `numFmtId='164'` is legal XML, and both sides read it through the same
+        // `get_attr` — so the style is the date format 164 to reader and writer
+        // alike. What matters is the agreement, not which way it goes: the typed
+        // date is stored as a serial under a date format and reads back as that
+        // date, never as a bare 45306.
         const bytes = patched_parts([
             ['/xl/styles.xml', 'formatCode="$#,##0.00"', 'formatCode="yyyy-mm-dd"'],
             ['/xl/styles.xml', '<xf numFmtId="164"', "<xf numFmtId='164'"],
         ]);
         const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '2024-01-15' }]);
         const { data } = await parse_xlsx(out);
-        expect(data.sheets[0].rows[0][0]!.raw).toBe('2024-01-15');
+        expect(String(data.sheets[0].rows[0][0]!.raw)).toContain('2024-01-15');
+        expect(data.sheets[0].rows[0][0]!.formatted).toBe('2024-01-15');
     });
 
     it('stores a long identifier as text rather than rounding it away', async () => {
@@ -1619,23 +1621,19 @@ describe('write_xlsx_cell_edits', () => {
             .toContain('2024-01-15');
     });
 
-    it('reads a formatCode exactly as the reader does, single quotes included', () => {
-        // Both quote styles are legal XML — but the reader's `get_attr` reads only
-        // `"…"`, so `formatCode='yyyy-mm-dd'` is a format it never sees, and a serial
-        // written under it would be displayed to the user as `45306`. This writer
-        // used to read it and store the serial for exactly that reason.
-        //
-        // Being more nearly correct about XML is not the requirement; agreeing with
-        // the side that renders the result is. Sharing `parse_styles` settles it:
-        // unreadable to the reader means not a date format to the writer either, so
-        // the typed date is stored as the text it was typed as.
+    it('reads a formatCode exactly as the reader does, single quotes included', async () => {
+        // Both quote styles are legal XML, and `get_attr` now reads either — so
+        // `formatCode='yyyy-mm-dd'` is a date format to reader and writer alike.
+        // Being more nearly correct about XML is not the requirement; agreeing
+        // with the side that renders the result is. Sharing `parse_styles`
+        // settles it: the serial is stored under a format that displays it as
+        // the date the user typed, never as a bare 45306.
         const bytes = patched_parts([
             ['/xl/styles.xml', /formatCode="([^"]*)"/, "formatCode='yyyy-mm-dd'"],
         ]);
         const out = write_xlsx_cell_edits(bytes, 0, [{ row: 0, col: 0, value: '2024-01-15' }]);
-        const sheet = part(out, '/xl/worksheets/sheet1.xml')!.toString('utf8');
-        expect(sheet).toContain('2024-01-15');
-        expect(sheet).not.toContain('<v>45306</v>');
+        const { data } = await parse_xlsx(out);
+        expect(data.sheets[0].rows[0][0]!.formatted).toBe('2024-01-15');
     });
 
     it('matches a relationship id spelled with a character reference', () => {
