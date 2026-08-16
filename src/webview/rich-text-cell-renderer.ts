@@ -59,18 +59,17 @@ function variant_of(
 export const rich_text_cell_renderer: CustomRenderer<RichTextGridCell> = {
     kind: GridCellKind.Custom,
     isMatch: is_rich_text_cell,
-    // Hover only matters on linked cells (pointer cursor); plain rich cells
-    // keep the cheap no-hover path.
-    needsHover: (cell) => cell.data.hyperlink !== undefined,
+    // The pointer cursor on linked cells comes from the GridCell's `cursor`
+    // field (read directly by the grid), not a hover-gated override — enabling
+    // needsHover would run Glide's enter/leave hover animation and its damage
+    // redraws for no visual effect.
+    needsHover: false,
     needsHoverPosition: false,
     draw: (args) => {
         const { ctx, rect, theme, cell } = args;
         const data = cell.data;
         const { x, y, width: w, height: h } = rect;
         const linked = data.hyperlink !== undefined;
-        if (linked && args.hoverAmount > 0) {
-            args.overrideCursor?.('pointer');
-        }
 
         // Mirrors drawMultiLineText's vertical layout so a rich cell lines up
         // with its plain neighbours: em-box line metric from the base font,
@@ -80,12 +79,16 @@ export const rich_text_cell_renderer: CustomRenderer<RichTextGridCell> = {
         const bias = getMiddleCenterBias(ctx, theme);
         const actual_height = em_height + line_height * (data.lines.length - 1);
 
-        // Always clip: segments never char-truncate the way the plain
-        // single-line path does, so long text would paint into the neighbour.
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(x, y, w, h);
-        ctx.clip();
+        // Glide's draw loop already clips each column horizontally, so a local
+        // clip is only needed when the line block can spill vertically into
+        // the rows above/below — the same rule drawMultiLineText uses.
+        const must_clip = actual_height + theme.cellVerticalPadding > h;
+        if (must_clip) {
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(x, y, w, h);
+            ctx.clip();
+        }
         ctx.fillStyle = linked ? theme.linkColor : theme.textDark;
 
         const variants = font_variants(data.font_size_px, theme.fontFamily);
@@ -132,7 +135,7 @@ export const rich_text_cell_renderer: CustomRenderer<RichTextGridCell> = {
             if (draw_y > y + h) break;
         }
 
-        ctx.restore();
+        if (must_clip) ctx.restore();
     },
     measure: (ctx, cell, theme) => {
         const variants = font_variants(cell.data.font_size_px, theme.fontFamily);

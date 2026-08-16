@@ -145,6 +145,9 @@ function rich_cell(
             // gate); keep Glide's paste path closed the same way `refused`
             // does for Text.
             readonly: true,
+            // The grid reads `cursor` straight off the hovered cell — no
+            // needsHover animation involved. Signals Ctrl/Cmd+click.
+            ...(c.hyperlink ? { cursor: 'pointer' as const } : {}),
         };
         rich_cell_cache.set(c, { font_size_px, cell });
     }
