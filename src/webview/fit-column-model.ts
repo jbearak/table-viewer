@@ -7,7 +7,10 @@
  */
 import type { RenderedCell } from '../data-source/interface';
 import { font_shorthand } from './cell-renderer';
-import { MIN_COLUMN_WIDTH_PX } from './grid-model';
+import {
+    MAX_COLUMN_WIDTH_PX,
+    MIN_COLUMN_WIDTH_PX,
+} from './grid-model';
 import { split_lines } from './line-breaks';
 
 /** Smallest width a fitted column may take. Aliases the grid's clamp floor
@@ -41,16 +44,18 @@ export function canvas_font(
 
 /**
  * Fitted width for one column: the widest measured visual line plus padding,
- * never below {@link MIN_COLUMN_WIDTH}. Measuring lines independently mirrors
- * Glide's column-border auto-size rule for wrapped text; passing a whole
- * multiline string to canvas `measureText` would instead size the column as if
- * its lines were laid out side by side. An empty column collapses to the minimum.
+ * bounded by the grid's shared minimum and maximum widths. Measuring lines
+ * independently mirrors Glide's column-border auto-size rule for wrapped text;
+ * passing a whole multiline string to canvas `measureText` would instead size
+ * the column as if its lines were laid out side by side. An empty column
+ * collapses to the minimum.
  */
 export function fit_column_width(
     cells: readonly MeasurableCell[],
     measure: (cell: MeasurableCell) => number,
     min_width: number = MIN_COLUMN_WIDTH,
     padding: number = COLUMN_PADDING,
+    max_width: number = MAX_COLUMN_WIDTH_PX,
 ): number {
     let max = 0;
     for (const cell of cells) {
@@ -62,8 +67,9 @@ export function fit_column_width(
             if (w > max) max = w;
         }
     }
-    if (max === 0) return min_width;
-    return Math.max(min_width, max + padding);
+    const fitted = max === 0 ? min_width : Math.max(min_width, max + padding);
+    const effective_max = Math.max(min_width, max_width);
+    return Math.min(effective_max, fitted);
 }
 
 /**
@@ -77,6 +83,7 @@ export function fit_column_widths(
     measure: (cell: MeasurableCell) => number,
     min_width: number = MIN_COLUMN_WIDTH,
     padding: number = COLUMN_PADDING,
+    max_width: number = MAX_COLUMN_WIDTH_PX,
 ): Record<number, number> {
     const widths: Record<number, number> = {};
     for (const source_column of source_columns) {
@@ -85,7 +92,13 @@ export function fit_column_widths(
             const cell = row[source_column];
             if (cell) cells.push(cell);
         }
-        widths[source_column] = fit_column_width(cells, measure, min_width, padding);
+        widths[source_column] = fit_column_width(
+            cells,
+            measure,
+            min_width,
+            padding,
+            max_width,
+        );
     }
     return widths;
 }

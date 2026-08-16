@@ -16,7 +16,7 @@ export const PAGE_SIZE = 100;
 export const HEADER_HEIGHT_PX = 36;
 
 export const MIN_COLUMN_WIDTH_PX = 40;
-export const MAX_COLUMN_WIDTH_PX = 800;
+export const MAX_COLUMN_WIDTH_PX = 3200;
 export const DEFAULT_COLUMN_WIDTH_PX = 120;
 
 /**
