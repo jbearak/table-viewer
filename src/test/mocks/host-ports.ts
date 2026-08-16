@@ -62,7 +62,13 @@ export const fake_host_ui_port: HostUiPort = {
                 : 'cancel';
     },
     async open_setting(): Promise<void> {},
+    open_external(url) {
+        opened_external_urls.push(url);
+    },
 };
+
+/** URLs handed to the fake `open_external`; tests read and reset this. */
+export const opened_external_urls: string[] = [];
 
 function config_value<T>(key: string, fallback: T): T {
     return vscode_mock.workspace.getConfiguration('tableViewer')

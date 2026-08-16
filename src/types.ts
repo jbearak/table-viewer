@@ -1465,6 +1465,11 @@ export type WebviewMessage =
     // User-facing warning raised inside the webview (e.g. a clipped copy) that
     // the host surfaces via vscode.window.showWarningMessage.
     | { type: 'showWarning'; message: string }
+    // Ctrl/Cmd+click (or the context menu's "Open link") on a hyperlinked
+    // cell. The webview pre-validates for immediate feedback, but the host
+    // re-validates with parse_http_external_url before anything reaches the
+    // OS opener — workbook contents are untrusted input.
+    | { type: 'openExternal'; url: string }
     | { type: 'requestFilterHistogram'; sheetIndex: number; columnIndex: number; requestId: string; generation: number; sourceGeneration: number }
     | { type: 'cancelFilterHistogram'; requestId: string }
     | { type: 'setExcelFirstRowHeader'; sheetIndex: number; sheetName: string; enabled: boolean; unhideAll?: boolean; headerRow?: number; requestId: string; generation: number; sourceGeneration: number }

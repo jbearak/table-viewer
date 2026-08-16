@@ -95,3 +95,22 @@ describe('cell context menu model', () => {
         expect(props.on_select_all).toHaveBeenCalledOnce();
     });
 });
+
+describe('Open link', () => {
+    it('is absent without a link callback', () => {
+        const items = cell_context_menu_items(base());
+        expect(items.some((item) => item.kind !== 'separator' && item.label === 'Open link'))
+            .toBe(false);
+    });
+
+    it('leads the menu and fires the callback on a linked cell', () => {
+        const on_open_link = vi.fn();
+        const items = cell_context_menu_items({ ...base(), on_open_link });
+        const first = items[0];
+        expect(first.kind).toBeUndefined();
+        expect(first.kind !== 'separator' && first.kind !== 'submenu' && first.label)
+            .toBe('Open link');
+        action(items, 'Open link').on_click({} as never);
+        expect(on_open_link).toHaveBeenCalledTimes(1);
+    });
+});

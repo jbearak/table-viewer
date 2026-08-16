@@ -193,3 +193,45 @@ describe('measurable_from_rendered', () => {
         ).toEqual({ text: '', bold: false, italic: false });
     });
 });
+
+describe('rich-run measurement', () => {
+    it('measures each segment with its own style and sums per line', () => {
+        // 'ab' plain (20) + 'cd' bold (20 + 50) = 90; padding 16 → 106.
+        const width = fit_column_width(
+            [{
+                text: 'abcd',
+                bold: false,
+                italic: false,
+                runs: [{ text: 'ab' }, { text: 'cd', style: { bold: true } }],
+            }],
+            fake_measure,
+        );
+        expect(width).toBe(90 + 16);
+    });
+
+    it('takes the widest visual line of a multi-line rich cell', () => {
+        // Line 1: 'longer' bold = 60 + 50 = 110; line 2: 'x' plain = 10.
+        const width = fit_column_width(
+            [{
+                text: 'longer\nx',
+                bold: false,
+                italic: false,
+                runs: [{ text: 'longer\nx', style: { bold: true } }],
+            }],
+            fake_measure,
+        );
+        expect(width).toBe(110 + 16);
+    });
+
+    it('measurable_from_rendered hands runs over only with formatting on', () => {
+        const cell: RenderedCell = {
+            raw: 'ab',
+            formatted: 'ab',
+            bold: false,
+            italic: false,
+            richText: { runs: [{ text: 'a' }, { text: 'b', style: { bold: true } }] },
+        };
+        expect(measurable_from_rendered(cell, true)?.runs).toEqual(cell.richText!.runs);
+        expect(measurable_from_rendered(cell, false)?.runs).toBeUndefined();
+    });
+});

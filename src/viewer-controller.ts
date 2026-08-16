@@ -55,6 +55,7 @@ import {
     normalize_host_state,
     plan_excel_candidate_state,
 } from './excel-header-plan';
+import { parse_http_external_url } from './external-url';
 import {
     acquire_file_coordinator,
     type ExcelHeaderOperationReceipt,
@@ -6331,6 +6332,19 @@ export function attach_viewer(
             case 'showWarning':
                 host.ui.show_warning(msg.message);
                 return;
+            case 'openExternal': {
+                // Authoritative validation: the webview also validates for UX,
+                // but a compromised or buggy renderer must not be able to hand
+                // an arbitrary string to the OS opener.
+                const url = parse_http_external_url(msg.url);
+                if (url === null) {
+                    host.ui.show_warning(
+                        'Table Viewer blocked a link that is not a valid http(s) URL.');
+                    return;
+                }
+                host.ui.open_external(url);
+                return;
+            }
             case 'openCsvRowLimitSetting':
                 await host.ui.open_setting('csvMaxRows');
                 return;

@@ -13,6 +13,8 @@ export interface CellContextMenuModelProps {
     selected_column_count: number;
     can_clear_highlight: boolean;
     highlight_cell_count: number;
+    /** Set when the cell carries a valid external hyperlink. */
+    on_open_link?: () => void;
     on_discard_edit: () => void;
     on_copy_cell: () => void;
     on_copy_selection: () => void;
@@ -27,6 +29,10 @@ export interface CellContextMenuModelProps {
 
 export function cell_context_menu_items(props: CellContextMenuModelProps): MenuItem[] {
     const items: MenuItem[] = [];
+    const { on_open_link } = props;
+    if (on_open_link) {
+        items.push({ label: 'Open link', on_click: () => on_open_link() });
+    }
     if (props.dirty) {
         items.push({ label: 'Discard edit', on_click: () => props.on_discard_edit() });
     }

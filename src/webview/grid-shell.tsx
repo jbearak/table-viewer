@@ -81,11 +81,16 @@ import { MergeIndex } from './merge-index';
 import {
     build_grid_cell,
     cell_allows_wrapping,
+    rich_cell_display_data,
     type CellEditOverlay,
 } from './cell-renderer';
+import { rich_text_cell_renderer } from './rich-text-cell-renderer';
+import { parse_http_external_url } from '../external-url';
 import {
     CELL_TOOLTIP_SHOW_DELAY_MS,
+    cell_tooltip_content,
     cell_tooltip_position,
+    rich_text_overflows_cell,
     clamp_tooltip_text,
     text_overflows_cell,
 } from './cell-overflow-model';
@@ -144,6 +149,9 @@ import {
 
 /** Pixel proximity to a row border that arms the resize strip. */
 const ROW_RESIZE_TOLERANCE_PX = 5;
+
+/** Module-level so the DataEditor prop is referentially stable. */
+const custom_renderers = [rich_text_cell_renderer];
 
 /** Resident-row cap sampled when auto-fitting columns (bounds the measure cost
  *  on huge sheets; we only ever measure already-loaded text, never force a
@@ -1605,6 +1613,18 @@ export function GridShell({
         [ensure_measure_ctx, font_family, font_size_px, show_formatting],
     );
 
+    /** The loaded cell's hyperlink at display coordinates. Merged blocks
+     *  arrive as anchor coordinates (Glide canonicalizes the hit), which is
+     *  where the content — and the link — lives. */
+    const cell_hyperlink = useCallback(
+        (display_column: number, row: number) => {
+            const source_column = source_column_for_display(display_column);
+            if (source_column === undefined) return undefined;
+            return get_row(row)?.[source_column]?.hyperlink;
+        },
+        [get_row, source_column_for_display],
+    );
+
     const font_flags_for_cell = useCallback(
         (display_column: number, row: number): { bold: boolean; italic: boolean } => {
             const source_column = source_column_for_display(display_column);
@@ -1641,28 +1661,62 @@ export function GridShell({
             set_cell_tooltip(null);
 
             const text = displayed_cell_text(display_column, row);
-            if (!text) return;
+            const link = cell_hyperlink(display_column, row);
+            if (!text && !link) return;
 
-            const flags = font_flags_for_cell(display_column, row);
-            // Use the same wrapping rule as build_grid_cell. `cell_bounds` is the
-            // full painted rectangle, including a vertical merge's covered rows.
-            const wrapping = cell_allows_wrapping(
-                text,
-                cell_bounds.height > default_row_height,
-            );
-            const overflows = text_overflows_cell(
-                text,
-                cell_bounds.width,
-                (line) => measure_line_width(line, flags.bold, flags.italic),
-                {
-                    cell_height: cell_bounds.height,
-                    line_height: line_height_for_font(font_size_px),
-                    wrapping,
-                },
-            );
-            if (!overflows) return;
+            // A dirty value paints through the Text path even on a rich cell,
+            // so only an undirtied rich cell measures with the rich rule.
+            const source_column = source_column_for_display(display_column);
+            const source_row = get_source_row(row);
+            const dirty = source_row !== undefined && source_column !== undefined
+                && store.get(`${source_row}:${source_column}`) !== undefined;
+            const loaded = source_column === undefined
+                ? null
+                : get_row(row)?.[source_column] ?? null;
+            const rich_data = !dirty && loaded
+                ? rich_cell_display_data(loaded, show_formatting, font_size_px)
+                : undefined;
 
-            const clamped = clamp_tooltip_text(text);
+            let overflows: boolean;
+            if (rich_data) {
+                // The rich renderer draws hard breaks only and uses per-run
+                // fonts; the overflow check must match or the tooltip lies.
+                overflows = rich_text_overflows_cell(
+                    rich_data.lines,
+                    cell_bounds.width,
+                    (segment, style) => measure_line_width(
+                        segment,
+                        style?.bold ?? false,
+                        style?.italic ?? false,
+                    ),
+                    {
+                        cell_height: cell_bounds.height,
+                        line_height: line_height_for_font(font_size_px),
+                    },
+                );
+            } else {
+                const flags = font_flags_for_cell(display_column, row);
+                // Use the same wrapping rule as build_grid_cell. `cell_bounds` is
+                // the full painted rectangle, including a vertical merge's rows.
+                const wrapping = cell_allows_wrapping(
+                    text,
+                    cell_bounds.height > default_row_height,
+                );
+                overflows = text !== '' && text_overflows_cell(
+                    text,
+                    cell_bounds.width,
+                    (line) => measure_line_width(line, flags.bold, flags.italic),
+                    {
+                        cell_height: cell_bounds.height,
+                        line_height: line_height_for_font(font_size_px),
+                        wrapping,
+                    },
+                );
+            }
+            const content = cell_tooltip_content(text, overflows, link);
+            if (content === null) return;
+
+            const clamped = clamp_tooltip_text(content);
             cell_tooltip_timer_ref.current = window.setTimeout(() => {
                 cell_tooltip_timer_ref.current = null;
                 // Drop if the pointer left this cell during the dwell.
@@ -1689,6 +1743,12 @@ export function GridShell({
             font_size_px,
             measure_line_width,
             default_row_height,
+            cell_hyperlink,
+            get_row,
+            get_source_row,
+            show_formatting,
+            source_column_for_display,
+            store,
         ],
     );
 
@@ -2740,6 +2800,45 @@ export function GridShell({
 
     const dismiss_context_menu = useCallback(() => set_context_menu(null), []);
 
+    /** The cell's external-link URL, pre-validated for immediate feedback
+     *  (the host re-validates before anything reaches the OS opener).
+     *  Internal links are render-only in v1, so they yield null here too. */
+    const external_link_url = useCallback(
+        (display_column: number, row: number): string | null => {
+            const link = cell_hyperlink(display_column, row);
+            if (link?.kind !== 'external') return null;
+            return parse_http_external_url(link.target);
+        },
+        [cell_hyperlink],
+    );
+
+    const open_external_url = useCallback((url: string) => {
+        host_bridge.postMessage({ type: 'openExternal', url });
+    }, []);
+
+    // Ctrl/Cmd+click on a linked cell opens the link; everything else falls
+    // through to the row-marker click logic this wraps.
+    const on_cell_clicked = useCallback(
+        (cell: Item, event: CellClickedEventArgs) => {
+            const [display_column, row] = cell;
+            if (
+                display_column >= 0
+                && (event.ctrlKey || event.metaKey)
+                && !event.shiftKey
+                && event.button === 0
+            ) {
+                const url = external_link_url(display_column, row);
+                if (url !== null) {
+                    event.preventDefault();
+                    open_external_url(url);
+                    return;
+                }
+            }
+            row_markers.on_cell_clicked(cell, event);
+        },
+        [external_link_url, open_external_url, row_markers],
+    );
+
     // Controlled keyboard nav. Tab/Shift+Tab use row-major wrapping and
     // view-mode hjkl keeps merge-aware movement; arrows (and range extension,
     // shortcuts) stay native to Glide, which steps past merges itself.
@@ -3092,7 +3191,11 @@ export function GridShell({
         // than guessing: it is also the case where discard_edit would have no key to
         // remove, so hiding "Discard edit" is the consistent answer.
         const menu_source_row = get_source_row(row);
+        const menu_link_url = external_link_url(display_col, row);
         cell_menu_items = cell_context_menu_items({
+            ...(menu_link_url !== null
+                ? { on_open_link: () => open_external_url(menu_link_url) }
+                : {}),
             dirty: menu_source_row !== undefined
                 && dirty_cells.has(`${menu_source_row}:${source_col}`),
             is_multi_cell: !!range && range.width * range.height > 1,
@@ -3183,7 +3286,8 @@ export function GridShell({
                 onColumnResize={handle_column_resize}
                 onItemHovered={on_item_hovered}
                 onCellEdited={on_cell_edited}
-                onCellClicked={row_markers.on_cell_clicked}
+                onCellClicked={on_cell_clicked}
+                customRenderers={custom_renderers}
                 onCellContextMenu={on_cell_context_menu}
                 onKeyDown={on_key_down}
                 provideEditor={provide_editor}

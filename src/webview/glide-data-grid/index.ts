@@ -11,8 +11,17 @@ export type {
     GridMouseEventArgs,
     HeaderClickedEventArgs,
 } from "./internal/data-grid/event-args.js";
-export type { Theme } from "./common/styles.js";
+export type { Theme, FullTheme } from "./common/styles.js";
 export { getDataEditorTheme as getDefaultTheme } from "./common/styles.js";
+// Custom-renderer surface: the renderer contract plus the text-metric helpers
+// a renderer needs to draw consistently with the built-in text cell.
+export type { CustomRenderer } from "./cells/cell-types.js";
+export {
+    measureTextCached,
+    getEmHeight,
+    getMiddleCenterBias,
+} from "./internal/data-grid/render/data-grid-lib.js";
+export { direction } from "./common/utils.js";
 
 export type { DataEditorRef } from "./data-editor/data-editor.js";
 export { DataEditorAll as DataEditor } from "./data-editor-all.js";
