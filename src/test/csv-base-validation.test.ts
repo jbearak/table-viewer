@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { validate_dirty_bases } from '../csv-base-validation';
-import type { RichText } from '../cell-content';
+import type { CellHyperlink, RichText } from '../cell-content';
 import type { CsvDirtyMap } from '../types';
 
 /** A raw reader over a dense grid of source text, `undefined` past either edge — the
@@ -220,6 +220,113 @@ describe('validate_dirty_bases formatting', () => {
             2,
             grid,
             rich_reader({ '0:0': underlined('a') }),
+        );
+        expect(outcome).toEqual({ type: 'conflicts', keys: ['0:0'] });
+    });
+});
+
+describe('validate_dirty_bases hyperlinks', () => {
+    const grid = reader([['a', 'b'], ['c', 'd']]);
+    const site: CellHyperlink = { kind: 'external', target: 'https://site.test/' };
+    const other: CellHyperlink = { kind: 'external', target: 'https://other.test/' };
+
+    /** A link reader over a dense record of observed cells: `null` is a real
+     *  observation (the cell has no link), `undefined` means unobserved — the
+     *  same contract harvest_source_bases' links map presents. */
+    function link_reader(cells: Record<string, CellHyperlink | null>) {
+        return (source_row: number, col: number): CellHyperlink | null | undefined =>
+            cells[`${source_row}:${col}`];
+    }
+
+    function link_edits(
+        entries: Record<string, { value: string; base: string;
+            link?: CellHyperlink | null; baseLink?: CellHyperlink | null }>,
+    ): CsvDirtyMap {
+        return entries as CsvDirtyMap;
+    }
+
+    it('accepts a link edit whose recorded base still matches the source', () => {
+        const outcome = validate_dirty_bases(
+            link_edits({ '0:0': { value: 'a', base: 'a', link: other, baseLink: site } }),
+            2,
+            grid,
+            undefined,
+            link_reader({ '0:0': site }),
+        );
+        expect(outcome).toEqual({ type: 'valid' });
+    });
+
+    it('conflicts when the source link changed under a pending link edit', () => {
+        const outcome = validate_dirty_bases(
+            link_edits({ '0:0': { value: 'a', base: 'a', link: other, baseLink: site } }),
+            2,
+            grid,
+            undefined,
+            link_reader({ '0:0': other }),
+        );
+        expect(outcome).toEqual({ type: 'conflicts', keys: ['0:0'] });
+    });
+
+    it('conflicts on a link gained or lost under a text-equal base', () => {
+        const source_gained = validate_dirty_bases(
+            link_edits({ '0:0': { value: 'a', base: 'a', link: site, baseLink: null } }),
+            2,
+            grid,
+            undefined,
+            link_reader({ '0:0': other }),
+        );
+        expect(source_gained).toEqual({ type: 'conflicts', keys: ['0:0'] });
+
+        const source_lost = validate_dirty_bases(
+            link_edits({ '0:0': { value: 'a', base: 'a', link: null, baseLink: site } }),
+            2,
+            grid,
+            undefined,
+            link_reader({ '0:0': null }),
+        );
+        expect(source_lost).toEqual({ type: 'conflicts', keys: ['0:0'] });
+    });
+
+    it('fails closed when the cell was never observed', () => {
+        // `undefined` is "unobserved", not "no link": accepting it would let a
+        // save overwrite whatever link the file actually holds.
+        const outcome = validate_dirty_bases(
+            link_edits({ '0:0': { value: 'a', base: 'a', link: site, baseLink: null } }),
+            2,
+            grid,
+            undefined,
+            link_reader({}),
+        );
+        expect(outcome).toEqual({ type: 'conflicts', keys: ['0:0'] });
+    });
+
+    it('ignores the link reader for entries carrying no link dimension', () => {
+        const outcome = validate_dirty_bases(
+            edits({ '0:0': { value: 'X', base: 'a' } }),
+            2,
+            grid,
+            undefined,
+            link_reader({ '0:0': site }),
+        );
+        expect(outcome).toEqual({ type: 'valid' });
+    });
+
+    it('keeps the text-only contract when no link reader is supplied', () => {
+        const outcome = validate_dirty_bases(
+            link_edits({ '0:0': { value: 'a', base: 'a', link: site, baseLink: null } }),
+            2,
+            grid,
+        );
+        expect(outcome).toEqual({ type: 'valid' });
+    });
+
+    it('does not double-report a key that already conflicted on text', () => {
+        const outcome = validate_dirty_bases(
+            link_edits({ '0:0': { value: 'X', base: 'stale', link: site, baseLink: null } }),
+            2,
+            grid,
+            undefined,
+            link_reader({ '0:0': other }),
         );
         expect(outcome).toEqual({ type: 'conflicts', keys: ['0:0'] });
     });

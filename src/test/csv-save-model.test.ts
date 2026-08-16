@@ -48,3 +48,51 @@ describe('collect_save_payload', () => {
         });
     });
 });
+
+describe('collect_save_payload — hyperlink edits', () => {
+    const link = { kind: 'external', target: 'https://a.test/' } as const;
+
+    it('emits no text edit for a link-only entry but carries its link exactly', () => {
+        const payload = collect_save_payload(new Map([
+            ['0:0', { value: 'same', base: 'same', link, baseLink: null }],
+        ]));
+        if (payload.status !== 'ready') throw new Error('expected ready');
+        // The whole point: rewriting an unedited cell's `<c>` as inlineStr
+        // would lose the original XML for a cell the user never retyped.
+        expect(payload.edits).toEqual({});
+        expect(payload.dirtyEdits['0:0']).toEqual({
+            value: 'same',
+            base: 'same',
+            link,
+            baseLink: null,
+        });
+    });
+
+    it('emits both dimensions when text and link changed together', () => {
+        const payload = collect_save_payload(new Map([
+            ['1:1', { value: 'new', base: 'old', link, baseLink: null }],
+        ]));
+        if (payload.status !== 'ready') throw new Error('expected ready');
+        expect(payload.edits).toEqual({ '1:1': 'new' });
+        expect(payload.dirtyEdits['1:1']).toEqual({
+            value: 'new',
+            base: 'old',
+            link,
+            baseLink: null,
+        });
+    });
+
+    it('carries a clear (link: null against a linked base)', () => {
+        const payload = collect_save_payload(new Map([
+            ['2:0', { value: 'x', base: 'x', link: null, baseLink: link }],
+        ]));
+        if (payload.status !== 'ready') throw new Error('expected ready');
+        expect(payload.edits).toEqual({});
+        expect(payload.dirtyEdits['2:0']).toEqual({
+            value: 'x',
+            base: 'x',
+            link: null,
+            baseLink: link,
+        });
+    });
+});
