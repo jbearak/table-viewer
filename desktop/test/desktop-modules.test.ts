@@ -1074,14 +1074,14 @@ describe('theme', () => {
         expect(list_themes('light').map((t) => t.id)).toEqual([
             'light', 'solarized-light', 'catppuccin-latte',
             'gruvbox-light-hard', 'gruvbox-light-medium', 'gruvbox-light-soft',
-            'light-high-contrast',
+            'light-high-contrast', 'macher-light',
         ]);
         expect(list_themes('dark').map((t) => t.id)).toEqual([
             'dark', 'solarized-dark', 'catppuccin-frappe',
             'catppuccin-macchiato', 'catppuccin-mocha',
             'gruvbox-dark-hard', 'gruvbox-dark-medium', 'gruvbox-dark-soft',
             'synthwave-84', 'cyberpunk', 'cyberpunk-scarlet',
-            'red', 'dark-high-contrast',
+            'red', 'dark-high-contrast', 'macher-dark',
         ]);
         // Every id belongs to exactly one kind's list.
         expect(list_themes('light').length + list_themes('dark').length)
@@ -1131,6 +1131,27 @@ describe('theme', () => {
         expect(payload.variables['--vscode-list-activeSelectionForeground']).toBe('#292929');
         expect(payload.variables['--vscode-editorInfo-foreground']).toBe('#0f4a85');
         expect(payload.variables['--vscode-input-placeholderForeground']).toBe('#5f5f5f');
+    });
+
+    it('ships the Macher pair as one coherent brand-inspired family', () => {
+        const light = theme_payload('macher-light');
+        const dark = theme_payload('macher-dark');
+        expect(light.kind).toBe('light');
+        expect(dark.kind).toBe('dark');
+        expect(light.highContrast).toBe(false);
+        expect(dark.highContrast).toBe(false);
+        expect(light.variables['--vscode-editor-background']).toBe('#ffffff');
+        expect(dark.variables['--vscode-editor-background']).toBe('#011919');
+        expect(light.variables['--vscode-focusBorder']).toBe('#00788a');
+        expect(dark.variables['--vscode-focusBorder']).toBe('#08cdca');
+        expect(light.variables['--vscode-editorInfo-foreground']).toBe('#006b83');
+        expect(dark.variables['--vscode-editorInfo-foreground']).toBe('#08cdca');
+        expect(light.variables['--vscode-errorForeground']).toBe('#ad3d1f');
+        expect(dark.variables['--vscode-errorForeground']).toBe('#ff6941');
+        expect(light.variables['--vscode-editorWidget-border']).toBe('#006b83');
+        expect(dark.variables['--vscode-editorWidget-border']).toBe('#08cdca');
+        expect(light.variables['--vscode-editorWarning-foreground']).toBe('#5f5e12');
+        expect(dark.variables['--vscode-input-placeholderForeground']).toBe('#cef5f4');
     });
 
     it('rejects unknown AND wrong-kind theme ids', () => {
@@ -1290,12 +1311,12 @@ describe('theme × Glide grid theme', () => {
             dirty.add(tints.dirtyBg);
             conflict.add(tints.conflictBg);
         }
-        // 20 themes. The collisions are all intended
+        // 22 themes. The collisions are all intended
         // palette sharing: solarized-light and solarized-dark share one palette;
         // each gruvbox kind's three contrasts differ only in their background;
         // and the two Cyberpunk variants share their warning and error colors.
-        expect(dirty.size).toBe(14);
-        expect(conflict.size).toBe(13);
+        expect(dirty.size).toBe(16);
+        expect(conflict.size).toBe(15);
         // A typo'd variable name would collapse every theme onto the fallback.
         // (`dark`'s warning genuinely IS #cca700 — the same rgb as the dirty
         // fallback — so only the conflict side can assert non-fallback.)

@@ -39,13 +39,15 @@ export type ThemeId =
     | 'gruvbox-light-medium'
     | 'gruvbox-light-soft'
     | 'light-high-contrast'
+    | 'macher-light'
     | 'gruvbox-dark-hard'
     | 'gruvbox-dark-medium'
     | 'gruvbox-dark-soft'
     | 'cyberpunk'
     | 'cyberpunk-scarlet'
     | 'red'
-    | 'dark-high-contrast';
+    | 'dark-high-contrast'
+    | 'macher-dark';
 
 export interface ThemeDefinition {
     readonly id: ThemeId;
@@ -613,6 +615,57 @@ const LIGHT_HIGH_CONTRAST: Record<string, string> = {
     '--vscode-input-placeholderForeground': '#5f5f5f',
 };
 
+/* Macher — an original pair inspired by the current public-facing palette of
+   the Guttmacher Institute, where the app's author works. These are not ports
+   of an upstream editor theme and do not imply an official affiliation or
+   endorsement. The shared family comes from the public site's named color
+   tokens: deep/bright teals, coral, chartreuse, and cool near-whites. Roles are
+   tuned independently for sustained table use and accessible UI contrast. */
+const MACHER_LIGHT: SemanticPalette = {
+    bg: '#ffffff',
+    bgAlt: '#f7f8fc',
+    bgElevated: '#e6f7f7',
+    fg: '#222222',
+    fgMuted: '#555555',
+    fgSubtle: '#666666',
+    border: '#006b83',
+    accent: '#00788a',
+    accentHover: '#00586a',
+    accentFg: '#ffffff',
+    selection: '#cef5f4',
+    hover: '#e8f2af',
+    link: '#006b83',
+    error: '#ad3d1f',
+    warning: '#5f5e12',
+    info: '#006b83',
+};
+
+const MACHER_DARK: SemanticPalette = {
+    bg: '#011919',
+    bgAlt: '#002e31',
+    bgElevated: '#00586a',
+    fg: '#f7f8fc',
+    fgMuted: '#cef5f4',
+    fgSubtle: '#a3a3a3',
+    border: '#08cdca',
+    accent: '#08cdca',
+    accentHover: '#6fd8d7',
+    accentFg: '#011919',
+    selection: '#006b83',
+    hover: '#00454d',
+    link: '#6fd8d7',
+    error: '#ff6941',
+    warning: '#d1e560',
+    info: '#08cdca',
+};
+
+const MACHER_DARK_VARIABLES: Record<string, string> = {
+    ...derive_theme_variables(MACHER_DARK),
+    // Disabled controls keep the quieter gray, while placeholder copy remains
+    // normal readable text on the saturated teal input surface.
+    '--vscode-input-placeholderForeground': '#cef5f4',
+};
+
 // --- the registry -----------------------------------------------------------
 
 export const THEME_DEFINITIONS: Record<ThemeId, ThemeDefinition> = {
@@ -641,6 +694,10 @@ export const THEME_DEFINITIONS: Record<ThemeId, ThemeDefinition> = {
         id: 'light-high-contrast', kind: 'light', label: 'Light High Contrast',
         variables: LIGHT_HIGH_CONTRAST,
         highContrast: true,
+    },
+    'macher-light': {
+        id: 'macher-light', kind: 'light', label: 'Macher Light',
+        variables: derive_theme_variables(MACHER_LIGHT),
     },
     dark: { id: 'dark', kind: 'dark', label: 'Dark', variables: DARK },
     'solarized-dark': {
@@ -691,6 +748,10 @@ export const THEME_DEFINITIONS: Record<ThemeId, ThemeDefinition> = {
         id: 'dark-high-contrast', kind: 'dark', label: 'Dark High Contrast',
         variables: DARK_HIGH_CONTRAST,
         highContrast: true,
+    },
+    'macher-dark': {
+        id: 'macher-dark', kind: 'dark', label: 'Macher Dark',
+        variables: MACHER_DARK_VARIABLES,
     },
 };
 
