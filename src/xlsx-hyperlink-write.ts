@@ -247,6 +247,90 @@ function remove_relationships(rels_xml: string, ids: ReadonlySet<string>): strin
     return out;
 }
 
+/** The `display` text a clear edit is about to delete along with its element. */
+export interface ClearedDisplay {
+    readonly row: number;
+    readonly col: number;
+    readonly text: string;
+}
+
+/**
+ * The `display` texts that *clear* edits would delete along with their elements.
+ *
+ * `display` is the cell's text when the sheet has no `<c>` for that coordinate
+ * (see parse-xlsx.ts), so a clear that removes the element can remove the only
+ * copy of the text and the cell reads back blank. A *replacement* is already
+ * safe — `apply_hyperlink_edits` carries `displaced_display` onto the new
+ * element — so only clears are reported.
+ *
+ * Deliberately NOT called "orphaned": this layer can see that a text is about
+ * to be deleted, but not whether anything else still supplies it. Whether the
+ * cell actually depends on it is the worksheet-body question the caller
+ * answers, since only it knows whether a `<c>` exists — or is about to, from a
+ * value edit in the same save.
+ */
+export function cleared_display_texts(
+    sheet_xml: string,
+    edits: readonly XlsxHyperlinkEdit[],
+): ClearedDisplay[] {
+    // Same last-wins canonicalization the splice uses, so the two cannot
+    // disagree about which edit governs a cell: a clear followed by a set keeps
+    // its display on the replacement and needs no promotion.
+    const by_ref = canonical_link_edits(edits, () => undefined);
+    let any_clear = false;
+    for (const edit of by_ref.values()) if (edit.link === null) { any_clear = true; break; }
+    // A set-only batch can never delete a display, so it never pays for the
+    // section scan below.
+    if (!any_clear) return [];
+    const section = find_element_section(sheet_xml, 'hyperlinks');
+    if (!section) return [];
+    const out: ClearedDisplay[] = [];
+    // FIRST element per ref wins, because that is the one whose text the reader
+    // shows: parse-xlsx synthesizes the cell from the first `<hyperlink>` it
+    // meets for a coordinate and a later duplicate only overwrites the cell's
+    // `.hyperlink`, never its text. Taking the last instead changed a cell
+    // reading `first` into `second` on a clear, and invented `second` outright
+    // when the first element carried no display at all. Nothing forbids two
+    // elements naming one ref, so this is not a hypothetical shape.
+    const seen = new Set<string>();
+    for (const link of existing_hyperlinks(section.inner)) {
+        if (seen.has(link.ref)) continue;
+        seen.add(link.ref);
+        const edit = by_ref.get(link.ref);
+        if (!edit || edit.link !== null) continue;
+        if (link.display === null || link.display === '') continue;
+        out.push({ row: edit.row, col: edit.col, text: link.display });
+    }
+    return out;
+}
+
+/**
+ * Collapse edits to one per cell ref, last write winning.
+ *
+ * Shared by the splice and the display preflight so a duplicate coordinate
+ * cannot resolve to one edit in one and a different edit in the other — the
+ * preflight would then preserve the text for an edit that never ran.
+ *
+ * `on_invalid` decides what an out-of-range coordinate means to the caller:
+ * the splice throws, while the preflight is only reporting and lets the splice
+ * be the one to refuse.
+ */
+function canonical_link_edits(
+    edits: readonly XlsxHyperlinkEdit[],
+    on_invalid: (edit: XlsxHyperlinkEdit) => void,
+): Map<string, XlsxHyperlinkEdit> {
+    const by_ref = new Map<string, XlsxHyperlinkEdit>();
+    for (const edit of edits) {
+        if (!Number.isSafeInteger(edit.row) || edit.row < 0
+            || !Number.isSafeInteger(edit.col) || edit.col < 0) {
+            on_invalid(edit);
+            continue;
+        }
+        by_ref.set(cell_ref(edit.row, edit.col), edit);
+    }
+    return by_ref;
+}
+
 /**
  * Apply a worksheet's hyperlink edits to its XML and `.rels` text.
  *
@@ -263,14 +347,9 @@ export function apply_hyperlink_edits(
         return { sheet_xml, rels_xml: null };
     }
     // Last edit wins per cell ref.
-    const by_ref = new Map<string, XlsxHyperlinkEdit>();
-    for (const edit of edits) {
-        if (!Number.isSafeInteger(edit.row) || edit.row < 0
-            || !Number.isSafeInteger(edit.col) || edit.col < 0) {
-            throw new Error('Invalid hyperlink edit coordinates');
-        }
-        by_ref.set(cell_ref(edit.row, edit.col), edit);
-    }
+    const by_ref = canonical_link_edits(edits, () => {
+        throw new Error('Invalid hyperlink edit coordinates');
+    });
 
     // Same locator the reader uses, so the two cannot disagree about which
     // `<hyperlinks>` section is the live one.

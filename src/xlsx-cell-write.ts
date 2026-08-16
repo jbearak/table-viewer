@@ -42,6 +42,17 @@ export interface XlsxCellEdit {
      * the cell is written as a rich inline string.
      */
     readonly runs?: readonly RichTextRun[];
+    /**
+     * Store `value` as text verbatim, skipping number/date/boolean inference.
+     *
+     * For a value that was never typed by a user and is already known to be a
+     * string. Type inference exists to turn what someone typed into what they
+     * meant, and applying it to text the file already held is not a
+     * translation but a change: a hyperlink `display` of `1e3` is the string
+     * `1e3` to the reader, and inferring it wrote `<v>1e3</v>`, which reads
+     * back as the number 1000. Absent (the ordinary case) infers as before.
+     */
+    readonly force_text?: boolean;
 }
 
 /** Strings written to the workbook go inline, so the writer never needs the shared string table. */
@@ -337,6 +348,13 @@ function build_cell_xml(
                 .join('');
             return `<c r="${ref}"${style_attr} t="inlineStr"><is>${runs}</is></c>`;
         }
+    }
+    // Text the file already held, not something a user typed: stored as-is,
+    // ahead of every inference path below. See `force_text`. An empty value
+    // still clears the cell rather than writing an empty string, which is what
+    // the classification would have done with it anyway.
+    if (edit.force_text && value !== '') {
+        return `<c r="${ref}"${style_attr} t="inlineStr"><is><t xml:space="preserve">${encode_xml(value)}</t></is></c>`;
     }
     // An ISO-date cell edited back to a date stays one, for the same reason a
     // boolean does. `t="d"` stores the date as text and the reader shows it
@@ -1175,6 +1193,56 @@ function assert_writable_sheet_data(xml: string, from: number, to: number): void
             unsupported('worksheet elements in a different XML namespace');
         }
     }
+}
+
+/**
+ * Which of `coordinates` already have a `<c>` element in the worksheet, as
+ * `"row:col"` keys.
+ *
+ * The question is deliberately "is there a `<c>` at all", not "does it hold a
+ * value". That is the distinction `parse_xlsx` draws when it decides whether a
+ * `<hyperlink display=…>` supplies the cell's text: it keys every `<c r=…>`
+ * into its map as it scans — value or not — and falls back to `display` only
+ * for a coordinate with no entry. So a styled-but-empty `<c r="B2" s="3"/>`, or
+ * a formula cell with no cached `<v>`, reads as BLANK today, and treating
+ * either as display-backed would let a save invent text the user never saw.
+ *
+ * Resolved exactly as an edit would resolve it — same `scan_rows`/`scan_cells`
+ * — so the answer describes the cell the writer would actually splice.
+ *
+ * Batched because the caller has a set of coordinates and the scan is
+ * sheet-wide: asking one coordinate at a time re-walked the whole worksheet per
+ * question, which is quadratic in a save that clears many links at once.
+ */
+export function cells_present(
+    xml: string,
+    coordinates: Iterable<{ readonly row: number; readonly col: number }>,
+): Set<string> {
+    const found = new Set<string>();
+    const by_row = new Map<number, number[]>();
+    for (const { row, col } of coordinates) {
+        const cols = by_row.get(row);
+        if (cols) cols.push(col);
+        else by_row.set(row, [col]);
+    }
+    if (by_row.size === 0) return found;
+    const sd_open = find_sheet_data_open(xml);
+    if (!sd_open) return found;
+    const rows = scan_rows(xml, sd_open.inner_start, sd_open.inner_end);
+    for (const [row, cols] of by_row) {
+        const spans = rows.get(row);
+        if (!spans) continue;
+        // One `scan_cells` per row element, not per requested column: several
+        // coordinates commonly share a row, and the scan covers the whole span.
+        const cells = new Map<number, Span>();
+        for (const span of spans) {
+            for (const [col, cell] of scan_cells(xml, span.inner_start, span.end, row)) {
+                cells.set(col, cell);
+            }
+        }
+        for (const col of cols) if (cells.has(col)) found.add(`${row}:${col}`);
+    }
+    return found;
 }
 
 /** One pending splice: replace `[start, end)` with `text`. */
