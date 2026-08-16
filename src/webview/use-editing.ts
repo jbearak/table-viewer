@@ -6,7 +6,18 @@ import {
     type EditSessionStore,
     type GetCellRaw,
 } from './edit-session-store';
-import type { CsvDirtyEntry } from '../types';
+import { make_dirty_entry, type CsvDirtyEntry } from '../types';
+import {
+    cell_edit_base,
+    cell_edits_equal,
+    committed_value_runs,
+    dirty_value_edit_text,
+    edit_display_text,
+    parse_cell_edit,
+    type EditableSourceCell,
+    type EditSyntax,
+    type ParsedCellEdit,
+} from '../cell-edit-model';
 
 // Re-exported so consumers keep importing the edit vocabulary from the hook they
 // already use; the definitions moved to the store because it, not the hook, owns
@@ -47,12 +58,29 @@ export interface EditingCell {
  * that has nowhere to hoist the store to (the hook's own tests, and GridShell
  * before App wires one down) gets a hook-owned one instead.
  */
+/** Markdown-mode wiring, absent for plain (CSV) consumers. */
+export interface UseEditingOptions {
+    /** How this sheet's cells are edited. Defaults to 'plain'. */
+    readonly syntax?: EditSyntax;
+    /**
+     * The full loaded cell by source coordinates, for markdown mode only:
+     * edit text and conflict bases derive from the cell's effective rich
+     * content, which the plain-text reader cannot carry. Same residency
+     * contract as {@link GetCellRaw} (`null` = resident-but-blank,
+     * `undefined` = not resident).
+     */
+    readonly get_cell?: (source_row: number, col: number) => EditableSourceCell | null | undefined;
+}
+
 export function use_editing(
     get_cell_raw: GetCellRaw,
     reload_token: number,
     session_id: string | undefined,
     store?: EditSessionStore,
+    options?: UseEditingOptions,
 ) {
+    const syntax: EditSyntax = options?.syntax ?? 'plain';
+    const get_cell = options?.get_cell;
     const own_store_ref = useRef<EditSessionStore | null>(null);
     // Only when no store was handed down, matching GridShell's fallback: building
     // one anyway would allocate a map per mount that nothing ever reads.
@@ -90,6 +118,24 @@ export function use_editing(
         set_editing_cell(null);
     }, []);
 
+    // The cell's conflict base in edit space: its effective rich content when
+    // the loaded cell is available in markdown mode, else the plain raw text.
+    // The fallback matters even in markdown mode — `get_cell_raw` layers the
+    // in-flight save's values over residency, which `get_cell` cannot see, so
+    // the raw reader stays the authority on the *text* and the loaded cell
+    // only contributes styling.
+    const edit_base_at = useCallback(
+        (source_row: number, source_col: number): ParsedCellEdit => {
+            const raw = get_cell_raw(source_row, source_col) ?? '';
+            if (syntax === 'markdown') {
+                const cell = get_cell?.(source_row, source_col);
+                if (cell && (cell.raw ?? '') === raw) return cell_edit_base(cell);
+            }
+            return { text: raw };
+        },
+        [get_cell_raw, get_cell, syntax],
+    );
+
     // Every coordinate below is a source coordinate. The store's keys, the
     // GetCellRaw reader and EditingCell all live in source space, so nothing on
     // this path converts — and a caller holding a display row must convert
@@ -99,16 +145,23 @@ export function use_editing(
             const key = `${source_row}:${source_col}`;
             const dirty_entry = dirty_cells.get(key);
             if (dirty_entry !== undefined) {
-                set_editing_cell({ source_row, source_col, value: dirty_entry.value });
+                // A dirty markdown cell re-opens showing its stored runs as
+                // markup, so what the user last committed is what they resume
+                // editing — spelled canonically, which the revert rule accepts.
+                set_editing_cell({
+                    source_row,
+                    source_col,
+                    value: dirty_value_edit_text(dirty_entry, syntax),
+                });
                 return;
             }
             set_editing_cell({
                 source_row,
                 source_col,
-                value: get_cell_raw(source_row, source_col) ?? '',
+                value: edit_display_text(edit_base_at(source_row, source_col), syntax),
             });
         },
-        [get_cell_raw, dirty_cells],
+        [edit_base_at, dirty_cells, syntax],
     );
 
     const start_editing = useCallback(
@@ -128,27 +181,48 @@ export function use_editing(
         [begin_editing],
     );
 
-    const confirm_edit = useCallback(
-        (new_value: string) => {
-            if (!editing_cell) return;
-            const { source_row, source_col } = editing_cell;
+    // The shared body of both commit entry points: parse the editor's text in
+    // the sheet's syntax, revert when it means the same thing as the cell's
+    // current content (semantic comparison — retyping a bold cell's own
+    // `**markup**`, however spelled, is a revert; deleting the `**` is an
+    // edit), otherwise store the plain projection plus runs when styled.
+    const settle_edit = useCallback(
+        (source_row: number, source_col: number, input: string) => {
             const key = `${source_row}:${source_col}`;
-            // begin-edit/commit always run on a resident, visible cell, so a
-            // definite string is expected; coalesce defensively.
-            const original = get_cell_raw(source_row, source_col) ?? '';
-
-            set_editing_cell(null);
+            const parsed = parse_cell_edit(input, syntax);
+            const base = edit_base_at(source_row, source_col);
 
             // The revert rule lives here rather than in the store: only the hook
-            // can read the cell's persisted text.
-            if (new_value === original) {
+            // can read the cell's persisted content.
+            if (cell_edits_equal(parsed, base)) {
                 active_store.remove(session_id, key);
                 return;
             }
 
-            active_store.commit(session_id, key, { value: new_value, base: original });
+            active_store.commit(
+                session_id,
+                key,
+                make_dirty_entry(
+                    parsed.text,
+                    base.text,
+                    // Explicit plain runs when the user stripped a styled
+                    // base's markup — see committed_value_runs.
+                    committed_value_runs(parsed, base),
+                    base.rich,
+                ),
+            );
         },
-        [active_store, editing_cell, get_cell_raw, session_id],
+        [active_store, edit_base_at, session_id, syntax],
+    );
+
+    const confirm_edit = useCallback(
+        (new_value: string) => {
+            if (!editing_cell) return;
+            const { source_row, source_col } = editing_cell;
+            set_editing_cell(null);
+            settle_edit(source_row, source_col, new_value);
+        },
+        [editing_cell, settle_edit],
     );
 
     // Location-based commit for Glide, whose overlay editor reports edits via
@@ -158,23 +232,14 @@ export function use_editing(
     // arguments are already source coordinates here.
     const commit_edit = useCallback(
         (source_row: number, source_col: number, new_value: string) => {
-            const key = `${source_row}:${source_col}`;
-            const original = get_cell_raw(source_row, source_col) ?? '';
-
             set_editing_cell((prev) =>
                 prev && prev.source_row === source_row && prev.source_col === source_col
                     ? null
                     : prev,
             );
-
-            if (new_value === original) {
-                active_store.remove(session_id, key);
-                return;
-            }
-
-            active_store.commit(session_id, key, { value: new_value, base: original });
+            settle_edit(source_row, source_col, new_value);
         },
-        [active_store, get_cell_raw, session_id],
+        [settle_edit],
     );
 
     const cancel_edit = useCallback(() => {

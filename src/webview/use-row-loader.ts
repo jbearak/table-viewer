@@ -33,6 +33,10 @@ export interface UseRowLoader {
      * `GetCellRaw` in edit-session-store.ts).
      */
     get_cell_raw_for_source(source_row: number, col: number): string | undefined;
+    /** The full loaded cell by canonical source row — same residency contract;
+     *  `null` = resident but blank. The markdown edit path builds edit text and
+     *  bases from the cell's effective rich content through this. */
+    get_cell_for_source(source_row: number, col: number): RenderedCell | null | undefined;
     /** Whether a canonical source row is currently resident on some cached page. */
     has_source_row(source_row: number): boolean;
     /** Up to `max` resident rows for sampling (column auto-fit). */
@@ -99,6 +103,10 @@ export function use_row_loader(
         (source_row: number, col: number) => loader.get_cell_raw_for_source(source_row, col),
         [loader],
     );
+    const get_cell_for_source = useCallback(
+        (source_row: number, col: number) => loader.get_cell_for_source(source_row, col),
+        [loader],
+    );
     const has_source_row = useCallback((source_row: number) => loader.has_source_row(source_row), [loader]);
     const sample_loaded_rows = useCallback((max: number) => loader.sample_loaded_rows(max), [loader]);
 
@@ -110,6 +118,7 @@ export function use_row_loader(
         get_row,
         get_source_row,
         get_cell_raw_for_source,
+        get_cell_for_source,
         has_source_row,
         sample_loaded_rows,
         version,

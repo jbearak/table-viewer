@@ -90,12 +90,15 @@ import {
     CELL_TOOLTIP_SHOW_DELAY_MS,
     cell_tooltip_content,
     cell_tooltip_position,
+    link_open_hint,
     rich_text_overflows_cell,
     clamp_tooltip_text,
     text_overflows_cell,
 } from './cell-overflow-model';
+import { browserIsOSX } from './glide-data-grid/common/browser-detect.js';
 import { count_lines, has_line_break } from './line-breaks';
 import { use_editing, type DirtyEntry } from './use-editing';
+import { cell_edit_text, dirty_value_edit_text, type EditSyntax } from '../cell-edit-model';
 import {
     create_edit_session_store,
     type EditSessionStore,
@@ -163,6 +166,28 @@ const AUTO_FIT_SAMPLE_ROWS = 2000;
 const PREVIEW_RESTORE_MAX_ATTEMPTS = 8;
 const PREVIEW_RESTORE_RETRY_MS = 16;
 const PREVIEW_RESTORE_SETTLE_MS = 32;
+
+/**
+ * Markdown serialization cache for `get_cell_content`'s overlay `edit_value`.
+ * That callback is Glide's per-cell paint path, and re-serializing every
+ * visible editable cell's runs each frame is measurable on wide sheets. Both
+ * inputs — a dirty entry and a loaded cell — are immutable objects replaced
+ * wholesale on change, so object identity is a sound cache key; module-level
+ * because the WeakMap holds nothing alive. Markdown-only: plain sheets never
+ * compute an edit_value here.
+ */
+const markdown_edit_text_cache = new WeakMap<object, string>();
+
+function cached_markdown_edit_text(
+    source: object,
+    serialize: () => string,
+): string {
+    const hit = markdown_edit_text_cache.get(source);
+    if (hit !== undefined) return hit;
+    const text = serialize();
+    markdown_edit_text_cache.set(source, text);
+    return text;
+}
 
 import { use_row_loader } from './use-row-loader';
 import { theme_font_size_px, use_vscode_theme } from './vscode-theme';
@@ -310,6 +335,8 @@ export interface GridShellProps {
     // only possible when csv_editable.
     edit_mode?: boolean;
     csv_editable?: boolean;
+    /** How this sheet's cells are edited ('markdown' for xlsx). Default 'plain'. */
+    edit_syntax?: EditSyntax;
     edit_session_id?: string;
     /** App-owned operation survives generation-keyed GridShell remounts. */
     save_operation?: CsvSaveOperation;
@@ -399,6 +426,7 @@ export function GridShell({
     preview_mode = false,
     edit_mode = false,
     csv_editable = false,
+    edit_syntax = 'plain',
     edit_session_id,
     save_operation,
     save_lifecycle = { revision: 0, state: 'idle' },
@@ -601,6 +629,7 @@ export function GridShell({
         get_row,
         get_source_row,
         get_cell_raw_for_source,
+        get_cell_for_source,
         sample_loaded_rows,
         version,
     } = loader;
@@ -673,6 +702,8 @@ export function GridShell({
     get_row_ref.current = get_row;
     const get_cell_raw_for_source_ref = useRef(get_cell_raw_for_source);
     get_cell_raw_for_source_ref.current = get_cell_raw_for_source;
+    const get_cell_for_source_ref = useRef(get_cell_for_source);
+    get_cell_for_source_ref.current = get_cell_for_source;
     // First parameter is a **canonical source row**, not a display row: durable
     // edit keys are source-keyed, and the store hands the row component of a key
     // straight to this reader (is_entry_conflicted / resolve_pending_bases).
@@ -703,7 +734,16 @@ export function GridShell({
         replace_dirty,
         clear_dirty_keys,
         discard_conflicted,
-    } = use_editing(get_cell_raw, generation, edit_session_id, store);
+    } = use_editing(get_cell_raw, generation, edit_session_id, store, {
+        syntax: edit_syntax,
+        // Same identity discipline as get_cell_raw: rebinds with `version` so
+        // freshly-loaded pages refresh markdown edit text and bases.
+        get_cell: useCallback(
+            (source_row: number, col: number) =>
+                get_cell_for_source_ref.current(source_row, col),
+            [version],
+        ),
+    });
 
     // Tint set = what the webview can derive ∪ what the host named. The union is
     // what everything downstream consumes (the paint callback's ref, the targeted
@@ -1256,12 +1296,26 @@ export function GridShell({
         // rather than being silently dropped (see commit_source_row).
         const source_row = commit_source_row(row);
         if (source_row === undefined) return null;
-        return {
-            key: `${source_row}:${source_column}`,
-            value,
-            original: get_cell_raw(source_row, source_column) ?? '',
-        };
-    }, [commit_source_row, get_cell_raw, source_column_for_display]);
+        // `original` is what the editor *opened with*, so cleanliness is a
+        // comparison in the editor's own space. On a markdown sheet that is
+        // the cell's markup (mirroring get_cell_content's `edit_value`), not
+        // the plain raw text — comparing "**x**" against "x" would mark an
+        // untouched bold cell as uncommitted the moment its editor opened.
+        const key = `${source_row}:${source_column}`;
+        let original: string;
+        const dirty = store.get(key);
+        if (dirty) {
+            original = dirty_value_edit_text(dirty, edit_syntax);
+        } else if (edit_syntax === 'markdown') {
+            const cell = get_cell_for_source_ref.current(source_row, source_column);
+            original = cell
+                ? cell_edit_text(cell, edit_syntax)
+                : get_cell_raw(source_row, source_column) ?? '';
+        } else {
+            original = get_cell_raw(source_row, source_column) ?? '';
+        }
+        return { key, value, original };
+    }, [commit_source_row, edit_syntax, get_cell_raw, source_column_for_display, store]);
 
     // The tracking editor wrapper (provide_editor) refreshes live_uncommitted on
     // open and on every keystroke and clears it on close, so the editing-status
@@ -1536,6 +1590,23 @@ export function GridShell({
         top: number;
     };
     const [cell_tooltip, set_cell_tooltip] = useState<CellTooltipState | null>(null);
+    // Whether the link-open modifier (Cmd on macOS, Ctrl elsewhere) is held.
+    // Drives the linked-cell cursor: a plain click selects, so the pointer
+    // cursor appears only while Ctrl/Cmd+click would actually open the link.
+    // Reset on window blur — the keyup is lost when e.g. Cmd+Tab switches away.
+    const [link_modifier_held, set_link_modifier_held] = useState(false);
+    useEffect(() => {
+        const update = (e: KeyboardEvent) => set_link_modifier_held(e.metaKey || e.ctrlKey);
+        const reset = () => set_link_modifier_held(false);
+        window.addEventListener('keydown', update);
+        window.addEventListener('keyup', update);
+        window.addEventListener('blur', reset);
+        return () => {
+            window.removeEventListener('keydown', update);
+            window.removeEventListener('keyup', update);
+            window.removeEventListener('blur', reset);
+        };
+    }, []);
     const cell_tooltip_timer_ref = useRef<number | null>(null);
     const cell_tooltip_el_ref = useRef<HTMLDivElement | null>(null);
     const cell_tooltip_key_ref = useRef<string | null>(null);
@@ -1713,7 +1784,12 @@ export function GridShell({
                     },
                 );
             }
-            const content = cell_tooltip_content(text, overflows, link);
+            const content = cell_tooltip_content(
+                text,
+                overflows,
+                link,
+                link_open_hint(browserIsOSX.value),
+            );
             if (content === null) return;
 
             const clamped = clamp_tooltip_text(content);
@@ -1928,10 +2004,34 @@ export function GridShell({
             // this closure's identity doesn't churn per edit; the targeted repaint
             // effect damages the cells whose tint actually changed.
             const editable = editable_cells && source_row !== undefined;
+            const loaded_row = get_row(row);
+            // On a markdown sheet the overlay editor must open with markup, not
+            // the plain projection: a dirty cell re-opens showing its committed
+            // runs, a clean cell its effective rich content. Only computed when
+            // the cell can actually open an editor — this is Glide's per-cell
+            // paint callback.
+            let edit_value: string | undefined;
+            if (edit_syntax === 'markdown' && editable) {
+                if (dirty) {
+                    edit_value = cached_markdown_edit_text(
+                        dirty,
+                        () => dirty_value_edit_text(dirty, edit_syntax),
+                    );
+                } else {
+                    const loaded = loaded_row?.[source_column];
+                    if (loaded) {
+                        edit_value = cached_markdown_edit_text(
+                            loaded,
+                            () => cell_edit_text(loaded, edit_syntax),
+                        );
+                    }
+                }
+            }
             let overlay: CellEditOverlay | undefined;
             if (editable_cells || dirty || highlight_bg) {
                 overlay = {
                     editable,
+                    ...(edit_value !== undefined ? { edit_value } : {}),
                     // `refused` is narrower than `!editable` on purpose: it means
                     // "editing is on here and we are refusing this cell", which is
                     // the only situation where Glide's paste path needs closing. A
@@ -1949,7 +2049,7 @@ export function GridShell({
             }
             return build_grid_cell(
                 source_column,
-                get_row(row),
+                loaded_row,
                 show_formatting,
                 overlay,
                 font_size_px,
@@ -1957,14 +2057,17 @@ export function GridShell({
                 // vertical merges whose constituent rows remain at default height.
                 // One-line-high cells keep Glide's cheap single-line paint.
                 get_cell_height(row, display_column) > default_row_height,
+                link_modifier_held,
             );
         },
         // version: bumps when a page lands so the closure (and the redraw effect) refresh.
         [
+            link_modifier_held,
             get_row,
             show_formatting,
             version,
             editable_cells,
+            edit_syntax,
             font_size_px,
             source_column_for_display,
             get_source_row,
@@ -3194,7 +3297,10 @@ export function GridShell({
         const menu_link_url = external_link_url(display_col, row);
         cell_menu_items = cell_context_menu_items({
             ...(menu_link_url !== null
-                ? { on_open_link: () => open_external_url(menu_link_url) }
+                ? {
+                    on_open_link: () => open_external_url(menu_link_url),
+                    on_copy_link: () => void safe_write_to_clipboard(menu_link_url),
+                }
                 : {}),
             dirty: menu_source_row !== undefined
                 && dirty_cells.has(`${menu_source_row}:${source_col}`),

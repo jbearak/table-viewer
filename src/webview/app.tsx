@@ -22,7 +22,8 @@ import {
     type CellHighlightMutation,
     type CellHighlightSelection,
     type CellHighlightState,
-    type CsvDirtyMap,
+    dirty_entries_equal,
+    type CsvDirtyEntry,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
     type CsvSaveWorksheetOperation,
@@ -444,6 +445,8 @@ export function App(): React.JSX.Element {
     const [preview_mode, set_preview_mode] = useState(false);
     const [csv_editable, set_csv_editable] = useState(false);
     const [csv_editing_supported, set_csv_editing_supported] = useState(false);
+    // 'markdown' on xlsx: cell text edits as inline markup (see cell-edit-model).
+    const [edit_syntax, set_edit_syntax] = useState<'plain' | 'markdown'>('plain');
     const [csv_edit_session_id, set_csv_edit_session_id_state] = useState<string>();
     const csv_edit_session_id_ref = useRef<string>();
     /**
@@ -599,7 +602,7 @@ export function App(): React.JSX.Element {
         sheet_index: number;
         sheet_name: string | undefined;
         worksheet_id: string | undefined;
-        entries: Record<string, { value: string; base: string }>;
+        entries: Record<string, CsvDirtyEntry>;
     } | null>(null);
 
     const state_ref = useRef<PerFileState>({});
@@ -2134,6 +2137,7 @@ export function App(): React.JSX.Element {
                     set_csv_editing_supported(
                         snapshot.capabilities.csvEditingSupported,
                     );
+                    set_edit_syntax(snapshot.capabilities.editSyntax ?? 'plain');
 
                     // Acknowledge the exact delivered identity before an optional
                     // corrective CAS write.
@@ -3527,13 +3531,13 @@ export function App(): React.JSX.Element {
                         // already have moved on. `live_rejected_keys` compares against
                         // this so a key that came back with a different value or a
                         // re-read base is understood as a new, unjudged edit.
+                        // The full entry, runs included: a formatting-only
+                        // replacement is a new, unjudged edit, so identity must
+                        // cover the run sides too.
                         entries: Object.fromEntries(
                             msg.rejection.keys.map((key) => [
                                 key,
-                                {
-                                    value: submitted[key]?.value ?? '',
-                                    base: submitted[key]?.base ?? '',
-                                },
+                                submitted[key] ?? { value: '', base: '' },
                             ]),
                         ),
                     });
@@ -4129,12 +4133,13 @@ export function App(): React.JSX.Element {
                 // as a different edit — the user discards a rejected cell and types
                 // into it again, and the fresh entry's base is re-read from the file
                 // the host just changed. That edit has never been submitted, so
-                // claiming "save was cancelled" over it is a lie. Comparing both
-                // fields is deliberate: value alone misses a re-typed identical
-                // value over a new base (genuinely unjudged), and base alone misses
-                // a corrected value over the same stale base.
+                // claiming "save was cancelled" over it is a lie. Full durable
+                // identity is deliberate: value alone misses a re-typed identical
+                // value over a new base (genuinely unjudged), base alone misses
+                // a corrected value over the same stale base, and the run sides
+                // catch a formatting-only replacement.
                 const judged = save_rejection.entries[key];
-                return live.value === judged.value && live.base === judged.base;
+                return dirty_entries_equal(live, judged);
             });
         },
         [
@@ -4554,6 +4559,7 @@ export function App(): React.JSX.Element {
             preview_mode={preview_mode}
             edit_mode={edit_mode_on_active_sheet}
             csv_editable={csv_editable}
+            edit_syntax={edit_syntax}
             edit_session_id={csv_edit_session_id}
             // Save lifecycle is workbook-scoped so it fences every grid; edit
             // stores remain worksheet-scoped so cell keys never cross sheets.

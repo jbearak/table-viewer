@@ -124,21 +124,31 @@ export function hyperlink_tooltip_text(link: CellHyperlink): string {
     return link.tooltip ?? (link.kind === 'external' ? link.target : link.location);
 }
 
+/** The open-gesture hint appended to a linked cell's tooltip — the modifier is
+ *  platform-specific, so the discoverability line must name the right key. */
+export function link_open_hint(is_mac: boolean): string {
+    return is_mac ? 'Cmd+click to open link' : 'Ctrl+click to open link';
+}
+
 /**
  * Content of the hover tooltip, or null for no tooltip. Overflowing text and a
  * hyperlink each earn one; when both apply the link destination goes on its
  * own final line. A linked cell shows a tooltip even without overflow: with
  * Ctrl/Cmd+click as the open gesture, the user needs to see where a link goes
- * before committing.
+ * before committing — and `open_hint` (see {@link link_open_hint}) teaches
+ * the gesture itself, since a plain click only selects.
  */
 export function cell_tooltip_content(
     text: string,
     overflows: boolean,
     link: CellHyperlink | undefined,
+    open_hint?: string,
 ): string | null {
     const link_text = link ? hyperlink_tooltip_text(link) : undefined;
     if (link_text === undefined) return overflows ? text : null;
-    return overflows ? `${text}\n${link_text}` : link_text;
+    // The hint applies only to external links — internal ones aren't openable.
+    const hint = link?.kind === 'external' && open_hint ? `\n${open_hint}` : '';
+    return overflows ? `${text}\n${link_text}${hint}` : `${link_text}${hint}`;
 }
 
 export function clamp_tooltip_text(

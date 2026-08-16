@@ -297,6 +297,89 @@ describe('xlsx edit sessions', () => {
         expect(after.data.sheets[0].rows[1][0]?.raw).toBe(people_before);
     });
 
+    it('writes a styled edit as a rich inline string the reader resolves back', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                saveRequestId: 'save-rich',
+                worksheets: [{
+                    sheetIndex: 0,
+                    sheetName: 'People',
+                    worksheetId: '1',
+                    edits: { '1:0': 'plain bold' },
+                    dirtyEdits: {
+                        '1:0': {
+                            value: 'plain bold',
+                            base: 'Alice',
+                            valueRuns: {
+                                runs: [
+                                    { text: 'plain ' },
+                                    { text: 'bold', style: { bold: true } },
+                                ],
+                            },
+                        },
+                    },
+                }],
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+        const after = await parse_xlsx(bytes);
+        const cell = after.data.sheets[0].rows[1][0];
+        expect(cell?.raw).toBe('plain bold');
+        expect(cell?.richText).toEqual({
+            runs: [
+                { text: 'plain ' },
+                { text: 'bold', style: { bold: true } },
+            ],
+        });
+    });
+
+    it('drops wire runs whose text disagrees with the edit and writes the plain value', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                saveRequestId: 'save-smuggled',
+                worksheets: [{
+                    sheetIndex: 0,
+                    sheetName: 'People',
+                    worksheetId: '1',
+                    edits: { '1:0': 'Alicia' },
+                    dirtyEdits: {
+                        '1:0': {
+                            value: 'Alicia',
+                            base: 'Alice',
+                            // Malicious/buggy renderer: runs spelling a different
+                            // value than the one base validation checked. The
+                            // sanitizer drops the runs; the validated text wins.
+                            valueRuns: {
+                                runs: [{ text: 'SMUGGLED', style: { bold: true } }],
+                            },
+                        },
+                    },
+                }],
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+        const after = await parse_xlsx(bytes);
+        const cell = after.data.sheets[0].rows[1][0];
+        expect(cell?.raw).toBe('Alicia');
+        expect(cell?.richText).toBeUndefined();
+    });
+
     it('writes and clears several worksheets as one atomic workbook save', async () => {
         const state = versioned_state_store({});
         const panel = await open_ready_xlsx(file_path, state);

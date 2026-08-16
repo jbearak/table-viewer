@@ -31,6 +31,11 @@
  * `row-loader.ts`'s ingest validation and deliberately so.
  */
 
+import {
+    rich_text_equal,
+    rich_text_from_plain,
+    type RichText,
+} from './cell-content';
 import type { CsvDirtyMap } from './types';
 
 export type BaseValidationOutcome =
@@ -38,10 +43,35 @@ export type BaseValidationOutcome =
     | { readonly type: 'conflicts'; readonly keys: readonly string[] }
     | { readonly type: 'removedRows'; readonly keys: readonly string[] };
 
+/** Formatting halves of a base comparison, texts already known equal. An
+ *  absent side means "plain", so a plain-vs-plain cell is equal without
+ *  materializing runs, and a one-sided absence compares against explicit
+ *  plain runs of the shared text rather than failing on mere sparseness. */
+function base_formatting_equal(
+    left: RichText | undefined,
+    right: RichText | undefined,
+    text: string,
+): boolean {
+    if (left === undefined && right === undefined) return true;
+    return rich_text_equal(
+        left ?? rich_text_from_plain(text),
+        right ?? rich_text_from_plain(text),
+    );
+}
+
 export function validate_dirty_bases(
     dirty_edits: CsvDirtyMap,
     source_row_count: number,
     read_raw: (source_row: number, col: number) => string | undefined,
+    /**
+     * The source cell's *effective* rich content (cell-edit-model.ts's
+     * `cell_edit_base(...).rich`), or undefined for a plain cell. When the
+     * caller supplies this reader, a base whose text still matches but whose
+     * formatting drifted is a conflict too — otherwise a stale formatting-only
+     * edit would silently overwrite newer formatting. Callers with no rich
+     * source (CSV) omit it, keeping their text-only contract intact.
+     */
+    read_rich?: (source_row: number, col: number) => RichText | undefined,
 ): BaseValidationOutcome {
     const removed_keys: string[] = [];
     const conflicted_keys: string[] = [];
@@ -76,7 +106,20 @@ export function validate_dirty_bases(
         // contract, where a loaded-but-blank cell is ''. Without this every edit
         // that filled a blank trailing cell would validate as a false conflict.
         const current = read_raw(source_row, col) ?? '';
-        if (current !== entry.base) conflicted_keys.push(key);
+        if (current !== entry.base) {
+            conflicted_keys.push(key);
+            continue;
+        }
+        // Text matches; on a rich source, the formatting must too. A cell the
+        // text reader could not observe was already conflicted above (`current`
+        // is '' only when the base claims ''), so reading rich for it is moot —
+        // undefined from either side of an unobserved cell means "plain".
+        if (
+            read_rich
+            && !base_formatting_equal(entry.baseRuns, read_rich(source_row, col), current)
+        ) {
+            conflicted_keys.push(key);
+        }
     }
 
     // A removed row outranks a mismatch: it is the more destructive fact, and its

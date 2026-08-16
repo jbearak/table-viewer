@@ -4,7 +4,7 @@
  * folding rule is unit-tested without Glide or the DOM.
  */
 
-import type { CsvDirtyEntry, CsvDirtyMap } from '../types';
+import { make_dirty_entry, type CsvDirtyEntry, type CsvDirtyMap } from '../types';
 
 export type CsvSavePayloadPreflight =
     | {
@@ -34,7 +34,11 @@ export function collect_save_payload(
             });
         }
         edits[key] = entry.value;
-        exact[key] = Object.freeze({ value: entry.value, base: entry.base });
+        // Runs ride along: the xlsx save plan reads `valueRuns` off the exact
+        // entry to write styled inline strings; string-only consumers ignore it.
+        exact[key] = Object.freeze(
+            make_dirty_entry(entry.value, entry.base, entry.valueRuns, entry.baseRuns),
+        );
     }
     return Object.freeze({
         status: 'ready',

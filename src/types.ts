@@ -8,7 +8,13 @@ import type {
     WorkbookSnapshot,
     WorkbookSnapshotIdentity,
 } from './viewer-snapshot';
-import type { RichCellFields } from './cell-content';
+import {
+    is_matching_rich_text,
+    rich_text_equal,
+    type RichCellFields,
+    type RichText,
+} from './cell-content';
+import { is_plain_record } from './plain-record';
 
 export interface WorkbookData {
     sheets: SheetData[];
@@ -595,9 +601,7 @@ export interface LegacyPerFileState {
 }
 export type StoredPerFileState = PerFileState | LegacyPerFileState;
 
-export function is_plain_record(value: unknown): value is Record<string, unknown> {
-    return !!value && typeof value === 'object' && !Array.isArray(value);
-}
+export { is_plain_record };
 
 function is_non_negative_integer(value: unknown): value is number {
     return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
@@ -747,6 +751,18 @@ function validate_edit_cells(value: unknown): Record<string, string | CsvDirtyEn
         if (typeof entry === 'string') continue;
         if (!is_plain_record(entry) || typeof entry.value !== 'string' || typeof entry.base !== 'string') {
             invalid_leaf('pendingEdits');
+        }
+        // Optional styled-run sides of a rich edit. Rejected (not dropped) when
+        // malformed, like every other field: silently stripping runs would turn
+        // a formatting edit into a no-op that still overwrites the cell. The
+        // text-agreement half of the predicate is the smuggling boundary — see
+        // `is_matching_rich_text`.
+        for (const [runs, text] of [
+            [entry.valueRuns, entry.value],
+            [entry.baseRuns, entry.base],
+        ] as const) {
+            if (runs === undefined) continue;
+            if (!is_matching_rich_text(runs, text)) invalid_leaf('pendingEdits');
         }
     }
     return value as Record<string, string | CsvDirtyEntry>;
@@ -1266,13 +1282,120 @@ export function reconcile_pending_edit_sheets(
     return next.length === 0 ? undefined : next;
 }
 
-/** Exact conflict-preserving entry durably owned by the CSV edit session. */
+/** Exact conflict-preserving entry durably owned by the CSV edit session.
+ *
+ *  `value`/`base` are always the plain-text projection, which is what every
+ *  string-typed consumer (the CSV serializer, wire dedupe, legacy durable
+ *  entries) continues to see. The optional run fields are present only when
+ *  the corresponding side carries styles (Excel markdown editing): a plain
+ *  edit keeps its exact legacy shape, and semantic comparison composes
+ *  `{text, rich?}` through cell-edit-model.ts. */
 export interface CsvDirtyEntry {
     readonly value: string;
     readonly base: string;
+    /** Styled runs of `value`, when the committed edit carries styles. */
+    readonly valueRuns?: RichText;
+    /** Styled runs of `base`, when the cell's effective content did. */
+    readonly baseRuns?: RichText;
 }
 
 export type CsvDirtyMap = Readonly<Record<string, CsvDirtyEntry>>;
+
+/**
+ * The one constructor of the sparse dirty-entry shape: run sides present only
+ * when given, so plain edits keep their exact legacy `{value, base}` form.
+ * Every layer that copies an entry into an owned object (store commit, wire
+ * payload, save payload, durable persist) goes through here, so a future
+ * optional field is added in one place rather than per copy site.
+ */
+export function make_dirty_entry(
+    value: string,
+    base: string,
+    valueRuns?: RichText,
+    baseRuns?: RichText,
+): CsvDirtyEntry {
+    return {
+        value,
+        base,
+        ...(valueRuns !== undefined ? { valueRuns } : {}),
+        ...(baseRuns !== undefined ? { baseRuns } : {}),
+    };
+}
+
+/**
+ * Copy an untrusted dirty entry into the exact owned shape, keeping a run side
+ * only when `is_matching_rich_text` accepts it — the same smuggling boundary
+ * `validate_edit_cells` enforces. Unlike the durable validator this *drops* a
+ * bad run side rather than rejecting the entry: this runs on the save path,
+ * where the plain projection is still the text the user committed, so writing
+ * it unstyled is a correct save while refusing the whole operation over one
+ * malformed optional field is not.
+ */
+export function sanitized_dirty_entry(entry: {
+    readonly value: string;
+    readonly base: string;
+    readonly valueRuns?: unknown;
+    readonly baseRuns?: unknown;
+}): CsvDirtyEntry {
+    const keep = (runs: unknown, text: string): RichText | undefined => (
+        is_matching_rich_text(runs, text) ? runs : undefined
+    );
+    return make_dirty_entry(
+        entry.value,
+        entry.base,
+        keep(entry.valueRuns, entry.value),
+        keep(entry.baseRuns, entry.base),
+    );
+}
+
+/**
+ * `sanitized_dirty_entry` for a value straight off the wire, where even the
+ * `{value, base}` record shape is a claim: a stale or buggy renderer can post
+ * `null`, a string where an object belongs, or numbers in the text fields, and
+ * the sanitizer would throw on the first property read. Returns `undefined`
+ * for anything that is not a two-string record — the caller drops the entry —
+ * and otherwise defers to the sanitizer's run-side policy.
+ */
+export function sanitized_wire_dirty_entry(entry: unknown): CsvDirtyEntry | undefined {
+    if (
+        !is_plain_record(entry)
+        || typeof entry.value !== 'string'
+        || typeof entry.base !== 'string'
+    ) return undefined;
+    return sanitized_dirty_entry(entry as {
+        readonly value: string;
+        readonly base: string;
+        readonly valueRuns?: unknown;
+        readonly baseRuns?: unknown;
+    });
+}
+
+/**
+ * Durable identity of one dirty entry — the comparison every dedupe/no-op
+ * guard on the edit path shares (store notification suppression, wire payload
+ * dedupe, save-lifecycle operation matching). Runs compare via the canonical
+ * `rich_text_equal` (an absent side differs from a present one), so equal
+ * formatting is equal identity and a formatting-only difference reads as a
+ * real difference everywhere at once.
+ */
+export function dirty_entries_equal(
+    left: CsvDirtyEntry,
+    right: CsvDirtyEntry,
+): boolean {
+    return left.value === right.value
+        && left.base === right.base
+        && optional_runs_equal(left.valueRuns, right.valueRuns)
+        && optional_runs_equal(left.baseRuns, right.baseRuns);
+}
+
+function optional_runs_equal(
+    left: RichText | undefined,
+    right: RichText | undefined,
+): boolean {
+    if (left === right) return true;
+    if (left === undefined || right === undefined) return false;
+    return rich_text_equal(left, right);
+}
 
 /** Why the host refused a save whose bases no longer match the file. Carried on
  *  the failure result rather than a separate message so it cannot be delivered
@@ -1457,7 +1580,7 @@ export type WebviewMessage =
     // no sheet names to reorder (the CSV shape). The host validates the pair and
     // resolves the *name* at write time, so a post queued across an external
     // reorder still lands in the worksheet the user actually edited.
-    | { type: 'pendingEditsChanged'; edits: Record<string, { value: string; base: string }> | null; editSessionId: string; sequence: number; sheetIndex?: number; sheetName?: string; worksheetId?: string }
+    | { type: 'pendingEditsChanged'; edits: Record<string, CsvDirtyEntry> | null; editSessionId: string; sequence: number; sheetIndex?: number; sheetName?: string; worksheetId?: string }
     /** Renderer close/reload barrier response; zero means no map was produced. */
     | { type: 'pendingEditsFlush'; requestId: string; editSessionId?: string; highestProducedSequence: number }
     /** The renderer could not establish the requested close/reload barrier. */

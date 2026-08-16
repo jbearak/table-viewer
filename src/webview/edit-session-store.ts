@@ -12,7 +12,7 @@
  * this file entirely.
  */
 
-import type { CsvDirtyEntry } from '../types';
+import { dirty_entries_equal, make_dirty_entry, type CsvDirtyEntry } from '../types';
 
 export interface DirtyEntry extends CsvDirtyEntry {
     // When true, `base` has not yet been captured against a resident page (an
@@ -47,7 +47,13 @@ export function clear_saved_dirty_entries(
         const entry = next.get(key);
         if (!entry) continue;
         if (entry.value === value) next.delete(key);
-        else next.set(key, { value: entry.value, base: value });
+        // Re-based on the plain text the save wrote. The kept side's runs come
+        // along; the new base gets none — the saved string is all this path
+        // knows, and a missing base side just means the next conflict check
+        // compares plain text, which is what the host validates anyway.
+        else {
+            next.set(key, make_dirty_entry(entry.value, value, entry.valueRuns));
+        }
     }
     return next;
 }
@@ -209,7 +215,9 @@ function entries_equal(
         const before = prev.get(key);
         if (before === undefined) return false;
         if (before === entry) continue;
-        if (before.value !== entry.value || before.base !== entry.base) return false;
+        // Run sides included: a formatting-only recommit (same text, different
+        // runs) must read as a change or the notification chain drops it.
+        if (!dirty_entries_equal(before, entry)) return false;
         if (!!before.base_pending !== !!entry.base_pending) return false;
     }
     return true;
@@ -345,7 +353,7 @@ export function create_edit_session_store(
         commit: (session_id, key, entry) => {
             if (!owns(session_id)) return;
             const next = new Map(state.entries);
-            next.set(key, { value: entry.value, base: entry.base });
+            next.set(key, make_dirty_entry(entry.value, entry.base, entry.valueRuns, entry.baseRuns));
             set_entries(next, state.pending_base);
         },
         remove: (session_id, key) => {
@@ -369,12 +377,13 @@ export function create_edit_session_store(
             let pending_base = false;
             const next = new Map<string, DirtyEntry>();
             for (const [key, entry] of Object.entries(entries)) {
+                const owned = make_dirty_entry(entry.value, entry.base, entry.valueRuns, entry.baseRuns);
                 if (entry.base_pending) {
                     pending_base = true;
-                    next.set(key, { value: entry.value, base: entry.base, base_pending: true });
+                    next.set(key, { ...owned, base_pending: true });
                     continue;
                 }
-                next.set(key, { value: entry.value, base: entry.base });
+                next.set(key, owned);
             }
             set_entries(next, pending_base);
         },
@@ -400,7 +409,7 @@ export function create_edit_session_store(
                     const [r, c] = key.split(':').map(Number);
                     const cur = get_cell_raw(r, c);
                     if (cur !== undefined) {
-                        next.set(key, { value: entry.value, base: cur });
+                        next.set(key, make_dirty_entry(entry.value, cur, entry.valueRuns));
                         changed = true;
                         continue;
                     }

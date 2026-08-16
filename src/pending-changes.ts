@@ -13,15 +13,22 @@
  * the host can refuse a save whose source moved underneath it.
  */
 
-import { is_plain_record } from './types';
+import { is_plain_record } from './plain-record';
 import {
     hyperlinks_equal,
+    is_valid_rich_text,
     rich_text_equal,
     rich_text_from_plain,
     rich_text_plain_text,
     type CellHyperlink,
     type RichText,
 } from './cell-content';
+
+// Structural rich-text validation lives beside the RichText model in
+// cell-content.ts (a leaf), so future codecs can validate without importing
+// this higher-level module; re-exported because this is where consumers of the
+// *pending-change* validators already look.
+export { is_matching_rich_text, is_valid_rich_text } from './cell-content';
 
 /** A value as the editor produces it. `plain` carries exact text (CSV and
  *  typed scalars); `richText` carries normalized runs (Excel text cells). */
@@ -80,29 +87,7 @@ export function hyperlink_changes_equal(
 
 // --- Validation (durable state and wire payloads are untrusted) ---
 
-const MAX_RUNS_PER_CELL = 4096;
 const MAX_HYPERLINK_LENGTH = 8 * 1024;
-
-function is_valid_style(value: unknown): boolean {
-    if (!is_plain_record(value)) return false;
-    for (const [key, flag] of Object.entries(value)) {
-        if (key !== 'bold' && key !== 'italic' && key !== 'underline' && key !== 'strikethrough') {
-            return false;
-        }
-        if (flag !== true) return false;
-    }
-    return true;
-}
-
-export function is_valid_rich_text(value: unknown): value is RichText {
-    if (!is_plain_record(value) || !Array.isArray(value.runs)) return false;
-    if (value.runs.length > MAX_RUNS_PER_CELL) return false;
-    for (const run of value.runs) {
-        if (!is_plain_record(run) || typeof run.text !== 'string') return false;
-        if (run.style !== undefined && !is_valid_style(run.style)) return false;
-    }
-    return true;
-}
 
 export function is_valid_editable_value(value: unknown): value is EditableCellValue {
     if (!is_plain_record(value)) return false;

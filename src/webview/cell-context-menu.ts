@@ -15,6 +15,8 @@ export interface CellContextMenuModelProps {
     highlight_cell_count: number;
     /** Set when the cell carries a valid external hyperlink. */
     on_open_link?: () => void;
+    /** Set alongside `on_open_link`: copy the link's URL to the clipboard. */
+    on_copy_link?: () => void;
     on_discard_edit: () => void;
     on_copy_cell: () => void;
     on_copy_selection: () => void;
@@ -29,9 +31,12 @@ export interface CellContextMenuModelProps {
 
 export function cell_context_menu_items(props: CellContextMenuModelProps): MenuItem[] {
     const items: MenuItem[] = [];
-    const { on_open_link } = props;
+    const { on_open_link, on_copy_link } = props;
     if (on_open_link) {
         items.push({ label: 'Open link', on_click: () => on_open_link() });
+    }
+    if (on_copy_link) {
+        items.push({ label: 'Copy link', on_click: () => on_copy_link() });
     }
     if (props.dirty) {
         items.push({ label: 'Discard edit', on_click: () => props.on_discard_edit() });

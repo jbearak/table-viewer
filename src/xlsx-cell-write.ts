@@ -1,4 +1,5 @@
 import { find_tag_end, is_tag_boundary, is_self_closing } from './ooxml-xml';
+import { text_styles_equal, type CellTextStyle, type RichTextRun } from './cell-content';
 
 /**
  * Surgical, `putexcel`-style cell writes into a worksheet's OOXML.
@@ -25,6 +26,15 @@ export interface XlsxCellEdit {
     readonly col: number;
     /** The raw text the user typed. Empty string clears the cell's value. */
     readonly value: string;
+    /**
+     * Styled runs of `value`, present when the edit carries character-level
+     * formatting. Concatenated run text must equal `value`. When every run's
+     * style equals the cell's own font style the writer reduces to the plain
+     * string form (the runs carry no information beyond the `s=` style, and a
+     * plain form keeps number/date/boolean classification working); otherwise
+     * the cell is written as a rich inline string.
+     */
+    readonly runs?: readonly RichTextRun[];
 }
 
 /** Strings written to the workbook go inline, so the writer never needs the shared string table. */
@@ -37,6 +47,22 @@ export interface XlsxWriteOptions {
      * serial (keeping the cell's date format) or a plain string.
      */
     readonly is_date_style: (xf_index: number, serial: number) => boolean;
+    /**
+     * The four style flags of the cell font behind an `s=` index, as the reader
+     * resolves them. Rich edits consult this for the uniform-style reduction
+     * above. Absent (legacy callers) reads as "no cell font style", which only
+     * forgoes the reduction — rich output stays correct, just less minimal.
+     */
+    readonly cell_font_style?: (xf_index: number) => CellTextStyle | undefined;
+    /**
+     * The cell font's non-flag properties (name, size, color, family, scheme…)
+     * as raw `<rPr>`-ready inner XML, for the `s=` index. OOXML run properties
+     * REPLACE the cell font rather than merging with it, so an `<rPr>` that
+     * carried only our four flags would silently reset a Cambria-14 cell's
+     * styled runs to the default font. Every emitted `<rPr>` starts from this
+     * base. Absent reads as '' — correct for default-font workbooks.
+     */
+    readonly run_font_base?: (xf_index: number) => string;
 }
 
 const MS_PER_DAY = 86400000;
@@ -250,6 +276,34 @@ function boolean_literal(value: string): '1' | '0' | null {
 }
 
 /**
+ * One `<r>` run of a rich inline string.
+ *
+ * A present `<rPr>` REPLACES the referencing cell's font (OOXML inheritance
+ * rule, mirrored by the reader's `resolve_rich_text_runs`), so:
+ *  - a run whose style equals the cell font's own flags is written with *no*
+ *    `<rPr>` and inherits everything, including name/size/color;
+ *  - any other run gets `<rPr>` = the cell font's non-flag properties
+ *    (`font_base`, so a Cambria-14 cell's styled runs stay Cambria-14) plus a
+ *    tag per flag that is on. Off flags are simply absent — replacement
+ *    semantics make absence mean off, which is exactly how
+ *    `parse_font_properties` reads it back.
+ */
+function build_run_xml(
+    run: RichTextRun,
+    cell_style: CellTextStyle | undefined,
+    font_base: string,
+): string {
+    const text = `<t xml:space="preserve">${encode_xml(run.text)}</t>`;
+    if (text_styles_equal(run.style, cell_style)) return `<r>${text}</r>`;
+    const props = font_base
+        + (run.style?.bold ? '<b/>' : '')
+        + (run.style?.italic ? '<i/>' : '')
+        + (run.style?.strikethrough ? '<strike/>' : '')
+        + (run.style?.underline ? '<u/>' : '');
+    return `<r><rPr>${props}</rPr>${text}</r>`;
+}
+
+/**
  * Build the replacement `<c>` element for one cell.
  *
  * Strings are written as `t="inlineStr"` rather than appended to
@@ -263,14 +317,31 @@ function boolean_literal(value: string): '1' | '0' | null {
 function build_cell_xml(
     row: number,
     col: number,
-    value: string,
+    edit: XlsxCellEdit,
     xf_index: number | null,
     options: XlsxWriteOptions,
     was_boolean = false,
     was_iso_date = false,
 ): string {
+    const { value } = edit;
     const ref = `${col_index_to_letter(col)}${row + 1}`;
     const style_attr = xf_index !== null && xf_index !== 0 ? ` s="${xf_index}"` : '';
+    // A rich edit whose runs still carry styling beyond the cell's own font is
+    // written as a rich inline string — checked ahead of the scalar paths
+    // because styled text is text: `**2024-01-15**` must not become a serial.
+    // Runs that all match the cell font carry nothing the `s=` style doesn't
+    // already say, so they reduce to `value` and fall through to the ordinary
+    // classification below (string, number, date, boolean — unchanged).
+    if (edit.runs !== undefined && edit.runs.length > 0) {
+        const cell_style = options.cell_font_style?.(xf_index ?? 0);
+        if (!edit.runs.every((run) => text_styles_equal(run.style, cell_style))) {
+            const font_base = options.run_font_base?.(xf_index ?? 0) ?? '';
+            const runs = edit.runs
+                .map((run) => build_run_xml(run, cell_style, font_base))
+                .join('');
+            return `<c r="${ref}"${style_attr} t="inlineStr"><is>${runs}</is></c>`;
+        }
+    }
     // An ISO-date cell edited back to a date stays one, for the same reason a
     // boolean does. `t="d"` stores the date as text and the reader shows it
     // verbatim — no serial, no style consulted — so the user retypes what looks
@@ -1295,7 +1366,7 @@ export function apply_cell_edits(
             // Whole row absent: synthesize it, with its cells in column order.
             const cells = [...row_edits]
                 .sort((a, b) => a.col - b.col)
-                .map((e) => build_cell_xml(e.row, e.col, e.value, null, options))
+                .map((e) => build_cell_xml(e.row, e.col, e, null, options))
                 .join('');
             new_rows.push({ row, text: `<row r="${row + 1}">${cells}</row>` });
             continue;
@@ -1349,7 +1420,7 @@ export function apply_cell_edits(
                     text: build_cell_xml(
                         e.row,
                         e.col,
-                        e.value,
+                        e,
                         xf,
                         options,
                         /\bt="b"/.test(cell_span.open_tag),
@@ -1357,7 +1428,7 @@ export function apply_cell_edits(
                     ),
                 });
             } else {
-                inserts.push({ col: e.col, text: build_cell_xml(e.row, e.col, e.value, null, options) });
+                inserts.push({ col: e.col, text: build_cell_xml(e.row, e.col, e, null, options) });
             }
         }
 
