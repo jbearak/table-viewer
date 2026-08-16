@@ -38,6 +38,7 @@ export type ThemeId =
     | 'gruvbox-light-hard'
     | 'gruvbox-light-medium'
     | 'gruvbox-light-soft'
+    | 'light-high-contrast'
     | 'gruvbox-dark-hard'
     | 'gruvbox-dark-medium'
     | 'gruvbox-dark-soft'
@@ -567,6 +568,51 @@ const DARK_HIGH_CONTRAST: Record<string, string> = {
     '--vscode-list-activeSelectionBackground': '#000000',
 };
 
+/* Light High Contrast — Copyright (c) Microsoft Corporation, MIT. Ported from
+   VS Code 1.101's `theme-defaults/themes/hc_light.json` and its `hc-light`
+   workbench defaults.
+
+   The upstream JSON is deliberately sparse: most chrome colors are inherited
+   from VS Code's workbench. Copying only those sparse overrides into this app
+   leaves our explicitly themed toolbar, sheet strip, sort strip, and popovers
+   on their dark fallbacks while `foreground` becomes #292929 — dark-on-dark,
+   as the regression screenshots in this change demonstrate. This palette
+   therefore preserves the upstream white editor, #292929 text, blue focus /
+   contrast family, and #dddddd toggled fill while completing them into a light
+   surface ladder for the app-specific chrome. */
+const LIGHT_HIGH_CONTRAST_PALETTE: SemanticPalette = {
+    bg: '#ffffff',
+    bgAlt: '#f2f2f2',       // hc-light blockquote/code-block surface
+    bgElevated: '#e6e6e6',  // app chrome: raised from bgAlt without going dark
+    fg: '#292929',          // hc-light foreground
+    fgMuted: '#696969',     // hc-light 70% foreground flattened onto white
+    fgSubtle: '#7f7f7f',    // hc-light disabledForeground
+    border: '#0f4a85',      // hc-light contrastBorder
+    accent: '#006bbd',      // hc-light focusBorder
+    accentHover: '#005a9e', // hand-darkened focus blue
+    accentFg: '#ffffff',
+    selection: '#0f4a85',
+    hover: '#dddddd',       // actionBar.toggledBackground
+    link: '#0f4a85',        // hc-light textLink.foreground
+    error: '#b5200d',       // hc-light errorForeground
+    warning: '#895503',
+    info: '#0f4a85',        // darkened to keep info-banner text above 4.5:1
+};
+
+const LIGHT_HIGH_CONTRAST: Record<string, string> = {
+    ...derive_theme_variables(LIGHT_HIGH_CONTRAST_PALETTE),
+    '--vscode-button-border': '#0f4a85',
+    '--vscode-contrastBorder': '#0f4a85',
+    // HC list selections use the page surface plus an explicit focus/contrast
+    // outline. A dark filled row would recreate the illegible chrome this port
+    // is specifically avoiding.
+    '--vscode-list-activeSelectionBackground': '#ffffff',
+    '--vscode-list-activeSelectionForeground': '#292929',
+    // Keep the upstream disabled tone, but placeholders are readable text rather
+    // than disabled controls and need 4.5:1 against the raised input surface.
+    '--vscode-input-placeholderForeground': '#5f5f5f',
+};
+
 // --- the registry -----------------------------------------------------------
 
 export const THEME_DEFINITIONS: Record<ThemeId, ThemeDefinition> = {
@@ -590,6 +636,11 @@ export const THEME_DEFINITIONS: Record<ThemeId, ThemeDefinition> = {
     'gruvbox-light-soft': {
         id: 'gruvbox-light-soft', kind: 'light', label: 'Gruvbox Light Soft',
         variables: derive_theme_variables(GRUVBOX_LIGHT_SOFT),
+    },
+    'light-high-contrast': {
+        id: 'light-high-contrast', kind: 'light', label: 'Light High Contrast',
+        variables: LIGHT_HIGH_CONTRAST,
+        highContrast: true,
     },
     dark: { id: 'dark', kind: 'dark', label: 'Dark', variables: DARK },
     'solarized-dark': {
