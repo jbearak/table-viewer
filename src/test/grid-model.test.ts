@@ -34,6 +34,10 @@ describe('get_needed_page_starts', () => {
 });
 
 describe('clamp_column_width', () => {
+    it('allows columns up to 3,200 pixels wide', () => {
+        expect(MAX_COLUMN_WIDTH_PX).toBe(3200);
+        expect(clamp_column_width(3200)).toBe(3200);
+    });
     it('clamps below the minimum', () => {
         expect(clamp_column_width(1)).toBe(MIN_COLUMN_WIDTH_PX);
     });

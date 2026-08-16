@@ -24,17 +24,20 @@ async function render_editor(
     on_change = vi.fn(),
     on_finished = vi.fn(),
     on_navigation = vi.fn(),
+    initial_value?: string,
 ) {
     container = document.createElement('div');
     document.body.appendChild(container);
     root = createRoot(container);
     await act(async () => {
-        root!.render(React.createElement(CsvCellEditor, {
+        const props = {
             value: value(text),
             onChange: on_change,
             onFinishedEditing: on_finished,
             onCommitNavigation: on_navigation,
-        }));
+            initialValue: initial_value,
+        };
+        root!.render(React.createElement(CsvCellEditor, props));
     });
     return { on_change, on_finished, on_navigation };
 }
@@ -48,6 +51,22 @@ afterEach(() => {
 });
 
 describe('CsvCellEditor', () => {
+    it('places the caret after the seed character when typing opens the editor', async () => {
+        await render_editor('a', vi.fn(), vi.fn(), vi.fn(), 'a');
+
+        const input = container!.querySelector('input')!;
+        expect(input.selectionStart).toBe(1);
+        expect(input.selectionEnd).toBe(1);
+    });
+
+    it('selects the existing value when opening without typed input', async () => {
+        await render_editor('Alice');
+
+        const input = container!.querySelector('input')!;
+        expect(input.selectionStart).toBe(0);
+        expect(input.selectionEnd).toBe(5);
+    });
+
     it('reports forward Tab navigation and leaves movement to GridShell', async () => {
         const { on_finished, on_navigation } = await render_editor('Alice');
         const input = container!.querySelector('input')!;

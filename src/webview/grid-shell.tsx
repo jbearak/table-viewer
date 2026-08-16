@@ -45,7 +45,10 @@ import {
     column_projections_equal,
     type ColumnProjection,
 } from './column-projection';
-import { build_grid_columns } from './grid-model';
+import {
+    build_grid_columns,
+    MAX_COLUMN_WIDTH_PX,
+} from './grid-model';
 import { ContextMenu } from './context-menu';
 import { cell_context_menu_items } from './cell-context-menu';
 import { ColumnContextMenu, MultiColumnContextMenu } from './column-context-menu';
@@ -3480,6 +3483,8 @@ export function GridShell({
                 height="100%"
                 rows={row_count}
                 columns={columns}
+                maxColumnWidth={MAX_COLUMN_WIDTH_PX}
+                maxColumnAutoWidth={MAX_COLUMN_WIDTH_PX}
                 mergedRanges={merged_ranges}
                 getCellContent={get_cell_content}
                 rowHeight={get_row_height}
