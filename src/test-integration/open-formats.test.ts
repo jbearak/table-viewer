@@ -1,4 +1,7 @@
 import * as assert from 'assert';
+import * as fs from 'fs/promises';
+import * as os from 'os';
+import * as path from 'path';
 import * as vscode from 'vscode';
 import {
     activate_extension,
@@ -42,6 +45,37 @@ describe('open supported formats', () => {
         );
         const opened = await wait_for(() => has_custom_tab('tableViewer.editor'));
         assert.ok(opened, 'expected a tableViewer.editor custom tab for basic.tsv');
+    });
+
+    it('discovers the table editor for every selector alternative and letter case', async () => {
+        const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'table-viewer-selector-'));
+        const cases = [
+            ['basic.xlsx', 'selector.XlSx'],
+            ['basic.xls', 'selector.XlS'],
+            ['basic.csv', 'selector.CsV'],
+            ['basic.tsv', 'selector.TsV'],
+        ] as const;
+
+        try {
+            for (const [fixture, target_name] of cases) {
+                const target = vscode.Uri.file(path.join(directory, target_name));
+                await fs.copyFile(fixture_uri(fixture).fsPath, target.fsPath);
+                await vscode.commands.executeCommand('vscode.open', target);
+
+                const opened = await wait_for(() => has_custom_tab('tableViewer.editor'));
+                assert.ok(opened, `expected Table Viewer to be discovered for ${target_name}`);
+
+                await close_all_editors();
+                const closed = await wait_for(
+                    () => has_custom_tab('tableViewer.editor') === false,
+                    5000,
+                );
+                assert.ok(closed, `expected Table Viewer to close after testing ${target_name}`);
+            }
+        } finally {
+            await close_all_editors();
+            await fs.rm(directory, { recursive: true, force: true });
+        }
     });
 
     it('CSV opened via the editor association renders (no xls error)', async () => {

@@ -136,10 +136,10 @@ describe('extension custom-editor manifest', () => {
         const editor = contribution('tableViewer.editor');
         expect(editor.priority).toBe('default');
         expect(editor.selector).toEqual([
-            { filenamePattern: '*.[xX][lL][sS][xX]' },
-            { filenamePattern: '*.[xX][lL][sS]' },
-            { filenamePattern: '*.[cC][sS][vV]' },
-            { filenamePattern: '*.[tT][sS][vV]' },
+            {
+                filenamePattern:
+                    '*.{[xX][lL][sS][xX],[xX][lL][sS],[cC][sS][vV],[tT][sS][vV]}',
+            },
         ]);
         expect(custom_editors).toHaveLength(1);
     });
