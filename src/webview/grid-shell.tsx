@@ -2788,11 +2788,26 @@ export function GridShell({
             // Damage explicitly: a link change on an already-dirty cell leaves
             // the dirty key set unchanged, so the tint effect below sees no
             // transition and would never repaint the new link presentation.
-            grid_ref.current?.updateCells([
-                { cell: [target.display_col, target.row] },
-            ]);
+            // Through the same source-keyed pipeline as every other such
+            // repaint, so one source row showing at several display rows — and
+            // a merge whose anchor is off-screen — are handled here too.
+            const cells = source_key_damage(
+                new Set([`${target.source_row}:${target.source_col}`]),
+                visible_ref.current,
+                display_column_for_source,
+                get_source_row,
+                merged_ranges,
+            ).map(({ cell }) => ({ cell: cell as Item }));
+            if (cells.length > 0) grid_ref.current?.updateCells(cells);
         },
-        [commit_hyperlink, hyperlink_dialog, save_in_flight_ref],
+        [
+            commit_hyperlink,
+            display_column_for_source,
+            get_source_row,
+            hyperlink_dialog,
+            merged_ranges,
+            save_in_flight_ref,
+        ],
     );
 
     const apply_column_sort = useCallback((

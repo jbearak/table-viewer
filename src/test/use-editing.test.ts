@@ -851,4 +851,37 @@ describe('use_editing — commit_hyperlink', () => {
             link: { kind: 'internal', location: 'B2' }, baseLink: site,
         });
     });
+
+    it('flags a stale link edit as conflicted and discards it locally', async () => {
+        // The source link changed under a pending link edit. Detected here,
+        // not only at save time, so the cell is tinted and reachable by
+        // "Discard conflicted" like any other stale edit.
+        const rows: (CellData | null)[][] = [[
+            { raw: 'site', formatted: 'site', bold: false, italic: false, hyperlink: site },
+        ]];
+        await render_linked(rows);
+        await act(async () => { hook_result!.commit_hyperlink(0, 0, other); });
+        expect(hook_result!.conflicted_keys.has('0:0')).toBe(false);
+
+        rows[0][0] = {
+            raw: 'site', formatted: 'site', bold: false, italic: false,
+            hyperlink: { kind: 'internal', location: 'B2' },
+        };
+        // Re-render so the hook re-derives against the changed source.
+        await act(async () => {
+            root!.render(React.createElement(LinkHarness, { rows }));
+        });
+        expect(hook_result!.conflicted_keys.has('0:0')).toBe(true);
+
+        await act(async () => { hook_result!.discard_conflicted(); });
+        expect(hook_result!.dirty_cells.has('0:0')).toBe(false);
+    });
+
+    it('does not flag a link edit whose row is not resident', async () => {
+        await render_linked();
+        await act(async () => { hook_result!.commit_hyperlink(0, 1, site); });
+        // Row 9 was never loaded; an unknown cell is not a conflict.
+        await act(async () => { hook_result!.commit_hyperlink(9, 0, site); });
+        expect(hook_result!.conflicted_keys.has('9:0')).toBe(false);
+    });
 });

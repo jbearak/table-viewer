@@ -22,6 +22,7 @@
  */
 
 import {
+    encode_xml_attr,
     find_tag_end,
     get_attr,
     is_self_closing,
@@ -42,12 +43,12 @@ export interface XlsxHyperlinkEdit {
 
 /** The two texts a worksheet's hyperlink edits change. `rels_xml` is null when
  *  the `.rels` part needs no change (internal-only edits against a sheet whose
- *  rels are untouched); `rels_created` marks a part that must be ADDED to the
- *  package rather than replaced. */
+ *  rels are untouched). Whether a returned part must be ADDED to the package
+ *  rather than replaced is not reported here: the caller passed the part in, so
+ *  it already knows — a null input with a non-null result is a creation. */
 export interface HyperlinkWriteResult {
     readonly sheet_xml: string;
     readonly rels_xml: string | null;
-    readonly rels_created: boolean;
 }
 
 const HYPERLINK_REL_TYPE
@@ -55,27 +56,6 @@ const HYPERLINK_REL_TYPE
 const RELS_NS = 'http://schemas.openxmlformats.org/package/2006/relationships';
 const OFFICE_R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
 
-/** Attribute-value escaping (attributes only — these strings never land in
- *  text content). Quotes matter here where xlsx-cell-write's content escaper
- *  wouldn't need them. */
-function encode_attr(s: string): string {
-    return s
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        // Raw whitespace in attribute values is normalized to spaces by every
-        // XML parser (1.0 §3.3.3); numeric references are exempt, and they
-        // are how a deliberate tab/newline in a tooltip survives a round-trip.
-        .replace(/\t/g, '&#9;')
-        .replace(/\r/g, '&#13;')
-        .replace(/\n/g, '&#10;')
-        // Characters XML 1.0 forbids outright (no escape exists); see
-        // xlsx-cell-write.ts encode_xml for the full rationale.
-        // eslint-disable-next-line no-control-regex
-        .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g, '')
-        .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '');
-}
 
 /** `0,0` → `A1`. */
 function cell_ref(row: number, col: number): string {
@@ -282,7 +262,7 @@ export function apply_hyperlink_edits(
     edits: readonly XlsxHyperlinkEdit[],
 ): HyperlinkWriteResult {
     if (edits.length === 0) {
-        return { sheet_xml, rels_xml: null, rels_created: false };
+        return { sheet_xml, rels_xml: null };
     }
     // Last edit wins per cell ref.
     const by_ref = new Map<string, XlsxHyperlinkEdit>();
@@ -323,16 +303,16 @@ export function apply_hyperlink_edits(
         if (edit.link === null) continue;
         if (edit.link.kind === 'internal') {
             const tooltip = edit.link.tooltip !== undefined
-                ? ` tooltip="${encode_attr(edit.link.tooltip)}"` : '';
-            added.push(`<hyperlink ref="${ref}" location="${encode_attr(edit.link.location)}"${tooltip}/>`);
+                ? ` tooltip="${encode_xml_attr(edit.link.tooltip)}"` : '';
+            added.push(`<hyperlink ref="${ref}" location="${encode_xml_attr(edit.link.location)}"${tooltip}/>`);
         } else {
             const r_id = fresh_rel_id(used_ids);
             const tooltip = edit.link.tooltip !== undefined
-                ? ` tooltip="${encode_attr(edit.link.tooltip)}"` : '';
+                ? ` tooltip="${encode_xml_attr(edit.link.tooltip)}"` : '';
             added.push(`<hyperlink ref="${ref}" r:id="${r_id}"${tooltip}/>`);
             new_rel_elements.push(
                 `<Relationship Id="${r_id}" Type="${HYPERLINK_REL_TYPE}" `
-                + `Target="${encode_attr(edit.link.target)}" TargetMode="External"/>`,
+                + `Target="${encode_xml_attr(edit.link.target)}" TargetMode="External"/>`,
             );
             kept_r_ids.add(r_id);
         }
@@ -369,15 +349,13 @@ export function apply_hyperlink_edits(
 
     // Splice the rels.
     let updated_rels: string | null = null;
-    let rels_created = false;
     if (new_rel_elements.length > 0 || removed_rel_ids.size > 0) {
         const base = rels_xml ?? EMPTY_RELS;
-        rels_created = rels_xml === null;
         updated_rels = append_relationships(
             remove_relationships(base, removed_rel_ids),
             new_rel_elements,
         );
     }
 
-    return { sheet_xml: updated_sheet, rels_xml: updated_rels, rels_created };
+    return { sheet_xml: updated_sheet, rels_xml: updated_rels };
 }

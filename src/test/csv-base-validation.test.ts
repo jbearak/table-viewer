@@ -311,13 +311,16 @@ describe('validate_dirty_bases hyperlinks', () => {
         expect(outcome).toEqual({ type: 'valid' });
     });
 
-    it('keeps the text-only contract when no link reader is supplied', () => {
+    it('fails closed when the caller supplied no link reader at all', () => {
+        // Unlike the rich reader, whose absence means "this source has no
+        // formatting", a link-bearing entry with no link observer means the
+        // two sides disagree about the format — refuse rather than write it.
         const outcome = validate_dirty_bases(
             link_edits({ '0:0': { value: 'a', base: 'a', link: site, baseLink: null } }),
             2,
             grid,
         );
-        expect(outcome).toEqual({ type: 'valid' });
+        expect(outcome).toEqual({ type: 'conflicts', keys: ['0:0'] });
     });
 
     it('does not double-report a key that already conflicted on text', () => {

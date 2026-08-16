@@ -36,7 +36,8 @@ describe('apply_hyperlink_edits', () => {
         // Inserted after </sheetData>.
         expect(out.sheet_xml.indexOf('<hyperlinks>'))
             .toBeGreaterThan(out.sheet_xml.indexOf('</sheetData>'));
-        expect(out.rels_created).toBe(true);
+        // A null rels input with a non-null result is the creation signal.
+        expect(out.rels_xml).not.toBeNull();
         const parsed = parse_relationships(out.rels_xml!);
         expect(parsed.get('rId1')).toEqual({
             type: HYPERLINK_TYPE,
@@ -52,7 +53,6 @@ describe('apply_hyperlink_edits', () => {
         ]);
         expect(out.sheet_xml).toContain('<hyperlink ref="B2" location="Sheet2!B5" tooltip="jump"/>');
         expect(out.rels_xml).toBeNull();
-        expect(out.rels_created).toBe(false);
     });
 
     it('inserts the section before schema-later elements, not after them', () => {
@@ -190,7 +190,6 @@ describe('apply_hyperlink_edits', () => {
         const out = apply_hyperlink_edits(xml, null, [{ row: 4, col: 4, link: null }]);
         expect(out.sheet_xml).toBe(xml);
         expect(out.rels_xml).toBeNull();
-        expect(out.rels_created).toBe(false);
     });
 
     it('rejects invalid coordinates', () => {
@@ -212,7 +211,6 @@ describe('apply_hyperlink_edits', () => {
         ]);
         const parsed = parse_relationships(out.rels_xml!);
         expect(parsed.size).toBe(1);
-        expect(out.rels_created).toBe(false);
     });
 
     it('round-trips through the package writer and our own parser', async () => {

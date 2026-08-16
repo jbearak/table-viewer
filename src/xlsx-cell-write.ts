@@ -1,4 +1,9 @@
-import { find_tag_end, is_tag_boundary, is_self_closing } from './ooxml-xml';
+import {
+    find_tag_end,
+    is_tag_boundary,
+    is_self_closing,
+    strip_illegal_xml_chars,
+} from './ooxml-xml';
 import { text_styles_equal, type CellTextStyle, type RichTextRun } from './cell-content';
 
 /**
@@ -70,31 +75,20 @@ const EXCEL_1900_EPOCH_MS = Date.UTC(1899, 11, 31);
 const EXCEL_1904_EPOCH_MS = Date.UTC(1904, 0, 1);
 
 function encode_xml(s: string): string {
-    return s
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        // A raw CR does not survive: XML 1.0 requires every parser to normalize
-        // `\r` and `\r\n` in content to a single `\n` before the application ever
-        // sees it, so a literal one is not "preserved as typed" — it is silently a
-        // line feed on the way back in, and `\r\n` loses a character outright. The
-        // numeric reference is exempt from that normalization, which is what makes
-        // it the only spelling that round-trips. Excel writes CRs this way too.
-        .replace(/\r/g, '&#13;')
-        // Control characters XML 1.0 forbids outright: they have no escape, so a
-        // numeric reference would be just as invalid as the raw byte. Excel drops
-        // them on paste too. A user pasting from a terminal or a PDF can carry
-        // one in without ever seeing it, and the result would be a worksheet part
-        // no reader accepts — a corrupt workbook from one invisible character.
-        // eslint-disable-next-line no-control-regex
-        .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g, '')
-        // An unpaired surrogate is no more a legal XML character than those, and it
-        // arrives the same way: a JavaScript string can hold one, so a paste from a
-        // program that split a code point carries it in unseen. Left in, it reaches
-        // the part as an unencodable half-character and the workbook stops opening --
-        // the same corrupt-from-one-invisible-character outcome the line above exists
-        // to prevent.
-        .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '');
+    return strip_illegal_xml_chars(
+        s
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            // A raw CR does not survive: XML 1.0 requires every parser to
+            // normalize `\r` and `\r\n` in content to a single `\n` before the
+            // application ever sees it, so a literal one is not "preserved as
+            // typed" — it is silently a line feed on the way back in, and
+            // `\r\n` loses a character outright. The numeric reference is
+            // exempt from that normalization, which is what makes it the only
+            // spelling that round-trips. Excel writes CRs this way too.
+            .replace(/\r/g, '&#13;'),
+    );
 }
 
 /** Convert a 0-based column index to its letter form (0 → A, 26 → AA). */

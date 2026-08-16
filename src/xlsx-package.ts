@@ -383,7 +383,8 @@ export function write_xlsx_workbook_cell_edits(
                 replacements.push({
                     path: rels_path,
                     xml: link_result.rels_xml,
-                    created: link_result.rels_created,
+                    // A sheet that had no `.rels` part gets one created.
+                    created: rels_xml === null,
                 });
             }
         }

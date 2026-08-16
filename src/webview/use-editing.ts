@@ -6,7 +6,12 @@ import {
     type EditSessionStore,
     type GetCellRaw,
 } from './edit-session-store';
-import { dirty_entry_value_changed, make_dirty_entry, type CsvDirtyEntry } from '../types';
+import {
+    copy_dirty_entry,
+    dirty_entry_value_changed,
+    make_dirty_entry,
+    type CsvDirtyEntry,
+} from '../types';
 import { hyperlinks_equal, type CellHyperlink } from '../cell-content';
 import {
     cell_edit_base,
@@ -125,6 +130,24 @@ export function use_editing(
     // in-flight save's values over residency, which `get_cell` cannot see, so
     // the raw reader stays the authority on the *text* and the loaded cell
     // only contributes styling.
+    /**
+     * The cell's persisted link, for conflict detection. Only markdown-mode
+     * consumers supply `get_cell`, which is also the only place link edits can
+     * be made, so the reader is absent exactly when there are no links to
+     * check. `null` distinguishes a resident linkless cell from a
+     * non-resident row (`undefined`), which is what keeps an evicted page from
+     * reading as a conflict.
+     */
+    const get_cell_link = useMemo(
+        () => (get_cell
+            ? (source_row: number, col: number) => {
+                const cell = get_cell(source_row, col);
+                return cell === undefined ? undefined : cell?.hyperlink ?? null;
+            }
+            : undefined),
+        [get_cell],
+    );
+
     const edit_base_at = useCallback(
         (source_row: number, source_col: number): ParsedCellEdit => {
             const raw = get_cell_raw(source_row, source_col) ?? '';
@@ -270,12 +293,7 @@ export function use_editing(
                 active_store.commit(
                     session_id,
                     key,
-                    make_dirty_entry(
-                        pending.value,
-                        pending.base,
-                        pending.valueRuns,
-                        pending.baseRuns,
-                    ),
+                    copy_dirty_entry(pending, { link: undefined, baseLink: undefined }),
                 );
                 return;
             }
@@ -284,14 +302,7 @@ export function use_editing(
                 active_store.commit(
                     session_id,
                     key,
-                    make_dirty_entry(
-                        pending.value,
-                        pending.base,
-                        pending.valueRuns,
-                        pending.baseRuns,
-                        next,
-                        base_link,
-                    ),
+                    copy_dirty_entry(pending, { link: next, baseLink: base_link }),
                 );
                 return;
             }
@@ -390,16 +401,16 @@ export function use_editing(
             const active_entry = dirty_cells.get(active_key);
             if (
                 active_entry &&
-                is_entry_conflicted(active_key, active_entry, get_cell_raw)
+                is_entry_conflicted(active_key, active_entry, get_cell_raw, get_cell_link)
             ) {
                 set_editing_cell(null);
             }
         }
         active_store.retain(
             session_id,
-            (key, entry) => !is_entry_conflicted(key, entry, get_cell_raw),
+            (key, entry) => !is_entry_conflicted(key, entry, get_cell_raw, get_cell_link),
         );
-    }, [active_store, get_cell_raw, editing_cell, dirty_cells, session_id]);
+    }, [active_store, get_cell_raw, get_cell_link, editing_cell, dirty_cells, session_id]);
 
     // Resolve deferred bases for old-format restores: once a pending entry's page
     // becomes resident, capture its true on-disk value as the base. Runs whenever
@@ -425,12 +436,12 @@ export function use_editing(
     const conflicted_keys = useMemo(() => {
         const keys = new Set<string>();
         for (const [key, entry] of dirty_cells) {
-            if (is_entry_conflicted(key, entry, get_cell_raw)) {
+            if (is_entry_conflicted(key, entry, get_cell_raw, get_cell_link)) {
                 keys.add(key);
             }
         }
         return keys;
-    }, [dirty_cells, get_cell_raw]);
+    }, [dirty_cells, get_cell_raw, get_cell_link]);
 
     // Close any open editor when the data reloads (token bump) — whether from our
     // own save or an external change. Dirty edits are preserved either way so the

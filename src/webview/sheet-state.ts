@@ -1,6 +1,7 @@
 import type {
     FilterEntry,
     PerFileState,
+    SheetPendingEditCells,
     ScrollPosition,
     SheetColumnVisibilityState,
     SheetTransformState,
@@ -12,6 +13,7 @@ import {
     MAX_PERSISTED_HIDDEN_ROWS,
     is_range_filter_operator,
     reconcile_pending_edit_sheets,
+    sanitized_wire_dirty_entry,
     sheet_name_from_transform_schema,
     worksheet_identity,
 } from '../types';
@@ -330,11 +332,11 @@ function normalize_pending_edits(
 
 function normalize_pending_edit_cells(
     value: unknown
-): Record<string, string | { value: string; base: string }> | undefined {
+): SheetPendingEditCells | undefined {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
         return undefined;
     }
-    const result: Record<string, string | { value: string; base: string }> = {};
+    const result: SheetPendingEditCells = {};
     for (const [key, val] of Object.entries(value)) {
         // Keys must be exactly "<row>:<col>" integers. A malformed key (corrupt
         // or old-format persisted state) would parse to NaN coordinates, leaving
@@ -344,13 +346,15 @@ function normalize_pending_edit_cells(
         }
         if (typeof val === 'string') {
             result[key] = val;
-        } else if (
-            typeof val === 'object' && val !== null &&
-            'value' in val && typeof (val as Record<string, unknown>).value === 'string' &&
-            'base' in val && typeof (val as Record<string, unknown>).base === 'string'
-        ) {
-            result[key] = { value: (val as { value: string; base: string }).value, base: (val as { value: string; base: string }).base };
+            continue;
         }
+        // Every other dimension of an entry — runs, and the link pair — goes
+        // through the shared wire sanitizer rather than being re-listed here.
+        // Rebuilding `{value, base}` by hand silently dropped them, which for
+        // persisted state means a pending formatting or hyperlink edit
+        // disappearing on the next restore.
+        const entry = sanitized_wire_dirty_entry(val);
+        if (entry) result[key] = entry;
     }
     return Object.keys(result).length > 0 ? result : undefined;
 }

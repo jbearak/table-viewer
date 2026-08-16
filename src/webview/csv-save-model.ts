@@ -6,7 +6,7 @@
 
 import {
     dirty_entry_value_changed,
-    make_dirty_entry,
+    copy_dirty_entry,
     type CsvDirtyEntry,
     type CsvDirtyMap,
 } from '../types';
@@ -44,16 +44,7 @@ export function collect_save_payload(
         // Runs and the link dimension ride along: the xlsx save plan reads
         // `valueRuns`/`link` off the exact entry; string-only consumers
         // (the CSV serializer) ignore them.
-        exact[key] = Object.freeze(
-            make_dirty_entry(
-                entry.value,
-                entry.base,
-                entry.valueRuns,
-                entry.baseRuns,
-                entry.link,
-                entry.baseLink,
-            ),
-        );
+        exact[key] = Object.freeze(copy_dirty_entry(entry));
     }
     return Object.freeze({
         status: 'ready',

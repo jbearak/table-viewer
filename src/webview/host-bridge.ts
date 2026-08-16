@@ -1,5 +1,5 @@
 import {
-    make_dirty_entry,
+    copy_dirty_entry,
     type CsvDirtyEntry,
     type SheetPendingEditCells,
     worksheet_target_key,
@@ -80,14 +80,11 @@ function pending_edit_payload(edits: SheetPendingEditCells | null): string {
         // Runs are part of durability identity: a formatting-only change has
         // equal value/base strings, and canonicalizing them away would dedupe
         // the post that carries the new formatting. Field order is pinned by
-        // make_dirty_entry (runs were normalized at commit), so JSON equality
+        // the shared entry constructor (runs were normalized at commit), so JSON equality
         // is semantic equality here just as it is for the string sides.
         canonical[key] = typeof entry === 'string'
             ? entry
-            : make_dirty_entry(
-                entry.value, entry.base, entry.valueRuns, entry.baseRuns,
-                entry.link, entry.baseLink,
-            );
+            : copy_dirty_entry(entry);
     }
     return JSON.stringify(canonical);
 }

@@ -1354,6 +1354,31 @@ export function make_dirty_entry(
 }
 
 /**
+ * Copy an entry into a fresh owned object, optionally overriding some fields.
+ *
+ * This is what every *copy* site should use rather than re-listing the
+ * dimensions positionally through {@link make_dirty_entry}: a site that
+ * forgets one silently drops that dimension, which is not a type error and
+ * not visible until the metadata goes missing at save time. Overrides are
+ * applied by presence, so `{baseRuns: undefined}` clears the run side while
+ * an omitted key carries it across.
+ */
+export function copy_dirty_entry(
+    entry: CsvDirtyEntry,
+    overrides: Partial<CsvDirtyEntry> = {},
+): CsvDirtyEntry {
+    const merged = { ...entry, ...overrides };
+    return make_dirty_entry(
+        merged.value,
+        merged.base,
+        merged.valueRuns,
+        merged.baseRuns,
+        merged.link,
+        merged.baseLink,
+    );
+}
+
+/**
  * Copy an untrusted dirty entry into the exact owned shape, keeping a run side
  * only when `is_matching_rich_text` accepts it — the same smuggling boundary
  * `validate_edit_cells` enforces. Unlike the durable validator this *drops* a
