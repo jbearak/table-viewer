@@ -200,6 +200,18 @@ jobs:
           node ../../scripts/validate-update-metadata.mjs latest-portable.yml "$VERSION" "table-viewer-${VERSION}-x64-portable.exe" --strict
           node ../../scripts/validate-update-metadata.mjs latest-portable-arm64.yml "$VERSION" "table-viewer-${VERSION}-arm64-portable.exe" --strict
 
+      # Packaging success does not prove that the assisted NSIS installer can
+      # install, register, launch, and remove the app. Exercise the host-native
+      # setup executable in an isolated per-user directory. The script polls the
+      # app window, state database, and uninstall result rather than relying on
+      # fixed delays, so slow hosted runners do not turn this into a timing test.
+      - name: Smoke test Windows installer
+        shell: pwsh
+        run: |
+          $version = node -p "require('./package.json').version"
+          ./scripts/smoke-test-windows-installer.ps1 `
+            -InstallerPath "dist/desktop-packages/table-viewer-$version-x64-setup.exe"
+
   windows-sqlite:
     runs-on: windows-latest
 
