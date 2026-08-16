@@ -50,9 +50,14 @@ export function clear_saved_dirty_entries(
         // Re-based on the plain text the save wrote. The kept side's runs come
         // along; the new base gets none — the saved string is all this path
         // knows, and a missing base side just means the next conflict check
-        // compares plain text, which is what the host validates anyway.
+        // compares plain text, which is what the host validates anyway. A
+        // pending link dimension survives untouched: its baseLink may now be
+        // stale (the save wrote an older link), which the next conflict check
+        // surfaces rather than this path guessing.
         else {
-            next.set(key, make_dirty_entry(entry.value, value, entry.valueRuns));
+            next.set(key, make_dirty_entry(
+                entry.value, value, entry.valueRuns, undefined, entry.link, entry.baseLink,
+            ));
         }
     }
     return next;
@@ -353,7 +358,10 @@ export function create_edit_session_store(
         commit: (session_id, key, entry) => {
             if (!owns(session_id)) return;
             const next = new Map(state.entries);
-            next.set(key, make_dirty_entry(entry.value, entry.base, entry.valueRuns, entry.baseRuns));
+            next.set(key, make_dirty_entry(
+                entry.value, entry.base, entry.valueRuns, entry.baseRuns,
+                entry.link, entry.baseLink,
+            ));
             set_entries(next, state.pending_base);
         },
         remove: (session_id, key) => {
@@ -377,7 +385,10 @@ export function create_edit_session_store(
             let pending_base = false;
             const next = new Map<string, DirtyEntry>();
             for (const [key, entry] of Object.entries(entries)) {
-                const owned = make_dirty_entry(entry.value, entry.base, entry.valueRuns, entry.baseRuns);
+                const owned = make_dirty_entry(
+                    entry.value, entry.base, entry.valueRuns, entry.baseRuns,
+                    entry.link, entry.baseLink,
+                );
                 if (entry.base_pending) {
                     pending_base = true;
                     next.set(key, { ...owned, base_pending: true });
@@ -409,7 +420,10 @@ export function create_edit_session_store(
                     const [r, c] = key.split(':').map(Number);
                     const cur = get_cell_raw(r, c);
                     if (cur !== undefined) {
-                        next.set(key, make_dirty_entry(entry.value, cur, entry.valueRuns));
+                        next.set(key, make_dirty_entry(
+                            entry.value, cur, entry.valueRuns, undefined,
+                            entry.link, entry.baseLink,
+                        ));
                         changed = true;
                         continue;
                     }

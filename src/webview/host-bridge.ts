@@ -84,7 +84,10 @@ function pending_edit_payload(edits: SheetPendingEditCells | null): string {
         // is semantic equality here just as it is for the string sides.
         canonical[key] = typeof entry === 'string'
             ? entry
-            : make_dirty_entry(entry.value, entry.base, entry.valueRuns, entry.baseRuns);
+            : make_dirty_entry(
+                entry.value, entry.base, entry.valueRuns, entry.baseRuns,
+                entry.link, entry.baseLink,
+            );
     }
     return JSON.stringify(canonical);
 }

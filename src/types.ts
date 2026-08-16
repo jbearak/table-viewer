@@ -1436,6 +1436,27 @@ export function dirty_entries_equal(
         && optional_links_equal(left.baseLink, right.baseLink);
 }
 
+/**
+ * Whether the entry's VALUE dimension differs from its base. False for a
+ * link-only entry, whose text and runs are the unedited cell content — the
+ * save must not emit a text edit for it (rewriting an unedited cell's `<c>`
+ * breaks the unedited-cells-keep-original-XML invariant), and a text-identical
+ * echo must not read as a value revert.
+ */
+export function dirty_entry_value_changed(entry: CsvDirtyEntry): boolean {
+    if (entry.value !== entry.base) return true;
+    return !optional_runs_equal(entry.valueRuns, entry.baseRuns);
+}
+
+/** Whether the entry carries a link change whose value differs from its base.
+ *  (An entry constructed with `link` equal to `baseLink` should not exist —
+ *  commit paths drop the dimension on revert — but the save path must not
+ *  trust that.) */
+export function dirty_entry_link_changed(entry: CsvDirtyEntry): boolean {
+    if (entry.link === undefined) return false;
+    return !hyperlinks_equal(entry.link, entry.baseLink ?? null);
+}
+
 /** An absent link dimension ("no link change") differs from a present one —
  *  including a present `null` ("clear the link"). */
 function optional_links_equal(

@@ -41,7 +41,8 @@ import { write_xlsx_workbook_cell_edits } from './xlsx-package';
 import type { XlsxCellEdit } from './xlsx-cell-write';
 import { validate_dirty_bases } from './csv-base-validation';
 import { cell_edit_base } from './cell-edit-model';
-import type { RichText } from './cell-content';
+import type { CellHyperlink, RichText } from './cell-content';
+import type { XlsxHyperlinkEdit } from './xlsx-hyperlink-write';
 import type {
     AuthorityFileStateStore,
     FileStateSnapshot,
@@ -92,6 +93,7 @@ import {
     type ActiveCsvSaveLifecycle,
     type CsvDirtyMap,
     dirty_entries_equal,
+    dirty_entry_link_changed,
     sanitized_dirty_entry,
     sanitized_wire_dirty_entry,
     type CsvSaveLifecycle,
@@ -181,6 +183,12 @@ export interface SavePlan {
      * change does.
      */
     readonly observed_rich?: readonly ReadonlyMap<string, RichText>[];
+    /**
+     * The cells' hyperlinks per worksheet, xlsx only. Every observed cell has
+     * an entry (`null` = linkless), so validation can distinguish "the cell
+     * verifiably has no link" from "the cell was never observed".
+     */
+    readonly observed_links?: readonly ReadonlyMap<string, CellHyperlink | null>[];
     /**
      * The bytes to write, given the file's current bytes.
      *
@@ -494,13 +502,22 @@ function harvest_source_bases(
     src: DataSource,
     sheet_index: number,
     wanted_bases: Iterable<string>,
-): { texts: Map<string, string>; rich: Map<string, RichText> } {
+): {
+    texts: Map<string, string>;
+    rich: Map<string, RichText>;
+    links: Map<string, CellHyperlink | null>;
+} {
     const observed_bases = new Map<string, string>();
     // The same cells' *effective* rich content (runs, or the cell font as one
     // run), present only where it carries styles — the exact derivation the
     // webview used to record `baseRuns`, so text-equal bases whose formatting
     // drifted read as conflicts rather than being silently overwritten.
     const observed_rich = new Map<string, RichText>();
+    // The cells' hyperlinks. Unlike `rich`, absence must be observable — a
+    // link edit's base may legitimately be "no link" — so every observed cell
+    // records an entry, `null` for linkless, and only an unobserved cell reads
+    // as undefined.
+    const observed_links = new Map<string, CellHyperlink | null>();
     const by_projected_row = new Map<number, { source_row: number; cols: number[] }>();
     for (const key of wanted_bases) {
         const [source_row, col] = key.split(':').map(Number);
@@ -530,10 +547,11 @@ function harvest_source_bases(
                     const rich = cell_edit_base(cell).rich;
                     if (rich) observed_rich.set(cell_key, rich);
                 }
+                observed_links.set(cell_key, cell?.hyperlink ?? null);
             }
         });
     }
-    return { texts: observed_bases, rich: observed_rich };
+    return { texts: observed_bases, rich: observed_rich, links: observed_links };
 }
 
 /**
@@ -553,7 +571,11 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
     // writer likewise computes every replacement before mutating the container,
     // so one invalid worksheet rejects the workbook save atomically.
     const planned = input.worksheets.map(({ sheet_index, edits, wanted_bases, dirty_edits }) => {
-        const { texts: observed_bases, rich: observed_rich } = harvest_source_bases(src, sheet_index, wanted_bases);
+        const {
+            texts: observed_bases,
+            rich: observed_rich,
+            links: observed_links,
+        } = harvest_source_bases(src, sheet_index, wanted_bases);
         const cell_edits: XlsxCellEdit[] = [];
         for (const [key, value] of Object.entries(edits)) {
             const [row, col] = key.split(':').map(Number);
@@ -565,11 +587,46 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
             const runs = dirty_edits?.[key]?.valueRuns?.runs;
             cell_edits.push(runs && runs.length > 0 ? { row, col, value, runs } : { row, col, value });
         }
-        return { observed_bases, observed_rich, sheetIndex: sheet_index, edits: cell_edits };
+        // Link edits come from the exact dirty entries, not `edits`: a
+        // link-only change carries no text edit at all (see
+        // collect_save_payload), and a text edit may carry no link change.
+        const link_edits: XlsxHyperlinkEdit[] = [];
+        for (const [key, entry] of Object.entries(dirty_edits ?? {})) {
+            if (!dirty_entry_link_changed(entry)) continue;
+            const [row, col] = key.split(':').map(Number);
+            if (!Number.isInteger(row) || !Number.isInteger(col)) continue;
+            // The host is the authority on what an external target may be —
+            // the dialog validates for UX, but the wire is untrusted. Only the
+            // WRITTEN value is constrained to http(s); bases mirror whatever
+            // the file already holds. Fail the save closed rather than write a
+            // scheme the dialog could never have produced.
+            if (entry.link?.kind === 'external') {
+                const normalized = parse_http_external_url(entry.link.target);
+                if (normalized === null) {
+                    throw new Error('A hyperlink edit has an invalid or non-HTTP target.');
+                }
+                link_edits.push({
+                    row,
+                    col,
+                    link: { ...entry.link, target: normalized },
+                });
+                continue;
+            }
+            link_edits.push({ row, col, link: entry.link ?? null });
+        }
+        return {
+            observed_bases,
+            observed_rich,
+            observed_links,
+            sheetIndex: sheet_index,
+            edits: cell_edits,
+            link_edits,
+        };
     });
     return {
         observed_bases: planned.map(({ observed_bases }) => observed_bases),
         observed_rich: planned.map(({ observed_rich }) => observed_rich),
+        observed_links: planned.map(({ observed_links }) => observed_links),
         produce: (raw) => write_xlsx_workbook_cell_edits(raw, planned),
     };
 }
@@ -2658,6 +2715,7 @@ export function attach_viewer(
             source_row_count,
             (source_row, col) => observed_bases.texts.get(`${source_row}:${col}`),
             (source_row, col) => observed_bases.rich.get(`${source_row}:${col}`),
+            (source_row, col) => observed_bases.links.get(`${source_row}:${col}`),
         );
         if (validation.type === 'valid') return undefined;
         return {
@@ -4718,6 +4776,9 @@ export function attach_viewer(
                     (source_row, col) => plan.observed_bases[index]?.get(`${source_row}:${col}`),
                     plan.observed_rich
                         ? (source_row, col) => plan.observed_rich?.[index]?.get(`${source_row}:${col}`)
+                        : undefined,
+                    plan.observed_links
+                        ? (source_row, col) => plan.observed_links?.[index]?.get(`${source_row}:${col}`)
                         : undefined,
                 )
                 : { type: 'baseMismatch' as const, keys: Object.keys(worksheet.dirtyEdits) };
