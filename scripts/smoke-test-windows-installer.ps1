@@ -31,7 +31,6 @@ function Invoke-CheckedProcess {
         [Parameter(Mandatory = $true)]
         [string]$FilePath,
         [string[]]$ArgumentList = @(),
-        [hashtable]$Environment = @(),
         [int]$TimeoutSeconds = 180
     )
 
@@ -40,9 +39,6 @@ function Invoke-CheckedProcess {
     $startInfo.UseShellExecute = $false
     foreach ($argument in $ArgumentList) {
         [void]$startInfo.ArgumentList.Add($argument)
-    }
-    foreach ($entry in $Environment.GetEnumerator()) {
-        $startInfo.Environment[$entry.Key] = $entry.Value
     }
 
     $process = [System.Diagnostics.Process]::Start($startInfo)
@@ -135,7 +131,8 @@ Set-Content -LiteralPath $fixture -Encoding utf8NoBOM -Value "name,value`ninstal
 
 try {
     Write-Host "Installing $(Split-Path -Leaf $installer) into $installDirectory"
-    Invoke-CheckedProcess $installer @('/S', '/currentuser', "/D=$installDirectory") | Out-Null
+    Invoke-CheckedProcess -FilePath $installer `
+        -ArgumentList @('/S', '/currentuser', "/D=$installDirectory") | Out-Null
 
     foreach ($requiredPath in @($appExecutable, $uninstaller)) {
         if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
@@ -180,7 +177,8 @@ try {
     } 'the installed app to exit cleanly'
 
     Write-Host "Uninstalling from $installDirectory"
-    Invoke-CheckedProcess $uninstaller @('/S', '/currentuser') | Out-Null
+    Invoke-CheckedProcess -FilePath $uninstaller `
+        -ArgumentList @('/S', '/currentuser') | Out-Null
     Wait-ForCondition {
         -not (Test-Path -LiteralPath $installDirectory)
     } 'the uninstaller to remove the installation directory'
@@ -204,7 +202,8 @@ try {
     }
     if (-not $uninstalled -and (Test-Path -LiteralPath $uninstaller -PathType Leaf)) {
         try {
-            Invoke-CheckedProcess $uninstaller @('/S', '/currentuser') | Out-Null
+            Invoke-CheckedProcess -FilePath $uninstaller `
+                -ArgumentList @('/S', '/currentuser') | Out-Null
             Wait-ForCondition {
                 -not (Test-Path -LiteralPath $installDirectory)
             } 'cleanup uninstaller to remove the installation directory'
