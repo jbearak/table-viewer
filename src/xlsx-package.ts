@@ -388,7 +388,12 @@ export function write_xlsx_workbook_cell_edits(
                 });
             }
         }
-        removed_formula ||= formula_count(updated) < formula_count(sheet_xml);
+        // Only a cell write can drop a formula; a hyperlink splice touches the
+        // `<hyperlinks>` section and the rels, never a `<c>`. Skipping the two
+        // whole-sheet scans keeps a link-only save off the worksheet body.
+        if (edits.length > 0) {
+            removed_formula ||= formula_count(updated) < formula_count(sheet_xml);
+        }
         replacements.push({ path, xml: updated });
     }
 
