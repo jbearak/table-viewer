@@ -28,6 +28,16 @@ describe('apply_theme_to_document', () => {
 
         apply_theme_to_document(doc, theme_payload('light'));
         expect(doc.body.classList.contains('vscode-high-contrast')).toBe(false);
+
+        apply_theme_to_document(doc, theme_payload('light-high-contrast'));
+        expect(doc.documentElement.style.colorScheme).toBe('light');
+        expect(doc.body.classList.contains('vscode-light')).toBe(true);
+        expect(doc.body.classList.contains('vscode-high-contrast')).toBe(false);
+        expect(doc.body.classList.contains('vscode-high-contrast-light')).toBe(true);
+
+        apply_theme_to_document(doc, theme_payload('dark-high-contrast'));
+        expect(doc.body.classList.contains('vscode-high-contrast')).toBe(true);
+        expect(doc.body.classList.contains('vscode-high-contrast-light')).toBe(false);
     });
 
     // Regression: the viewer preload calls this before the response is parsed,

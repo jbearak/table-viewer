@@ -164,7 +164,13 @@ export function apply_theme_to_document(doc: Document, payload: ThemePayload): v
     if (body) {
         body.classList.toggle('vscode-dark', payload.kind === 'dark');
         body.classList.toggle('vscode-light', payload.kind === 'light');
-        body.classList.toggle('vscode-high-contrast', payload.highContrast);
-        body.classList.toggle('vscode-high-contrast-light', false);
+        body.classList.toggle(
+            'vscode-high-contrast',
+            payload.highContrast && payload.kind === 'dark',
+        );
+        body.classList.toggle(
+            'vscode-high-contrast-light',
+            payload.highContrast && payload.kind === 'light',
+        );
     }
 }

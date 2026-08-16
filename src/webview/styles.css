@@ -454,6 +454,33 @@ body.vscode-high-contrast-light .highlight-swatch.selected {
     outline-offset: -3px;
 }
 
+/* A fill change alone is too subtle for hc-light's upstream #dddddd toggled
+   color on the app's light chrome surfaces. Every control/row that consumes
+   list-hoverBackground also gets the theme's explicit contrast outline. */
+body.vscode-high-contrast :is(
+    .toggle:not(.active):not([aria-disabled="true"]),
+    .toolbar-split-caret,
+    .column-visibility-item,
+    .highlight-swatch,
+    .sheet-tab,
+    .sheet-tabs-orientation,
+    .filter-value-item
+):hover,
+body.vscode-high-contrast-light :is(
+    .toggle:not(.active):not([aria-disabled="true"]),
+    .toolbar-split-caret,
+    .column-visibility-item,
+    .highlight-swatch,
+    .sheet-tab,
+    .sheet-tabs-orientation,
+    .filter-value-item
+):hover,
+body.vscode-high-contrast .toolbar-split-caret.open,
+body.vscode-high-contrast-light .toolbar-split-caret.open {
+    outline: 1px solid var(--vscode-contrastBorder, currentColor);
+    outline-offset: -2px;
+}
+
 .toolbar-tooltip {
     position: fixed;
     z-index: 20;

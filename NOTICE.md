@@ -32,6 +32,10 @@ in its entry). Every one of them permits this use under GPL-3.0.
 - **Dark High Contrast** — Copyright (c) Microsoft Corporation —
   <https://github.com/microsoft/vscode/blob/1.101.0/extensions/theme-defaults/themes/hc_black.json>
   (ported from VS Code 1.101's built-in `theme-defaults` extension).
+- **Light High Contrast** — Copyright (c) Microsoft Corporation —
+  <https://github.com/microsoft/vscode/blob/1.101.0/extensions/theme-defaults/themes/hc_light.json>
+  (adapted from VS Code 1.101's built-in `theme-defaults` extension; app-specific
+  chrome surfaces complete the sparse upstream high-contrast-light overrides).
 
 ## MIT License
 
