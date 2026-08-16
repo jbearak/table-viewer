@@ -42,7 +42,8 @@ export type ThemeId =
     | 'gruvbox-dark-medium'
     | 'gruvbox-dark-soft'
     | 'cyberpunk'
-    | 'cyberpunk-scarlet';
+    | 'cyberpunk-scarlet'
+    | 'red';
 
 export interface ThemeDefinition {
     readonly id: ThemeId;
@@ -495,6 +496,35 @@ const CYBERPUNK_SCARLET: SemanticPalette = {
     info: '#00c3ff',        // inputValidation.infoBorder
 };
 
+/* Red — Copyright (c) Microsoft Corporation, MIT. Ported from VS Code 1.101's
+   built-in `vscode.theme-red` (themes/Red-color-theme.json).
+
+   The source theme has separate #330000 tab and #300000 widget surfaces; the
+   semantic palette has one shared `bgAlt` role, so the darker widget surface is
+   used to preserve contrast with the #580000 raised controls. The source's
+   translucent focus border is represented by its opaque #cc3333 badge/progress
+   accent, which remains visible as the grid's current-cell ring. VS Code does
+   not define button hover, muted/subtle text, warning, or general info colors
+   for this theme, so those roles use colors from its token and picker palettes. */
+const RED: SemanticPalette = {
+    bg: '#390000',          // editor.background
+    bgAlt: '#300000',       // editorWidget / editorHoverWidget background
+    bgElevated: '#580000',  // input / dropdown background
+    fg: '#f8f8f8',          // editor.foreground
+    fgMuted: '#cc9999',     // pickerGroup.foreground
+    fgSubtle: '#a43f3f',    // editorLineNumber.foreground flattened onto bg
+    border: '#611414',      // editorGroup.border flattened onto bg
+    accent: '#cc3333',      // badge / progressBar background
+    accentHover: '#dc4b4b', // hand-lightened red
+    accentFg: '#f8f8f8',
+    selection: '#750000',   // editor.selectionBackground
+    hover: '#800000',       // list.hoverBackground
+    link: '#ffd0aa',        // editorLink.activeForeground
+    error: '#ffeaea',       // errorForeground
+    warning: '#fec758',     // entity token
+    info: '#db7e58',        // inputValidation.infoBorder
+};
+
 // --- the registry -----------------------------------------------------------
 
 export const THEME_DEFINITIONS: Record<ThemeId, ThemeDefinition> = {
@@ -559,6 +589,10 @@ export const THEME_DEFINITIONS: Record<ThemeId, ThemeDefinition> = {
     'cyberpunk-scarlet': {
         id: 'cyberpunk-scarlet', kind: 'dark', label: 'Cyberpunk Scarlet Protocol',
         variables: derive_theme_variables(CYBERPUNK_SCARLET),
+    },
+    red: {
+        id: 'red', kind: 'dark', label: 'Red',
+        variables: derive_theme_variables(RED),
     },
 };
 

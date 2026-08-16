@@ -1080,10 +1080,22 @@ describe('theme', () => {
             'catppuccin-macchiato', 'catppuccin-mocha',
             'gruvbox-dark-hard', 'gruvbox-dark-medium', 'gruvbox-dark-soft',
             'synthwave-84', 'cyberpunk', 'cyberpunk-scarlet',
+            'red',
         ]);
         // Every id belongs to exactly one kind's list.
         expect(list_themes('light').length + list_themes('dark').length)
             .toBe(THEME_IDS.length);
+    });
+
+    it('ports the defining colors of VS Code Red', () => {
+        const vars = theme_payload('red').variables;
+        expect(vars['--vscode-editor-background']).toBe('#390000');
+        expect(vars['--vscode-editor-foreground']).toBe('#f8f8f8');
+        expect(vars['--vscode-input-background']).toBe('#580000');
+        expect(vars['--vscode-editor-selectionBackground']).toBe('#750000');
+        expect(vars['--vscode-list-hoverBackground']).toBe('#800000');
+        expect(vars['--vscode-editorWidget-border']).toBe('#611414');
+        expect(vars['--vscode-textLink-foreground']).toBe('#ffd0aa');
     });
 
     it('rejects unknown AND wrong-kind theme ids', () => {
@@ -1243,12 +1255,12 @@ describe('theme × Glide grid theme', () => {
             dirty.add(tints.dirtyBg);
             conflict.add(tints.conflictBg);
         }
-        // 17 themes, 11 distinct values each. The collisions are all intended
+        // 18 themes, 12 distinct values each. The collisions are all intended
         // palette sharing: solarized-light and solarized-dark share one palette;
         // each gruvbox kind's three contrasts differ only in their background;
         // and the two Cyberpunk variants share their warning and error colors.
-        expect(dirty.size).toBe(11);
-        expect(conflict.size).toBe(11);
+        expect(dirty.size).toBe(12);
+        expect(conflict.size).toBe(12);
         // A typo'd variable name would collapse every theme onto the fallback.
         // (`dark`'s warning genuinely IS #cca700 — the same rgb as the dirty
         // fallback — so only the conflict side can assert non-fallback.)
