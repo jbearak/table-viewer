@@ -1203,10 +1203,25 @@ export class ViewerWindowManager {
                 // fire-and-forget, so an unhandled rejection would take the
                 // main process down over a long link in a workbook. Refusing
                 // and catching both end the same way for the user (nothing
-                // opens), but neither crashes.
+                // opens), but neither crashes. Both say so: a link the user
+                // deliberately clicked that produces nothing at all reads as
+                // the app being broken, and a workbook can legitimately carry a
+                // URL that clears our 8 KiB validation and still exceeds this.
                 open_external: (url) => {
-                    if (url.length > MAX_OPEN_EXTERNAL_LENGTH) return;
-                    void shell.openExternal(url).catch(() => { /* nothing to open */ });
+                    const too_long = url.length > MAX_OPEN_EXTERNAL_LENGTH;
+                    const failed = () => {
+                        void message_box({
+                            type: 'warning',
+                            message: too_long
+                                ? 'This link is too long for the system to open.'
+                                : 'This link could not be opened.',
+                        });
+                    };
+                    if (too_long) {
+                        failed();
+                        return;
+                    }
+                    void shell.openExternal(url).catch(failed);
                 },
             }),
             config: this.config_store.config_port(),

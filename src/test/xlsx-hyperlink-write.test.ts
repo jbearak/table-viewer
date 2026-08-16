@@ -389,6 +389,21 @@ describe('apply_hyperlink_edits', () => {
         expect(out.sheet_xml).toContain('<hyperlink ref="A1" location="D4"/>');
     });
 
+    it('scans a part with many candidates and many comments in linear time', () => {
+        // The other half of the same hazard: each candidate position is tested
+        // against the ignorable ranges, so walking the ranges made the work the
+        // *product* of the two counts — and a workbook controls both. Ranges
+        // are hoisted once and searched by bisection; 20k of each is
+        // milliseconds here and minutes if either regresses.
+        const noise = '<!-- <hyperlink ref="Z1" location="Ghost"/> -->'.repeat(20_000);
+        const xml = sheet(`<sheetData/><hyperlinks>${noise}<hyperlink ref="A1" location="B2"/></hyperlinks>`);
+        const out = apply_hyperlink_edits(xml, null, [
+            { row: 0, col: 0, link: internal('D4') },
+        ]);
+        expect(out.sheet_xml).toContain('<hyperlink ref="A1" location="D4"/>');
+        expect(out.sheet_xml).not.toContain('<hyperlink ref="Z1"');
+    });
+
     it('keeps ignored content nested inside an untouched live element', () => {
         // The rebuild re-emits untouched elements verbatim. Reading them from a
         // stripped copy would delete a vendor extension payload out of a link

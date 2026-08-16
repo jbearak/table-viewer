@@ -149,10 +149,14 @@ function index_of_markup_in(
 
 /** {@link String.lastIndexOf} with the same ignored-region rule. */
 export function last_index_of_markup(xml: string, needle: string): number {
+    // Ranges hoisted, not recomputed per hit: this walks every occurrence, and
+    // each range scan is a pass over the whole part. A worksheet with many
+    // matches would otherwise be quadratic in an untrusted file's size.
+    const ranges = ignorable_ranges(xml, 0, xml.length);
     let found = -1;
     let pos = 0;
     while (true) {
-        const hit = index_of_markup(xml, needle, pos);
+        const hit = index_of_markup_in(xml, needle, pos, ranges);
         if (hit === -1) return found;
         found = hit;
         pos = hit + needle.length;
@@ -310,11 +314,21 @@ export function ignorable_ranges(xml: string, from: number, to: number): Array<[
     return out;
 }
 
-/** Where to resume from if `at` falls inside an ignorable range, else undefined. */
+/** Where to resume from if `at` falls inside an ignorable range, else undefined.
+ *
+ *  Binary search, not a walk: `ignorable_ranges` returns disjoint ranges in
+ *  ascending order, and this is called once per candidate position in scans
+ *  that have many of both. Walking made that the product of the two counts,
+ *  which a crafted workbook controls. */
 export function ignorable_end(ranges: ReadonlyArray<[number, number]>, at: number): number | undefined {
-    for (const [start, end] of ranges) {
-        if (at < start) return undefined;
-        if (at < end) return end;
+    let lo = 0;
+    let hi = ranges.length - 1;
+    while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        const [start, end] = ranges[mid];
+        if (at < start) hi = mid - 1;
+        else if (at < end) return end;
+        else lo = mid + 1;
     }
     return undefined;
 }
