@@ -1,7 +1,6 @@
 import type { CellHyperlink } from '../cell-content';
 import {
     worksheet_target_key,
-    worksheet_target_matches,
     type CellHighlightColor,
     type WorksheetTarget,
 } from '../types';
@@ -305,10 +304,39 @@ function estimate_cell_delta_bytes(delta: CellHistoryDelta): number {
         + estimate_overlay_bytes(delta.afterOverlay, charge);
 }
 
-function estimate_change_bytes(change: HistoryChange): number {
-    return change.kind === 'cell'
+/**
+ * Charges each distinct worksheet identity string once per action.
+ *
+ * `sheetName` and `worksheetId` are retained in every delta and neither is
+ * length-bounded — a name comes from the file, an id from its relationships — so
+ * a gesture carrying a megabyte-long name past the byte bound is a gesture that
+ * exhausted the heap history was bounded to protect.
+ *
+ * Charged per distinct STRING VALUE rather than per delta: a million-cell paste
+ * names one worksheet, whose name exists once in memory however many deltas point
+ * at it, and charging each of them would refuse gestures that fit the bound. Keyed
+ * on the value because that is the only thing a `Set` can key on, which errs
+ * safely: two equal strings from different sources are charged once, and the
+ * measurement is an estimate either way.
+ */
+function worksheet_charger(): (worksheet: WorksheetTarget) => number {
+    const counted = new Set<string>();
+    const once = (text: string | undefined): number => {
+        if (text === undefined || counted.has(text)) return 0;
+        counted.add(text);
+        return estimate_string_bytes(text);
+    };
+    return (worksheet) => once(worksheet.sheetName) + once(worksheet.worksheetId);
+}
+
+function estimate_change_bytes(
+    change: HistoryChange,
+    charge_worksheet: (worksheet: WorksheetTarget) => number,
+): number {
+    const worksheet = charge_worksheet(change.delta.worksheet);
+    return worksheet + (change.kind === 'cell'
         ? estimate_cell_delta_bytes(change.delta)
-        : CHANGE_OVERHEAD_BYTES;
+        : CHANGE_OVERHEAD_BYTES);
 }
 
 function change_cell_key(change: HistoryChange): string {
@@ -331,10 +359,11 @@ type OwnedAction = MeasuredAction;
 /** Costs of an action this module already owns, so nothing needs rebuilding. */
 function measure_costs(action: HistoryAction): HistoryCosts {
     const cells = new Set<string>();
+    const charge_worksheet = worksheet_charger();
     let byteCost = estimate_string_bytes(action.label);
     for (const change of action.changes) {
         cells.add(change_cell_key(change));
-        byteCost += estimate_change_bytes(change);
+        byteCost += estimate_change_bytes(change, charge_worksheet);
     }
     return { cellCount: cells.size, byteCost };
 }
@@ -352,6 +381,7 @@ function measure_costs(action: HistoryAction): HistoryCosts {
  */
 function own_and_measure(action: HistoryAction, budget = Infinity): OwnedAction | undefined {
     const cells = new Set<string>();
+    const charge_worksheet = worksheet_charger();
     const owned: HistoryChange[] = [];
     // Truncated rather than charged: a label can be built from data, and a bound
     // that merely refused an oversized one would still have to retain it to say
@@ -360,7 +390,7 @@ function own_and_measure(action: HistoryAction, budget = Infinity): OwnedAction 
     let byteCost = estimate_string_bytes(label);
     for (const change of action.changes) {
         const canonical = own_history_change(change);
-        byteCost += estimate_change_bytes(canonical);
+        byteCost += estimate_change_bytes(canonical, charge_worksheet);
         if (byteCost > budget) return undefined;
         cells.add(change_cell_key(canonical));
         owned.push(canonical);
@@ -759,19 +789,34 @@ export function action_focus_worksheet(action: HistoryAction): WorksheetTarget |
 /**
  * Whether every change in the action belongs to one worksheet.
  *
- * Matched symmetrically, as `viewer-controller` does when reconciling a target
- * against a message: `worksheet_target_matches` treats its first argument as
- * authoritative, so an id-less target compared against an identified one falls
- * back to the name while the reverse comparison insists on the id. Application
- * order must not decide whether a gesture spans sheets.
+ * Decided over the whole action at once rather than by comparing each change to
+ * the first, because `worksheet_target_matches` treats its first argument as
+ * authoritative — an id-less target compared against an identified one falls back
+ * to the name, while the reverse insists on the id — and a relation that
+ * asymmetric is not transitive. Two targets sharing a name but carrying different
+ * ids each match an id-less first target, so a pairwise-against-the-first check
+ * called a cross-sheet gesture single-sheet whenever the id-less change happened
+ * to be applied first. Neither application order nor which change is strongest
+ * may decide this.
+ *
+ * So: at most one distinct id, at most one distinct name, and — only when some
+ * change identifies its sheet by position alone — at most one distinct index. An
+ * index is otherwise ignored, since an external reorder reassigns indices while
+ * the identity it carries alongside stays true.
  */
 export function action_is_single_worksheet(action: HistoryAction): boolean {
-    const first = action_focus_worksheet(action);
-    if (first === undefined) return true;
-    return action.changes.every(({ delta }) => (
-        worksheet_target_matches(delta.worksheet, first)
-        || worksheet_target_matches(first, delta.worksheet)
-    ));
+    const ids = new Set<string>();
+    const names = new Set<string>();
+    const indices = new Set<number>();
+    let positional = false;
+    for (const { delta } of action.changes) {
+        const { sheetIndex, sheetName, worksheetId } = delta.worksheet;
+        if (worksheetId !== undefined) ids.add(worksheetId);
+        if (sheetName !== undefined) names.add(sheetName);
+        if (worksheetId === undefined && sheetName === undefined) positional = true;
+        indices.add(sheetIndex);
+    }
+    return ids.size <= 1 && names.size <= 1 && (!positional || indices.size <= 1);
 }
 
 /**

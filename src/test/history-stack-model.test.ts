@@ -450,6 +450,48 @@ describe('measure_history_action', () => {
         expect(entry.byteCost).toBeGreaterThan(long.length * 2);
     });
 
+    it('charges a worksheet name and id, which nothing bounds', () => {
+        // A name comes from the file and an id from its relationships, so neither is
+        // length-bounded; a gesture carrying a megabyte-long name past the byte
+        // bound is a gesture that exhausted the heap history was bounded to protect.
+        const huge: WorksheetTarget = {
+            sheetIndex: 0,
+            sheetName: 'n'.repeat(60_000),
+            worksheetId: 'i'.repeat(40_000),
+        };
+        const entry = measure_history_action(history_action('Edit', [cell_change(0, 0, 'v', huge)]));
+        expect(entry.byteCost).toBeGreaterThan(100_000 * 2);
+    });
+
+    it('charges one worksheet identity once across a wide gesture', () => {
+        // A million-cell paste names one worksheet, whose name exists once in
+        // memory however many deltas point at it. Charging each of them would
+        // refuse gestures that fit the bound.
+        const named: WorksheetTarget = { sheetIndex: 0, sheetName: 'n'.repeat(50_000) };
+        const entry = measure_history_action(history_action('Paste', [
+            cell_change(0, 0, 'v', named),
+            cell_change(1, 0, 'v', named),
+            cell_change(2, 0, 'v', { ...named }),
+        ]));
+        expect(entry.byteCost).toBeLessThan(50_000 * 2 * 2);
+    });
+
+    it('refuses a gesture whose worksheet name alone exceeds the hard bound', () => {
+        const hard: HistoryBounds = {
+            maxActions: 100,
+            maxCells: 1_000_000,
+            softMaxBytes: 10_000,
+            hardMaxBytes: 20_000,
+        };
+        const named: WorksheetTarget = { sheetIndex: 0, sheetName: 'n'.repeat(50_000) };
+        const outcome = record_history_action(
+            empty_history_stack(),
+            history_action('Edit', [cell_change(0, 0, 'v', named)]),
+            hard,
+        );
+        expect(outcome.kind).toBe('refused');
+    });
+
     it('charges longer content more', () => {
         const small = measure_history_action(history_action('S', [cell_change(0, 0, 'x')]));
         const large = measure_history_action(history_action('L', [cell_change(0, 0, 'x'.repeat(5_000))]));
@@ -953,6 +995,30 @@ describe('worksheet focus', () => {
         ]);
         expect(action_is_single_worksheet(forward)).toBe(true);
         expect(action_is_single_worksheet(reversed)).toBe(true);
+    });
+
+    it('sees through an id-less change to two sheets sharing a name', () => {
+        // Two targets sharing a name but carrying different ids each match an
+        // id-less target, so comparing every change to the FIRST one called this
+        // single-sheet whenever the id-less change happened to be applied first.
+        const anonymous: WorksheetTarget = { sheetIndex: 0, sheetName: 'Data' };
+        const one: WorksheetTarget = { sheetIndex: 0, sheetName: 'Data', worksheetId: 'rId1' };
+        const two: WorksheetTarget = { sheetIndex: 1, sheetName: 'Data', worksheetId: 'rId9' };
+        const action = history_action('Discard all', [
+            cell_change(0, 0, 'v', anonymous),
+            cell_change(1, 0, 'v', one),
+            cell_change(2, 0, 'v', two),
+        ]);
+        expect(action_is_single_worksheet(action)).toBe(false);
+    });
+
+    it('separates two positional changes at different indices', () => {
+        // Nothing but the index identifies these, so the index has to be believed.
+        const action = history_action('Discard all', [
+            cell_change(0, 0, 'v', { sheetIndex: 0 }),
+            cell_change(1, 0, 'v', { sheetIndex: 1 }),
+        ]);
+        expect(action_is_single_worksheet(action)).toBe(false);
     });
 
     it('matches worksheets by identity, not by index', () => {
