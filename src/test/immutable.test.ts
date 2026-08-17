@@ -50,6 +50,16 @@ describe('is_deeply_frozen', () => {
         expect(is_deeply_frozen(Object.freeze([Object.freeze({ a: 1 }), { b: 2 }]))).toBe(false);
     });
 
+    it('rejects an accessor-backed property, whose value freezing does not reach', () => {
+        // Object.freeze freezes the descriptor, not what the getter closes over,
+        // so reading it once proves nothing about what it returns next time.
+        let backing = { a: 1 };
+        const value = Object.freeze({ get inner() { return backing; } });
+        expect(is_deeply_frozen(value)).toBe(false);
+        backing = { a: 2 };
+        expect(value.inner).toEqual({ a: 2 });
+    });
+
     it('terminates on a frozen cycle', () => {
         const cyclic: { self?: unknown } = {};
         cyclic.self = cyclic;

@@ -127,28 +127,52 @@ function estimate_string_bytes(text: string): number {
     return text.length * 2;
 }
 
-function estimate_value_bytes(value: HistoryValue): number {
-    let total = estimate_string_bytes(value.text);
-    for (const run of value.runs?.runs ?? []) {
-        total += RUN_OVERHEAD_BYTES + estimate_string_bytes(run.text);
-    }
-    return total;
+/**
+ * Charges each payload object once per delta.
+ *
+ * A delta's transitions and its overlay snapshots SHARE their payloads:
+ * `build_cell_history_delta` puts the same `HistoryValue` object in
+ * `value.desired.content` and in `afterOverlay.value.value`, and
+ * `structuredClone` preserves the alias, so the string exists once in memory.
+ * Charging both views would roughly double a paste's measured cost and refuse
+ * gestures that fit the hard bound — losing the user's undo to protect memory
+ * that was never allocated.
+ */
+function payload_charger(): {
+    value: (value: HistoryValue) => number;
+    link: (link: CellHyperlink | null) => number;
+} {
+    const counted = new WeakSet<object>();
+    const once = <T extends object>(payload: T | null, cost: (payload: T) => number): number => {
+        if (payload === null || counted.has(payload)) return 0;
+        counted.add(payload);
+        return cost(payload);
+    };
+    return {
+        value: (value) => once(value, (payload) => {
+            let total = estimate_string_bytes(payload.text);
+            for (const run of payload.runs?.runs ?? []) {
+                total += RUN_OVERHEAD_BYTES + estimate_string_bytes(run.text);
+            }
+            return total;
+        }),
+        link: (link) => once(link, (payload) => {
+            const destination = payload.kind === 'external' ? payload.target : payload.location;
+            return estimate_string_bytes(destination) + estimate_string_bytes(payload.tooltip ?? '');
+        }),
+    };
 }
 
-function estimate_hyperlink_bytes(link: CellHyperlink | null): number {
-    if (link === null) return 0;
-    const destination = link.kind === 'external' ? link.target : link.location;
-    return estimate_string_bytes(destination) + estimate_string_bytes(link.tooltip ?? '');
-}
-
-function estimate_overlay_bytes(overlay: CellOverlayState): number {
+function estimate_overlay_bytes(
+    overlay: CellOverlayState,
+    charge: ReturnType<typeof payload_charger>,
+): number {
     if (overlay.kind === 'absent') return 0;
     const value = overlay.value.kind === 'present'
-        ? estimate_value_bytes(overlay.value.value) + estimate_value_bytes(overlay.value.base)
-        : estimate_value_bytes(overlay.value.anchor);
+        ? charge.value(overlay.value.value) + charge.value(overlay.value.base)
+        : charge.value(overlay.value.anchor);
     const link = overlay.hyperlink.kind === 'present'
-        ? estimate_hyperlink_bytes(overlay.hyperlink.value)
-            + estimate_hyperlink_bytes(overlay.hyperlink.base)
+        ? charge.link(overlay.hyperlink.value) + charge.link(overlay.hyperlink.base)
         : 0;
     return value + link;
 }
@@ -156,27 +180,28 @@ function estimate_overlay_bytes(overlay: CellOverlayState): number {
 /**
  * A delta's retained cost, measured over everything it actually holds.
  *
- * The overlay snapshots are not second copies of the transition content, so
- * they have to be measured rather than approximated from it. A link-only edit
- * on a cell holding a very long string moves a few dozen bytes of hyperlink
- * while retaining that whole string twice as the untouched dimension's anchor;
- * a recommit against a base that moved underneath retains two long bases behind
- * an unchanged short value. Charging only the transitions would let either slip
- * past the hard bound by orders of magnitude.
+ * The overlays have to be walked, not approximated from the transitions: a
+ * link-only edit on a cell holding a very long string moves a few dozen bytes of
+ * hyperlink while retaining that whole string as the untouched dimension's
+ * anchor, and a recommit against a base that moved underneath retains two long
+ * bases behind an unchanged short value. Either would slip past the hard bound
+ * by orders of magnitude if only the transitions were charged. What the overlays
+ * share with the transitions is charged once — see `payload_charger`.
  */
 function estimate_cell_delta_bytes(delta: CellHistoryDelta): number {
+    const charge = payload_charger();
     let total = CHANGE_OVERHEAD_BYTES;
     if (delta.value !== undefined) {
-        total += estimate_value_bytes(delta.value.expected.content)
-            + estimate_value_bytes(delta.value.desired.content);
+        total += charge.value(delta.value.expected.content)
+            + charge.value(delta.value.desired.content);
     }
     if (delta.hyperlink !== undefined) {
-        total += estimate_hyperlink_bytes(delta.hyperlink.expected.content)
-            + estimate_hyperlink_bytes(delta.hyperlink.desired.content);
+        total += charge.link(delta.hyperlink.expected.content)
+            + charge.link(delta.hyperlink.desired.content);
     }
     return total
-        + estimate_overlay_bytes(delta.beforeOverlay)
-        + estimate_overlay_bytes(delta.afterOverlay);
+        + estimate_overlay_bytes(delta.beforeOverlay, charge)
+        + estimate_overlay_bytes(delta.afterOverlay, charge);
 }
 
 function estimate_change_bytes(change: HistoryChange): number {
@@ -403,11 +428,22 @@ export function action_focus_worksheet(action: HistoryAction): WorksheetTarget |
     return action.changes[0]?.delta.worksheet;
 }
 
-/** Whether every change in the action belongs to one worksheet. */
+/**
+ * Whether every change in the action belongs to one worksheet.
+ *
+ * Matched symmetrically, as `viewer-controller` does when reconciling a target
+ * against a message: `worksheet_target_matches` treats its first argument as
+ * authoritative, so an id-less target compared against an identified one falls
+ * back to the name while the reverse comparison insists on the id. Application
+ * order must not decide whether a gesture spans sheets.
+ */
 export function action_is_single_worksheet(action: HistoryAction): boolean {
     const first = action_focus_worksheet(action);
     if (first === undefined) return true;
-    return action.changes.every((change) => worksheet_target_matches(change.delta.worksheet, first));
+    return action.changes.every(({ delta }) => (
+        worksheet_target_matches(delta.worksheet, first)
+        || worksheet_target_matches(first, delta.worksheet)
+    ));
 }
 
 /**

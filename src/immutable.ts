@@ -20,9 +20,15 @@ function is_frozen_recursive(value: unknown, seen: WeakSet<object>): boolean {
     if (seen.has(object)) return true;
     seen.add(object);
     if (!Object.isFrozen(object)) return false;
-    return Reflect.ownKeys(object).every(
-        (key) => is_frozen_recursive(Reflect.get(object, key), seen),
-    );
+    return Reflect.ownKeys(object).every((key) => {
+        const descriptor = Reflect.getOwnPropertyDescriptor(object, key);
+        if (descriptor === undefined) return false;
+        // Freezing an accessor property freezes the descriptor, not whatever the
+        // getter closes over, so reading it once proves nothing about what it
+        // will return next time.
+        if (!('value' in descriptor)) return false;
+        return is_frozen_recursive(descriptor.value, seen);
+    });
 }
 
 /**

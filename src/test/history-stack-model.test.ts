@@ -277,6 +277,19 @@ describe('measure_history_action', () => {
         expect(entry.cellCount).toBe(2);
     });
 
+    it('charges a payload the transitions and overlays share only once', () => {
+        // `build_cell_history_delta` puts the same HistoryValue object in the
+        // transition and in the overlay snapshot, so the string exists once in
+        // memory. Charging both views would refuse gestures that fit the hard
+        // bound — losing the user's undo to protect memory never allocated.
+        const long = 'x'.repeat(100_000);
+        const entry = measure_history_action(history_action('Edit', [cell_change(0, 0, long)]));
+        // The edit retains the new value and the base once each; charging the
+        // overlay separately would put this near four times the value's size.
+        expect(entry.byteCost).toBeLessThan(long.length * 2 * 2);
+        expect(entry.byteCost).toBeGreaterThan(long.length * 2);
+    });
+
     it('charges longer content more', () => {
         const small = measure_history_action(history_action('S', [cell_change(0, 0, 'x')]));
         const large = measure_history_action(history_action('L', [cell_change(0, 0, 'x'.repeat(5_000))]));
@@ -525,6 +538,23 @@ describe('worksheet focus', () => {
     it('recognizes a single-worksheet action', () => {
         const action = history_action('Paste', [cell_change(0, 0, 'v'), cell_change(1, 0, 'v')]);
         expect(action_is_single_worksheet(action)).toBe(true);
+    });
+
+    it('does not let change order decide whether a gesture spans sheets', () => {
+        // An id-less target compared against an identified one falls back to the
+        // name, while the reverse comparison insists on the id.
+        const identified: WorksheetTarget = { sheetIndex: 0, sheetName: 'Data', worksheetId: 'rId1' };
+        const anonymous: WorksheetTarget = { sheetIndex: 0, sheetName: 'Data' };
+        const forward = history_action('Paste', [
+            cell_change(0, 0, 'v', anonymous),
+            cell_change(1, 0, 'v', identified),
+        ]);
+        const reversed = history_action('Paste', [
+            cell_change(0, 0, 'v', identified),
+            cell_change(1, 0, 'v', anonymous),
+        ]);
+        expect(action_is_single_worksheet(forward)).toBe(true);
+        expect(action_is_single_worksheet(reversed)).toBe(true);
     });
 
     it('matches worksheets by identity, not by index', () => {
