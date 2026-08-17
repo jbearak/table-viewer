@@ -628,7 +628,7 @@ function copy_cell_history_delta(
         values.set(value, copied);
         return copied;
     };
-    const links = new Map<CellHyperlink, CellHyperlink | null>();
+    const links = new Map<CellHyperlink, CellHyperlink>();
     const link_of = (link: CellHyperlink | null): CellHyperlink | null => {
         if (link === null) return null;
         const seen = links.get(link);
@@ -796,11 +796,7 @@ function copy_style(style: CellTextStyle): CellTextStyle {
     };
 }
 
-function copy_hyperlink(
-    link: CellHyperlink | null,
-    owner: HistoryActionOwner,
-): CellHyperlink | null {
-    if (link === null) return null;
+function copy_hyperlink(link: CellHyperlink, owner: HistoryActionOwner): CellHyperlink {
     const tooltip = link.tooltip;
     const rest = tooltip === undefined ? {} : { tooltip: owner.own_string(tooltip) };
     return link.kind === 'external'

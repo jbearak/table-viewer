@@ -420,9 +420,6 @@ interface HistoryCosts {
     readonly byteCost: number;
 }
 
-/** The action as history would retain it, with its costs. */
-type OwnedAction = MeasuredAction;
-
 /** Costs of an action this module already owns, so nothing needs rebuilding. */
 function measure_costs(action: HistoryAction): HistoryCosts {
     const cells = cell_count_index();
@@ -567,7 +564,7 @@ function map_entry<K, V>(map: Map<K, V>, key: K, make: () => V): V {
  * the change's cost, not the cost itself: `estimate_change_bytes` still has the
  * last word below, since it also charges the shape.
  */
-function own_and_measure(action: HistoryAction, budget = Infinity): OwnedAction | undefined {
+function own_and_measure(action: HistoryAction, budget = Infinity): MeasuredAction | undefined {
     const cells = cell_count_index();
     const charge = action_charger();
     const owned: HistoryChange[] = [];
@@ -623,7 +620,7 @@ const OWNED_ACTIONS = new WeakSet<HistoryAction>();
  */
 export function measure_history_action(action: HistoryAction): MeasuredAction {
     // No budget, so the walk always completes.
-    return own_and_measure(action) as OwnedAction;
+    return own_and_measure(action) as MeasuredAction;
 }
 
 export interface RecordedOutcome {
@@ -720,14 +717,14 @@ export function record_history_action(
     const owned = OWNED_ACTIONS.has(action)
         ? { action, ...measure_costs(action) }
         : own_and_measure({ label, changes: action.changes }, bounds.hardMaxBytes);
-    if (owned === undefined) return refused(state, label, bounds);
+    if (owned === undefined) return refused(state, label, bounds.hardMaxBytes);
     // A gesture that moved nothing is answered before the byte bound is
     // consulted, so no barrier can be installed for an action that never needed
     // recording — a label built from data must not be able to destroy valid
     // history. It is answered after the walk because the walk is what reads the
     // changes, and reading them twice is what the copy above was avoiding.
     if (owned.action.changes.length === 0) return { kind: 'empty', state };
-    if (owned.byteCost > bounds.hardMaxBytes) return refused(state, label, bounds);
+    if (owned.byteCost > bounds.hardMaxBytes) return refused(state, label, bounds.hardMaxBytes);
 
     const entry: HistoryEntry = { ...owned, id: {}, moves: 0, epoch: state.epoch };
     const { kept, evicted } = evict_to_fit([...state.undoStack, entry], bounds);
@@ -747,7 +744,7 @@ export function record_history_action(
 function refused(
     state: HistoryStackState,
     label: string,
-    bounds: HistoryBounds,
+    hardMaxBytes: number,
 ): RefusedOutcome {
     return {
         kind: 'refused',
@@ -758,7 +755,7 @@ function refused(
             epoch: state.epoch + 1,
         },
         reason: 'action-too-large',
-        hardMaxBytes: bounds.hardMaxBytes,
+        hardMaxBytes,
     };
 }
 
@@ -1103,7 +1100,7 @@ function own_highlight_history_delta(
 
 /** Builds a frozen action, so a caller reusing its builders cannot mutate history. */
 export function history_action(label: string, changes: readonly HistoryChange[]): HistoryAction {
-    return (own_and_measure({ label, changes }) as OwnedAction).action;
+    return (own_and_measure({ label, changes }) as MeasuredAction).action;
 }
 
 /**
