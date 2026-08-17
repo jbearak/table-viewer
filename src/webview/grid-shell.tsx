@@ -1595,6 +1595,63 @@ export function GridShell({
     const sample_loaded_rows_ref = useRef(sample_loaded_rows);
     sample_loaded_rows_ref.current = sample_loaded_rows;
 
+    const get_row_height = useMemo(() => {
+        // Glide walks the visible rows once per column and getCellContent runs for
+        // every cell. Keep row-height layer searches at roughly once per row, as
+        // row-heights.ts budgets, without retaining an unbounded sheet-sized map.
+        const cache = new Map<number, number>();
+        return (row: number): number => {
+            const cached = cache.get(row);
+            if (cached !== undefined) return cached;
+            const height = (
+                row_resize_preview
+                && (
+                    row_resize_preview.row === row
+                    || row_resize_preview.preview_rows?.hasIndex(row)
+                )
+            )
+                ? row_resize_preview.height
+                : resolved_row_height(
+                    row_heights,
+                    row_height_overlay,
+                    row,
+                    default_row_height,
+                );
+            // A 512-row viewport is already over 12,000px at the minimum row
+            // height. Clear rather than let non-paint consumers grow this forever.
+            if (cache.size >= 512) cache.clear();
+            cache.set(row, height);
+            return height;
+        };
+    }, [default_row_height, row_heights, row_height_overlay, row_resize_preview]);
+
+    const get_cell_height = useCallback((row: number, display_column: number): number => {
+        // Glide requests a merged block at its anchor coordinates, but paints it
+        // across every covered row. Its effective height is therefore the sum of
+        // the span, not merely the anchor row's height.
+        const entry = merge_index.is_anchor(row, display_column);
+        const last_row = entry?.endRow ?? row;
+        let height = 0;
+        for (let r = row; r <= last_row; r++) height += get_row_height(r);
+        return height;
+    }, [get_row_height, merge_index]);
+
+    const get_cell_width = useCallback((row: number, display_column: number): number => {
+        // The renderer paints in logical canvas pixels. Hover bounds are scaled
+        // client pixels (and include Glide's one-pixel hit-test border), so they
+        // cannot be compared directly with canvas measureText widths. Sum the
+        // same displayed-column widths the renderer uses, including a horizontal
+        // merge's full span.
+        const entry = merge_index.is_anchor(row, display_column);
+        const last_column = entry?.endCol ?? display_column;
+        let width = 0;
+        for (let column = display_column; column <= last_column; column++) {
+            const grid_column = columns[column];
+            if (grid_column && 'width' in grid_column) width += grid_column.width;
+        }
+        return width;
+    }, [columns, merge_index]);
+
     // Truncated-cell hover tooltip. Shown after a short dwell only when the
     // displayed value does not fit the painted cell (horizontal ellipsis or
     // vertical clip of wrapped / multiline text). Cleared on leave, scroll,
@@ -1773,6 +1830,13 @@ export function GridShell({
             const rich_data = !dirty && loaded
                 ? rich_cell_display_data(loaded, show_formatting, font_size_px)
                 : undefined;
+            // Hover bounds are client-space geometry. A fractional canvas scale
+            // can make a default 24px row arrive as 24.5px, which must not turn
+            // every single-line cell into a soft-wrapped cell. Read the same
+            // logical (merge-aware) height used by build_grid_cell instead, so
+            // painting and tooltip overflow choose the same wrapping mode.
+            const cell_height = get_cell_height(row, display_column);
+            const cell_width = get_cell_width(row, display_column);
 
             let overflows: boolean;
             if (rich_data) {
@@ -1780,31 +1844,32 @@ export function GridShell({
                 // fonts; the overflow check must match or the tooltip lies.
                 overflows = rich_text_overflows_cell(
                     rich_data.lines,
-                    cell_bounds.width,
+                    cell_width,
                     (segment, style) => measure_line_width(
                         segment,
                         style?.bold ?? false,
                         style?.italic ?? false,
                     ),
                     {
-                        cell_height: cell_bounds.height,
+                        cell_height,
                         line_height: line_height_for_font(font_size_px),
                     },
                 );
             } else {
                 const flags = font_flags_for_cell(display_column, row);
                 // Use the same wrapping rule as build_grid_cell. `cell_bounds` is
-                // the full painted rectangle, including a vertical merge's rows.
+                // client-space positioning only; logical height also includes a
+                // vertical merge's rows without inheriting canvas scale noise.
                 const wrapping = cell_allows_wrapping(
                     text,
-                    cell_bounds.height > default_row_height,
+                    cell_height > default_row_height,
                 );
                 overflows = text !== '' && text_overflows_cell(
                     text,
-                    cell_bounds.width,
+                    cell_width,
                     (line) => measure_line_width(line, flags.bold, flags.italic),
                     {
-                        cell_height: cell_bounds.height,
+                        cell_height,
                         line_height: line_height_for_font(font_size_px),
                         wrapping,
                     },
@@ -1848,6 +1913,8 @@ export function GridShell({
             cell_hyperlink,
             get_row,
             get_source_row,
+            get_cell_height,
+            get_cell_width,
             show_formatting,
             source_column_for_display,
             store,
@@ -1936,47 +2003,6 @@ export function GridShell({
         const color = cell_highlights?.cells[`${source_row}:${source_column}`];
         return color ? highlight_rgba(color, high_contrast) : undefined;
     }, [cell_highlights, high_contrast]);
-
-    const get_row_height = useMemo(() => {
-        // Glide walks the visible rows once per column and getCellContent runs for
-        // every cell. Keep row-height layer searches at roughly once per row, as
-        // row-heights.ts budgets, without retaining an unbounded sheet-sized map.
-        const cache = new Map<number, number>();
-        return (row: number): number => {
-            const cached = cache.get(row);
-            if (cached !== undefined) return cached;
-            const height = (
-                row_resize_preview
-                && (
-                    row_resize_preview.row === row
-                    || row_resize_preview.preview_rows?.hasIndex(row)
-                )
-            )
-                ? row_resize_preview.height
-                : resolved_row_height(
-                    row_heights,
-                    row_height_overlay,
-                    row,
-                    default_row_height,
-                );
-            // A 512-row viewport is already over 12,000px at the minimum row
-            // height. Clear rather than let non-paint consumers grow this forever.
-            if (cache.size >= 512) cache.clear();
-            cache.set(row, height);
-            return height;
-        };
-    }, [default_row_height, row_heights, row_height_overlay, row_resize_preview]);
-
-    const get_cell_height = useCallback((row: number, display_column: number): number => {
-        // Glide requests a merged block at its anchor coordinates, but paints it
-        // across every covered row. Its effective height is therefore the sum of
-        // the span, not merely the anchor row's height.
-        const entry = merge_index.is_anchor(row, display_column);
-        const last_row = entry?.endRow ?? row;
-        let height = 0;
-        for (let r = row; r <= last_row; r++) height += get_row_height(r);
-        return height;
-    }, [get_row_height, merge_index]);
 
     const get_cell_content = useCallback(
         (cell: Item): GridCell => {
