@@ -213,11 +213,11 @@ describe('record_history_action', () => {
         expect(outcome.state.undoStack[0]?.action).toBe(action);
     });
 
-    it('shares a caller-built action\'s content rather than copying it', () => {
-        // Canonicalizing rebuilds the skeleton, which is a handful of small
-        // objects per cell. The CONTENT is shared: a supported gesture is a
-        // million cells, and duplicating that would double peak memory exactly
-        // when there is least of it.
+    it('reuses a delta the model itself built instead of copying it again', () => {
+        // `build_cell_history_delta` canonicalizes, so its result is already frozen
+        // with every string detached. Rebuilding it would allocate a second copy of
+        // all of that content, and a gesture near the hard bound would hold both at
+        // once — exhausting memory below the bound meant to prevent exactly that.
         const change = cell_change(0, 0, 'x'.repeat(1_000));
         const outcome = record_history_action(empty_history_stack(), {
             label: 'Edit',
@@ -228,9 +228,25 @@ describe('record_history_action', () => {
             throw new Error('fixture did not build a cell change');
         }
 
-        expect(recorded.delta).not.toBe(change.delta);
-        expect(recorded.delta.value?.desired.content.text)
-            .toBe(change.delta.value?.desired.content.text);
+        expect(recorded.delta).toBe(change.delta);
+    });
+
+    it('rebuilds a delta it did not build, sharing the content', () => {
+        // A hand-assembled delta is untrusted structure — a getter, a prototype
+        // field, an undeclared extra — so it is rebuilt. Only the SKELETON: the
+        // content strings are interned, not duplicated, because a supported gesture
+        // is a million cells.
+        const built = cell_change(0, 0, 'x'.repeat(1_000)).delta as CellHistoryDelta;
+        const forged: HistoryChange = { kind: 'cell', delta: { ...built } };
+        const outcome = record_history_action(empty_history_stack(), {
+            label: 'Edit',
+            changes: [forged],
+        });
+        const recorded = outcome.state.undoStack[0]?.action.changes[0];
+        if (recorded?.kind !== 'cell') throw new Error('fixture did not build a cell change');
+
+        expect(recorded.delta).not.toBe(forged.delta);
+        expect(recorded.delta.value?.desired.content.text).toBe(built.value?.desired.content.text);
     });
 
     it('truncates a label built from data rather than retaining it', () => {
@@ -488,6 +504,26 @@ describe('measure_history_action', () => {
         expect(entry.byteCost).toBeGreaterThan(100_000 * 2);
     });
 
+    it('shares one copy of a worksheet name across a wide gesture', () => {
+        // Detaching per delta would turn one shared name into a copy per cell, each
+        // charged once by an estimator that deduplicates — the bound defeated by the
+        // copying meant to make it honest. Interning is the other half of detaching.
+        const name = 'n'.repeat(5_000);
+        const forged = (row: number): HistoryChange => ({
+            kind: 'cell',
+            delta: { ...(cell_change(row, 0, 'v', { sheetIndex: 0, sheetName: name }).delta as CellHistoryDelta) },
+        });
+        const outcome = record_history_action(empty_history_stack(), {
+            label: 'Paste',
+            changes: [forged(0), forged(1), forged(2)],
+        });
+        const changes = outcome.state.undoStack[0]?.action.changes ?? [];
+
+        expect(changes).toHaveLength(3);
+        expect(changes[1]?.delta.worksheet.sheetName).toBe(changes[0]?.delta.worksheet.sheetName);
+        expect(changes[2]?.delta.worksheet.sheetName).toBe(changes[0]?.delta.worksheet.sheetName);
+    });
+
     it('charges one worksheet identity once across a wide gesture', () => {
         // A million-cell paste names one worksheet, whose name exists once in
         // memory however many deltas point at it. Charging each of them would
@@ -499,6 +535,15 @@ describe('measure_history_action', () => {
             cell_change(2, 0, 'v', { ...named }),
         ]));
         expect(entry.byteCost).toBeLessThan(50_000 * 2 * 2);
+    });
+
+    it('charges a run\'s shape, not only its text', () => {
+        // A cell of one-character runs is mostly shape: a budget told only about text
+        // would let the whole run graph be allocated before anything checked.
+        const many = rich_change(Array.from({ length: 2_000 }, () => ({ text: 'y' })));
+        const few = rich_change(Array.from({ length: 2 }, () => ({ text: 'y' })));
+        expect(measure_history_action(history_action('Many', [many])).byteCost)
+            .toBeGreaterThan(measure_history_action(history_action('Few', [few])).byteCost + 10_000);
     });
 
     it('stops rebuilding inside one change whose runs exceed the hard bound', () => {
@@ -513,8 +558,10 @@ describe('measure_history_action', () => {
             hardMaxBytes: 20_000,
         };
         let read = 0;
-        const runs = Array.from({ length: 500 }, () => ({
-            get text() { read += 1; return 'y'.repeat(1_000); },
+        // Distinct texts, because equal ones are interned and cost nothing after the
+        // first — the shape is what has to be charged here.
+        const runs = Array.from({ length: 500 }, (_unused, index) => ({
+            get text() { read += 1; return `${index}${'y'.repeat(1_000)}`; },
         })) as { readonly text: string }[];
         const change = rich_change(runs);
 

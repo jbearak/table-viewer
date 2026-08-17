@@ -610,8 +610,9 @@ function effective_hyperlink_side(
  */
 export function canonical_cell_history_delta(
     delta: CellHistoryDelta,
-    meter?: RetainedStringMeter,
+    owner: RetainedStringOwner = detaching_owner(),
 ): CellHistoryDelta {
+    if (CANONICAL_DELTAS.has(delta)) return delta;
     // A memo per delta, so an object the input SHARED between a transition and an
     // overlay is shared by the output too. That aliasing is load-bearing: it is
     // how one string exists once in memory, and how the byte estimate charges it
@@ -620,7 +621,7 @@ export function canonical_cell_history_delta(
     const value_of = (value: HistoryValue): HistoryValue => {
         const seen = values.get(value);
         if (seen !== undefined) return seen;
-        const canonical = canonical_value(value, meter);
+        const canonical = canonical_value(value, owner);
         values.set(value, canonical);
         return canonical;
     };
@@ -629,13 +630,13 @@ export function canonical_cell_history_delta(
         if (link === null) return null;
         const seen = links.get(link);
         if (seen !== undefined) return seen;
-        const canonical = canonical_hyperlink(link, meter);
+        const canonical = canonical_hyperlink(link, owner);
         links.set(link, canonical);
         return canonical;
     };
 
     const base: CellHistoryDeltaBase = {
-        worksheet: canonical_worksheet_target(delta.worksheet, meter),
+        worksheet: canonical_worksheet_target(delta.worksheet, owner),
         sourceRow: delta.sourceRow,
         sourceColumn: delta.sourceColumn,
         beforeOverlay: canonical_overlay(delta.beforeOverlay, value_of, link_of),
@@ -652,20 +653,70 @@ export function canonical_cell_history_delta(
         : value !== undefined
             ? { ...base, value: canonical_transition(value, value_of) }
             : { ...base, hyperlink: canonical_transition(hyperlink!, link_of) };
-    return freeze_deep_declared(out);
+    const frozen = freeze_deep_declared(out);
+    CANONICAL_DELTAS.add(frozen);
+    return frozen;
 }
 
 /**
- * Told about every string a canonical delta retains, as it is retained.
+ * An owner for a lone delta: detaches, shares within the delta, charges nothing.
  *
- * The bounds are enforced against a separate estimating walk, which cannot stop a
- * rebuild already under way: one cell carrying enough rich-text runs to exceed the
- * hard bound was canonicalized in full — the caller's graph and the whole clone
- * alive together — before anything checked. A meter is a tripwire, not the
- * accounting: it may throw to abandon the walk, and the estimator still has the
- * last word on what an action costs.
+ * The default for a caller building one delta at a time, where there is no action
+ * to bound and no sibling delta to share with.
  */
-export type RetainedStringMeter = (text: string) => void;
+export function detaching_owner(): RetainedStringOwner {
+    const owned = new Map<string, string>();
+    return {
+        own: (text) => {
+            const seen = owned.get(text);
+            if (seen !== undefined) return seen;
+            const detached = detached_string(text);
+            owned.set(text, detached);
+            return detached;
+        },
+        charge_run: () => {},
+    };
+}
+
+/**
+ * Who owns the strings and the shape a canonical delta retains.
+ *
+ * Two jobs a delta cannot do for itself, because both are properties of the whole
+ * ACTION rather than of one cell:
+ *
+ *   - `own` returns the string to retain, SHARED across every delta that asks for
+ *     an equal one. A million-cell paste names one worksheet; detaching that name
+ *     per delta would allocate a million copies of it, each of them charged once by
+ *     an estimator that deduplicates by value — a bound defeated by the very
+ *     copying that was meant to make the bound honest.
+ *   - `charge_run` accounts for a run's shape as it is built. The bounds are
+ *     otherwise enforced by a separate estimating walk, which cannot stop a rebuild
+ *     already under way: a cell carrying millions of one-character runs is mostly
+ *     shape, so metering only their text let the whole run graph be allocated
+ *     before anything checked.
+ *
+ * Either may throw to abandon the walk. The estimator still has the last word on
+ * what an action costs; this is a tripwire.
+ */
+export interface RetainedStringOwner {
+    own(text: string): string;
+    charge_run(): void;
+}
+
+/** Registers what this module built, so a second rebuild can be skipped. */
+const CANONICAL_DELTAS = new WeakSet<CellHistoryDelta>();
+
+/**
+ * Whether this delta is already the canonical, frozen, detached form.
+ *
+ * True only of a graph this module built. Re-canonicalizing one would allocate a
+ * second full copy of every string it holds, so a gesture near the hard bound
+ * would hold both copies at once — exhausting memory below the bound meant to
+ * prevent exactly that.
+ */
+export function is_canonical_cell_delta(delta: CellHistoryDelta): boolean {
+    return CANONICAL_DELTAS.has(delta);
+}
 
 /**
  * How much of a string is copied at a time when detaching it.
@@ -708,30 +759,25 @@ function detached_chunk(text: string, start: number, end: number): string {
     return String.fromCharCode(...units);
 }
 
-function retained(text: string, meter: RetainedStringMeter | undefined): string {
-    meter?.(text);
-    return detached_string(text);
-}
-
 function canonical_worksheet_target(
     target: WorksheetTarget,
-    meter?: RetainedStringMeter,
+    owner: RetainedStringOwner,
 ): WorksheetTarget {
     const { sheetIndex, sheetName, worksheetId } = target;
     return {
         sheetIndex,
-        ...(sheetName === undefined ? {} : { sheetName: retained(sheetName, meter) }),
-        ...(worksheetId === undefined ? {} : { worksheetId: retained(worksheetId, meter) }),
+        ...(sheetName === undefined ? {} : { sheetName: owner.own(sheetName) }),
+        ...(worksheetId === undefined ? {} : { worksheetId: owner.own(worksheetId) }),
     };
 }
 
-function canonical_value(value: HistoryValue, meter?: RetainedStringMeter): HistoryValue {
+function canonical_value(value: HistoryValue, owner: RetainedStringOwner): HistoryValue {
     const runs = value.runs;
     return {
-        text: retained(value.text, meter),
+        text: owner.own(value.text),
         ...(runs === undefined
             ? {}
-            : { runs: { runs: canonical_runs(runs.runs, meter) } }),
+            : { runs: { runs: canonical_runs(runs.runs, owner) } }),
     };
 }
 
@@ -745,17 +791,22 @@ function canonical_value(value: HistoryValue, meter?: RetainedStringMeter): Hist
  */
 function canonical_runs(
     runs: readonly RichTextRun[],
-    meter?: RetainedStringMeter,
+    owner: RetainedStringOwner,
 ): readonly RichTextRun[] {
     const out: RichTextRun[] = [];
-    for (const run of runs) out.push(canonical_run(run, meter));
+    for (const run of runs) {
+        // Charged before it is built: a cell of one-character runs is mostly shape,
+        // so a budget told only about text would allocate the whole run graph.
+        owner.charge_run();
+        out.push(canonical_run(run, owner));
+    }
     return out;
 }
 
-function canonical_run(run: RichTextRun, meter?: RetainedStringMeter): RichTextRun {
+function canonical_run(run: RichTextRun, owner: RetainedStringOwner): RichTextRun {
     const style = run.style;
     return {
-        text: retained(run.text, meter),
+        text: owner.own(run.text),
         ...(style === undefined ? {} : { style: canonical_style(style) }),
     };
 }
@@ -772,14 +823,14 @@ function canonical_style(style: CellTextStyle): CellTextStyle {
 
 function canonical_hyperlink(
     link: CellHyperlink | null,
-    meter?: RetainedStringMeter,
+    owner: RetainedStringOwner,
 ): CellHyperlink | null {
     if (link === null) return null;
     const tooltip = link.tooltip;
-    const rest = tooltip === undefined ? {} : { tooltip: retained(tooltip, meter) };
+    const rest = tooltip === undefined ? {} : { tooltip: owner.own(tooltip) };
     return link.kind === 'external'
-        ? { kind: 'external', target: retained(link.target, meter), ...rest }
-        : { kind: 'internal', location: retained(link.location, meter), ...rest };
+        ? { kind: 'external', target: owner.own(link.target), ...rest }
+        : { kind: 'internal', location: owner.own(link.location), ...rest };
 }
 
 interface CanonicalTransition<T> {

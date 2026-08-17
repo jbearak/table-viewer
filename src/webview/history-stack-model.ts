@@ -7,7 +7,7 @@ import {
 import {
     canonical_cell_history_delta,
     detached_string,
-    type RetainedStringMeter,
+    type RetainedStringOwner,
     type CellHistoryDelta,
     type CellOverlayState,
     type HistoryDirection,
@@ -305,19 +305,18 @@ function estimate_cell_delta_bytes(delta: CellHistoryDelta): number {
 }
 
 /**
- * Charges each distinct worksheet identity string once per action.
+ * Charges each worksheet identity string once per action.
  *
  * `sheetName` and `worksheetId` are retained in every delta and neither is
  * length-bounded — a name comes from the file, an id from its relationships — so
  * a gesture carrying a megabyte-long name past the byte bound is a gesture that
  * exhausted the heap history was bounded to protect.
  *
- * Charged per distinct STRING VALUE rather than per delta: a million-cell paste
- * names one worksheet, whose name exists once in memory however many deltas point
- * at it, and charging each of them would refuse gestures that fit the bound. Keyed
- * on the value because that is the only thing a `Set` can key on, which errs
- * safely: two equal strings from different sources are charged once, and the
- * measurement is an estimate either way.
+ * Charged once per distinct VALUE across the action, which is exactly what memory
+ * holds: `action_owner` interns by value, so a million-cell paste naming one
+ * worksheet retains one copy of that name however many deltas point at it.
+ * Charging each delta would refuse gestures that fit the bound; charging once
+ * without the interning would accept gestures that do not.
  */
 function worksheet_charger(): (worksheet: WorksheetTarget) => number {
     const counted = new Set<string>();
@@ -368,8 +367,39 @@ function measure_costs(action: HistoryAction): HistoryCosts {
     return { cellCount: cells.size, byteCost };
 }
 
-/** Thrown by the meter to abandon a rebuild mid-change. Never escapes this module. */
+/** Thrown by the owner to abandon a rebuild mid-change. Never escapes this module. */
 class BudgetExhausted extends Error {}
+
+/**
+ * Owns every string one ACTION retains, sharing them across its changes.
+ *
+ * Detaching a string is what makes the byte bound honest — a retained view keeps
+ * its whole parent alive while being charged its own length — but detaching PER
+ * DELTA turns one shared worksheet name into a million private copies, each of them
+ * charged once by an estimator that deduplicates. So interning is the other half of
+ * detaching, and both belong to the action rather than the cell: within an action,
+ * equal strings become one string, which is then charged once.
+ *
+ * The trip function is told about each newly retained string and each run's shape,
+ * so a rebuild can be abandoned mid-change — a cell of a million one-character runs
+ * is mostly shape, and metering only text would allocate the whole run graph before
+ * anything checked.
+ */
+function action_owner(trip: (cost: number) => void): RetainedStringOwner {
+    const owned = new Map<string, string>();
+    return {
+        own: (text) => {
+            const seen = owned.get(text);
+            // Already retained for this action, so it costs nothing more.
+            if (seen !== undefined) return seen;
+            trip(estimate_string_bytes(text));
+            const detached = detached_string(text);
+            owned.set(text, detached);
+            return detached;
+        },
+        charge_run: () => trip(RUN_OVERHEAD_BYTES),
+    };
+}
 
 /**
  * The action history will retain, canonicalized and measured together.
@@ -399,20 +429,20 @@ function own_and_measure(action: HistoryAction, budget = Infinity): OwnedAction 
     // so in the barrier.
     const label = barrier_label(String(action.label));
     let byteCost = estimate_string_bytes(label);
-    // Strings a change retains, charged as they are retained. Reset per change,
-    // because `estimate_change_bytes` recharges the finished change in full and
-    // deduplicates payloads the way the memory does; this running figure exists
-    // only to stop a runaway rebuild.
+    // What the rebuild has retained so far, reset per change: the finished change is
+    // recharged in full below, deduplicating payloads the way memory does. This
+    // running figure exists only to stop a runaway rebuild mid-change.
     let pending = 0;
-    const meter: RetainedStringMeter = (text) => {
-        pending += estimate_string_bytes(text);
+    const trip = (cost: number): void => {
+        pending += cost;
         if (byteCost + pending > budget) throw new BudgetExhausted();
     };
+    const owner = action_owner(trip);
     for (const change of action.changes) {
         pending = 0;
         let canonical: HistoryChange;
         try {
-            canonical = own_history_change(change, meter);
+            canonical = own_history_change(change, owner);
         } catch (error) {
             if (error instanceof BudgetExhausted) return undefined;
             throw error;
@@ -842,32 +872,43 @@ export function action_focus_worksheet(action: HistoryAction): WorksheetTarget |
  * reassigns indices while the identity carried alongside stays true.
  */
 export function action_is_single_worksheet(action: HistoryAction): boolean {
-    // At most three identifiers can be consistent — one id, one name, one index —
-    // so the groups are found by merging their labels rather than by union-find.
-    const ids = new Set<string>();
-    const names = new Set<string>();
-    const indices = new Set<number>();
-    // Each entry is the set of identifier labels one target proved to be the same
-    // sheet, as `id`/`name`/`index`.
-    const links: Set<string>[] = [];
+    // At most three identifiers can be consistent — one id, one name, one index — so
+    // the groups are tracked as three labels merged in place. A set per change would
+    // hold a quarter of a million of them alive on a wide gesture.
+    let id: string | undefined;
+    let name: string | undefined;
+    let index: number | undefined;
+    // Which of the three have been proved to name the same sheet. `id` and `name`
+    // start apart and are linked by the first target that carries both.
+    let id_linked_to_name = false;
+    let seen_id = false;
+    let seen_name = false;
+    let seen_index = false;
     for (const { delta } of action.changes) {
         const { sheetIndex, sheetName, worksheetId } = delta.worksheet;
-        const labels = new Set<string>();
-        if (worksheetId !== undefined) { ids.add(worksheetId); labels.add('id'); }
-        if (sheetName !== undefined) { names.add(sheetName); labels.add('name'); }
-        if (labels.size === 0) { indices.add(sheetIndex); labels.add('index'); }
-        links.push(labels);
+        if (worksheetId !== undefined) {
+            if (seen_id && id !== worksheetId) return false;
+            id = worksheetId;
+            seen_id = true;
+        }
+        if (sheetName !== undefined) {
+            if (seen_name && name !== sheetName) return false;
+            name = sheetName;
+            seen_name = true;
+        }
+        if (worksheetId !== undefined && sheetName !== undefined) id_linked_to_name = true;
+        // Only a target with nothing else to go on is believed about its index.
+        if (worksheetId === undefined && sheetName === undefined) {
+            if (seen_index && index !== sheetIndex) return false;
+            index = sheetIndex;
+            seen_index = true;
+        }
     }
-    if (ids.size > 1 || names.size > 1 || indices.size > 1) return false;
-
-    const groups: Set<string>[] = [];
-    for (const labels of links) {
-        const touched = groups.filter((group) => [...labels].some((label) => group.has(label)));
-        const merged = new Set<string>(labels);
-        for (const group of touched) for (const label of group) merged.add(label);
-        groups.splice(0, groups.length, ...groups.filter((group) => !touched.includes(group)), merged);
-    }
-    return groups.length <= 1;
+    // A positional target shares no identifier with an identified one, so it is its
+    // own group; and an id-only target beside a name-only one is two groups until
+    // some target asserts they are the same sheet.
+    if (seen_index && (seen_id || seen_name)) return false;
+    return !seen_id || !seen_name || id_linked_to_name;
 }
 
 /**
@@ -888,26 +929,22 @@ export function action_is_single_worksheet(action: HistoryAction): boolean {
  * has to bound rather than refuse: duplicating the content would double peak
  * memory at the exact moment there is least of it.
  */
-function own_history_change(change: HistoryChange, meter?: RetainedStringMeter): HistoryChange {
+function own_history_change(change: HistoryChange, owner: RetainedStringOwner): HistoryChange {
     return change.kind === 'cell'
-        ? Object.freeze({ kind: 'cell', delta: canonical_cell_history_delta(change.delta, meter) })
-        : Object.freeze({ kind: 'highlight', delta: canonical_highlight_delta(change.delta, meter) });
+        ? Object.freeze({ kind: 'cell', delta: canonical_cell_history_delta(change.delta, owner) })
+        : Object.freeze({ kind: 'highlight', delta: canonical_highlight_delta(change.delta, owner) });
 }
 
 function canonical_highlight_delta(
     delta: HighlightHistoryDelta,
-    meter?: RetainedStringMeter,
+    owner: RetainedStringOwner,
 ): HighlightHistoryDelta {
     const { sheetIndex, sheetName, worksheetId } = delta.worksheet;
-    const detach = (text: string): string => {
-        meter?.(text);
-        return detached_string(text);
-    };
     return Object.freeze({
         worksheet: Object.freeze({
             sheetIndex,
-            ...(sheetName === undefined ? {} : { sheetName: detach(sheetName) }),
-            ...(worksheetId === undefined ? {} : { worksheetId: detach(worksheetId) }),
+            ...(sheetName === undefined ? {} : { sheetName: owner.own(sheetName) }),
+            ...(worksheetId === undefined ? {} : { worksheetId: owner.own(worksheetId) }),
         }),
         sourceRow: delta.sourceRow,
         sourceColumn: delta.sourceColumn,

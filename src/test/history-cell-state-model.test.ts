@@ -19,6 +19,7 @@ import {
     history_value,
     history_values_equal,
     hyperlink_only_overlay,
+    is_canonical_cell_delta,
     overlay_for_direction,
     overlay_state_from_dirty_entry,
     overlay_states_equal,
@@ -672,5 +673,42 @@ describe('canonical_cell_history_delta', () => {
         const canonical_runs = delta.value!.desired.content.runs!.runs;
         expect(canonical_runs).not.toBeInstanceOf(Sneaky);
         expect(canonical_runs).not.toHaveProperty('smuggled');
+    });
+});
+describe('canonical delta ownership', () => {
+    it('recognizes its own output and returns it unchanged', () => {
+        // Re-canonicalizing would allocate a second copy of every string the delta
+        // holds, so a gesture near the byte bound would hold both at once.
+        const delta = build_cell_history_delta({
+            worksheet: { sheetIndex: 0, sheetName: 'Data' },
+            sourceRow: 0,
+            sourceColumn: 0,
+            before: absent_overlay(),
+            after: value_only_overlay(history_value('v'), history_value('base')),
+            persistedValue: history_value('base'),
+            persistedHyperlink: null,
+        });
+        if (delta === undefined) throw new Error('fixture built a delta that moved nothing');
+
+        expect(is_canonical_cell_delta(delta)).toBe(true);
+        expect(canonical_cell_history_delta(delta)).toBe(delta);
+        expect(is_canonical_cell_delta({ ...delta })).toBe(false);
+    });
+
+    it('shares one string across a delta that repeats it', () => {
+        const text = 'repeated';
+        const delta = canonical_cell_history_delta({
+            ...(build_cell_history_delta({
+                worksheet: { sheetIndex: 0, sheetName: text },
+                sourceRow: 0,
+                sourceColumn: 0,
+                before: absent_overlay(),
+                after: value_only_overlay(history_value(text), history_value(text)),
+                persistedValue: history_value(text),
+                persistedHyperlink: null,
+            })!),
+        });
+
+        expect(delta.worksheet.sheetName).toBe(delta.value?.desired.content.text);
     });
 });
