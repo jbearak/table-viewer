@@ -1,12 +1,10 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import type { WorksheetTarget } from '../types';
 import {
     absent_overlay,
     build_cell_history_delta,
-    detached_string,
     history_value,
     hyperlink_only_overlay,
-    reset_interned_worksheet_targets,
     value_only_overlay,
     type CellHistoryDelta,
     type HistoryValue,
@@ -30,10 +28,6 @@ import {
     type HistoryEntry,
     type HistoryStackState,
 } from '../webview/history-stack-model';
-
-// Canonical worksheet targets are interned for the session, so what a gesture is
-// charged for a sheet name depends on whether an earlier test already retained it.
-beforeEach(reset_interned_worksheet_targets);
 
 const SHEET: WorksheetTarget = { sheetIndex: 0, sheetName: 'Data', worksheetId: 'rId1' };
 const LINK = { kind: 'external', target: 'https://example.com/' } as const;
@@ -94,7 +88,7 @@ function link_only_change(text: string): HistoryChange {
 /**
  * A change whose new value carries rich-text runs, built around the delta builder.
  *
- * `build_cell_history_delta` canonicalizes, so runs handed to it arrive at the
+ * `build_cell_history_delta` snapshots, so runs handed to it arrive at the
  * recorder already copied. Grafting them onto a finished delta is what puts them
  * in front of the recorder's own walk, which is the walk under test.
  */
@@ -212,17 +206,17 @@ describe('record_history_action', () => {
 
     it('does not rebuild an action it already owns', () => {
         // `history_action` exists so a caller can hold an owned action; rebuilding
-        // it on the way in would pay for the whole canonical graph twice.
+        // it on the way in would pay for the whole owned graph twice.
         const action = history_action('Edit', [cell_change(0, 0, 'x'.repeat(1_000))]);
         const outcome = record_history_action(empty_history_stack(), action);
         expect(outcome.state.undoStack[0]?.action).toBe(action);
     });
 
-    it('reuses a delta the model itself built instead of copying it again', () => {
-        // `build_cell_history_delta` canonicalizes, so its result is already frozen
-        // with every string detached. Rebuilding it would allocate a second copy of
-        // all of that content, and a gesture near the hard bound would hold both at
-        // once — exhausting memory below the bound meant to prevent exactly that.
+    it('rebuilds even a delta the model built, because a snapshot is not owned', () => {
+        // `build_cell_history_delta` snapshots: its strings are the CALLER's, shared
+        // by value rather than materialized, so retaining one would retain whatever
+        // those strings hold alive — uncharged. Every delta crosses the action
+        // boundary.
         const change = cell_change(0, 0, 'x'.repeat(1_000));
         const outcome = record_history_action(empty_history_stack(), {
             label: 'Edit',
@@ -233,7 +227,10 @@ describe('record_history_action', () => {
             throw new Error('fixture did not build a cell change');
         }
 
-        expect(recorded.delta).toBe(change.delta);
+        expect(recorded.delta).not.toBe(change.delta);
+        expect(recorded.delta.value?.desired.content.text)
+            .toBe(change.delta.value?.desired.content.text);
+        expect(Object.isFrozen(recorded.delta)).toBe(true);
     });
 
     it('rebuilds a delta it did not build, sharing the content', () => {
@@ -567,10 +564,10 @@ describe('measure_history_action', () => {
     });
 
     it('shares one worksheet target across a wide gesture', () => {
-        // Detaching per delta would turn one shared name into a copy per cell, each
-        // charged once by an estimator that deduplicated by value — the bound
-        // defeated by the copying meant to make it honest. Canonical targets are
-        // interned instead, and the estimator charges the object.
+        // Materializing per delta would turn one shared name into a copy per cell,
+        // each charged once by an estimator that deduplicated by value — the bound
+        // defeated by the copying meant to make it honest. The action's owner hands
+        // out one target instead, and the estimator charges the object.
         const name = 'n'.repeat(5_000);
         const sheet: WorksheetTarget = { sheetIndex: 0, sheetName: name };
         const outcome = record_history_action(empty_history_stack(), {
@@ -586,18 +583,19 @@ describe('measure_history_action', () => {
         expect(outcome.state.undoStack[0]?.byteCost).toBeLessThan(5_000 * 2 * 2);
     });
 
-    it('shares one worksheet target between two gestures on the same sheet', () => {
-        // Interned for the session, so a later gesture on the same sheet points at
-        // the same target and allocates no new name. Each action is still charged
-        // for the target it holds — the bounds cap a history whose entries may
-        // outlive each other, and over-charging a shared string is the safe way to
-        // be wrong.
+    it('does not share a worksheet target between two gestures', () => {
+        // Ownership is per action, because an action is what gets recorded, refused,
+        // evicted and released. Two actions each own their copy and each are charged
+        // for it — which is what the bounds cap, since either may outlive the other.
         const sheet: WorksheetTarget = { sheetIndex: 0, sheetName: 'n'.repeat(5_000) };
         const first = record_history_action(empty_history_stack(), history_action('A', [cell_change(0, 0, 'v', sheet)]));
         const second = record_history_action(first.state, history_action('B', [cell_change(1, 0, 'v', sheet)]));
         const [a, b] = second.state.undoStack;
 
-        expect(a?.action.changes[0]?.delta.worksheet).toBe(b?.action.changes[0]?.delta.worksheet);
+        expect(a?.action.changes[0]?.delta.worksheet).not.toBe(b?.action.changes[0]?.delta.worksheet);
+        expect(a?.action.changes[0]?.delta.worksheet.sheetName)
+            .toBe(b?.action.changes[0]?.delta.worksheet.sheetName);
+        expect(a?.byteCost).toBeGreaterThan(5_000 * 2);
         expect(b?.byteCost).toBeGreaterThan(5_000 * 2);
     });
 
@@ -629,16 +627,31 @@ describe('measure_history_action', () => {
             .toBe(entry.action.changes[0]?.delta.worksheet);
     });
 
-    it('charges an unshareable identity for every copy it really retains', () => {
-        // An identity too long to key a lookup on cheaply is not interned across
-        // distinct source objects, so each delta detaches its own copy — and each
-        // copy is charged. The estimate follows the memory, whichever way it goes.
+    it('shares an identity of any length within one action', () => {
+        // No length cutoff: the action's index is keyed on the strings it already
+        // owns, so there is no composite key whose cost would grow with the identity.
         const name = 'n'.repeat(50_000);
         const entry = measure_history_action(history_action('Paste', [
             cell_change(0, 0, 'v', { sheetIndex: 0, sheetName: name }),
             cell_change(1, 0, 'v', { sheetIndex: 0, sheetName: name }),
         ]));
-        expect(entry.byteCost).toBeGreaterThan(50_000 * 2 * 2);
+        expect(entry.byteCost).toBeLessThan(50_000 * 2 * 2);
+        expect(entry.action.changes[1]?.delta.worksheet)
+            .toBe(entry.action.changes[0]?.delta.worksheet);
+    });
+
+    it('does not share targets that disagree on a field replay would ignore', () => {
+        // What is shared has to be what is RETAINED, or the estimator's per-object
+        // charge is wrong again: these two are one sheet to replay and two different
+        // snapshots to hold.
+        const entry = measure_history_action(history_action('Paste', [
+            cell_change(0, 0, 'v', { sheetIndex: 0, sheetName: 'Before', worksheetId: 'rId1' }),
+            cell_change(1, 0, 'v', { sheetIndex: 0, sheetName: 'After', worksheetId: 'rId1' }),
+        ]));
+        expect(entry.action.changes[1]?.delta.worksheet)
+            .not.toBe(entry.action.changes[0]?.delta.worksheet);
+        // Still one cell each, since replay identity is a separate question.
+        expect(entry.cellCount).toBe(2);
     });
 
     it('shares a short identity that arrives as two different objects', () => {
@@ -673,7 +686,7 @@ describe('measure_history_action', () => {
             hardMaxBytes: 20_000,
         };
         let read = 0;
-        // Distinct texts, because equal ones are interned and cost nothing after the
+        // Distinct texts, because equal ones are shared and cost nothing after the
         // first — the shape is what has to be charged here.
         const runs = Array.from({ length: 500 }, (_unused, index) => ({
             get text() { read += 1; return `${index}${'y'.repeat(1_000)}`; },
@@ -1140,29 +1153,46 @@ describe('peek_history and commit_history_move', () => {
     });
 });
 
-describe('detached_string', () => {
-    it('reproduces the text exactly, at every size around the chunk boundary', () => {
-        for (const length of [0, 1, 4_095, 4_096, 4_097, 12_289]) {
+describe('string materialization at the ownership boundary', () => {
+    // Flatness is not observable from JavaScript, so these pin the VALUES that
+    // survive materialization. The heap behaviour is why the copy exists: a 20-unit
+    // slice of a 100MiB parent retains 50MiB unmaterialized and 0.0MiB after.
+
+    it('reproduces retained text exactly, at every size around the chunk boundary', () => {
+        for (const length of [1, 4_095, 4_096, 4_097, 12_289]) {
             const text = Array.from({ length }, (_unused, index) => String.fromCharCode(0x41 + (index % 26))).join('');
-            expect(detached_string(text)).toBe(text);
+            const outcome = record_history_action(empty_history_stack(), history_action('Edit', [
+                cell_change(0, 0, text),
+            ]));
+            const retained = outcome.state.undoStack[0]?.action.changes[0];
+            if (retained?.kind !== 'cell') throw new Error('fixture did not build a cell change');
+            expect(retained.delta.value?.desired.content.text).toBe(text);
         }
     });
 
-    it('preserves astral characters split across a chunk boundary', () => {
-        // A pair straddling the 4096-unit chunk cut must survive the copy: the units
-        // are copied one at a time, so the halves land in different chunks.
+    it('preserves an astral character split across a chunk boundary', () => {
+        // The units are copied one at a time, so the halves of a pair straddling the
+        // 4096-unit cut land in different chunks.
         const text = `${'a'.repeat(4_095)}😀${'b'.repeat(10)}`;
-        expect(detached_string(text)).toBe(text);
-        expect([...detached_string(text)]).toContain('😀');
+        const outcome = record_history_action(empty_history_stack(), history_action('Edit', [
+            cell_change(0, 0, text),
+        ]));
+        const retained = outcome.state.undoStack[0]?.action.changes[0];
+        if (retained?.kind !== 'cell') throw new Error('fixture did not build a cell change');
+
+        expect(retained.delta.value?.desired.content.text).toBe(text);
+        expect([...(retained.delta.value?.desired.content.text ?? '')]).toContain('😀');
     });
 
-    it('does not retain the parent of a slice', () => {
-        // V8 answers `slice` with a view retaining the WHOLE of its parent, so a
-        // short cell sliced out of a large document keeps all of it reachable while
-        // the estimator charges forty bytes. Flatness is not observable from JS —
-        // this pins the value; the heap behaviour is why the copy exists.
+    it('retains a cell value sliced out of a large parent', () => {
         const parent = `Cell ${'x'.repeat(500_000)}`;
-        expect(detached_string(parent.slice(0, 9))).toBe('Cell xxxx');
+        const outcome = record_history_action(empty_history_stack(), history_action('Edit', [
+            cell_change(0, 0, parent.slice(0, 9)),
+        ]));
+        const retained = outcome.state.undoStack[0]?.action.changes[0];
+        if (retained?.kind !== 'cell') throw new Error('fixture did not build a cell change');
+
+        expect(retained.delta.value?.desired.content.text).toBe('Cell xxxx');
     });
 });
 

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
 import { rich_text_from_plain, type CellHyperlink, type RichText } from '../cell-content';
 import {
@@ -10,7 +10,6 @@ import {
 import {
     absent_overlay,
     build_cell_history_delta,
-    canonical_cell_history_delta,
     combined_overlay,
     delta_addresses_same_cell,
     delta_touches_hyperlink,
@@ -19,8 +18,6 @@ import {
     history_value,
     history_values_equal,
     hyperlink_only_overlay,
-    is_canonical_cell_delta,
-    reset_interned_worksheet_targets,
     overlay_for_direction,
     overlay_state_from_dirty_entry,
     overlay_states_equal,
@@ -30,8 +27,6 @@ import {
     type CellOverlayState,
     type HistoryDirtyEntry,
 } from '../webview/history-cell-state-model';
-
-beforeEach(reset_interned_worksheet_targets);
 
 const SHEET: WorksheetTarget = { sheetIndex: 0, sheetName: 'Sheet1', worksheetId: 'ws-1' };
 
@@ -589,7 +584,7 @@ describe('worksheet identity', () => {
     });
 });
 
-describe('canonical_cell_history_delta', () => {
+describe('the snapshot a built delta is', () => {
     const base = (text: string) => build_cell_history_delta({
         worksheet: SHEET,
         sourceRow: 1,
@@ -604,7 +599,7 @@ describe('canonical_cell_history_delta', () => {
         // The same HistoryValue object stands in the transition and the overlay,
         // so the string exists once in memory. Rebuilding it twice would make a
         // holder charge it twice and refuse gestures that fit its bounds.
-        const delta = canonical_cell_history_delta(base('b'));
+        const delta = base('b');
         const overlay = delta.afterOverlay;
         if (overlay.kind !== 'present' || overlay.value.kind !== 'present') {
             throw new Error('fixture did not build a present value dimension');
@@ -614,7 +609,7 @@ describe('canonical_cell_history_delta', () => {
 
     it('drops a property nobody declared', () => {
         const smuggled = { ...base('b'), extra: 'x'.repeat(100) } as unknown as CellHistoryDelta;
-        expect(canonical_cell_history_delta(smuggled)).not.toHaveProperty('extra');
+        expect(snapshot_of(smuggled)).not.toHaveProperty('extra');
     });
 
     it('drops an undeclared property from a nested run', () => {
@@ -633,25 +628,6 @@ describe('canonical_cell_history_delta', () => {
         expect(delta.value!.desired.content.runs!.runs[0]).not.toHaveProperty('extra');
     });
 
-    it('reads an accessor-backed side once, so it cannot pair two answers', () => {
-        // A side read twice could answer with two different objects, pairing one
-        // answer's content with the other's overlay membership — a state the
-        // caller never supplied, which replay would compare against or restore.
-        const source = base('b');
-        let reads = 0;
-        const delta = {
-            ...source,
-            value: {
-                mode: source.value!.mode,
-                get expected() { reads += 1; return source.value!.expected; },
-                desired: source.value!.desired,
-            },
-        } as unknown as CellHistoryDelta;
-
-        canonical_cell_history_delta(delta);
-        expect(reads).toBe(1);
-    });
-
     it('copies runs into a plain array, ignoring a foreign species', () => {
         // A readonly array can be an Array subclass, and `map` honours its
         // Symbol.species — which would carry undeclared state into what a holder
@@ -663,7 +639,7 @@ describe('canonical_cell_history_delta', () => {
         sneaky.push({ text: 'b' });
         const runs = sneaky as unknown as readonly { text: string }[];
         const value = history_value('b', { runs } as never);
-        const delta = canonical_cell_history_delta(build_cell_history_delta({
+        const delta = build_cell_history_delta({
             worksheet: SHEET,
             sourceRow: 1,
             sourceColumn: 2,
@@ -671,126 +647,69 @@ describe('canonical_cell_history_delta', () => {
             after: value_only_overlay(value, history_value('a')),
             persistedValue: history_value('a'),
             persistedHyperlink: null,
-        })!);
+        })!;
 
-        const canonical_runs = delta.value!.desired.content.runs!.runs;
-        expect(canonical_runs).not.toBeInstanceOf(Sneaky);
-        expect(canonical_runs).not.toHaveProperty('smuggled');
+        const copied_runs = delta.value!.desired.content.runs!.runs;
+        expect(copied_runs).not.toBeInstanceOf(Sneaky);
+        expect(copied_runs).not.toHaveProperty('smuggled');
     });
-});
-describe('canonical delta ownership', () => {
-    it('recognizes its own output and returns it unchanged', () => {
-        // Re-canonicalizing would allocate a second copy of every string the delta
-        // holds, so a gesture near the byte bound would hold both at once.
+
+    it('isolates the snapshot from later mutation of what built it', () => {
+        // The caller's overlays and targets stay mutable while a gesture is
+        // assembled, and `readonly` is a compile-time claim only.
+        const worksheet = { sheetIndex: 0, sheetName: 'Before' };
+        const runs = [{ text: 'b' }];
+        const value = history_value('b', { runs } as never);
         const delta = build_cell_history_delta({
-            worksheet: { sheetIndex: 0, sheetName: 'Data' },
-            sourceRow: 0,
+            worksheet,
+            sourceRow: 1,
+            sourceColumn: 2,
+            before: absent_overlay(),
+            after: value_only_overlay(value, history_value('a')),
+            persistedValue: history_value('a'),
+            persistedHyperlink: null,
+        })!;
+
+        worksheet.sheetName = 'After';
+        runs[0]!.text = 'changed';
+
+        expect(delta.worksheet.sheetName).toBe('Before');
+        expect(delta.value!.desired.content.runs!.runs[0]?.text).toBe('b');
+        expect(Object.isFrozen(delta)).toBe(true);
+    });
+
+    it('does not share a target between two independently built deltas', () => {
+        // Sharing belongs to the action that retains them, not to the builder: a
+        // snapshot outlives nothing and sharing here would need state that does.
+        const worksheet = { sheetIndex: 0, sheetName: 'Data' };
+        const first = snapshot_of(base('b'));
+        const second = build_cell_history_delta({
+            worksheet,
+            sourceRow: 9,
             sourceColumn: 0,
             before: absent_overlay(),
-            after: value_only_overlay(history_value('v'), history_value('base')),
-            persistedValue: history_value('base'),
+            after: value_only_overlay(history_value('c'), history_value('a')),
+            persistedValue: history_value('a'),
             persistedHyperlink: null,
-        });
-        if (delta === undefined) throw new Error('fixture built a delta that moved nothing');
-
-        expect(is_canonical_cell_delta(delta)).toBe(true);
-        expect(canonical_cell_history_delta(delta)).toBe(delta);
-        expect(is_canonical_cell_delta({ ...delta })).toBe(false);
-    });
-
-    it('shares one string across a delta that repeats it', () => {
-        const text = 'repeated';
-        const delta = canonical_cell_history_delta({
-            ...(build_cell_history_delta({
-                worksheet: { sheetIndex: 0, sheetName: text },
-                sourceRow: 0,
-                sourceColumn: 0,
-                before: absent_overlay(),
-                after: value_only_overlay(history_value(text), history_value(text)),
-                persistedValue: history_value(text),
-                persistedHyperlink: null,
-            })!),
-        });
-
-        expect(delta.worksheet.sheetName).toBe(delta.value?.desired.content.text);
-    });
-});
-describe('interned worksheet targets', () => {
-    it('gives two deltas on one sheet the same target object', () => {
-        // A delta is built one cell at a time, long before there is an action to
-        // scope an owner to, so without a shared target every delta would detach its
-        // own copy of the sheet name.
-        const sheet: WorksheetTarget = { sheetIndex: 3, sheetName: 'Long', worksheetId: 'rId7' };
-        const first = build_delta(sheet, 0);
-        const second = build_delta(sheet, 1);
-
-        expect(second.worksheet).toBe(first.worksheet);
-        expect(second.worksheet.sheetName).toBe('Long');
-    });
-
-    it('does not conflate a named sheet with an unnamed one at the same index', () => {
-        const named = build_delta({ sheetIndex: 0, sheetName: '' }, 0);
-        const bare = build_delta({ sheetIndex: 0 }, 0);
-
-        expect(named.worksheet).not.toBe(bare.worksheet);
-        expect('sheetName' in bare.worksheet).toBe(false);
-    });
-
-    it('answers from the source object without touching a long identity', () => {
-        // A wide gesture names one worksheet with one object, so the common case is
-        // O(1) and never builds a composite key — which would be O(identity length)
-        // per cell on an identity nothing bounds.
-        const sheet: WorksheetTarget = { sheetIndex: 0, sheetName: 'n'.repeat(200_000) };
-        const first = build_delta(sheet, 0);
-        const second = build_delta(sheet, 1);
-
-        expect(second.worksheet).toBe(first.worksheet);
-    });
-
-    it('does not intern an identity too long to key on cheaply', () => {
-        // Two equal targets arriving as different objects stay separate rather than
-        // paying O(identity length) to discover they match. Each copy is then
-        // charged, so the estimate still follows the memory.
-        const name = 'n'.repeat(200_000);
-        const first = build_delta({ sheetIndex: 0, sheetName: name }, 0);
-        const second = build_delta({ sheetIndex: 0, sheetName: name }, 1);
+        })!;
 
         expect(second.worksheet).not.toBe(first.worksheet);
-        expect(second.worksheet.sheetName).toBe(name);
-    });
-
-    it('does not answer from the source memo after the caller mutated it', () => {
-        // A caller's target is a mutable object — `readonly` is a compile-time claim
-        // — and one renamed between two cells of a gesture would otherwise keep
-        // answering with the first snapshot, so later deltas would replay against
-        // the sheet it used to be.
-        const sheet = { sheetIndex: 0, sheetName: 'Before' };
-        const first = build_delta(sheet, 0);
-        sheet.sheetName = 'After';
-        const second = build_delta(sheet, 1);
-
-        expect(first.worksheet.sheetName).toBe('Before');
-        expect(second.worksheet.sheetName).toBe('After');
-    });
-
-    it('does not conflate a name with an id of the same text', () => {
-        const named = build_delta({ sheetIndex: 0, sheetName: 'x' }, 0);
-        const identified = build_delta({ sheetIndex: 0, worksheetId: 'x' }, 0);
-
-        expect(named.worksheet).not.toBe(identified.worksheet);
+        expect(second.worksheet.sheetName).toBe('Data');
     });
 });
 
-function build_delta(worksheet: WorksheetTarget, row: number): CellHistoryDelta {
-    const delta = build_cell_history_delta({
-        worksheet,
-        sourceRow: row,
-        sourceColumn: 0,
+/** Rebuilds a hand-made delta the way the builder snapshots its own. */
+function snapshot_of(delta: CellHistoryDelta): CellHistoryDelta {
+    return build_cell_history_delta({
+        worksheet: delta.worksheet,
+        sourceRow: delta.sourceRow,
+        sourceColumn: delta.sourceColumn,
         before: absent_overlay(),
-        after: value_only_overlay(history_value('v'), history_value('base')),
-        persistedValue: history_value('base'),
+        after: value_only_overlay(
+            delta.value!.desired.content,
+            delta.value!.expected.content,
+        ),
+        persistedValue: delta.value!.expected.content,
         persistedHyperlink: null,
-    });
-    if (delta === undefined) throw new Error('fixture built a delta that moved nothing');
-    return delta;
+    })!;
 }

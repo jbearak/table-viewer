@@ -4,10 +4,8 @@ import {
     type WorksheetTarget,
 } from '../types';
 import {
-    canonical_cell_history_delta,
-    canonical_worksheet_target,
-    detached_string,
-    type RetainedStringOwner,
+    own_cell_history_delta,
+    type HistoryActionOwner,
     type CellHistoryDelta,
     type CellOverlayState,
     type HistoryDirection,
@@ -138,13 +136,13 @@ export const MAX_BARRIER_LABEL_LENGTH = 200;
  * keeping its high half, so the result is never lone-surrogate garbage.
  */
 function barrier_label(label: string): string {
-    if (label.length <= MAX_BARRIER_LABEL_LENGTH) return detached_string(label);
+    if (label.length <= MAX_BARRIER_LABEL_LENGTH) return materialized_string(label);
     const kept = MAX_BARRIER_LABEL_LENGTH - 1;
     const last = label.charCodeAt(kept - 1);
     // A cut through a surrogate pair drops the pair rather than keeping its high
     // half, so the result is never lone-surrogate garbage.
     const end = last >= 0xd800 && last <= 0xdbff ? kept - 1 : kept;
-    return `${detached_string(label.slice(0, end))}…`;
+    return `${materialized_string(label.slice(0, end))}…`;
 }
 
 export interface HistoryStackState {
@@ -181,7 +179,7 @@ export interface HistoryBounds {
  * Past the hard bound the retained copy is a bigger liability than the lost
  * affordance, and `HistoryBarrier` reports the loss instead of hiding it.
  *
- * `maxCells` is the loosest of the three in practice. A canonical cell change
+ * `maxCells` is the loosest of the three in practice. An owned cell change
  * costs at least `CHANGE_OVERHEAD_BYTES` in shape alone, so the byte bounds bind
  * first on any wide gesture and a paste approaching a million cells is refused on
  * bytes long before the count matters. It is kept as a second ceiling because it
@@ -203,7 +201,7 @@ export function empty_history_stack(): HistoryStackState {
 /**
  * Fixed per-change allowance for the object graph around the payload.
  *
- * A canonical cell change is not one object but a small tree of them: the
+ * An owned cell change is not one object but a small tree of them: the
  * `{kind, delta}` wrapper, the delta, its worksheet target, two overlay states
  * each with two dimensions, a transition with two sides, and the value objects
  * those hold. Fifteen-odd small objects, each with a header and its slots, so a
@@ -312,13 +310,13 @@ function estimate_cell_delta_bytes(delta: CellHistoryDelta): number {
  * gesture carrying a megabyte-long name past the byte bound is a gesture that
  * exhausted the heap history was bounded to protect.
  *
- * Keyed on the target OBJECT, which is what memory actually holds:
- * canonicalization interns targets, so every delta naming one worksheet points at
- * one target holding one copy of its name. Charging per delta would refuse a
- * million-cell paste over a long sheet name that costs a few kilobytes; charging
- * per distinct VALUE would let a wide gesture whose deltas each detached their own
- * copy pass the bound while retaining many times it. Neither happens when the
- * charge follows the object.
+ * Keyed on the target OBJECT, which is what memory actually holds: the action's
+ * owner hands out one target per distinct tuple, so every delta naming one
+ * worksheet points at one target holding one copy of its name. Charging per delta
+ * would refuse a million-cell paste over a long sheet name that costs a few
+ * kilobytes; charging per distinct VALUE would undercount a walk that did allocate
+ * a copy per delta. Neither happens when the charge follows the object — which is
+ * why this stays correct however much the owner manages to share.
  */
 function worksheet_charger(): (worksheet: WorksheetTarget) => number {
     const counted = new WeakSet<WorksheetTarget>();
@@ -439,38 +437,117 @@ function measure_costs(action: HistoryAction): HistoryCosts {
 class BudgetExhausted extends Error {}
 
 /**
- * Owns every string one ACTION retains, sharing them across its changes.
+ * How much of a string is copied at a time when materializing it.
  *
- * Detaching a string is what makes the byte bound honest — a retained view keeps
- * its whole parent alive while being charged its own length — but detaching PER
- * DELTA turns one shared worksheet name into a million private copies, each of them
- * charged once by an estimator that deduplicates. So interning is the other half of
- * detaching, and both belong to the action rather than the cell: within an action,
- * equal strings become one string, which is then charged once.
- *
- * The trip function is told about each newly retained string and each run's shape,
- * so a rebuild can be abandoned mid-change — a cell of a million one-character runs
- * is mostly shape, and metering only text would allocate the whole run graph before
- * anything checked.
+ * Large enough that a cell's text is one pass, small enough that the argument list
+ * never approaches the engine's limit on a spread call.
  */
-function action_owner(trip: (cost: number) => void): RetainedStringOwner {
-    const owned = new Map<string, string>();
+const MATERIALIZE_CHUNK = 4_096;
+
+/**
+ * A string that stands on its own, holding no other string alive.
+ *
+ * V8 answers `slice` with a view retaining the WHOLE of its parent, and `a + b`
+ * with a rope retaining both halves, so a twenty-character cell sliced out of a
+ * 300MiB document keeps all 300MiB reachable while the estimator charges it forty
+ * bytes — the hard bound defeated by content it did measure, honestly, at the wrong
+ * size. `String.fromCharCode` is one of the few constructions that actually
+ * allocates a fresh flat string rather than a view of an existing one.
+ *
+ * Private, and called from exactly two places: an action taking ownership of a
+ * string, and a barrier label. That is the rule made mechanical — searching for
+ * this function finds every point where memory crosses into history.
+ */
+function materialized_string(text: string): string {
+    if (text.length <= MATERIALIZE_CHUNK) return materialized_chunk(text, 0, text.length);
+    const chunks: string[] = [];
+    for (let start = 0; start < text.length; start += MATERIALIZE_CHUNK) {
+        chunks.push(materialized_chunk(text, start, Math.min(start + MATERIALIZE_CHUNK, text.length)));
+    }
+    // Joined rather than accumulated with `+=`: the result is one flat string, where
+    // a chain of concatenations would be a rope thousands of nodes deep. Its pieces
+    // are all ours either way, so nothing foreign is retained.
+    return chunks.join('');
+}
+
+function materialized_chunk(text: string, start: number, end: number): string {
+    const units: number[] = [];
+    for (let index = start; index < end; index += 1) units.push(text.charCodeAt(index));
+    return String.fromCharCode(...units);
+}
+
+/** Absent optional fields, as index keys no string can collide with. */
+const ABSENT_SHEET_NAME = Symbol('absent sheet name');
+const ABSENT_WORKSHEET_ID = Symbol('absent worksheet id');
+type NameKey = string | typeof ABSENT_SHEET_NAME;
+type IdKey = string | typeof ABSENT_WORKSHEET_ID;
+
+/**
+ * Owns everything one ACTION retains: its strings, and its worksheet targets.
+ *
+ * The whole of history's ownership boundary. Materializing a string is what makes
+ * the byte bound honest — a retained view keeps its parent alive while being
+ * charged its own length — and SHARING is the other half: materializing per delta
+ * would turn one worksheet name into a copy per cell, each charged once by an
+ * estimator that deduplicates. Both belong to the action, because the action is
+ * the unit that is recorded, measured, refused, evicted and released.
+ *
+ * A target is shared per exact declared tuple, not per replay identity: two targets
+ * agreeing on an id but disagreeing on a name are one sheet to replay and two
+ * different snapshots to retain, and what is shared has to be what is retained or
+ * the estimator's per-object charge is wrong again.
+ *
+ * Every map here is created per call and unreachable when it returns. Nothing
+ * survives a refusal, so nothing needs cleaning up after one.
+ */
+function action_owner(trip: (cost: number) => void): HistoryActionOwner {
+    const strings = new Map<string, string>();
+    const targets = new Map<number, Map<NameKey, Map<IdKey, WorksheetTarget>>>();
+    const own_string = (text: string): string => {
+        const seen = strings.get(text);
+        // Already retained for this action, so it costs nothing more.
+        if (seen !== undefined) return seen;
+        trip(estimate_string_bytes(text));
+        const materialized = materialized_string(text);
+        strings.set(text, materialized);
+        return materialized;
+    };
     return {
-        own: (text) => {
-            const seen = owned.get(text);
-            // Already retained for this action, so it costs nothing more.
+        own_string,
+        own_worksheet_target: (target) => {
+            // Each field read exactly once: an accessor answering differently on a
+            // second read must not pair one field's value with another's.
+            const { sheetIndex, sheetName, worksheetId } = target;
+            const by_name = map_entry(targets, sheetIndex, () => new Map<NameKey, Map<IdKey, WorksheetTarget>>());
+            const by_id = map_entry(by_name, sheetName ?? ABSENT_SHEET_NAME, () => new Map<IdKey, WorksheetTarget>());
+            const key = worksheetId ?? ABSENT_WORKSHEET_ID;
+            const seen = by_id.get(key);
             if (seen !== undefined) return seen;
-            trip(estimate_string_bytes(text));
-            const detached = detached_string(text);
-            owned.set(text, detached);
-            return detached;
+            // Charged through `own_string`, so an identity too large to retain trips
+            // the budget here rather than after it has been copied.
+            const owned = Object.freeze({
+                sheetIndex,
+                ...(sheetName === undefined ? {} : { sheetName: own_string(sheetName) }),
+                ...(worksheetId === undefined ? {} : { worksheetId: own_string(worksheetId) }),
+            });
+            by_id.set(key, owned);
+            return owned;
         },
         charge_run: () => trip(RUN_OVERHEAD_BYTES),
     };
 }
 
+function map_entry<K, V>(map: Map<K, V>, key: K, make: () => V): V {
+    const existing = map.get(key);
+    if (existing !== undefined) return existing;
+    const created = make();
+    map.set(key, created);
+    return created;
+}
+
 /**
- * The action history will retain, canonicalized and measured together.
+ * The action history will retain, rebuilt into the action's ownership and
+ * measured in the same walk.
  *
  * `budget` stops the walk as soon as the retained bytes exceed it, returning
  * `undefined`. That interleaving is the point: an oversized gesture has to be
@@ -481,7 +558,7 @@ function action_owner(trip: (cost: number) => void): RetainedStringOwner {
  * skeletons.
  *
  * The budget reaches INSIDE a change as well as between them, via a meter the
- * canonicalizer calls for every string it retains. One cell can hold enough
+ * owner calls for every string it retains. One cell can hold enough
  * rich-text runs to exceed the bound by itself, and checking only between changes
  * would rebuild all of it — the caller's graph and the whole clone alive together
  * — before deciding to keep none of it. The meter's running total is a floor on
@@ -508,32 +585,32 @@ function own_and_measure(action: HistoryAction, budget = Infinity): OwnedAction 
     const owner = action_owner(trip);
     for (const change of action.changes) {
         pending = 0;
-        let canonical: HistoryChange;
+        let owned_change: HistoryChange;
         try {
-            canonical = own_history_change(change, owner);
+            owned_change = own_history_change(change, owner);
         } catch (error) {
             if (error instanceof BudgetExhausted) return undefined;
             throw error;
         }
-        byteCost += estimate_change_bytes(canonical, charge_worksheet);
+        byteCost += estimate_change_bytes(owned_change, charge_worksheet);
         if (byteCost > budget) return undefined;
-        add_counted_cell(cells, canonical);
-        owned.push(canonical);
+        add_counted_cell(cells, owned_change);
+        owned.push(owned_change);
     }
-    const canonical = Object.freeze({ label, changes: Object.freeze(owned) });
-    CANONICAL_ACTIONS.add(canonical);
-    return { action: canonical, cellCount: cells.count, byteCost };
+    const owned_action = Object.freeze({ label, changes: Object.freeze(owned) });
+    OWNED_ACTIONS.add(owned_action);
+    return { action: owned_action, cellCount: cells.count, byteCost };
 }
 
 /**
  * Actions this module built, which therefore need no second rebuild.
  *
  * `history_action` exists so a caller can hold an owned action, and a caller who
- * uses it before recording would otherwise pay for the whole canonical graph
- * twice — once unbudgeted in the builder, once again in the recorder. Weakly
- * held, so remembering an action never keeps it alive.
+ * uses it before recording would otherwise pay for the whole owned graph twice —
+ * once unbudgeted in the builder, once again in the recorder. Weakly held, so
+ * remembering an action never keeps it alive.
  */
-const CANONICAL_ACTIONS = new WeakSet<HistoryAction>();
+const OWNED_ACTIONS = new WeakSet<HistoryAction>();
 
 /**
  * Measures an action's costs and takes ownership of it. Both costs are estimates.
@@ -638,7 +715,7 @@ export function record_history_action(
     // budget could stop at the first oversized prefix, which is the peak-memory
     // spike the budget exists to avoid. The walk reads the array once and retains
     // only what it visited.
-    const owned = CANONICAL_ACTIONS.has(action)
+    const owned = OWNED_ACTIONS.has(action)
         ? { action, ...measure_costs(action) }
         : own_and_measure({ label, changes: action.changes }, bounds.hardMaxBytes);
     if (owned === undefined) return refused(state, label, bounds);
@@ -997,22 +1074,22 @@ export function action_is_single_worksheet(action: HistoryAction): boolean {
  * has to bound rather than refuse: duplicating the content would double peak
  * memory at the exact moment there is least of it.
  */
-function own_history_change(change: HistoryChange, owner: RetainedStringOwner): HistoryChange {
+function own_history_change(change: HistoryChange, owner: HistoryActionOwner): HistoryChange {
     return change.kind === 'cell'
-        ? Object.freeze({ kind: 'cell', delta: canonical_cell_history_delta(change.delta, owner) })
-        : Object.freeze({ kind: 'highlight', delta: canonical_highlight_delta(change.delta, owner) });
+        ? Object.freeze({ kind: 'cell', delta: own_cell_history_delta(change.delta, owner) })
+        : Object.freeze({ kind: 'highlight', delta: own_highlight_history_delta(change.delta, owner) });
 }
 
-function canonical_highlight_delta(
+function own_highlight_history_delta(
     delta: HighlightHistoryDelta,
-    owner: RetainedStringOwner,
+    owner: HistoryActionOwner,
 ): HighlightHistoryDelta {
     return Object.freeze({
-        // The same interning a cell delta gets, so a multi-cell highlight gesture
+        // The same sharing a cell delta gets, so a multi-cell highlight gesture
         // holds one target and is charged for one — the estimator charges the
         // object, and a target per highlighted cell would charge a long sheet name
         // once per cell and refuse a gesture that retains one copy of it.
-        worksheet: canonical_worksheet_target(delta.worksheet, owner),
+        worksheet: owner.own_worksheet_target(delta.worksheet),
         sourceRow: delta.sourceRow,
         sourceColumn: delta.sourceColumn,
         before: delta.before,

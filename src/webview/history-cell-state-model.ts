@@ -470,12 +470,16 @@ export function build_cell_history_delta(args: {
         : value_moved
             ? { ...base, value: value_transition }
             : { ...base, hyperlink: link_transition };
-    // History outlives the objects it was built from: the caller's RichText,
-    // CellHyperlink and WorksheetTarget stay reachable and mutable, and a later
-    // mutation would silently rewrite what undo replays. `readonly` is a
-    // compile-time claim only, so take an isolated frozen copy here — this
-    // function is history's ownership boundary.
-    return canonical_cell_history_delta(delta);
+    // The caller's RichText, CellHyperlink and WorksheetTarget stay reachable and
+    // mutable while the gesture is assembled, and a later mutation would silently
+    // rewrite what undo replays — `readonly` is a compile-time claim only. So the
+    // result is an isolated frozen SNAPSHOT.
+    //
+    // Not history's ownership, which belongs to recording the action: this shares
+    // the caller's strings by value rather than materializing them, because
+    // materializing here would copy every string a second time. See
+    // `snapshot_owner`.
+    return snapshot_cell_history_delta(delta);
 }
 
 /**
@@ -593,26 +597,25 @@ function effective_hyperlink_side(
 }
 
 /**
- * A delta rebuilt to its declared shape, field by field.
+ * A delta rebuilt to its declared shape, field by field, through an owner.
  *
  * `CellHistoryDelta` is a structural type, so a value that satisfies it can also
  * carry a getter where a data property was expected, inherit a field from a
  * prototype, or hold extra properties nobody declared. Any of those makes the
  * graph a holder measured and the graph it retained two different things — an
- * unmeasured 300MiB string riding along on a highlight delta, or a `worksheet`
- * that answers differently after the bounds were computed.
+ * unmeasured 300MiB string riding along on a delta, or a `worksheet` that answers
+ * differently after the bounds were computed.
  *
  * So it is rebuilt rather than inspected. Each field is read exactly once and
  * copied into a frozen object of the declared shape; nothing undeclared survives.
- * The copy is cheap because the content is primitives — the strings themselves
- * are shared, not duplicated, which is what makes this affordable on the
- * million-cell gestures history has to bound rather than refuse.
+ * What the copy does with the CONTENT is the owner's business — a snapshot shares
+ * the caller's strings, an action materializes and charges them — which is why
+ * this is one function and not two that could drift apart.
  */
-export function canonical_cell_history_delta(
+function copy_cell_history_delta(
     delta: CellHistoryDelta,
-    owner: RetainedStringOwner = detaching_owner(),
+    owner: HistoryActionOwner,
 ): CellHistoryDelta {
-    if (CANONICAL_DELTAS.has(delta)) return delta;
     // A memo per delta, so an object the input SHARED between a transition and an
     // overlay is shared by the output too. That aliasing is load-bearing: it is
     // how one string exists once in memory, and how the byte estimate charges it
@@ -621,259 +624,135 @@ export function canonical_cell_history_delta(
     const value_of = (value: HistoryValue): HistoryValue => {
         const seen = values.get(value);
         if (seen !== undefined) return seen;
-        const canonical = canonical_value(value, owner);
-        values.set(value, canonical);
-        return canonical;
+        const copied = copy_value(value, owner);
+        values.set(value, copied);
+        return copied;
     };
     const links = new Map<CellHyperlink, CellHyperlink | null>();
     const link_of = (link: CellHyperlink | null): CellHyperlink | null => {
         if (link === null) return null;
         const seen = links.get(link);
         if (seen !== undefined) return seen;
-        const canonical = canonical_hyperlink(link, owner);
-        links.set(link, canonical);
-        return canonical;
+        const copied = copy_hyperlink(link, owner);
+        links.set(link, copied);
+        return copied;
     };
 
     const base: CellHistoryDeltaBase = {
-        worksheet: canonical_worksheet_target(delta.worksheet, owner),
+        worksheet: owner.own_worksheet_target(delta.worksheet),
         sourceRow: delta.sourceRow,
         sourceColumn: delta.sourceColumn,
-        beforeOverlay: canonical_overlay(delta.beforeOverlay, value_of, link_of),
-        afterOverlay: canonical_overlay(delta.afterOverlay, value_of, link_of),
+        beforeOverlay: copy_overlay(delta.beforeOverlay, value_of, link_of),
+        afterOverlay: copy_overlay(delta.afterOverlay, value_of, link_of),
     };
     const value = delta.value;
     const hyperlink = delta.hyperlink;
     const out: CellHistoryDelta = value !== undefined && hyperlink !== undefined
         ? {
             ...base,
-            value: canonical_transition(value, value_of),
-            hyperlink: canonical_transition(hyperlink, link_of),
+            value: copy_transition(value, value_of),
+            hyperlink: copy_transition(hyperlink, link_of),
         }
         : value !== undefined
-            ? { ...base, value: canonical_transition(value, value_of) }
-            : { ...base, hyperlink: canonical_transition(hyperlink!, link_of) };
-    const frozen = freeze_deep_declared(out);
-    CANONICAL_DELTAS.add(frozen);
-    return frozen;
+            ? { ...base, value: copy_transition(value, value_of) }
+            : { ...base, hyperlink: copy_transition(hyperlink!, link_of) };
+    return freeze_deep_declared(out);
 }
 
 /**
- * An owner for a lone delta: detaches, shares within the delta, charges nothing.
+ * A freshly built delta, isolated from later mutation of what built it.
  *
- * The default for a caller building one delta at a time, where there is no action
- * to bound and no sibling delta to share with.
+ * Not history's ownership: the strings are the caller's, shared by value. See
+ * `snapshot_owner`.
  */
-export function detaching_owner(): RetainedStringOwner {
-    const owned = new Map<string, string>();
+function snapshot_cell_history_delta(delta: CellHistoryDelta): CellHistoryDelta {
+    return copy_cell_history_delta(delta, snapshot_owner());
+}
+
+/**
+ * The delta history will retain, rebuilt through the owner of the action holding
+ * it.
+ *
+ * Always rebuilt, even from a builder's snapshot: a snapshot's strings are the
+ * caller's, so retaining one would retain whatever those strings hold alive,
+ * uncharged. This is the only way a cell delta enters history.
+ */
+export function own_cell_history_delta(
+    delta: CellHistoryDelta,
+    owner: HistoryActionOwner,
+): CellHistoryDelta {
+    return copy_cell_history_delta(delta, owner);
+}
+
+/**
+ * Who owns what one ACTION retains.
+ *
+ * History has exactly one ownership boundary — recording an action — and this is
+ * the interface across it. Three jobs no single delta can do for itself, because
+ * all three are properties of the gesture rather than of one cell:
+ *
+ *   - `own_string` returns the string to retain, materialized and SHARED across
+ *     every delta of the action asking for an equal one. Materialized because V8
+ *     answers `slice` with a view retaining its whole parent, so an unmaterialized
+ *     string costs its parent's allocation while being charged its own length.
+ *     Shared because a million-cell paste names one worksheet, and materializing
+ *     that name per delta would allocate a million copies of it.
+ *   - `own_worksheet_target` returns one frozen target per exact target tuple in
+ *     the action, so the estimator — which charges the retained target object —
+ *     charges a gesture's worksheet identity once.
+ *   - `charge_run` accounts for a run's shape as it is built. A cell carrying
+ *     millions of one-character runs is mostly shape, so metering only their text
+ *     let the whole run graph be allocated before anything checked.
+ *
+ * Any of them may throw to abandon the walk. The estimator still has the last word
+ * on what an action costs; this is a tripwire.
+ */
+export interface HistoryActionOwner {
+    own_string(text: string): string;
+    own_worksheet_target(target: WorksheetTarget): WorksheetTarget;
+    charge_run(): void;
+}
+
+/**
+ * The owner a delta gets while a gesture is still being assembled.
+ *
+ * A delta is built one cell at a time, long before there is an action to own it,
+ * and it must still be isolated from later mutation of the caller's overlays,
+ * hyperlinks and targets — `readonly` is a compile-time claim only. So the builder
+ * SNAPSHOTS: it rebuilds the declared shape and freezes it, sharing the caller's
+ * string VALUES rather than materializing them.
+ *
+ * Sharing a value is safe because strings are immutable; what it does not do is
+ * materialize, so a snapshot may still hold a parent string alive. That retention ends
+ * with the caller's gesture-building graph, because history never retains a
+ * snapshot: recording rebuilds every delta through the action's owner, where the
+ * strings are materialized and charged. Materializing here as well would copy every
+ * string twice.
+ */
+function snapshot_owner(): HistoryActionOwner {
     return {
-        own: (text) => {
-            const seen = owned.get(text);
-            if (seen !== undefined) return seen;
-            const detached = detached_string(text);
-            owned.set(text, detached);
-            return detached;
+        own_string: (text) => text,
+        own_worksheet_target: (target) => {
+            const { sheetIndex, sheetName, worksheetId } = target;
+            return Object.freeze({
+                sheetIndex,
+                ...(sheetName === undefined ? {} : { sheetName }),
+                ...(worksheetId === undefined ? {} : { worksheetId }),
+            });
         },
         charge_run: () => {},
     };
 }
 
-/**
- * Who owns the strings and the shape a canonical delta retains.
- *
- * Two jobs a delta cannot do for itself, because both are properties of the whole
- * ACTION rather than of one cell:
- *
- *   - `own` returns the string to retain, SHARED across every delta that asks for
- *     an equal one. A million-cell paste names one worksheet; detaching that name
- *     per delta would allocate a million copies of it, each of them charged once by
- *     an estimator that deduplicates by value — a bound defeated by the very
- *     copying that was meant to make the bound honest.
- *   - `charge_run` accounts for a run's shape as it is built. The bounds are
- *     otherwise enforced by a separate estimating walk, which cannot stop a rebuild
- *     already under way: a cell carrying millions of one-character runs is mostly
- *     shape, so metering only their text let the whole run graph be allocated
- *     before anything checked.
- *
- * Either may throw to abandon the walk. The estimator still has the last word on
- * what an action costs; this is a tripwire.
- */
-export interface RetainedStringOwner {
-    own(text: string): string;
-    charge_run(): void;
-}
 
-/** Registers what this module built, so a second rebuild can be skipped. */
-const CANONICAL_DELTAS = new WeakSet<CellHistoryDelta>();
 
-/**
- * Whether this delta is already the canonical, frozen, detached form.
- *
- * True only of a graph this module built. Re-canonicalizing one would allocate a
- * second full copy of every string it holds, so a gesture near the hard bound
- * would hold both copies at once — exhausting memory below the bound meant to
- * prevent exactly that.
- */
-export function is_canonical_cell_delta(delta: CellHistoryDelta): boolean {
-    return CANONICAL_DELTAS.has(delta);
-}
-
-/**
- * How much of a string is copied at a time when detaching it.
- *
- * Large enough that a cell's text is one pass, small enough that the argument
- * list never approaches the engine's limit on a spread call.
- */
-const DETACH_CHUNK = 4_096;
-
-/**
- * A string that stands on its own, holding no other string alive.
- *
- * V8 answers `slice` with a view retaining the WHOLE of its parent, and `a + b`
- * with a rope retaining both halves, so a twenty-character cell sliced out of a
- * 300MiB document keeps all 300MiB reachable while the estimator charges it forty
- * bytes — the hard bound defeated by content it did measure, honestly, at the
- * wrong size. Every string history retains is therefore copied out unit by unit;
- * `String.fromCharCode` is one of the few constructions that actually allocates a
- * fresh flat string rather than a view of an existing one.
- *
- * Copying costs a pass over the text once per retained string, which is cheap
- * against what it prevents: cell text is short, and a long value is one that
- * would otherwise be retained unmeasured.
- */
-export function detached_string(text: string): string {
-    if (text.length <= DETACH_CHUNK) return detached_chunk(text, 0, text.length);
-    const chunks: string[] = [];
-    for (let start = 0; start < text.length; start += DETACH_CHUNK) {
-        chunks.push(detached_chunk(text, start, Math.min(start + DETACH_CHUNK, text.length)));
-    }
-    // Joined rather than accumulated with `+=`: the result is one flat string,
-    // where a chain of concatenations would be a rope thousands of nodes deep. Its
-    // pieces are all ours either way, so nothing foreign is retained.
-    return chunks.join('');
-}
-
-function detached_chunk(text: string, start: number, end: number): string {
-    const units: number[] = [];
-    for (let index = start; index < end; index += 1) units.push(text.charCodeAt(index));
-    return String.fromCharCode(...units);
-}
-
-/**
- * Canonical worksheet targets, interned for the life of the session.
- *
- * Interned GLOBALLY rather than per action, because a delta is built one cell at a
- * time — long before there is an action to scope an owner to. A million-cell paste
- * names one worksheet, and without a shared target every delta would detach its own
- * copy of that name while the estimator charged one.
- *
- * The estimator keys its charge on the target OBJECT, so this is an optimization
- * and never a correctness requirement: a target that misses every cache is freshly
- * built and honestly charged. That is what lets both caches be bounded.
- *
- * Two of them, because they answer different questions:
- *
- *   - `BY_SOURCE` maps a caller's target object to its canonical form. A wide
- *     gesture names one worksheet with one object, so this answers in O(1) without
- *     touching the identity strings at all. Weak, so it costs nothing to keep.
- *   - `BY_IDENTITY` catches equal targets that arrive as different objects, keyed
- *     on a composite of the identity. Building that key is O(identity length), so
- *     it is only consulted for identities short enough for that to be free — a
- *     real sheet name is a few dozen characters, and a caller handing us a
- *     megabyte-long one gets correctly-charged copies rather than a hang.
- */
-const MAX_INTERNED_TARGETS = 4_096;
-/** Longest identity worth building a composite key for. Real names are tiny. */
-const MAX_INTERNED_IDENTITY_LENGTH = 512;
-/**
- * A canonical target remembered against the source object it came from, WITH the
- * field values it was built from.
- *
- * A caller's target is a mutable object — `readonly` is a compile-time claim — and
- * one that gets renamed or reordered between two cells of a gesture would otherwise
- * keep answering with the first snapshot, so later deltas would replay against the
- * sheet it used to be.
- */
-interface SourceMemo {
-    readonly sheetIndex: number;
-    readonly sheetName: string | undefined;
-    readonly worksheetId: string | undefined;
-    readonly canonical: WorksheetTarget;
-}
-let BY_SOURCE = new WeakMap<WorksheetTarget, SourceMemo>();
-const BY_IDENTITY = new Map<string, WorksheetTarget>();
-
-export function canonical_worksheet_target(
-    target: WorksheetTarget,
-    owner: RetainedStringOwner,
-): WorksheetTarget {
-    // Each field is read exactly once, here, and everything below uses the locals:
-    // an accessor that answers differently on a second read must not be able to
-    // pair one field's value with another's.
-    const { sheetIndex, sheetName, worksheetId } = target;
-
-    // The common case: every delta of a gesture was handed the same target object.
-    // Verified against the values it was built from, since the caller's object can
-    // be mutated between two cells of one gesture.
-    const memo = BY_SOURCE.get(target);
-    if (
-        memo !== undefined
-        && memo.sheetIndex === sheetIndex
-        && memo.sheetName === sheetName
-        && memo.worksheetId === worksheetId
-    ) {
-        return memo.canonical;
-    }
-
-    const identity_length = (sheetName?.length ?? 0) + (worksheetId?.length ?? 0);
-    const key = identity_length <= MAX_INTERNED_IDENTITY_LENGTH
-        ? `${sheetIndex}\u0000${sheetName === undefined ? 0 : 1}${worksheetId === undefined ? 0 : 1}\u0000${sheetName ?? ''}\u0000${worksheetId ?? ''}`
-        : undefined;
-    const seen = key === undefined ? undefined : BY_IDENTITY.get(key);
-    if (seen !== undefined) {
-        BY_SOURCE.set(target, { sheetIndex, sheetName, worksheetId, canonical: seen });
-        return seen;
-    }
-
-    // Charged only when it is really allocated: a delta pointing at an
-    // already-interned sheet retains no new string, and the estimator agrees
-    // because it charges per retained target object.
-    const canonical = Object.freeze({
-        sheetIndex,
-        ...(sheetName === undefined ? {} : { sheetName: owner.own(sheetName) }),
-        ...(worksheetId === undefined ? {} : { worksheetId: owner.own(worksheetId) }),
-    });
-    // Always remembered against the source object, which retains nothing the source
-    // was not already keeping alive.
-    BY_SOURCE.set(target, { sheetIndex, sheetName, worksheetId, canonical });
-    if (key !== undefined && BY_IDENTITY.size < MAX_INTERNED_TARGETS) {
-        // The key repeats the identity, so it is only ever a bounded few hundred
-        // characters — which is what MAX_INTERNED_IDENTITY_LENGTH is for.
-        BY_IDENTITY.set(detached_string(key), canonical);
-    }
-    return canonical;
-}
-
-/**
- * Test seam: forgets every interned worksheet target.
- *
- * Both caches, or the reset would leave tests order-dependent: a target object
- * memoized before the reset would keep answering with its old canonical form
- * without repopulating the identity map, so an equal target arriving afterwards
- * would get a different object and be charged separately.
- */
-export function reset_interned_worksheet_targets(): void {
-    BY_IDENTITY.clear();
-    BY_SOURCE = new WeakMap<WorksheetTarget, SourceMemo>();
-}
-
-function canonical_value(value: HistoryValue, owner: RetainedStringOwner): HistoryValue {
+function copy_value(value: HistoryValue, owner: HistoryActionOwner): HistoryValue {
     const runs = value.runs;
     return {
-        text: owner.own(value.text),
+        text: owner.own_string(value.text),
         ...(runs === undefined
             ? {}
-            : { runs: { runs: canonical_runs(runs.runs, owner) } }),
+            : { runs: { runs: copy_runs(runs.runs, owner) } }),
     };
 }
 
@@ -885,29 +764,29 @@ function canonical_value(value: HistoryValue, owner: RetainedStringOwner): Histo
  * whatever undeclared state it holds into what history retains and the estimator
  * never charges. A `for` loop into a literal cannot be redirected that way.
  */
-function canonical_runs(
+function copy_runs(
     runs: readonly RichTextRun[],
-    owner: RetainedStringOwner,
+    owner: HistoryActionOwner,
 ): readonly RichTextRun[] {
     const out: RichTextRun[] = [];
     for (const run of runs) {
         // Charged before it is built: a cell of one-character runs is mostly shape,
         // so a budget told only about text would allocate the whole run graph.
         owner.charge_run();
-        out.push(canonical_run(run, owner));
+        out.push(copy_run(run, owner));
     }
     return out;
 }
 
-function canonical_run(run: RichTextRun, owner: RetainedStringOwner): RichTextRun {
+function copy_run(run: RichTextRun, owner: HistoryActionOwner): RichTextRun {
     const style = run.style;
     return {
-        text: owner.own(run.text),
-        ...(style === undefined ? {} : { style: canonical_style(style) }),
+        text: owner.own_string(run.text),
+        ...(style === undefined ? {} : { style: copy_style(style) }),
     };
 }
 
-function canonical_style(style: CellTextStyle): CellTextStyle {
+function copy_style(style: CellTextStyle): CellTextStyle {
     const { bold, italic, underline, strikethrough } = style;
     return {
         ...(bold === undefined ? {} : { bold }),
@@ -917,30 +796,30 @@ function canonical_style(style: CellTextStyle): CellTextStyle {
     };
 }
 
-function canonical_hyperlink(
+function copy_hyperlink(
     link: CellHyperlink | null,
-    owner: RetainedStringOwner,
+    owner: HistoryActionOwner,
 ): CellHyperlink | null {
     if (link === null) return null;
     const tooltip = link.tooltip;
-    const rest = tooltip === undefined ? {} : { tooltip: owner.own(tooltip) };
+    const rest = tooltip === undefined ? {} : { tooltip: owner.own_string(tooltip) };
     return link.kind === 'external'
-        ? { kind: 'external', target: owner.own(link.target), ...rest }
-        : { kind: 'internal', location: owner.own(link.location), ...rest };
+        ? { kind: 'external', target: owner.own_string(link.target), ...rest }
+        : { kind: 'internal', location: owner.own_string(link.location), ...rest };
 }
 
-interface CanonicalTransition<T> {
+interface CopiedTransition<T> {
     readonly mode: CellHistoryTransitionMode;
     readonly expected: HistoryDimensionSide<T>;
     readonly desired: HistoryDimensionSide<T>;
 }
 
-function canonical_transition<T>(
-    transition: CanonicalTransition<T>,
+function copy_transition<T>(
+    transition: CopiedTransition<T>,
     content: (value: T) => T,
-): CanonicalTransition<T> {
+): CopiedTransition<T> {
     // Each side is read once. An accessor read twice could answer with two
-    // different objects, and the canonical delta would then pair one side's
+    // different objects, and the copy would then pair one side's
     // content with the other's overlay membership — a state the caller never
     // supplied, which replay would go on to compare against or restore.
     const expected = transition.expected;
@@ -952,7 +831,7 @@ function canonical_transition<T>(
     };
 }
 
-function canonical_overlay(
+function copy_overlay(
     overlay: CellOverlayState,
     value_of: (value: HistoryValue) => HistoryValue,
     link_of: (link: CellHyperlink | null) => CellHyperlink | null,
@@ -960,7 +839,7 @@ function canonical_overlay(
     if (overlay.kind === 'absent') return ABSENT;
     const value = overlay.value;
     const hyperlink = overlay.hyperlink;
-    const canonical_value_dimension: OverlayValueDimension = value.kind === 'present'
+    const copied_value_dimension: OverlayValueDimension = value.kind === 'present'
         ? {
             kind: 'present',
             value: value_of(value.value),
@@ -968,7 +847,7 @@ function canonical_overlay(
             basePending: value.basePending,
         }
         : { kind: 'untouched', anchor: value_of(value.anchor) };
-    const canonical_link_dimension: OverlayHyperlinkDimension = hyperlink.kind === 'present'
+    const copied_link_dimension: OverlayHyperlinkDimension = hyperlink.kind === 'present'
         ? {
             kind: 'present',
             value: link_of(hyperlink.value),
@@ -981,8 +860,8 @@ function canonical_overlay(
     // was a present/untouched pair there.
     return {
         kind: 'present',
-        value: canonical_value_dimension,
-        hyperlink: canonical_link_dimension,
+        value: copied_value_dimension,
+        hyperlink: copied_link_dimension,
     } as PresentCellOverlayState;
 }
 
