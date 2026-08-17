@@ -58,6 +58,24 @@ export interface HistoryEntry {
     readonly cellCount: number;
     /** Estimated retained bytes. Approximate by construction — see `estimate_*`. */
     readonly byteCost: number;
+    /**
+     * Which entry this is, for the life of the session. Stable across moves.
+     *
+     * Object identity cannot serve, because a moved entry is a new object; and
+     * the action cannot, because a user can repeat a gesture.
+     */
+    readonly id: object;
+    /**
+     * How many times this entry has moved between the stacks.
+     *
+     * A commit names the move it belongs to, not just the entry, because entry
+     * identity has an ABA hole: undo B then redo B puts B back where it started,
+     * and a delayed duplicate of the first undo's commit would otherwise read as
+     * a fresh move — leaving history claiming B is undone while its content is
+     * redone. Comparing counts also says WHICH way the commit is stale: a lower
+     * count is a move that already happened, a higher one cannot have.
+     */
+    readonly moves: number;
 }
 
 /**
@@ -245,8 +263,8 @@ function measure_costs(changes: readonly HistoryChange[]): HistoryCosts {
 
 /** Measures an action's costs and takes ownership of it. Both costs are estimates. */
 export function measure_history_action(action: HistoryAction): HistoryEntry {
-    const changes = [...action.changes];
-    return { action: own_action(action, changes), ...measure_costs(changes) };
+    const owned = own_action(action);
+    return { action: owned, ...measure_costs(owned.changes), id: {}, moves: 0 };
 }
 
 export interface RecordedOutcome {
@@ -320,24 +338,22 @@ export function record_history_action(
     action: HistoryAction,
     bounds: HistoryBounds = DEFAULT_HISTORY_BOUNDS,
 ): RecordOutcome {
-    if (action.changes.length === 0) return { kind: 'empty', state };
+    // Canonicalized first, so everything below reads the graph history will
+    // retain rather than whatever the caller's object answers next.
+    const owned = own_action(action);
+    if (owned.changes.length === 0) return { kind: 'empty', state };
 
-    // `changes` is read exactly once. It can be an accessor on a caller-built
-    // action — a valid implementation of a readonly property — and a getter
-    // answering differently across the measure and the record could walk a
-    // gesture straight past the hard bound.
-    const changes = [...action.changes];
-
-    // Measured before it is owned: a refusal must not first copy the graph the
-    // bound exists to keep out of memory.
-    const costs = measure_costs(changes);
+    // Measured after canonicalization but before the payloads are copied: a
+    // refusal must not first duplicate the very graph the bound exists to keep
+    // out of memory, and `own_action` retains those payloads by reference.
+    const costs = measure_costs(owned.changes);
     if (costs.byteCost > bounds.hardMaxBytes) {
         return {
             kind: 'refused',
             state: {
                 undoStack: [],
                 redoStack: [],
-                barrier: { reason: 'action-too-large', label: action.label },
+                barrier: { reason: 'action-too-large', label: owned.label },
             },
             reason: 'action-too-large',
             byteCost: costs.byteCost,
@@ -345,7 +361,7 @@ export function record_history_action(
         };
     }
 
-    const entry: HistoryEntry = { action: own_action(action, changes), ...costs };
+    const entry: HistoryEntry = { action: owned, ...costs, id: {}, moves: 0 };
     const { kept, evicted } = evict_to_fit([...state.undoStack, entry], bounds);
     return {
         kind: 'recorded',
@@ -453,28 +469,29 @@ export function commit_history_move(
     entry: HistoryEntry,
 ): CommitOutcome {
     const other: HistoryDirection = direction === 'undo' ? 'redo' : 'undo';
-    if (stack_for(state, other).includes(entry)) {
+    const destination = stack_for(state, other);
+    const from = stack_for(state, direction);
+
+    const current = [...destination, ...from].find((candidate) => candidate.id === entry.id);
+    // Anywhere in history with the move already counted: this commit, or a later
+    // one that superseded it, has run.
+    if (current !== undefined && current.moves > entry.moves) {
         return { kind: 'already-committed', state };
     }
 
-    const from = stack_for(state, direction);
-    const position = from.lastIndexOf(entry);
+    const position = from.findIndex((candidate) => candidate.id === entry.id);
     if (position === -1) return { kind: 'dropped', state };
     if (position !== from.length - 1) {
         const kept = [...from.slice(0, position), ...from.slice(position + 1)];
         return {
             kind: 'dropped',
-            state: with_stacks(state, direction, kept, stack_for(state, other)),
+            state: with_stacks(state, direction, kept, destination),
         };
     }
+    const moved: HistoryEntry = { ...from[position], moves: entry.moves + 1 };
     return {
         kind: 'moved',
-        state: with_stacks(
-            state,
-            direction,
-            from.slice(0, -1),
-            [...stack_for(state, other), entry],
-        ),
+        state: with_stacks(state, direction, from.slice(0, -1), [...destination, moved]),
     };
 }
 
@@ -547,52 +564,43 @@ export function action_is_single_worksheet(action: HistoryAction): boolean {
 /**
  * The action history will retain, isolated from the caller.
  *
- * History owning its own copy is not optional: `cellCount` and `byteCost` are
- * measured once, so a caller that mutated a recorded action afterwards would
- * change what replay does while the bounds still described the old graph.
+ * Every action is CANONICALIZED rather than inspected and conditionally reused.
+ * The declared fields are read exactly once into a fresh frozen object, so
+ * nothing downstream can be surprised by the caller's: a `readonly` property may
+ * legitimately be a getter, or live on a prototype, or sit beside extra
+ * properties structural typing allows, and any of those makes "the graph I
+ * measured" and "the graph I retained" two different things — which is how a
+ * gesture walks past the hard bound with a stale `byteCost`, or changes what
+ * replay does after its costs were fixed. Reading once is also cheap: the copy
+ * is one array of wrappers, not the content.
  *
- * Ownership is taken at the shallowest level that needs it. The payload — the
- * delta, which is where all the retained content is — is normally already frozen
- * all the way down, because `build_cell_history_delta` returns a
- * `deep_clone_and_freeze`d value; only the `{kind, delta}` wrapper a caller
- * built around it is new. Cloning the whole change to own that wrapper would
- * copy every string in the payload a second time, and at this size that is the
- * difference between recording a supported million-cell gesture and running out
- * of memory deciding to refuse it.
- *
- * `is_deeply_frozen` is what makes the reuse safe. A shallow `Object.isFrozen`
- * would pass a frozen wrapper around mutable innards, and retaining that leaves
- * the caller able to retarget a replay or invalidate a measured cost.
+ * The PAYLOAD is what must not be copied. The delta holds everything large, and
+ * it normally arrives frozen all the way down from `build_cell_history_delta`;
+ * only the `{kind, delta}` wrapper around it is the caller's. Cloning the whole
+ * change to own that wrapper would duplicate every string in the payload, which
+ * at this size is the difference between recording a supported million-cell
+ * gesture and running out of memory refusing it. `is_deeply_frozen` is what makes
+ * retaining the payload by reference safe — a shallow `Object.isFrozen` would
+ * pass a frozen wrapper around mutable innards, and an accessor is rejected
+ * outright rather than read.
  */
-function own_action(
-    action: HistoryAction,
-    changes: readonly HistoryChange[],
-): HistoryAction {
-    const owned = changes.map(own_history_change);
-    // The whole graph reachable through `action`, accessors included, must be
-    // frozen for the object itself to be safe to retain: a frozen action whose
-    // `changes` is a getter can answer with a different array tomorrow, which
-    // would change what replay does while the measured costs described the array
-    // read today.
-    return is_deeply_frozen(action) && owned.every((change, index) => change === changes[index])
-        ? action
-        : Object.freeze({ label: action.label, changes: Object.freeze(owned) });
+function own_action(action: HistoryAction): HistoryAction {
+    const changes = [...action.changes].map(own_history_change);
+    return Object.freeze({ label: action.label, changes: Object.freeze(changes) });
 }
 
 function own_history_change(change: HistoryChange): HistoryChange {
-    if (is_deeply_frozen(change)) return change;
-    if (is_deeply_frozen(change.delta)) {
-        // Only the wrapper is the caller's. Freezing a copy of it retains the
-        // payload by reference instead of duplicating it.
-        return Object.freeze({ kind: change.kind, delta: change.delta } as HistoryChange);
-    }
-    return deep_clone_and_freeze(change);
+    // Canonicalized like the action, and for the same reasons — but only the
+    // wrapper. A deeply frozen delta is retained by reference.
+    const delta = is_deeply_frozen(change.delta)
+        ? change.delta
+        : deep_clone_and_freeze(change.delta);
+    return Object.freeze({ kind: change.kind, delta } as HistoryChange);
 }
 
 /** Builds a frozen action, so a caller reusing its builders cannot mutate history. */
 export function history_action(label: string, changes: readonly HistoryChange[]): HistoryAction {
-    const snapshot = [...changes];
-    return own_action({ label, changes: snapshot }, snapshot);
+    return own_action({ label, changes });
 }
 
 /**

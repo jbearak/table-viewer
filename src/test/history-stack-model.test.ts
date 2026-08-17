@@ -179,13 +179,14 @@ describe('record_history_action', () => {
         expect(Object.isFrozen(recorded?.action.changes)).toBe(true);
     });
 
-    it('reuses an already-frozen action rather than copying it again', () => {
-        // A supported gesture is a million cells; cloning that graph a second
-        // time to freeze what is already frozen doubles peak memory exactly when
-        // there is least of it.
+    it('retains a re-recorded action\'s payloads rather than copying them again', () => {
+        // The action and its wrappers are canonicalized on every pass — they are
+        // one array of small objects. The payloads are not: a supported gesture is
+        // a million cells, and copying that graph to freeze what is already frozen
+        // doubles peak memory exactly when there is least of it.
         const action = history_action('Edit', [cell_change(0, 0, 'v')]);
         const outcome = record_history_action(empty_history_stack(), action);
-        expect(outcome.state.undoStack[0]?.action).toBe(action);
+        expect(outcome.state.undoStack[0]?.action.changes[0]?.delta).toBe(action.changes[0]?.delta);
     });
 
     it('retains a frozen delta by reference, owning only the wrapper', () => {
@@ -542,6 +543,35 @@ describe('peek_history and commit_history_move', () => {
         const start = record_all(['A', 'B']);
         const entry = top(start, 'undo');
         expect(commit_history_move(clear_history(start), 'undo', entry).kind).toBe('dropped');
+    });
+
+    it('ignores a stale commit of a move the user has since redone', () => {
+        // Undo B, redo B: the same entry is back on the undo stack, so entry
+        // identity alone would read a delayed duplicate of the first undo's
+        // commit as a fresh move — leaving history claiming B is undone while its
+        // content is redone.
+        const start = record_all(['A', 'B']);
+        const first_peek = top(start, 'undo');
+        const undone = commit_history_move(start, 'undo', first_peek).state;
+        const redone = move(undone, 'redo');
+        expect(redone.undoStack.map((item) => item.action.label)).toEqual(['A', 'B']);
+
+        const stale = commit_history_move(redone, 'undo', first_peek);
+        expect(stale.kind).toBe('already-committed');
+        expect(stale.state).toBe(redone);
+        expect(stale.state.undoStack.map((item) => item.action.label)).toEqual(['A', 'B']);
+    });
+
+    it('recognizes a duplicate commit after the entry moved twice more', () => {
+        // The count says which way a stale commit is stale, so a commit two moves
+        // behind still reads as already-committed rather than as a vanished entry.
+        const start = record_all(['A', 'B']);
+        const peeked = top(start, 'undo');
+        const undone = commit_history_move(start, 'undo', peeked).state;
+        const redone = move(undone, 'redo');
+        const undone_again = move(redone, 'undo');
+
+        expect(commit_history_move(undone_again, 'undo', peeked).kind).toBe('already-committed');
     });
 
     it('reports a commit after another undo already moved the entry', () => {
