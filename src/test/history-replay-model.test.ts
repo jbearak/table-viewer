@@ -16,7 +16,8 @@ import {
 import { history_action, type HistoryChange } from '../webview/history-stack-model';
 import {
     plan_history_replay,
-    type ReadCellOverlay,
+    type CellReplayState,
+    type ReadCellState,
     type ReplayPlan,
     type ReplayRefusal,
 } from '../webview/history-replay-model';
@@ -58,22 +59,28 @@ function cell(delta: CellHistoryDelta): HistoryChange {
     return { kind: 'cell', delta };
 }
 
-/** A reader over a fixed map of overlays, keyed `sheetIndex:row:col`. */
+/**
+ * A reader over a fixed map of overlays, keyed `sheetIndex:row:col`. Every cell
+ * reads 'disk' as its persisted text unless `persisted` says otherwise.
+ */
 function overlays(
     entries: Record<string, CellOverlayState | undefined>,
     seen?: string[],
-): ReadCellOverlay {
+    persisted: Record<string, string> = {},
+): ReadCellState {
     return (worksheet, row, column) => {
         const key = `${worksheet.sheetIndex}:${row}:${column}`;
         seen?.push(key);
-        return entries[key];
+        const overlay = entries[key];
+        if (overlay === undefined) return undefined;
+        return { overlay, persisted: value(persisted[key] ?? 'disk') };
     };
 }
 
 function plan_of(
     changes: readonly HistoryChange[],
     direction: HistoryDirection,
-    read: ReadCellOverlay,
+    read: ReadCellState,
 ): ReplayPlan {
     const result = plan_history_replay(history_action('Edit', changes), direction, read);
     if (result.kind !== 'plan') {
@@ -85,7 +92,7 @@ function plan_of(
 function refusal_of(
     changes: readonly HistoryChange[],
     direction: HistoryDirection,
-    read: ReadCellOverlay,
+    read: ReadCellState,
 ): ReplayRefusal {
     const result = plan_history_replay(history_action('Edit', changes), direction, read);
     if (result.kind !== 'refused') throw new Error('expected a refusal');
@@ -402,7 +409,7 @@ describe('the anchor a link-only entry is restored on', () => {
         const plan = plan_of(
             [cell(delta({ before: absent_overlay(), after, persisted: 'A' }))],
             'redo',
-            overlays({ '0:0:0': absent_overlay() }),
+            overlays({ '0:0:0': absent_overlay() }, undefined, { '0:0:0': 'A' }),
         );
 
         expect(plan.writes[0]?.entry?.value).toBe('A');
@@ -415,10 +422,29 @@ describe('the anchor a link-only entry is restored on', () => {
         const plan = plan_of(
             [cell(delta({ before, after: absent_overlay(), persisted: 'A' }))],
             'undo',
-            overlays({ '0:0:0': absent_overlay() }),
+            overlays({ '0:0:0': absent_overlay() }, undefined, { '0:0:0': 'A' }),
         );
 
         expect(plan.writes[0]?.entry?.value).toBe('A');
+        expect(plan.writes[0]?.entry?.link).toEqual(LINK);
+    });
+
+    it('anchors on what the disk holds now, not what it held then', () => {
+        // The recorded anchor was the disk content at record time, and a save may
+        // legitimately have moved it since. Restoring it would not rewrite what
+        // the user sees, but it would fabricate a conflict base the cell never
+        // had — so the next save would report a conflict against content nobody
+        // changed. Same rule membership mode follows, applied to the one field
+        // the merge still has to fill in.
+        const after = hyperlink_only_overlay(value('A'), LINK, null);
+        const plan = plan_of(
+            [cell(delta({ before: absent_overlay(), after, persisted: 'A' }))],
+            'redo',
+            overlays({ '0:0:0': absent_overlay() }, undefined, { '0:0:0': 'C' }),
+        );
+
+        expect(plan.writes[0]?.entry?.value).toBe('C');
+        expect(plan.writes[0]?.entry?.base).toBe('C');
         expect(plan.writes[0]?.entry?.link).toEqual(LINK);
     });
 

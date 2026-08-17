@@ -223,15 +223,17 @@ export interface EditSessionStore {
      * what the plan/apply split exists to prevent, and it is what would be
      * published to the host as `pendingEdits`.
      *
-     * So the caller stages every store, then calls every returned commit: each
-     * swaps its own state without notifying, and the notifications go out only
-     * once every swap has happened. Staging cannot fail, so a caller that has
-     * staged them all can always finish.
+     * The protocol is three passes, and the order is the whole point: stage every
+     * store, `valid()` every staging, and only then commit and notify. Checking
+     * validity inside each commit would not do — the first store would already
+     * have swapped by the time the third discovered its session had moved, and
+     * that half-replayed state is observable through `snapshot()` and `get()`
+     * whether or not anything has notified yet. A staging that is still valid
+     * cannot fail to commit, so once the whole list validates the caller can
+     * always finish.
      *
-     * Returns `undefined` when the session moved on, exactly as the mutators
-     * drop a stale write — a caller that gets one must abandon the whole plan
-     * rather than commit the rest, since the gesture is no longer this session's
-     * to replay.
+     * Returns `undefined` when the session moved on before staging, exactly as
+     * the mutators drop a stale write.
      */
     stage_writes(
         session_id: string | undefined,
@@ -242,13 +244,23 @@ export interface EditSessionStore {
 /**
  * A store's next state, held back from its subscribers.
  *
- * `commit` swaps it in and answers whether anything actually moved; `notify`
- * publishes. Both are idempotent, so a caller may run the list twice without
- * double-notifying. Nothing here holds the store's listeners open — an abandoned
- * staging is simply dropped.
+ * `valid()` asks whether this staging may still be committed: false once the
+ * store has crossed a hydration boundary or been mutated by anything else since
+ * it was staged. It changes nothing, so a caller can ask about every store
+ * before moving any of them.
+ *
+ * `commit` swaps the staged state in; `notify` publishes. Both are idempotent,
+ * so a caller may run the list twice without double-notifying. Nothing here
+ * holds the store's listeners open — an abandoned staging is simply dropped.
  */
 export interface StagedWrites {
-    /** Swap the staged state in without notifying. Answers whether it changed. */
+    /** Whether the staging still describes a swap this store will accept. */
+    valid(): boolean;
+    /**
+     * Swap the staged state in without notifying. Answers whether it changed.
+     * Refuses — answering false — if the staging is no longer {@link valid}, but
+     * a caller that validated the whole list first can never reach that.
+     */
     commit(): boolean;
     /** Notify this store's subscribers, once, if the commit changed anything. */
     notify(): void;
@@ -543,18 +555,21 @@ export function create_edit_session_store(
         },
         stage_writes: (session_id, writes) => {
             if (!owns(session_id)) return undefined;
+            // The state staged against, so a store that moved for any reason —
+            // an install, a keystroke, a save landing — invalidates the staging
+            // rather than silently rebasing it onto a map it never saw.
+            const staged_from = state;
             const next = staged_state(writes);
             let changed = false;
             let committed = false;
             let notified = false;
+            const valid = (): boolean => state === staged_from && owns(session_id);
             return {
+                valid,
                 commit: () => {
                     if (committed) return changed;
+                    if (!valid()) return false;
                     committed = true;
-                    // Re-checked at swap time, not just at staging: a staged plan
-                    // is held across the staging of every other store, and an
-                    // install could have crossed a hydration boundary in between.
-                    if (!owns(session_id)) return false;
                     changed = next.pending_base !== state.pending_base
                         || !entries_equal(state.entries, next.entries);
                     if (changed) state = next;

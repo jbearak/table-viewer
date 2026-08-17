@@ -757,6 +757,7 @@ describe('edit session store', () => {
                 first.stage_writes('s', [{ key: '0:0', entry: { value: 'a', base: 'A' } }]),
                 second.stage_writes('s', [{ key: '0:0', entry: { value: 'b', base: 'B' } }]),
             ];
+            expect(staged.every((stage) => stage?.valid())).toBe(true);
             for (const stage of staged) stage?.commit();
             for (const stage of staged) stage?.notify();
 
@@ -780,9 +781,46 @@ describe('edit session store', () => {
             ]);
 
             store.install({ session_id: 'second' }, {});
-            staged?.commit();
 
+            expect(staged?.valid()).toBe(false);
+            staged?.commit();
             expect(store.size()).toBe(0);
+        });
+
+        it('invalidates a staging whose store moved under it', () => {
+            // Not only a session change: a staging rebased onto a map it never
+            // saw would silently drop whatever landed in between.
+            const store = create_edit_session_store({ session_id: 's' }, {});
+            const staged = store.stage_writes('s', [
+                { key: '0:0', entry: { value: 'a', base: 'A' } },
+            ]);
+
+            store.commit('s', '0:1', { value: 'meanwhile', base: 'B' });
+
+            expect(staged?.valid()).toBe(false);
+            expect(staged?.commit()).toBe(false);
+            expect(Object.fromEntries(store.snapshot()))
+                .toEqual({ '0:1': { value: 'meanwhile', base: 'B' } });
+        });
+
+        it('answers for every store before any of them swaps', () => {
+            // The reason validity is its own pass. Checking inside each commit
+            // would leave the first store replayed by the time the second
+            // discovered its session had moved — a half-replayed gesture that is
+            // observable through snapshot() whether or not anything notified.
+            const first = create_edit_session_store({ session_id: 's' }, {});
+            const second = create_edit_session_store({ session_id: 's' }, {});
+            const staged = [
+                first.stage_writes('s', [{ key: '0:0', entry: { value: 'a', base: 'A' } }]),
+                second.stage_writes('s', [{ key: '0:0', entry: { value: 'b', base: 'B' } }]),
+            ];
+
+            second.install({ session_id: 'other' }, {});
+
+            expect(staged.every((stage) => stage?.valid())).toBe(false);
+            // The caller abandons, and neither store has moved.
+            expect(first.size()).toBe(0);
+            expect(second.size()).toBe(0);
         });
 
         it('notifies once however often the caller runs the list', () => {

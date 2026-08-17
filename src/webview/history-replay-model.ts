@@ -42,21 +42,34 @@ import {
 import { hyperlinks_equal, type CellHyperlink } from '../cell-content';
 import type { WorksheetTarget } from '../types';
 
+/** What a cell holds right now: its overlay, and the content underneath it. */
+export interface CellReplayState {
+    readonly overlay: CellOverlayState;
+    /**
+     * The cell's CURRENT persisted text — what a save would leave if the overlay
+     * went away. Needed because an overlay that is absent has no unedited anchor
+     * to offer, and a link restored onto such a cell has to hang on the content
+     * that is there now rather than on whatever was there when the action was
+     * recorded.
+     */
+    readonly persisted: HistoryValue;
+}
+
 /**
- * The overlay state a cell holds right now, or `undefined` when the question
- * cannot be answered — the worksheet the action names is not open, or is not the
- * one now at that address.
+ * The state a cell holds right now, or `undefined` when the question cannot be
+ * answered — the worksheet the action names is not open, or is not the one now
+ * at that address.
  *
  * Unanswerable is not the same as absent, and the difference decides whether a
  * replay proceeds. An absent overlay is a fact about a cell the reader can see;
  * `undefined` means it cannot see the cell at all, and treating that as absence
  * would let an undo delete an entry it never actually looked at.
  */
-export type ReadCellOverlay = (
+export type ReadCellState = (
     worksheet: WorksheetTarget,
     sourceRow: number,
     sourceColumn: number,
-) => CellOverlayState | undefined;
+) => CellReplayState | undefined;
 
 /** One cell's write: the entry to store, or `undefined` to remove it. */
 export interface PlannedCellWrite {
@@ -116,7 +129,7 @@ export type ReplayPlanResult = ReplayPlan | ReplayRefusal;
 export function plan_history_replay(
     action: HistoryAction,
     direction: HistoryDirection,
-    read_overlay: ReadCellOverlay,
+    read_state: ReadCellState,
 ): ReplayPlanResult {
     const writes: PlannedCellWrite[] = [];
     const highlights: HighlightHistoryDelta[] = [];
@@ -128,10 +141,10 @@ export function plan_history_replay(
     // which will not have moved until the whole plan is applied. Reading the
     // store for both would look for B, find C, and refuse a replay that is
     // perfectly consistent with itself.
-    const planned_state = new Map<string, CellOverlayState>();
-    const read_planned: ReadCellOverlay = (worksheet, row, column) =>
+    const planned_state = new Map<string, CellReplayState>();
+    const read_planned: ReadCellState = (worksheet, row, column) =>
         planned_state.get(cell_address(worksheet, row, column))
-            ?? read_overlay(worksheet, row, column);
+            ?? read_state(worksheet, row, column);
 
     for (const change of action_replay_changes(action, direction)) {
         if (change.kind === 'highlight') {
@@ -177,21 +190,22 @@ function cell_address(worksheet: WorksheetTarget, row: number, column: number): 
 interface PlannedCell {
     readonly kind: 'planned';
     readonly write: PlannedCellWrite;
-    /** The overlay the write leaves behind, for a later delta on the same cell. */
-    readonly result: CellOverlayState;
+    /** The state the write leaves behind, for a later delta on the same cell. */
+    readonly result: CellReplayState;
 }
 
 function plan_cell_replay(
     delta: CellHistoryDelta,
     direction: HistoryDirection,
-    read_overlay: ReadCellOverlay,
+    read_state: ReadCellState,
 ): PlannedCell | ReplayRefusal {
     const { worksheet, sourceRow, sourceColumn } = delta;
     const refuse = (reason: ReplayRefusal['reason']): ReplayRefusal =>
         ({ kind: 'refused', reason, worksheet, sourceRow, sourceColumn });
 
-    const current = read_overlay(worksheet, sourceRow, sourceColumn);
-    if (current === undefined) return refuse('unavailable');
+    const state = read_state(worksheet, sourceRow, sourceColumn);
+    if (state === undefined) return refuse('unavailable');
+    const current = state.overlay;
 
     // Undo restores `expected` and must find `desired` in place; redo the
     // reverse. `transition_side` answers with the destination, so the check
@@ -218,12 +232,12 @@ function plan_cell_replay(
         if (!anchor_matches(current, recorded)) return refuse('conflict');
     }
 
-    const merged = merge_replayed_dimensions(delta, current, overlay_for_direction(delta, direction));
+    const merged = merge_replayed_dimensions(delta, state, overlay_for_direction(delta, direction));
     if (merged === undefined) return refuse('base-pending');
     const result = merged === ABSENT_RESULT ? absent_overlay() : merged;
     return {
         kind: 'planned',
-        result,
+        result: { overlay: result, persisted: state.persisted },
         write: {
             worksheet,
             sourceRow,
@@ -312,9 +326,10 @@ const ABSENT_RESULT = Symbol('absent overlay');
  */
 function merge_replayed_dimensions(
     delta: CellHistoryDelta,
-    current: CellOverlayState,
+    state: CellReplayState,
     destination: CellOverlayState,
 ): PresentCellOverlayState | typeof ABSENT_RESULT | undefined {
+    const current = state.overlay;
     const value = delta.value !== undefined
         ? dimension_of(destination, 'value')
         : dimension_of(current, 'value');
@@ -331,7 +346,7 @@ function merge_replayed_dimensions(
     }
     // No value dimension left. Without a link either, the entry is gone.
     if (link.kind !== 'present') return ABSENT_RESULT;
-    const anchor = surviving_anchor(destination, current);
+    const anchor = surviving_anchor(destination, state);
     if (anchor === undefined) return undefined;
     return hyperlink_only_overlay(anchor, link.value, link.base);
 }
@@ -366,25 +381,29 @@ const UNTOUCHED_LINK_DIMENSION: OverlayHyperlinkDimension = Object.freeze({
 /**
  * The unedited text a surviving link dimension hangs on.
  *
- * The DESTINATION's own anchor first: that is the text the action recorded for
- * this cell, and it is the only source that survives the cell having no entry at
- * all. Redoing a hyperlink attached to an unedited cell starts from an absent
- * overlay, so asking the current state would refuse a replay whose answer the
- * action was carrying all along — and where two link-only states differ only in
- * their anchor, taking the current one would make the undo a silent no-op while
- * history advanced past it.
+ * A cell with no overlay answers with what is PERSISTED there now, not with the
+ * anchor the action recorded. The recorded anchor was the disk content at record
+ * time, and an intervening save may have legitimately moved it — restoring it
+ * would not rewrite what the user sees, but it would fabricate a conflict base
+ * the cell never had, so the next save would report a conflict against content
+ * nobody changed. That is the same rule `membership` mode follows for an absent
+ * side, applied to the one field the merge still has to fill in.
  *
- * Otherwise the cell's current entry knows it: a present value dimension's
- * `base` IS the unedited content, captured when the edit started. A base still
- * pending is a placeholder rather than that content, and has no answer.
+ * With an overlay in place the recorded anchor is right and is preferred: it is
+ * session state the CAS has just checked, so an anchor-only undo restores the
+ * anchor it recorded instead of silently keeping the one already there. Failing
+ * that, a present value dimension's `base` IS the unedited content, captured
+ * when the edit started; a base still pending is a placeholder rather than that
+ * content, and has no answer.
  */
 function surviving_anchor(
     destination: CellOverlayState,
-    current: CellOverlayState,
+    state: CellReplayState,
 ): HistoryValue | undefined {
+    const current = state.overlay;
+    if (current.kind === 'absent') return state.persisted;
     const recorded = untouched_anchor(destination);
     if (recorded !== undefined) return recorded;
-    if (current.kind === 'absent') return undefined;
     if (current.value.kind === 'untouched') return current.value.anchor;
     return current.value.basePending ? undefined : current.value.base;
 }
