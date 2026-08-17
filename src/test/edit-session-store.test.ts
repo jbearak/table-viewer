@@ -692,6 +692,22 @@ describe('edit session store', () => {
             expect(store.has_pending_base()).toBe(false);
         });
 
+        it('restores a pending base rather than promoting the placeholder', () => {
+            // Undoing the discard of a legacy edit whose page was never resident
+            // puts back an entry whose base is a placeholder. Dropping the flag
+            // would make '' read as observed content: the cell would stop being
+            // held back, and a save would be admitted against a base the user
+            // never saw.
+            const store = create_edit_session_store({ session_id: 's' }, {});
+
+            store.apply_writes('s', [
+                { key: '0:0', entry: { value: 'B', base: '', base_pending: true } },
+            ]);
+
+            expect(store.get('0:0')?.base_pending).toBe(true);
+            expect(store.has_pending_base()).toBe(true);
+        });
+
         it('accepts an empty plan without notifying', () => {
             const store = create_edit_session_store({ session_id: 's' }, {
                 '0:0': { value: 'a', base: 'A' },
@@ -701,6 +717,112 @@ describe('edit session store', () => {
             store.apply_writes('s', []);
 
             expect(notifications.n).toBe(0);
+            expect(store.size()).toBe(1);
+        });
+    });
+
+    describe('stage_writes', () => {
+        it('does not publish until the commit', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {});
+            const notifications = count_notifications(store);
+
+            const staged = store.stage_writes('s', [
+                { key: '0:0', entry: { value: 'a', base: 'A' } },
+            ]);
+            expect(store.size()).toBe(0);
+            expect(notifications.n).toBe(0);
+
+            staged?.commit();
+            expect(store.size()).toBe(1);
+            // Swapped, but the subscribers have not been told: the caller is
+            // still staging the other worksheets of the gesture.
+            expect(notifications.n).toBe(0);
+
+            staged?.notify();
+            expect(notifications.n).toBe(1);
+        });
+
+        it('lets two stores swap before either notifies', () => {
+            // The reason this exists: a plan spans worksheets, and a subscriber
+            // must never see one sheet replayed while the rest hold the old
+            // state — that half-replayed gesture is what gets posted as
+            // pendingEdits.
+            const first = create_edit_session_store({ session_id: 's' }, {});
+            const second = create_edit_session_store({ session_id: 's' }, {});
+            const seen: number[] = [];
+            first.subscribe(() => { seen.push(first.size() + second.size()); });
+            second.subscribe(() => { seen.push(first.size() + second.size()); });
+
+            const staged = [
+                first.stage_writes('s', [{ key: '0:0', entry: { value: 'a', base: 'A' } }]),
+                second.stage_writes('s', [{ key: '0:0', entry: { value: 'b', base: 'B' } }]),
+            ];
+            for (const stage of staged) stage?.commit();
+            for (const stage of staged) stage?.notify();
+
+            expect(seen).toEqual([2, 2]);
+        });
+
+        it('refuses to stage for a session that moved on', () => {
+            const store = create_edit_session_store({ session_id: 'current' }, {});
+
+            expect(store.stage_writes('stale', [
+                { key: '0:0', entry: { value: 'a', base: 'A' } },
+            ])).toBeUndefined();
+        });
+
+        it('drops a staged swap when the session moved on before the commit', () => {
+            // A staged plan is held while every other store is staged, so a
+            // hydration boundary can cross in between.
+            const store = create_edit_session_store({ session_id: 'first' }, {});
+            const staged = store.stage_writes('first', [
+                { key: '0:0', entry: { value: 'a', base: 'A' } },
+            ]);
+
+            store.install({ session_id: 'second' }, {});
+            staged?.commit();
+
+            expect(store.size()).toBe(0);
+        });
+
+        it('notifies once however often the caller runs the list', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {});
+            const notifications = count_notifications(store);
+
+            const staged = store.stage_writes('s', [
+                { key: '0:0', entry: { value: 'a', base: 'A' } },
+            ]);
+            staged?.commit();
+            staged?.commit();
+            staged?.notify();
+            staged?.notify();
+
+            expect(notifications.n).toBe(1);
+            expect(store.size()).toBe(1);
+        });
+
+        it('stays silent when the staged state is the one already showing', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+            });
+            const notifications = count_notifications(store);
+
+            const staged = store.stage_writes('s', [
+                { key: '0:0', entry: { value: 'a', base: 'A' } },
+            ]);
+
+            expect(staged?.commit()).toBe(false);
+            staged?.notify();
+            expect(notifications.n).toBe(0);
+        });
+
+        it('leaves the store untouched when a staging is abandoned', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+            });
+
+            store.stage_writes('s', [{ key: '0:0', entry: undefined }]);
+
             expect(store.size()).toBe(1);
         });
     });

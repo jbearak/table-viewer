@@ -329,6 +329,152 @@ describe('dimensions the action did not touch', () => {
     });
 });
 
+describe('conflict metadata the swap must not ignore', () => {
+    it('refuses when the base moved under an unchanged value', () => {
+        // A recommit against a base that moved underneath is a real history
+        // change: the base decides whether the cell reads as conflicted and
+        // whether the save may be admitted. Comparing only the displayed value
+        // would pass the swap and silently overwrite the later recommit.
+        const before = value_only_overlay(value('B'), value('A'));
+        const after = value_only_overlay(value('B'), value('C'));
+        const moved = value_only_overlay(value('B'), value('D'));
+        const refusal = refusal_of(
+            [cell(delta({ before, after }))],
+            'undo',
+            overlays({ '0:0:0': moved }),
+        );
+
+        expect(refusal.reason).toBe('conflict');
+    });
+
+    it('refuses when basePending moved under an unchanged value', () => {
+        const before = value_only_overlay(value('B'), value('A'));
+        const after = value_only_overlay(value('B'), value('C'));
+        const moved: CellOverlayState = {
+            kind: 'present',
+            value: { kind: 'present', value: value('B'), base: value('C'), basePending: true },
+            hyperlink: { kind: 'untouched' },
+        };
+        const refusal = refusal_of(
+            [cell(delta({ before, after }))],
+            'undo',
+            overlays({ '0:0:0': moved }),
+        );
+
+        expect(refusal.reason).toBe('conflict');
+    });
+
+    it('refuses when baseLink moved under an unchanged link', () => {
+        const before = hyperlink_only_overlay(value('disk'), LINK, null);
+        const after = hyperlink_only_overlay(value('disk'), LINK, OTHER_LINK);
+        const moved = hyperlink_only_overlay(value('disk'), LINK, LINK);
+        const refusal = refusal_of(
+            [cell(delta({ before, after }))],
+            'undo',
+            overlays({ '0:0:0': moved }),
+        );
+
+        expect(refusal.reason).toBe('conflict');
+    });
+
+    it('refuses when a link-only anchor moved under an unchanged link', () => {
+        // The anchor is reconstructed into the entry's value/base pair, so a move
+        // of it changes the base the save is validated against.
+        const before = hyperlink_only_overlay(value('A'), null, null);
+        const after = hyperlink_only_overlay(value('A'), LINK, null);
+        const moved = hyperlink_only_overlay(value('C'), LINK, null);
+        const refusal = refusal_of(
+            [cell(delta({ before, after }))],
+            'undo',
+            overlays({ '0:0:0': moved }),
+        );
+
+        expect(refusal.reason).toBe('conflict');
+    });
+});
+
+describe('the anchor a link-only entry is restored on', () => {
+    it('redoes a link attached to an unedited cell', () => {
+        // Redo starts from an absent overlay, which has no anchor to offer — but
+        // the action recorded one, and asking the cell instead would refuse a
+        // replay whose answer was in hand all along.
+        const after = hyperlink_only_overlay(value('A'), LINK, null);
+        const plan = plan_of(
+            [cell(delta({ before: absent_overlay(), after, persisted: 'A' }))],
+            'redo',
+            overlays({ '0:0:0': absent_overlay() }),
+        );
+
+        expect(plan.writes[0]?.entry?.value).toBe('A');
+        expect(plan.writes[0]?.entry?.base).toBe('A');
+        expect(plan.writes[0]?.entry?.link).toEqual(LINK);
+    });
+
+    it('undoes the removal of a link-only entry', () => {
+        const before = hyperlink_only_overlay(value('A'), LINK, null);
+        const plan = plan_of(
+            [cell(delta({ before, after: absent_overlay(), persisted: 'A' }))],
+            'undo',
+            overlays({ '0:0:0': absent_overlay() }),
+        );
+
+        expect(plan.writes[0]?.entry?.value).toBe('A');
+        expect(plan.writes[0]?.entry?.link).toEqual(LINK);
+    });
+
+    it('restores the recorded anchor rather than the one in place', () => {
+        // Otherwise the undo is a silent no-op while history advances past it.
+        const before = hyperlink_only_overlay(value('A'), LINK, null);
+        const after = hyperlink_only_overlay(value('C'), LINK, null);
+        const plan = plan_of(
+            [cell(delta({ before, after }))],
+            'undo',
+            overlays({ '0:0:0': after }),
+        );
+
+        expect(plan.writes[0]?.entry?.value).toBe('A');
+        expect(plan.writes[0]?.entry?.base).toBe('A');
+    });
+});
+
+describe('addressing a cell across an action', () => {
+    it('treats one worksheet id as one cell however the target was snapshotted', () => {
+        // Two gestures merged into one action can name a sheet that was renamed
+        // or moved between them. They resolve to the same worksheet, so the
+        // second delta must see the first's planned state — keying on the whole
+        // tuple would file them as two cells and refuse a consistent replay.
+        const renamed: WorksheetTarget = { sheetIndex: 1, sheetName: 'New', worksheetId: 'ws-1' };
+        const a = value_only_overlay(value('A'), value('disk'));
+        const b = value_only_overlay(value('B'), value('disk'));
+        const c = value_only_overlay(value('C'), value('disk'));
+        const plan = plan_of(
+            [
+                cell(delta({ before: a, after: b, worksheet: SHEET })),
+                cell(delta({ before: b, after: c, worksheet: renamed })),
+            ],
+            'undo',
+            overlays({ '0:0:0': c, '1:0:0': c }),
+        );
+
+        expect(plan.writes.map((write) => write.entry?.value)).toEqual(['B', 'A']);
+    });
+
+    it('keeps two genuinely different sheets apart', () => {
+        const a = value_only_overlay(value('A'), value('disk'));
+        const b = value_only_overlay(value('B'), value('disk'));
+        const plan = plan_of(
+            [
+                cell(delta({ before: a, after: b, worksheet: SHEET })),
+                cell(delta({ before: a, after: b, worksheet: OTHER })),
+            ],
+            'undo',
+            overlays({ '0:0:0': b, '1:0:0': b }),
+        );
+
+        expect(plan.writes.map((write) => write.entry?.value)).toEqual(['A', 'A']);
+    });
+});
+
 describe('a plan across the workbook', () => {
     it('keeps every worksheet\'s writes, each addressed by its own target', () => {
         const before = value_only_overlay(value('A'), value('disk'));

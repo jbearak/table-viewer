@@ -155,10 +155,23 @@ export function plan_history_replay(
  * tuple — but a plan must not depend on how its action was built, and two
  * gestures merged into one action can legitimately carry equal targets that are
  * not the same object.
+ *
+ * Keyed by the STRONGEST identity the target carries, which is the hierarchy
+ * `worksheet_target_lookup` resolves by: id, then name, then index. Two targets
+ * naming one worksheet may disagree on the weaker fields — a sheet renamed or
+ * moved between the two gestures an action merged — and keying on the whole
+ * tuple would file them as two cells, so the second delta would miss the first's
+ * planned state, read a store that has not moved, and refuse a replay that is
+ * consistent with itself.
  */
 function cell_address(worksheet: WorksheetTarget, row: number, column: number): string {
     const { sheetIndex, sheetName, worksheetId } = worksheet;
-    return JSON.stringify([sheetIndex, sheetName ?? null, worksheetId ?? null, row, column]);
+    const identity: readonly [string, string | number] = worksheetId !== undefined
+        ? ['id', worksheetId]
+        : sheetName !== undefined
+            ? ['name', sheetName]
+            : ['index', sheetIndex];
+    return JSON.stringify([...identity, row, column]);
 }
 
 interface PlannedCell {
@@ -184,20 +197,25 @@ function plan_cell_replay(
     // reverse. `transition_side` answers with the destination, so the check
     // reads the other one.
     const source: HistoryDirection = direction === 'undo' ? 'redo' : 'undo';
+    const recorded = overlay_for_direction(delta, source);
     if (delta.value !== undefined) {
         const side = transition_side(delta.value, source);
-        if (!value_dimension_matches(current.kind === 'absent' ? undefined : current.value, side)) {
+        if (!value_dimension_matches(
+            dimension_of(current, 'value'),
+            side.overlay === 'present' ? dimension_of(recorded, 'value') : undefined,
+        )) {
             return refuse('conflict');
         }
     }
     if (delta.hyperlink !== undefined) {
         const side = transition_side(delta.hyperlink, source);
         if (!link_dimension_matches(
-            current.kind === 'absent' ? undefined : current.hyperlink,
-            side,
+            dimension_of(current, 'hyperlink'),
+            side.overlay === 'present' ? dimension_of(recorded, 'hyperlink') : undefined,
         )) {
             return refuse('conflict');
         }
+        if (!anchor_matches(current, recorded)) return refuse('conflict');
     }
 
     const merged = merge_replayed_dimensions(delta, current, overlay_for_direction(delta, direction));
@@ -219,30 +237,58 @@ function plan_cell_replay(
 /**
  * Whether the cell's value dimension is where the action left it.
  *
- * Membership is always checked. Content is checked only when the recorded side
- * was IN the overlay, because an overlay's content is session state the replay
- * itself put there — comparing it catches a later edit the replay would
- * otherwise discard. When the recorded side was absent, its content is the
- * cell's persisted text at record time, which an intervening save may have
- * legitimately moved; comparing that would refuse an undo for the very reason
- * `membership` mode exists to tolerate.
+ * Membership is always checked. When the recorded side was IN the overlay, the
+ * WHOLE dimension is checked — value, base and `basePending` — because all three
+ * are session state the replay itself put there, and `build_cell_history_delta`
+ * records a move of any of them as a real change. Checking only the displayed
+ * value would let a later recommit against a base that moved underneath
+ * (`{value: B, base: C}` becoming `{value: B, base: D}`) pass the swap and be
+ * silently overwritten, taking with it whether the cell reads as conflicted and
+ * whether a save may be admitted at all.
+ *
+ * `undefined` for `recorded` means the dimension was NOT in the overlay, and
+ * then only its absence is asserted: the content of an absent side is the cell's
+ * persisted text at record time, which an intervening save may have legitimately
+ * moved. Comparing that would refuse an undo for the very reason `membership`
+ * mode exists to tolerate.
  */
 function value_dimension_matches(
-    current: OverlayValueDimension | undefined,
-    side: { readonly content: HistoryValue; readonly overlay: 'absent' | 'present' },
+    current: OverlayValueDimension,
+    recorded: OverlayValueDimension | undefined,
 ): boolean {
-    if (side.overlay === 'absent') return current === undefined || current.kind === 'untouched';
-    if (current === undefined || current.kind !== 'present') return false;
-    return history_values_equal(current.value, side.content);
+    if (recorded === undefined || recorded.kind !== 'present') return current.kind !== 'present';
+    if (current.kind !== 'present') return false;
+    return current.basePending === recorded.basePending
+        && history_values_equal(current.value, recorded.value)
+        && history_values_equal(current.base, recorded.base);
 }
 
 function link_dimension_matches(
-    current: OverlayHyperlinkDimension | undefined,
-    side: { readonly content: CellHyperlink | null; readonly overlay: 'absent' | 'present' },
+    current: OverlayHyperlinkDimension,
+    recorded: OverlayHyperlinkDimension | undefined,
 ): boolean {
-    if (side.overlay === 'absent') return current === undefined || current.kind === 'untouched';
-    if (current === undefined || current.kind !== 'present') return false;
-    return hyperlinks_equal(current.value, side.content);
+    if (recorded === undefined || recorded.kind !== 'present') return current.kind !== 'present';
+    if (current.kind !== 'present') return false;
+    return hyperlinks_equal(current.value, recorded.value)
+        && hyperlinks_equal(current.base, recorded.base);
+}
+
+/**
+ * Whether a link-only entry's unedited anchor is where the action left it.
+ *
+ * Checked only for a replayed hyperlink dimension, and only between two entries
+ * that are both link-only, because that is exactly the case
+ * `hyperlink_metadata_moved` attributes to this dimension: the anchor is
+ * reconstructed into the entry's `value`/`base` pair, so a move of it changes
+ * the base a save is validated against even though nothing about the link moved.
+ * A dimension whose membership differs has already been reported as moved, and
+ * an absent overlay has no anchor to compare.
+ */
+function anchor_matches(current: CellOverlayState, recorded: CellOverlayState): boolean {
+    const left = untouched_anchor(current);
+    const right = untouched_anchor(recorded);
+    if (left === undefined || right === undefined) return true;
+    return history_values_equal(left, right);
 }
 
 /** The merge produced no entry at all, as distinct from the merge failing. */
@@ -285,7 +331,7 @@ function merge_replayed_dimensions(
     }
     // No value dimension left. Without a link either, the entry is gone.
     if (link.kind !== 'present') return ABSENT_RESULT;
-    const anchor = surviving_anchor(value, current);
+    const anchor = surviving_anchor(destination, current);
     if (anchor === undefined) return undefined;
     return hyperlink_only_overlay(anchor, link.value, link.base);
 }
@@ -320,20 +366,31 @@ const UNTOUCHED_LINK_DIMENSION: OverlayHyperlinkDimension = Object.freeze({
 /**
  * The unedited text a surviving link dimension hangs on.
  *
- * The destination's own anchor when it has one — that is the text the action
- * recorded for this cell. Otherwise the cell's current entry knows it: a present
- * value dimension's `base` IS the unedited content, captured when the edit
- * started. A base still pending is a placeholder rather than that content, and
- * has no answer.
+ * The DESTINATION's own anchor first: that is the text the action recorded for
+ * this cell, and it is the only source that survives the cell having no entry at
+ * all. Redoing a hyperlink attached to an unedited cell starts from an absent
+ * overlay, so asking the current state would refuse a replay whose answer the
+ * action was carrying all along — and where two link-only states differ only in
+ * their anchor, taking the current one would make the undo a silent no-op while
+ * history advanced past it.
+ *
+ * Otherwise the cell's current entry knows it: a present value dimension's
+ * `base` IS the unedited content, captured when the edit started. A base still
+ * pending is a placeholder rather than that content, and has no answer.
  */
 function surviving_anchor(
-    destination_value: OverlayValueDimension,
+    destination: CellOverlayState,
     current: CellOverlayState,
 ): HistoryValue | undefined {
-    if (destination_value.kind === 'untouched' && destination_value !== ABSENT_VALUE_DIMENSION) {
-        return destination_value.anchor;
-    }
+    const recorded = untouched_anchor(destination);
+    if (recorded !== undefined) return recorded;
     if (current.kind === 'absent') return undefined;
     if (current.value.kind === 'untouched') return current.value.anchor;
     return current.value.basePending ? undefined : current.value.base;
+}
+
+/** A link-only overlay's unedited text, or `undefined` for any other state. */
+function untouched_anchor(state: CellOverlayState): HistoryValue | undefined {
+    if (state.kind === 'absent' || state.value.kind !== 'untouched') return undefined;
+    return state.value.anchor;
 }

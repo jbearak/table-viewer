@@ -213,12 +213,60 @@ export interface EditSessionStore {
      * produced: a cell a gesture touched twice ends where the last write puts it.
      */
     apply_writes(session_id: string | undefined, writes: Iterable<StoreWrite>): void;
+    /**
+     * Stage writes without publishing them, returning the swap that lands them.
+     *
+     * A replay plan spans worksheets, and a store owns exactly one — so a
+     * cross-sheet undo needs several stores to move, and {@link apply_writes} on
+     * each in turn would let a subscriber see the first sheet replayed while the
+     * rest still hold the old state. That half-replayed gesture is precisely
+     * what the plan/apply split exists to prevent, and it is what would be
+     * published to the host as `pendingEdits`.
+     *
+     * So the caller stages every store, then calls every returned commit: each
+     * swaps its own state without notifying, and the notifications go out only
+     * once every swap has happened. Staging cannot fail, so a caller that has
+     * staged them all can always finish.
+     *
+     * Returns `undefined` when the session moved on, exactly as the mutators
+     * drop a stale write — a caller that gets one must abandon the whole plan
+     * rather than commit the rest, since the gesture is no longer this session's
+     * to replay.
+     */
+    stage_writes(
+        session_id: string | undefined,
+        writes: Iterable<StoreWrite>,
+    ): StagedWrites | undefined;
 }
 
-/** One key's write: the entry to set, or `undefined` to remove the key. */
+/**
+ * A store's next state, held back from its subscribers.
+ *
+ * `commit` swaps it in and answers whether anything actually moved; `notify`
+ * publishes. Both are idempotent, so a caller may run the list twice without
+ * double-notifying. Nothing here holds the store's listeners open — an abandoned
+ * staging is simply dropped.
+ */
+export interface StagedWrites {
+    /** Swap the staged state in without notifying. Answers whether it changed. */
+    commit(): boolean;
+    /** Notify this store's subscribers, once, if the commit changed anything. */
+    notify(): void;
+}
+
+/**
+ * One key's write: the entry to set, or `undefined` to remove the key.
+ *
+ * `DirtyEntry` rather than `CsvDirtyEntry`, so a write can carry `base_pending`.
+ * A replay really can restore one — undoing the discard of a legacy edit whose
+ * page was never resident puts back an entry whose base is still a placeholder —
+ * and dropping the flag would promote that placeholder to observed content, so
+ * conflict detection would compare against `''` and a save would be admitted
+ * against a base the user never saw.
+ */
 export interface StoreWrite {
     readonly key: string;
-    readonly entry: CsvDirtyEntry | undefined;
+    readonly entry: DirtyEntry | undefined;
 }
 
 interface NormalizedEdits {
@@ -362,6 +410,36 @@ export function create_edit_session_store(
         notify();
     };
 
+    // The map a set of writes produces, built without publishing anything.
+    const staged_state = (writes: Iterable<StoreWrite>): {
+        entries: Map<string, DirtyEntry>;
+        pending_base: boolean;
+    } => {
+        const entries = new Map(state.entries);
+        for (const { key, entry } of writes) {
+            if (entry === undefined) {
+                entries.delete(key);
+                continue;
+            }
+            // `copy_dirty_entry` rebuilds only the wire fields, so the flag is
+            // carried across explicitly.
+            const copied = copy_dirty_entry(entry);
+            entries.set(key, entry.base_pending ? { ...copied, base_pending: true } : copied);
+        }
+        // Recomputed over the whole map, in BOTH directions. A replay adds and
+        // removes, so it can clear the last pending entry — and, undoing a
+        // discard, it can restore one where there was none, which the
+        // narrowing-only recompute would leave reading false.
+        let pending_base = false;
+        for (const entry of entries.values()) {
+            if (entry.base_pending) {
+                pending_base = true;
+                break;
+            }
+        }
+        return { entries, pending_base };
+    };
+
     // Recompute the flag from what actually survived. The mutators that only ever
     // drop entries (remove, remove_keys, clear, retain, clear_saved) previously
     // carried the old flag forward, leaving it stuck `true` after the last pending
@@ -463,21 +541,39 @@ export function create_edit_session_store(
             if (!owns(session_id)) return;
             set_entries_recomputed(clear_saved_dirty_entries(state.entries, saved));
         },
+        stage_writes: (session_id, writes) => {
+            if (!owns(session_id)) return undefined;
+            const next = staged_state(writes);
+            let changed = false;
+            let committed = false;
+            let notified = false;
+            return {
+                commit: () => {
+                    if (committed) return changed;
+                    committed = true;
+                    // Re-checked at swap time, not just at staging: a staged plan
+                    // is held across the staging of every other store, and an
+                    // install could have crossed a hydration boundary in between.
+                    if (!owns(session_id)) return false;
+                    changed = next.pending_base !== state.pending_base
+                        || !entries_equal(state.entries, next.entries);
+                    if (changed) state = next;
+                    return changed;
+                },
+                notify: () => {
+                    if (notified || !changed) return;
+                    notified = true;
+                    notify();
+                },
+            };
+        },
         apply_writes: (session_id, writes) => {
             if (!owns(session_id)) return;
             // Copied once, ahead of the walk, then handed to `set_entries` — which
             // drops it untouched if nothing moved, so a replay that lands on the
             // state already showing costs one map copy and no notification.
-            const next = new Map(state.entries);
-            for (const { key, entry } of writes) {
-                if (entry === undefined) next.delete(key);
-                else next.set(key, copy_dirty_entry(entry));
-            }
-            // Recomputed rather than carried: a replay both adds and removes, so
-            // it can clear the last pending entry (the flag must narrow) and it
-            // can never introduce one (`copy_dirty_entry` drops the flag, and a
-            // planned entry's base is real content by construction).
-            set_entries_recomputed(next);
+            const next = staged_state(writes);
+            set_entries(next.entries, next.pending_base);
         },
         resolve_pending_bases: (session_id, get_cell_raw) => {
             if (!owns(session_id)) return;
