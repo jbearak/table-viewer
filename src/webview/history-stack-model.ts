@@ -225,22 +225,45 @@ function estimate_string_bytes(text: string): number {
     return text.length * 2;
 }
 
-/**
- * Charges each payload object once per delta.
- *
- * A delta's transitions and its overlay snapshots SHARE their payloads:
- * `build_cell_history_delta` puts the same `HistoryValue` object in
- * `value.desired.content` and in `afterOverlay.value.value`, and
- * `structuredClone` preserves the alias, so the string exists once in memory.
- * Charging both views would roughly double a paste's measured cost and refuse
- * gestures that fit the hard bound — losing the user's undo to protect memory
- * that was never allocated.
- */
-function payload_charger(): {
+interface ActionCharger {
     value: (value: HistoryValue) => number;
     link: (link: CellHyperlink | null) => number;
-} {
+    worksheet: (worksheet: WorksheetTarget) => number;
+}
+
+/**
+ * Charges what ONE ACTION retains, over the whole of that action.
+ *
+ * Scoped to the action rather than the delta because that is the scope ownership
+ * has: the action's owner materializes each distinct string once and hands the
+ * same one to every delta asking for an equal one. A charger rebuilt per delta
+ * would charge the same retained string once per delta holding it, so pasting one
+ * 20MiB value into ten cells would measure ten copies of memory that exists once
+ * — and refuse, clearing valid history, a gesture that fits the bound easily.
+ *
+ * Two identities, because the action shares two different things two different
+ * ways:
+ *
+ *   - Objects are keyed by identity. A delta's transitions and its overlay
+ *     snapshots share their payloads — `build_cell_history_delta` puts the same
+ *     `HistoryValue` in `value.desired.content` and `afterOverlay.value.value`,
+ *     and `copy_cell_history_delta` preserves that alias through its per-delta
+ *     memo — so charging both views would roughly double a paste's cost.
+ *   - Strings are keyed by VALUE, which is what the owner shares them by. Two
+ *     distinct payload objects in two deltas may hold the same one string; so may
+ *     two distinct worksheet targets that differ only in `sheetIndex`.
+ *
+ * Object shape is still charged per object, since each is separately allocated —
+ * only the strings inside them are shared.
+ */
+function action_charger(): ActionCharger {
     const counted = new WeakSet<object>();
+    const charged = new Set<string>();
+    const string_bytes = (text: string): number => {
+        if (charged.has(text)) return 0;
+        charged.add(text);
+        return estimate_string_bytes(text);
+    };
     const once = <T extends object>(payload: T | null, cost: (payload: T) => number): number => {
         if (payload === null || counted.has(payload)) return 0;
         counted.add(payload);
@@ -248,22 +271,31 @@ function payload_charger(): {
     };
     return {
         value: (value) => once(value, (payload) => {
-            let total = estimate_string_bytes(payload.text);
+            let total = string_bytes(payload.text);
             for (const run of payload.runs?.runs ?? []) {
-                total += RUN_OVERHEAD_BYTES + estimate_string_bytes(run.text);
+                total += RUN_OVERHEAD_BYTES + string_bytes(run.text);
             }
             return total;
         }),
         link: (link) => once(link, (payload) => {
             const destination = payload.kind === 'external' ? payload.target : payload.location;
-            return estimate_string_bytes(destination) + estimate_string_bytes(payload.tooltip ?? '');
+            return string_bytes(destination) + string_bytes(payload.tooltip ?? '');
         }),
+        // `sheetName` and `worksheetId` are held by every delta and neither is
+        // length-bounded — a name comes from the file, an id from its
+        // relationships — so a gesture carrying a megabyte-long name past the byte
+        // bound is a gesture that exhausted the heap history was bounded to
+        // protect. Charged by value like any other string: a million-cell paste
+        // over a long sheet name pays for that name once, and a target that really
+        // did allocate a second copy of it is charged for that copy.
+        worksheet: (worksheet) => once(worksheet, (target) =>
+            string_bytes(target.sheetName ?? '') + string_bytes(target.worksheetId ?? '')),
     };
 }
 
 function estimate_overlay_bytes(
     overlay: CellOverlayState,
-    charge: ReturnType<typeof payload_charger>,
+    charge: ActionCharger,
 ): number {
     if (overlay.kind === 'absent') return 0;
     const value = overlay.value.kind === 'present'
@@ -284,10 +316,9 @@ function estimate_overlay_bytes(
  * anchor, and a recommit against a base that moved underneath retains two long
  * bases behind an unchanged short value. Either would slip past the hard bound
  * by orders of magnitude if only the transitions were charged. What the overlays
- * share with the transitions is charged once — see `payload_charger`.
+ * share with the transitions is charged once — see `action_charger`.
  */
-function estimate_cell_delta_bytes(delta: CellHistoryDelta): number {
-    const charge = payload_charger();
+function estimate_cell_delta_bytes(delta: CellHistoryDelta, charge: ActionCharger): number {
     let total = CHANGE_OVERHEAD_BYTES;
     if (delta.value !== undefined) {
         total += charge.value(delta.value.expected.content)
@@ -302,39 +333,9 @@ function estimate_cell_delta_bytes(delta: CellHistoryDelta): number {
         + estimate_overlay_bytes(delta.afterOverlay, charge);
 }
 
-/**
- * Charges each retained worksheet target once per action.
- *
- * `sheetName` and `worksheetId` are held by every delta and neither is
- * length-bounded — a name comes from the file, an id from its relationships — so a
- * gesture carrying a megabyte-long name past the byte bound is a gesture that
- * exhausted the heap history was bounded to protect.
- *
- * Keyed on the target OBJECT, which is what memory actually holds: the action's
- * owner hands out one target per distinct tuple, so every delta naming one
- * worksheet points at one target holding one copy of its name. Charging per delta
- * would refuse a million-cell paste over a long sheet name that costs a few
- * kilobytes; charging per distinct VALUE would undercount a walk that did allocate
- * a copy per delta. Neither happens when the charge follows the object — which is
- * why this stays correct however much the owner manages to share.
- */
-function worksheet_charger(): (worksheet: WorksheetTarget) => number {
-    const counted = new WeakSet<WorksheetTarget>();
-    return (worksheet) => {
-        if (counted.has(worksheet)) return 0;
-        counted.add(worksheet);
-        return estimate_string_bytes(worksheet.sheetName ?? '')
-            + estimate_string_bytes(worksheet.worksheetId ?? '');
-    };
-}
-
-function estimate_change_bytes(
-    change: HistoryChange,
-    charge_worksheet: (worksheet: WorksheetTarget) => number,
-): number {
-    const worksheet = charge_worksheet(change.delta.worksheet);
-    return worksheet + (change.kind === 'cell'
-        ? estimate_cell_delta_bytes(change.delta)
+function estimate_change_bytes(change: HistoryChange, charge: ActionCharger): number {
+    return charge.worksheet(change.delta.worksheet) + (change.kind === 'cell'
+        ? estimate_cell_delta_bytes(change.delta, charge)
         : CHANGE_OVERHEAD_BYTES);
 }
 
@@ -424,11 +425,11 @@ type OwnedAction = MeasuredAction;
 /** Costs of an action this module already owns, so nothing needs rebuilding. */
 function measure_costs(action: HistoryAction): HistoryCosts {
     const cells = cell_count_index();
-    const charge_worksheet = worksheet_charger();
+    const charge = action_charger();
     let byteCost = estimate_string_bytes(action.label);
     for (const change of action.changes) {
         add_counted_cell(cells, change);
-        byteCost += estimate_change_bytes(change, charge_worksheet);
+        byteCost += estimate_change_bytes(change, charge);
     }
     return { cellCount: cells.count, byteCost };
 }
@@ -567,7 +568,7 @@ function map_entry<K, V>(map: Map<K, V>, key: K, make: () => V): V {
  */
 function own_and_measure(action: HistoryAction, budget = Infinity): OwnedAction | undefined {
     const cells = cell_count_index();
-    const charge_worksheet = worksheet_charger();
+    const charge = action_charger();
     const owned: HistoryChange[] = [];
     // Truncated rather than charged: a label can be built from data, and a bound
     // that merely refused an oversized one would still have to retain it to say
@@ -592,7 +593,7 @@ function own_and_measure(action: HistoryAction, budget = Infinity): OwnedAction 
             if (error instanceof BudgetExhausted) return undefined;
             throw error;
         }
-        byteCost += estimate_change_bytes(owned_change, charge_worksheet);
+        byteCost += estimate_change_bytes(owned_change, charge);
         if (byteCost > budget) return undefined;
         add_counted_cell(cells, owned_change);
         owned.push(owned_change);
@@ -1059,7 +1060,7 @@ export function action_is_single_worksheet(action: HistoryAction): boolean {
 /**
  * The change history will retain, isolated from the caller.
  *
- * Every change is CANONICALIZED rather than inspected and conditionally reused.
+ * Every change is REBUILT rather than inspected and conditionally reused.
  * The declared fields are read exactly once into a fresh frozen object of the
  * declared shape, so nothing downstream can be surprised by the caller's: a
  * `readonly` property may legitimately be a getter, live on a prototype, or sit
@@ -1068,11 +1069,13 @@ export function action_is_single_worksheet(action: HistoryAction): boolean {
  * unmeasured payload rides past the hard bound, or replay's target changes after
  * the costs were fixed.
  *
- * What is rebuilt is the SKELETON — a handful of small objects per cell. The
- * content is shared, the strings and their runs copied by reference into the new
- * shape. That is what makes this affordable on the million-cell gestures history
- * has to bound rather than refuse: duplicating the content would double peak
- * memory at the exact moment there is least of it.
+ * What is rebuilt is the shape: the wrappers, the run objects, the styles — a
+ * handful of small objects per cell, plus one per run. Strings are not copied
+ * per occurrence; the action's owner materializes each distinct one once and
+ * every delta holding an equal one gets that same string. That is what makes this
+ * affordable on the million-cell gestures history has to bound rather than
+ * refuse: a copy per occurrence would multiply peak memory at the exact moment
+ * there is least of it.
  */
 function own_history_change(change: HistoryChange, owner: HistoryActionOwner): HistoryChange {
     return change.kind === 'cell'

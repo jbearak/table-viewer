@@ -583,6 +583,36 @@ describe('measure_history_action', () => {
         expect(outcome.state.undoStack[0]?.byteCost).toBeLessThan(5_000 * 2 * 2);
     });
 
+    it('charges one string once however many cells of the action hold it', () => {
+        // The owner materializes each distinct string once and hands that one
+        // string to every delta asking for an equal one, so a charge per delta
+        // would measure ten copies of memory that exists once — and refuse, behind
+        // a barrier that clears valid history, a paste that fits the bound easily.
+        const text = 'v'.repeat(100_000);
+        const wide = measure_history_action(history_action(
+            'Paste',
+            [0, 1, 2, 3, 4].map((row) => cell_change(row, 0, text)),
+        ));
+        const one = measure_history_action(history_action('Paste', [cell_change(0, 0, text)]));
+
+        expect(wide.byteCost - one.byteCost).toBeLessThan(100_000 * 2);
+    });
+
+    it('charges an identity shared by two targets once', () => {
+        // Two targets, because they are two distinct tuples replay must not
+        // conflate — but one `worksheetId` string between them, because that is
+        // what the owner shares by value and therefore what memory holds.
+        const id = 'r'.repeat(50_000);
+        const entry = measure_history_action(history_action('Paste', [
+            cell_change(0, 0, 'v', { sheetIndex: 0, worksheetId: id }),
+            cell_change(1, 0, 'v', { sheetIndex: 1, worksheetId: id }),
+        ]));
+
+        expect(entry.action.changes[1]?.delta.worksheet)
+            .not.toBe(entry.action.changes[0]?.delta.worksheet);
+        expect(entry.byteCost).toBeLessThan(50_000 * 2 * 2);
+    });
+
     it('does not share a worksheet target between two gestures', () => {
         // Ownership is per action, because an action is what gets recorded, refused,
         // evicted and released. Two actions each own their copy and each are charged
