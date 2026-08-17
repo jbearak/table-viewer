@@ -475,6 +475,18 @@ describe('measure_history_action', () => {
         expect(entry.cellCount).toBe(2);
     });
 
+    it('counts one cell once when its two targets could not be shared', () => {
+        // Interning is bounded, so a very long identity leaves two equal targets
+        // unshared on purpose. Counting by object identity would then call one cell
+        // two and evict history the user could still undo.
+        const name = 'n'.repeat(200_000);
+        const entry = measure_history_action(history_action('Paste', [
+            cell_change(4, 2, 'first', { sheetIndex: 0, sheetName: name }),
+            cell_change(4, 2, 'second', { sheetIndex: 0, sheetName: name }),
+        ]));
+        expect(entry.cellCount).toBe(1);
+    });
+
     it('does not collapse the same address on two worksheets', () => {
         const entry = measure_history_action(history_action('Discard all', [
             cell_change(1, 1, 'v', SHEET),
