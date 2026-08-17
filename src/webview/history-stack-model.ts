@@ -233,10 +233,10 @@ interface HistoryCosts {
  * out of memory, while the old history is still live — running out of memory on
  * the way to deciding not to keep it.
  */
-function measure_costs(action: HistoryAction): HistoryCosts {
+function measure_costs(changes: readonly HistoryChange[]): HistoryCosts {
     const cells = new Set<string>();
     let byteCost = 0;
-    for (const change of action.changes) {
+    for (const change of changes) {
         cells.add(change_cell_key(change));
         byteCost += estimate_change_bytes(change);
     }
@@ -245,7 +245,8 @@ function measure_costs(action: HistoryAction): HistoryCosts {
 
 /** Measures an action's costs and takes ownership of it. Both costs are estimates. */
 export function measure_history_action(action: HistoryAction): HistoryEntry {
-    return { action: own_history_action(action), ...measure_costs(action) };
+    const changes = [...action.changes];
+    return { action: own_action(action, changes), ...measure_costs(changes) };
 }
 
 export interface RecordedOutcome {
@@ -321,9 +322,15 @@ export function record_history_action(
 ): RecordOutcome {
     if (action.changes.length === 0) return { kind: 'empty', state };
 
+    // `changes` is read exactly once. It can be an accessor on a caller-built
+    // action — a valid implementation of a readonly property — and a getter
+    // answering differently across the measure and the record could walk a
+    // gesture straight past the hard bound.
+    const changes = [...action.changes];
+
     // Measured before it is owned: a refusal must not first copy the graph the
     // bound exists to keep out of memory.
-    const costs = measure_costs(action);
+    const costs = measure_costs(changes);
     if (costs.byteCost > bounds.hardMaxBytes) {
         return {
             kind: 'refused',
@@ -338,7 +345,7 @@ export function record_history_action(
         };
     }
 
-    const entry: HistoryEntry = { action: own_history_action(action), ...costs };
+    const entry: HistoryEntry = { action: own_action(action, changes), ...costs };
     const { kept, evicted } = evict_to_fit([...state.undoStack, entry], bounds);
     return {
         kind: 'recorded',
@@ -394,8 +401,8 @@ export interface MovedCommit {
 }
 
 /**
- * The entry is not on the stack at all, so this commit already happened. The
- * state is returned untouched — committing twice must not carry a second,
+ * The entry is already on the destination stack: this exact commit ran before.
+ * The state is returned untouched — committing twice must not carry a second,
  * never-replayed gesture across, where redo would apply content the user never
  * undid.
  */
@@ -405,15 +412,18 @@ export interface AlreadyCommitted {
 }
 
 /**
- * The replay landed, but the entry is buried: something was recorded, or another
- * move committed, while this replay was in flight.
+ * The replay landed, but the entry is no longer in a position to move: something
+ * was recorded, another move committed, or history was cleared while this replay
+ * was in flight.
  *
- * The entry is dropped rather than moved. Its content has been replayed, so
- * leaving it on the undo stack would claim a change is applied that is not — and
- * pushing it onto the redo stack would put it out of chronological order in a
- * history whose whole premise is one workbook-wide chronology. What sits above it
- * stays undoable, guarded as always by the compare-and-swap; only this one
- * gesture stops being redoable, which is why the caller is told.
+ * The entry is dropped rather than moved. Its content HAS been replayed, so
+ * leaving it on the source stack would claim a change is applied that is not —
+ * and putting it on the destination stack would place it out of order in a
+ * history whose whole premise is one workbook-wide chronology, or resurrect an
+ * entry that a barrier or a clear deliberately discarded. Everything else stays
+ * movable, guarded as always by the compare-and-swap; only this one gesture
+ * leaves the history, which is why the caller is told rather than left to infer
+ * it from an unchanged state.
  */
 export interface DroppedCommit {
     readonly kind: 'dropped';
@@ -426,20 +436,30 @@ export type CommitOutcome = MovedCommit | AlreadyCommitted | DroppedCommit;
  * Records that a replayed entry has landed.
  *
  * `entry` is the one `peek_history` handed out. Replay is asynchronous, so by the
- * time it lands the stack may have been recorded onto or moved; the entry's
- * position is therefore checked rather than assumed, and the three outcomes say
- * which case this was instead of quietly doing nothing.
+ * time it lands the stack may have been recorded onto, moved, or cleared; the
+ * entry's position is therefore checked rather than assumed, and the three
+ * outcomes say which case this was instead of quietly doing nothing.
+ *
+ * Absence from the source stack is not by itself proof the commit already ran.
+ * Recording clears the redo stack, so a redo that was in flight when the user
+ * made a fresh edit finds its entry gone from both stacks even though nothing
+ * ever committed it — and calling that `already-committed` would leave a
+ * reapplied change with no record, where the next undo would skip it and unwind
+ * an older gesture instead.
  */
 export function commit_history_move(
     state: HistoryStackState,
     direction: HistoryDirection,
     entry: HistoryEntry,
 ): CommitOutcome {
+    const other: HistoryDirection = direction === 'undo' ? 'redo' : 'undo';
+    if (stack_for(state, other).includes(entry)) {
+        return { kind: 'already-committed', state };
+    }
+
     const from = stack_for(state, direction);
     const position = from.lastIndexOf(entry);
-    if (position === -1) return { kind: 'already-committed', state };
-
-    const other: HistoryDirection = direction === 'undo' ? 'redo' : 'undo';
+    if (position === -1) return { kind: 'dropped', state };
     if (position !== from.length - 1) {
         const kept = [...from.slice(0, position), ...from.slice(position + 1)];
         return {
@@ -544,16 +564,19 @@ export function action_is_single_worksheet(action: HistoryAction): boolean {
  * would pass a frozen wrapper around mutable innards, and retaining that leaves
  * the caller able to retarget a replay or invalidate a measured cost.
  */
-function own_history_action(action: HistoryAction): HistoryAction {
-    let reusable = is_deeply_frozen(action.label) && Object.isFrozen(action.changes);
-    const changes = action.changes.map((change) => {
-        const owned = own_history_change(change);
-        if (owned !== change) reusable = false;
-        return owned;
-    });
-    return reusable && Object.isFrozen(action)
+function own_action(
+    action: HistoryAction,
+    changes: readonly HistoryChange[],
+): HistoryAction {
+    const owned = changes.map(own_history_change);
+    // The whole graph reachable through `action`, accessors included, must be
+    // frozen for the object itself to be safe to retain: a frozen action whose
+    // `changes` is a getter can answer with a different array tomorrow, which
+    // would change what replay does while the measured costs described the array
+    // read today.
+    return is_deeply_frozen(action) && owned.every((change, index) => change === changes[index])
         ? action
-        : Object.freeze({ label: action.label, changes: Object.freeze(changes) });
+        : Object.freeze({ label: action.label, changes: Object.freeze(owned) });
 }
 
 function own_history_change(change: HistoryChange): HistoryChange {
@@ -568,7 +591,8 @@ function own_history_change(change: HistoryChange): HistoryChange {
 
 /** Builds a frozen action, so a caller reusing its builders cannot mutate history. */
 export function history_action(label: string, changes: readonly HistoryChange[]): HistoryAction {
-    return own_history_action({ label, changes });
+    const snapshot = [...changes];
+    return own_action({ label, changes: snapshot }, snapshot);
 }
 
 /**

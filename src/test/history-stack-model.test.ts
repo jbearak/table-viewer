@@ -20,6 +20,7 @@ import {
     measure_history_action,
     peek_history,
     record_history_action,
+    type HistoryAction,
     type HistoryBounds,
     type HistoryChange,
     type HistoryEntry,
@@ -197,6 +198,25 @@ describe('record_history_action', () => {
         const action = history_action('Edit', [change]);
         expect(action.changes[0]).not.toBe(change);
         expect(action.changes[0]?.delta).toBe(change.delta);
+    });
+
+    it('copies an action whose changes are an accessor', () => {
+        // A getter is a valid implementation of a readonly property, and it can
+        // answer differently tomorrow. Retaining the object would change what
+        // replay does while the measured costs described today's array.
+        let backing = [cell_change(0, 0, 'v')];
+        const action: HistoryAction = Object.freeze({
+            label: 'Edit',
+            get changes() { return backing; },
+        });
+
+        const outcome = record_history_action(empty_history_stack(), action);
+        const recorded = outcome.state.undoStack[0];
+        backing = [cell_change(1, 0, 'w'), cell_change(2, 0, 'x')];
+
+        expect(recorded?.action).not.toBe(action);
+        expect(recorded?.action.changes).toHaveLength(1);
+        expect(recorded?.cellCount).toBe(1);
     });
 
     it('copies a change whose payload the caller could still mutate', () => {
@@ -502,6 +522,26 @@ describe('peek_history and commit_history_move', () => {
 
         expect(top(dropped, 'undo').action.label).toBe('C');
         expect(move(dropped, 'undo').undoStack.map((item) => item.action.label)).toEqual(['A']);
+    });
+
+    it('drops a redo whose entry a concurrent record cleared', () => {
+        // Recording clears the redo stack, so a redo in flight when the user made
+        // a fresh edit finds its entry gone from both stacks though nothing ever
+        // committed it. Calling that already-committed would leave a reapplied
+        // change with no record, and the next undo would skip it and unwind an
+        // older gesture instead.
+        const undone = move(record_all(['A', 'B']), 'undo');
+        const entry = top(undone, 'redo');
+        const branched = record_history_action(undone, history_action('C', [cell_change(9, 0, 'c')])).state;
+        expect(branched.redoStack).toHaveLength(0);
+
+        expect(commit_history_move(branched, 'redo', entry).kind).toBe('dropped');
+    });
+
+    it('drops a commit whose entry a clear discarded', () => {
+        const start = record_all(['A', 'B']);
+        const entry = top(start, 'undo');
+        expect(commit_history_move(clear_history(start), 'undo', entry).kind).toBe('dropped');
     });
 
     it('reports a commit after another undo already moved the entry', () => {
