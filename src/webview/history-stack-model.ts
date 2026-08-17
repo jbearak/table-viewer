@@ -120,10 +120,32 @@ export interface HistoryBarrier {
  */
 export const MAX_BARRIER_LABEL_LENGTH = 200;
 
+/**
+ * The retained form of a label: at most `MAX_BARRIER_LABEL_LENGTH` code units,
+ * built as a fresh flat string.
+ *
+ * Copied unit by unit rather than sliced, and assembled by `fromCharCode` rather
+ * than by interpolation, because neither of those produces a string that stands
+ * on its own: V8 answers `slice` with a view that retains the WHOLE of its parent
+ * and `${a}${b}` with a rope that retains both halves. A label built from data —
+ * the pasted content, a cell's text — would then be charged a few hundred bytes
+ * while keeping hundreds of MiB alive, which is `hardMaxBytes` defeated by the
+ * one string that is not measured against it. Every label is materialized, not
+ * just an over-long one, since a caller can hand us a short view of a huge parent.
+ *
+ * A truncation that would split a surrogate pair drops the pair instead of
+ * keeping its high half, so the result is never lone-surrogate garbage.
+ */
 function barrier_label(label: string): string {
-    return label.length <= MAX_BARRIER_LABEL_LENGTH
-        ? label
-        : `${label.slice(0, MAX_BARRIER_LABEL_LENGTH - 1)}…`;
+    const kept = label.length <= MAX_BARRIER_LABEL_LENGTH
+        ? label.length
+        : MAX_BARRIER_LABEL_LENGTH - 1;
+    const units: number[] = [];
+    for (let index = 0; index < kept; index += 1) units.push(label.charCodeAt(index));
+    const last = units[units.length - 1];
+    if (last !== undefined && last >= 0xd800 && last <= 0xdbff) units.pop();
+    if (kept < label.length) units.push(0x2026);
+    return String.fromCharCode(...units);
 }
 
 export interface HistoryStackState {
@@ -633,10 +655,8 @@ export function commit_history_move(
     const destination = stack_for(state, other);
     const from = stack_for(state, direction);
 
-    const current = [...destination, ...from].find((candidate) => candidate.id === entry.id);
-    // Anywhere in history with the move already counted: this commit, or a later
-    // one that superseded it, has run.
-    if (current !== undefined && current.moves > entry.moves) {
+    // This commit, or a later one that superseded it, has already run.
+    if ((COMMITTED_MOVES.get(entry.id) ?? 0) > entry.moves) {
         return { kind: 'already-committed', state };
     }
 
@@ -652,6 +672,7 @@ export function commit_history_move(
         if (direction === 'redo' && entry.epoch === state.epoch) {
             const adopted: HistoryEntry = { ...entry, moves: entry.moves + 1 };
             const { kept, evicted } = evict_to_fit([...state.undoStack, adopted], bounds);
+            COMMITTED_MOVES.set(entry.id, adopted.moves);
             return { kind: 'moved', state: { ...state, undoStack: kept }, evicted };
         }
         return { kind: 'dropped', state };
@@ -664,12 +685,28 @@ export function commit_history_move(
         };
     }
     const moved: HistoryEntry = { ...from[position], moves: entry.moves + 1 };
+    COMMITTED_MOVES.set(entry.id, moved.moves);
     return {
         kind: 'moved',
         state: with_stacks(state, direction, from.slice(0, -1), [...destination, moved]),
         evicted: 0,
     };
 }
+
+/**
+ * How many moves of each entry have been committed.
+ *
+ * Kept beside the stacks rather than in them, because a committed entry can leave
+ * history altogether: eviction drops the oldest, and an adopted redo that later
+ * ages out would otherwise look exactly like one whose first commit never
+ * arrived — so a duplicate commit would adopt it a second time, evicting a newer
+ * action to resurrect an old one as the next undo. Keyed on the entry's identity
+ * and weakly held, so the ledger disappears with the entry and no bound is needed.
+ *
+ * This is the one piece of history that is not a function of `HistoryStackState`.
+ * It has to outlive the state, and the state has nowhere bounded to record it.
+ */
+const COMMITTED_MOVES = new WeakMap<object, number>();
 
 function with_stacks(
     state: HistoryStackState,

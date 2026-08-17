@@ -218,6 +218,38 @@ describe('record_history_action', () => {
         expect(label.endsWith('…')).toBe(true);
     });
 
+    it('copies a short label built by slicing a huge parent', () => {
+        // V8 answers `slice` with a view that retains the WHOLE of its parent, so a
+        // label sliced out of pasted content charges a few hundred bytes while
+        // keeping hundreds of MiB alive — hardMaxBytes defeated by the one string
+        // not measured against it. Short labels are therefore materialized too,
+        // not only over-long ones.
+        //
+        // Flatness is not observable from JS: this asserts the value survives the
+        // copy, and reading `barrier_label` is what confirms it is a copy.
+        const parent = `Paste ${'x'.repeat(200_000)}`;
+        const outcome = record_history_action(empty_history_stack(), {
+            label: parent.slice(0, 20),
+            changes: [cell_change(0, 0, 'v')],
+        });
+
+        expect(outcome.state.undoStack[0]?.action.label).toBe('Paste xxxxxxxxxxxxxx');
+    });
+
+    it('does not truncate a label into a lone surrogate', () => {
+        // The pair straddles the cut: its high half is the last unit kept.
+        const label = `${'a'.repeat(MAX_BARRIER_LABEL_LENGTH - 2)}😀 and more`;
+        const outcome = record_history_action(empty_history_stack(), {
+            label,
+            changes: [cell_change(0, 0, 'v')],
+        });
+        const kept = outcome.state.undoStack[0]?.action.label ?? '';
+
+        // Dropped whole rather than kept as a lone high surrogate.
+        expect(kept).toBe(`${'a'.repeat(MAX_BARRIER_LABEL_LENGTH - 2)}…`);
+        expect([...kept].every((unit) => unit.codePointAt(0)! < 0xd800)).toBe(true);
+    });
+
     it('answers an empty action before the bounds can install a barrier', () => {
         // A label built from data must not be able to destroy valid history for a
         // gesture that never needed recording.
@@ -763,6 +795,40 @@ describe('peek_history and commit_history_move', () => {
         expect(outcome.kind).toBe('moved');
         expect(outcome.state.undoStack.map((item) => item.action.label)).toEqual(['C', 'E', 'D']);
         expect(outcome.kind === 'moved' && outcome.evicted).toBe(1);
+    });
+
+    it('does not adopt a duplicate redo commit after the first adoption aged out', () => {
+        // A committed entry can leave history altogether — eviction drops the
+        // oldest — and an adopted redo that later ages out would otherwise look
+        // exactly like one whose first commit never arrived. Adopting it again
+        // would evict a newer action to resurrect an old one as the next undo.
+        const bounds: HistoryBounds = {
+            maxActions: 2,
+            maxCells: 1_000_000,
+            softMaxBytes: 128 * 1024 * 1024,
+            hardMaxBytes: 256 * 1024 * 1024,
+        };
+        const undone = move(record_all(['A', 'B'], bounds), 'undo');
+        const entry = top(undone, 'redo');
+        const branched = record_history_action(
+            undone,
+            history_action('C', [cell_change(9, 0, 'c')]),
+            bounds,
+        ).state;
+        const adopted = commit_history_move(branched, 'redo', entry, bounds).state;
+        expect(adopted.undoStack.map((item) => item.action.label)).toEqual(['C', 'B']);
+
+        // B ages out behind two fresh gestures, so nothing on either stack
+        // remembers it.
+        let aged = adopted;
+        for (const label of ['D', 'E']) {
+            aged = record_history_action(aged, history_action(label, [cell_change(8, 0, label)]), bounds).state;
+        }
+        expect(aged.undoStack.map((item) => item.action.label)).toEqual(['D', 'E']);
+
+        const again = commit_history_move(aged, 'redo', entry, bounds);
+        expect(again.kind).toBe('already-committed');
+        expect(again.state.undoStack.map((item) => item.action.label)).toEqual(['D', 'E']);
     });
 
     it('drops a commit whose entry a clear discarded', () => {
