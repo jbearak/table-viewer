@@ -11,7 +11,11 @@ import type {
 import { matches_filter } from '../table-transform';
 import type { CsvSaveOperation, FilterEntry, SheetTransformState } from '../types';
 import { create_edit_session_store } from '../webview/edit-session-store';
-import { MAX_COLUMN_WIDTH_PX } from '../webview/grid-model';
+import {
+    LAST_COLUMN_RESIZE_GUTTER_PX,
+    MAX_AUTO_FIT_COLUMN_WIDTH_PX,
+    MAX_COLUMN_WIDTH_PX,
+} from '../webview/grid-model';
 import { button, field, find_button, set_input_value } from './helpers/dom-interaction';
 import {
     MAX_ROW_HEIGHT_PX,
@@ -393,7 +397,9 @@ describe('GridShell column projection', () => {
             { id: '2', title: 'C name', width: 200 },
         ]);
         expect(grid_mock.props!.maxColumnWidth).toBe(MAX_COLUMN_WIDTH_PX);
-        expect(grid_mock.props!.maxColumnAutoWidth).toBe(MAX_COLUMN_WIDTH_PX);
+        expect(grid_mock.props!.maxColumnAutoWidth).toBe(MAX_AUTO_FIT_COLUMN_WIDTH_PX);
+        expect(grid_mock.props!.maxColumnAutoWidth).toBe(MAX_COLUMN_WIDTH_PX / 4);
+        expect(grid_mock.props!.overscrollX).toBe(LAST_COLUMN_RESIZE_GUTTER_PX);
 
         const get_cell_content = grid_mock.props!.getCellContent as
             (cell: [number, number]) => { data: string };

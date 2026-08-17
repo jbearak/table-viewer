@@ -9,7 +9,7 @@ import type { RenderedCell } from '../data-source/interface';
 import type { RichTextRun } from '../cell-content';
 import { font_shorthand } from './cell-renderer';
 import {
-    MAX_COLUMN_WIDTH_PX,
+    MAX_AUTO_FIT_COLUMN_WIDTH_PX,
     MIN_COLUMN_WIDTH_PX,
 } from './grid-model';
 import { split_lines } from './line-breaks';
@@ -49,10 +49,10 @@ export function canvas_font(
 
 /**
  * Fitted width for one column: the widest measured visual line plus padding,
- * bounded by the grid's shared minimum and maximum widths. Measuring lines
- * independently mirrors Glide's column-border auto-size rule for wrapped text;
- * passing a whole multiline string to canvas `measureText` would instead size
- * the column as if its lines were laid out side by side. An empty column
+ * bounded by the grid's shared minimum and auto-fit maximum widths. Measuring
+ * lines independently mirrors Glide's column-border auto-size rule for wrapped
+ * text; passing a whole multiline string to canvas `measureText` would instead
+ * size the column as if its lines were laid out side by side. An empty column
  * collapses to the minimum.
  */
 export function fit_column_width(
@@ -60,7 +60,7 @@ export function fit_column_width(
     measure: (cell: MeasurableCell) => number,
     min_width: number = MIN_COLUMN_WIDTH,
     padding: number = COLUMN_PADDING,
-    max_width: number = MAX_COLUMN_WIDTH_PX,
+    max_width: number = MAX_AUTO_FIT_COLUMN_WIDTH_PX,
 ): number {
     let max = 0;
     for (const cell of cells) {
@@ -102,7 +102,7 @@ export function fit_column_widths(
     measure: (cell: MeasurableCell) => number,
     min_width: number = MIN_COLUMN_WIDTH,
     padding: number = COLUMN_PADDING,
-    max_width: number = MAX_COLUMN_WIDTH_PX,
+    max_width: number = MAX_AUTO_FIT_COLUMN_WIDTH_PX,
 ): Record<number, number> {
     const widths: Record<number, number> = {};
     for (const source_column of source_columns) {
