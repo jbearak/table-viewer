@@ -115,7 +115,7 @@ function record_all(
 function move(state: HistoryStackState, direction: 'undo' | 'redo'): HistoryStackState {
     const peeked = peek_history(state, direction);
     if (peeked.kind !== 'available') return state;
-    return commit_history_move(state, direction, peeked.entry);
+    return commit_history_move(state, direction, peeked.entry).state;
 }
 
 function top(state: HistoryStackState, direction: 'undo' | 'redo'): HistoryEntry {
@@ -446,36 +446,72 @@ describe('peek_history and commit_history_move', () => {
         expect(move(state, 'redo')).toBe(state);
     });
 
-    it('ignores a second commit of the same peeked entry', () => {
+    it('refuses to record a gesture it would have to copy to refuse', () => {
+        // Measuring precedes ownership: cloning a gesture past the hard bound
+        // would allocate a second copy of the graph the bound exists to keep out
+        // of memory, while the old history is still live.
+        const hard: HistoryBounds = {
+            maxActions: 100,
+            maxCells: 1_000_000,
+            softMaxBytes: 1_000,
+            hardMaxBytes: 2_000,
+        };
+        const changes: HistoryChange[] = [cell_change(0, 0, 'x'.repeat(50_000))];
+        const outcome = record_history_action(empty_history_stack(), { label: 'Huge', changes }, hard);
+
+        expect(outcome.kind).toBe('refused');
+        // Nothing was retained, so the caller's array is still its own.
+        expect(Object.isFrozen(changes)).toBe(false);
+    });
+
+    it('reports a second commit of the same peeked entry as already committed', () => {
         // Replay is asynchronous; a commit that ran twice must not carry a
         // second, never-replayed gesture onto the redo stack, where redo would
         // apply content the user never undid.
         const start = record_all(['A', 'B']);
         const entry = top(start, 'undo');
         const once = commit_history_move(start, 'undo', entry);
-        const twice = commit_history_move(once, 'undo', entry);
+        const twice = commit_history_move(once.state, 'undo', entry);
 
-        expect(twice).toBe(once);
-        expect(twice.undoStack.map((item) => item.action.label)).toEqual(['A']);
-        expect(twice.redoStack.map((item) => item.action.label)).toEqual(['B']);
+        expect(once.kind).toBe('moved');
+        expect(twice.kind).toBe('already-committed');
+        expect(twice.state).toBe(once.state);
+        expect(twice.state.undoStack.map((item) => item.action.label)).toEqual(['A']);
+        expect(twice.state.redoStack.map((item) => item.action.label)).toEqual(['B']);
     });
 
-    it('ignores a commit whose entry is no longer on top', () => {
-        // The user recorded a new edit while the replay was in flight. Popping
-        // whatever is on top now would move a gesture that never replayed.
+    it('drops a replayed entry that a concurrent record buried', () => {
+        // The user edited while the undo replay was in flight. The replay landed,
+        // so leaving B on the undo stack would claim its change is still applied;
+        // pushing it onto the redo stack would put it out of chronological order.
         const start = record_all(['A', 'B']);
         const entry = top(start, 'undo');
         const branched = record_history_action(start, history_action('C', [cell_change(9, 0, 'c')])).state;
 
-        expect(commit_history_move(branched, 'undo', entry)).toBe(branched);
+        const outcome = commit_history_move(branched, 'undo', entry);
+        expect(outcome.kind).toBe('dropped');
+        expect(outcome.state.undoStack.map((item) => item.action.label)).toEqual(['A', 'C']);
+        expect(outcome.state.redoStack).toHaveLength(0);
     });
 
-    it('ignores a commit after another undo already moved the stack', () => {
+    it('leaves the entries above a dropped one undoable', () => {
+        const start = record_all(['A', 'B']);
+        const entry = top(start, 'undo');
+        const branched = record_history_action(start, history_action('C', [cell_change(9, 0, 'c')])).state;
+        const dropped = commit_history_move(branched, 'undo', entry).state;
+
+        expect(top(dropped, 'undo').action.label).toBe('C');
+        expect(move(dropped, 'undo').undoStack.map((item) => item.action.label)).toEqual(['A']);
+    });
+
+    it('reports a commit after another undo already moved the entry', () => {
         const start = record_all(['A', 'B']);
         const entry = top(start, 'undo');
         const moved = move(start, 'undo');
 
-        expect(commit_history_move(moved, 'undo', entry)).toBe(moved);
+        const outcome = commit_history_move(moved, 'undo', entry);
+        expect(outcome.kind).toBe('already-committed');
+        expect(outcome.state).toBe(moved);
         expect(moved.undoStack.map((item) => item.action.label)).toEqual(['A']);
     });
 

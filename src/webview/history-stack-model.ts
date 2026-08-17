@@ -219,16 +219,33 @@ function change_cell_key(change: HistoryChange): string {
     return `${change.kind} ${worksheet_target_key(worksheet)} ${sourceRow}:${sourceColumn}`;
 }
 
-/** Measures an action's costs. Both are estimates the bounds are applied to. */
-export function measure_history_action(action: HistoryAction): HistoryEntry {
-    const owned = own_history_action(action);
+interface HistoryCosts {
+    readonly cellCount: number;
+    readonly byteCost: number;
+}
+
+/**
+ * An action's costs, read without retaining it.
+ *
+ * Measuring precedes ownership so that an action too large to record is refused
+ * before anything is copied for it. Cloning a gesture that exceeds the hard
+ * bound would allocate a second copy of the very graph the bound exists to keep
+ * out of memory, while the old history is still live — running out of memory on
+ * the way to deciding not to keep it.
+ */
+function measure_costs(action: HistoryAction): HistoryCosts {
     const cells = new Set<string>();
     let byteCost = 0;
-    for (const change of owned.changes) {
+    for (const change of action.changes) {
         cells.add(change_cell_key(change));
         byteCost += estimate_change_bytes(change);
     }
-    return { action: owned, cellCount: cells.size, byteCost };
+    return { cellCount: cells.size, byteCost };
+}
+
+/** Measures an action's costs and takes ownership of it. Both costs are estimates. */
+export function measure_history_action(action: HistoryAction): HistoryEntry {
+    return { action: own_history_action(action), ...measure_costs(action) };
 }
 
 export interface RecordedOutcome {
@@ -304,8 +321,10 @@ export function record_history_action(
 ): RecordOutcome {
     if (action.changes.length === 0) return { kind: 'empty', state };
 
-    const entry = measure_history_action(action);
-    if (entry.byteCost > bounds.hardMaxBytes) {
+    // Measured before it is owned: a refusal must not first copy the graph the
+    // bound exists to keep out of memory.
+    const costs = measure_costs(action);
+    if (costs.byteCost > bounds.hardMaxBytes) {
         return {
             kind: 'refused',
             state: {
@@ -314,11 +333,12 @@ export function record_history_action(
                 barrier: { reason: 'action-too-large', label: action.label },
             },
             reason: 'action-too-large',
-            byteCost: entry.byteCost,
+            byteCost: costs.byteCost,
             hardMaxBytes: bounds.hardMaxBytes,
         };
     }
 
+    const entry: HistoryEntry = { action: own_history_action(action), ...costs };
     const { kept, evicted } = evict_to_fit([...state.undoStack, entry], bounds);
     return {
         kind: 'recorded',
@@ -367,28 +387,86 @@ export function peek_history(state: HistoryStackState, direction: HistoryDirecti
     return { kind: 'exhausted' };
 }
 
+/** The replayed entry moved to the other stack, as asked. */
+export interface MovedCommit {
+    readonly kind: 'moved';
+    readonly state: HistoryStackState;
+}
+
 /**
- * Moves the entry that was replayed to the other stack.
+ * The entry is not on the stack at all, so this commit already happened. The
+ * state is returned untouched — committing twice must not carry a second,
+ * never-replayed gesture across, where redo would apply content the user never
+ * undid.
+ */
+export interface AlreadyCommitted {
+    readonly kind: 'already-committed';
+    readonly state: HistoryStackState;
+}
+
+/**
+ * The replay landed, but the entry is buried: something was recorded, or another
+ * move committed, while this replay was in flight.
  *
- * `entry` is the one `peek_history` handed out, and it must still be on top or
- * nothing moves. Popping whichever entry is on top now would be wrong in both
- * directions: replay is asynchronous, so the stack can have been recorded onto
- * or moved in the meantime, and a commit that ran twice would otherwise move a
- * second, never-replayed gesture onto the redo stack — where redo would then
- * apply content the user never undid.
+ * The entry is dropped rather than moved. Its content has been replayed, so
+ * leaving it on the undo stack would claim a change is applied that is not — and
+ * pushing it onto the redo stack would put it out of chronological order in a
+ * history whose whole premise is one workbook-wide chronology. What sits above it
+ * stays undoable, guarded as always by the compare-and-swap; only this one
+ * gesture stops being redoable, which is why the caller is told.
+ */
+export interface DroppedCommit {
+    readonly kind: 'dropped';
+    readonly state: HistoryStackState;
+}
+
+export type CommitOutcome = MovedCommit | AlreadyCommitted | DroppedCommit;
+
+/**
+ * Records that a replayed entry has landed.
+ *
+ * `entry` is the one `peek_history` handed out. Replay is asynchronous, so by the
+ * time it lands the stack may have been recorded onto or moved; the entry's
+ * position is therefore checked rather than assumed, and the three outcomes say
+ * which case this was instead of quietly doing nothing.
  */
 export function commit_history_move(
     state: HistoryStackState,
     direction: HistoryDirection,
     entry: HistoryEntry,
-): HistoryStackState {
+): CommitOutcome {
     const from = stack_for(state, direction);
-    if (from[from.length - 1] !== entry) return state;
-    const rest = from.slice(0, -1);
-    const to = [...stack_for(state, direction === 'undo' ? 'redo' : 'undo'), entry];
+    const position = from.lastIndexOf(entry);
+    if (position === -1) return { kind: 'already-committed', state };
+
+    const other: HistoryDirection = direction === 'undo' ? 'redo' : 'undo';
+    if (position !== from.length - 1) {
+        const kept = [...from.slice(0, position), ...from.slice(position + 1)];
+        return {
+            kind: 'dropped',
+            state: with_stacks(state, direction, kept, stack_for(state, other)),
+        };
+    }
+    return {
+        kind: 'moved',
+        state: with_stacks(
+            state,
+            direction,
+            from.slice(0, -1),
+            [...stack_for(state, other), entry],
+        ),
+    };
+}
+
+function with_stacks(
+    state: HistoryStackState,
+    direction: HistoryDirection,
+    from: readonly HistoryEntry[],
+    to: readonly HistoryEntry[],
+): HistoryStackState {
     return direction === 'undo'
-        ? { undoStack: rest, redoStack: to, barrier: state.barrier }
-        : { undoStack: to, redoStack: rest, barrier: state.barrier };
+        ? { undoStack: from, redoStack: to, barrier: state.barrier }
+        : { undoStack: to, redoStack: from, barrier: state.barrier };
 }
 
 /**
