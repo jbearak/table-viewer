@@ -186,6 +186,40 @@ describe('record_history_action', () => {
         const outcome = record_history_action(empty_history_stack(), action);
         expect(outcome.state.undoStack[0]?.action).toBe(action);
     });
+
+    it('retains a frozen delta by reference, owning only the wrapper', () => {
+        // `build_cell_history_delta` already returns a frozen graph; only the
+        // `{kind, delta}` wrapper around it is the caller's. Copying the change
+        // to own that wrapper would duplicate the whole payload.
+        const change = cell_change(0, 0, 'v');
+        expect(Object.isFrozen(change)).toBe(false);
+
+        const action = history_action('Edit', [change]);
+        expect(action.changes[0]).not.toBe(change);
+        expect(action.changes[0]?.delta).toBe(change.delta);
+    });
+
+    it('copies a change whose payload the caller could still mutate', () => {
+        // A shallow-frozen wrapper around a mutable delta is not ownership: the
+        // caller could retarget the replay or invalidate the measured cost.
+        const worksheet = { ...SHEET };
+        const change: HistoryChange = Object.freeze({
+            kind: 'highlight',
+            delta: Object.freeze({
+                worksheet,
+                sourceRow: 0,
+                sourceColumn: 0,
+                before: null,
+                after: 'yellow',
+            }),
+        } as const);
+
+        const action = history_action('Highlight', [change]);
+        worksheet.sheetName = 'Renamed';
+
+        expect(action.changes[0]?.delta.worksheet.sheetName).toBe('Data');
+        expect(action.changes[0]?.delta).not.toBe(change.delta);
+    });
 });
 
 describe('action_replay_changes', () => {

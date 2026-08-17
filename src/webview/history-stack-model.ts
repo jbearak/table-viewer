@@ -1,5 +1,5 @@
 import type { CellHyperlink } from '../cell-content';
-import { deep_clone_and_freeze } from '../immutable';
+import { deep_clone_and_freeze, is_deeply_frozen } from '../immutable';
 import {
     worksheet_target_key,
     worksheet_target_matches,
@@ -417,39 +417,39 @@ export function action_is_single_worksheet(action: HistoryAction): boolean {
  * measured once, so a caller that mutated a recorded action afterwards would
  * change what replay does while the bounds still described the old graph.
  *
- * A change already frozen all the way down is reused rather than copied, which
- * is the normal case — `build_cell_history_delta` returns a
- * `deep_clone_and_freeze`d delta — and it matters at this size. A supported
- * gesture can be a million cells and hundreds of MiB; cloning that graph a
- * second time just to freeze what is already frozen doubles peak memory at the
- * exact moment there is least of it, and does so even for a gesture about to be
- * refused for being too large.
+ * Ownership is taken at the shallowest level that needs it. The payload — the
+ * delta, which is where all the retained content is — is normally already frozen
+ * all the way down, because `build_cell_history_delta` returns a
+ * `deep_clone_and_freeze`d value; only the `{kind, delta}` wrapper a caller
+ * built around it is new. Cloning the whole change to own that wrapper would
+ * copy every string in the payload a second time, and at this size that is the
+ * difference between recording a supported million-cell gesture and running out
+ * of memory deciding to refuse it.
+ *
+ * `is_deeply_frozen` is what makes the reuse safe. A shallow `Object.isFrozen`
+ * would pass a frozen wrapper around mutable innards, and retaining that leaves
+ * the caller able to retarget a replay or invalidate a measured cost.
  */
 function own_history_action(action: HistoryAction): HistoryAction {
-    if (Object.isFrozen(action) && Object.isFrozen(action.changes)
-        && action.changes.every(change_is_owned)) {
-        return action;
-    }
-    const changes = action.changes.map(
-        (change) => (change_is_owned(change) ? change : deep_clone_and_freeze(change)),
-    );
-    return Object.freeze({ label: action.label, changes: Object.freeze(changes) });
+    let reusable = is_deeply_frozen(action.label) && Object.isFrozen(action.changes);
+    const changes = action.changes.map((change) => {
+        const owned = own_history_change(change);
+        if (owned !== change) reusable = false;
+        return owned;
+    });
+    return reusable && Object.isFrozen(action)
+        ? action
+        : Object.freeze({ label: action.label, changes: Object.freeze(changes) });
 }
 
-/**
- * Whether a change is already deeply frozen.
- *
- * Only the mutable-by-construction shapes are inspected. Deltas arrive frozen
- * whole from `build_cell_history_delta`, so the check is a few `isFrozen` calls
- * rather than a traversal of the retained strings.
- */
-function change_is_owned(change: HistoryChange): boolean {
-    if (!Object.isFrozen(change) || !Object.isFrozen(change.delta)) return false;
-    if (change.kind === 'highlight') return true;
-    const { beforeOverlay, afterOverlay, value, hyperlink } = change.delta;
-    return Object.isFrozen(beforeOverlay) && Object.isFrozen(afterOverlay)
-        && (value === undefined || Object.isFrozen(value))
-        && (hyperlink === undefined || Object.isFrozen(hyperlink));
+function own_history_change(change: HistoryChange): HistoryChange {
+    if (is_deeply_frozen(change)) return change;
+    if (is_deeply_frozen(change.delta)) {
+        // Only the wrapper is the caller's. Freezing a copy of it retains the
+        // payload by reference instead of duplicating it.
+        return Object.freeze({ kind: change.kind, delta: change.delta } as HistoryChange);
+    }
+    return deep_clone_and_freeze(change);
 }
 
 /** Builds a frozen action, so a caller reusing its builders cannot mutate history. */
