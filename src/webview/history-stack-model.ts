@@ -6,6 +6,8 @@ import {
 } from '../types';
 import {
     canonical_cell_history_delta,
+    detached_string,
+    type RetainedStringMeter,
     type CellHistoryDelta,
     type CellOverlayState,
     type HistoryDirection,
@@ -136,15 +138,13 @@ export const MAX_BARRIER_LABEL_LENGTH = 200;
  * keeping its high half, so the result is never lone-surrogate garbage.
  */
 function barrier_label(label: string): string {
-    const kept = label.length <= MAX_BARRIER_LABEL_LENGTH
-        ? label.length
-        : MAX_BARRIER_LABEL_LENGTH - 1;
-    const units: number[] = [];
-    for (let index = 0; index < kept; index += 1) units.push(label.charCodeAt(index));
-    const last = units[units.length - 1];
-    if (last !== undefined && last >= 0xd800 && last <= 0xdbff) units.pop();
-    if (kept < label.length) units.push(0x2026);
-    return String.fromCharCode(...units);
+    if (label.length <= MAX_BARRIER_LABEL_LENGTH) return detached_string(label);
+    const kept = MAX_BARRIER_LABEL_LENGTH - 1;
+    const last = label.charCodeAt(kept - 1);
+    // A cut through a surrogate pair drops the pair rather than keeping its high
+    // half, so the result is never lone-surrogate garbage.
+    const end = last >= 0xd800 && last <= 0xdbff ? kept - 1 : kept;
+    return `${detached_string(label.slice(0, end))}…`;
 }
 
 export interface HistoryStackState {
@@ -368,6 +368,9 @@ function measure_costs(action: HistoryAction): HistoryCosts {
     return { cellCount: cells.size, byteCost };
 }
 
+/** Thrown by the meter to abandon a rebuild mid-change. Never escapes this module. */
+class BudgetExhausted extends Error {}
+
 /**
  * The action history will retain, canonicalized and measured together.
  *
@@ -378,6 +381,14 @@ function measure_costs(action: HistoryAction): HistoryCosts {
  * process can run out of memory on the way to deciding not to keep it. Rebuilding
  * copies only the skeleton, but a gesture large enough to refuse has a great many
  * skeletons.
+ *
+ * The budget reaches INSIDE a change as well as between them, via a meter the
+ * canonicalizer calls for every string it retains. One cell can hold enough
+ * rich-text runs to exceed the bound by itself, and checking only between changes
+ * would rebuild all of it — the caller's graph and the whole clone alive together
+ * — before deciding to keep none of it. The meter's running total is a floor on
+ * the change's cost, not the cost itself: `estimate_change_bytes` still has the
+ * last word below, since it also charges the shape.
  */
 function own_and_measure(action: HistoryAction, budget = Infinity): OwnedAction | undefined {
     const cells = new Set<string>();
@@ -388,8 +399,24 @@ function own_and_measure(action: HistoryAction, budget = Infinity): OwnedAction 
     // so in the barrier.
     const label = barrier_label(String(action.label));
     let byteCost = estimate_string_bytes(label);
+    // Strings a change retains, charged as they are retained. Reset per change,
+    // because `estimate_change_bytes` recharges the finished change in full and
+    // deduplicates payloads the way the memory does; this running figure exists
+    // only to stop a runaway rebuild.
+    let pending = 0;
+    const meter: RetainedStringMeter = (text) => {
+        pending += estimate_string_bytes(text);
+        if (byteCost + pending > budget) throw new BudgetExhausted();
+    };
     for (const change of action.changes) {
-        const canonical = own_history_change(change);
+        pending = 0;
+        let canonical: HistoryChange;
+        try {
+            canonical = own_history_change(change, meter);
+        } catch (error) {
+            if (error instanceof BudgetExhausted) return undefined;
+            throw error;
+        }
         byteCost += estimate_change_bytes(canonical, charge_worksheet);
         if (byteCost > budget) return undefined;
         cells.add(change_cell_key(canonical));
@@ -799,24 +826,48 @@ export function action_focus_worksheet(action: HistoryAction): WorksheetTarget |
  * to be applied first. Neither application order nor which change is strongest
  * may decide this.
  *
- * So: at most one distinct id, at most one distinct name, and — only when some
- * change identifies its sheet by position alone — at most one distinct index. An
- * index is otherwise ignored, since an external reorder reassigns indices while
- * the identity it carries alongside stays true.
+ * A gesture is single-sheet when its targets AGREE, which needs more than each
+ * identifier being individually unique: an id-only target and a name-only target
+ * share no identifier at all, so "one distinct id, one distinct name" would call
+ * two demonstrably different sheets one sheet.
+ *
+ * What is actually being asked is whether the targets are all LINKED. Each target
+ * carries up to two identifiers, and a target carrying both asserts they name the
+ * same sheet; the identifiers of a single-sheet gesture therefore form one
+ * connected group. `{id: rId1}` beside `{name: Data}` is two groups and spans
+ * sheets; add `{id: rId1, name: Data}` and the three become one and it does not.
+ *
+ * Two distinct ids or two distinct names contradict outright. An index is believed
+ * only for a target that carries no identity at all, since an external reorder
+ * reassigns indices while the identity carried alongside stays true.
  */
 export function action_is_single_worksheet(action: HistoryAction): boolean {
+    // At most three identifiers can be consistent — one id, one name, one index —
+    // so the groups are found by merging their labels rather than by union-find.
     const ids = new Set<string>();
     const names = new Set<string>();
     const indices = new Set<number>();
-    let positional = false;
+    // Each entry is the set of identifier labels one target proved to be the same
+    // sheet, as `id`/`name`/`index`.
+    const links: Set<string>[] = [];
     for (const { delta } of action.changes) {
         const { sheetIndex, sheetName, worksheetId } = delta.worksheet;
-        if (worksheetId !== undefined) ids.add(worksheetId);
-        if (sheetName !== undefined) names.add(sheetName);
-        if (worksheetId === undefined && sheetName === undefined) positional = true;
-        indices.add(sheetIndex);
+        const labels = new Set<string>();
+        if (worksheetId !== undefined) { ids.add(worksheetId); labels.add('id'); }
+        if (sheetName !== undefined) { names.add(sheetName); labels.add('name'); }
+        if (labels.size === 0) { indices.add(sheetIndex); labels.add('index'); }
+        links.push(labels);
     }
-    return ids.size <= 1 && names.size <= 1 && (!positional || indices.size <= 1);
+    if (ids.size > 1 || names.size > 1 || indices.size > 1) return false;
+
+    const groups: Set<string>[] = [];
+    for (const labels of links) {
+        const touched = groups.filter((group) => [...labels].some((label) => group.has(label)));
+        const merged = new Set<string>(labels);
+        for (const group of touched) for (const label of group) merged.add(label);
+        groups.splice(0, groups.length, ...groups.filter((group) => !touched.includes(group)), merged);
+    }
+    return groups.length <= 1;
 }
 
 /**
@@ -837,19 +888,26 @@ export function action_is_single_worksheet(action: HistoryAction): boolean {
  * has to bound rather than refuse: duplicating the content would double peak
  * memory at the exact moment there is least of it.
  */
-function own_history_change(change: HistoryChange): HistoryChange {
+function own_history_change(change: HistoryChange, meter?: RetainedStringMeter): HistoryChange {
     return change.kind === 'cell'
-        ? Object.freeze({ kind: 'cell', delta: canonical_cell_history_delta(change.delta) })
-        : Object.freeze({ kind: 'highlight', delta: canonical_highlight_delta(change.delta) });
+        ? Object.freeze({ kind: 'cell', delta: canonical_cell_history_delta(change.delta, meter) })
+        : Object.freeze({ kind: 'highlight', delta: canonical_highlight_delta(change.delta, meter) });
 }
 
-function canonical_highlight_delta(delta: HighlightHistoryDelta): HighlightHistoryDelta {
+function canonical_highlight_delta(
+    delta: HighlightHistoryDelta,
+    meter?: RetainedStringMeter,
+): HighlightHistoryDelta {
     const { sheetIndex, sheetName, worksheetId } = delta.worksheet;
+    const detach = (text: string): string => {
+        meter?.(text);
+        return detached_string(text);
+    };
     return Object.freeze({
         worksheet: Object.freeze({
             sheetIndex,
-            ...(sheetName === undefined ? {} : { sheetName }),
-            ...(worksheetId === undefined ? {} : { worksheetId }),
+            ...(sheetName === undefined ? {} : { sheetName: detach(sheetName) }),
+            ...(worksheetId === undefined ? {} : { worksheetId: detach(worksheetId) }),
         }),
         sourceRow: delta.sourceRow,
         sourceColumn: delta.sourceColumn,

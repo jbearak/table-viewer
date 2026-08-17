@@ -3,10 +3,12 @@ import type { WorksheetTarget } from '../types';
 import {
     absent_overlay,
     build_cell_history_delta,
+    detached_string,
     history_value,
     hyperlink_only_overlay,
     value_only_overlay,
     type CellHistoryDelta,
+    type HistoryValue,
 } from '../webview/history-cell-state-model';
 import {
     action_focus_worksheet,
@@ -82,6 +84,29 @@ function link_only_change(text: string): HistoryChange {
     });
     if (delta === undefined) throw new Error('fixture built a delta that moved nothing');
     return { kind: 'cell', delta };
+}
+
+/**
+ * A change whose new value carries rich-text runs, built around the delta builder.
+ *
+ * `build_cell_history_delta` canonicalizes, so runs handed to it arrive at the
+ * recorder already copied. Grafting them onto a finished delta is what puts them
+ * in front of the recorder's own walk, which is the walk under test.
+ */
+function rich_change(runs: readonly { readonly text: string }[]): HistoryChange {
+    const delta = cell_change(0, 0, 'v').delta as CellHistoryDelta;
+    const value = { text: 'v', runs: { runs } } as HistoryValue;
+    return {
+        kind: 'cell',
+        delta: {
+            ...delta,
+            value: {
+                ...delta.value!,
+                desired: { ...delta.value!.desired, content: value },
+            },
+            afterOverlay: value_only_overlay(value, history_value('base')),
+        },
+    };
 }
 
 /** A short pending value recommitted against a base that moved underneath. */
@@ -474,6 +499,29 @@ describe('measure_history_action', () => {
             cell_change(2, 0, 'v', { ...named }),
         ]));
         expect(entry.byteCost).toBeLessThan(50_000 * 2 * 2);
+    });
+
+    it('stops rebuilding inside one change whose runs exceed the hard bound', () => {
+        // One cell can hold enough rich text to exceed the bound by itself, and a
+        // budget checked only BETWEEN changes would rebuild all of it — the
+        // caller's graph and the whole clone alive together — before deciding to
+        // keep none of it.
+        const hard: HistoryBounds = {
+            maxActions: 100,
+            maxCells: 1_000_000,
+            softMaxBytes: 10_000,
+            hardMaxBytes: 20_000,
+        };
+        let read = 0;
+        const runs = Array.from({ length: 500 }, () => ({
+            get text() { read += 1; return 'y'.repeat(1_000); },
+        })) as { readonly text: string }[];
+        const change = rich_change(runs);
+
+        expect(record_history_action(empty_history_stack(), { label: 'Rich', changes: [change] }, hard).kind)
+            .toBe('refused');
+        // Abandoned within the first few runs rather than copying all five hundred.
+        expect(read).toBeLessThan(30);
     });
 
     it('refuses a gesture whose worksheet name alone exceeds the hard bound', () => {
@@ -930,6 +978,32 @@ describe('peek_history and commit_history_move', () => {
     });
 });
 
+describe('detached_string', () => {
+    it('reproduces the text exactly, at every size around the chunk boundary', () => {
+        for (const length of [0, 1, 4_095, 4_096, 4_097, 12_289]) {
+            const text = Array.from({ length }, (_unused, index) => String.fromCharCode(0x41 + (index % 26))).join('');
+            expect(detached_string(text)).toBe(text);
+        }
+    });
+
+    it('preserves astral characters split across a chunk boundary', () => {
+        // A pair straddling the 4096-unit chunk cut must survive the copy: the units
+        // are copied one at a time, so the halves land in different chunks.
+        const text = `${'a'.repeat(4_095)}😀${'b'.repeat(10)}`;
+        expect(detached_string(text)).toBe(text);
+        expect([...detached_string(text)]).toContain('😀');
+    });
+
+    it('does not retain the parent of a slice', () => {
+        // V8 answers `slice` with a view retaining the WHOLE of its parent, so a
+        // short cell sliced out of a large document keeps all of it reachable while
+        // the estimator charges forty bytes. Flatness is not observable from JS —
+        // this pins the value; the heap behaviour is why the copy exists.
+        const parent = `Cell ${'x'.repeat(500_000)}`;
+        expect(detached_string(parent.slice(0, 9))).toBe('Cell xxxx');
+    });
+});
+
 describe('history_usage', () => {
     it('counts undone actions as still retained', () => {
         const state = move(record_all(['A', 'B']), 'undo');
@@ -1017,6 +1091,36 @@ describe('worksheet focus', () => {
         const action = history_action('Discard all', [
             cell_change(0, 0, 'v', { sheetIndex: 0 }),
             cell_change(1, 0, 'v', { sheetIndex: 1 }),
+        ]);
+        expect(action_is_single_worksheet(action)).toBe(false);
+    });
+
+    it('spans sheets when two targets share no identifier at all', () => {
+        // An id-only target and a name-only target have one distinct id and one
+        // distinct name between them, so counting each identifier separately called
+        // two demonstrably different sheets one sheet.
+        const action = history_action('Discard all', [
+            cell_change(0, 0, 'v', { sheetIndex: 0, worksheetId: 'rId1' }),
+            cell_change(1, 0, 'v', { sheetIndex: 1, sheetName: 'Other' }),
+        ]);
+        expect(action_is_single_worksheet(action)).toBe(false);
+    });
+
+    it('links an id-only and a name-only target through one that carries both', () => {
+        // A target carrying both identifiers asserts they name the same sheet, so
+        // the three identifiers become one connected group.
+        const action = history_action('Paste', [
+            cell_change(0, 0, 'v', { sheetIndex: 0, worksheetId: 'rId1' }),
+            cell_change(1, 0, 'v', { sheetIndex: 0, sheetName: 'Data' }),
+            cell_change(2, 0, 'v', { sheetIndex: 0, sheetName: 'Data', worksheetId: 'rId1' }),
+        ]);
+        expect(action_is_single_worksheet(action)).toBe(true);
+    });
+
+    it('spans sheets when a positional target joins an identified one', () => {
+        const action = history_action('Discard all', [
+            cell_change(0, 0, 'v', { sheetIndex: 0, worksheetId: 'rId1' }),
+            cell_change(1, 0, 'v', { sheetIndex: 4 }),
         ]);
         expect(action_is_single_worksheet(action)).toBe(false);
     });

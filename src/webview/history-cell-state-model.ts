@@ -608,7 +608,10 @@ function effective_hyperlink_side(
  * are shared, not duplicated, which is what makes this affordable on the
  * million-cell gestures history has to bound rather than refuse.
  */
-export function canonical_cell_history_delta(delta: CellHistoryDelta): CellHistoryDelta {
+export function canonical_cell_history_delta(
+    delta: CellHistoryDelta,
+    meter?: RetainedStringMeter,
+): CellHistoryDelta {
     // A memo per delta, so an object the input SHARED between a transition and an
     // overlay is shared by the output too. That aliasing is load-bearing: it is
     // how one string exists once in memory, and how the byte estimate charges it
@@ -617,7 +620,7 @@ export function canonical_cell_history_delta(delta: CellHistoryDelta): CellHisto
     const value_of = (value: HistoryValue): HistoryValue => {
         const seen = values.get(value);
         if (seen !== undefined) return seen;
-        const canonical = canonical_value(value);
+        const canonical = canonical_value(value, meter);
         values.set(value, canonical);
         return canonical;
     };
@@ -626,13 +629,13 @@ export function canonical_cell_history_delta(delta: CellHistoryDelta): CellHisto
         if (link === null) return null;
         const seen = links.get(link);
         if (seen !== undefined) return seen;
-        const canonical = canonical_hyperlink(link);
+        const canonical = canonical_hyperlink(link, meter);
         links.set(link, canonical);
         return canonical;
     };
 
     const base: CellHistoryDeltaBase = {
-        worksheet: canonical_worksheet_target(delta.worksheet),
+        worksheet: canonical_worksheet_target(delta.worksheet, meter),
         sourceRow: delta.sourceRow,
         sourceColumn: delta.sourceColumn,
         beforeOverlay: canonical_overlay(delta.beforeOverlay, value_of, link_of),
@@ -652,22 +655,83 @@ export function canonical_cell_history_delta(delta: CellHistoryDelta): CellHisto
     return freeze_deep_declared(out);
 }
 
-function canonical_worksheet_target(target: WorksheetTarget): WorksheetTarget {
+/**
+ * Told about every string a canonical delta retains, as it is retained.
+ *
+ * The bounds are enforced against a separate estimating walk, which cannot stop a
+ * rebuild already under way: one cell carrying enough rich-text runs to exceed the
+ * hard bound was canonicalized in full — the caller's graph and the whole clone
+ * alive together — before anything checked. A meter is a tripwire, not the
+ * accounting: it may throw to abandon the walk, and the estimator still has the
+ * last word on what an action costs.
+ */
+export type RetainedStringMeter = (text: string) => void;
+
+/**
+ * How much of a string is copied at a time when detaching it.
+ *
+ * Large enough that a cell's text is one pass, small enough that the argument
+ * list never approaches the engine's limit on a spread call.
+ */
+const DETACH_CHUNK = 4_096;
+
+/**
+ * A string that stands on its own, holding no other string alive.
+ *
+ * V8 answers `slice` with a view retaining the WHOLE of its parent, and `a + b`
+ * with a rope retaining both halves, so a twenty-character cell sliced out of a
+ * 300MiB document keeps all 300MiB reachable while the estimator charges it forty
+ * bytes — the hard bound defeated by content it did measure, honestly, at the
+ * wrong size. Every string history retains is therefore copied out unit by unit;
+ * `String.fromCharCode` is one of the few constructions that actually allocates a
+ * fresh flat string rather than a view of an existing one.
+ *
+ * Copying costs a pass over the text once per retained string, which is cheap
+ * against what it prevents: cell text is short, and a long value is one that
+ * would otherwise be retained unmeasured.
+ */
+export function detached_string(text: string): string {
+    if (text.length <= DETACH_CHUNK) return detached_chunk(text, 0, text.length);
+    const chunks: string[] = [];
+    for (let start = 0; start < text.length; start += DETACH_CHUNK) {
+        chunks.push(detached_chunk(text, start, Math.min(start + DETACH_CHUNK, text.length)));
+    }
+    // Joined rather than accumulated with `+=`: the result is one flat string,
+    // where a chain of concatenations would be a rope thousands of nodes deep. Its
+    // pieces are all ours either way, so nothing foreign is retained.
+    return chunks.join('');
+}
+
+function detached_chunk(text: string, start: number, end: number): string {
+    const units: number[] = [];
+    for (let index = start; index < end; index += 1) units.push(text.charCodeAt(index));
+    return String.fromCharCode(...units);
+}
+
+function retained(text: string, meter: RetainedStringMeter | undefined): string {
+    meter?.(text);
+    return detached_string(text);
+}
+
+function canonical_worksheet_target(
+    target: WorksheetTarget,
+    meter?: RetainedStringMeter,
+): WorksheetTarget {
     const { sheetIndex, sheetName, worksheetId } = target;
     return {
         sheetIndex,
-        ...(sheetName === undefined ? {} : { sheetName }),
-        ...(worksheetId === undefined ? {} : { worksheetId }),
+        ...(sheetName === undefined ? {} : { sheetName: retained(sheetName, meter) }),
+        ...(worksheetId === undefined ? {} : { worksheetId: retained(worksheetId, meter) }),
     };
 }
 
-function canonical_value(value: HistoryValue): HistoryValue {
+function canonical_value(value: HistoryValue, meter?: RetainedStringMeter): HistoryValue {
     const runs = value.runs;
     return {
-        text: value.text,
+        text: retained(value.text, meter),
         ...(runs === undefined
             ? {}
-            : { runs: { runs: canonical_runs(runs.runs) } }),
+            : { runs: { runs: canonical_runs(runs.runs, meter) } }),
     };
 }
 
@@ -679,16 +743,19 @@ function canonical_value(value: HistoryValue): HistoryValue {
  * whatever undeclared state it holds into what history retains and the estimator
  * never charges. A `for` loop into a literal cannot be redirected that way.
  */
-function canonical_runs(runs: readonly RichTextRun[]): readonly RichTextRun[] {
+function canonical_runs(
+    runs: readonly RichTextRun[],
+    meter?: RetainedStringMeter,
+): readonly RichTextRun[] {
     const out: RichTextRun[] = [];
-    for (const run of runs) out.push(canonical_run(run));
+    for (const run of runs) out.push(canonical_run(run, meter));
     return out;
 }
 
-function canonical_run(run: RichTextRun): RichTextRun {
+function canonical_run(run: RichTextRun, meter?: RetainedStringMeter): RichTextRun {
     const style = run.style;
     return {
-        text: run.text,
+        text: retained(run.text, meter),
         ...(style === undefined ? {} : { style: canonical_style(style) }),
     };
 }
@@ -703,13 +770,16 @@ function canonical_style(style: CellTextStyle): CellTextStyle {
     };
 }
 
-function canonical_hyperlink(link: CellHyperlink | null): CellHyperlink | null {
+function canonical_hyperlink(
+    link: CellHyperlink | null,
+    meter?: RetainedStringMeter,
+): CellHyperlink | null {
     if (link === null) return null;
     const tooltip = link.tooltip;
-    const rest = tooltip === undefined ? {} : { tooltip };
+    const rest = tooltip === undefined ? {} : { tooltip: retained(tooltip, meter) };
     return link.kind === 'external'
-        ? { kind: 'external', target: link.target, ...rest }
-        : { kind: 'internal', location: link.location, ...rest };
+        ? { kind: 'external', target: retained(link.target, meter), ...rest }
+        : { kind: 'internal', location: retained(link.location, meter), ...rest };
 }
 
 interface CanonicalTransition<T> {
