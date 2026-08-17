@@ -708,7 +708,7 @@ describe('GridShell CSV save', () => {
         expect(retry.worksheets[0].edits).toEqual({ '0:0': 'first' });
     });
 
-    it('ignores a raw active lifecycle with no operation', async () => {
+    it('ignores a raw active lifecycle with an empty worksheet list', async () => {
         const dirty = { '0:0': { value: 'safe', base: 'base' } };
         const { post_message, editing_ref } = await render_grid(undefined, {
             initial_edits: dirty,
@@ -717,7 +717,15 @@ describe('GridShell CSV save', () => {
         await act(async () => {
             window.dispatchEvent(new MessageEvent('message', { data: {
                 type: 'saveOperationStarted',
-                lifecycle: { revision: 1, state: 'active' },
+                lifecycle: {
+                    revision: 1,
+                    state: 'active',
+                    operation: {
+                        editSessionId: 'session-1',
+                        saveRequestId: 'empty-workbook',
+                        worksheets: [],
+                    },
+                },
             } }));
         });
 

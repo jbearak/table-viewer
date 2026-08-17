@@ -643,21 +643,13 @@ export function GridShell({
         sample_loaded_rows,
         version,
     } = loader;
-    const lifecycle_operation = (
-        save_lifecycle.state === 'active'
-        || (
-            save_lifecycle.state === 'failed'
-            && 'operation' in save_lifecycle
-        )
-    )
+    const lifecycle_operation = save_lifecycle.state === 'active'
         && save_lifecycle.operation.editSessionId === edit_session_id
         ? save_lifecycle.operation
         : undefined;
     const restored_save_operation = save_operation?.editSessionId === edit_session_id
         ? save_operation
-        : save_lifecycle.state === 'active'
-            ? lifecycle_operation
-            : undefined;
+        : lifecycle_operation;
     const worksheet_payload = useCallback((operation: CsvSaveOperation | undefined) =>
         operation && save_operation_worksheet(
             operation,

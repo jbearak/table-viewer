@@ -15,6 +15,7 @@ import {
     type CsvSaveWorksheetOperation,
     type SheetPendingEditCells,
     type TerminalCsvSaveLifecycle,
+    type WorksheetTarget,
 } from '../types';
 
 export { save_lifecycle_correlation } from '../types';
@@ -117,14 +118,56 @@ function strict_dirty_maps_equal_and_agree(
     return left_count === right_count && expected_edit_count === edit_count;
 }
 
+interface SanitizedWorksheetTargetMember {
+    readonly source: Record<string, unknown>;
+    readonly target: WorksheetTarget;
+}
+
+function sanitized_operation_worksheet_targets(
+    operation: unknown,
+): readonly SanitizedWorksheetTargetMember[] | undefined {
+    if (
+        !is_plain_record(operation)
+        || !Array.isArray(operation.worksheets)
+        || operation.worksheets.length === 0
+    ) return undefined;
+    const members: SanitizedWorksheetTargetMember[] = [];
+    const sheet_indices = new Set<number>();
+    const target_keys = new Set<string>();
+    for (let index = 0; index < operation.worksheets.length; index += 1) {
+        // Array iteration skips holes, so require every ordinal to be an owned
+        // member before treating the collection as an atomic workbook payload.
+        if (!Object.prototype.hasOwnProperty.call(operation.worksheets, index)) {
+            return undefined;
+        }
+        const source = operation.worksheets[index];
+        const target = sanitized_wire_worksheet_target(source);
+        if (!target) return undefined;
+        const target_key = worksheet_target_key(target);
+        if (
+            sheet_indices.has(target.sheetIndex)
+            || target_keys.has(target_key)
+        ) return undefined;
+        sheet_indices.add(target.sheetIndex);
+        target_keys.add(target_key);
+        members.push({
+            // A successful target decode proves that the source is a plain record.
+            source: source as Record<string, unknown>,
+            target,
+        });
+    }
+    return members;
+}
+
 function sanitized_operation_worksheet(
-    value: unknown,
+    member: SanitizedWorksheetTargetMember,
 ): CsvSaveWorksheetOperation | undefined {
-    if (!is_plain_record(value)) return undefined;
-    const target = sanitized_wire_worksheet_target(value);
-    const maps = sanitized_wire_save_maps(value.edits, value.dirtyEdits);
-    if (!target || !maps) return undefined;
-    return Object.freeze({ ...target, ...maps });
+    const maps = sanitized_wire_save_maps(
+        member.source.edits,
+        member.source.dirtyEdits,
+    );
+    if (!maps) return undefined;
+    return Object.freeze({ ...member.target, ...maps });
 }
 
 function worksheet_operations_equal(left: unknown, right: unknown): boolean {
@@ -174,25 +217,16 @@ function worksheet_operations_equal(left: unknown, right: unknown): boolean {
 export function save_operation_worksheets(
     operation: CsvSaveOperation | undefined,
 ): readonly CsvSaveWorksheetOperation[] {
-    if (!is_plain_record(operation) || !Array.isArray(operation.worksheets)) return [];
+    const members = sanitized_operation_worksheet_targets(operation);
+    if (!members) return [];
     const worksheets: CsvSaveWorksheetOperation[] = [];
-    const sheet_indices = new Set<number>();
-    const target_keys = new Set<string>();
-    for (const candidate of operation.worksheets) {
-        const worksheet = sanitized_operation_worksheet(candidate);
+    for (const member of members) {
+        const worksheet = sanitized_operation_worksheet(member);
         // Recovery is workbook-atomic just like host admission: one malformed
         // member invalidates the whole proposal instead of exposing a safe-looking
-        // subset that could overwrite newer per-sheet state. Duplicate targets
-        // are equally non-atomic: sequentially restoring them would replace the
-        // same sheet store more than once.
+        // subset that could overwrite newer per-sheet state. Target collection
+        // validity and uniqueness were established by the shared shallow decoder.
         if (!worksheet) return [];
-        const target_key = worksheet_target_key(worksheet);
-        if (
-            sheet_indices.has(worksheet.sheetIndex)
-            || target_keys.has(target_key)
-        ) return [];
-        sheet_indices.add(worksheet.sheetIndex);
-        target_keys.add(target_key);
         worksheets.push(worksheet);
     }
     return worksheets;
@@ -429,9 +463,11 @@ export function is_valid_csv_save_lifecycle(
         && value.state !== 'failed'
         && value.state !== 'succeeded'
     ) return false;
-    return operation_correlation(value.operation) !== undefined
-        && is_plain_record(value.operation)
-        && Array.isArray(value.operation.worksheets);
+    if (operation_correlation(value.operation) === undefined) return false;
+    // Keep malformed maps recoverable by a later correlation-only terminal, but
+    // reject any target collection that cannot participate in atomic worksheet
+    // recovery and could otherwise strand an active save lock.
+    return sanitized_operation_worksheet_targets(value.operation) !== undefined;
 }
 
 /** Apply one host projection without using request IDs as ordering authority. */

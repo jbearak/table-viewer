@@ -6,6 +6,7 @@ import type {
 } from '../types';
 import {
     csv_save_operations_equal,
+    is_valid_csv_save_lifecycle,
     propose_csv_save,
     reduce_csv_save_projection,
     resolve_csv_save_hydration,
@@ -116,7 +117,66 @@ describe('CSV save lifecycle projection', () => {
         expect(projection.authoritative.state).toBe('failed');
     });
 
-    it('rejects an active lifecycle with no operation', () => {
+    it.each([
+        ['no operation', { revision: 4, state: 'active' }],
+        ['no worksheets', {
+            revision: 4,
+            state: 'active',
+            operation: operation('empty-workbook', 'edit-session', []),
+        }],
+        ['an unusable worksheet member', {
+            revision: 4,
+            state: 'active',
+            operation: {
+                ...operation('malformed-workbook'),
+                worksheets: [null],
+            },
+        }],
+        ['a sparse worksheet list', {
+            revision: 4,
+            state: 'active',
+            operation: {
+                ...operation('sparse-workbook'),
+                worksheets: new Array(1),
+            },
+        }],
+        ['duplicate sheet indices', {
+            revision: 4,
+            state: 'active',
+            operation: operation('duplicate-indices', 'edit-session', [
+                worksheet('first', 0, 'First'),
+                worksheet('second', 0, 'Second'),
+            ]),
+        }],
+        ['duplicate strongest target keys', {
+            revision: 4,
+            state: 'active',
+            operation: operation('duplicate-targets', 'edit-session', [
+                worksheet('first', 0, 'First', 'same-id'),
+                worksheet('second', 1, 'Second', 'same-id'),
+            ]),
+        }],
+    ])('rejects an active lifecycle with %s', (_label, lifecycle) => {
+        expect(is_valid_csv_save_lifecycle(lifecycle)).toBe(false);
+    });
+
+    it('keeps malformed worksheet maps recoverable by lifecycle correlation', () => {
+        const malformed_maps = {
+            ...operation('malformed-maps'),
+            worksheets: [{
+                ...worksheet('malformed'),
+                dirtyEdits: { '0:0': null },
+            }],
+        };
+
+        expect(is_valid_csv_save_lifecycle({
+            revision: 4,
+            state: 'active',
+            operation: malformed_maps,
+        })).toBe(true);
+    });
+
+    it('ignores an active projection without an operation', () => {
         const current = propose_csv_save({
             authoritative: { revision: 3, state: 'idle' },
         }, operation('local'));
