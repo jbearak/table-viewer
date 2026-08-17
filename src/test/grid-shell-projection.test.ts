@@ -2,7 +2,8 @@
 
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import type {
     EditingHandle,
     GridFocusHandle,
@@ -10,6 +11,7 @@ import type {
 } from '../webview/grid-shell';
 import { matches_filter } from '../table-transform';
 import type { CsvSaveOperation, FilterEntry, SheetTransformState } from '../types';
+import { CsvDataSource } from '../data-source/csv-source';
 import { create_edit_session_store } from '../webview/edit-session-store';
 import {
     LAST_COLUMN_RESIZE_GUTTER_PX,
@@ -351,6 +353,79 @@ afterEach(() => {
 });
 
 describe('GridShell cell wrapping', () => {
+    it('does not tooltip fitted produce cells when canvas scaling makes bounds fractional', async () => {
+        vi.useFakeTimers();
+        const canvas_context = vi.spyOn(HTMLCanvasElement.prototype, 'getContext')
+            .mockReturnValue({
+                font: '',
+                measureText: (text: string) => ({ width: text.length * 7.4 }),
+            } as unknown as CanvasRenderingContext2D);
+        onTestFinished(() => canvas_context.mockRestore());
+        const source = new CsvDataSource(
+            readFileSync('src/test/fixtures/produce-nutrients.csv'),
+            ',',
+            10_000,
+            { firstRowIsHeader: true },
+        );
+        const sheet = source.meta().sheets[0];
+        grid_mock.get_row.mockImplementation((row?: number) => (
+            row === undefined ? undefined : source.read_rows(0, row, 1).rows[0]
+        ));
+        const visible_to_source = Array.from(
+            { length: sheet.columnCount },
+            (_, column) => column,
+        );
+        await render_grid(props({
+            sheet_meta: sheet,
+            row_count: sheet.rowCount,
+            column_projection: {
+                visible_to_source,
+                source_to_visible: visible_to_source,
+                hidden_count: 0,
+            },
+            column_widths: Object.fromEntries(
+                visible_to_source.map((column) => [column, 120]),
+            ),
+        }));
+
+        const on_item_hovered = grid_mock.props!.onItemHovered as
+            (args: Record<string, unknown>) => void;
+        await act(async () => {
+            on_item_hovered({
+                kind: 'cell', location: [0, 0], buttons: 0,
+                // Glide's 121x25 logical hit bounds at a 0.98 canvas scale.
+                bounds: { x: 32, y: 36, width: 118.5, height: 24.5 },
+                localEventX: 20, localEventY: 12,
+            });
+            await vi.runAllTimersAsync();
+        });
+        expect(container!.querySelector('[role="tooltip"]')).toBeNull();
+
+        // A near-edge value still fits the logical 120px painted column even
+        // though its measured width exceeds the downscaled client-space budget.
+        await act(async () => {
+            on_item_hovered({
+                kind: 'cell', location: [20, 1], buttons: 0,
+                bounds: { x: 32, y: 36, width: 118.5, height: 24.5 },
+                localEventX: 20, localEventY: 12,
+            });
+            await vi.runAllTimersAsync();
+        });
+        expect(container!.querySelector('[role="tooltip"]')).toBeNull();
+
+        // The regression guard must not disable legitimate truncation tips.
+        await act(async () => {
+            on_item_hovered({
+                kind: 'cell', location: [21, 0], buttons: 0,
+                bounds: { x: 32, y: 36, width: 118.5, height: 24.5 },
+                localEventX: 20, localEventY: 12,
+            });
+            await vi.runAllTimersAsync();
+        });
+        expect(container!.querySelector('[role="tooltip"]')?.textContent)
+            .toBe('Crisp when eaten fresh');
+    });
+
     it('uses a vertical merge full height when deciding whether to soft-wrap', async () => {
         grid_mock.get_row.mockImplementation(() => [
             {
