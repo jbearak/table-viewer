@@ -18,6 +18,7 @@ import {
     history_action,
     history_usage,
     measure_history_action,
+    MAX_BARRIER_LABEL_LENGTH,
     peek_history,
     record_history_action,
     type HistoryAction,
@@ -207,19 +208,46 @@ describe('record_history_action', () => {
             .toBe(change.delta.value?.desired.content.text);
     });
 
-    it('charges the label, which a caller can build from data', () => {
+    it('truncates a label built from data rather than retaining it', () => {
+        const outcome = record_history_action(empty_history_stack(), {
+            label: 'x'.repeat(50_000),
+            changes: [cell_change(0, 0, 'v')],
+        });
+        const label = outcome.state.undoStack[0]?.action.label ?? '';
+        expect(label.length).toBe(MAX_BARRIER_LABEL_LENGTH);
+        expect(label.endsWith('…')).toBe(true);
+    });
+
+    it('answers an empty action before the bounds can install a barrier', () => {
+        // A label built from data must not be able to destroy valid history for a
+        // gesture that never needed recording.
+        const hard: HistoryBounds = {
+            maxActions: 100,
+            maxCells: 1_000_000,
+            softMaxBytes: 10,
+            hardMaxBytes: 20,
+        };
+        const existing = record_all(['A']);
+        const outcome = record_history_action(existing, { label: 'x'.repeat(50_000), changes: [] }, hard);
+
+        expect(outcome.kind).toBe('empty');
+        expect(outcome.state).toBe(existing);
+    });
+
+    it('truncates the label a barrier reports', () => {
         const hard: HistoryBounds = {
             maxActions: 100,
             maxCells: 1_000_000,
             softMaxBytes: 1_000,
-            hardMaxBytes: 5_000,
+            hardMaxBytes: 2_000,
         };
         const outcome = record_history_action(
             empty_history_stack(),
-            { label: 'x'.repeat(50_000), changes: [cell_change(0, 0, 'v')] },
+            { label: 'y'.repeat(50_000), changes: [cell_change(0, 0, 'x'.repeat(50_000))] },
             hard,
         );
         expect(outcome.kind).toBe('refused');
+        expect(outcome.state.barrier?.label.length).toBe(MAX_BARRIER_LABEL_LENGTH);
     });
 
     it('refuses a pre-built action that exceeds the hard bound', () => {

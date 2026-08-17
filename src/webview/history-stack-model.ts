@@ -88,8 +88,29 @@ export interface HistoryEntry {
  */
 export interface HistoryBarrier {
     readonly reason: 'action-too-large';
-    /** The gesture that forced it, for the message. */
+    /**
+     * The gesture that forced it, for the message. Truncated to
+     * `MAX_BARRIER_LABEL_LENGTH`: a label can be built from data, and retaining an
+     * unbounded one on the refusal path would keep alive some of the very memory
+     * the refusal exists to release.
+     */
     readonly label: string;
+}
+
+/**
+ * Enough to name a gesture in a menu or a message, and nothing like enough to
+ * matter against the byte bounds.
+ *
+ * Every label history retains is truncated to it, not just a barrier's. A label
+ * can be built from data, and a bound that merely refused an oversized one would
+ * still have to retain it to say which gesture it refused.
+ */
+export const MAX_BARRIER_LABEL_LENGTH = 200;
+
+function barrier_label(label: string): string {
+    return label.length <= MAX_BARRIER_LABEL_LENGTH
+        ? label
+        : `${label.slice(0, MAX_BARRIER_LABEL_LENGTH - 1)}…`;
 }
 
 export interface HistoryStackState {
@@ -297,10 +318,11 @@ function measure_costs(action: HistoryAction): HistoryCosts {
 function own_and_measure(action: HistoryAction, budget = Infinity): OwnedAction | undefined {
     const cells = new Set<string>();
     const owned: HistoryChange[] = [];
-    const label = String(action.label);
-    // The label is retained too, and a caller can build it from data.
+    // Truncated rather than charged: a label can be built from data, and a bound
+    // that merely refused an oversized one would still have to retain it to say
+    // so in the barrier.
+    const label = barrier_label(String(action.label));
     let byteCost = estimate_string_bytes(label);
-    if (byteCost > budget) return undefined;
     for (const change of action.changes) {
         const canonical = own_history_change(change);
         byteCost += estimate_change_bytes(canonical);
@@ -405,6 +427,13 @@ export function record_history_action(
     action: HistoryAction,
     bounds: HistoryBounds = DEFAULT_HISTORY_BOUNDS,
 ): RecordOutcome {
+    // A gesture that moved nothing is answered before the bounds are consulted, so
+    // no barrier can be installed for an action that never needed recording — a
+    // label built from data must not be able to destroy valid history.
+    const label = barrier_label(String(action.label));
+    const changes = [...action.changes];
+    if (changes.length === 0) return { kind: 'empty', state };
+
     // Canonicalized and measured in one walk, which abandons the rebuild as soon
     // as the hard bound is passed. Everything below therefore reads the graph
     // history will retain, not whatever the caller's object answers next.
@@ -415,20 +444,19 @@ export function record_history_action(
     // first.
     const owned = CANONICAL_ACTIONS.has(action)
         ? { action, ...measure_costs(action) }
-        : own_and_measure(action, bounds.hardMaxBytes);
+        : own_and_measure({ label, changes }, bounds.hardMaxBytes);
     if (owned === undefined || owned.byteCost > bounds.hardMaxBytes) {
         return {
             kind: 'refused',
             state: {
                 undoStack: [],
                 redoStack: [],
-                barrier: { reason: 'action-too-large', label: String(action.label) },
+                barrier: { reason: 'action-too-large', label },
             },
             reason: 'action-too-large',
             hardMaxBytes: bounds.hardMaxBytes,
         };
     }
-    if (owned.action.changes.length === 0) return { kind: 'empty', state };
 
     const entry: HistoryEntry = { ...owned, id: {}, moves: 0 };
     const { kept, evicted } = evict_to_fit([...state.undoStack, entry], bounds);
@@ -465,9 +493,17 @@ export type PeekResult = AvailableMove | ExhaustedMove | BlockedMove;
  * What a move would apply, without committing to it.
  *
  * Replay is asynchronous and refusable — it re-acquires an edit session and
- * compares against disk — so the entry has to be readable before it is
- * consumed. The caller commits with `commit_history_move` only once replay has
- * landed, and simply keeps the old state when it has not.
+ * compares against disk — so the entry has to be readable before it is consumed.
+ * The caller commits with `commit_history_move` only once replay has landed, and
+ * simply keeps the old state when it has not.
+ *
+ * ONE REPLAY AT A TIME is the caller's obligation. The stack tolerates a commit
+ * arriving late, out of order, or twice, and says which case it was; what it
+ * cannot repair is two replays of the SAME entry in flight together. Both would
+ * find the same compare-and-swap precondition satisfied, both could land, and no
+ * bookkeeping here can tell "the second attempt applied it again" from "the first
+ * attempt's commit is merely late". So the caller must not start a move while one
+ * is outstanding — a keypress arriving mid-replay is dropped, not queued twice.
  */
 export function peek_history(state: HistoryStackState, direction: HistoryDirection): PeekResult {
     const stack = stack_for(state, direction);
