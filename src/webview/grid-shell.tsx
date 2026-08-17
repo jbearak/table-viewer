@@ -47,6 +47,8 @@ import {
 } from './column-projection';
 import {
     build_grid_columns,
+    LAST_COLUMN_RESIZE_GUTTER_PX,
+    MAX_AUTO_FIT_COLUMN_WIDTH_PX,
     MAX_COLUMN_WIDTH_PX,
 } from './grid-model';
 import { ContextMenu } from './context-menu';
@@ -3491,7 +3493,8 @@ export function GridShell({
                 rows={row_count}
                 columns={columns}
                 maxColumnWidth={MAX_COLUMN_WIDTH_PX}
-                maxColumnAutoWidth={MAX_COLUMN_WIDTH_PX}
+                maxColumnAutoWidth={MAX_AUTO_FIT_COLUMN_WIDTH_PX}
+                overscrollX={LAST_COLUMN_RESIZE_GUTTER_PX}
                 mergedRanges={merged_ranges}
                 getCellContent={get_cell_content}
                 rowHeight={get_row_height}
