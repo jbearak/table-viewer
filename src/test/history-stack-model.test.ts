@@ -599,6 +599,35 @@ describe('peek_history and commit_history_move', () => {
         expect(Object.isFrozen(changes)).toBe(false);
     });
 
+    it('refuses an oversized gesture without walking past the bound', () => {
+        // The changes are not copied before the budgeted walk: a copy would
+        // enumerate and allocate the whole of a million-change gesture before the
+        // budget could stop, which is the peak-memory spike the budget exists to
+        // avoid.
+        const hard: HistoryBounds = {
+            maxActions: 100,
+            maxCells: 1_000_000,
+            softMaxBytes: 1_000,
+            hardMaxBytes: 2_000,
+        };
+        let yielded = 0;
+        const backing = Array.from({ length: 100 }, (_unused, index) => cell_change(index, 0, 'x'.repeat(1_000)));
+        const changes = Object.create(backing, {
+            [Symbol.iterator]: {
+                value: function* iterate() {
+                    for (const change of backing) {
+                        yielded += 1;
+                        yield change;
+                    }
+                },
+            },
+        }) as readonly HistoryChange[];
+
+        expect(record_history_action(empty_history_stack(), { label: 'Huge', changes }, hard).kind)
+            .toBe('refused');
+        expect(yielded).toBeLessThan(10);
+    });
+
     it('reports a second commit of the same peeked entry as already committed', () => {
         // Replay is asynchronous; a commit that ran twice must not carry a
         // second, never-replayed gesture onto the redo stack, where redo would
@@ -677,6 +706,63 @@ describe('peek_history and commit_history_move', () => {
         for (const _ of [0, 1, 2]) state = move(state, 'undo');
         expect(state.undoStack).toHaveLength(0);
         expect(state.redoStack.map((item) => item.action.label)).toEqual(['B', 'C', 'A']);
+    });
+
+    it('does not adopt a landed redo whose history a clear discarded', () => {
+        // The clear means the document under history stopped being the one it
+        // described — a workbook replaced, a sheet set beyond re-identification.
+        // Readmitting the entry would let undo write the old workbook's content
+        // into the new one wherever their worksheet identities happen to agree.
+        const undone = move(record_all(['A', 'B']), 'undo');
+        const entry = top(undone, 'redo');
+
+        const outcome = commit_history_move(clear_history(undone), 'redo', entry);
+        expect(outcome.kind).toBe('dropped');
+        expect(outcome.state.undoStack).toHaveLength(0);
+    });
+
+    it('does not adopt a landed redo whose history a refusal discarded', () => {
+        const hard: HistoryBounds = {
+            maxActions: 100,
+            maxCells: 1_000_000,
+            softMaxBytes: 1_000,
+            hardMaxBytes: 2_000,
+        };
+        const undone = move(record_all(['A', 'B']), 'undo');
+        const entry = top(undone, 'redo');
+        const refused = record_history_action(
+            undone,
+            history_action('Huge', [cell_change(9, 0, 'x'.repeat(5_000))]),
+            hard,
+        );
+        expect(refused.kind).toBe('refused');
+
+        expect(commit_history_move(refused.state, 'redo', entry).kind).toBe('dropped');
+    });
+
+    it('re-applies the bounds when adopting, because adoption grows the history', () => {
+        // Recording trims to the bound and clears redo; appending the landed redo
+        // on top would otherwise leave the history one entry over its limit.
+        const bounds: HistoryBounds = {
+            maxActions: 3,
+            maxCells: 1_000_000,
+            softMaxBytes: 128 * 1024 * 1024,
+            hardMaxBytes: 256 * 1024 * 1024,
+        };
+        const undone = move(record_all(['A', 'B', 'C', 'D'], bounds), 'undo');
+        expect(undone.undoStack.map((item) => item.action.label)).toEqual(['B', 'C']);
+        const entry = top(undone, 'redo');
+        const branched = record_history_action(
+            undone,
+            history_action('E', [cell_change(9, 0, 'e')]),
+            bounds,
+        ).state;
+        expect(branched.undoStack.map((item) => item.action.label)).toEqual(['B', 'C', 'E']);
+
+        const outcome = commit_history_move(branched, 'redo', entry, bounds);
+        expect(outcome.kind).toBe('moved');
+        expect(outcome.state.undoStack.map((item) => item.action.label)).toEqual(['C', 'E', 'D']);
+        expect(outcome.kind === 'moved' && outcome.evicted).toBe(1);
     });
 
     it('drops a commit whose entry a clear discarded', () => {

@@ -51,13 +51,26 @@ export interface HistoryAction {
     readonly changes: readonly HistoryChange[];
 }
 
-/** A recorded action plus the costs the bounds are enforced against. */
-export interface HistoryEntry {
+/** An action history owns, with the costs the bounds are enforced against. */
+export interface MeasuredAction {
     readonly action: HistoryAction;
     /** Distinct cells the action touches, counting a cell once per change. */
     readonly cellCount: number;
     /** Estimated retained bytes. Approximate by construction — see `estimate_*`. */
     readonly byteCost: number;
+}
+
+/** A recorded action, identified so an asynchronous replay can be committed. */
+export interface HistoryEntry extends MeasuredAction {
+    /**
+     * The history this entry was recorded into.
+     *
+     * Bumped whenever history is discarded wholesale — a clear or a refusal — so
+     * a replay still in flight across that boundary can be told from one whose
+     * entry merely left the stack because a fresh recording cleared the redos.
+     * The first must not be readmitted; the second must.
+     */
+    readonly epoch: number;
     /**
      * Which entry this is, for the life of the session. Stable across moves.
      *
@@ -119,6 +132,8 @@ export interface HistoryStackState {
     /** Most recently undone last; the last element is the next thing redo would apply. */
     readonly redoStack: readonly HistoryEntry[];
     readonly barrier: HistoryBarrier | undefined;
+    /** Incremented on every discard of the whole history. See `HistoryEntry.epoch`. */
+    readonly epoch: number;
 }
 
 export interface HistoryBounds {
@@ -161,7 +176,7 @@ export const DEFAULT_HISTORY_BOUNDS: HistoryBounds = {
 };
 
 export function empty_history_stack(): HistoryStackState {
-    return { undoStack: [], redoStack: [], barrier: undefined };
+    return { undoStack: [], redoStack: [], barrier: undefined, epoch: 0 };
 }
 
 /**
@@ -289,9 +304,7 @@ interface HistoryCosts {
 }
 
 /** The action as history would retain it, with its costs. */
-interface OwnedAction extends HistoryCosts {
-    readonly action: HistoryAction;
-}
+type OwnedAction = MeasuredAction;
 
 /** Costs of an action this module already owns, so nothing needs rebuilding. */
 function measure_costs(action: HistoryAction): HistoryCosts {
@@ -345,11 +358,16 @@ function own_and_measure(action: HistoryAction, budget = Infinity): OwnedAction 
  */
 const CANONICAL_ACTIONS = new WeakSet<HistoryAction>();
 
-/** Measures an action's costs and takes ownership of it. Both costs are estimates. */
-export function measure_history_action(action: HistoryAction): HistoryEntry {
+/**
+ * Measures an action's costs and takes ownership of it. Both costs are estimates.
+ *
+ * No identity is handed out: only `record_history_action` can mint an entry,
+ * because an entry's `id`, `moves` and `epoch` only mean anything relative to
+ * the history it was recorded into.
+ */
+export function measure_history_action(action: HistoryAction): MeasuredAction {
     // No budget, so the walk always completes.
-    const owned = own_and_measure(action) as OwnedAction;
-    return { ...owned, id: {}, moves: 0 };
+    return own_and_measure(action) as OwnedAction;
 }
 
 export interface RecordedOutcome {
@@ -427,12 +445,7 @@ export function record_history_action(
     action: HistoryAction,
     bounds: HistoryBounds = DEFAULT_HISTORY_BOUNDS,
 ): RecordOutcome {
-    // A gesture that moved nothing is answered before the bounds are consulted, so
-    // no barrier can be installed for an action that never needed recording — a
-    // label built from data must not be able to destroy valid history.
     const label = barrier_label(String(action.label));
-    const changes = [...action.changes];
-    if (changes.length === 0) return { kind: 'empty', state };
 
     // Canonicalized and measured in one walk, which abandons the rebuild as soon
     // as the hard bound is passed. Everything below therefore reads the graph
@@ -442,28 +455,54 @@ export function record_history_action(
     // `history_action` was already built in full, so it is only measured here —
     // which is why a caller recording an enormous gesture should not build one
     // first.
+    //
+    // `action.changes` is passed through rather than copied: a copy would
+    // enumerate and allocate the whole of a million-change gesture before the
+    // budget could stop at the first oversized prefix, which is the peak-memory
+    // spike the budget exists to avoid. The walk reads the array once and retains
+    // only what it visited.
     const owned = CANONICAL_ACTIONS.has(action)
         ? { action, ...measure_costs(action) }
-        : own_and_measure({ label, changes }, bounds.hardMaxBytes);
-    if (owned === undefined || owned.byteCost > bounds.hardMaxBytes) {
-        return {
-            kind: 'refused',
-            state: {
-                undoStack: [],
-                redoStack: [],
-                barrier: { reason: 'action-too-large', label },
-            },
-            reason: 'action-too-large',
-            hardMaxBytes: bounds.hardMaxBytes,
-        };
-    }
+        : own_and_measure({ label, changes: action.changes }, bounds.hardMaxBytes);
+    if (owned === undefined) return refused(state, label, bounds);
+    // A gesture that moved nothing is answered before the byte bound is
+    // consulted, so no barrier can be installed for an action that never needed
+    // recording — a label built from data must not be able to destroy valid
+    // history. It is answered after the walk because the walk is what reads the
+    // changes, and reading them twice is what the copy above was avoiding.
+    if (owned.action.changes.length === 0) return { kind: 'empty', state };
+    if (owned.byteCost > bounds.hardMaxBytes) return refused(state, label, bounds);
 
-    const entry: HistoryEntry = { ...owned, id: {}, moves: 0 };
+    const entry: HistoryEntry = { ...owned, id: {}, moves: 0, epoch: state.epoch };
     const { kept, evicted } = evict_to_fit([...state.undoStack, entry], bounds);
     return {
         kind: 'recorded',
-        state: { undoStack: kept, redoStack: [], barrier: state.barrier },
+        state: { undoStack: kept, redoStack: [], barrier: state.barrier, epoch: state.epoch },
         evicted,
+    };
+}
+
+/**
+ * History discarded behind a barrier, the gesture left applied.
+ *
+ * The epoch advances with the discard: a replay in flight across it must not be
+ * readmitted afterwards, and the epoch is how a late commit can tell.
+ */
+function refused(
+    state: HistoryStackState,
+    label: string,
+    bounds: HistoryBounds,
+): RefusedOutcome {
+    return {
+        kind: 'refused',
+        state: {
+            undoStack: [],
+            redoStack: [],
+            barrier: { reason: 'action-too-large', label },
+            epoch: state.epoch + 1,
+        },
+        reason: 'action-too-large',
+        hardMaxBytes: bounds.hardMaxBytes,
     };
 }
 
@@ -519,6 +558,11 @@ export function peek_history(state: HistoryStackState, direction: HistoryDirecti
 export interface MovedCommit {
     readonly kind: 'moved';
     readonly state: HistoryStackState;
+    /**
+     * Older entries dropped to make room. Only ever non-zero on the adoption
+     * path below, which grows the history rather than moving within it.
+     */
+    readonly evicted: number;
 }
 
 /**
@@ -570,11 +614,20 @@ export type CommitOutcome = MovedCommit | AlreadyCommitted | DroppedCommit;
  * chronologically, its content having landed after everything the undo stack
  * already holds. Discarding it would leave a reapplied change with no record, and
  * the next undo would skip it to unwind an older gesture instead.
+ *
+ * Adoption is confined to that one case by the epoch: an entry from a history
+ * since discarded describes a document this one may no longer be, and readmitting
+ * it would let undo write the old workbook's content into the new one wherever
+ * their worksheet identities happen to agree. And because adoption grows the
+ * history rather than moving within it, `bounds` are re-applied — otherwise a
+ * redo landing into a stack recording had just trimmed to the limit would leave
+ * it one entry over.
  */
 export function commit_history_move(
     state: HistoryStackState,
     direction: HistoryDirection,
     entry: HistoryEntry,
+    bounds: HistoryBounds = DEFAULT_HISTORY_BOUNDS,
 ): CommitOutcome {
     const other: HistoryDirection = direction === 'undo' ? 'redo' : 'undo';
     const destination = stack_for(state, other);
@@ -594,12 +647,12 @@ export function commit_history_move(
         // content IS applied; adopting it as the newest undo entry keeps history
         // able to unwind it, and is chronologically right because that content
         // was applied after everything the undo stack already holds.
-        if (direction === 'redo') {
+        // Unless history was discarded in the meantime: an entry from an earlier
+        // epoch describes a document this history no longer claims to.
+        if (direction === 'redo' && entry.epoch === state.epoch) {
             const adopted: HistoryEntry = { ...entry, moves: entry.moves + 1 };
-            return {
-                kind: 'moved',
-                state: { ...state, undoStack: [...state.undoStack, adopted] },
-            };
+            const { kept, evicted } = evict_to_fit([...state.undoStack, adopted], bounds);
+            return { kind: 'moved', state: { ...state, undoStack: kept }, evicted };
         }
         return { kind: 'dropped', state };
     }
@@ -614,6 +667,7 @@ export function commit_history_move(
     return {
         kind: 'moved',
         state: with_stacks(state, direction, from.slice(0, -1), [...destination, moved]),
+        evicted: 0,
     };
 }
 
@@ -624,8 +678,8 @@ function with_stacks(
     to: readonly HistoryEntry[],
 ): HistoryStackState {
     return direction === 'undo'
-        ? { undoStack: from, redoStack: to, barrier: state.barrier }
-        : { undoStack: to, redoStack: from, barrier: state.barrier };
+        ? { ...state, undoStack: from, redoStack: to }
+        : { ...state, undoStack: to, redoStack: from };
 }
 
 /**
@@ -637,7 +691,7 @@ function with_stacks(
  * further back has not stopped being true.
  */
 export function clear_history(state: HistoryStackState): HistoryStackState {
-    return { undoStack: [], redoStack: [], barrier: state.barrier };
+    return { undoStack: [], redoStack: [], barrier: state.barrier, epoch: state.epoch + 1 };
 }
 
 export interface HistoryUsage {
