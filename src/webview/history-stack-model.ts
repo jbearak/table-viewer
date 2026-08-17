@@ -123,6 +123,14 @@ export interface HistoryBounds {
  * 200MiB of text and immediately wants it back is the exact case undo is for.
  * Past the hard bound the retained copy is a bigger liability than the lost
  * affordance, and `HistoryBarrier` reports the loss instead of hiding it.
+ *
+ * `maxCells` is the loosest of the three in practice. A canonical cell change
+ * costs at least `CHANGE_OVERHEAD_BYTES` in shape alone, so the byte bounds bind
+ * first on any wide gesture and a paste approaching a million cells is refused on
+ * bytes long before the count matters. It is kept as a second ceiling because it
+ * is the one a reader reasons about — "how many cells can I undo" — and because
+ * it still binds on the accretion case the byte bounds are loose about: many
+ * modest gestures whose shapes add up.
  */
 export const DEFAULT_HISTORY_BOUNDS: HistoryBounds = {
     maxActions: 100,
@@ -135,8 +143,25 @@ export function empty_history_stack(): HistoryStackState {
     return { undoStack: [], redoStack: [], barrier: undefined };
 }
 
-/** Fixed per-change allowance for the object graph around the payload. */
-const CHANGE_OVERHEAD_BYTES = 256;
+/**
+ * Fixed per-change allowance for the object graph around the payload.
+ *
+ * A canonical cell change is not one object but a small tree of them: the
+ * `{kind, delta}` wrapper, the delta, its worksheet target, two overlay states
+ * each with two dimensions, a transition with two sides, and the value objects
+ * those hold. Fifteen-odd small objects, each with a header and its slots, so a
+ * few hundred bytes of shape before a single character of content.
+ *
+ * Set high enough to cover that, because the alternative is worse than a
+ * conservative refusal: a per-change figure that flatters the shape lets a paste
+ * of a million short values measure ~250MiB and retain a multiple of it, which is
+ * how a bounded history exhausts the heap it was bounded to protect. A
+ * consequence worth naming: with this figure the byte bound binds well before
+ * `maxCells` on wide gestures, so a million-cell paste is refused — history
+ * clears behind a barrier and the gesture stays applied. That is the designed
+ * behaviour for a gesture too large to retain, not an accident of the constant.
+ */
+const CHANGE_OVERHEAD_BYTES = 1_024;
 /** Fixed per-run allowance, on top of the run's own text. */
 const RUN_OVERHEAD_BYTES = 64;
 
@@ -247,6 +272,17 @@ interface OwnedAction extends HistoryCosts {
     readonly action: HistoryAction;
 }
 
+/** Costs of an action this module already owns, so nothing needs rebuilding. */
+function measure_costs(action: HistoryAction): HistoryCosts {
+    const cells = new Set<string>();
+    let byteCost = estimate_string_bytes(action.label);
+    for (const change of action.changes) {
+        cells.add(change_cell_key(change));
+        byteCost += estimate_change_bytes(change);
+    }
+    return { cellCount: cells.size, byteCost };
+}
+
 /**
  * The action history will retain, canonicalized and measured together.
  *
@@ -261,7 +297,10 @@ interface OwnedAction extends HistoryCosts {
 function own_and_measure(action: HistoryAction, budget = Infinity): OwnedAction | undefined {
     const cells = new Set<string>();
     const owned: HistoryChange[] = [];
-    let byteCost = 0;
+    const label = String(action.label);
+    // The label is retained too, and a caller can build it from data.
+    let byteCost = estimate_string_bytes(label);
+    if (byteCost > budget) return undefined;
     for (const change of action.changes) {
         const canonical = own_history_change(change);
         byteCost += estimate_change_bytes(canonical);
@@ -269,12 +308,20 @@ function own_and_measure(action: HistoryAction, budget = Infinity): OwnedAction 
         cells.add(change_cell_key(canonical));
         owned.push(canonical);
     }
-    return {
-        action: Object.freeze({ label: action.label, changes: Object.freeze(owned) }),
-        cellCount: cells.size,
-        byteCost,
-    };
+    const canonical = Object.freeze({ label, changes: Object.freeze(owned) });
+    CANONICAL_ACTIONS.add(canonical);
+    return { action: canonical, cellCount: cells.size, byteCost };
 }
+
+/**
+ * Actions this module built, which therefore need no second rebuild.
+ *
+ * `history_action` exists so a caller can hold an owned action, and a caller who
+ * uses it before recording would otherwise pay for the whole canonical graph
+ * twice — once unbudgeted in the builder, once again in the recorder. Weakly
+ * held, so remembering an action never keeps it alive.
+ */
+const CANONICAL_ACTIONS = new WeakSet<HistoryAction>();
 
 /** Measures an action's costs and takes ownership of it. Both costs are estimates. */
 export function measure_history_action(action: HistoryAction): HistoryEntry {
@@ -361,8 +408,15 @@ export function record_history_action(
     // Canonicalized and measured in one walk, which abandons the rebuild as soon
     // as the hard bound is passed. Everything below therefore reads the graph
     // history will retain, not whatever the caller's object answers next.
-    const owned = own_and_measure(action, bounds.hardMaxBytes);
-    if (owned === undefined) {
+    //
+    // Pass a plain `{label, changes}` to get that short circuit. An action from
+    // `history_action` was already built in full, so it is only measured here —
+    // which is why a caller recording an enormous gesture should not build one
+    // first.
+    const owned = CANONICAL_ACTIONS.has(action)
+        ? { action, ...measure_costs(action) }
+        : own_and_measure(action, bounds.hardMaxBytes);
+    if (owned === undefined || owned.byteCost > bounds.hardMaxBytes) {
         return {
             kind: 'refused',
             state: {

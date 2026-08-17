@@ -179,18 +179,60 @@ describe('record_history_action', () => {
         expect(Object.isFrozen(recorded?.action.changes)).toBe(true);
     });
 
-    it('shares a re-recorded action\'s content rather than copying it', () => {
-        // Canonicalizing rebuilds the skeleton on every pass, which is a handful
-        // of small objects per cell. The CONTENT is shared: a supported gesture is
-        // a million cells, and duplicating that would double peak memory exactly
-        // when there is least of it.
-        const long = 'x'.repeat(1_000);
-        const action = history_action('Edit', [cell_change(0, 0, long)]);
+    it('does not rebuild an action it already owns', () => {
+        // `history_action` exists so a caller can hold an owned action; rebuilding
+        // it on the way in would pay for the whole canonical graph twice.
+        const action = history_action('Edit', [cell_change(0, 0, 'x'.repeat(1_000))]);
         const outcome = record_history_action(empty_history_stack(), action);
-        const recorded = outcome.state.undoStack[0]?.action.changes[0];
+        expect(outcome.state.undoStack[0]?.action).toBe(action);
+    });
 
-        expect(recorded?.delta).not.toBe(action.changes[0]?.delta);
-        expect(recorded).toEqual(action.changes[0]);
+    it('shares a caller-built action\'s content rather than copying it', () => {
+        // Canonicalizing rebuilds the skeleton, which is a handful of small
+        // objects per cell. The CONTENT is shared: a supported gesture is a
+        // million cells, and duplicating that would double peak memory exactly
+        // when there is least of it.
+        const change = cell_change(0, 0, 'x'.repeat(1_000));
+        const outcome = record_history_action(empty_history_stack(), {
+            label: 'Edit',
+            changes: [change],
+        });
+        const recorded = outcome.state.undoStack[0]?.action.changes[0];
+        if (recorded?.kind !== 'cell' || change.kind !== 'cell') {
+            throw new Error('fixture did not build a cell change');
+        }
+
+        expect(recorded.delta).not.toBe(change.delta);
+        expect(recorded.delta.value?.desired.content.text)
+            .toBe(change.delta.value?.desired.content.text);
+    });
+
+    it('charges the label, which a caller can build from data', () => {
+        const hard: HistoryBounds = {
+            maxActions: 100,
+            maxCells: 1_000_000,
+            softMaxBytes: 1_000,
+            hardMaxBytes: 5_000,
+        };
+        const outcome = record_history_action(
+            empty_history_stack(),
+            { label: 'x'.repeat(50_000), changes: [cell_change(0, 0, 'v')] },
+            hard,
+        );
+        expect(outcome.kind).toBe('refused');
+    });
+
+    it('refuses a pre-built action that exceeds the hard bound', () => {
+        // The short circuit does not apply to an already-owned action, but the
+        // bound still does.
+        const hard: HistoryBounds = {
+            maxActions: 100,
+            maxCells: 1_000_000,
+            softMaxBytes: 1_000,
+            hardMaxBytes: 5_000,
+        };
+        const action = history_action('Huge', [cell_change(0, 0, 'x'.repeat(50_000))]);
+        expect(record_history_action(empty_history_stack(), action, hard).kind).toBe('refused');
     });
 
     it('strips a property nobody declared, rather than retaining it unmeasured', () => {
