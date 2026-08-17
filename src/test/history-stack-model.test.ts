@@ -639,18 +639,44 @@ describe('peek_history and commit_history_move', () => {
         expect(move(dropped, 'undo').undoStack.map((item) => item.action.label)).toEqual(['A']);
     });
 
-    it('drops a redo whose entry a concurrent record cleared', () => {
-        // Recording clears the redo stack, so a redo in flight when the user made
-        // a fresh edit finds its entry gone from both stacks though nothing ever
-        // committed it. Calling that already-committed would leave a reapplied
-        // change with no record, and the next undo would skip it and unwind an
-        // older gesture instead.
+    it('adopts a landed redo whose stack a concurrent record cleared', () => {
+        // Recording clears the redo stack, so a redo in flight when the user made a
+        // fresh edit finds its entry gone from both stacks though nothing ever
+        // committed it. Its content is applied all the same, so discarding it would
+        // leave a reapplied change with no record — the next undo would skip it and
+        // unwind an older gesture instead.
         const undone = move(record_all(['A', 'B']), 'undo');
         const entry = top(undone, 'redo');
         const branched = record_history_action(undone, history_action('C', [cell_change(9, 0, 'c')])).state;
         expect(branched.redoStack).toHaveLength(0);
 
-        expect(commit_history_move(branched, 'redo', entry).kind).toBe('dropped');
+        const outcome = commit_history_move(branched, 'redo', entry);
+        expect(outcome.kind).toBe('moved');
+        // Newest, which is also where it belongs: its content landed last.
+        expect(outcome.state.undoStack.map((item) => item.action.label)).toEqual(['A', 'C', 'B']);
+        expect(outcome.state.redoStack).toHaveLength(0);
+    });
+
+    it('does not adopt an adopted redo twice', () => {
+        const undone = move(record_all(['A', 'B']), 'undo');
+        const entry = top(undone, 'redo');
+        const branched = record_history_action(undone, history_action('C', [cell_change(9, 0, 'c')])).state;
+        const adopted = commit_history_move(branched, 'redo', entry).state;
+
+        const again = commit_history_move(adopted, 'redo', entry);
+        expect(again.kind).toBe('already-committed');
+        expect(again.state.undoStack.map((item) => item.action.label)).toEqual(['A', 'C', 'B']);
+    });
+
+    it('can unwind everything an adoption left applied', () => {
+        const undone = move(record_all(['A', 'B']), 'undo');
+        const entry = top(undone, 'redo');
+        const branched = record_history_action(undone, history_action('C', [cell_change(9, 0, 'c')])).state;
+        let state = commit_history_move(branched, 'redo', entry).state;
+
+        for (const _ of [0, 1, 2]) state = move(state, 'undo');
+        expect(state.undoStack).toHaveLength(0);
+        expect(state.redoStack.map((item) => item.action.label)).toEqual(['B', 'C', 'A']);
     });
 
     it('drops a commit whose entry a clear discarded', () => {

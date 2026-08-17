@@ -533,9 +533,10 @@ export interface AlreadyCommitted {
 }
 
 /**
- * The replay landed, but the entry is no longer in a position to move: something
- * was recorded, another move committed, or history was cleared while this replay
- * was in flight.
+ * The replay landed, but the entry is no longer in a position to move: another
+ * move committed, or history was cleared, while this replay was in flight. (A
+ * landed redo whose stack was cleared by a fresh recording is adopted instead —
+ * see `commit_history_move`.)
  *
  * The entry is dropped rather than moved. Its content HAS been replayed, so
  * leaving it on the source stack would claim a change is applied that is not —
@@ -564,9 +565,11 @@ export type CommitOutcome = MovedCommit | AlreadyCommitted | DroppedCommit;
  * Absence from the source stack is not by itself proof the commit already ran.
  * Recording clears the redo stack, so a redo that was in flight when the user
  * made a fresh edit finds its entry gone from both stacks even though nothing
- * ever committed it — and calling that `already-committed` would leave a
- * reapplied change with no record, where the next undo would skip it and unwind
- * an older gesture instead.
+ * ever committed it. Its content is applied all the same, so it is ADOPTED as the
+ * newest undo entry rather than discarded — which is also where it belongs
+ * chronologically, its content having landed after everything the undo stack
+ * already holds. Discarding it would leave a reapplied change with no record, and
+ * the next undo would skip it to unwind an older gesture instead.
  */
 export function commit_history_move(
     state: HistoryStackState,
@@ -585,7 +588,21 @@ export function commit_history_move(
     }
 
     const position = from.findIndex((candidate) => candidate.id === entry.id);
-    if (position === -1) return { kind: 'dropped', state };
+    if (position === -1) {
+        // The entry has left the stack without being committed — only recording
+        // can do that, by clearing the redo stack. The replay landed, so its
+        // content IS applied; adopting it as the newest undo entry keeps history
+        // able to unwind it, and is chronologically right because that content
+        // was applied after everything the undo stack already holds.
+        if (direction === 'redo') {
+            const adopted: HistoryEntry = { ...entry, moves: entry.moves + 1 };
+            return {
+                kind: 'moved',
+                state: { ...state, undoStack: [...state.undoStack, adopted] },
+            };
+        }
+        return { kind: 'dropped', state };
+    }
     if (position !== from.length - 1) {
         const kept = [...from.slice(0, position), ...from.slice(position + 1)];
         return {
