@@ -10,6 +10,7 @@ import {
 import {
     absent_overlay,
     build_cell_history_delta,
+    canonical_cell_history_delta,
     combined_overlay,
     delta_addresses_same_cell,
     delta_touches_hyperlink,
@@ -23,6 +24,7 @@ import {
     overlay_states_equal,
     transition_side,
     value_only_overlay,
+    type CellHistoryDelta,
     type CellOverlayState,
     type HistoryDirtyEntry,
 } from '../webview/history-cell-state-model';
@@ -580,5 +582,95 @@ describe('worksheet identity', () => {
             worksheet: { sheetIndex: 0, sheetName: 'Sheet2', worksheetId: 'ws-2' },
         };
         expect(delta_addresses_same_cell(d!, other)).toBe(false);
+    });
+});
+
+describe('canonical_cell_history_delta', () => {
+    const base = (text: string) => build_cell_history_delta({
+        worksheet: SHEET,
+        sourceRow: 1,
+        sourceColumn: 2,
+        before: absent_overlay(),
+        after: value_only_overlay(history_value(text), history_value('a')),
+        persistedValue: history_value('a'),
+        persistedHyperlink: null,
+    })!;
+
+    it('preserves the aliasing the byte estimate depends on', () => {
+        // The same HistoryValue object stands in the transition and the overlay,
+        // so the string exists once in memory. Rebuilding it twice would make a
+        // holder charge it twice and refuse gestures that fit its bounds.
+        const delta = canonical_cell_history_delta(base('b'));
+        const overlay = delta.afterOverlay;
+        if (overlay.kind !== 'present' || overlay.value.kind !== 'present') {
+            throw new Error('fixture did not build a present value dimension');
+        }
+        expect(delta.value!.desired.content).toBe(overlay.value.value);
+    });
+
+    it('drops a property nobody declared', () => {
+        const smuggled = { ...base('b'), extra: 'x'.repeat(100) } as unknown as CellHistoryDelta;
+        expect(canonical_cell_history_delta(smuggled)).not.toHaveProperty('extra');
+    });
+
+    it('drops an undeclared property from a nested run', () => {
+        const styled_value = history_value('b', {
+            runs: [{ text: 'b', extra: 'x' } as unknown as { text: string }],
+        } as never);
+        const delta = build_cell_history_delta({
+            worksheet: SHEET,
+            sourceRow: 1,
+            sourceColumn: 2,
+            before: absent_overlay(),
+            after: value_only_overlay(styled_value, history_value('a')),
+            persistedValue: history_value('a'),
+            persistedHyperlink: null,
+        })!;
+        expect(delta.value!.desired.content.runs!.runs[0]).not.toHaveProperty('extra');
+    });
+
+    it('reads an accessor-backed side once, so it cannot pair two answers', () => {
+        // A side read twice could answer with two different objects, pairing one
+        // answer's content with the other's overlay membership — a state the
+        // caller never supplied, which replay would compare against or restore.
+        const source = base('b');
+        let reads = 0;
+        const delta = {
+            ...source,
+            value: {
+                mode: source.value!.mode,
+                get expected() { reads += 1; return source.value!.expected; },
+                desired: source.value!.desired,
+            },
+        } as unknown as CellHistoryDelta;
+
+        canonical_cell_history_delta(delta);
+        expect(reads).toBe(1);
+    });
+
+    it('copies runs into a plain array, ignoring a foreign species', () => {
+        // A readonly array can be an Array subclass, and `map` honours its
+        // Symbol.species — which would carry undeclared state into what a holder
+        // retains and its estimator never charges.
+        class Sneaky<T> extends Array<T> {
+            smuggled = 'x'.repeat(100);
+        }
+        const sneaky = new Sneaky<{ text: string }>();
+        sneaky.push({ text: 'b' });
+        const runs = sneaky as unknown as readonly { text: string }[];
+        const value = history_value('b', { runs } as never);
+        const delta = canonical_cell_history_delta(build_cell_history_delta({
+            worksheet: SHEET,
+            sourceRow: 1,
+            sourceColumn: 2,
+            before: absent_overlay(),
+            after: value_only_overlay(value, history_value('a')),
+            persistedValue: history_value('a'),
+            persistedHyperlink: null,
+        })!);
+
+        const canonical_runs = delta.value!.desired.content.runs!.runs;
+        expect(canonical_runs).not.toBeInstanceOf(Sneaky);
+        expect(canonical_runs).not.toHaveProperty('smuggled');
     });
 });

@@ -667,8 +667,22 @@ function canonical_value(value: HistoryValue): HistoryValue {
         text: value.text,
         ...(runs === undefined
             ? {}
-            : { runs: { runs: runs.runs.map(canonical_run) } }),
+            : { runs: { runs: canonical_runs(runs.runs) } }),
     };
+}
+
+/**
+ * Copies runs into a plain array.
+ *
+ * A `readonly RichTextRun[]` can be an Array subclass, and `map` honours its
+ * `Symbol.species` — so mapping would hand back another subclass, carrying
+ * whatever undeclared state it holds into what history retains and the estimator
+ * never charges. A `for` loop into a literal cannot be redirected that way.
+ */
+function canonical_runs(runs: readonly RichTextRun[]): readonly RichTextRun[] {
+    const out: RichTextRun[] = [];
+    for (const run of runs) out.push(canonical_run(run));
+    return out;
 }
 
 function canonical_run(run: RichTextRun): RichTextRun {
@@ -698,14 +712,26 @@ function canonical_hyperlink(link: CellHyperlink | null): CellHyperlink | null {
         : { kind: 'internal', location: link.location, ...rest };
 }
 
+interface CanonicalTransition<T> {
+    readonly mode: CellHistoryTransitionMode;
+    readonly expected: HistoryDimensionSide<T>;
+    readonly desired: HistoryDimensionSide<T>;
+}
+
 function canonical_transition<T>(
-    transition: { readonly mode: CellHistoryTransitionMode; readonly expected: HistoryDimensionSide<T>; readonly desired: HistoryDimensionSide<T> },
+    transition: CanonicalTransition<T>,
     content: (value: T) => T,
-): { readonly mode: CellHistoryTransitionMode; readonly expected: HistoryDimensionSide<T>; readonly desired: HistoryDimensionSide<T> } {
+): CanonicalTransition<T> {
+    // Each side is read once. An accessor read twice could answer with two
+    // different objects, and the canonical delta would then pair one side's
+    // content with the other's overlay membership — a state the caller never
+    // supplied, which replay would go on to compare against or restore.
+    const expected = transition.expected;
+    const desired = transition.desired;
     return {
         mode: transition.mode,
-        expected: { content: content(transition.expected.content), overlay: transition.expected.overlay },
-        desired: { content: content(transition.desired.content), overlay: transition.desired.overlay },
+        expected: { content: content(expected.content), overlay: expected.overlay },
+        desired: { content: content(desired.content), overlay: desired.overlay },
     };
 }
 

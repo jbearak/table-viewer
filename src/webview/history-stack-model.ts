@@ -242,29 +242,45 @@ interface HistoryCosts {
     readonly byteCost: number;
 }
 
+/** The action as history would retain it, with its costs. */
+interface OwnedAction extends HistoryCosts {
+    readonly action: HistoryAction;
+}
+
 /**
- * An action's costs, read without retaining it.
+ * The action history will retain, canonicalized and measured together.
  *
- * Measuring precedes ownership so that an action too large to record is refused
- * before anything is copied for it. Cloning a gesture that exceeds the hard
- * bound would allocate a second copy of the very graph the bound exists to keep
- * out of memory, while the old history is still live — running out of memory on
- * the way to deciding not to keep it.
+ * `budget` stops the walk as soon as the retained bytes exceed it, returning
+ * `undefined`. That interleaving is the point: an oversized gesture has to be
+ * refused without first rebuilding the whole of it, because the caller's graph
+ * and the existing history are both still live while it is being rebuilt — the
+ * process can run out of memory on the way to deciding not to keep it. Rebuilding
+ * copies only the skeleton, but a gesture large enough to refuse has a great many
+ * skeletons.
  */
-function measure_costs(changes: readonly HistoryChange[]): HistoryCosts {
+function own_and_measure(action: HistoryAction, budget = Infinity): OwnedAction | undefined {
     const cells = new Set<string>();
+    const owned: HistoryChange[] = [];
     let byteCost = 0;
-    for (const change of changes) {
-        cells.add(change_cell_key(change));
-        byteCost += estimate_change_bytes(change);
+    for (const change of action.changes) {
+        const canonical = own_history_change(change);
+        byteCost += estimate_change_bytes(canonical);
+        if (byteCost > budget) return undefined;
+        cells.add(change_cell_key(canonical));
+        owned.push(canonical);
     }
-    return { cellCount: cells.size, byteCost };
+    return {
+        action: Object.freeze({ label: action.label, changes: Object.freeze(owned) }),
+        cellCount: cells.size,
+        byteCost,
+    };
 }
 
 /** Measures an action's costs and takes ownership of it. Both costs are estimates. */
 export function measure_history_action(action: HistoryAction): HistoryEntry {
-    const owned = own_action(action);
-    return { action: owned, ...measure_costs(owned.changes), id: {}, moves: 0 };
+    // No budget, so the walk always completes.
+    const owned = own_and_measure(action) as OwnedAction;
+    return { ...owned, id: {}, moves: 0 };
 }
 
 export interface RecordedOutcome {
@@ -279,7 +295,11 @@ export interface RefusedOutcome {
     /** History cleared, with a barrier installed. The gesture stays applied. */
     readonly state: HistoryStackState;
     readonly reason: 'action-too-large';
-    readonly byteCost: number;
+    /**
+     * The bound that was passed. No total accompanies it: the measurement stops
+     * at the bound rather than completing, precisely so an oversized gesture is
+     * never fully rebuilt just to report how oversized it was.
+     */
     readonly hardMaxBytes: number;
 }
 
@@ -338,30 +358,25 @@ export function record_history_action(
     action: HistoryAction,
     bounds: HistoryBounds = DEFAULT_HISTORY_BOUNDS,
 ): RecordOutcome {
-    // Canonicalized first, so everything below reads the graph history will
-    // retain rather than whatever the caller's object answers next.
-    const owned = own_action(action);
-    if (owned.changes.length === 0) return { kind: 'empty', state };
-
-    // Measured after canonicalization but before the payloads are copied: a
-    // refusal must not first duplicate the very graph the bound exists to keep
-    // out of memory, and `own_action` retains those payloads by reference.
-    const costs = measure_costs(owned.changes);
-    if (costs.byteCost > bounds.hardMaxBytes) {
+    // Canonicalized and measured in one walk, which abandons the rebuild as soon
+    // as the hard bound is passed. Everything below therefore reads the graph
+    // history will retain, not whatever the caller's object answers next.
+    const owned = own_and_measure(action, bounds.hardMaxBytes);
+    if (owned === undefined) {
         return {
             kind: 'refused',
             state: {
                 undoStack: [],
                 redoStack: [],
-                barrier: { reason: 'action-too-large', label: owned.label },
+                barrier: { reason: 'action-too-large', label: String(action.label) },
             },
             reason: 'action-too-large',
-            byteCost: costs.byteCost,
             hardMaxBytes: bounds.hardMaxBytes,
         };
     }
+    if (owned.action.changes.length === 0) return { kind: 'empty', state };
 
-    const entry: HistoryEntry = { action: owned, ...costs, id: {}, moves: 0 };
+    const entry: HistoryEntry = { ...owned, id: {}, moves: 0 };
     const { kept, evicted } = evict_to_fit([...state.undoStack, entry], bounds);
     return {
         kind: 'recorded',
@@ -562,36 +577,24 @@ export function action_is_single_worksheet(action: HistoryAction): boolean {
 }
 
 /**
- * The action history will retain, isolated from the caller.
+ * The change history will retain, isolated from the caller.
  *
- * Every action is CANONICALIZED rather than inspected and conditionally reused.
- * The declared fields are read exactly once into a fresh frozen object, so
- * nothing downstream can be surprised by the caller's: a `readonly` property may
- * legitimately be a getter, or live on a prototype, or sit beside extra
- * properties structural typing allows, and any of those makes "the graph I
- * measured" and "the graph I retained" two different things — which is how a
- * gesture walks past the hard bound with a stale `byteCost`, or changes what
- * replay does after its costs were fixed. Reading once is also cheap: the copy
- * is one array of wrappers, not the content.
+ * Every change is CANONICALIZED rather than inspected and conditionally reused.
+ * The declared fields are read exactly once into a fresh frozen object of the
+ * declared shape, so nothing downstream can be surprised by the caller's: a
+ * `readonly` property may legitimately be a getter, live on a prototype, or sit
+ * beside extra properties structural typing allows, and any of those makes "the
+ * graph measured" and "the graph retained" two different things — which is how an
+ * unmeasured payload rides past the hard bound, or replay's target changes after
+ * the costs were fixed.
  *
- * What canonicalizing rebuilds is the SKELETON — a handful of small objects per
- * cell. The content is shared, because the strings and their runs are copied by
- * reference into the new shape. That is what makes this affordable on the
- * million-cell gestures history has to bound rather than refuse: duplicating the
- * content would double peak memory at the exact moment there is least of it, and
- * would do it even for a gesture about to be refused for being too large.
+ * What is rebuilt is the SKELETON — a handful of small objects per cell. The
+ * content is shared, the strings and their runs copied by reference into the new
+ * shape. That is what makes this affordable on the million-cell gestures history
+ * has to bound rather than refuse: duplicating the content would double peak
+ * memory at the exact moment there is least of it.
  */
-function own_action(action: HistoryAction): HistoryAction {
-    const changes = [...action.changes].map(own_history_change);
-    return Object.freeze({ label: action.label, changes: Object.freeze(changes) });
-}
-
 function own_history_change(change: HistoryChange): HistoryChange {
-    // Read once, then rebuilt to the declared shape. Canonicalizing is what makes
-    // "the graph measured" and "the graph retained" the same object: a structural
-    // type admits getters, inherited fields and undeclared extras, and any of
-    // those could carry unmeasured megabytes past the bounds or answer
-    // differently after the costs were fixed.
     return change.kind === 'cell'
         ? Object.freeze({ kind: 'cell', delta: canonical_cell_history_delta(change.delta) })
         : Object.freeze({ kind: 'highlight', delta: canonical_highlight_delta(change.delta) });
@@ -614,7 +617,7 @@ function canonical_highlight_delta(delta: HighlightHistoryDelta): HighlightHisto
 
 /** Builds a frozen action, so a caller reusing its builders cannot mutate history. */
 export function history_action(label: string, changes: readonly HistoryChange[]): HistoryAction {
-    return own_action({ label, changes });
+    return (own_and_measure({ label, changes }) as OwnedAction).action;
 }
 
 /**

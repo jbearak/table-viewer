@@ -504,20 +504,27 @@ describe('peek_history and commit_history_move', () => {
         expect(move(state, 'redo')).toBe(state);
     });
 
-    it('refuses to record a gesture it would have to copy to refuse', () => {
-        // Measuring precedes ownership: cloning a gesture past the hard bound
-        // would allocate a second copy of the graph the bound exists to keep out
-        // of memory, while the old history is still live.
+    it('stops rebuilding a gesture as soon as it passes the hard bound', () => {
+        // An oversized gesture must be refused without first rebuilding the whole
+        // of it: the caller's graph and the existing history are both still live
+        // while it is being rebuilt, so the process can run out of memory on the
+        // way to deciding not to keep it.
         const hard: HistoryBounds = {
             maxActions: 100,
             maxCells: 1_000_000,
             softMaxBytes: 1_000,
             hardMaxBytes: 2_000,
         };
-        const changes: HistoryChange[] = [cell_change(0, 0, 'x'.repeat(50_000))];
+        let read = 0;
+        const changes: HistoryChange[] = Array.from({ length: 100 }, (_unused, index) => {
+            const change = cell_change(index, 0, 'x'.repeat(1_000));
+            return { get kind() { read += 1; return change.kind; }, delta: change.delta } as HistoryChange;
+        });
         const outcome = record_history_action(empty_history_stack(), { label: 'Huge', changes }, hard);
 
         expect(outcome.kind).toBe('refused');
+        // Abandoned within the first few changes rather than walking all hundred.
+        expect(read).toBeLessThan(10);
         // Nothing was retained, so the caller's array is still its own.
         expect(Object.isFrozen(changes)).toBe(false);
     });
