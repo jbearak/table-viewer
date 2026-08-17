@@ -23,6 +23,7 @@ import {
     overlay_states_equal,
     transition_side,
     value_only_overlay,
+    type CellHistoryDelta,
     type CellOverlayState,
     type HistoryDirtyEntry,
 } from '../webview/history-cell-state-model';
@@ -582,3 +583,133 @@ describe('worksheet identity', () => {
         expect(delta_addresses_same_cell(d!, other)).toBe(false);
     });
 });
+
+describe('the snapshot a built delta is', () => {
+    const base = (text: string) => build_cell_history_delta({
+        worksheet: SHEET,
+        sourceRow: 1,
+        sourceColumn: 2,
+        before: absent_overlay(),
+        after: value_only_overlay(history_value(text), history_value('a')),
+        persistedValue: history_value('a'),
+        persistedHyperlink: null,
+    })!;
+
+    it('preserves the aliasing the byte estimate depends on', () => {
+        // The same HistoryValue object stands in the transition and the overlay,
+        // so the string exists once in memory. Rebuilding it twice would make a
+        // holder charge it twice and refuse gestures that fit its bounds.
+        const delta = base('b');
+        const overlay = delta.afterOverlay;
+        if (overlay.kind !== 'present' || overlay.value.kind !== 'present') {
+            throw new Error('fixture did not build a present value dimension');
+        }
+        expect(delta.value!.desired.content).toBe(overlay.value.value);
+    });
+
+    it('drops a property nobody declared', () => {
+        const smuggled = { ...base('b'), extra: 'x'.repeat(100) } as unknown as CellHistoryDelta;
+        expect(snapshot_of(smuggled)).not.toHaveProperty('extra');
+    });
+
+    it('drops an undeclared property from a nested run', () => {
+        const styled_value = history_value('b', {
+            runs: [{ text: 'b', extra: 'x' } as unknown as { text: string }],
+        } as never);
+        const delta = build_cell_history_delta({
+            worksheet: SHEET,
+            sourceRow: 1,
+            sourceColumn: 2,
+            before: absent_overlay(),
+            after: value_only_overlay(styled_value, history_value('a')),
+            persistedValue: history_value('a'),
+            persistedHyperlink: null,
+        })!;
+        expect(delta.value!.desired.content.runs!.runs[0]).not.toHaveProperty('extra');
+    });
+
+    it('copies runs into a plain array, ignoring a foreign species', () => {
+        // A readonly array can be an Array subclass, and `map` honours its
+        // Symbol.species — which would carry undeclared state into what a holder
+        // retains and its estimator never charges.
+        class Sneaky<T> extends Array<T> {
+            smuggled = 'x'.repeat(100);
+        }
+        const sneaky = new Sneaky<{ text: string }>();
+        sneaky.push({ text: 'b' });
+        const runs = sneaky as unknown as readonly { text: string }[];
+        const value = history_value('b', { runs } as never);
+        const delta = build_cell_history_delta({
+            worksheet: SHEET,
+            sourceRow: 1,
+            sourceColumn: 2,
+            before: absent_overlay(),
+            after: value_only_overlay(value, history_value('a')),
+            persistedValue: history_value('a'),
+            persistedHyperlink: null,
+        })!;
+
+        const copied_runs = delta.value!.desired.content.runs!.runs;
+        expect(copied_runs).not.toBeInstanceOf(Sneaky);
+        expect(copied_runs).not.toHaveProperty('smuggled');
+    });
+
+    it('isolates the snapshot from later mutation of what built it', () => {
+        // The caller's overlays and targets stay mutable while a gesture is
+        // assembled, and `readonly` is a compile-time claim only.
+        const worksheet = { sheetIndex: 0, sheetName: 'Before' };
+        const runs = [{ text: 'b' }];
+        const value = history_value('b', { runs } as never);
+        const delta = build_cell_history_delta({
+            worksheet,
+            sourceRow: 1,
+            sourceColumn: 2,
+            before: absent_overlay(),
+            after: value_only_overlay(value, history_value('a')),
+            persistedValue: history_value('a'),
+            persistedHyperlink: null,
+        })!;
+
+        worksheet.sheetName = 'After';
+        runs[0]!.text = 'changed';
+
+        expect(delta.worksheet.sheetName).toBe('Before');
+        expect(delta.value!.desired.content.runs!.runs[0]?.text).toBe('b');
+        expect(Object.isFrozen(delta)).toBe(true);
+    });
+
+    it('does not share a target between two independently built deltas', () => {
+        // Sharing belongs to the action that retains them, not to the builder: a
+        // snapshot outlives nothing and sharing here would need state that does.
+        const worksheet = { sheetIndex: 0, sheetName: 'Data' };
+        const first = snapshot_of(base('b'));
+        const second = build_cell_history_delta({
+            worksheet,
+            sourceRow: 9,
+            sourceColumn: 0,
+            before: absent_overlay(),
+            after: value_only_overlay(history_value('c'), history_value('a')),
+            persistedValue: history_value('a'),
+            persistedHyperlink: null,
+        })!;
+
+        expect(second.worksheet).not.toBe(first.worksheet);
+        expect(second.worksheet.sheetName).toBe('Data');
+    });
+});
+
+/** Rebuilds a hand-made delta the way the builder snapshots its own. */
+function snapshot_of(delta: CellHistoryDelta): CellHistoryDelta {
+    return build_cell_history_delta({
+        worksheet: delta.worksheet,
+        sourceRow: delta.sourceRow,
+        sourceColumn: delta.sourceColumn,
+        before: absent_overlay(),
+        after: value_only_overlay(
+            delta.value!.desired.content,
+            delta.value!.expected.content,
+        ),
+        persistedValue: delta.value!.expected.content,
+        persistedHyperlink: null,
+    })!;
+}

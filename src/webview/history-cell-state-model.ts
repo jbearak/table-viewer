@@ -36,9 +36,10 @@
 import {
     hyperlinks_equal,
     type CellHyperlink,
+    type CellTextStyle,
     type RichText,
+    type RichTextRun,
 } from '../cell-content';
-import { deep_clone_and_freeze } from '../immutable';
 import {
     editable_values_equal,
     plain_value,
@@ -469,12 +470,16 @@ export function build_cell_history_delta(args: {
         : value_moved
             ? { ...base, value: value_transition }
             : { ...base, hyperlink: link_transition };
-    // History outlives the objects it was built from: the caller's RichText,
-    // CellHyperlink and WorksheetTarget stay reachable and mutable, and a later
-    // mutation would silently rewrite what undo replays. `readonly` is a
-    // compile-time claim only, so take an isolated frozen copy here — this
-    // function is history's ownership boundary.
-    return deep_clone_and_freeze(delta);
+    // The caller's RichText, CellHyperlink and WorksheetTarget stay reachable and
+    // mutable while the gesture is assembled, and a later mutation would silently
+    // rewrite what undo replays — `readonly` is a compile-time claim only. So the
+    // result is an isolated frozen SNAPSHOT.
+    //
+    // Not history's ownership, which belongs to recording the action: this shares
+    // the caller's strings by value rather than materializing them, because
+    // materializing here would copy every string a second time. See
+    // `snapshot_owner`.
+    return snapshot_cell_history_delta(delta);
 }
 
 /**
@@ -589,6 +594,280 @@ function effective_hyperlink_side(
         return { content: persisted, overlay: 'absent' };
     }
     return { content: state.hyperlink.value, overlay: 'present' };
+}
+
+/**
+ * A delta rebuilt to its declared shape, field by field, through an owner.
+ *
+ * `CellHistoryDelta` is a structural type, so a value that satisfies it can also
+ * carry a getter where a data property was expected, inherit a field from a
+ * prototype, or hold extra properties nobody declared. Any of those makes the
+ * graph a holder measured and the graph it retained two different things — an
+ * unmeasured 300MiB string riding along on a delta, or a `worksheet` that answers
+ * differently after the bounds were computed.
+ *
+ * So it is rebuilt rather than inspected. Each field is read exactly once and
+ * copied into a frozen object of the declared shape; nothing undeclared survives.
+ * What the copy does with the CONTENT is the owner's business — a snapshot shares
+ * the caller's strings, an action materializes and charges them — which is why
+ * this is one function and not two that could drift apart.
+ */
+function copy_cell_history_delta(
+    delta: CellHistoryDelta,
+    owner: HistoryActionOwner,
+): CellHistoryDelta {
+    // A memo per delta, so an object the input SHARED between a transition and an
+    // overlay is shared by the output too. That aliasing is load-bearing: it is
+    // how one string exists once in memory, and how the byte estimate charges it
+    // once instead of refusing gestures that fit the bounds.
+    const values = new Map<HistoryValue, HistoryValue>();
+    const value_of = (value: HistoryValue): HistoryValue => {
+        const seen = values.get(value);
+        if (seen !== undefined) return seen;
+        const copied = copy_value(value, owner);
+        values.set(value, copied);
+        return copied;
+    };
+    const links = new Map<CellHyperlink, CellHyperlink>();
+    const link_of = (link: CellHyperlink | null): CellHyperlink | null => {
+        if (link === null) return null;
+        const seen = links.get(link);
+        if (seen !== undefined) return seen;
+        const copied = copy_hyperlink(link, owner);
+        links.set(link, copied);
+        return copied;
+    };
+
+    const base: CellHistoryDeltaBase = {
+        worksheet: owner.own_worksheet_target(delta.worksheet),
+        sourceRow: delta.sourceRow,
+        sourceColumn: delta.sourceColumn,
+        beforeOverlay: copy_overlay(delta.beforeOverlay, value_of, link_of),
+        afterOverlay: copy_overlay(delta.afterOverlay, value_of, link_of),
+    };
+    const value = delta.value;
+    const hyperlink = delta.hyperlink;
+    const out: CellHistoryDelta = value !== undefined && hyperlink !== undefined
+        ? {
+            ...base,
+            value: copy_transition(value, value_of),
+            hyperlink: copy_transition(hyperlink, link_of),
+        }
+        : value !== undefined
+            ? { ...base, value: copy_transition(value, value_of) }
+            : { ...base, hyperlink: copy_transition(hyperlink!, link_of) };
+    return freeze_deep_declared(out);
+}
+
+/**
+ * A freshly built delta, isolated from later mutation of what built it.
+ *
+ * Not history's ownership: the strings are the caller's, shared by value. See
+ * `snapshot_owner`.
+ */
+function snapshot_cell_history_delta(delta: CellHistoryDelta): CellHistoryDelta {
+    return copy_cell_history_delta(delta, snapshot_owner());
+}
+
+/**
+ * The delta history will retain, rebuilt through the owner of the action holding
+ * it.
+ *
+ * Always rebuilt, even from a builder's snapshot: a snapshot's strings are the
+ * caller's, so retaining one would retain whatever those strings hold alive,
+ * uncharged. This is the only way a cell delta enters history.
+ */
+export function own_cell_history_delta(
+    delta: CellHistoryDelta,
+    owner: HistoryActionOwner,
+): CellHistoryDelta {
+    return copy_cell_history_delta(delta, owner);
+}
+
+/**
+ * Who owns what one ACTION retains.
+ *
+ * History has exactly one ownership boundary — recording an action — and this is
+ * the interface across it. Three jobs no single delta can do for itself, because
+ * all three are properties of the gesture rather than of one cell:
+ *
+ *   - `own_string` returns the string to retain, materialized and SHARED across
+ *     every delta of the action asking for an equal one. Materialized because V8
+ *     answers `slice` with a view retaining its whole parent, so an unmaterialized
+ *     string costs its parent's allocation while being charged its own length.
+ *     Shared because a million-cell paste names one worksheet, and materializing
+ *     that name per delta would allocate a million copies of it.
+ *   - `own_worksheet_target` returns one frozen target per exact target tuple in
+ *     the action, so the estimator — which charges the retained target object —
+ *     charges a gesture's worksheet identity once.
+ *   - `charge_run` accounts for a run's shape as it is built. A cell carrying
+ *     millions of one-character runs is mostly shape, so metering only their text
+ *     let the whole run graph be allocated before anything checked.
+ *
+ * Any of them may throw to abandon the walk. The estimator still has the last word
+ * on what an action costs; this is a tripwire.
+ */
+export interface HistoryActionOwner {
+    own_string(text: string): string;
+    own_worksheet_target(target: WorksheetTarget): WorksheetTarget;
+    charge_run(): void;
+}
+
+/**
+ * The owner a delta gets while a gesture is still being assembled.
+ *
+ * A delta is built one cell at a time, long before there is an action to own it,
+ * and it must still be isolated from later mutation of the caller's overlays,
+ * hyperlinks and targets — `readonly` is a compile-time claim only. So the builder
+ * SNAPSHOTS: it rebuilds the declared shape and freezes it, sharing the caller's
+ * string VALUES rather than materializing them.
+ *
+ * Sharing a value is safe because strings are immutable; what it does not do is
+ * materialize, so a snapshot may still hold a parent string alive. That retention ends
+ * with the caller's gesture-building graph, because history never retains a
+ * snapshot: recording rebuilds every delta through the action's owner, where the
+ * strings are materialized and charged. Materializing here as well would copy every
+ * string twice.
+ */
+function snapshot_owner(): HistoryActionOwner {
+    return {
+        own_string: (text) => text,
+        own_worksheet_target: (target) => {
+            const { sheetIndex, sheetName, worksheetId } = target;
+            return Object.freeze({
+                sheetIndex,
+                ...(sheetName === undefined ? {} : { sheetName }),
+                ...(worksheetId === undefined ? {} : { worksheetId }),
+            });
+        },
+        charge_run: () => {},
+    };
+}
+
+
+
+function copy_value(value: HistoryValue, owner: HistoryActionOwner): HistoryValue {
+    const runs = value.runs;
+    return {
+        text: owner.own_string(value.text),
+        ...(runs === undefined
+            ? {}
+            : { runs: { runs: copy_runs(runs.runs, owner) } }),
+    };
+}
+
+/**
+ * Copies runs into a plain array.
+ *
+ * A `readonly RichTextRun[]` can be an Array subclass, and `map` honours its
+ * `Symbol.species` — so mapping would hand back another subclass, carrying
+ * whatever undeclared state it holds into what history retains and the estimator
+ * never charges. A `for` loop into a literal cannot be redirected that way.
+ */
+function copy_runs(
+    runs: readonly RichTextRun[],
+    owner: HistoryActionOwner,
+): readonly RichTextRun[] {
+    const out: RichTextRun[] = [];
+    for (const run of runs) {
+        // Charged before it is built: a cell of one-character runs is mostly shape,
+        // so a budget told only about text would allocate the whole run graph.
+        owner.charge_run();
+        out.push(copy_run(run, owner));
+    }
+    return out;
+}
+
+function copy_run(run: RichTextRun, owner: HistoryActionOwner): RichTextRun {
+    const style = run.style;
+    return {
+        text: owner.own_string(run.text),
+        ...(style === undefined ? {} : { style: copy_style(style) }),
+    };
+}
+
+function copy_style(style: CellTextStyle): CellTextStyle {
+    const { bold, italic, underline, strikethrough } = style;
+    return {
+        ...(bold === undefined ? {} : { bold }),
+        ...(italic === undefined ? {} : { italic }),
+        ...(underline === undefined ? {} : { underline }),
+        ...(strikethrough === undefined ? {} : { strikethrough }),
+    };
+}
+
+function copy_hyperlink(link: CellHyperlink, owner: HistoryActionOwner): CellHyperlink {
+    const tooltip = link.tooltip;
+    const rest = tooltip === undefined ? {} : { tooltip: owner.own_string(tooltip) };
+    return link.kind === 'external'
+        ? { kind: 'external', target: owner.own_string(link.target), ...rest }
+        : { kind: 'internal', location: owner.own_string(link.location), ...rest };
+}
+
+interface CopiedTransition<T> {
+    readonly mode: CellHistoryTransitionMode;
+    readonly expected: HistoryDimensionSide<T>;
+    readonly desired: HistoryDimensionSide<T>;
+}
+
+function copy_transition<T>(
+    transition: CopiedTransition<T>,
+    content: (value: T) => T,
+): CopiedTransition<T> {
+    // Each side is read once. An accessor read twice could answer with two
+    // different objects, and the copy would then pair one side's
+    // content with the other's overlay membership — a state the caller never
+    // supplied, which replay would go on to compare against or restore.
+    const expected = transition.expected;
+    const desired = transition.desired;
+    return {
+        mode: transition.mode,
+        expected: { content: content(expected.content), overlay: expected.overlay },
+        desired: { content: content(desired.content), overlay: desired.overlay },
+    };
+}
+
+function copy_overlay(
+    overlay: CellOverlayState,
+    value_of: (value: HistoryValue) => HistoryValue,
+    link_of: (link: CellHyperlink | null) => CellHyperlink | null,
+): CellOverlayState {
+    if (overlay.kind === 'absent') return ABSENT;
+    const value = overlay.value;
+    const hyperlink = overlay.hyperlink;
+    const copied_value_dimension: OverlayValueDimension = value.kind === 'present'
+        ? {
+            kind: 'present',
+            value: value_of(value.value),
+            base: value_of(value.base),
+            basePending: value.basePending,
+        }
+        : { kind: 'untouched', anchor: value_of(value.anchor) };
+    const copied_link_dimension: OverlayHyperlinkDimension = hyperlink.kind === 'present'
+        ? {
+            kind: 'present',
+            value: link_of(hyperlink.value),
+            base: link_of(hyperlink.base),
+        }
+        : { kind: 'untouched' };
+    // The three-arm union enumerates the combinations a real entry can have, and
+    // the cast is what lets this build one generically. It is safe because a
+    // dimension's kind is carried over unchanged: a present/untouched pair here
+    // was a present/untouched pair there.
+    return {
+        kind: 'present',
+        value: copied_value_dimension,
+        hyperlink: copied_link_dimension,
+    } as PresentCellOverlayState;
+}
+
+/** Freezes a graph this module built, so no foreign accessor can be reached. */
+function freeze_deep_declared<T>(value: T): T {
+    if (value === null || typeof value !== 'object') return value;
+    for (const key of Object.keys(value)) {
+        freeze_deep_declared((value as Record<string, unknown>)[key]);
+    }
+    return Object.freeze(value);
 }
 
 /** Whether two deltas address the same cell of the same worksheet. */
