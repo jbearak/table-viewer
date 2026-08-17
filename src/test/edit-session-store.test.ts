@@ -39,6 +39,67 @@ describe('edit session store', () => {
         expect(store.has_pending_base()).toBe(true);
     });
 
+    it.each([
+        ['null container', null],
+        ['array container', []],
+        ['Date container', new Date(0)],
+        ['Map container', new Map([['1:1', { value: 'b', base: 'B' }]])],
+        ['Set container', new Set([{ value: 'b', base: 'B' }])],
+        ['null entry', { '1:1': null }],
+        ['number legacy scalar', { '1:1': 7 }],
+        ['boolean legacy scalar', { '1:1': false }],
+        ['non-string value', { '1:1': { value: 7, base: 'B' } }],
+        ['non-string base', { '1:1': { value: 'b', base: null } }],
+    ])('retains valid state when install receives a malformed %s', (_label, candidate) => {
+        const store = create_edit_session_store(
+            { session_id: 'first' },
+            { '0:0': 'typed' },
+        );
+
+        store.install({ session_id: 'second' }, candidate);
+
+        expect(store.identity()).toEqual({ session_id: 'second' });
+        expect(Object.fromEntries(store.snapshot())).toEqual({
+            '0:0': { value: 'typed', base: '', base_pending: true },
+        });
+        expect(store.has_pending_base()).toBe(true);
+        store.commit('second', '2:2', { value: 'later', base: 'base' });
+        expect(store.get('2:2')).toEqual({ value: 'later', base: 'base' });
+    });
+
+    it('re-stamps but retains valid state when reconcile receives malformed entries', () => {
+        const store = create_edit_session_store(
+            { session_id: 'first' },
+            { '0:0': { value: 'safe', base: 'base' } },
+        );
+        const before = store.snapshot();
+        const notifications = count_notifications(store);
+
+        store.reconcile({ session_id: 'second' }, { '1:1': null });
+
+        expect(store.identity()).toEqual({ session_id: 'second' });
+        expect(store.snapshot()).toBe(before);
+        expect(notifications.n).toBe(0);
+        store.commit('second', '2:2', { value: 'later', base: 'base' });
+        expect(store.get('2:2')).toEqual({ value: 'later', base: 'base' });
+    });
+
+    it('ignores malformed replacement maps without clearing valid state', () => {
+        const store = create_edit_session_store(
+            { session_id: 's' },
+            { '0:0': { value: 'safe', base: 'base' } },
+        );
+        const before = store.snapshot();
+        const notifications = count_notifications(store);
+
+        store.replace('s', { '1:1': null });
+
+        expect(store.snapshot()).toBe(before);
+        expect(notifications.n).toBe(0);
+        store.replace('s', { '2:2': { value: 'later', base: 'base' } });
+        expect(store.get('2:2')).toEqual({ value: 'later', base: 'base' });
+    });
+
     it('drops a mutator whose session does not match the stamp', () => {
         const store = create_edit_session_store(
             { session_id: 'current' },

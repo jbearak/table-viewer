@@ -12,8 +12,14 @@
  * this file entirely.
  */
 
-import { copy_dirty_entry, dirty_entries_equal, type CsvDirtyEntry } from '../types';
+import {
+    copy_dirty_entry,
+    dirty_entries_equal,
+    sanitized_wire_dirty_entry,
+    type CsvDirtyEntry,
+} from '../types';
 import { hyperlinks_equal, type CellHyperlink } from '../cell-content';
+import { is_plain_record } from '../plain-record';
 
 export interface DirtyEntry extends CsvDirtyEntry {
     // When true, `base` has not yet been captured against a resident page (an
@@ -139,10 +145,10 @@ export interface EditSessionStore {
      * belongs to. A string-valued entry is normalized to a base_pending entry
      * (see {@link create_edit_session_store}).
      */
-    install(identity: EditSessionIdentity, edits?: Record<string, string | DirtyEntry>): void;
+    install(identity: EditSessionIdentity, edits?: unknown): void;
     /** Reconcile an authoritative same-session refresh without notifying when its
      * map is already equal to the store's current contents. */
-    reconcile(identity: EditSessionIdentity, edits?: Record<string, string | DirtyEntry>): void;
+    reconcile(identity: EditSessionIdentity, edits?: unknown): void;
     /**
      * Re-stamp the session without touching contents, the pending-base flag, or
      * any listener. The stamp guards against a *stale writer* — a hook mounted
@@ -179,10 +185,7 @@ export interface EditSessionStore {
      * admitted with a base the user never saw, instead of being held back by
      * `collect_save_payload`.
      */
-    replace(
-        session_id: string | undefined,
-        entries: Readonly<Record<string, CsvDirtyEntry & { base_pending?: boolean }>>,
-    ): void;
+    replace(session_id: string | undefined, entries: unknown): void;
     /**
      * Filter in place by an arbitrary predicate. Exists so `discard_conflicted`'s
      * predicate ({@link is_entry_conflicted} against `get_cell_raw`) stays
@@ -196,25 +199,40 @@ export interface EditSessionStore {
     resolve_pending_bases(session_id: string | undefined, get_cell_raw: GetCellRaw): void;
 }
 
-function normalize(
-    edits: Record<string, string | DirtyEntry> | undefined,
-): { entries: Map<string, DirtyEntry>; pending_base: boolean } {
+interface NormalizedEdits {
+    readonly entries: Map<string, DirtyEntry>;
+    readonly pending_base: boolean;
+}
+
+function normalize(edits: unknown, allow_legacy_strings = true): NormalizedEdits | undefined {
     const entries = new Map<string, DirtyEntry>();
+    if (edits === undefined) return { entries, pending_base: false };
+    if (!is_plain_record(edits)) return undefined;
+
     let pending_base = false;
-    for (const [key, value] of Object.entries(edits ?? {})) {
-        if (typeof value === 'object' && value !== null) {
-            entries.set(key, value);
-            // A restored entry can itself still be pending (an install that
-            // round-trips a not-yet-resolved map back through the prop).
-            if (value.base_pending) pending_base = true;
+    for (const [key, value] of Object.entries(edits)) {
+        if (typeof value === 'string') {
+            if (!allow_legacy_strings) return undefined;
+            // Old-format string entry: defer base capture uniformly. Baking in a
+            // base now would risk a permanent false conflict when the page isn't
+            // resident; resolve_pending_bases captures the true base once the page
+            // loads.
+            pending_base = true;
+            entries.set(key, { value, base: '', base_pending: true });
             continue;
         }
-        // Old-format string entry: defer base capture uniformly. Baking in a
-        // base now would risk a permanent false conflict when the page isn't
-        // resident; resolve_pending_bases captures the true base once the page
-        // loads.
-        pending_base = true;
-        entries.set(key, { value, base: '', base_pending: true });
+        const sanitized = sanitized_wire_dirty_entry(value);
+        if (!sanitized) return undefined;
+        // A restored entry can itself still be pending (an install that
+        // round-trips a not-yet-resolved map back through the prop). Only a real
+        // boolean flag is retained; malformed optional metadata is quarantined.
+        const base_pending = (value as { readonly base_pending?: unknown }).base_pending;
+        if (typeof base_pending === 'boolean') {
+            if (base_pending) pending_base = true;
+            entries.set(key, { ...sanitized, base_pending });
+            continue;
+        }
+        entries.set(key, sanitized);
     }
     return { entries, pending_base };
 }
@@ -257,10 +275,10 @@ function entries_equal(
 
 export function create_edit_session_store(
     identity?: EditSessionIdentity,
-    edits?: Record<string, string | DirtyEntry>,
+    edits?: unknown,
 ): EditSessionStore {
     let stamp: EditSessionIdentity | null = identity ?? null;
-    let state = normalize(edits);
+    let state = normalize(edits) ?? { entries: new Map<string, DirtyEntry>(), pending_base: false };
     const listeners = new Set<() => void>();
 
     const notify = (): void => {
@@ -365,17 +383,18 @@ export function create_edit_session_store(
             // "the contents didn't change" is not the same claim as "nothing that
             // a subscriber cares about changed" — and it runs once per grant or
             // restore, never on a keystroke, so there is no cost to buy by
-            // guessing. The one thing suppression would definitely be safe for is
-            // the map identity itself; everything else here (a fresh normalize
-            // that re-stamps caller-owned entry objects into the store, a session
-            // change that GridShell may already be mid-remount for) is exactly
-            // the kind of boundary where a silent install would be a very quiet
-            // bug. The guard exists for the hot paths; this isn't one.
-            set_entries(next.entries, next.pending_base, true);
+            // guessing. A malformed candidate retains the current valid state but
+            // still crosses that identity boundary and therefore still notifies.
+            set_entries(
+                next?.entries ?? state.entries,
+                next?.pending_base ?? state.pending_base,
+                true,
+            );
         },
         reconcile: (next_identity, next_edits) => {
             stamp = next_identity;
             const next = normalize(next_edits);
+            if (!next) return;
             set_entries(next.entries, next.pending_base);
         },
         adopt_session: (session_id) => {
@@ -406,18 +425,9 @@ export function create_edit_session_store(
         },
         replace: (session_id, entries) => {
             if (!owns(session_id)) return;
-            let pending_base = false;
-            const next = new Map<string, DirtyEntry>();
-            for (const [key, entry] of Object.entries(entries)) {
-                const owned = copy_dirty_entry(entry);
-                if (entry.base_pending) {
-                    pending_base = true;
-                    next.set(key, { ...owned, base_pending: true });
-                    continue;
-                }
-                next.set(key, owned);
-            }
-            set_entries(next, pending_base);
+            const next = normalize(entries, false);
+            if (!next) return;
+            set_entries(next.entries, next.pending_base);
         },
         retain: (session_id, keep) => {
             if (!owns(session_id)) return;

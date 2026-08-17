@@ -195,6 +195,29 @@ describe('xlsx edit sessions', () => {
         return { panel, plan_save };
     }
 
+    function save_worksheet(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+        return {
+            sheetIndex: 0,
+            sheetName: 'People',
+            worksheetId: '1',
+            edits: { '1:0': 'Alicia' },
+            dirtyEdits: { '1:0': { value: 'Alicia', base: 'Alice' } },
+            ...overrides,
+        };
+    }
+
+    function workbook_request(
+        session: string,
+        request_id: string,
+        worksheet: unknown,
+    ): Record<string, unknown> {
+        return {
+            editSessionId: session,
+            saveRequestId: request_id,
+            worksheets: [worksheet],
+        };
+    }
+
     it('grants an edit session on .xlsx and refuses one on .xls', async () => {
         const xlsx = open_xlsx(file_path);
         await xlsx.__receive({ type: 'ready' });
@@ -206,30 +229,32 @@ describe('xlsx edit sessions', () => {
         expect(profile_for('/tmp/legacy.xls').editing).toBe(false);
     });
 
-    it('refuses non-integer save sheet indices before planning', async () => {
+    it.each([
+        ['a missing index', undefined],
+        ['a null index', null],
+        ['NaN', Number.NaN],
+        ['infinity', Number.POSITIVE_INFINITY],
+        ['a fractional index', 0.5],
+        ['a negative index', -1],
+        ['an unsafe index', Number.MAX_SAFE_INTEGER + 1],
+    ])('refuses %s before planning', async (_label, sheet_index) => {
         const { panel, plan_save } = await open_with_plan_spy();
         await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
         const session = latest_edit_session(panel)!.editSessionId!;
         const before = bytes;
+        const requested = save_worksheet({ sheetIndex: sheet_index });
+        if (sheet_index === undefined) delete requested.sheetIndex;
 
-        for (const [index, sheet_index] of [Number.NaN, 0.5].entries()) {
-            const result_count = save_results(panel).length;
-            await panel.__receive({
-                type: 'saveCsv',
-                operation: {
-                    editSessionId: session,
-                    saveRequestId: `invalid-sheet-${index}`,
-                    worksheets: [{
-                        sheetIndex: sheet_index,
-                        edits: { '1:0': 'Alicia' },
-                        dirtyEdits: { '1:0': { value: 'Alicia', base: 'Alice' } },
-                    }],
-                },
-            });
-            await wait_for_observable(() => save_results(panel).length > result_count);
-            expect(save_results(panel).at(-1)).toMatchObject({ success: false });
-        }
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(session, `invalid-sheet:${_label}`, requested),
+        } as never);
+        await wait_for_observable(() => save_results(panel).length > 0);
 
+        expect(save_results(panel).at(-1)).toMatchObject({
+            success: false,
+            lifecycle: { state: 'failed', failure: 'malformedRequest' },
+        });
         expect(plan_save).not.toHaveBeenCalled();
         expect(bytes).toEqual(before);
     });
@@ -649,10 +674,14 @@ describe('xlsx edit sessions', () => {
         expect(after.data.sheets[1].rows[1][0]?.raw).toBe('Widget');
     });
 
-    it('treats a non-array worksheets field as a legacy flat save', async () => {
-        const panel = await open_ready_xlsx(file_path);
+    it.each([
+        ['a present non-array worksheets field', null],
+        ['an empty workbook operation', []],
+    ])('rejects %s before planning', async (_label, worksheets) => {
+        const { panel, plan_save } = await open_with_plan_spy();
         await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
         const session = latest_edit_session(panel)!.editSessionId!;
+        const untouched = bytes;
 
         await panel.__receive({
             type: 'saveCsv',
@@ -664,14 +693,117 @@ describe('xlsx edit sessions', () => {
                 worksheetId: '2',
                 edits: { '1:0': 'Gadget' },
                 dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
-                worksheets: null,
+                worksheets,
             },
         } as never);
         await wait_for_observable(() => save_results(panel).length > 0);
 
+        expect(save_results(panel).at(-1)).toMatchObject({
+            success: false,
+            lifecycle: { state: 'failed', failure: 'malformedRequest' },
+        });
+        expect(plan_save).not.toHaveBeenCalled();
+        expect(bytes).toBe(untouched);
+    });
+
+    it.each([
+        ['a null worksheet element', () => null],
+        ['a primitive worksheet element', () => 'worksheet'],
+        ['a null edits container', () => save_worksheet({ edits: null })],
+        ['an array edits container', () => save_worksheet({ edits: [] })],
+        ['a null dirtyEdits container', () => save_worksheet({ dirtyEdits: null })],
+        ['an array dirtyEdits container', () => save_worksheet({ dirtyEdits: [] })],
+        ['a malformed dirty entry', () => save_worksheet({
+            dirtyEdits: { '1:0': null },
+        })],
+        ['a non-string edit value', () => save_worksheet({
+            edits: { '1:0': 7 },
+        })],
+        ['an extra edit entry', () => save_worksheet({
+            edits: { '1:0': 'Alicia', '1:1': 'unvalidated' },
+        })],
+        ['a missing edit entry', () => save_worksheet({ edits: {} })],
+        ['an edit value that disagrees with dirtyEdits', () => save_worksheet({
+            edits: { '1:0': 'Mallory' },
+        })],
+    ])('rejects %s atomically before planning', async (_label, make_worksheet) => {
+        const { panel, plan_save } = await open_with_plan_spy();
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const untouched = bytes;
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(
+                session,
+                `malformed:${_label}`,
+                make_worksheet(),
+            ),
+        } as never);
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({
+            success: false,
+            lifecycle: { state: 'failed', failure: 'malformedRequest' },
+        });
+        expect(plan_save).not.toHaveBeenCalled();
+        expect(bytes).toBe(untouched);
+    });
+
+    it('accepts a valid save after a correlated malformed request', async () => {
+        const { panel, plan_save } = await open_with_plan_spy();
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(
+                session,
+                'malformed-before-valid',
+                save_worksheet({ edits: { '1:0': 'Alicia', '1:1': 'extra' } }),
+            ),
+        } as never);
+        await wait_for_observable(() => save_results(panel).length > 0);
+        expect(save_results(panel).at(-1)).toMatchObject({
+            success: false,
+            lifecycle: { state: 'failed', failure: 'malformedRequest' },
+        });
+        expect(plan_save).not.toHaveBeenCalled();
+
+        const result_count = save_results(panel).length;
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(session, 'valid-after-malformed', save_worksheet()),
+        });
+        await wait_for_observable(() => save_results(panel).length > result_count);
+
         expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+        expect(plan_save).toHaveBeenCalledTimes(1);
         const after = await parse_xlsx(bytes);
-        expect(after.data.sheets[1].rows[1][0]?.raw).toBe('Gadget');
+        expect(after.data.sheets[0].rows[1][0]?.raw).toBe('Alicia');
+    });
+
+    it('fails closed on uncorrelatable operation envelopes and accepts a later save', async () => {
+        const { panel, plan_save } = await open_with_plan_spy();
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const untouched = bytes;
+
+        for (const operation of [null, 17, []]) {
+            await panel.__receive({ type: 'saveCsv', operation } as never);
+        }
+
+        expect(save_results(panel)).toHaveLength(0);
+        expect(plan_save).not.toHaveBeenCalled();
+        expect(bytes).toBe(untouched);
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(session, 'valid-after-bad-envelope', save_worksheet()),
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+        expect(plan_save).toHaveBeenCalledTimes(1);
     });
 
     it('rejects duplicate physical worksheets before planning', async () => {
@@ -704,7 +836,7 @@ describe('xlsx edit sessions', () => {
 
         expect(save_results(panel).at(-1)).toMatchObject({
             success: false,
-            lifecycle: { state: 'failed' },
+            lifecycle: { state: 'failed', failure: 'malformedRequest' },
         });
         expect(plan_save).not.toHaveBeenCalled();
         expect(panel.__messages.some((message) => (
@@ -712,6 +844,41 @@ describe('xlsx edit sessions', () => {
             && message !== null
             && (message as { type?: unknown }).type === 'saveOperationStarted'
         ))).toBe(false);
+    });
+
+    it('rejects duplicate strongest worksheet identities before planning', async () => {
+        const { panel, plan_save } = await open_with_plan_spy();
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 1 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                saveRequestId: 'duplicate-worksheet-id',
+                worksheets: [
+                    {
+                        sheetIndex: 0,
+                        worksheetId: '2',
+                        edits: { '1:0': 'Gadget' },
+                        dirtyEdits: { '1:0': { value: 'Gadget', base: 'Widget' } },
+                    },
+                    {
+                        sheetIndex: 1,
+                        worksheetId: '2',
+                        edits: { '1:1': '25' },
+                        dirtyEdits: { '1:1': { value: '25', base: '10' } },
+                    },
+                ],
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({
+            success: false,
+            lifecycle: { state: 'failed', failure: 'malformedRequest' },
+        });
+        expect(plan_save).not.toHaveBeenCalled();
     });
 
     it('rejects an identity-less save for a multi-sheet workbook', async () => {

@@ -6673,22 +6673,17 @@ describe('edit mode save exit', () => {
         await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
         const submitted = grid_shell_mock.latest_props?.save_operation as CsvSaveOperation;
         expect(submitted).toBeDefined();
-        const sanitized: CsvSaveOperation = {
-            ...submitted,
-            worksheets: submitted.worksheets.map((worksheet) => ({
-                ...worksheet,
-                dirtyEdits: {},
-            })),
-        };
-
         await dispatch_host_message({
             type: 'saveResult',
             success: false,
             lifecycle: {
                 revision: 1,
                 state: 'failed',
-                operation: sanitized,
                 failure: 'malformedRequest',
+                correlation: {
+                    editSessionId: submitted.editSessionId,
+                    saveRequestId: submitted.saveRequestId,
+                },
             },
         });
 
@@ -6702,6 +6697,68 @@ describe('edit mode save exit', () => {
         expect(retry).toBeDefined();
         expect(retry.saveRequestId).not.toBe(submitted.saveRequestId);
         expect(retry.worksheets[0].dirtyEdits).toEqual(dirty);
+        expect(post_message).toHaveBeenCalledWith({ type: 'saveCsv', operation: retry });
+    });
+
+    it('retains safe dirty state when the renderer-held proposal is itself malformed', async () => {
+        grid_shell_mock.is_dirty = true;
+        grid_shell_mock.has_uncommitted_changes = true;
+        const dirty = { '0:0': { value: 'draft', base: 'base' } };
+        const malformed = {
+            editSessionId: 'malformed-local-session',
+            saveRequestId: 'malformed-local-request',
+            worksheets: [{
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                edits: { '0:0': 'draft' },
+                dirtyEdits: { '0:0': null },
+            }],
+        } as unknown as CsvSaveOperation;
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(
+            make_meta(['Sheet1'], false),
+            {
+                state: { pendingEdits: sheet_edits(dirty) },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: malformed.editSessionId,
+                    csvSaveLifecycle: {
+                        revision: 1,
+                        state: 'active',
+                        operation: malformed,
+                    },
+                },
+            },
+        ));
+
+        expect(grid_shell_mock.latest_props?.save_operation).toBe(malformed);
+        expect(latest_store_edits()).toEqual(dirty);
+
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 2,
+                state: 'failed',
+                failure: 'malformedRequest',
+                correlation: {
+                    editSessionId: malformed.editSessionId,
+                    saveRequestId: malformed.saveRequestId,
+                },
+            },
+        });
+
+        expect(grid_shell_mock.latest_props?.save_operation).toBeUndefined();
+        expect(latest_store_edits()).toEqual(dirty);
+
+        post_message.mockClear();
+        await click_button('Edit');
+        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        const retry = grid_shell_mock.latest_props?.save_operation as CsvSaveOperation;
+        expect(retry.saveRequestId).not.toBe(malformed.saveRequestId);
+        expect(retry.worksheets[0].dirtyEdits).toEqual(dirty);
+        expect(retry.worksheets[0].edits).toEqual({ '0:0': 'draft' });
         expect(post_message).toHaveBeenCalledWith({ type: 'saveCsv', operation: retry });
     });
 
@@ -6756,6 +6813,57 @@ describe('edit mode save exit', () => {
         });
         expect(grid_shell_mock.latest_props?.save_operation).toEqual(proposed);
         expect(latest_store_edits()).toEqual(proposed.worksheets[0].dirtyEdits);
+    });
+
+    it('does not partially hydrate targets that alias one live worksheet', async () => {
+        await render_app();
+        const meta = make_meta(['People', 'Inventory'], false);
+        meta.sheets[0].worksheetId = '1';
+        meta.sheets[1].worksheetId = '2';
+        const people = { '0:0': { value: 'safe people', base: 'people base' } };
+        const inventory = { '0:0': { value: 'safe inventory', base: 'inventory base' } };
+        const aliased: CsvSaveOperation = {
+            editSessionId: 'aliased-session',
+            saveRequestId: 'aliased-request',
+            worksheets: [
+                {
+                    sheetIndex: 0,
+                    sheetName: 'Former Inventory',
+                    worksheetId: '2',
+                    edits: { '0:0': 'by-id' },
+                    dirtyEdits: { '0:0': { value: 'by-id', base: 'id base' } },
+                },
+                {
+                    sheetIndex: 1,
+                    sheetName: 'Inventory',
+                    edits: { '0:0': 'by-name' },
+                    dirtyEdits: { '0:0': { value: 'by-name', base: 'name base' } },
+                },
+            ],
+        };
+
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            state: {
+                pendingEdits: [
+                    { sheetName: 'People', worksheetId: '1', cells: people },
+                    { sheetName: 'Inventory', worksheetId: '2', cells: inventory },
+                ],
+            },
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: aliased.editSessionId,
+                csvSaveLifecycle: {
+                    revision: 1,
+                    state: 'active',
+                    operation: aliased,
+                },
+            },
+        }));
+
+        expect(latest_store_edits()).toEqual(people);
+        await click_sheet_tab('Inventory');
+        expect(latest_store_edits()).toEqual(inventory);
     });
 
     it('applies a succeeded save lifecycle to a non-pointer worksheet on initial hydration', async () => {
@@ -7884,14 +7992,10 @@ describe('edit mode save exit', () => {
             .toEqual(['4:1']);
     });
 
-    it('lets a later save result supersede an earlier rejection', async () => {
-        // The adoption block only ever *sets*, so without a clear at the top of the
-        // handler a rejection outlives every later verdict that does not name keys
-        // of its own. Modelled with a second failed save reporting no `rejection`
-        // (a write error rather than a base mismatch), because that is the only
-        // terminal result that leaves edit mode and the session intact — a success
-        // exits edit mode, which would hide the banner for an unrelated reason and
-        // make the assertion vacuous.
+    it.each([
+        ['preserves it after a pre-validation failure', {}, true],
+        ['clears it after a post-validation failure', { basesValidated: true as const }, false],
+    ])('%s', async (_label, result_details, rejection_remains) => {
         const { post_message } = await render_app();
         await dispatch_host_message(
             initial_snapshot_message(make_meta(['Sheet1'], false), {
@@ -7925,9 +8029,9 @@ describe('edit mode save exit', () => {
         });
         expect(container!.querySelector('.conflict-banner')).not.toBeNull();
 
-        // A second save over the same map, refused for a reason that names no keys.
-        // The absence of `rejection` has to speak: this verdict says nothing is
-        // base-mismatched any more.
+        // A refusal before base validation says nothing new about the existing
+        // mismatch. Once the host explicitly reports that it validated the same
+        // bases, a rejection-less failure proves the earlier verdict is stale.
         await dispatch_host_message({
             type: 'saveResult',
             success: false,
@@ -7944,15 +8048,168 @@ describe('edit mode save exit', () => {
                     }],
                 },
             },
+            ...result_details,
         });
-        // Same map, unchanged — so only the cleared verdict can move the banner.
         await report_grid_editing(true, true, [], {
             '4:1': { value: 'edited', base: 'stale' },
         });
 
-        expect(container!.querySelector('.conflict-banner')).toBeNull();
+        expect(container!.querySelector('.conflict-banner') !== null)
+            .toBe(rejection_remains);
         expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
-            .toEqual([]);
+            .toEqual(rejection_remains ? ['4:1'] : []);
+    });
+
+    it('ignores a malformed rejection without disturbing the current verdict', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+        const failed_operation = (request_id: string): CsvSaveOperation => ({
+            editSessionId: 'test-edit-session',
+            saveRequestId: request_id,
+            worksheets: [{
+                sheetIndex: 0,
+                edits: { '4:1': 'edited' },
+                dirtyEdits: { '4:1': { value: 'edited', base: 'stale' } },
+            }],
+        });
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 906,
+                state: 'failed',
+                operation: failed_operation('save-7'),
+            },
+            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['4:1'] },
+        });
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'stale' },
+        });
+
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 907,
+                state: 'failed',
+                operation: failed_operation('save-8'),
+            },
+            rejection: {
+                reason: 'baseMismatch',
+                worksheetOperationIndex: 0,
+                keys: null,
+            },
+        } as never);
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 908,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-9',
+                    worksheets: ['malformed worksheet'],
+                },
+            },
+            rejection: {
+                reason: 'baseMismatch',
+                worksheetOperationIndex: 0,
+                keys: ['4:1'],
+            },
+        } as never);
+
+        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
+            .toEqual(['4:1']);
+    });
+
+    it('keeps its rejection and save fence across a mismatched newer terminal', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await enter_edit_mode(post_message);
+        const dirty = { '4:1': { value: 'edited', base: 'stale' } };
+        await report_grid_editing(true, true, [], dirty);
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 906,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'rejected-save',
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: { '4:1': 'edited' },
+                        dirtyEdits: dirty,
+                    }],
+                },
+            },
+            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['4:1'] },
+        });
+        await report_grid_editing(true, true, [], dirty);
+
+        await act(async () => seed_mounted_store(dirty));
+        post_message.mockClear();
+        await click_button('Edit');
+        await dispatch_host_message({ type: 'saveDialogResult', choice: 'save' });
+        const local = grid_shell_mock.latest_props?.save_operation as CsvSaveOperation;
+        expect(local).toBeDefined();
+
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 907,
+                state: 'failed',
+                operation: {
+                    ...local,
+                    worksheets: [{
+                        ...local.worksheets[0],
+                        edits: { '4:1': 'different' },
+                        dirtyEdits: {
+                            '4:1': { value: 'different', base: 'stale' },
+                        },
+                    }],
+                },
+            },
+            basesValidated: true,
+        });
+
+        expect(grid_shell_mock.latest_props?.save_operation).toBe(local);
+        expect(get_button('Edit').getAttribute('aria-disabled')).toBe('true');
+
+        // Settle the retained proposal with an early failure. That makes the old
+        // verdict visible again; if the mismatched basesValidated terminal had
+        // cleared it, this rejection-less result could not reconstruct it.
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 908,
+                state: 'failed',
+                operation: local,
+            },
+        });
+        await report_grid_editing(true, true, [], dirty);
+
+        expect(grid_shell_mock.latest_props?.save_operation).toBeUndefined();
+        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
+            .toEqual(['4:1']);
     });
 
     it.each([

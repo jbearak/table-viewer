@@ -127,6 +127,15 @@ let active_post_message: ReturnType<typeof vi.fn> | null = null;
 let save_request_sequence = 0;
 let save_lifecycle_revision = 0;
 
+function posted_save(
+    post_message: ReturnType<typeof vi.fn>,
+): CsvSaveOperation | undefined {
+    return [...post_message.mock.calls]
+        .reverse()
+        .map(([message]) => message)
+        .find((message) => message?.type === 'saveCsv')?.operation;
+}
+
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 async function render_grid(
@@ -621,14 +630,7 @@ describe('GridShell CSV save', () => {
         await edit_cell('first');
         post_message.mockClear();
         expect(await request_save(editing_ref)).toBe(true);
-        const first = post_message.mock.calls.at(-1)?.[0].operation as CsvSaveOperation;
-        const sanitized = {
-            ...first,
-            worksheets: first.worksheets.map((worksheet) => ({
-                ...worksheet,
-                dirtyEdits: {},
-            })),
-        };
+        const first = posted_save(post_message)!;
 
         await act(async () => {
             window.dispatchEvent(new MessageEvent('message', { data: {
@@ -637,8 +639,11 @@ describe('GridShell CSV save', () => {
                 lifecycle: {
                     revision: 1,
                     state: 'failed',
-                    operation: sanitized,
                     failure: 'malformedRequest',
+                    correlation: {
+                        editSessionId: first.editSessionId,
+                        saveRequestId: first.saveRequestId,
+                    },
                 },
             } }));
         });
@@ -652,6 +657,110 @@ describe('GridShell CSV save', () => {
         expect(saves[1].operation.worksheets[0].dirtyEdits).toEqual(
             first.worksheets[0].dirtyEdits,
         );
+    });
+
+    it('unlocks without replacing valid state from a malformed local proposal', async () => {
+        const dirty = { '0:0': { value: 'first', base: 'base' } };
+        const edit_session = create_edit_session_store(
+            { session_id: 'session-1' },
+            dirty,
+        );
+        const malformed = {
+            editSessionId: 'session-1',
+            saveRequestId: 'malformed-local',
+            worksheets: [{
+                sheetIndex: 0,
+                sheetName: 'Sheet1',
+                edits: { '0:0': 'first' },
+                dirtyEdits: { '0:0': null },
+            }],
+        } as unknown as CsvSaveOperation;
+        const { post_message, editing_ref } = await render_grid(undefined, {
+            save_operation: malformed,
+            edit_session,
+        });
+
+        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('first');
+        expect(await request_save(editing_ref)).toBe(false);
+
+        await act(async () => {
+            window.dispatchEvent(new MessageEvent('message', { data: {
+                type: 'saveResult',
+                success: false,
+                lifecycle: {
+                    revision: 1,
+                    state: 'failed',
+                    failure: 'malformedRequest',
+                    correlation: {
+                        editSessionId: malformed.editSessionId,
+                        saveRequestId: malformed.saveRequestId,
+                    },
+                },
+            } }));
+        });
+
+        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('first');
+        expect(Object.fromEntries(edit_session.snapshot())).toEqual(dirty);
+        expect(await request_save(editing_ref)).toBe(true);
+        const retry = posted_save(post_message)!;
+        expect(retry.saveRequestId).not.toBe(malformed.saveRequestId);
+        expect(retry.worksheets[0].dirtyEdits).toEqual(dirty);
+        expect(retry.worksheets[0].edits).toEqual({ '0:0': 'first' });
+    });
+
+    it('ignores a raw active lifecycle with an empty worksheet list', async () => {
+        const dirty = { '0:0': { value: 'safe', base: 'base' } };
+        const { post_message, editing_ref } = await render_grid(undefined, {
+            initial_edits: dirty,
+        });
+
+        await act(async () => {
+            window.dispatchEvent(new MessageEvent('message', { data: {
+                type: 'saveOperationStarted',
+                lifecycle: {
+                    revision: 1,
+                    state: 'active',
+                    operation: {
+                        editSessionId: 'session-1',
+                        saveRequestId: 'empty-workbook',
+                        worksheets: [],
+                    },
+                },
+            } }));
+        });
+
+        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('safe');
+        expect(await request_save(editing_ref)).toBe(true);
+        expect(posted_save(post_message)?.worksheets[0].dirtyEdits).toEqual(dirty);
+    });
+
+    it('does not hydrate either of two targets that alias its live worksheet', async () => {
+        const dirty = { '0:0': { value: 'safe', base: 'base' } };
+        const aliased: CsvSaveOperation = {
+            editSessionId: 'session-1',
+            saveRequestId: 'aliased-targets',
+            worksheets: [
+                {
+                    sheetIndex: 1,
+                    sheetName: 'Sheet1',
+                    edits: { '0:0': 'by-name' },
+                    dirtyEdits: { '0:0': { value: 'by-name', base: 'name-base' } },
+                },
+                {
+                    sheetIndex: 0,
+                    edits: { '0:0': 'by-index' },
+                    dirtyEdits: { '0:0': { value: 'by-index', base: 'index-base' } },
+                },
+            ],
+        };
+        const { post_message, editing_ref } = await render_grid(undefined, {
+            save_lifecycle: { revision: 8, state: 'failed', operation: aliased },
+            initial_edits: dirty,
+        });
+
+        expect(grid_mock.props!.getCellContent!([0, 0]).data).toBe('safe');
+        expect(await request_save(editing_ref)).toBe(true);
+        expect(posted_save(post_message)?.worksheets[0].dirtyEdits).toEqual(dirty);
     });
 
     it('keeps the exact dirty map locked through delayed idle before active acceptance', async () => {
@@ -1045,13 +1154,6 @@ describe('GridShell source-keyed save payloads', () => {
         });
     }
 
-    function posted_save(post_message: ReturnType<typeof vi.fn>) {
-        return [...post_message.mock.calls]
-            .reverse()
-            .map(([message]) => message)
-            .find((message) => message?.type === 'saveCsv')?.operation;
-    }
-
     it('posts a committed edit under its source-row key with that row\'s base', async () => {
         permute_display_0_to_source_5();
         const { post_message, editing_ref } = await render_grid();
@@ -1061,7 +1163,7 @@ describe('GridShell source-keyed save payloads', () => {
 
         // Display-keyed, this would post '0:0' — and its base would be whatever
         // source row 0 holds, which is not the text the user was looking at.
-        const operation = posted_save(post_message);
+        const operation = posted_save(post_message)!;
         expect(operation.worksheets[0].edits).toEqual({ '5:0': 'typed' });
         expect(operation.worksheets[0].dirtyEdits).toEqual({
             '5:0': { value: 'typed', base: 'five-a' },
@@ -1077,7 +1179,7 @@ describe('GridShell source-keyed save payloads', () => {
 
         // read_live_edit builds the key, so a display-keyed LiveEdit would poison
         // the collectors even though nothing was ever committed through commit_edit.
-        const operation = posted_save(post_message);
+        const operation = posted_save(post_message)!;
         expect(operation.worksheets[0].edits).toEqual({ '5:0': 'overlay-text' });
         expect(operation.worksheets[0].dirtyEdits).toEqual({
             '5:0': { value: 'overlay-text', base: 'five-a' },
