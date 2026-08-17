@@ -2139,7 +2139,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                         0,
                         cells,
                         minColumnWidth,
-                        maxColumnWidth,
+                        maxColumnAutoWidth,
                         false,
                         getCellRenderer
                     );
@@ -2150,7 +2150,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
         [
             columns,
             getCellsForSelection,
-            maxColumnWidth,
+            maxColumnAutoWidth,
             mergedTheme,
             minColumnWidth,
             onColumnResize,

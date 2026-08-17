@@ -3717,6 +3717,51 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         expect(spy).toBeCalledWith({ icon: "headerCode", title: "B", width: 160 }, 50, 1, 50);
     });
 
+    test("Auto Resize Column honors the auto width maximum", async () => {
+        const spy = vi.fn();
+        vi.useFakeTimers();
+        render(
+            <EventedDataEditor
+                {...basicProps}
+                getCellContent={() => ({
+                    kind: GridCellKind.Text,
+                    allowOverlay: true,
+                    data: "x".repeat(1000),
+                    displayData: "x".repeat(1000),
+                })}
+                maxColumnWidth={500}
+                maxColumnAutoWidth={80}
+                onColumnResize={spy}
+            />,
+            { wrapper: Context }
+        );
+        prep();
+        const canvas = screen.getByTestId("data-grid-canvas");
+
+        fireEvent.mouseDown(canvas, {
+            clientX: 310,
+            clientY: 16,
+        });
+        fireEvent.mouseUp(canvas, {
+            clientX: 310,
+            clientY: 16,
+        });
+        fireEvent.mouseDown(canvas, {
+            clientX: 310,
+            clientY: 16,
+        });
+        fireEvent.mouseUp(canvas, {
+            clientX: 310,
+            clientY: 16,
+        });
+        fireEvent.click(canvas, {
+            clientX: 310,
+            clientY: 16,
+        });
+
+        expect(spy).toBeCalledWith({ icon: "headerCode", title: "B", width: 160 }, 80, 1, 80);
+    });
+
     test("Auto Resize Column Ref", async () => {
         const spy = vi.fn();
         vi.useFakeTimers();
