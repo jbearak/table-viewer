@@ -3,15 +3,32 @@ import { read_overlay_editor_value } from './live-editor';
 import {
     create_edit_session_store,
     is_entry_conflicted,
+    type DirtyEntry,
     type EditSessionStore,
     type GetCellRaw,
+    type StoreWrite,
 } from './edit-session-store';
 import {
     copy_dirty_entry,
     dirty_entry_value_changed,
     make_dirty_entry,
     type CsvDirtyEntry,
+    type WorksheetTarget,
 } from '../types';
+import {
+    begin_gesture_capture,
+    type PersistedCellHistoryState,
+} from './history-capture-model';
+import {
+    absent_overlay,
+    combined_overlay,
+    history_value,
+    hyperlink_only_overlay,
+    overlay_state_from_dirty_entry,
+    value_only_overlay,
+    type CellOverlayState,
+} from './history-cell-state-model';
+import type { HistoryStore } from './history-store';
 import { hyperlinks_equal, type CellHyperlink } from '../cell-content';
 import {
     cell_edit_base,
@@ -76,6 +93,161 @@ export interface UseEditingOptions {
      * `undefined` = not resident).
      */
     readonly get_cell?: (source_row: number, col: number) => EditableSourceCell | null | undefined;
+    /**
+     * Which sheet these edits belong to. Recorded on every history change, so
+     * an undo can find its way back to the sheet the edit was made on — the
+     * history is workbook-wide and its entries have to say where they landed.
+     */
+    readonly worksheet?: WorksheetTarget;
+    /**
+     * The workbook's history. Capture is on only when this and `worksheet` are
+     * both supplied, so the hook's own tests and any consumer with no workbook
+     * around it keep working unchanged, editing without recording.
+     */
+    readonly history?: HistoryStore;
+}
+
+/** One cell's new text, in source space. */
+export interface CellValueEdit {
+    readonly source_row: number;
+    readonly source_col: number;
+    readonly value: string;
+}
+
+/** One cell's new whole-cell hyperlink, or `null` to clear it. */
+export interface CellHyperlinkEdit {
+    readonly source_row: number;
+    readonly source_col: number;
+    readonly value: CellHyperlink | null;
+}
+
+/**
+ * A planned write: the entry to store, plus the overlay it MEANS.
+ *
+ * The overlay travels alongside because the entry alone cannot express it —
+ * `{value: 'A', base: 'A', link}` is written by two different intents that undo
+ * differently (see `ValueDimensionIntent`). The planner knows which one it just
+ * made, so it says, rather than leaving capture to guess with `'infer'`.
+ */
+interface PlannedOverlayWrite {
+    readonly entry: DirtyEntry | undefined;
+    readonly overlay: CellOverlayState;
+}
+
+/**
+ * What a text commit should leave in the store — decided, not applied.
+ *
+ * Pure so a batch can plan every cell of a paste before any of them mutates:
+ * a gesture is one transaction, and a half-applied paste is not a state the
+ * user ever asked for. The revert rule lives here rather than in the store
+ * because only this layer can read the cell's persisted content.
+ */
+function plan_value_write(
+    before_entry: DirtyEntry | undefined,
+    input: string,
+    base: ParsedCellEdit,
+    syntax: EditSyntax,
+): PlannedOverlayWrite {
+    const parsed = parse_cell_edit(input, syntax);
+    // A pending link change is its own dimension: a text revert must not
+    // discard it, and a text commit must carry it forward.
+    const link_dimension = before_entry?.link !== undefined
+        ? { link: before_entry.link, baseLink: before_entry.baseLink ?? null }
+        : undefined;
+    const base_value = history_value(base.text, base.rich);
+
+    // Semantic comparison: retyping a bold cell's own `**markup**`, however
+    // spelled, is a revert; deleting the `**` is an edit.
+    if (cell_edits_equal(parsed, base)) {
+        if (link_dimension === undefined) {
+            return { entry: undefined, overlay: absent_overlay() };
+        }
+        // Text reverted, link still pending: the entry survives as link-only,
+        // its value dimension back at the base — and `link-only` is exactly
+        // what the overlay has to say, since the entry it writes is the
+        // ambiguous `{value: A, base: A, link}` shape.
+        return {
+            entry: make_dirty_entry(
+                base.text, base.text, base.rich, base.rich,
+                link_dimension.link, link_dimension.baseLink,
+            ),
+            overlay: hyperlink_only_overlay(
+                base_value, link_dimension.link, link_dimension.baseLink,
+            ),
+        };
+    }
+
+    // Explicit plain runs when the user stripped a styled base's markup — see
+    // committed_value_runs.
+    const value_runs = committed_value_runs(parsed, base);
+    const entry = make_dirty_entry(
+        parsed.text, base.text, value_runs, base.rich,
+        link_dimension?.link, link_dimension?.baseLink,
+    );
+    const value = history_value(parsed.text, value_runs);
+    return {
+        entry,
+        overlay: link_dimension === undefined
+            ? value_only_overlay(value, base_value)
+            : combined_overlay(
+                value, base_value, link_dimension.link, link_dimension.baseLink,
+            ),
+    };
+}
+
+/**
+ * What a hyperlink commit should leave in the store.
+ *
+ * `persisted_link` is the cell's link on disk. The base recorded is the already
+ * pending `baseLink` when there is one, never the pending value, so re-editing
+ * one cell's link keeps a single honest conflict base.
+ */
+function plan_hyperlink_write(
+    before_entry: DirtyEntry | undefined,
+    next: CellHyperlink | null,
+    base: ParsedCellEdit,
+    persisted_link: CellHyperlink | null,
+): PlannedOverlayWrite {
+    const base_link = before_entry?.link !== undefined
+        ? before_entry.baseLink ?? null
+        : persisted_link;
+    const value_changed = before_entry !== undefined && dirty_entry_value_changed(before_entry);
+    const base_value = history_value(base.text, base.rich);
+
+    if (hyperlinks_equal(next, base_link)) {
+        // Link reverted. Drop the dimension, keep any value change.
+        if (!value_changed) return { entry: undefined, overlay: absent_overlay() };
+        const entry = copy_dirty_entry(before_entry!, { link: undefined, baseLink: undefined });
+        return {
+            entry,
+            overlay: value_only_overlay(
+                history_value(entry.value, entry.valueRuns),
+                history_value(entry.base, entry.baseRuns),
+            ),
+        };
+    }
+
+    if (before_entry !== undefined) {
+        const entry = copy_dirty_entry(before_entry, { link: next, baseLink: base_link });
+        const value = history_value(entry.value, entry.valueRuns);
+        // The value dimension's intent survives from the entry being extended:
+        // a cell whose value never moved keeps a link-only value dimension even
+        // as its link changes, so undo does not restore text it never wrote.
+        return {
+            entry,
+            overlay: value_changed
+                ? combined_overlay(
+                    value, history_value(entry.base, entry.baseRuns), next, base_link,
+                )
+                : hyperlink_only_overlay(value, next, base_link),
+        };
+    }
+
+    // Link-only entry: value dimension pinned at the base text.
+    return {
+        entry: make_dirty_entry(base.text, base.text, base.rich, base.rich, next, base_link),
+        overlay: hyperlink_only_overlay(base_value, next, base_link),
+    };
 }
 
 export function use_editing(
@@ -205,123 +377,187 @@ export function use_editing(
         [begin_editing],
     );
 
-    // The shared body of both commit entry points: parse the editor's text in
-    // the sheet's syntax, revert when it means the same thing as the cell's
-    // current content (semantic comparison — retyping a bold cell's own
-    // `**markup**`, however spelled, is a revert; deleting the `**` is an
-    // edit), otherwise store the plain projection plus runs when styled.
-    const settle_edit = useCallback(
-        (source_row: number, source_col: number, input: string) => {
-            const key = `${source_row}:${source_col}`;
-            const parsed = parse_cell_edit(input, syntax);
-            const base = edit_base_at(source_row, source_col);
-            // A pending link change is its own dimension: a text revert must
-            // not discard it, and a text commit must carry it forward.
-            const pending = active_store.get(key);
-            const link_dimension = pending?.link !== undefined
-                ? { link: pending.link, baseLink: pending.baseLink ?? null }
-                : undefined;
+    // Capture needs both: a history to record into, and the sheet identity to
+    // record. Consumers without a workbook around them (the hook's own tests,
+    // GridShell before App wires one down) edit exactly as before, unrecorded.
+    const worksheet = options?.worksheet;
+    const history = options?.history;
+    const capturing = worksheet !== undefined && history !== undefined;
 
-            // The revert rule lives here rather than in the store: only the hook
-            // can read the cell's persisted content.
-            if (cell_edits_equal(parsed, base)) {
-                if (link_dimension === undefined) {
-                    active_store.remove(session_id, key);
-                } else {
-                    // Text reverted, link still pending: the entry survives as
-                    // link-only, its value dimension back at the base.
-                    active_store.commit(
-                        session_id,
-                        key,
-                        make_dirty_entry(
-                            base.text,
-                            base.text,
-                            base.rich,
-                            base.rich,
-                            link_dimension.link,
-                            link_dimension.baseLink,
-                        ),
-                    );
-                }
-                return;
+    /**
+     * The cell's state on disk — the side of an undo transition the overlay is
+     * an edit ON TOP OF.
+     *
+     * `undefined` when the page is not resident, and the caller must then refuse
+     * that cell rather than mutate it. `edit_base_at`'s `?? ''` fallback is fine
+     * for opening an editor, where a wrong base only means the user retypes; as
+     * a history base it would fabricate the missing side, and undo would write
+     * an empty cell over content it never saw.
+     */
+    const persisted_history_state_at = useCallback(
+        (source_row: number, source_col: number): PersistedCellHistoryState | undefined => {
+            const raw = get_cell_raw(source_row, source_col);
+            if (raw === undefined) return undefined;
+            if (syntax !== 'markdown') {
+                // CSV and TSV cannot carry an editable whole-cell hyperlink, so
+                // `null` here is a known persisted state rather than a guess.
+                return { value: history_value(raw), hyperlink: null };
             }
-
-            active_store.commit(
-                session_id,
-                key,
-                make_dirty_entry(
-                    parsed.text,
-                    base.text,
-                    // Explicit plain runs when the user stripped a styled
-                    // base's markup — see committed_value_runs.
-                    committed_value_runs(parsed, base),
-                    base.rich,
-                    link_dimension?.link,
-                    link_dimension?.baseLink,
-                ),
-            );
+            const cell = get_cell?.(source_row, source_col);
+            if (cell === undefined) return undefined;
+            // Same rich-text consistency rule as `edit_base_at`: the loaded cell
+            // contributes styling only while its plain projection still agrees
+            // with the raw reader, which sees an in-flight save's values.
+            if (cell !== null && (cell.raw ?? '') === raw) {
+                const base = cell_edit_base(cell);
+                return {
+                    value: history_value(base.text, base.rich),
+                    hyperlink: cell.hyperlink ?? null,
+                };
+            }
+            return { value: history_value(raw), hyperlink: cell?.hyperlink ?? null };
         },
-        [active_store, edit_base_at, session_id, syntax],
+        [get_cell_raw, get_cell, syntax],
     );
 
     /**
-     * Commit a whole-cell hyperlink change (dialog output): a link to set, or
-     * null to clear. Reverting to the cell's current link removes the link
-     * dimension — and the whole entry when no value change remains. The base
-     * recorded is the cell's LOADED link (or the already-pending baseLink),
-     * never the pending value, so a re-edit of the same cell keeps one honest
-     * conflict base.
+     * Apply one gesture: plan every cell, then swap the edits and the history
+     * recording together.
+     *
+     * The transaction is the point. Looping over `commit`/`remove` would publish
+     * each cell of a paste separately — a re-render, a pendingEdits post and a
+     * host-side workspace-state write per cell — and would leave a half-applied
+     * gesture visible if anything after the first cell refused. Planning is
+     * pure and total: it reads state and produces every write or none.
+     *
+     * `plan` returns the store entry AND the overlay it means, per cell. The
+     * overlay is what capture records; nothing here re-derives one from the
+     * entry, because the entry cannot express the difference.
      */
+    const run_edit_gesture = useCallback(
+        <T extends { readonly source_row: number; readonly source_col: number }>(
+            edits: readonly T[],
+            label: string,
+            plan: (
+                edit: T,
+                before_entry: DirtyEntry | undefined,
+                persisted: PersistedCellHistoryState | undefined,
+            ) => PlannedOverlayWrite | undefined,
+        ): void => {
+            if (edits.length === 0) return;
+            const writes: StoreWrite[] = [];
+            const gesture = begin_gesture_capture();
+            // The store as this gesture found it, plus what the gesture has
+            // written so far: a paste whose target overlaps a cell it already
+            // wrote has to plan against its own earlier write, not against the
+            // state the batch began in.
+            const working = new Map<string, DirtyEntry | undefined>();
+
+            for (const edit of edits) {
+                const { source_row, source_col } = edit;
+                if (!Number.isInteger(source_row) || source_row < 0) continue;
+                if (!Number.isInteger(source_col) || source_col < 0) continue;
+                const key = `${source_row}:${source_col}`;
+                const persisted = persisted_history_state_at(source_row, source_col);
+                // Capture cannot represent a cell with no persisted side, so
+                // that cell does not move either — an applied edit history could
+                // not describe would let undo cross an unrecorded change.
+                if (capturing && persisted === undefined) continue;
+                const before_entry = working.has(key) ? working.get(key) : active_store.get(key);
+
+                const planned = plan(edit, before_entry, persisted);
+                if (planned === undefined) continue;
+
+                writes.push({ key, entry: planned.entry });
+                working.set(key, planned.entry);
+
+                if (!capturing || persisted === undefined) continue;
+                gesture.record(key, {
+                    worksheet,
+                    sourceRow: source_row,
+                    sourceColumn: source_col,
+                    // The exact overlay an earlier write in this gesture left,
+                    // when there was one; otherwise what the store holds, read
+                    // with `'infer'` because its writer's intent is long gone.
+                    before: gesture.overlay_at(key)
+                        ?? (before_entry === undefined
+                            ? absent_overlay()
+                            : overlay_state_from_dirty_entry(before_entry)),
+                    after: planned.overlay,
+                    persisted,
+                });
+            }
+
+            const staged_writes = active_store.stage_writes(session_id, writes);
+            // The session moved on: this hook's writes belong to a session that
+            // is no longer current, so nothing lands and nothing is recorded.
+            if (staged_writes === undefined) return;
+            const staged_record = capturing
+                ? history.stage_record(gesture.action(label))
+                : undefined;
+
+            // Validate both before moving either: committing the edits and then
+            // finding the history unrecordable would leave the two out of step.
+            if (!staged_writes.valid()) return;
+            if (staged_record !== undefined && !staged_record.valid()) return;
+
+            staged_writes.commit();
+            // A refusal commits too — its state is the barrier, and by decision
+            // an oversized gesture stays applied with the history cleared behind
+            // it rather than being rejected.
+            staged_record?.commit();
+            staged_writes.notify();
+            staged_record?.notify();
+        },
+        [active_store, capturing, history, persisted_history_state_at, session_id, worksheet],
+    );
+
+    /**
+     * Commit new text into cells: one gesture, one history action.
+     *
+     * Parses each editor's text in the sheet's syntax and reverts a cell whose
+     * text means the same thing as its persisted content, otherwise stores the
+     * plain projection plus runs when styled.
+     */
+    const commit_edits = useCallback(
+        (edits: readonly CellValueEdit[], label = 'Edit cell'): void => {
+            run_edit_gesture(edits, label, (edit, before_entry) => plan_value_write(
+                before_entry,
+                edit.value,
+                edit_base_at(edit.source_row, edit.source_col),
+                syntax,
+            ));
+        },
+        [run_edit_gesture, edit_base_at, syntax],
+    );
+
+    /**
+     * Commit whole-cell hyperlink changes (dialog output): a link to set, or
+     * null to clear. Reverting to a cell's current link removes the link
+     * dimension — and the whole entry when no value change remains.
+     */
+    const commit_hyperlinks = useCallback(
+        (edits: readonly CellHyperlinkEdit[], label = 'Edit hyperlink'): void => {
+            run_edit_gesture(edits, label, (edit, before_entry, persisted) => {
+                const loaded_link = persisted !== undefined
+                    ? persisted.hyperlink
+                    : get_cell?.(edit.source_row, edit.source_col)?.hyperlink ?? null;
+                return plan_hyperlink_write(
+                    before_entry,
+                    edit.value,
+                    edit_base_at(edit.source_row, edit.source_col),
+                    loaded_link,
+                );
+            });
+        },
+        [run_edit_gesture, edit_base_at, get_cell],
+    );
+
     const commit_hyperlink = useCallback(
         (source_row: number, source_col: number, next: CellHyperlink | null) => {
-            const key = `${source_row}:${source_col}`;
-            const pending = active_store.get(key);
-            const loaded_link = get_cell?.(source_row, source_col)?.hyperlink ?? null;
-            const base_link = pending?.link !== undefined
-                ? pending.baseLink ?? null
-                : loaded_link;
-
-            const value_changed = pending !== undefined
-                && dirty_entry_value_changed(pending);
-
-            if (hyperlinks_equal(next, base_link)) {
-                // Link reverted. Drop the dimension, keep any value change.
-                if (!value_changed) {
-                    if (pending !== undefined) active_store.remove(session_id, key);
-                    return;
-                }
-                active_store.commit(
-                    session_id,
-                    key,
-                    copy_dirty_entry(pending, { link: undefined, baseLink: undefined }),
-                );
-                return;
-            }
-
-            if (pending !== undefined) {
-                active_store.commit(
-                    session_id,
-                    key,
-                    copy_dirty_entry(pending, { link: next, baseLink: base_link }),
-                );
-                return;
-            }
-            // Link-only entry: value dimension pinned at the base text.
-            const base = edit_base_at(source_row, source_col);
-            active_store.commit(
-                session_id,
-                key,
-                make_dirty_entry(
-                    base.text,
-                    base.text,
-                    base.rich,
-                    base.rich,
-                    next,
-                    base_link,
-                ),
-            );
+            commit_hyperlinks([{ source_row, source_col, value: next }]);
         },
-        [active_store, edit_base_at, get_cell, session_id],
+        [commit_hyperlinks],
     );
 
     const confirm_edit = useCallback(
@@ -329,9 +565,9 @@ export function use_editing(
             if (!editing_cell) return;
             const { source_row, source_col } = editing_cell;
             set_editing_cell(null);
-            settle_edit(source_row, source_col, new_value);
+            commit_edits([{ source_row, source_col, value: new_value }]);
         },
-        [editing_cell, settle_edit],
+        [editing_cell, commit_edits],
     );
 
     // Location-based commit for Glide, whose overlay editor reports edits via
@@ -346,9 +582,9 @@ export function use_editing(
                     ? null
                     : prev,
             );
-            settle_edit(source_row, source_col, new_value);
+            commit_edits([{ source_row, source_col, value: new_value }]);
         },
-        [settle_edit],
+        [commit_edits],
     );
 
     const cancel_edit = useCallback(() => {
@@ -475,7 +711,9 @@ export function use_editing(
         force_start_editing,
         confirm_edit,
         commit_edit,
+        commit_edits,
         commit_hyperlink,
+        commit_hyperlinks,
         cancel_edit,
         clear_dirty,
         replace_dirty,
