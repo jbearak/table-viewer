@@ -286,8 +286,9 @@ function action_charger(): ActionCharger {
         // relationships — so a gesture carrying a megabyte-long name past the byte
         // bound is a gesture that exhausted the heap history was bounded to
         // protect. Charged by value like any other string: a million-cell paste
-        // over a long sheet name pays for that name once, and a target that really
-        // did allocate a second copy of it is charged for that copy.
+        // over a long sheet name pays for that name once. Distinct targets are
+        // still charged separately for their own shape, since replay needs each
+        // tuple; it is only the equal strings inside them that are shared.
         worksheet: (worksheet) => once(worksheet, (target) =>
             string_bytes(target.sheetName ?? '') + string_bytes(target.worksheetId ?? '')),
     };
