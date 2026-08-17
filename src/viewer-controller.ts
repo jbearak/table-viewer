@@ -59,6 +59,7 @@ import {
     plan_excel_candidate_state,
 } from './excel-header-plan';
 import { parse_http_external_url } from './external-url';
+import { is_plain_record } from './plain-record';
 import {
     acquire_file_coordinator,
     type ExcelHeaderOperationReceipt,
@@ -94,14 +95,18 @@ import {
     type CsvDirtyMap,
     dirty_entries_equal,
     dirty_entry_link_changed,
+    dirty_entry_value_changed,
+    is_wire_save_correlation,
     sanitized_wire_dirty_entry,
+    sanitized_wire_save_maps,
+    sanitized_wire_worksheet_target,
+    save_lifecycle_correlation,
+    type CsvSaveCorrelation,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
-    type CsvSaveOperationRequest,
     type CsvSaveWorksheetOperation,
     type CsvSaveRejection,
     type HostMessage,
-    type LegacyCsvSaveOperationRequest,
     type PerFileState,
     type SheetPendingEditCells,
     type SheetTransformState,
@@ -840,7 +845,7 @@ export function attach_viewer(
     // Save identities whose edits `persist_accepted_save` wrote into durable state.
     // A failed save only needs a tombstone if it got that far; see the write site in
     // `release_edit_session`. Weak so a retired operation's entry goes with it —
-    // `save_lifecycle.operation` is the only strong reference either way.
+    // A normal terminal lifecycle's operation is the only strong reference either way.
     const persisted_save_targets = new WeakMap<CsvSaveOperation, readonly WorksheetTarget[]>();
     const pending_rehydration_rejections = new WeakMap<PanelAdoption, {
         readonly operation: CsvSaveOperation;
@@ -1775,24 +1780,26 @@ export function attach_viewer(
         return save_lifecycle;
     }
 
-    function begin_save_lifecycle(
-        operation: CsvSaveOperation,
-    ): ActiveCsvSaveLifecycle {
-        const lifecycle = Object.freeze<ActiveCsvSaveLifecycle>({
-            revision: save_lifecycle.revision + 1,
-            state: 'active',
-            operation,
-        });
+    function adopt_save_lifecycle<T extends CsvSaveLifecycle>(lifecycle: T): T {
         save_lifecycle = lifecycle;
         recapture_edit_capabilities();
         return lifecycle;
     }
 
+    function begin_save_lifecycle(
+        operation: CsvSaveOperation,
+    ): ActiveCsvSaveLifecycle {
+        return adopt_save_lifecycle(Object.freeze<ActiveCsvSaveLifecycle>({
+            revision: save_lifecycle.revision + 1,
+            state: 'active',
+            operation,
+        }));
+    }
+
     function finish_save_lifecycle(
         operation: CsvSaveOperation,
         state: 'failed',
-        failure?: 'malformedRequest',
-    ): Extract<CsvSaveLifecycle, { state: 'failed' }>;
+    ): Extract<CsvSaveLifecycle, { state: 'failed'; operation: CsvSaveOperation }>;
     function finish_save_lifecycle(
         operation: CsvSaveOperation,
         state: 'succeeded',
@@ -1800,17 +1807,23 @@ export function attach_viewer(
     function finish_save_lifecycle(
         operation: CsvSaveOperation,
         state: 'failed' | 'succeeded',
-        failure?: 'malformedRequest',
-    ): Extract<CsvSaveLifecycle, { state: 'failed' | 'succeeded' }> {
-        const lifecycle = Object.freeze({
+    ): Extract<CsvSaveLifecycle, { state: 'failed' | 'succeeded'; operation: CsvSaveOperation }> {
+        const revision = save_lifecycle.revision + 1;
+        const lifecycle = state === 'failed'
+            ? Object.freeze({ revision, state: 'failed' as const, operation })
+            : Object.freeze({ revision, state: 'succeeded' as const, operation });
+        return adopt_save_lifecycle(lifecycle);
+    }
+
+    function finish_malformed_save_lifecycle(
+        correlation: CsvSaveCorrelation,
+    ): Extract<CsvSaveLifecycle, { failure: 'malformedRequest' }> {
+        return adopt_save_lifecycle(Object.freeze({
             revision: save_lifecycle.revision + 1,
-            state,
-            operation,
-            ...(state === 'failed' && failure !== undefined ? { failure } : {}),
-        });
-        save_lifecycle = lifecycle;
-        recapture_edit_capabilities();
-        return lifecycle;
+            state: 'failed' as const,
+            failure: 'malformedRequest' as const,
+            correlation,
+        }));
     }
 
     function retire_save_lifecycle(
@@ -1824,15 +1837,15 @@ export function attach_viewer(
             terminal_state !== undefined
             && save_lifecycle.state !== terminal_state
         ) return false;
+        const correlation = save_lifecycle_correlation(save_lifecycle);
         if (
             edit_session_id !== undefined
-            && save_lifecycle.operation.editSessionId !== edit_session_id
+            && correlation?.editSessionId !== edit_session_id
         ) return false;
-        save_lifecycle = Object.freeze({
+        adopt_save_lifecycle(Object.freeze<CsvSaveLifecycle>({
             revision: save_lifecycle.revision + 1,
             state: 'idle',
-        });
-        recapture_edit_capabilities();
+        }));
         return true;
     }
 
@@ -2076,25 +2089,32 @@ export function attach_viewer(
                     type: 'saveResult',
                     success: false,
                     lifecycle,
+                    basesValidated: true,
                 });
             }
         }
-        if (
-            save_lifecycle.state === 'failed'
-            && save_lifecycle.operation.editSessionId === edit_session_id
-        ) {
-            // Only a save that got as far as `persist_accepted_save` leaves anything
-            // for the tombstone to undo. The early rejections — base mismatch,
-            // removed rows, serialize failure, "still refreshing" — return before
-            // `active_save_operation` is even assigned, so the only pending edits on
-            // disk are the ones the *user's own* posts made durable. A tombstone
-            // there would have `ensure_failed_save_cleanup` strip them by value,
-            // silently discarding work the user still has open in the grid: hit Save
-            // on an externally-changed file, read the "try again" warning, close the
-            // tab, and the edit is gone.
-            const durable_targets = persisted_save_targets.get(save_lifecycle.operation);
-            if (durable_targets) file_edit_state.failedSaveTombstone = save_lifecycle.operation;
-            retire_save_lifecycle(edit_session_id, 'failed');
+        if (save_lifecycle.state === 'failed') {
+            const failed_session_id = save_lifecycle_correlation(save_lifecycle)?.editSessionId;
+            if (failed_session_id === edit_session_id) {
+                // Only a save that got as far as `persist_accepted_save` leaves anything
+                // for the tombstone to undo. The early rejections — base mismatch,
+                // removed rows, serialize failure, "still refreshing" — return before
+                // `active_save_operation` is even assigned, so the only pending edits on
+                // disk are the ones the *user's own* posts made durable. A tombstone
+                // there would have `ensure_failed_save_cleanup` strip them by value,
+                // silently discarding work the user still has open in the grid: hit Save
+                // on an externally-changed file, read the "try again" warning, close the
+                // tab, and the edit is gone.
+                if ('operation' in save_lifecycle) {
+                    const durable_targets = persisted_save_targets.get(
+                        save_lifecycle.operation,
+                    );
+                    if (durable_targets) {
+                        file_edit_state.failedSaveTombstone = save_lifecycle.operation;
+                    }
+                }
+                retire_save_lifecycle(edit_session_id, 'failed');
+            }
         }
 
         const fence = fence_edit_session_writes(edit_session_id);
@@ -2445,7 +2465,7 @@ export function attach_viewer(
             || operation_sheet_index(worksheet, scope.sheets, scope.slots)
                 === scope.sheetIndex;
         let projected = pending_edits;
-        if (save_lifecycle.state !== 'idle') {
+        if (save_lifecycle.state !== 'idle' && 'operation' in save_lifecycle) {
             if (
                 save_lifecycle.state !== 'succeeded'
                 && save_lifecycle.operation.editSessionId === active_edit_session_id
@@ -3719,7 +3739,7 @@ export function attach_viewer(
                                     restored_sheet_index,
                                 );
                                 if (!validation) continue;
-                                const cloned = clone_save_operation({
+                                const parsed = parse_save_operation({
                                     editSessionId: active_edit_session_id,
                                     saveRequestId: `rehydration:${seq}`,
                                     worksheets: [{
@@ -3728,15 +3748,19 @@ export function attach_viewer(
                                         worksheetId: next_sheets[restored_sheet_index]?.worksheetId,
                                         edits: Object.fromEntries(Object.entries(
                                             validation.dirtyEdits,
-                                        ).map(([key, entry]) => [key, entry.value])),
+                                        ).flatMap(([key, entry]) => (
+                                            dirty_entry_value_changed(entry)
+                                                ? [[key, entry.value] as const]
+                                                : []
+                                        ))),
                                         dirtyEdits: validation.dirtyEdits,
                                     }],
                                 });
-                                if (cloned.hasMalformedDirtyEntry) {
-                                    throw new Error('Restored save operation held a malformed dirty entry.');
+                                if (parsed.status === 'malformed') {
+                                    throw new Error('Restored save operation held malformed edits.');
                                 }
                                 pending_rehydration_rejections.set(adoption, {
-                                    operation: cloned.operation,
+                                    operation: parsed.operation,
                                     rejection: validation.rejection,
                                 });
                                 break;
@@ -4549,74 +4573,92 @@ export function attach_viewer(
             type: 'saveResult',
             success: false,
             lifecycle,
+            basesValidated: true,
         });
     }
 
-    function clone_save_operation(input: CsvSaveOperationRequest): {
-        operation: CsvSaveOperation;
-        hasMalformedDirtyEntry: boolean;
-    } {
-        const is_workbook_request = 'worksheets' in input
-            && Array.isArray(input.worksheets);
-        const requested_worksheets: readonly (
-            | CsvSaveWorksheetOperation
-            | LegacyCsvSaveOperationRequest
-        )[] = is_workbook_request
-            ? input.worksheets
+    type ParsedSaveOperation =
+        | { readonly status: 'valid'; readonly operation: CsvSaveOperation }
+        | { readonly status: 'malformed'; readonly correlation?: CsvSaveCorrelation };
+
+    function parse_save_operation(input: unknown): ParsedSaveOperation {
+        if (!is_plain_record(input)) return { status: 'malformed' };
+        const correlation = is_wire_save_correlation(input)
+            ? Object.freeze<CsvSaveCorrelation>({
+                editSessionId: input.editSessionId,
+                saveRequestId: input.saveRequestId,
+            })
+            : undefined;
+        const malformed = (): ParsedSaveOperation => ({
+            status: 'malformed',
+            ...(correlation ? { correlation } : {}),
+        });
+        if (!correlation) return malformed();
+
+        const is_workbook_request = Object.prototype.hasOwnProperty.call(
+            input,
+            'worksheets',
+        );
+        if (
+            is_workbook_request
+            && (!Array.isArray(input.worksheets) || input.worksheets.length === 0)
+        ) return malformed();
+        const requested_worksheets: readonly unknown[] = is_workbook_request
+            ? input.worksheets as readonly unknown[]
             : [input];
-        let has_malformed_dirty_entry = false;
-        const worksheets = requested_worksheets.map((worksheet) => {
-            const dirty_edits = Object.fromEntries(
-                Object.entries(worksheet.dirtyEdits).flatMap(([key, entry]) => {
-                    // Wire runs are untrusted; the sanitizer keeps a run side
-                    // only when its text equals the plain projection, so the
-                    // planner can hand runs to the xlsx writer without
-                    // re-checking. A malformed required entry marks the whole
-                    // operation invalid. It is omitted only from this terminal
-                    // lifecycle identity; handle_save refuses the operation
-                    // before planning, so its matching `edits` value can never
-                    // be written without a validated base.
-                    const sanitized = sanitized_wire_dirty_entry(entry);
-                    if (!sanitized) {
-                        has_malformed_dirty_entry = true;
-                        return [];
-                    }
-                    return [[key, Object.freeze(sanitized)] as const];
-                }),
+        const worksheets: CsvSaveWorksheetOperation[] = [];
+        const sheet_indices = new Set<number>();
+        const target_keys = new Set<string>();
+        for (const requested of requested_worksheets) {
+            if (!is_plain_record(requested)) return malformed();
+            const target = sanitized_wire_worksheet_target(
+                requested,
+                is_workbook_request ? undefined : 0,
             );
-            const sheet_index = worksheet.sheetIndex ?? 0;
-            const sheet_name = worksheet.sheetName ?? (
+            const maps = sanitized_wire_save_maps(
+                requested.edits,
+                requested.dirtyEdits,
+            );
+            if (!target || !maps) return malformed();
+            const target_key = worksheet_target_key(target);
+            if (
+                sheet_indices.has(target.sheetIndex)
+                || target_keys.has(target_key)
+            ) return malformed();
+            sheet_indices.add(target.sheetIndex);
+            target_keys.add(target_key);
+
+            const sheet_name = target.sheetName ?? (
                 (source?.meta().sheets.length ?? 0) <= 1
-                    ? sheet_name_at(sheet_index)
+                    ? sheet_name_at(target.sheetIndex)
                     : undefined
             );
-            return Object.freeze<CsvSaveWorksheetOperation>({
-                sheetIndex: sheet_index,
+            worksheets.push(Object.freeze<CsvSaveWorksheetOperation>({
+                sheetIndex: target.sheetIndex,
                 ...(sheet_name !== undefined ? { sheetName: sheet_name } : {}),
-                ...(worksheet.worksheetId !== undefined
-                    ? { worksheetId: worksheet.worksheetId }
+                ...(target.worksheetId !== undefined
+                    ? { worksheetId: target.worksheetId }
                     : {}),
-                edits: Object.freeze({ ...worksheet.edits }),
-                dirtyEdits: Object.freeze(dirty_edits),
-            });
-        });
-        const workbook_operation = {
-            editSessionId: input.editSessionId,
-            saveRequestId: input.saveRequestId,
-            worksheets: Object.freeze(worksheets),
-        };
-        if (is_workbook_request) {
-            return {
-                operation: Object.freeze(workbook_operation),
-                hasMalformedDirtyEntry: has_malformed_dirty_entry,
-            };
+                ...maps,
+            }));
         }
+
+        const workbook_operation = Object.freeze<CsvSaveOperation>({
+            editSessionId: correlation.editSessionId,
+            saveRequestId: correlation.saveRequestId,
+            worksheets: Object.freeze(worksheets),
+        });
+        if (is_workbook_request) {
+            return { status: 'valid', operation: workbook_operation };
+        }
+
         // Old renderers compare the flat fields they proposed and ignore unknown
         // fields; current renderers compare `worksheets` and ignore these aliases.
         // One hybrid identity therefore settles both generations through every
         // lifecycle channel, including snapshots, without weakening either reducer.
         const worksheet = worksheets[0];
         return {
+            status: 'valid',
             operation: Object.freeze({
                 ...workbook_operation,
                 sheetIndex: worksheet.sheetIndex,
@@ -4629,7 +4671,6 @@ export function attach_viewer(
                 edits: worksheet.edits,
                 dirtyEdits: worksheet.dirtyEdits,
             }),
-            hasMalformedDirtyEntry: has_malformed_dirty_entry,
         };
     }
 
@@ -4647,9 +4688,9 @@ export function attach_viewer(
             let pending = current.pendingEdits;
             operation.identity.worksheets.forEach((worksheet, index) => {
                 const target = operation.durableTargets[index];
-                // Already sanitized: `operation.identity` is the clone built by
-                // `clone_save_operation`, whose entries went through
-                // `sanitized_wire_dirty_entry` at ingress.
+                // Already sanitized: `operation.identity` is the owned operation
+                // built by `parse_save_operation` after its complete dirty maps
+                // passed the wire boundary.
                 pending = with_pending_edits_for_sheet(
                     pending,
                     target.sheetIndex,
@@ -4666,18 +4707,13 @@ export function attach_viewer(
         notify_edit_state(committed);
     }
 
-    async function handle_save(input: CsvSaveOperationRequest): Promise<void> {
+    async function handle_save(input: unknown): Promise<void> {
         const receiver_epoch = session.current_receiver_epoch;
         if (active_save_operation) return;
-        const cloned = clone_save_operation(input);
-        const identity = cloned.operation;
-        if (cloned.hasMalformedDirtyEntry) {
-            const active = begin_save_lifecycle(identity);
-            const lifecycle = finish_save_lifecycle(
-                active.operation,
-                'failed',
-                'malformedRequest',
-            );
+        const parsed = parse_save_operation(input);
+        if (parsed.status === 'malformed') {
+            if (!parsed.correlation) return;
+            const lifecycle = finish_malformed_save_lifecycle(parsed.correlation);
             void post_to_receiver({
                 type: 'saveResult',
                 success: false,
@@ -4685,32 +4721,24 @@ export function attach_viewer(
             }, receiver_epoch);
             return;
         }
+        const identity = parsed.operation;
         // The session covers the workbook, so the save names its own worksheet —
         // but the index is a caller-controlled wire number that reaches the
         // planner and the meta lookup below, so it is bounded against the live
-        // workbook here. `clone_save_operation` captured the name at that index;
+        // workbook here. `parse_save_operation` captured the name at that index;
         // an index the workbook does not have captured no name and resolves to
         // nothing, and a reorder landing between the message and this check makes
         // the captured name resolve elsewhere — both are refusals, not saves into
         // whatever sheet now sits at the number.
         const live_sheet_count = source?.meta().sheets.length ?? 0;
-        const target_indices = identity.worksheets.map(
-            (worksheet) => worksheet.sheetIndex,
-        );
-        const has_duplicate_target = new Set(target_indices).size
-            !== target_indices.length;
-        const wrong_sheet = identity.worksheets.length === 0
-            || has_duplicate_target
-            || identity.worksheets.some((worksheet) => {
-                const missing_multisheet_identity = live_sheet_count > 1
-                    && worksheet.worksheetId === undefined
-                    && worksheet.sheetName === undefined;
-                return !Number.isSafeInteger(worksheet.sheetIndex)
-                    || worksheet.sheetIndex < 0
-                    || worksheet.sheetIndex >= live_sheet_count
-                    || missing_multisheet_identity
-                    || save_sheet_displaced(worksheet);
-            });
+        const wrong_sheet = identity.worksheets.some((worksheet) => {
+            const missing_multisheet_identity = live_sheet_count > 1
+                && worksheet.worksheetId === undefined
+                && worksheet.sheetName === undefined;
+            return worksheet.sheetIndex >= live_sheet_count
+                || missing_multisheet_identity
+                || save_sheet_displaced(worksheet);
+        });
         if (wrong_sheet || !edit_message_is_current(identity.editSessionId)) {
             const active = begin_save_lifecycle(identity);
             const lifecycle = finish_save_lifecycle(active.operation, 'failed');
@@ -5036,6 +5064,7 @@ export function attach_viewer(
                 type: 'saveResult',
                 success: false,
                 lifecycle,
+                basesValidated: true,
             });
             return;
         }
@@ -6778,14 +6807,16 @@ export function attach_viewer(
                         ) {
                             file_edit_state.failedSaveTombstone = undefined;
                         }
-                        if (
-                            save_lifecycle.state === 'failed'
-                            && (
-                                save_lifecycle.operation.editSessionId !== edit_session_id
-                                || supersedes(save_lifecycle.operation)
-                            )
-                        ) {
-                            retire_save_lifecycle(undefined, 'failed');
+                        if (save_lifecycle.state === 'failed') {
+                            const correlation = save_lifecycle_correlation(save_lifecycle);
+                            const should_retire = correlation?.editSessionId !== edit_session_id
+                                || (
+                                    'operation' in save_lifecycle
+                                    && supersedes(save_lifecycle.operation)
+                                );
+                            if (should_retire) {
+                                retire_save_lifecycle(undefined, 'failed');
+                            }
                         }
                         notify_edit_state(result.snapshot);
                         delete_shared_edit_state_if_unused();

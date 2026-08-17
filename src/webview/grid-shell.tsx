@@ -111,7 +111,10 @@ import {
 } from './edit-session-store';
 import {
     csv_save_operations_equal,
+    is_valid_csv_save_lifecycle,
+    remove_operation_owned_pending_edits,
     resolve_csv_save_hydration,
+    save_lifecycle_correlation,
     save_operation_worksheet,
     terminal_csv_save_settles_operation,
 } from './csv-save-lifecycle';
@@ -642,7 +645,10 @@ export function GridShell({
     } = loader;
     const lifecycle_operation = (
         save_lifecycle.state === 'active'
-        || save_lifecycle.state === 'failed'
+        || (
+            save_lifecycle.state === 'failed'
+            && 'operation' in save_lifecycle
+        )
     )
         && save_lifecycle.operation.editSessionId === edit_session_id
         ? save_lifecycle.operation
@@ -659,7 +665,10 @@ export function GridShell({
             sheet_meta.name,
             sheet_meta.worksheetId,
         ), [sheet_index, sheet_meta.name, sheet_meta.worksheetId]);
-    const restored_worksheet = worksheet_payload(restored_save_operation);
+    const restored_worksheet = useMemo(
+        () => worksheet_payload(restored_save_operation),
+        [restored_save_operation, worksheet_payload],
+    );
     // Fallback for a consumer that doesn't hoist the session store (the shell's
     // own tests). Lazy so `resolve_csv_save_hydration` runs once at store
     // creation rather than on every render; its live job is session filtering at
@@ -797,6 +806,7 @@ export function GridShell({
     }, [edit_session_id, save_operation, worksheet_payload]);
 
     const apply_save_lifecycle = useCallback((lifecycle: CsvSaveLifecycle) => {
+        if (!is_valid_csv_save_lifecycle(lifecycle)) return;
         if (lifecycle.revision <= applied_save_lifecycle_revision_ref.current) return;
         applied_save_lifecycle_revision_ref.current = lifecycle.revision;
         if (lifecycle.state === 'active') {
@@ -817,29 +827,31 @@ export function GridShell({
         // Idle carries no proposal identity, so it cannot settle an operation that
         // may have been proposed after that idle projection was created.
         if (lifecycle.state === 'idle' || !operation) return;
-        if (
+        const correlation = save_lifecycle_correlation(lifecycle);
+        if (!correlation || (
             lifecycle.state === 'failed'
-                ? lifecycle.operation.editSessionId !== edit_session_id
+                ? correlation.editSessionId !== edit_session_id
                 : edit_session_id !== undefined
-                    && lifecycle.operation.editSessionId !== edit_session_id
-        ) return;
+                    && correlation.editSessionId !== edit_session_id
+        )) return;
         if (!terminal_csv_save_settles_operation(lifecycle, operation)) return;
 
-        const restore = (resolve_csv_save_hydration(
-            lifecycle.state === 'failed'
-                ? { authoritative: lifecycle, operation }
-                : { authoritative: lifecycle },
-            edit_session_id,
-            sheet_index,
-            sheet_meta.name,
-            sheet_meta.worksheetId,
-            Object.fromEntries(store.snapshot()),
-        ) ?? {}) as CsvDirtyMap;
-        replace_dirty(restore);
+        const pending = Object.fromEntries(store.snapshot());
+        const worksheet = worksheet_payload(operation);
+        const restore: CsvDirtyMap = worksheet === undefined
+            ? pending
+            : lifecycle.state === 'failed'
+                ? worksheet.dirtyEdits
+                : remove_operation_owned_pending_edits(pending, worksheet) ?? {};
+        // Release the lock before publishing the recovered map. The hydration and
+        // store boundaries make malformed proposals a safe no-op/fallback; keeping
+        // the flags first also guarantees the next request is admissible as soon as
+        // subscribers observe that recovery.
         save_operation_ref.current = undefined;
         saved_edits_ref.current = {};
         save_in_flight_ref.current = false;
         set_save_in_flight(false);
+        replace_dirty(restore);
     }, [
         edit_session_id,
         replace_dirty,

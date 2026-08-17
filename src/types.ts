@@ -1387,6 +1387,10 @@ export function copy_dirty_entry(
  * it unstyled is a correct save while refusing the whole operation over one
  * malformed optional field is not.
  */
+function is_nullable_hyperlink(value: unknown): value is CellHyperlink | null {
+    return value === null || is_valid_hyperlink(value);
+}
+
 export function sanitized_dirty_entry(entry: {
     readonly value: string;
     readonly base: string;
@@ -1403,12 +1407,10 @@ export function sanitized_dirty_entry(entry: {
     // (a change with no recorded base could never be conflict-checked).
     // Dropping a malformed pair leaves the cell's link untouched on save,
     // which is the safe failure for relationship metadata.
-    const link_side_ok = (side: unknown): side is CellHyperlink | null =>
-        side === null || is_valid_hyperlink(side);
     const keep_link = entry.link !== undefined
-        && link_side_ok(entry.link)
+        && is_nullable_hyperlink(entry.link)
         && entry.baseLink !== undefined
-        && link_side_ok(entry.baseLink);
+        && is_nullable_hyperlink(entry.baseLink);
     return make_dirty_entry(
         entry.value,
         entry.base,
@@ -1440,6 +1442,71 @@ export function sanitized_wire_dirty_entry(entry: unknown): CsvDirtyEntry | unde
         readonly baseRuns?: unknown;
         readonly link?: unknown;
         readonly baseLink?: unknown;
+    });
+}
+
+/** Runtime shape guard for an exact lifecycle identity. Unlike the save-ingress
+ * sanitizer, this rejects malformed optional metadata instead of dropping it. */
+export function is_strict_wire_dirty_entry(value: unknown): value is CsvDirtyEntry {
+    if (
+        !is_plain_record(value)
+        || typeof value.value !== 'string'
+        || typeof value.base !== 'string'
+    ) return false;
+    if (
+        value.valueRuns !== undefined
+        && !is_matching_rich_text(value.valueRuns, value.value)
+    ) return false;
+    if (
+        value.baseRuns !== undefined
+        && !is_matching_rich_text(value.baseRuns, value.base)
+    ) return false;
+
+    const has_link = value.link !== undefined || value.baseLink !== undefined;
+    return !has_link || (
+        value.link !== undefined
+        && value.baseLink !== undefined
+        && is_nullable_hyperlink(value.link)
+        && is_nullable_hyperlink(value.baseLink)
+    );
+}
+
+function sanitized_wire_record<T>(
+    value: unknown,
+    sanitize_entry: (entry: unknown) => T | undefined,
+): Readonly<Record<string, T>> | undefined {
+    if (!is_plain_record(value)) return undefined;
+    // A null prototype makes arbitrary cell keys, including `__proto__`, ordinary
+    // data properties without paying for one property descriptor per edited cell.
+    const result = Object.create(null) as Record<string, T>;
+    for (const key in value) {
+        if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+        const sanitized = sanitize_entry(value[key]);
+        if (sanitized === undefined) return undefined;
+        result[key] = sanitized;
+    }
+    return Object.freeze(result);
+}
+
+/** Copy an untrusted string-valued record into an owned, frozen record. */
+export function sanitized_wire_string_record(
+    value: unknown,
+): Readonly<Record<string, string>> | undefined {
+    return sanitized_wire_record(value, (entry) => (
+        typeof entry === 'string' ? entry : undefined
+    ));
+}
+
+/**
+ * Copy a complete dirty map off an untrusted boundary. Required entry fields are
+ * atomic: one malformed entry rejects the whole map, so a caller can never
+ * validate bases from a partial proposal. Optional rich/link metadata keeps the
+ * entry sanitizer's safe drop policy.
+ */
+export function sanitized_wire_dirty_map(value: unknown): CsvDirtyMap | undefined {
+    return sanitized_wire_record(value, (entry) => {
+        const sanitized = sanitized_wire_dirty_entry(entry);
+        return sanitized ? Object.freeze(sanitized) : undefined;
     });
 }
 
@@ -1519,10 +1586,44 @@ export interface CsvSaveRejection {
     readonly keys: readonly string[];
 }
 
+export function is_wire_csv_save_rejection(
+    value: unknown,
+): value is CsvSaveRejection {
+    return is_plain_record(value)
+        && (value.reason === 'baseMismatch' || value.reason === 'rowsRemoved')
+        && Number.isSafeInteger(value.worksheetOperationIndex)
+        && (value.worksheetOperationIndex as number) >= 0
+        && Array.isArray(value.keys)
+        && value.keys.every((key) => typeof key === 'string');
+}
+
 /** One worksheet-local payload inside an atomic workbook save. */
 export interface CsvSaveWorksheetOperation extends WorksheetTarget {
     readonly edits: Readonly<Record<string, string>>;
     readonly dirtyEdits: CsvDirtyMap;
+}
+
+/** Decode one worksheet target, optionally defaulting a legacy missing index. */
+export function sanitized_wire_worksheet_target(
+    value: unknown,
+    fallback_sheet_index?: number,
+): WorksheetTarget | undefined {
+    if (!is_plain_record(value)) return undefined;
+    const sheet_index = value.sheetIndex === undefined
+        ? fallback_sheet_index
+        : value.sheetIndex;
+    if (
+        typeof sheet_index !== 'number'
+        || !Number.isSafeInteger(sheet_index)
+        || sheet_index < 0
+        || (value.sheetName !== undefined && typeof value.sheetName !== 'string')
+        || (value.worksheetId !== undefined && typeof value.worksheetId !== 'string')
+    ) return undefined;
+    return Object.freeze({
+        sheetIndex: sheet_index,
+        ...(value.sheetName !== undefined ? { sheetName: value.sheetName } : {}),
+        ...(value.worksheetId !== undefined ? { worksheetId: value.worksheetId } : {}),
+    });
 }
 
 /** Immutable identity and complete payload for one accepted workbook save. */
@@ -1546,6 +1647,59 @@ export interface LegacyCsvSaveOperationRequest
 /** A workbook save as the webview posts it, including the prior one-sheet shape. */
 export type CsvSaveOperationRequest = CsvSaveOperation | LegacyCsvSaveOperationRequest;
 
+/** Renderer-generated identity that remains safe to echo when the payload is not. */
+export interface CsvSaveCorrelation {
+    readonly editSessionId: string;
+    readonly saveRequestId: string;
+}
+
+export function is_wire_save_correlation(
+    value: unknown,
+): value is CsvSaveCorrelation {
+    return is_plain_record(value)
+        && typeof value.editSessionId === 'string'
+        && typeof value.saveRequestId === 'string';
+}
+
+/** The renderer's canonical relation between the writer and durable dirty maps. */
+export function save_maps_agree(
+    edits: Readonly<Record<string, string>>,
+    dirty_edits: CsvDirtyMap,
+): boolean {
+    let expected_edit_count = 0;
+    for (const key in dirty_edits) {
+        if (!Object.prototype.hasOwnProperty.call(dirty_edits, key)) continue;
+        const entry = dirty_edits[key];
+        if (dirty_entry_value_changed(entry)) {
+            expected_edit_count += 1;
+            if (
+                !Object.prototype.hasOwnProperty.call(edits, key)
+                || edits[key] !== entry.value
+            ) return false;
+        } else if (Object.prototype.hasOwnProperty.call(edits, key)) {
+            return false;
+        }
+    }
+    let actual_edit_count = 0;
+    for (const key in edits) {
+        if (Object.prototype.hasOwnProperty.call(edits, key)) actual_edit_count += 1;
+    }
+    return actual_edit_count === expected_edit_count;
+}
+
+/** Decode and own the two worksheet maps as one atomic wire boundary. */
+export function sanitized_wire_save_maps(
+    edits_value: unknown,
+    dirty_edits_value: unknown,
+): Pick<CsvSaveWorksheetOperation, 'edits' | 'dirtyEdits'> | undefined {
+    const edits = sanitized_wire_string_record(edits_value);
+    const dirty_edits = sanitized_wire_dirty_map(dirty_edits_value);
+    if (!edits || !dirty_edits || !save_maps_agree(edits, dirty_edits)) {
+        return undefined;
+    }
+    return Object.freeze({ edits, dirtyEdits: dirty_edits });
+}
+
 export type CsvSaveLifecycle =
     | { readonly revision: number; readonly state: 'idle' }
     | { readonly revision: number; readonly state: 'active'; readonly operation: CsvSaveOperation }
@@ -1553,18 +1707,43 @@ export type CsvSaveLifecycle =
         readonly revision: number;
         readonly state: 'failed';
         readonly operation: CsvSaveOperation;
-        /** The host could not safely echo the complete untrusted payload, so this
-         *  terminal settles only the renderer proposal with the same session and
-         *  request IDs. The renderer restores its own locked payload. */
-        readonly failure?: 'malformedRequest';
+    }
+    | {
+        readonly revision: number;
+        readonly state: 'failed';
+        readonly failure: 'malformedRequest';
+        /** The host cannot safely echo a malformed payload. The renderer restores
+         *  its own proposal after matching only this session/request identity. */
+        readonly correlation: CsvSaveCorrelation;
     }
     | { readonly revision: number; readonly state: 'succeeded'; readonly operation: CsvSaveOperation };
 
 export type ActiveCsvSaveLifecycle = Extract<CsvSaveLifecycle, { state: 'active' }>;
+export type MalformedCsvSaveLifecycle = Extract<
+    CsvSaveLifecycle,
+    { failure: 'malformedRequest' }
+>;
 export type TerminalCsvSaveLifecycle = Extract<
     CsvSaveLifecycle,
     { state: 'failed' | 'succeeded' }
 >;
+
+/** Safely identify any non-idle lifecycle without assuming its payload variant. */
+export function save_lifecycle_correlation(
+    lifecycle: unknown,
+): CsvSaveCorrelation | undefined {
+    if (!is_plain_record(lifecycle) || lifecycle.state === 'idle') return undefined;
+    const candidate = lifecycle.state === 'failed'
+        && lifecycle.failure === 'malformedRequest'
+        ? lifecycle.correlation
+        : lifecycle.operation;
+    return is_wire_save_correlation(candidate)
+        ? {
+            editSessionId: candidate.editSessionId,
+            saveRequestId: candidate.saveRequestId,
+        }
+        : undefined;
+}
 
 /** Messages from extension host to webview. */
 export type HostMessage =
@@ -1578,7 +1757,14 @@ export type HostMessage =
     | { type: 'rowData'; sheetIndex: number; startRow: number; rows: (RenderedCell | null)[][]; sourceRows: number[]; requestId: string; generation: number }
     | { type: 'scrollToRow'; row: number }
     | { type: 'saveOperationStarted'; lifecycle: ActiveCsvSaveLifecycle }
-    | { type: 'saveResult'; success: boolean; lifecycle: TerminalCsvSaveLifecycle; rejection?: CsvSaveRejection }
+    | {
+        type: 'saveResult';
+        success: boolean;
+        lifecycle: TerminalCsvSaveLifecycle;
+        rejection?: CsvSaveRejection;
+        /** The host reached and passed dirty-base validation before this result. */
+        basesValidated?: true;
+    }
     // `sheetIndex` mirrors the request's: optional, defaulting to the only sheet
     // a single-sheet source has. Every host answer echoes back the sheet it was
     // asked about, so the webview can route a grant to the right worksheet store.

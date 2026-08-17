@@ -10,6 +10,7 @@ import {
     EMPTY_TRANSFORM,
     MAX_PERSISTED_ROW_HEIGHTS,
     is_range_filter_operator,
+    is_wire_csv_save_rejection,
     pending_edits_for_sheet,
     sheet_index_with_pending_edits,
     transform_has_entries,
@@ -84,7 +85,10 @@ import {
     csv_save_operations_equal,
     propose_csv_save,
     reduce_csv_save_projection,
-    resolve_csv_save_hydration,
+    remove_operation_owned_pending_edits,
+    resolve_csv_save_hydration_from_worksheets,
+    save_lifecycle_correlation,
+    save_operation_worksheets,
     terminal_csv_save_settles_operation,
     type CsvSaveProjection,
 } from './csv-save-lifecycle';
@@ -997,35 +1001,42 @@ export function App(): React.JSX.Element {
         set_save_lifecycle(next.authoritative);
         set_save_operation(next.operation);
 
-        // The authoritative lifecycle is what the fence is really about; the
-        // owning grid's report is only the usual way it is heard. While the user
-        // is on another worksheet there is no owning grid mounted, and a *failed*
-        // save keeps the session, so nothing was left to lower the fence: every
-        // transform was silently refused and the close flush published nothing,
-        // until the user happened to visit the owning sheet again.
-        if (next.authoritative.state !== 'active') {
+        // A terminal that settles the local proposal lowers the document fence;
+        // the owning grid's report is only the usual way it is heard. While the
+        // user is on another worksheet there is no owning grid mounted, and a
+        // failed save keeps the session, so App must lower the fence itself. A
+        // mismatched terminal retains `next.operation`, however, and therefore
+        // cannot release the still-live proposal's fence.
+        if (
+            next.authoritative.state !== 'active'
+            && next.operation === undefined
+        ) {
             save_in_flight_ref.current = false;
         }
 
         const current_session_id = csv_edit_session_id_ref.current;
         const hydrate_and_install = (
             operation: CsvSaveOperation,
-            projection: Pick<CsvSaveProjection, 'authoritative' | 'operation'> = next,
+            disposition: 'restore' | 'tombstone',
         ) => {
             const sheet_index_for = worksheet_target_lookup(meta_ref.current?.sheets ?? []);
-            for (const worksheet of operation.worksheets) {
+            const resolved: [number, CsvSaveWorksheetOperation][] = [];
+            const seen = new Set<number>();
+            for (const worksheet of save_operation_worksheets(operation)) {
                 const sheet_index = sheet_index_for(worksheet);
-                if (sheet_index === undefined) continue;
+                if (sheet_index === undefined || seen.has(sheet_index)) return;
+                seen.add(sheet_index);
+                resolved.push([sheet_index, worksheet]);
+            }
+            for (const [sheet_index, worksheet] of resolved) {
                 const entries = edit_session_registry_ref.current!
                     .for_sheet(sheet_index).snapshot();
-                const hydrated = resolve_csv_save_hydration(
-                    projection,
-                    current_session_id,
-                    sheet_index,
-                    meta_ref.current?.sheets[sheet_index]?.name,
-                    meta_ref.current?.sheets[sheet_index]?.worksheetId,
-                    entries.size > 0 ? Object.fromEntries(entries) : undefined,
-                );
+                const pending = entries.size > 0
+                    ? Object.fromEntries(entries)
+                    : undefined;
+                const hydrated = disposition === 'restore'
+                    ? worksheet.dirtyEdits
+                    : remove_operation_owned_pending_edits(pending, worksheet);
                 install_edit_session(hydrated, current_session_id, sheet_index);
             }
         };
@@ -1034,7 +1045,7 @@ export function App(): React.JSX.Element {
                 incoming.operation.editSessionId === current_session_id
                 && csv_save_operations_equal(next.operation, incoming.operation)
             ) {
-                hydrate_and_install(incoming.operation);
+                hydrate_and_install(incoming.operation, 'restore');
             }
         } else if (incoming.state !== 'idle') {
             const settled_operation = previous.operation
@@ -1047,23 +1058,22 @@ export function App(): React.JSX.Element {
             if (incoming.state === 'failed') {
                 if (
                     settled_operation
-                    && incoming.operation.editSessionId === current_session_id
+                    && save_lifecycle_correlation(incoming)?.editSessionId
+                        === current_session_id
                 ) {
                     // A malformed request lifecycle carries only a sanitized
-                    // host identity. Restore the exact renderer-owned proposal,
-                    // which is both the user's real dirty map and the only copy
-                    // that never crossed the untrusted wire boundary.
-                    hydrate_and_install(settled_operation, {
-                        authoritative: next.authoritative,
-                        operation: settled_operation,
-                    });
+                    // host identity. Prefer the renderer-owned proposal, but run
+                    // it back through the recovery boundary too: a corrupted
+                    // local payload must retain the store's valid dirty map rather
+                    // than throw or install malformed state.
+                    hydrate_and_install(settled_operation, 'restore');
                     pending_exit_ref.current = false;
                 }
             } else if (
                 current_session_id === undefined
                 || incoming.operation.editSessionId === current_session_id
             ) {
-                hydrate_and_install(incoming.operation);
+                hydrate_and_install(incoming.operation, 'tombstone');
                 set_csv_edit_session_id(undefined);
                 set_edit_session_pending(false);
                 set_edit_mode(false);
@@ -1386,23 +1396,61 @@ export function App(): React.JSX.Element {
                     }
                     const snapshot_edit_session_id =
                         snapshot.capabilities.csvEditSessionId;
-                    const refresh_edits_for_sheet = (sheet_index: number) => (
-                        snapshot.presentation === 'refresh'
-                            ? resolve_csv_save_hydration(
-                                applied_save_transition.next,
-                                snapshot_edit_session_id,
-                                sheet_index,
-                                snapshot.meta.sheets[sheet_index]?.name,
-                                snapshot.meta.sheets[sheet_index]?.worksheetId,
-                                pending_edits_for_sheet(
-                                    refresh_authoritative_state?.pendingEdits,
-                                    sheet_index,
-                                    snapshot.meta.sheets[sheet_index]?.name,
-                                    snapshot.meta.sheets[sheet_index]?.worksheetId,
-                                ),
-                            )
-                            : undefined
+                    const hydration_projection = applied_save_transition.next;
+                    const authoritative_operation =
+                        'operation' in hydration_projection.authoritative
+                            ? hydration_projection.authoritative.operation
+                            : undefined;
+                    const proposed_worksheets = save_operation_worksheets(
+                        hydration_projection.operation,
                     );
+                    const authoritative_worksheets = authoritative_operation
+                        === hydration_projection.operation
+                        ? proposed_worksheets
+                        : save_operation_worksheets(authoritative_operation);
+                    const sheet_index_for = worksheet_target_lookup(snapshot.meta.sheets);
+                    const by_sheet_index = (
+                        worksheets: readonly CsvSaveWorksheetOperation[],
+                    ): ReadonlyMap<number, CsvSaveWorksheetOperation> => {
+                        const indexed = new Map<number, CsvSaveWorksheetOperation>();
+                        for (const worksheet of worksheets) {
+                            const sheet_index = sheet_index_for(worksheet);
+                            if (
+                                sheet_index === undefined
+                                || indexed.has(sheet_index)
+                            ) return new Map();
+                            indexed.set(sheet_index, worksheet);
+                        }
+                        return indexed;
+                    };
+                    const proposed_worksheet_by_sheet = by_sheet_index(proposed_worksheets);
+                    const authoritative_worksheet_by_sheet = authoritative_worksheets
+                        === proposed_worksheets
+                        ? proposed_worksheet_by_sheet
+                        : by_sheet_index(authoritative_worksheets);
+                    const hydrate_snapshot_edits = (
+                        sheet_index: number,
+                        pending_edits: SheetPendingEditCells | undefined,
+                    ) => resolve_csv_save_hydration_from_worksheets(
+                        hydration_projection,
+                        snapshot_edit_session_id,
+                        pending_edits,
+                        proposed_worksheet_by_sheet.get(sheet_index),
+                        authoritative_worksheet_by_sheet.get(sheet_index),
+                    );
+                    const refresh_edits_for_sheet = (sheet_index: number) => {
+                        if (snapshot.presentation !== 'refresh') return undefined;
+                        const sheet = snapshot.meta.sheets[sheet_index];
+                        return hydrate_snapshot_edits(
+                            sheet_index,
+                            pending_edits_for_sheet(
+                                refresh_authoritative_state?.pendingEdits,
+                                sheet_index,
+                                sheet?.name,
+                                sheet?.worksheetId,
+                            ),
+                        );
+                    };
                     const authoritative_refresh_edits_for_target = (
                         target: WorksheetTarget,
                     ): SheetPendingEditCells | undefined => {
@@ -1805,17 +1853,15 @@ export function App(): React.JSX.Element {
                                 : snapshot.configuration.defaultTabOrientation === 'vertical',
                         );
                         state_ref.current = normalized;
-                        const restored_edits = resolve_csv_save_hydration(
-                            applied_save_transition.next,
-                            snapshot_edit_session_id,
+                        const restored_sheet =
+                            snapshot.meta.sheets[snapshot_edit_sheet_index];
+                        const restored_edits = hydrate_snapshot_edits(
                             snapshot_edit_sheet_index,
-                            snapshot.meta.sheets[snapshot_edit_sheet_index]?.name,
-                            snapshot.meta.sheets[snapshot_edit_sheet_index]?.worksheetId,
                             pending_edits_for_sheet(
                                 normalized.pendingEdits,
                                 snapshot_edit_sheet_index,
-                                snapshot.meta.sheets[snapshot_edit_sheet_index]?.name,
-                                snapshot.meta.sheets[snapshot_edit_sheet_index]?.worksheetId,
+                                restored_sheet?.name,
+                                restored_sheet?.worksheetId,
                             ),
                         );
                         const exact_session_succeeded =
@@ -1839,12 +1885,8 @@ export function App(): React.JSX.Element {
                         normalized.pendingEdits?.forEach((_slot, index) => {
                             if (index === snapshot_edit_sheet_index) return;
                             const sheet = snapshot.meta.sheets[index];
-                            const cells = resolve_csv_save_hydration(
-                                applied_save_transition.next,
-                                snapshot_edit_session_id,
+                            const cells = hydrate_snapshot_edits(
                                 index,
-                                sheet?.name,
-                                sheet?.worksheetId,
                                 pending_edits_for_sheet(
                                     normalized.pendingEdits,
                                     index,
@@ -3503,36 +3545,48 @@ export function App(): React.JSX.Element {
                 // not just its projection. A stale terminal must not clear or replace
                 // the verdict installed by a later accepted result.
                 if (!transition.changed) return;
-                const matching = !operation
-                    || terminal_csv_save_settles_operation(msg.lifecycle, operation);
-                // Every accepted save result supersedes the previous one, including a
-                // success and including a rejection that named different keys. Clearing
-                // here, before the adoption block below re-records one, is what makes a
-                // *successful* save drop the banner: adoption only ever sets, so
-                // without this a rejection would survive until the session ended.
-                clear_save_verdict();
-                if (matching) {
-                    pending_exit_ref.current = false;
-                }
+                const current_session_id = csv_edit_session_id_ref.current;
+                const matching = operation
+                    ? terminal_csv_save_settles_operation(msg.lifecycle, operation)
+                    : current_session_id === undefined
+                        || save_lifecycle_correlation(msg.lifecycle)?.editSessionId
+                            === current_session_id;
+                if (!matching) return;
+                pending_exit_ref.current = false;
+
+                // A success or a retry that passed dirty-base validation supersedes
+                // any prior verdict. An earlier transient failure with no valid
+                // rejection does not: the previously judged map is still live, and
+                // `live_rejected_keys` expires keys when their identity changes.
+                if (
+                    msg.lifecycle.state === 'succeeded'
+                    || msg.basesValidated === true
+                ) clear_save_verdict();
+
+                const rejection = is_wire_csv_save_rejection(msg.rejection)
+                    ? msg.rejection
+                    : undefined;
                 // Adopt the host's named keys only for our own session: a rejection
                 // for someone else's session names keys our store does not hold, and
                 // a banner over them would offer a discard that does nothing. Ride
                 // in on the lifecycle rather than a separate message so the map has
                 // already been restored above (see CsvSaveRejection in types.ts).
                 if (
-                    msg.rejection
-                    && msg.lifecycle.operation.editSessionId
-                        === csv_edit_session_id_ref.current
+                    rejection
+                    && msg.lifecycle.state === 'failed'
+                    && 'operation' in msg.lifecycle
+                    && msg.lifecycle.operation.editSessionId === current_session_id
                 ) {
-                    const submitted_worksheet = msg.lifecycle.operation.worksheets[
-                        msg.rejection.worksheetOperationIndex
-                    ];
+                    const submitted_worksheet = save_operation_worksheets(
+                        msg.lifecycle.operation,
+                    )[rejection.worksheetOperationIndex];
                     if (!submitted_worksheet) return;
                     const submitted = submitted_worksheet.dirtyEdits;
+                    clear_save_verdict();
                     set_save_rejection({
-                        reason: msg.rejection.reason,
-                        keys: [...msg.rejection.keys],
-                        session_id: csv_edit_session_id_ref.current,
+                        reason: rejection.reason,
+                        keys: [...rejection.keys],
+                        session_id: current_session_id,
                         sheet_index: submitted_worksheet.sheetIndex,
                         sheet_name: submitted_worksheet.sheetName,
                         worksheet_id: submitted_worksheet.worksheetId,
@@ -3545,7 +3599,7 @@ export function App(): React.JSX.Element {
                         // replacement is a new, unjudged edit, so identity must
                         // cover the run sides too.
                         entries: Object.fromEntries(
-                            msg.rejection.keys.map((key) => [
+                            rejection.keys.map((key) => [
                                 key,
                                 submitted[key] ?? { value: '', base: '' },
                             ]),
@@ -4361,10 +4415,15 @@ export function App(): React.JSX.Element {
     // from the mounted grid's report. The lifecycle is document-scoped, so these
     // controls must remain fenced when any worksheet participates in the save,
     // including a sibling-only operation the current grid does not hydrate.
-    // These two have to name the same condition or the UI is lying about it.
+    // A retained local proposal remains authoritative for the document fence even
+    // after a mismatched newer terminal advances the host lifecycle. These controls
+    // must name that proposal as well as the usual active/status signals or they can
+    // admit exit and transform requests while the save is still locked.
+    const save_ui_fenced = save_operation !== undefined
+        || save_lifecycle.state === 'active'
+        || editing_status?.save_in_flight === true;
     const transform_ui_blocked =
-        save_lifecycle.state === 'active'
-        || editing_status?.save_in_flight === true
+        save_ui_fenced
         || edit_session_pending
         || preview_mode
         || excel_header_pending;
@@ -4717,8 +4776,7 @@ export function App(): React.JSX.Element {
                 // moves no rows. `transform_pending` — work in flight — still
                 // disables, matching the host's own transient refusal.
                 edit_disabled={
-                    save_lifecycle.state === 'active'
-                    || editing_status?.save_in_flight === true
+                    save_ui_fenced
                     // `csvEditable` is also false while another panel owns the
                     // workbook session, where pressing Edit is how this panel asks
                     // for ownership. Truncation is different: no request can make a
@@ -4736,8 +4794,7 @@ export function App(): React.JSX.Element {
                     ))
                 }
                 edit_disabled_reason={
-                    save_lifecycle.state === 'active'
-                    || editing_status?.save_in_flight
+                    save_ui_fenced
                         ? 'Saving changes.'
                         : truncation_message && !csv_editable
                         ? 'Editing is disabled until all rows are loaded.'

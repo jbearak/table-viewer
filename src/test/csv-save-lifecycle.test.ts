@@ -1,10 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import type { CsvSaveOperation, SheetPendingEditCells } from '../types';
+import type {
+    CsvSaveOperation,
+    SheetPendingEditCells,
+    TerminalCsvSaveLifecycle,
+} from '../types';
 import {
     csv_save_operations_equal,
     propose_csv_save,
     reduce_csv_save_projection,
     resolve_csv_save_hydration,
+    save_lifecycle_correlation,
+    save_operation_worksheet,
     terminal_csv_save_settles_operation,
     type CsvSaveProjection,
 } from '../webview/csv-save-lifecycle';
@@ -110,6 +116,19 @@ describe('CSV save lifecycle projection', () => {
         expect(projection.authoritative.state).toBe('failed');
     });
 
+    it('rejects an active lifecycle with no operation', () => {
+        const current = propose_csv_save({
+            authoritative: { revision: 3, state: 'idle' },
+        }, operation('local'));
+
+        const reduced = reduce_csv_save_projection(current, {
+            revision: 4,
+            state: 'active',
+        } as never);
+
+        expect(reduced).toBe(current);
+    });
+
     it('retains a local proposal across mismatched terminals and identity-free idle', () => {
         const local = operation('local');
         let projection = propose_csv_save({
@@ -140,8 +159,11 @@ describe('CSV save lifecycle projection', () => {
         const malformed_failure = {
             revision: 11,
             state: 'failed',
-            operation: sanitized,
             failure: 'malformedRequest',
+            correlation: {
+                editSessionId: sanitized.editSessionId,
+                saveRequestId: sanitized.saveRequestId,
+            },
         } as const;
 
         expect(terminal_csv_save_settles_operation(malformed_failure, local)).toBe(true);
@@ -149,12 +171,161 @@ describe('CSV save lifecycle projection', () => {
             malformed_failure,
             operation('other-request'),
         )).toBe(false);
+        expect(terminal_csv_save_settles_operation(
+            malformed_failure,
+            operation('local', 'other-session'),
+        )).toBe(false);
+
+        const changed_payload = operation('local', local.editSessionId, [worksheet('changed')]);
+        expect(terminal_csv_save_settles_operation({
+            revision: 11,
+            state: 'failed',
+            operation: sanitized,
+        }, changed_payload)).toBe(false);
+
+        const ordinary_with_stray_correlation = {
+            revision: 11,
+            state: 'failed',
+            operation: local,
+            correlation: {
+                editSessionId: 'stray-session',
+                saveRequestId: 'stray-request',
+            },
+        } as unknown as TerminalCsvSaveLifecycle;
+        expect(terminal_csv_save_settles_operation(
+            ordinary_with_stray_correlation,
+            local,
+        )).toBe(true);
+        expect(save_lifecycle_correlation(ordinary_with_stray_correlation)).toEqual({
+            editSessionId: local.editSessionId,
+            saveRequestId: local.saveRequestId,
+        });
+        expect(terminal_csv_save_settles_operation({
+            revision: 11,
+            state: 'succeeded',
+            operation: sanitized,
+        }, local)).toBe(false);
 
         const proposed = propose_csv_save({
             authoritative: { revision: 10, state: 'idle' },
         }, local);
         expect(reduce_csv_save_projection(proposed, malformed_failure).operation)
             .toBeUndefined();
+    });
+
+    it('settles a canonical success against malformed optional local metadata', () => {
+        const canonical = operation('local');
+        const local = {
+            ...canonical,
+            worksheets: [{
+                ...canonical.worksheets[0],
+                dirtyEdits: {
+                    '0:0': {
+                        ...canonical.worksheets[0].dirtyEdits['0:0'],
+                        valueRuns: 'malformed',
+                    },
+                },
+            }],
+        } as unknown as CsvSaveOperation;
+        const success = {
+            revision: 11,
+            state: 'succeeded',
+            operation: canonical,
+        } as const;
+
+        expect(csv_save_operations_equal(local, canonical)).toBe(true);
+        expect(terminal_csv_save_settles_operation(success, local)).toBe(true);
+
+        const proposed = propose_csv_save({
+            authoritative: { revision: 10, state: 'idle' },
+        }, local);
+        expect(reduce_csv_save_projection(proposed, success).operation)
+            .toBeUndefined();
+    });
+
+    it('treats malformed local operation structure as non-equal and hydrates safely', () => {
+        const valid = operation('local');
+        const pending = { '9:9': { value: 'safe', base: 'base' } };
+        const malformed_maps = {
+            ...valid,
+            worksheets: [{
+                ...valid.worksheets[0],
+                dirtyEdits: { '0:0': null },
+            }],
+        } as unknown as CsvSaveOperation;
+        const malformed_relation = {
+            ...valid,
+            worksheets: [{
+                ...valid.worksheets[0],
+                edits: { '0:0': 'local', '1:0': 'unvalidated' },
+            }],
+        } as unknown as CsvSaveOperation;
+        const malformed_envelope = {
+            ...valid,
+            worksheets: null,
+        } as unknown as CsvSaveOperation;
+
+        expect(csv_save_operations_equal(malformed_maps, valid)).toBe(false);
+        expect(csv_save_operations_equal(malformed_maps, malformed_maps)).toBe(false);
+        expect(csv_save_operations_equal(malformed_relation, malformed_relation)).toBe(false);
+        expect(csv_save_operations_equal(malformed_envelope, malformed_envelope)).toBe(false);
+        expect(save_operation_worksheet(malformed_maps, 0, undefined, undefined))
+            .toBeUndefined();
+        expect(save_operation_worksheet(malformed_relation, 0, undefined, undefined))
+            .toBeUndefined();
+        expect(save_operation_worksheet(malformed_envelope, 0, undefined, undefined))
+            .toBeUndefined();
+        expect(hydrate({
+            authoritative: { revision: 10, state: 'idle' },
+            operation: malformed_maps,
+        }, valid.editSessionId, pending)).toBe(pending);
+    });
+
+    it('does not recover a valid worksheet from a partially malformed workbook', () => {
+        const malformed_workbook = {
+            ...operation('workbook'),
+            worksheets: [
+                worksheet('recoverable', 0, 'People'),
+                {
+                    ...worksheet('broken', 1, 'Inventory'),
+                    dirtyEdits: { '0:0': null },
+                },
+            ],
+        } as unknown as CsvSaveOperation;
+        const pending = {
+            '9:9': { value: 'safe', base: 'base' },
+        };
+
+        expect(save_operation_worksheet(
+            malformed_workbook,
+            0,
+            'People',
+            undefined,
+        )).toBeUndefined();
+        expect(hydrate({
+            authoritative: { revision: 10, state: 'idle' },
+            operation: malformed_workbook,
+        }, malformed_workbook.editSessionId, pending, 0, 'People'))
+            .toBe(pending);
+    });
+
+    it('rejects captured targets that alias the same live worksheet', () => {
+        const aliased = operation('aliased', 'edit-session', [
+            worksheet('by-id', 0, 'Former Name', 'sheet-id'),
+            worksheet('by-name', 1, 'Current Name'),
+        ]);
+        const pending = { '9:9': { value: 'safe', base: 'base' } };
+
+        expect(save_operation_worksheet(
+            aliased,
+            1,
+            'Current Name',
+            'sheet-id',
+        )).toBeUndefined();
+        expect(hydrate({
+            authoritative: { revision: 10, state: 'failed', operation: aliased },
+        }, aliased.editSessionId, pending, 1, 'Current Name', 'sheet-id'))
+            .toBe(pending);
     });
 
     it('keeps a proposal locked through failed r2, delayed idle r3, and exact active r4', () => {
@@ -308,6 +479,24 @@ describe('CSV save lifecycle projection', () => {
             'new-session',
             { '0:0': { ...plain_ws.dirtyEdits['0:0'], valueRuns: bold } },
         )).toBeUndefined();
+    });
+
+    it('retains malformed optional pending metadata during tombstone cleanup', () => {
+        const saved = operation('saved', 'saved-session');
+        const pending = {
+            '0:0': {
+                ...saved.worksheets[0].dirtyEdits['0:0'],
+                valueRuns: { runs: null },
+            },
+        } as unknown as SheetPendingEditCells;
+
+        expect(hydrate({
+            authoritative: {
+                revision: 10,
+                state: 'succeeded',
+                operation: saved,
+            },
+        }, saved.editSessionId, pending)).toBe(pending);
     });
 
     it('allows a legacy index-only operation to match richer current identity', () => {

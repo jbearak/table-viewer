@@ -2012,7 +2012,7 @@ describe('CSV edit sessions', () => {
             lifecycle: expect.objectContaining({
                 state: 'failed',
                 failure: 'malformedRequest',
-                operation: expect.objectContaining({
+                correlation: expect.objectContaining({
                     saveRequestId: 'malformed-save',
                 }),
             }),
@@ -3128,6 +3128,35 @@ describe('CSV edit sessions', () => {
         expect(second_grant.granted).toBe(true);
         expect(second_grant.editSessionId).not.toBe(first_session);
         expect(sheet_cells(second_grant.pendingEdits)).toBeUndefined();
+
+        // A malformed save for the new session advances the shared lifecycle but
+        // owns no operation map. That must not bypass the independent tombstone
+        // projection and expose panel A's already-retired edits in a fresh snapshot.
+        const snapshot_count = second.__messages.filter((message: any) => (
+            message?.type === 'workbookSnapshot'
+        )).length;
+        await second.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: second_grant.editSessionId,
+                saveRequestId: 'malformed-panel-b-save',
+                worksheets: [{
+                    sheetIndex: 0,
+                    edits: { '0:0': 'malformed' },
+                    dirtyEdits: { '0:0': null },
+                }],
+            },
+        } as never);
+        await wait_for_observable(() => second.__messages.some((message: any) => (
+            message?.type === 'saveResult'
+            && message.lifecycle?.failure === 'malformedRequest'
+        )));
+        await second.__receive({ type: 'ready' });
+        await wait_for_observable(() => second.__messages.filter((message: any) => (
+            message?.type === 'workbookSnapshot'
+        )).length > snapshot_count);
+
+        expect(sheet_cells(latest_snapshot(second).state.pendingEdits)).toBeUndefined();
 
         reject_cleanup = false;
         await second.__receive({

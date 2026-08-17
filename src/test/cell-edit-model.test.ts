@@ -13,6 +13,7 @@ import {
     dirty_entries_equal,
     sanitized_dirty_entry,
     sanitized_wire_dirty_entry,
+    sanitized_wire_save_maps,
     type PerFileState,
 } from '../types';
 
@@ -167,6 +168,28 @@ describe('sanitized_wire_dirty_entry', () => {
             .toEqual({ value: 'x', base: 'x', link, baseLink: null });
         expect(sanitized_wire_dirty_entry({ value: 'x', base: 'x', link: 'junk', baseLink: null }))
             .toEqual({ value: 'x', base: 'x' });
+    });
+});
+
+describe('sanitized_wire_save_maps', () => {
+    it('preserves an own __proto__ key in null-prototype maps', () => {
+        const edits = Object.create(null) as Record<string, unknown>;
+        const dirty = Object.create(null) as Record<string, unknown>;
+        edits['__proto__'] = 'saved';
+        dirty['__proto__'] = { value: 'saved', base: 'base' };
+
+        const maps = sanitized_wire_save_maps(edits, dirty);
+
+        expect(maps).toBeDefined();
+        expect(Object.getPrototypeOf(maps!.edits)).toBeNull();
+        expect(Object.getPrototypeOf(maps!.dirtyEdits)).toBeNull();
+        expect(Object.prototype.hasOwnProperty.call(maps!.edits, '__proto__'))
+            .toBe(true);
+        expect(maps!.edits['__proto__']).toBe('saved');
+        expect(maps!.dirtyEdits.__proto__).toEqual({
+            value: 'saved',
+            base: 'base',
+        });
     });
 });
 
