@@ -197,6 +197,28 @@ export interface EditSessionStore {
     /** Capture true bases for base_pending entries whose page became resident.
      *  Notifies only when something changed. */
     resolve_pending_bases(session_id: string | undefined, get_cell_raw: GetCellRaw): void;
+    /**
+     * Apply a set of writes as ONE mutation: every key set or removed, one
+     * notification, one snapshot the subscribers ever see.
+     *
+     * Exists for history replay, where a gesture spans many cells and the
+     * intermediate states are not states the user ever had. Looping over
+     * {@link commit} and {@link remove} would publish each one — a re-render, a
+     * pendingEdits post and a host-side workspace-state write per cell of a
+     * paste — and, worse, would leave a half-applied undo visible if anything
+     * threw partway. The plan is decided before this is called (see
+     * `history-replay-model.ts`); this only lands it.
+     *
+     * Later writes to one key win, matching the replay order the planner
+     * produced: a cell a gesture touched twice ends where the last write puts it.
+     */
+    apply_writes(session_id: string | undefined, writes: Iterable<StoreWrite>): void;
+}
+
+/** One key's write: the entry to set, or `undefined` to remove the key. */
+export interface StoreWrite {
+    readonly key: string;
+    readonly entry: CsvDirtyEntry | undefined;
 }
 
 interface NormalizedEdits {
@@ -440,6 +462,22 @@ export function create_edit_session_store(
         clear_saved: (session_id, saved) => {
             if (!owns(session_id)) return;
             set_entries_recomputed(clear_saved_dirty_entries(state.entries, saved));
+        },
+        apply_writes: (session_id, writes) => {
+            if (!owns(session_id)) return;
+            // Copied once, ahead of the walk, then handed to `set_entries` — which
+            // drops it untouched if nothing moved, so a replay that lands on the
+            // state already showing costs one map copy and no notification.
+            const next = new Map(state.entries);
+            for (const { key, entry } of writes) {
+                if (entry === undefined) next.delete(key);
+                else next.set(key, copy_dirty_entry(entry));
+            }
+            // Recomputed rather than carried: a replay both adds and removes, so
+            // it can clear the last pending entry (the flag must narrow) and it
+            // can never introduce one (`copy_dirty_entry` drops the flag, and a
+            // planned entry's base is real content by construction).
+            set_entries_recomputed(next);
         },
         resolve_pending_bases: (session_id, get_cell_raw) => {
             if (!owns(session_id)) return;

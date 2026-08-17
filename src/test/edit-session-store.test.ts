@@ -596,6 +596,115 @@ describe('edit session store', () => {
         });
     });
 
+    describe('apply_writes', () => {
+        it('sets and removes in one mutation', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+                '0:1': { value: 'b', base: 'B' },
+            });
+            const notifications = count_notifications(store);
+
+            store.apply_writes('s', [
+                { key: '0:0', entry: undefined },
+                { key: '0:1', entry: { value: 'B2', base: 'B' } },
+                { key: '0:2', entry: { value: 'c', base: 'C' } },
+            ]);
+
+            expect(Object.fromEntries(store.snapshot())).toEqual({
+                '0:1': { value: 'B2', base: 'B' },
+                '0:2': { value: 'c', base: 'C' },
+            });
+            // One, not three: the intermediate states are not states the user
+            // ever had, and each would cost a render, a post and a host write.
+            expect(notifications.n).toBe(1);
+        });
+
+        it('publishes no state where only part of the plan has landed', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+            });
+            const seen: unknown[] = [];
+            store.subscribe(() => { seen.push(Object.fromEntries(store.snapshot())); });
+
+            store.apply_writes('s', [
+                { key: '0:0', entry: undefined },
+                { key: '0:1', entry: { value: 'b', base: 'B' } },
+            ]);
+
+            expect(seen).toEqual([{ '0:1': { value: 'b', base: 'B' } }]);
+        });
+
+        it('lets a later write to one key win', () => {
+            // Replay order: a cell a gesture touched twice ends where the last
+            // write puts it.
+            const store = create_edit_session_store({ session_id: 's' }, {});
+
+            store.apply_writes('s', [
+                { key: '0:0', entry: { value: 'first', base: 'A' } },
+                { key: '0:0', entry: { value: 'second', base: 'A' } },
+            ]);
+
+            expect(store.get('0:0')?.value).toBe('second');
+        });
+
+        it('does not notify when the writes land on the state already showing', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+            });
+            const notifications = count_notifications(store);
+
+            store.apply_writes('s', [{ key: '0:0', entry: { value: 'a', base: 'A' } }]);
+
+            expect(notifications.n).toBe(0);
+        });
+
+        it('is dropped whole when the session moved on', () => {
+            const store = create_edit_session_store({ session_id: 'current' }, {
+                '0:0': { value: 'a', base: 'A' },
+            });
+
+            store.apply_writes('stale', [
+                { key: '0:0', entry: undefined },
+                { key: '0:1', entry: { value: 'b', base: 'B' } },
+            ]);
+
+            expect(Object.fromEntries(store.snapshot())).toEqual({
+                '0:0': { value: 'a', base: 'A' },
+            });
+        });
+
+        it('copies each entry rather than adopting the caller\'s object', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {});
+            const entry = { value: 'a', base: 'A' };
+
+            store.apply_writes('s', [{ key: '0:0', entry }]);
+            entry.value = 'mutated';
+
+            expect(store.get('0:0')?.value).toBe('a');
+        });
+
+        it('clears the pending-base flag when the last pending entry goes', () => {
+            const store = create_edit_session_store({ session_id: 's' }, { '0:0': 'legacy' });
+            expect(store.has_pending_base()).toBe(true);
+
+            store.apply_writes('s', [{ key: '0:0', entry: undefined }]);
+
+            expect(store.has_pending_base()).toBe(false);
+        });
+
+        it('accepts an empty plan without notifying', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+            });
+            const notifications = count_notifications(store);
+
+            store.apply_writes('s', []);
+
+            expect(notifications.n).toBe(0);
+            expect(store.size()).toBe(1);
+        });
+    });
+
     it('retain filters by the caller predicate', () => {
         const store = create_edit_session_store({ session_id: 's' }, {
             '0:0': { value: 'a', base: 'A' },
