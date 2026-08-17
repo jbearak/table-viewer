@@ -596,7 +596,20 @@ describe('edit session store', () => {
         });
     });
 
-    describe('apply_writes', () => {
+    describe('a staged set of writes', () => {
+        // The store's only bulk mutator, so these cover what a plan does to the
+        // map; the staging protocol itself is exercised below.
+        const applied = (
+            store: ReturnType<typeof create_edit_session_store>,
+            session_id: string | undefined,
+            writes: Parameters<ReturnType<typeof create_edit_session_store>['stage_writes']>[1],
+        ): void => {
+            const staged = store.stage_writes(session_id, writes);
+            if (!staged?.valid()) return;
+            staged.commit();
+            staged.notify();
+        };
+
         it('sets and removes in one mutation', () => {
             const store = create_edit_session_store({ session_id: 's' }, {
                 '0:0': { value: 'a', base: 'A' },
@@ -604,7 +617,7 @@ describe('edit session store', () => {
             });
             const notifications = count_notifications(store);
 
-            store.apply_writes('s', [
+            applied(store, 's', [
                 { key: '0:0', entry: undefined },
                 { key: '0:1', entry: { value: 'B2', base: 'B' } },
                 { key: '0:2', entry: { value: 'c', base: 'C' } },
@@ -626,7 +639,7 @@ describe('edit session store', () => {
             const seen: unknown[] = [];
             store.subscribe(() => { seen.push(Object.fromEntries(store.snapshot())); });
 
-            store.apply_writes('s', [
+            applied(store, 's', [
                 { key: '0:0', entry: undefined },
                 { key: '0:1', entry: { value: 'b', base: 'B' } },
             ]);
@@ -639,7 +652,7 @@ describe('edit session store', () => {
             // write puts it.
             const store = create_edit_session_store({ session_id: 's' }, {});
 
-            store.apply_writes('s', [
+            applied(store, 's', [
                 { key: '0:0', entry: { value: 'first', base: 'A' } },
                 { key: '0:0', entry: { value: 'second', base: 'A' } },
             ]);
@@ -653,7 +666,7 @@ describe('edit session store', () => {
             });
             const notifications = count_notifications(store);
 
-            store.apply_writes('s', [{ key: '0:0', entry: { value: 'a', base: 'A' } }]);
+            applied(store, 's', [{ key: '0:0', entry: { value: 'a', base: 'A' } }]);
 
             expect(notifications.n).toBe(0);
         });
@@ -663,7 +676,7 @@ describe('edit session store', () => {
                 '0:0': { value: 'a', base: 'A' },
             });
 
-            store.apply_writes('stale', [
+            applied(store, 'stale', [
                 { key: '0:0', entry: undefined },
                 { key: '0:1', entry: { value: 'b', base: 'B' } },
             ]);
@@ -677,7 +690,7 @@ describe('edit session store', () => {
             const store = create_edit_session_store({ session_id: 's' }, {});
             const entry = { value: 'a', base: 'A' };
 
-            store.apply_writes('s', [{ key: '0:0', entry }]);
+            applied(store, 's', [{ key: '0:0', entry }]);
             entry.value = 'mutated';
 
             expect(store.get('0:0')?.value).toBe('a');
@@ -687,7 +700,7 @@ describe('edit session store', () => {
             const store = create_edit_session_store({ session_id: 's' }, { '0:0': 'legacy' });
             expect(store.has_pending_base()).toBe(true);
 
-            store.apply_writes('s', [{ key: '0:0', entry: undefined }]);
+            applied(store, 's', [{ key: '0:0', entry: undefined }]);
 
             expect(store.has_pending_base()).toBe(false);
         });
@@ -700,7 +713,7 @@ describe('edit session store', () => {
             // never saw.
             const store = create_edit_session_store({ session_id: 's' }, {});
 
-            store.apply_writes('s', [
+            applied(store, 's', [
                 { key: '0:0', entry: { value: 'B', base: '', base_pending: true } },
             ]);
 
@@ -714,7 +727,7 @@ describe('edit session store', () => {
             });
             const notifications = count_notifications(store);
 
-            store.apply_writes('s', []);
+            applied(store, 's', []);
 
             expect(notifications.n).toBe(0);
             expect(store.size()).toBe(1);

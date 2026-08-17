@@ -39,7 +39,7 @@ import {
     type HighlightHistoryDelta,
     type HistoryAction,
 } from './history-stack-model';
-import { hyperlinks_equal, type CellHyperlink } from '../cell-content';
+import { hyperlinks_equal } from '../cell-content';
 import type { WorksheetTarget } from '../types';
 
 /** What a cell holds right now: its overlay, and the content underneath it. */
@@ -215,8 +215,8 @@ function plan_cell_replay(
     if (delta.value !== undefined) {
         const side = transition_side(delta.value, source);
         if (!value_dimension_matches(
-            dimension_of(current, 'value'),
-            side.overlay === 'present' ? dimension_of(recorded, 'value') : undefined,
+            value_dimension_of(current),
+            side.overlay === 'present' ? value_dimension_of(recorded) : undefined,
         )) {
             return refuse('conflict');
         }
@@ -224,17 +224,16 @@ function plan_cell_replay(
     if (delta.hyperlink !== undefined) {
         const side = transition_side(delta.hyperlink, source);
         if (!link_dimension_matches(
-            dimension_of(current, 'hyperlink'),
-            side.overlay === 'present' ? dimension_of(recorded, 'hyperlink') : undefined,
+            link_dimension_of(current),
+            side.overlay === 'present' ? link_dimension_of(recorded) : undefined,
         )) {
             return refuse('conflict');
         }
         if (!anchor_matches(current, recorded)) return refuse('conflict');
     }
 
-    const merged = merge_replayed_dimensions(delta, state, overlay_for_direction(delta, direction));
-    if (merged === undefined) return refuse('base-pending');
-    const result = merged === ABSENT_RESULT ? absent_overlay() : merged;
+    const result = merge_replayed_dimensions(delta, state, overlay_for_direction(delta, direction));
+    if (result === undefined) return refuse('base-pending');
     return {
         kind: 'planned',
         result: { overlay: result, persisted: state.persisted },
@@ -267,11 +266,11 @@ function plan_cell_replay(
  * mode exists to tolerate.
  */
 function value_dimension_matches(
-    current: OverlayValueDimension,
+    current: OverlayValueDimension | undefined,
     recorded: OverlayValueDimension | undefined,
 ): boolean {
-    if (recorded === undefined || recorded.kind !== 'present') return current.kind !== 'present';
-    if (current.kind !== 'present') return false;
+    if (recorded === undefined || recorded.kind !== 'present') return current?.kind !== 'present';
+    if (current?.kind !== 'present') return false;
     return current.basePending === recorded.basePending
         && history_values_equal(current.value, recorded.value)
         && history_values_equal(current.base, recorded.base);
@@ -305,9 +304,6 @@ function anchor_matches(current: CellOverlayState, recorded: CellOverlayState): 
     return history_values_equal(left, right);
 }
 
-/** The merge produced no entry at all, as distinct from the merge failing. */
-const ABSENT_RESULT = Symbol('absent overlay');
-
 /**
  * Rebuild the cell's entry with only the replayed dimensions replaced.
  *
@@ -328,51 +324,49 @@ function merge_replayed_dimensions(
     delta: CellHistoryDelta,
     state: CellReplayState,
     destination: CellOverlayState,
-): PresentCellOverlayState | typeof ABSENT_RESULT | undefined {
+): CellOverlayState | undefined {
     const current = state.overlay;
     const value = delta.value !== undefined
-        ? dimension_of(destination, 'value')
-        : dimension_of(current, 'value');
+        ? value_dimension_of(destination)
+        : value_dimension_of(current);
     const link = delta.hyperlink !== undefined
-        ? dimension_of(destination, 'hyperlink')
-        : dimension_of(current, 'hyperlink');
+        ? link_dimension_of(destination)
+        : link_dimension_of(current);
 
     // The three-arm union enumerates the combinations a real entry can have, and
     // the cast is what lets this build one from two independently chosen
     // dimensions. Safe because a present value dimension is enough on its own:
     // every arm carrying one is valid whichever kind the link dimension has.
-    if (value.kind === 'present') {
+    if (value?.kind === 'present') {
         return { kind: 'present', value, hyperlink: link } as PresentCellOverlayState;
     }
     // No value dimension left. Without a link either, the entry is gone.
-    if (link.kind !== 'present') return ABSENT_RESULT;
+    if (link.kind !== 'present') return absent_overlay();
     const anchor = surviving_anchor(destination, state);
     if (anchor === undefined) return undefined;
     return hyperlink_only_overlay(anchor, link.value, link.base);
 }
 
-function dimension_of(state: CellOverlayState, dimension: 'value'): OverlayValueDimension;
-function dimension_of(state: CellOverlayState, dimension: 'hyperlink'): OverlayHyperlinkDimension;
-function dimension_of(
-    state: CellOverlayState,
-    dimension: 'value' | 'hyperlink',
-): OverlayValueDimension | OverlayHyperlinkDimension {
-    if (state.kind === 'absent') {
-        return dimension === 'value' ? ABSENT_VALUE_DIMENSION : UNTOUCHED_LINK_DIMENSION;
-    }
-    return dimension === 'value' ? state.value : state.hyperlink;
+/**
+ * An overlay's value dimension, or `undefined` when there is no overlay at all.
+ *
+ * An absent overlay has no value dimension to answer with — the shape needs an
+ * anchor, and the only honest anchor is the cell's persisted text, which
+ * {@link surviving_anchor} fetches when it is actually needed. `undefined` says
+ * that plainly rather than fabricating an empty one.
+ */
+function value_dimension_of(state: CellOverlayState): OverlayValueDimension | undefined {
+    return state.kind === 'absent' ? undefined : state.value;
 }
 
 /**
- * An absent overlay's value dimension, which needs an anchor no absent overlay
- * carries. The placeholder is never read for content: a merge that keeps it
- * either drops the entry entirely, or asks {@link surviving_anchor} for the real
- * unedited text.
+ * An overlay's hyperlink dimension. Unlike the value dimension this is total: an
+ * absent overlay's link dimension is `untouched`, a complete answer needing no
+ * content, and one a merge may carry into the entry it builds.
  */
-const ABSENT_VALUE_DIMENSION: OverlayValueDimension = Object.freeze({
-    kind: 'untouched' as const,
-    anchor: Object.freeze({ text: '' }),
-});
+function link_dimension_of(state: CellOverlayState): OverlayHyperlinkDimension {
+    return state.kind === 'absent' ? UNTOUCHED_LINK_DIMENSION : state.hyperlink;
+}
 
 const UNTOUCHED_LINK_DIMENSION: OverlayHyperlinkDimension = Object.freeze({
     kind: 'untouched' as const,

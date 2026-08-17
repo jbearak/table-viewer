@@ -198,7 +198,8 @@ export interface EditSessionStore {
      *  Notifies only when something changed. */
     resolve_pending_bases(session_id: string | undefined, get_cell_raw: GetCellRaw): void;
     /**
-     * Apply a set of writes as ONE mutation: every key set or removed, one
+     * Stage a whole set of writes as ONE mutation, held back from the
+     * subscribers until the caller says so: every key set or removed, one
      * notification, one snapshot the subscribers ever see.
      *
      * Exists for history replay, where a gesture spans many cells and the
@@ -211,17 +212,14 @@ export interface EditSessionStore {
      *
      * Later writes to one key win, matching the replay order the planner
      * produced: a cell a gesture touched twice ends where the last write puts it.
-     */
-    apply_writes(session_id: string | undefined, writes: Iterable<StoreWrite>): void;
-    /**
-     * Stage writes without publishing them, returning the swap that lands them.
      *
-     * A replay plan spans worksheets, and a store owns exactly one — so a
-     * cross-sheet undo needs several stores to move, and {@link apply_writes} on
-     * each in turn would let a subscriber see the first sheet replayed while the
-     * rest still hold the old state. That half-replayed gesture is precisely
-     * what the plan/apply split exists to prevent, and it is what would be
-     * published to the host as `pendingEdits`.
+     * Held back rather than published outright because a replay plan spans
+     * worksheets and a store owns exactly one — so a cross-sheet undo needs
+     * several stores to move, and publishing each as it landed would let a
+     * subscriber see the first sheet replayed while the rest still hold the old
+     * state. That half-replayed gesture is precisely what the plan/apply split
+     * exists to prevent, and it is what would be posted to the host as
+     * `pendingEdits`.
      *
      * The protocol is three passes, and the order is the whole point: stage every
      * store, `valid()` every staging, and only then commit and notify. Checking
@@ -581,14 +579,6 @@ export function create_edit_session_store(
                     notify();
                 },
             };
-        },
-        apply_writes: (session_id, writes) => {
-            if (!owns(session_id)) return;
-            // Copied once, ahead of the walk, then handed to `set_entries` — which
-            // drops it untouched if nothing moved, so a replay that lands on the
-            // state already showing costs one map copy and no notification.
-            const next = staged_state(writes);
-            set_entries(next.entries, next.pending_base);
         },
         resolve_pending_bases: (session_id, get_cell_raw) => {
             if (!owns(session_id)) return;
