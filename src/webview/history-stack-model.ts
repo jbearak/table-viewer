@@ -1,16 +1,16 @@
 import type { CellHyperlink } from '../cell-content';
-import { deep_clone_and_freeze, is_deeply_frozen } from '../immutable';
 import {
     worksheet_target_key,
     worksheet_target_matches,
     type CellHighlightColor,
     type WorksheetTarget,
 } from '../types';
-import type {
-    CellHistoryDelta,
-    CellOverlayState,
-    HistoryDirection,
-    HistoryValue,
+import {
+    canonical_cell_history_delta,
+    type CellHistoryDelta,
+    type CellOverlayState,
+    type HistoryDirection,
+    type HistoryValue,
 } from './history-cell-state-model';
 
 /**
@@ -574,15 +574,12 @@ export function action_is_single_worksheet(action: HistoryAction): boolean {
  * replay does after its costs were fixed. Reading once is also cheap: the copy
  * is one array of wrappers, not the content.
  *
- * The PAYLOAD is what must not be copied. The delta holds everything large, and
- * it normally arrives frozen all the way down from `build_cell_history_delta`;
- * only the `{kind, delta}` wrapper around it is the caller's. Cloning the whole
- * change to own that wrapper would duplicate every string in the payload, which
- * at this size is the difference between recording a supported million-cell
- * gesture and running out of memory refusing it. `is_deeply_frozen` is what makes
- * retaining the payload by reference safe — a shallow `Object.isFrozen` would
- * pass a frozen wrapper around mutable innards, and an accessor is rejected
- * outright rather than read.
+ * What canonicalizing rebuilds is the SKELETON — a handful of small objects per
+ * cell. The content is shared, because the strings and their runs are copied by
+ * reference into the new shape. That is what makes this affordable on the
+ * million-cell gestures history has to bound rather than refuse: duplicating the
+ * content would double peak memory at the exact moment there is least of it, and
+ * would do it even for a gesture about to be refused for being too large.
  */
 function own_action(action: HistoryAction): HistoryAction {
     const changes = [...action.changes].map(own_history_change);
@@ -590,12 +587,29 @@ function own_action(action: HistoryAction): HistoryAction {
 }
 
 function own_history_change(change: HistoryChange): HistoryChange {
-    // Canonicalized like the action, and for the same reasons — but only the
-    // wrapper. A deeply frozen delta is retained by reference.
-    const delta = is_deeply_frozen(change.delta)
-        ? change.delta
-        : deep_clone_and_freeze(change.delta);
-    return Object.freeze({ kind: change.kind, delta } as HistoryChange);
+    // Read once, then rebuilt to the declared shape. Canonicalizing is what makes
+    // "the graph measured" and "the graph retained" the same object: a structural
+    // type admits getters, inherited fields and undeclared extras, and any of
+    // those could carry unmeasured megabytes past the bounds or answer
+    // differently after the costs were fixed.
+    return change.kind === 'cell'
+        ? Object.freeze({ kind: 'cell', delta: canonical_cell_history_delta(change.delta) })
+        : Object.freeze({ kind: 'highlight', delta: canonical_highlight_delta(change.delta) });
+}
+
+function canonical_highlight_delta(delta: HighlightHistoryDelta): HighlightHistoryDelta {
+    const { sheetIndex, sheetName, worksheetId } = delta.worksheet;
+    return Object.freeze({
+        worksheet: Object.freeze({
+            sheetIndex,
+            ...(sheetName === undefined ? {} : { sheetName }),
+            ...(worksheetId === undefined ? {} : { worksheetId }),
+        }),
+        sourceRow: delta.sourceRow,
+        sourceColumn: delta.sourceColumn,
+        before: delta.before,
+        after: delta.after,
+    });
 }
 
 /** Builds a frozen action, so a caller reusing its builders cannot mutate history. */

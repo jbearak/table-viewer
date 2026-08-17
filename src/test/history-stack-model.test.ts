@@ -179,26 +179,63 @@ describe('record_history_action', () => {
         expect(Object.isFrozen(recorded?.action.changes)).toBe(true);
     });
 
-    it('retains a re-recorded action\'s payloads rather than copying them again', () => {
-        // The action and its wrappers are canonicalized on every pass — they are
-        // one array of small objects. The payloads are not: a supported gesture is
-        // a million cells, and copying that graph to freeze what is already frozen
-        // doubles peak memory exactly when there is least of it.
-        const action = history_action('Edit', [cell_change(0, 0, 'v')]);
+    it('shares a re-recorded action\'s content rather than copying it', () => {
+        // Canonicalizing rebuilds the skeleton on every pass, which is a handful
+        // of small objects per cell. The CONTENT is shared: a supported gesture is
+        // a million cells, and duplicating that would double peak memory exactly
+        // when there is least of it.
+        const long = 'x'.repeat(1_000);
+        const action = history_action('Edit', [cell_change(0, 0, long)]);
         const outcome = record_history_action(empty_history_stack(), action);
-        expect(outcome.state.undoStack[0]?.action.changes[0]?.delta).toBe(action.changes[0]?.delta);
+        const recorded = outcome.state.undoStack[0]?.action.changes[0];
+
+        expect(recorded?.delta).not.toBe(action.changes[0]?.delta);
+        expect(recorded).toEqual(action.changes[0]);
     });
 
-    it('retains a frozen delta by reference, owning only the wrapper', () => {
-        // `build_cell_history_delta` already returns a frozen graph; only the
-        // `{kind, delta}` wrapper around it is the caller's. Copying the change
-        // to own that wrapper would duplicate the whole payload.
-        const change = cell_change(0, 0, 'v');
-        expect(Object.isFrozen(change)).toBe(false);
+    it('strips a property nobody declared, rather than retaining it unmeasured', () => {
+        // A structural type admits extras. Retaining one would carry unmeasured
+        // bytes — a long string riding along on a highlight delta is charged the
+        // fixed per-change overhead — straight past the hard bound.
+        const change = {
+            ...highlight_change(0, 0),
+            smuggled: 'x'.repeat(10_000),
+        } as unknown as HistoryChange;
+
+        const action = history_action('Highlight', [change]);
+        expect(action.changes[0]).not.toHaveProperty('smuggled');
+        expect(action.changes[0]?.delta).not.toHaveProperty('smuggled');
+    });
+
+    it('strips an undeclared property from a cell delta too', () => {
+        const base = cell_change(0, 0, 'v');
+        const change = {
+            kind: 'cell',
+            delta: { ...base.delta, smuggled: 'x'.repeat(10_000) },
+        } as unknown as HistoryChange;
+
+        const entry = measure_history_action(history_action('Edit', [change]));
+        expect(entry.action.changes[0]?.delta).not.toHaveProperty('smuggled');
+        expect(entry.byteCost).toBeLessThan(10_000);
+    });
+
+    it('copies an accessor-backed delta instead of reading it twice', () => {
+        // A getter is a valid implementation of a readonly property and can answer
+        // differently on the second read, which would retain a graph nobody
+        // measured.
+        const first = cell_change(0, 0, 'v').delta as CellHistoryDelta;
+        let answered = 0;
+        const change = Object.freeze({
+            kind: 'cell',
+            get delta() {
+                answered += 1;
+                return first;
+            },
+        }) as unknown as HistoryChange;
 
         const action = history_action('Edit', [change]);
-        expect(action.changes[0]).not.toBe(change);
-        expect(action.changes[0]?.delta).toBe(change.delta);
+        expect(answered).toBe(1);
+        expect(action.changes[0]?.delta).toEqual(first);
     });
 
     it('copies an action whose changes are an accessor', () => {

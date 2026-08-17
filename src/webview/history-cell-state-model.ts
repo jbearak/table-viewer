@@ -36,9 +36,10 @@
 import {
     hyperlinks_equal,
     type CellHyperlink,
+    type CellTextStyle,
     type RichText,
+    type RichTextRun,
 } from '../cell-content';
-import { deep_clone_and_freeze } from '../immutable';
 import {
     editable_values_equal,
     plain_value,
@@ -474,7 +475,7 @@ export function build_cell_history_delta(args: {
     // mutation would silently rewrite what undo replays. `readonly` is a
     // compile-time claim only, so take an isolated frozen copy here — this
     // function is history's ownership boundary.
-    return deep_clone_and_freeze(delta);
+    return canonical_cell_history_delta(delta);
 }
 
 /**
@@ -589,6 +590,166 @@ function effective_hyperlink_side(
         return { content: persisted, overlay: 'absent' };
     }
     return { content: state.hyperlink.value, overlay: 'present' };
+}
+
+/**
+ * A delta rebuilt to its declared shape, field by field.
+ *
+ * `CellHistoryDelta` is a structural type, so a value that satisfies it can also
+ * carry a getter where a data property was expected, inherit a field from a
+ * prototype, or hold extra properties nobody declared. Any of those makes the
+ * graph a holder measured and the graph it retained two different things — an
+ * unmeasured 300MiB string riding along on a highlight delta, or a `worksheet`
+ * that answers differently after the bounds were computed.
+ *
+ * So it is rebuilt rather than inspected. Each field is read exactly once and
+ * copied into a frozen object of the declared shape; nothing undeclared survives.
+ * The copy is cheap because the content is primitives — the strings themselves
+ * are shared, not duplicated, which is what makes this affordable on the
+ * million-cell gestures history has to bound rather than refuse.
+ */
+export function canonical_cell_history_delta(delta: CellHistoryDelta): CellHistoryDelta {
+    // A memo per delta, so an object the input SHARED between a transition and an
+    // overlay is shared by the output too. That aliasing is load-bearing: it is
+    // how one string exists once in memory, and how the byte estimate charges it
+    // once instead of refusing gestures that fit the bounds.
+    const values = new Map<HistoryValue, HistoryValue>();
+    const value_of = (value: HistoryValue): HistoryValue => {
+        const seen = values.get(value);
+        if (seen !== undefined) return seen;
+        const canonical = canonical_value(value);
+        values.set(value, canonical);
+        return canonical;
+    };
+    const links = new Map<CellHyperlink, CellHyperlink | null>();
+    const link_of = (link: CellHyperlink | null): CellHyperlink | null => {
+        if (link === null) return null;
+        const seen = links.get(link);
+        if (seen !== undefined) return seen;
+        const canonical = canonical_hyperlink(link);
+        links.set(link, canonical);
+        return canonical;
+    };
+
+    const base: CellHistoryDeltaBase = {
+        worksheet: canonical_worksheet_target(delta.worksheet),
+        sourceRow: delta.sourceRow,
+        sourceColumn: delta.sourceColumn,
+        beforeOverlay: canonical_overlay(delta.beforeOverlay, value_of, link_of),
+        afterOverlay: canonical_overlay(delta.afterOverlay, value_of, link_of),
+    };
+    const value = delta.value;
+    const hyperlink = delta.hyperlink;
+    const out: CellHistoryDelta = value !== undefined && hyperlink !== undefined
+        ? {
+            ...base,
+            value: canonical_transition(value, value_of),
+            hyperlink: canonical_transition(hyperlink, link_of),
+        }
+        : value !== undefined
+            ? { ...base, value: canonical_transition(value, value_of) }
+            : { ...base, hyperlink: canonical_transition(hyperlink!, link_of) };
+    return freeze_deep_declared(out);
+}
+
+function canonical_worksheet_target(target: WorksheetTarget): WorksheetTarget {
+    const { sheetIndex, sheetName, worksheetId } = target;
+    return {
+        sheetIndex,
+        ...(sheetName === undefined ? {} : { sheetName }),
+        ...(worksheetId === undefined ? {} : { worksheetId }),
+    };
+}
+
+function canonical_value(value: HistoryValue): HistoryValue {
+    const runs = value.runs;
+    return {
+        text: value.text,
+        ...(runs === undefined
+            ? {}
+            : { runs: { runs: runs.runs.map(canonical_run) } }),
+    };
+}
+
+function canonical_run(run: RichTextRun): RichTextRun {
+    const style = run.style;
+    return {
+        text: run.text,
+        ...(style === undefined ? {} : { style: canonical_style(style) }),
+    };
+}
+
+function canonical_style(style: CellTextStyle): CellTextStyle {
+    const { bold, italic, underline, strikethrough } = style;
+    return {
+        ...(bold === undefined ? {} : { bold }),
+        ...(italic === undefined ? {} : { italic }),
+        ...(underline === undefined ? {} : { underline }),
+        ...(strikethrough === undefined ? {} : { strikethrough }),
+    };
+}
+
+function canonical_hyperlink(link: CellHyperlink | null): CellHyperlink | null {
+    if (link === null) return null;
+    const tooltip = link.tooltip;
+    const rest = tooltip === undefined ? {} : { tooltip };
+    return link.kind === 'external'
+        ? { kind: 'external', target: link.target, ...rest }
+        : { kind: 'internal', location: link.location, ...rest };
+}
+
+function canonical_transition<T>(
+    transition: { readonly mode: CellHistoryTransitionMode; readonly expected: HistoryDimensionSide<T>; readonly desired: HistoryDimensionSide<T> },
+    content: (value: T) => T,
+): { readonly mode: CellHistoryTransitionMode; readonly expected: HistoryDimensionSide<T>; readonly desired: HistoryDimensionSide<T> } {
+    return {
+        mode: transition.mode,
+        expected: { content: content(transition.expected.content), overlay: transition.expected.overlay },
+        desired: { content: content(transition.desired.content), overlay: transition.desired.overlay },
+    };
+}
+
+function canonical_overlay(
+    overlay: CellOverlayState,
+    value_of: (value: HistoryValue) => HistoryValue,
+    link_of: (link: CellHyperlink | null) => CellHyperlink | null,
+): CellOverlayState {
+    if (overlay.kind === 'absent') return ABSENT;
+    const value = overlay.value;
+    const hyperlink = overlay.hyperlink;
+    const canonical_value_dimension: OverlayValueDimension = value.kind === 'present'
+        ? {
+            kind: 'present',
+            value: value_of(value.value),
+            base: value_of(value.base),
+            basePending: value.basePending,
+        }
+        : { kind: 'untouched', anchor: value_of(value.anchor) };
+    const canonical_link_dimension: OverlayHyperlinkDimension = hyperlink.kind === 'present'
+        ? {
+            kind: 'present',
+            value: link_of(hyperlink.value),
+            base: link_of(hyperlink.base),
+        }
+        : { kind: 'untouched' };
+    // The three-arm union enumerates the combinations a real entry can have, and
+    // the cast is what lets this build one generically. It is safe because a
+    // dimension's kind is carried over unchanged: a present/untouched pair here
+    // was a present/untouched pair there.
+    return {
+        kind: 'present',
+        value: canonical_value_dimension,
+        hyperlink: canonical_link_dimension,
+    } as PresentCellOverlayState;
+}
+
+/** Freezes a graph this module built, so no foreign accessor can be reached. */
+function freeze_deep_declared<T>(value: T): T {
+    if (value === null || typeof value !== 'object') return value;
+    for (const key of Object.keys(value)) {
+        freeze_deep_declared((value as Record<string, unknown>)[key]);
+    }
+    return Object.freeze(value);
 }
 
 /** Whether two deltas address the same cell of the same worksheet. */
