@@ -736,6 +736,29 @@ describe('interned worksheet targets', () => {
         expect('sheetName' in bare.worksheet).toBe(false);
     });
 
+    it('answers from the source object without touching a long identity', () => {
+        // A wide gesture names one worksheet with one object, so the common case is
+        // O(1) and never builds a composite key — which would be O(identity length)
+        // per cell on an identity nothing bounds.
+        const sheet: WorksheetTarget = { sheetIndex: 0, sheetName: 'n'.repeat(200_000) };
+        const first = build_delta(sheet, 0);
+        const second = build_delta(sheet, 1);
+
+        expect(second.worksheet).toBe(first.worksheet);
+    });
+
+    it('does not intern an identity too long to key on cheaply', () => {
+        // Two equal targets arriving as different objects stay separate rather than
+        // paying O(identity length) to discover they match. Each copy is then
+        // charged, so the estimate still follows the memory.
+        const name = 'n'.repeat(200_000);
+        const first = build_delta({ sheetIndex: 0, sheetName: name }, 0);
+        const second = build_delta({ sheetIndex: 0, sheetName: name }, 1);
+
+        expect(second.worksheet).not.toBe(first.worksheet);
+        expect(second.worksheet.sheetName).toBe(name);
+    });
+
     it('does not conflate a name with an id of the same text', () => {
         const named = build_delta({ sheetIndex: 0, sheetName: 'x' }, 0);
         const identified = build_delta({ sheetIndex: 0, worksheetId: 'x' }, 0);

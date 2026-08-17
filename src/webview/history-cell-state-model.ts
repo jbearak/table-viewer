@@ -765,26 +765,48 @@ function detached_chunk(text: string, start: number, end: number): string {
  * Interned GLOBALLY rather than per action, because a delta is built one cell at a
  * time — long before there is an action to scope an owner to. A million-cell paste
  * names one worksheet, and without a shared target every delta would detach its own
- * copy of that name while the estimator charged the value once.
+ * copy of that name while the estimator charged one.
  *
- * The estimator keys its charge on the target OBJECT, so this map is an
- * optimization and not a correctness requirement: a delta that misses it gets a
- * fresh target and is charged for it. That is what lets the map be capped. A
- * workbook has tens of sheets, so the cap is only ever reached by a session that
- * has opened a great many files, and reaching it costs accuracy of nothing — just
- * copies that are then honestly charged.
+ * The estimator keys its charge on the target OBJECT, so this is an optimization
+ * and never a correctness requirement: a target that misses every cache is freshly
+ * built and honestly charged. That is what lets both caches be bounded.
+ *
+ * Two of them, because they answer different questions:
+ *
+ *   - `BY_SOURCE` maps a caller's target object to its canonical form. A wide
+ *     gesture names one worksheet with one object, so this answers in O(1) without
+ *     touching the identity strings at all. Weak, so it costs nothing to keep.
+ *   - `BY_IDENTITY` catches equal targets that arrive as different objects, keyed
+ *     on a composite of the identity. Building that key is O(identity length), so
+ *     it is only consulted for identities short enough for that to be free — a
+ *     real sheet name is a few dozen characters, and a caller handing us a
+ *     megabyte-long one gets correctly-charged copies rather than a hang.
  */
 const MAX_INTERNED_TARGETS = 4_096;
-const INTERNED_TARGETS = new Map<string, WorksheetTarget>();
+/** Longest identity worth building a composite key for. Real names are tiny. */
+const MAX_INTERNED_IDENTITY_LENGTH = 512;
+const BY_SOURCE = new WeakMap<WorksheetTarget, WorksheetTarget>();
+const BY_IDENTITY = new Map<string, WorksheetTarget>();
 
 function canonical_worksheet_target(
     target: WorksheetTarget,
     owner: RetainedStringOwner,
 ): WorksheetTarget {
+    // The common case: every delta of a gesture was handed the same target object.
+    const by_source = BY_SOURCE.get(target);
+    if (by_source !== undefined) return by_source;
+
     const { sheetIndex, sheetName, worksheetId } = target;
-    const key = `${sheetIndex}\u0000${sheetName ?? ''}\u0000${worksheetId ?? ''}\u0000${sheetName === undefined ? 0 : 1}${worksheetId === undefined ? 0 : 1}`;
-    const seen = INTERNED_TARGETS.get(key);
-    if (seen !== undefined) return seen;
+    const identity_length = (sheetName?.length ?? 0) + (worksheetId?.length ?? 0);
+    const key = identity_length <= MAX_INTERNED_IDENTITY_LENGTH
+        ? `${sheetIndex}\u0000${sheetName === undefined ? 0 : 1}${worksheetId === undefined ? 0 : 1}\u0000${sheetName ?? ''}\u0000${worksheetId ?? ''}`
+        : undefined;
+    const seen = key === undefined ? undefined : BY_IDENTITY.get(key);
+    if (seen !== undefined) {
+        BY_SOURCE.set(target, seen);
+        return seen;
+    }
+
     // Charged only when it is really allocated: a delta pointing at an
     // already-interned sheet retains no new string, and the estimator agrees
     // because it charges per retained target object.
@@ -793,15 +815,20 @@ function canonical_worksheet_target(
         ...(sheetName === undefined ? {} : { sheetName: owner.own(sheetName) }),
         ...(worksheetId === undefined ? {} : { worksheetId: owner.own(worksheetId) }),
     });
-    if (INTERNED_TARGETS.size < MAX_INTERNED_TARGETS) {
-        INTERNED_TARGETS.set(detached_string(key), canonical);
+    // Always remembered against the source object, which retains nothing the source
+    // was not already keeping alive.
+    BY_SOURCE.set(target, canonical);
+    if (key !== undefined && BY_IDENTITY.size < MAX_INTERNED_TARGETS) {
+        // The key repeats the identity, so it is only ever a bounded few hundred
+        // characters — which is what MAX_INTERNED_IDENTITY_LENGTH is for.
+        BY_IDENTITY.set(detached_string(key), canonical);
     }
     return canonical;
 }
 
 /** Test seam: forgets the interned worksheet targets. */
 export function reset_interned_worksheet_targets(): void {
-    INTERNED_TARGETS.clear();
+    BY_IDENTITY.clear();
 }
 
 function canonical_value(value: HistoryValue, owner: RetainedStringOwner): HistoryValue {

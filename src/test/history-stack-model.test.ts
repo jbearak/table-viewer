@@ -545,16 +545,39 @@ describe('measure_history_action', () => {
     });
 
     it('charges one worksheet identity once across a wide gesture', () => {
-        // A million-cell paste names one worksheet, whose name exists once in
-        // memory however many deltas point at it. Charging each of them would
-        // refuse gestures that fit the bound.
+        // A million-cell paste names one worksheet, whose name exists once in memory
+        // however many deltas point at it. Charging each of them would refuse
+        // gestures that fit the bound.
         const named: WorksheetTarget = { sheetIndex: 0, sheetName: 'n'.repeat(50_000) };
         const entry = measure_history_action(history_action('Paste', [
             cell_change(0, 0, 'v', named),
             cell_change(1, 0, 'v', named),
-            cell_change(2, 0, 'v', { ...named }),
+            cell_change(2, 0, 'v', named),
         ]));
         expect(entry.byteCost).toBeLessThan(50_000 * 2 * 2);
+    });
+
+    it('charges an unshareable identity for every copy it really retains', () => {
+        // An identity too long to key a lookup on cheaply is not interned across
+        // distinct source objects, so each delta detaches its own copy — and each
+        // copy is charged. The estimate follows the memory, whichever way it goes.
+        const name = 'n'.repeat(50_000);
+        const entry = measure_history_action(history_action('Paste', [
+            cell_change(0, 0, 'v', { sheetIndex: 0, sheetName: name }),
+            cell_change(1, 0, 'v', { sheetIndex: 0, sheetName: name }),
+        ]));
+        expect(entry.byteCost).toBeGreaterThan(50_000 * 2 * 2);
+    });
+
+    it('shares a short identity that arrives as two different objects', () => {
+        // A real sheet name is a few dozen characters, so a composite key over it is
+        // free to build and equal targets from different sources become one.
+        const outcome = record_history_action(empty_history_stack(), history_action('Paste', [
+            cell_change(0, 0, 'v', { sheetIndex: 0, sheetName: 'Data' }),
+            cell_change(1, 0, 'v', { sheetIndex: 0, sheetName: 'Data' }),
+        ]));
+        const changes = outcome.state.undoStack[0]?.action.changes ?? [];
+        expect(changes[1]?.delta.worksheet).toBe(changes[0]?.delta.worksheet);
     });
 
     it('charges a run\'s shape, not only its text', () => {
