@@ -93,6 +93,9 @@ const GridScroller: React.FunctionComponent<ScrollingDataGridProps> = p => {
         smoothScrollX = false,
         smoothScrollY = false,
         isDraggable,
+        onColumnResize,
+        onColumnResizeStart,
+        onColumnResizeEnd,
     } = p;
     const { paddingRight, paddingBottom } = experimental ?? {};
 
@@ -102,7 +105,39 @@ const GridScroller: React.FunctionComponent<ScrollingDataGridProps> = p => {
     const lastY = React.useRef<number | undefined>();
     const lastSize = React.useRef<readonly [number, number] | undefined>();
 
-    const width = nonGrowWidth + Math.max(0, overscrollX ?? 0);
+    const scrollContentWidth = nonGrowWidth + Math.max(0, overscrollX ?? 0);
+    const [resizeScrollWidthFloor, setResizeScrollWidthFloor] = React.useState<number>();
+    const hasColumnResize =
+        onColumnResize !== undefined || onColumnResizeStart !== undefined || onColumnResizeEnd !== undefined;
+
+    const onColumnResizeStartLocked = React.useCallback<
+        NonNullable<DataGridDndProps["onColumnResizeStart"]>
+    >(
+        (column, newSize, colIndex, newSizeWithGrow) => {
+            // At maximum horizontal scroll, shrinking the final column also
+            // shrinks the scroll range. The browser then clamps scrollLeft by
+            // the same amount, visually pinning the border while the pointer
+            // moves left. Hold the starting scroll width during the drag so
+            // the final border stays under the pointer.
+            if (colIndex === columns.length - 1) {
+                setResizeScrollWidthFloor(scrollContentWidth);
+            }
+            onColumnResizeStart?.(column, newSize, colIndex, newSizeWithGrow);
+        },
+        [columns.length, onColumnResizeStart, scrollContentWidth]
+    );
+
+    const onColumnResizeEndLocked = React.useCallback<
+        NonNullable<DataGridDndProps["onColumnResizeEnd"]>
+    >(
+        (column, newSize, colIndex, newSizeWithGrow) => {
+            setResizeScrollWidthFloor(undefined);
+            onColumnResizeEnd?.(column, newSize, colIndex, newSizeWithGrow);
+        },
+        [onColumnResizeEnd]
+    );
+
+    const scrollWidth = Math.max(scrollContentWidth, resizeScrollWidthFloor ?? 0);
 
     let height = enableGroups ? headerHeight + groupHeaderHeight : headerHeight;
     if (typeof rowHeight === "number") {
@@ -253,7 +288,7 @@ const GridScroller: React.FunctionComponent<ScrollingDataGridProps> = p => {
             kineticScrollPerfHack={experimental?.kineticScrollPerfHack}
             preventDiagonalScrolling={preventDiagonalScrolling}
             draggable={isDraggable === true || typeof isDraggable === "string"}
-            scrollWidth={width + (paddingRight ?? 0)}
+            scrollWidth={scrollWidth + (paddingRight ?? 0)}
             scrollHeight={height + (paddingBottom ?? 0)}
             clientHeight={clientHeight}
             rightElement={rightElement}
@@ -316,9 +351,9 @@ const GridScroller: React.FunctionComponent<ScrollingDataGridProps> = p => {
                 onCanvasFocused={p.onCanvasFocused}
                 onCellFocused={p.onCellFocused}
                 onColumnMoved={p.onColumnMoved}
-                onColumnResize={p.onColumnResize}
-                onColumnResizeEnd={p.onColumnResizeEnd}
-                onColumnResizeStart={p.onColumnResizeStart}
+                onColumnResize={onColumnResize}
+                onColumnResizeEnd={hasColumnResize ? onColumnResizeEndLocked : undefined}
+                onColumnResizeStart={hasColumnResize ? onColumnResizeStartLocked : undefined}
                 onContextMenu={p.onContextMenu}
                 onDragEnd={p.onDragEnd}
                 onDragLeave={p.onDragLeave}
