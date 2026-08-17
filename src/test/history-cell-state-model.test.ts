@@ -10,7 +10,6 @@ import {
 import {
     absent_overlay,
     build_cell_history_delta,
-    has_value_dimension,
     combined_overlay,
     delta_addresses_same_cell,
     delta_touches_hyperlink,
@@ -421,17 +420,17 @@ describe('conflict-base metadata', () => {
 });
 
 describe('link added to an existing value entry', () => {
-    it('does not read as a value change when the prior entry had a value dimension', () => {
-        // {value: A, base: A} + a link is BOTH a genuine link-only entry and a
-        // resolved legacy no-op that gained a link. Only the caller knows which,
-        // so it passes the prior dimension through.
+    it('does not read as a value change when the writer kept the value dimension', () => {
+        // {value: A, base: A} + a link is produced BOTH by attaching a link to
+        // an unedited cell and by attaching one to a resolved legacy no-op
+        // entry. Only the writer knows which, so it declares its intent.
         const before_entry: HistoryDirtyEntry = make_dirty_entry('A', 'A');
         const after_entry: HistoryDirtyEntry = make_dirty_entry(
             'A', 'A', undefined, undefined, LINK, null,
         );
 
         const before = overlay_state_from_dirty_entry(before_entry);
-        const after = overlay_state_from_dirty_entry(after_entry, has_value_dimension(before));
+        const after = overlay_state_from_dirty_entry(after_entry, 'in-overlay');
 
         const d = build_cell_history_delta({
             worksheet: SHEET,
@@ -446,6 +445,54 @@ describe('link added to an existing value entry', () => {
         // Only the link moved: the value dimension was present before and after.
         expect(d!.hyperlink).toBeDefined();
         expect(d!.value).toBeUndefined();
+    });
+
+    it('reads a text revert that leaves a pending link as link-only', () => {
+        // settle_edit: "the entry survives as link-only, its value dimension
+        // back at the base". The prior state HAD a value dimension, so prior
+        // membership is the wrong signal — the writer's intent is what counts.
+        // Misreading this as combined would emit a semantic value transition,
+        // and a redo after a save would write the stale text over the saved one.
+        const before = combined_overlay(history_value('B'), history_value('A'), LINK, null);
+        const after = overlay_state_from_dirty_entry(
+            make_dirty_entry('A', 'A', undefined, undefined, LINK, null),
+            'link-only',
+        );
+        expect(after.value.kind).toBe('untouched');
+
+        const d = build_cell_history_delta({
+            worksheet: SHEET,
+            sourceRow: 3,
+            sourceColumn: 2,
+            before,
+            after,
+            persistedValue: history_value('A'),
+            persistedHyperlink: null,
+        });
+        expect(d).toBeDefined();
+        expect(d!.value!.mode).toBe('membership');
+        expect(d!.value!.desired.overlay).toBe('absent');
+    });
+
+    it('records a link-only anchor base moving under an external change', () => {
+        // Disk A -> C, then recommitting C: the link never moved, but the
+        // anchor IS the reconstructed value/base pair, so the base the save is
+        // validated against changed.
+        const d = delta({
+            before: hyperlink_only_overlay(history_value('A'), LINK, null),
+            after: hyperlink_only_overlay(history_value('C'), LINK, null),
+            persistedValue: 'C',
+        });
+        expect(d).toBeDefined();
+    });
+
+    it('records a hyperlink base moving while its value does not', () => {
+        const d = delta({
+            before: hyperlink_only_overlay(history_value('A'), LINK, null),
+            after: hyperlink_only_overlay(history_value('A'), LINK, OTHER_LINK),
+            persistedValue: 'A',
+        });
+        expect(d).toBeDefined();
     });
 
     it('still reads a link on a cell with no prior entry as link-only', () => {

@@ -210,27 +210,38 @@ export function combined_overlay(
 }
 
 /**
+ * What the value dimension of a link-carrying entry MEANS — a fact the entry's
+ * fields cannot express.
+ *
+ * `{value: 'A', base: 'A', link, baseLink}` is produced by three different
+ * intents, all in `use-editing.ts`:
+ *   - attaching a link to an unedited cell (`commit_hyperlink`'s link-only
+ *     branch): the value fields are just the unedited text — `'link-only'`;
+ *   - reverting the text of a cell that has a pending link (`settle_edit`,
+ *     "the entry survives as link-only, its value dimension back at the base"):
+ *     the value dimension was deliberately REMOVED — `'link-only'`;
+ *   - attaching a link to an existing resolved legacy no-op entry, which
+ *     `commit_hyperlink` builds by copying that pending entry: the value
+ *     dimension is genuinely still in the overlay — `'in-overlay'`.
+ *
+ * Prior membership does not decide this: the second and third cases both follow
+ * a state that had a value dimension. Only the writer knows its own intent, so
+ * it says. `'infer'` is for readers with no intent to declare (hydration,
+ * enumerating a store) and falls back to whether the value differs from base.
+ */
+export type ValueDimensionIntent = 'in-overlay' | 'link-only' | 'infer';
+
+/**
  * Read a store entry into its overlay state.
  *
- * `value_dimension_in_overlay` resolves an ambiguity the entry alone cannot:
- * `{value: 'A', base: 'A', link, baseLink}` is produced BOTH by attaching a
- * link to an unedited cell (a genuine link-only entry, whose value fields are
- * just the unedited text) AND by attaching a link to an existing resolved
- * legacy no-op entry, which `use-editing.ts` `commit_hyperlink` builds by
- * copying the pending entry. In the second case the value dimension really is
- * part of the overlay, and dropping it would lose the entry's membership.
- *
- * Only the caller knows which happened, because only the caller knows whether
- * a value dimension was already there. Pass `true` when the cell already had a
- * value dimension in the overlay. The default is the common case: no prior
- * entry, so a link-carrying entry is link-only.
- *
- * Every other present entry keeps a present value dimension, including one
- * awaiting its true base.
+ * Every entry without a link keeps a present value dimension — including one
+ * whose value equals its base (a resolved legacy no-op) and one awaiting its
+ * true base — because such an entry is in the map, and so tinted, persisted and
+ * saved, regardless of comparing equal.
  */
 export function overlay_state_from_dirty_entry(
     entry: HistoryDirtyEntry,
-    value_dimension_in_overlay = false,
+    value_intent: ValueDimensionIntent = 'infer',
 ): PresentCellOverlayState {
     const value = history_value(entry.value, entry.valueRuns);
     const base = history_value(entry.base, entry.baseRuns);
@@ -240,8 +251,8 @@ export function overlay_state_from_dirty_entry(
     // value change: they are the unedited text the link was attached to.
     const value_untouched = link_present
         && !base_pending
-        && !value_dimension_in_overlay
-        && !dirty_entry_value_changed(entry);
+        && value_intent !== 'in-overlay'
+        && (value_intent === 'link-only' || !dirty_entry_value_changed(entry));
 
     if (value_untouched) {
         return hyperlink_only_overlay(value, entry.link ?? null, entry.baseLink ?? null);
@@ -256,12 +267,6 @@ export function overlay_state_from_dirty_entry(
         );
     }
     return value_only_overlay(value, base, base_pending);
-}
-
-/** Whether a state carries a value dimension, for threading into
- *  {@link overlay_state_from_dirty_entry} when reading the state that follows. */
-export function has_value_dimension(state: CellOverlayState): boolean {
-    return state.kind === 'present' && state.value.kind === 'present';
 }
 
 /** Rebuild the store entry a present overlay state describes. */
@@ -437,7 +442,8 @@ export function build_cell_history_delta(args: {
         || before_value.overlay !== after_value.overlay
         || value_metadata_moved(before, after);
     const link_moved = !hyperlinks_equal(before_link.content, after_link.content)
-        || before_link.overlay !== after_link.overlay;
+        || before_link.overlay !== after_link.overlay
+        || hyperlink_metadata_moved(before, after);
 
     if (!value_moved && !link_moved) return undefined;
 
@@ -500,17 +506,59 @@ function dimension_mode(
  * `validate_dirty_bases` will admit the save. The same goes for `basePending`,
  * which blocks saving outright. Neither may be dropped from history, or undo
  * could not restore the prior conflict state.
+ *
+ * Only a `present` value dimension carries this metadata. When membership
+ * itself differs the dimension has already been reported as moved, so a
+ * one-sided comparison would be redundant, and reading a link-only entry's
+ * anchor here would make attaching a link read as a value change.
  */
 function value_metadata_moved(before: CellOverlayState, after: CellOverlayState): boolean {
-    const left = before.kind === 'present' && before.value.kind === 'present'
-        ? before.value
-        : undefined;
-    const right = after.kind === 'present' && after.value.kind === 'present'
-        ? after.value
-        : undefined;
-    if (left === undefined || right === undefined) return left !== right;
+    const left = present_value_dimension(before);
+    const right = present_value_dimension(after);
+    if (left === undefined || right === undefined) return false;
     return left.basePending !== right.basePending
         || !history_values_equal(left.base, right.base);
+}
+
+function present_value_dimension(state: CellOverlayState): PresentValueDimension | undefined {
+    return state.kind === 'present' && state.value.kind === 'present' ? state.value : undefined;
+}
+
+function present_hyperlink_dimension(
+    state: CellOverlayState,
+): PresentHyperlinkDimension | undefined {
+    return state.kind === 'present' && state.hyperlink.kind === 'present'
+        ? state.hyperlink
+        : undefined;
+}
+
+/**
+ * Whether the hyperlink dimension's own metadata moved while its link did not.
+ *
+ * Two things count. `baseLink` decides whether the link change reads as
+ * conflicted, so a base-only move is a real change. And a link-only entry's
+ * `anchor` is reconstructed into the entry's `value`/`base` pair, so an
+ * external change that moves the anchor (disk A -> C, then recommitting C)
+ * changes the base the save is validated against even though nothing about the
+ * link moved. The anchor belongs to the hyperlink dimension's own bookkeeping
+ * here: the value dimension is untouched on both sides, and attributing it
+ * there would emit a value transition that undo would use to rewrite text.
+ */
+function hyperlink_metadata_moved(before: CellOverlayState, after: CellOverlayState): boolean {
+    const left = present_hyperlink_dimension(before);
+    const right = present_hyperlink_dimension(after);
+    if (left === undefined || right === undefined) return false;
+    if (!hyperlinks_equal(left.base, right.base)) return true;
+    const left_anchor = untouched_value_anchor(before);
+    const right_anchor = untouched_value_anchor(after);
+    if (left_anchor === undefined || right_anchor === undefined) return false;
+    return !history_values_equal(left_anchor, right_anchor);
+}
+
+function untouched_value_anchor(state: CellOverlayState): HistoryValue | undefined {
+    return state.kind === 'present' && state.value.kind === 'untouched'
+        ? state.value.anchor
+        : undefined;
 }
 
 /**
