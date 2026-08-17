@@ -487,6 +487,51 @@ describe('measure_history_action', () => {
         expect(entry.cellCount).toBe(1);
     });
 
+    it('counts one cell once across two targets sharing a worksheet id', () => {
+        // An external reorder reassigns indices, so an id outranks whatever index
+        // arrived with it.
+        const entry = measure_history_action(history_action('Paste', [
+            cell_change(4, 2, 'first', { sheetIndex: 0, worksheetId: 'rId1' }),
+            cell_change(4, 2, 'second', { sheetIndex: 7, worksheetId: 'rId1' }),
+        ]));
+        expect(entry.cellCount).toBe(1);
+    });
+
+    it('counts one cell once when an id outranks a name that disagrees', () => {
+        const entry = measure_history_action(history_action('Paste', [
+            cell_change(4, 2, 'first', { sheetIndex: 0, sheetName: 'Before', worksheetId: 'rId1' }),
+            cell_change(4, 2, 'second', { sheetIndex: 0, sheetName: 'After', worksheetId: 'rId1' }),
+        ]));
+        expect(entry.cellCount).toBe(1);
+    });
+
+    it('counts one cell once across two indices when only a name identifies it', () => {
+        const entry = measure_history_action(history_action('Paste', [
+            cell_change(4, 2, 'first', { sheetIndex: 0, sheetName: 'Data' }),
+            cell_change(4, 2, 'second', { sheetIndex: 3, sheetName: 'Data' }),
+        ]));
+        expect(entry.cellCount).toBe(1);
+    });
+
+    it('counts positional targets at different indices separately', () => {
+        // Nothing but the index identifies these, so the index has to be believed.
+        const entry = measure_history_action(history_action('Discard all', [
+            cell_change(4, 2, 'first', { sheetIndex: 0 }),
+            cell_change(4, 2, 'second', { sheetIndex: 1 }),
+        ]));
+        expect(entry.cellCount).toBe(2);
+    });
+
+    it('does not deduplicate a named target against an identified one', () => {
+        // Matching indices are not evidence: one target names its sheet, the other
+        // identifies a different one.
+        const entry = measure_history_action(history_action('Discard all', [
+            cell_change(4, 2, 'first', { sheetIndex: 0, sheetName: 'Data' }),
+            cell_change(4, 2, 'second', { sheetIndex: 0, worksheetId: 'rId9' }),
+        ]));
+        expect(entry.cellCount).toBe(2);
+    });
+
     it('does not collapse the same address on two worksheets', () => {
         const entry = measure_history_action(history_action('Discard all', [
             cell_change(1, 1, 'v', SHEET),

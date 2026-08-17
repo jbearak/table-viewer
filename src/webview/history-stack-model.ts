@@ -8,7 +8,6 @@ import {
     canonical_worksheet_target,
     detached_string,
     type RetainedStringOwner,
-    worksheet_token,
     type CellHistoryDelta,
     type CellOverlayState,
     type HistoryDirection,
@@ -341,15 +340,79 @@ function estimate_change_bytes(
         : CHANGE_OVERHEAD_BYTES);
 }
 
-function change_cell_key(change: HistoryChange): string {
+/** Columns touched, by row. */
+type RowIndex = Map<number, Set<number>>;
+
+/**
+ * Cells counted on one worksheet, reached by whichever identifier names it.
+ *
+ * Three maps rather than one key, because the identifiers are not interchangeable:
+ * an id names a sheet an external reorder cannot move, a name names it when there
+ * is no id, and an index is all a target without either has.
+ */
+interface WorksheetCellIndex {
+    readonly byId: Map<string, RowIndex>;
+    readonly byName: Map<string, RowIndex>;
+    readonly byIndex: Map<number, RowIndex>;
+}
+
+/**
+ * Distinct cells an action touches, counted without building a key per cell.
+ *
+ * A key holding the worksheet identity would be O(changes x identity length) of
+ * work and of retained string, on an identity nothing bounds — a real cost on the
+ * million-cell gestures this counter exists to bound. Indexing the fields directly
+ * costs a few map lookups and retains only what the action already holds.
+ *
+ * Lives for one measurement and dies with it: nothing here outlives the walk.
+ */
+interface CellCountIndex {
+    readonly cell: WorksheetCellIndex;
+    readonly highlight: WorksheetCellIndex;
+    count: number;
+}
+
+function worksheet_cell_index(): WorksheetCellIndex {
+    return { byId: new Map(), byName: new Map(), byIndex: new Map() };
+}
+
+function cell_count_index(): CellCountIndex {
+    return { cell: worksheet_cell_index(), highlight: worksheet_cell_index(), count: 0 };
+}
+
+/**
+ * Counts a change's cell, once.
+ *
+ * A cell's value and its highlight are separate changes and count separately; one
+ * cell touched twice by a gesture — a paste overlapping its own source — counts
+ * once. Worksheets are told apart by identity before index, as replay does, since
+ * an external reorder reassigns indices and two sheets must never collapse into
+ * one counted cell.
+ */
+function add_counted_cell(index: CellCountIndex, change: HistoryChange): void {
     const { worksheet, sourceRow, sourceColumn } = change.delta;
-    // A token rather than the identity itself: a sheet name is unbounded, and
-    // spelling it into a key per cell is O(changes x identity length) of work and of
-    // retained key. Canonical targets are interned, so the token is exactly as
-    // discriminating — which matters because an external reorder reassigns indices,
-    // and two sheets must never collapse into one counted cell. A cell's value and
-    // its highlight are separate changes, so the kind is part of the key.
-    return `${change.kind} ${worksheet_token(worksheet)} ${sourceRow}:${sourceColumn}`;
+    const sheets = change.kind === 'cell' ? index.cell : index.highlight;
+    const rows = worksheet.worksheetId !== undefined
+        ? map_row_index(sheets.byId, worksheet.worksheetId)
+        : worksheet.sheetName !== undefined
+            ? map_row_index(sheets.byName, worksheet.sheetName)
+            : map_row_index(sheets.byIndex, worksheet.sheetIndex);
+    let columns = rows.get(sourceRow);
+    if (columns === undefined) {
+        columns = new Set();
+        rows.set(sourceRow, columns);
+    }
+    if (columns.has(sourceColumn)) return;
+    columns.add(sourceColumn);
+    index.count += 1;
+}
+
+function map_row_index<K>(sheets: Map<K, RowIndex>, key: K): RowIndex {
+    const existing = sheets.get(key);
+    if (existing !== undefined) return existing;
+    const rows: RowIndex = new Map();
+    sheets.set(key, rows);
+    return rows;
 }
 
 interface HistoryCosts {
@@ -362,14 +425,14 @@ type OwnedAction = MeasuredAction;
 
 /** Costs of an action this module already owns, so nothing needs rebuilding. */
 function measure_costs(action: HistoryAction): HistoryCosts {
-    const cells = new Set<string>();
+    const cells = cell_count_index();
     const charge_worksheet = worksheet_charger();
     let byteCost = estimate_string_bytes(action.label);
     for (const change of action.changes) {
-        cells.add(change_cell_key(change));
+        add_counted_cell(cells, change);
         byteCost += estimate_change_bytes(change, charge_worksheet);
     }
-    return { cellCount: cells.size, byteCost };
+    return { cellCount: cells.count, byteCost };
 }
 
 /** Thrown by the owner to abandon a rebuild mid-change. Never escapes this module. */
@@ -426,7 +489,7 @@ function action_owner(trip: (cost: number) => void): RetainedStringOwner {
  * last word below, since it also charges the shape.
  */
 function own_and_measure(action: HistoryAction, budget = Infinity): OwnedAction | undefined {
-    const cells = new Set<string>();
+    const cells = cell_count_index();
     const charge_worksheet = worksheet_charger();
     const owned: HistoryChange[] = [];
     // Truncated rather than charged: a label can be built from data, and a bound
@@ -454,12 +517,12 @@ function own_and_measure(action: HistoryAction, budget = Infinity): OwnedAction 
         }
         byteCost += estimate_change_bytes(canonical, charge_worksheet);
         if (byteCost > budget) return undefined;
-        cells.add(change_cell_key(canonical));
+        add_counted_cell(cells, canonical);
         owned.push(canonical);
     }
     const canonical = Object.freeze({ label, changes: Object.freeze(owned) });
     CANONICAL_ACTIONS.add(canonical);
-    return { action: canonical, cellCount: cells.size, byteCost };
+    return { action: canonical, cellCount: cells.count, byteCost };
 }
 
 /**

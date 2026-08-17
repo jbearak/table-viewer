@@ -855,50 +855,6 @@ export function canonical_worksheet_target(
 }
 
 /**
- * A short stand-in for a canonical target's SEMANTIC identity.
- *
- * Anything that needs to tell two worksheets apart — deduplicating a gesture's
- * cells, say — would otherwise build a key holding the whole identity, once per
- * cell, on fields nothing bounds. A token is a handful of characters, computed once
- * per canonical target and remembered against it.
- *
- * Equal identities get equal tokens even when they are two objects. They can be:
- * interning is bounded, so a very long identity or a full table leaves two targets
- * unshared on purpose, and a token that followed object identity would then count
- * one cell twice and evict history the user could still undo. Sharing an object is
- * an optimization; naming the same sheet is a fact.
- */
-export function worksheet_token(target: WorksheetTarget): string {
-    const seen = TOKENS.get(target);
-    if (seen !== undefined) return seen;
-    const { sheetIndex, sheetName, worksheetId } = target;
-    // Prefers identity over index for the same reason replay does: an external
-    // reorder reassigns indices while the identity carried alongside stays true.
-    const identity = worksheetId !== undefined
-        ? `id:${worksheetId}`
-        : sheetName !== undefined
-            ? `name:${sheetName}`
-            : `index:${sheetIndex}`;
-    const existing = TOKENS_BY_IDENTITY.get(identity);
-    const token = existing ?? `w${NEXT_TOKEN++}`;
-    if (existing === undefined) TOKENS_BY_IDENTITY.set(detached_string(identity), token);
-    TOKENS.set(target, token);
-    return token;
-}
-
-let TOKENS = new WeakMap<WorksheetTarget, string>();
-/**
- * Identity to token, so two unshared targets naming one sheet agree.
- *
- * Held for the session and unbounded, which a canonical target's identity can
- * afford to be: it is only ever reached once per canonical target — the WeakMap
- * above answers every later ask — and a workbook has tens of sheets. The strings
- * are detached, so nothing larger is kept alive behind them.
- */
-const TOKENS_BY_IDENTITY = new Map<string, string>();
-let NEXT_TOKEN = 0;
-
-/**
  * Test seam: forgets every interned worksheet target.
  *
  * Both caches, or the reset would leave tests order-dependent: a target object
@@ -909,10 +865,6 @@ let NEXT_TOKEN = 0;
 export function reset_interned_worksheet_targets(): void {
     BY_IDENTITY.clear();
     BY_SOURCE = new WeakMap<WorksheetTarget, SourceMemo>();
-    TOKENS_BY_IDENTITY.clear();
-    // Both halves, for the same reason: a target still memoized against a token no
-    // identity maps to any more would leave an equal target with a different one.
-    TOKENS = new WeakMap<WorksheetTarget, string>();
 }
 
 function canonical_value(value: HistoryValue, owner: RetainedStringOwner): HistoryValue {
