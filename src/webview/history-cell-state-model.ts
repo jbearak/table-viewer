@@ -759,16 +759,49 @@ function detached_chunk(text: string, start: number, end: number): string {
     return String.fromCharCode(...units);
 }
 
+/**
+ * Canonical worksheet targets, interned for the life of the session.
+ *
+ * Interned GLOBALLY rather than per action, because a delta is built one cell at a
+ * time — long before there is an action to scope an owner to. A million-cell paste
+ * names one worksheet, and without a shared target every delta would detach its own
+ * copy of that name while the estimator charged the value once.
+ *
+ * The estimator keys its charge on the target OBJECT, so this map is an
+ * optimization and not a correctness requirement: a delta that misses it gets a
+ * fresh target and is charged for it. That is what lets the map be capped. A
+ * workbook has tens of sheets, so the cap is only ever reached by a session that
+ * has opened a great many files, and reaching it costs accuracy of nothing — just
+ * copies that are then honestly charged.
+ */
+const MAX_INTERNED_TARGETS = 4_096;
+const INTERNED_TARGETS = new Map<string, WorksheetTarget>();
+
 function canonical_worksheet_target(
     target: WorksheetTarget,
     owner: RetainedStringOwner,
 ): WorksheetTarget {
     const { sheetIndex, sheetName, worksheetId } = target;
-    return {
+    const key = `${sheetIndex}\u0000${sheetName ?? ''}\u0000${worksheetId ?? ''}\u0000${sheetName === undefined ? 0 : 1}${worksheetId === undefined ? 0 : 1}`;
+    const seen = INTERNED_TARGETS.get(key);
+    if (seen !== undefined) return seen;
+    // Charged only when it is really allocated: a delta pointing at an
+    // already-interned sheet retains no new string, and the estimator agrees
+    // because it charges per retained target object.
+    const canonical = Object.freeze({
         sheetIndex,
         ...(sheetName === undefined ? {} : { sheetName: owner.own(sheetName) }),
         ...(worksheetId === undefined ? {} : { worksheetId: owner.own(worksheetId) }),
-    };
+    });
+    if (INTERNED_TARGETS.size < MAX_INTERNED_TARGETS) {
+        INTERNED_TARGETS.set(detached_string(key), canonical);
+    }
+    return canonical;
+}
+
+/** Test seam: forgets the interned worksheet targets. */
+export function reset_interned_worksheet_targets(): void {
+    INTERNED_TARGETS.clear();
 }
 
 function canonical_value(value: HistoryValue, owner: RetainedStringOwner): HistoryValue {

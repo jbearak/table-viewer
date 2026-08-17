@@ -305,27 +305,29 @@ function estimate_cell_delta_bytes(delta: CellHistoryDelta): number {
 }
 
 /**
- * Charges each worksheet identity string once per action.
+ * Charges each retained worksheet target once per action.
  *
- * `sheetName` and `worksheetId` are retained in every delta and neither is
- * length-bounded — a name comes from the file, an id from its relationships — so
- * a gesture carrying a megabyte-long name past the byte bound is a gesture that
+ * `sheetName` and `worksheetId` are held by every delta and neither is
+ * length-bounded — a name comes from the file, an id from its relationships — so a
+ * gesture carrying a megabyte-long name past the byte bound is a gesture that
  * exhausted the heap history was bounded to protect.
  *
- * Charged once per distinct VALUE across the action, which is exactly what memory
- * holds: `action_owner` interns by value, so a million-cell paste naming one
- * worksheet retains one copy of that name however many deltas point at it.
- * Charging each delta would refuse gestures that fit the bound; charging once
- * without the interning would accept gestures that do not.
+ * Keyed on the target OBJECT, which is what memory actually holds:
+ * canonicalization interns targets, so every delta naming one worksheet points at
+ * one target holding one copy of its name. Charging per delta would refuse a
+ * million-cell paste over a long sheet name that costs a few kilobytes; charging
+ * per distinct VALUE would let a wide gesture whose deltas each detached their own
+ * copy pass the bound while retaining many times it. Neither happens when the
+ * charge follows the object.
  */
 function worksheet_charger(): (worksheet: WorksheetTarget) => number {
-    const counted = new Set<string>();
-    const once = (text: string | undefined): number => {
-        if (text === undefined || counted.has(text)) return 0;
-        counted.add(text);
-        return estimate_string_bytes(text);
+    const counted = new WeakSet<WorksheetTarget>();
+    return (worksheet) => {
+        if (counted.has(worksheet)) return 0;
+        counted.add(worksheet);
+        return estimate_string_bytes(worksheet.sheetName ?? '')
+            + estimate_string_bytes(worksheet.worksheetId ?? '');
     };
-    return (worksheet) => once(worksheet.sheetName) + once(worksheet.worksheetId);
 }
 
 function estimate_change_bytes(

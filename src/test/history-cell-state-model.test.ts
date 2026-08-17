@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 
 import { rich_text_from_plain, type CellHyperlink, type RichText } from '../cell-content';
 import {
@@ -20,6 +20,7 @@ import {
     history_values_equal,
     hyperlink_only_overlay,
     is_canonical_cell_delta,
+    reset_interned_worksheet_targets,
     overlay_for_direction,
     overlay_state_from_dirty_entry,
     overlay_states_equal,
@@ -29,6 +30,8 @@ import {
     type CellOverlayState,
     type HistoryDirtyEntry,
 } from '../webview/history-cell-state-model';
+
+beforeEach(reset_interned_worksheet_targets);
 
 const SHEET: WorksheetTarget = { sheetIndex: 0, sheetName: 'Sheet1', worksheetId: 'ws-1' };
 
@@ -712,3 +715,45 @@ describe('canonical delta ownership', () => {
         expect(delta.worksheet.sheetName).toBe(delta.value?.desired.content.text);
     });
 });
+describe('interned worksheet targets', () => {
+    it('gives two deltas on one sheet the same target object', () => {
+        // A delta is built one cell at a time, long before there is an action to
+        // scope an owner to, so without a shared target every delta would detach its
+        // own copy of the sheet name.
+        const sheet: WorksheetTarget = { sheetIndex: 3, sheetName: 'Long', worksheetId: 'rId7' };
+        const first = build_delta(sheet, 0);
+        const second = build_delta(sheet, 1);
+
+        expect(second.worksheet).toBe(first.worksheet);
+        expect(second.worksheet.sheetName).toBe('Long');
+    });
+
+    it('does not conflate a named sheet with an unnamed one at the same index', () => {
+        const named = build_delta({ sheetIndex: 0, sheetName: '' }, 0);
+        const bare = build_delta({ sheetIndex: 0 }, 0);
+
+        expect(named.worksheet).not.toBe(bare.worksheet);
+        expect('sheetName' in bare.worksheet).toBe(false);
+    });
+
+    it('does not conflate a name with an id of the same text', () => {
+        const named = build_delta({ sheetIndex: 0, sheetName: 'x' }, 0);
+        const identified = build_delta({ sheetIndex: 0, worksheetId: 'x' }, 0);
+
+        expect(named.worksheet).not.toBe(identified.worksheet);
+    });
+});
+
+function build_delta(worksheet: WorksheetTarget, row: number): CellHistoryDelta {
+    const delta = build_cell_history_delta({
+        worksheet,
+        sourceRow: row,
+        sourceColumn: 0,
+        before: absent_overlay(),
+        after: value_only_overlay(history_value('v'), history_value('base')),
+        persistedValue: history_value('base'),
+        persistedHyperlink: null,
+    });
+    if (delta === undefined) throw new Error('fixture built a delta that moved nothing');
+    return delta;
+}

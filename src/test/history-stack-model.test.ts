@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 import type { WorksheetTarget } from '../types';
 import {
     absent_overlay,
@@ -6,6 +6,7 @@ import {
     detached_string,
     history_value,
     hyperlink_only_overlay,
+    reset_interned_worksheet_targets,
     value_only_overlay,
     type CellHistoryDelta,
     type HistoryValue,
@@ -29,6 +30,10 @@ import {
     type HistoryEntry,
     type HistoryStackState,
 } from '../webview/history-stack-model';
+
+// Canonical worksheet targets are interned for the session, so what a gesture is
+// charged for a sheet name depends on whether an earlier test already retained it.
+beforeEach(reset_interned_worksheet_targets);
 
 const SHEET: WorksheetTarget = { sheetIndex: 0, sheetName: 'Data', worksheetId: 'rId1' };
 const LINK = { kind: 'external', target: 'https://example.com/' } as const;
@@ -504,24 +509,39 @@ describe('measure_history_action', () => {
         expect(entry.byteCost).toBeGreaterThan(100_000 * 2);
     });
 
-    it('shares one copy of a worksheet name across a wide gesture', () => {
+    it('shares one worksheet target across a wide gesture', () => {
         // Detaching per delta would turn one shared name into a copy per cell, each
-        // charged once by an estimator that deduplicates — the bound defeated by the
-        // copying meant to make it honest. Interning is the other half of detaching.
+        // charged once by an estimator that deduplicated by value — the bound
+        // defeated by the copying meant to make it honest. Canonical targets are
+        // interned instead, and the estimator charges the object.
         const name = 'n'.repeat(5_000);
-        const forged = (row: number): HistoryChange => ({
-            kind: 'cell',
-            delta: { ...(cell_change(row, 0, 'v', { sheetIndex: 0, sheetName: name }).delta as CellHistoryDelta) },
-        });
+        const sheet: WorksheetTarget = { sheetIndex: 0, sheetName: name };
         const outcome = record_history_action(empty_history_stack(), {
             label: 'Paste',
-            changes: [forged(0), forged(1), forged(2)],
+            changes: [0, 1, 2].map((row) => cell_change(row, 0, 'v', sheet)),
         });
         const changes = outcome.state.undoStack[0]?.action.changes ?? [];
 
         expect(changes).toHaveLength(3);
-        expect(changes[1]?.delta.worksheet.sheetName).toBe(changes[0]?.delta.worksheet.sheetName);
-        expect(changes[2]?.delta.worksheet.sheetName).toBe(changes[0]?.delta.worksheet.sheetName);
+        expect(changes[1]?.delta.worksheet).toBe(changes[0]?.delta.worksheet);
+        expect(changes[2]?.delta.worksheet).toBe(changes[0]?.delta.worksheet);
+        // Charged once, because one copy is what is retained.
+        expect(outcome.state.undoStack[0]?.byteCost).toBeLessThan(5_000 * 2 * 2);
+    });
+
+    it('shares one worksheet target between two gestures on the same sheet', () => {
+        // Interned for the session, so a later gesture on the same sheet points at
+        // the same target and allocates no new name. Each action is still charged
+        // for the target it holds — the bounds cap a history whose entries may
+        // outlive each other, and over-charging a shared string is the safe way to
+        // be wrong.
+        const sheet: WorksheetTarget = { sheetIndex: 0, sheetName: 'n'.repeat(5_000) };
+        const first = record_history_action(empty_history_stack(), history_action('A', [cell_change(0, 0, 'v', sheet)]));
+        const second = record_history_action(first.state, history_action('B', [cell_change(1, 0, 'v', sheet)]));
+        const [a, b] = second.state.undoStack;
+
+        expect(a?.action.changes[0]?.delta.worksheet).toBe(b?.action.changes[0]?.delta.worksheet);
+        expect(b?.byteCost).toBeGreaterThan(5_000 * 2);
     });
 
     it('charges one worksheet identity once across a wide gesture', () => {
