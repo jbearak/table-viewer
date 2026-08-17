@@ -197,6 +197,86 @@ export interface EditSessionStore {
     /** Capture true bases for base_pending entries whose page became resident.
      *  Notifies only when something changed. */
     resolve_pending_bases(session_id: string | undefined, get_cell_raw: GetCellRaw): void;
+    /**
+     * Stage a whole set of writes as ONE mutation, held back from the
+     * subscribers until the caller says so: every key set or removed, one
+     * notification, one snapshot the subscribers ever see.
+     *
+     * Exists for history replay, where a gesture spans many cells and the
+     * intermediate states are not states the user ever had. Looping over
+     * {@link commit} and {@link remove} would publish each one — a re-render, a
+     * pendingEdits post and a host-side workspace-state write per cell of a
+     * paste — and, worse, would leave a half-applied undo visible if anything
+     * threw partway. The plan is decided before this is called (see
+     * `history-replay-model.ts`); this only lands it.
+     *
+     * Later writes to one key win, matching the replay order the planner
+     * produced: a cell a gesture touched twice ends where the last write puts it.
+     *
+     * Held back rather than published outright because a replay plan spans
+     * worksheets and a store owns exactly one — so a cross-sheet undo needs
+     * several stores to move, and publishing each as it landed would let a
+     * subscriber see the first sheet replayed while the rest still hold the old
+     * state. That half-replayed gesture is precisely what the plan/apply split
+     * exists to prevent, and it is what would be posted to the host as
+     * `pendingEdits`.
+     *
+     * The protocol is three passes, and the order is the whole point: stage every
+     * store, `valid()` every staging, and only then commit and notify. Checking
+     * validity inside each commit would not do — the first store would already
+     * have swapped by the time the third discovered its session had moved, and
+     * that half-replayed state is observable through `snapshot()` and `get()`
+     * whether or not anything has notified yet. A staging that is still valid
+     * cannot fail to commit, so once the whole list validates the caller can
+     * always finish.
+     *
+     * Returns `undefined` when the session moved on before staging, exactly as
+     * the mutators drop a stale write.
+     */
+    stage_writes(
+        session_id: string | undefined,
+        writes: Iterable<StoreWrite>,
+    ): StagedWrites | undefined;
+}
+
+/**
+ * A store's next state, held back from its subscribers.
+ *
+ * `valid()` asks whether this staging may still be committed: false once the
+ * store has crossed a hydration boundary or been mutated by anything else since
+ * it was staged. It changes nothing, so a caller can ask about every store
+ * before moving any of them.
+ *
+ * `commit` swaps the staged state in; `notify` publishes. Both are idempotent,
+ * so a caller may run the list twice without double-notifying. Nothing here
+ * holds the store's listeners open — an abandoned staging is simply dropped.
+ */
+export interface StagedWrites {
+    /** Whether the staging still describes a swap this store will accept. */
+    valid(): boolean;
+    /**
+     * Swap the staged state in without notifying. Answers whether it changed.
+     * Refuses — answering false — if the staging is no longer {@link valid}, but
+     * a caller that validated the whole list first can never reach that.
+     */
+    commit(): boolean;
+    /** Notify this store's subscribers, once, if the commit changed anything. */
+    notify(): void;
+}
+
+/**
+ * One key's write: the entry to set, or `undefined` to remove the key.
+ *
+ * `DirtyEntry` rather than `CsvDirtyEntry`, so a write can carry `base_pending`.
+ * A replay really can restore one — undoing the discard of a legacy edit whose
+ * page was never resident puts back an entry whose base is still a placeholder —
+ * and dropping the flag would promote that placeholder to observed content, so
+ * conflict detection would compare against `''` and a save would be admitted
+ * against a base the user never saw.
+ */
+export interface StoreWrite {
+    readonly key: string;
+    readonly entry: DirtyEntry | undefined;
 }
 
 interface NormalizedEdits {
@@ -340,6 +420,36 @@ export function create_edit_session_store(
         notify();
     };
 
+    // The map a set of writes produces, built without publishing anything.
+    const staged_state = (writes: Iterable<StoreWrite>): {
+        entries: Map<string, DirtyEntry>;
+        pending_base: boolean;
+    } => {
+        const entries = new Map(state.entries);
+        for (const { key, entry } of writes) {
+            if (entry === undefined) {
+                entries.delete(key);
+                continue;
+            }
+            // `copy_dirty_entry` rebuilds only the wire fields, so the flag is
+            // carried across explicitly.
+            const copied = copy_dirty_entry(entry);
+            entries.set(key, entry.base_pending ? { ...copied, base_pending: true } : copied);
+        }
+        // Recomputed over the whole map, in BOTH directions. A replay adds and
+        // removes, so it can clear the last pending entry — and, undoing a
+        // discard, it can restore one where there was none, which the
+        // narrowing-only recompute would leave reading false.
+        let pending_base = false;
+        for (const entry of entries.values()) {
+            if (entry.base_pending) {
+                pending_base = true;
+                break;
+            }
+        }
+        return { entries, pending_base };
+    };
+
     // Recompute the flag from what actually survived. The mutators that only ever
     // drop entries (remove, remove_keys, clear, retain, clear_saved) previously
     // carried the old flag forward, leaving it stuck `true` after the last pending
@@ -440,6 +550,35 @@ export function create_edit_session_store(
         clear_saved: (session_id, saved) => {
             if (!owns(session_id)) return;
             set_entries_recomputed(clear_saved_dirty_entries(state.entries, saved));
+        },
+        stage_writes: (session_id, writes) => {
+            if (!owns(session_id)) return undefined;
+            // The state staged against, so a store that moved for any reason —
+            // an install, a keystroke, a save landing — invalidates the staging
+            // rather than silently rebasing it onto a map it never saw.
+            const staged_from = state;
+            const next = staged_state(writes);
+            let changed = false;
+            let committed = false;
+            let notified = false;
+            const valid = (): boolean => state === staged_from && owns(session_id);
+            return {
+                valid,
+                commit: () => {
+                    if (committed) return changed;
+                    if (!valid()) return false;
+                    committed = true;
+                    changed = next.pending_base !== state.pending_base
+                        || !entries_equal(state.entries, next.entries);
+                    if (changed) state = next;
+                    return changed;
+                },
+                notify: () => {
+                    if (notified || !changed) return;
+                    notified = true;
+                    notify();
+                },
+            };
         },
         resolve_pending_bases: (session_id, get_cell_raw) => {
             if (!owns(session_id)) return;

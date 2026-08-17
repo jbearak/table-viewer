@@ -596,6 +596,288 @@ describe('edit session store', () => {
         });
     });
 
+    describe('a staged set of writes', () => {
+        // The store's only bulk mutator, so these cover what a plan does to the
+        // map; the staging protocol itself is exercised below.
+        const applied = (
+            store: ReturnType<typeof create_edit_session_store>,
+            session_id: string | undefined,
+            writes: Parameters<ReturnType<typeof create_edit_session_store>['stage_writes']>[1],
+        ): void => {
+            const staged = store.stage_writes(session_id, writes);
+            if (!staged?.valid()) return;
+            staged.commit();
+            staged.notify();
+        };
+
+        it('sets and removes in one mutation', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+                '0:1': { value: 'b', base: 'B' },
+            });
+            const notifications = count_notifications(store);
+
+            applied(store, 's', [
+                { key: '0:0', entry: undefined },
+                { key: '0:1', entry: { value: 'B2', base: 'B' } },
+                { key: '0:2', entry: { value: 'c', base: 'C' } },
+            ]);
+
+            expect(Object.fromEntries(store.snapshot())).toEqual({
+                '0:1': { value: 'B2', base: 'B' },
+                '0:2': { value: 'c', base: 'C' },
+            });
+            // One, not three: the intermediate states are not states the user
+            // ever had, and each would cost a render, a post and a host write.
+            expect(notifications.n).toBe(1);
+        });
+
+        it('publishes no state where only part of the plan has landed', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+            });
+            const seen: unknown[] = [];
+            store.subscribe(() => { seen.push(Object.fromEntries(store.snapshot())); });
+
+            applied(store, 's', [
+                { key: '0:0', entry: undefined },
+                { key: '0:1', entry: { value: 'b', base: 'B' } },
+            ]);
+
+            expect(seen).toEqual([{ '0:1': { value: 'b', base: 'B' } }]);
+        });
+
+        it('lets a later write to one key win', () => {
+            // Replay order: a cell a gesture touched twice ends where the last
+            // write puts it.
+            const store = create_edit_session_store({ session_id: 's' }, {});
+
+            applied(store, 's', [
+                { key: '0:0', entry: { value: 'first', base: 'A' } },
+                { key: '0:0', entry: { value: 'second', base: 'A' } },
+            ]);
+
+            expect(store.get('0:0')?.value).toBe('second');
+        });
+
+        it('does not notify when the writes land on the state already showing', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+            });
+            const notifications = count_notifications(store);
+
+            applied(store, 's', [{ key: '0:0', entry: { value: 'a', base: 'A' } }]);
+
+            expect(notifications.n).toBe(0);
+        });
+
+        it('is dropped whole when the session moved on', () => {
+            const store = create_edit_session_store({ session_id: 'current' }, {
+                '0:0': { value: 'a', base: 'A' },
+            });
+
+            applied(store, 'stale', [
+                { key: '0:0', entry: undefined },
+                { key: '0:1', entry: { value: 'b', base: 'B' } },
+            ]);
+
+            expect(Object.fromEntries(store.snapshot())).toEqual({
+                '0:0': { value: 'a', base: 'A' },
+            });
+        });
+
+        it('copies each entry rather than adopting the caller\'s object', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {});
+            const entry = { value: 'a', base: 'A' };
+
+            applied(store, 's', [{ key: '0:0', entry }]);
+            entry.value = 'mutated';
+
+            expect(store.get('0:0')?.value).toBe('a');
+        });
+
+        it('clears the pending-base flag when the last pending entry goes', () => {
+            const store = create_edit_session_store({ session_id: 's' }, { '0:0': 'legacy' });
+            expect(store.has_pending_base()).toBe(true);
+
+            applied(store, 's', [{ key: '0:0', entry: undefined }]);
+
+            expect(store.has_pending_base()).toBe(false);
+        });
+
+        it('restores a pending base rather than promoting the placeholder', () => {
+            // Undoing the discard of a legacy edit whose page was never resident
+            // puts back an entry whose base is a placeholder. Dropping the flag
+            // would make '' read as observed content: the cell would stop being
+            // held back, and a save would be admitted against a base the user
+            // never saw.
+            const store = create_edit_session_store({ session_id: 's' }, {});
+
+            applied(store, 's', [
+                { key: '0:0', entry: { value: 'B', base: '', base_pending: true } },
+            ]);
+
+            expect(store.get('0:0')?.base_pending).toBe(true);
+            expect(store.has_pending_base()).toBe(true);
+        });
+
+        it('accepts an empty plan without notifying', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+            });
+            const notifications = count_notifications(store);
+
+            applied(store, 's', []);
+
+            expect(notifications.n).toBe(0);
+            expect(store.size()).toBe(1);
+        });
+    });
+
+    describe('stage_writes', () => {
+        it('does not publish until the commit', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {});
+            const notifications = count_notifications(store);
+
+            const staged = store.stage_writes('s', [
+                { key: '0:0', entry: { value: 'a', base: 'A' } },
+            ]);
+            expect(store.size()).toBe(0);
+            expect(notifications.n).toBe(0);
+
+            staged?.commit();
+            expect(store.size()).toBe(1);
+            // Swapped, but the subscribers have not been told: the caller is
+            // still staging the other worksheets of the gesture.
+            expect(notifications.n).toBe(0);
+
+            staged?.notify();
+            expect(notifications.n).toBe(1);
+        });
+
+        it('lets two stores swap before either notifies', () => {
+            // The reason this exists: a plan spans worksheets, and a subscriber
+            // must never see one sheet replayed while the rest hold the old
+            // state — that half-replayed gesture is what gets posted as
+            // pendingEdits.
+            const first = create_edit_session_store({ session_id: 's' }, {});
+            const second = create_edit_session_store({ session_id: 's' }, {});
+            const seen: number[] = [];
+            first.subscribe(() => { seen.push(first.size() + second.size()); });
+            second.subscribe(() => { seen.push(first.size() + second.size()); });
+
+            const staged = [
+                first.stage_writes('s', [{ key: '0:0', entry: { value: 'a', base: 'A' } }]),
+                second.stage_writes('s', [{ key: '0:0', entry: { value: 'b', base: 'B' } }]),
+            ];
+            expect(staged.every((stage) => stage?.valid())).toBe(true);
+            for (const stage of staged) stage?.commit();
+            for (const stage of staged) stage?.notify();
+
+            expect(seen).toEqual([2, 2]);
+        });
+
+        it('refuses to stage for a session that moved on', () => {
+            const store = create_edit_session_store({ session_id: 'current' }, {});
+
+            expect(store.stage_writes('stale', [
+                { key: '0:0', entry: { value: 'a', base: 'A' } },
+            ])).toBeUndefined();
+        });
+
+        it('drops a staged swap when the session moved on before the commit', () => {
+            // A staged plan is held while every other store is staged, so a
+            // hydration boundary can cross in between.
+            const store = create_edit_session_store({ session_id: 'first' }, {});
+            const staged = store.stage_writes('first', [
+                { key: '0:0', entry: { value: 'a', base: 'A' } },
+            ]);
+
+            store.install({ session_id: 'second' }, {});
+
+            expect(staged?.valid()).toBe(false);
+            staged?.commit();
+            expect(store.size()).toBe(0);
+        });
+
+        it('invalidates a staging whose store moved under it', () => {
+            // Not only a session change: a staging rebased onto a map it never
+            // saw would silently drop whatever landed in between.
+            const store = create_edit_session_store({ session_id: 's' }, {});
+            const staged = store.stage_writes('s', [
+                { key: '0:0', entry: { value: 'a', base: 'A' } },
+            ]);
+
+            store.commit('s', '0:1', { value: 'meanwhile', base: 'B' });
+
+            expect(staged?.valid()).toBe(false);
+            expect(staged?.commit()).toBe(false);
+            expect(Object.fromEntries(store.snapshot()))
+                .toEqual({ '0:1': { value: 'meanwhile', base: 'B' } });
+        });
+
+        it('answers for every store before any of them swaps', () => {
+            // The reason validity is its own pass. Checking inside each commit
+            // would leave the first store replayed by the time the second
+            // discovered its session had moved — a half-replayed gesture that is
+            // observable through snapshot() whether or not anything notified.
+            const first = create_edit_session_store({ session_id: 's' }, {});
+            const second = create_edit_session_store({ session_id: 's' }, {});
+            const staged = [
+                first.stage_writes('s', [{ key: '0:0', entry: { value: 'a', base: 'A' } }]),
+                second.stage_writes('s', [{ key: '0:0', entry: { value: 'b', base: 'B' } }]),
+            ];
+
+            second.install({ session_id: 'other' }, {});
+
+            expect(staged.every((stage) => stage?.valid())).toBe(false);
+            // The caller abandons, and neither store has moved.
+            expect(first.size()).toBe(0);
+            expect(second.size()).toBe(0);
+        });
+
+        it('notifies once however often the caller runs the list', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {});
+            const notifications = count_notifications(store);
+
+            const staged = store.stage_writes('s', [
+                { key: '0:0', entry: { value: 'a', base: 'A' } },
+            ]);
+            staged?.commit();
+            staged?.commit();
+            staged?.notify();
+            staged?.notify();
+
+            expect(notifications.n).toBe(1);
+            expect(store.size()).toBe(1);
+        });
+
+        it('stays silent when the staged state is the one already showing', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+            });
+            const notifications = count_notifications(store);
+
+            const staged = store.stage_writes('s', [
+                { key: '0:0', entry: { value: 'a', base: 'A' } },
+            ]);
+
+            expect(staged?.commit()).toBe(false);
+            staged?.notify();
+            expect(notifications.n).toBe(0);
+        });
+
+        it('leaves the store untouched when a staging is abandoned', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+            });
+
+            store.stage_writes('s', [{ key: '0:0', entry: undefined }]);
+
+            expect(store.size()).toBe(1);
+        });
+    });
+
     it('retain filters by the caller predicate', () => {
         const store = create_edit_session_store({ session_id: 's' }, {
             '0:0': { value: 'a', base: 'A' },
