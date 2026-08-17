@@ -10,6 +10,7 @@ import {
 import {
     absent_overlay,
     build_cell_history_delta,
+    has_value_dimension,
     combined_overlay,
     delta_addresses_same_cell,
     delta_touches_hyperlink,
@@ -350,6 +351,157 @@ describe('build_cell_history_delta — membership vs semantic mode', () => {
     });
 });
 
+describe('per-dimension transition mode', () => {
+    it('uses membership mode for a dimension that left while the cell stayed present', () => {
+        // Reverting a pending hyperlink while a value edit remains: the cell is
+        // present either side, but the LINK dimension left the overlay. If this
+        // were semantic, a redo after an intervening save would replay the
+        // historical link as a fresh edit over the saved one.
+        const d = delta({
+            before: combined_overlay(history_value('B'), history_value('A'), LINK, null),
+            after: value_only_overlay(history_value('B'), history_value('A')),
+            persistedValue: 'A',
+            persistedHyperlink: null,
+        });
+        expect(d).toBeDefined();
+        expect(d!.hyperlink!.mode).toBe('membership');
+        expect(d!.hyperlink!.desired.overlay).toBe('absent');
+        // The value dimension did not move, so it is not replayed at all.
+        expect(d!.value).toBeUndefined();
+    });
+
+    it('uses membership mode for a dimension that joined while the cell stayed present', () => {
+        const d = delta({
+            before: value_only_overlay(history_value('B'), history_value('A')),
+            after: combined_overlay(history_value('B'), history_value('A'), LINK, null),
+            persistedValue: 'A',
+            persistedHyperlink: null,
+        });
+        expect(d!.hyperlink!.mode).toBe('membership');
+        expect(d!.value).toBeUndefined();
+    });
+
+    it('gives each dimension its own mode in one action', () => {
+        // Value stays in the overlay (semantic) while the link leaves it
+        // (membership) — one delta, two modes.
+        const d = delta({
+            before: combined_overlay(history_value('B'), history_value('A'), LINK, null),
+            after: value_only_overlay(history_value('C'), history_value('A')),
+            persistedValue: 'A',
+            persistedHyperlink: null,
+        });
+        expect(d!.value!.mode).toBe('semantic');
+        expect(d!.hyperlink!.mode).toBe('membership');
+    });
+});
+
+describe('conflict-base metadata', () => {
+    it('records a base change even when the effective value is unchanged', () => {
+        // Disk moved A -> C under a pending B, so recommitting B rebases the
+        // entry to {value: B, base: C}. Effective value is B either side, but
+        // the base decides whether the cell reads as conflicted and whether
+        // validate_dirty_bases admits the save.
+        const d = delta({
+            before: value_only_overlay(history_value('B'), history_value('A')),
+            after: value_only_overlay(history_value('B'), history_value('C')),
+            persistedValue: 'C',
+        });
+        expect(d).toBeDefined();
+        expect(d!.value!.mode).toBe('semantic');
+    });
+
+    it('records a basePending change even when value and base are unchanged', () => {
+        const d = delta({
+            before: value_only_overlay(history_value('t'), history_value(''), true),
+            after: value_only_overlay(history_value('t'), history_value('')),
+            persistedValue: '',
+        });
+        expect(d).toBeDefined();
+    });
+});
+
+describe('link added to an existing value entry', () => {
+    it('does not read as a value change when the prior entry had a value dimension', () => {
+        // {value: A, base: A} + a link is BOTH a genuine link-only entry and a
+        // resolved legacy no-op that gained a link. Only the caller knows which,
+        // so it passes the prior dimension through.
+        const before_entry: HistoryDirtyEntry = make_dirty_entry('A', 'A');
+        const after_entry: HistoryDirtyEntry = make_dirty_entry(
+            'A', 'A', undefined, undefined, LINK, null,
+        );
+
+        const before = overlay_state_from_dirty_entry(before_entry);
+        const after = overlay_state_from_dirty_entry(after_entry, has_value_dimension(before));
+
+        const d = build_cell_history_delta({
+            worksheet: SHEET,
+            sourceRow: 3,
+            sourceColumn: 2,
+            before,
+            after,
+            persistedValue: history_value('A'),
+            persistedHyperlink: null,
+        });
+        expect(d).toBeDefined();
+        // Only the link moved: the value dimension was present before and after.
+        expect(d!.hyperlink).toBeDefined();
+        expect(d!.value).toBeUndefined();
+    });
+
+    it('still reads a link on a cell with no prior entry as link-only', () => {
+        const state = overlay_state_from_dirty_entry(
+            make_dirty_entry('A', 'A', undefined, undefined, LINK, null),
+        );
+        expect(present(state).value.kind).toBe('untouched');
+    });
+
+    it('round-trips an unresolved entry that also carries a cleared link', () => {
+        const entry: HistoryDirtyEntry = {
+            ...make_dirty_entry('typed', '', undefined, undefined, null, LINK),
+            base_pending: true,
+        };
+        const state = present(overlay_state_from_dirty_entry(entry));
+        const rebuilt = dirty_entry_from_overlay_state(state);
+        expect(rebuilt).toEqual(entry);
+        expect('link' in rebuilt).toBe(true);
+        expect(rebuilt.link).toBeNull();
+        expect(rebuilt.baseLink).toEqual(LINK);
+        expect(rebuilt.base_pending).toBe(true);
+    });
+});
+
+describe('history ownership', () => {
+    it('is unaffected by later mutation of the objects it was built from', () => {
+        const runs: RichText = rich_text_from_plain('x', { bold: true });
+        const link: { kind: 'external'; target: string } = {
+            kind: 'external',
+            target: 'https://example.com/a',
+        };
+        const worksheet = { sheetIndex: 0, sheetName: 'Sheet1', worksheetId: 'ws-1' };
+
+        const d = build_cell_history_delta({
+            worksheet,
+            sourceRow: 1,
+            sourceColumn: 1,
+            before: absent_overlay(),
+            after: combined_overlay(history_value('x', runs), history_value('y'), link, null),
+            persistedValue: history_value('y'),
+            persistedHyperlink: null,
+        })!;
+
+        // Mutate every source object the delta was built from.
+        link.target = 'https://evil.example/';
+        worksheet.sheetName = 'Renamed';
+        (runs.runs as { text: string }[])[0].text = 'mutated';
+
+        expect(d.worksheet.sheetName).toBe('Sheet1');
+        expect((d.hyperlink!.desired.content as { target: string }).target)
+            .toBe('https://example.com/a');
+        expect(d.value!.desired.content.runs?.runs[0]?.text).toBe('x');
+        expect(Object.isFrozen(d)).toBe(true);
+    });
+});
+
 describe('worksheet identity', () => {
     it('carries the full target, not just an index', () => {
         const d = delta({
@@ -357,8 +509,7 @@ describe('worksheet identity', () => {
             after: value_only_overlay(history_value('B'), history_value('A')),
             persistedValue: 'A',
         });
-        expect(d!.worksheet.worksheetId).toBe('ws-1');
-        expect(d!.worksheet.sheetName).toBe('Sheet1');
+        expect(d!.worksheet).toEqual(SHEET);
     });
 
     it('matches by stable identity after a reorder changes the index', () => {

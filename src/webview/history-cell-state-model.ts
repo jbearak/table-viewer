@@ -38,6 +38,7 @@ import {
     type CellHyperlink,
     type RichText,
 } from '../cell-content';
+import { deep_clone_and_freeze } from '../immutable';
 import {
     editable_values_equal,
     plain_value,
@@ -101,44 +102,72 @@ export function history_values_equal(left: HistoryValue, right: HistoryValue): b
  * therefore tinted, persisted, and saved — while comparing equal. Membership
  * and semantic inequality are different facts.
  */
-export type OverlayValueDimension =
-    | { readonly kind: 'untouched'; readonly anchor: HistoryValue }
-    | {
-        readonly kind: 'present';
-        readonly value: HistoryValue;
-        readonly base: HistoryValue;
-        readonly basePending: boolean;
-    };
+export interface UntouchedValueDimension {
+    readonly kind: 'untouched';
+    readonly anchor: HistoryValue;
+}
+
+export interface PresentValueDimension {
+    readonly kind: 'present';
+    readonly value: HistoryValue;
+    readonly base: HistoryValue;
+    readonly basePending: boolean;
+}
+
+export type OverlayValueDimension = UntouchedValueDimension | PresentValueDimension;
 
 /** The hyperlink dimension. `untouched` = absent `link` field, i.e. "leave the
  *  cell's link alone"; a present dimension with `value: null` clears it. */
+export interface UntouchedHyperlinkDimension {
+    readonly kind: 'untouched';
+}
+
+export interface PresentHyperlinkDimension {
+    readonly kind: 'present';
+    readonly value: CellHyperlink | null;
+    readonly base: CellHyperlink | null;
+}
+
 export type OverlayHyperlinkDimension =
-    | { readonly kind: 'untouched' }
+    | UntouchedHyperlinkDimension
+    | PresentHyperlinkDimension;
+
+export interface AbsentCellOverlayState {
+    readonly kind: 'absent';
+}
+
+/**
+ * A present overlay: an entry in the dirty map, with at least one dimension in
+ * it. The three arms enumerate the combinations a real entry can have, so an
+ * entry with neither dimension — which the save path would have nothing to do
+ * with — is unrepresentable rather than merely undocumented.
+ */
+export type PresentCellOverlayState =
     | {
         readonly kind: 'present';
-        readonly value: CellHyperlink | null;
-        readonly base: CellHyperlink | null;
+        readonly value: PresentValueDimension;
+        readonly hyperlink: UntouchedHyperlinkDimension;
+    }
+    | {
+        readonly kind: 'present';
+        readonly value: UntouchedValueDimension;
+        readonly hyperlink: PresentHyperlinkDimension;
+    }
+    | {
+        readonly kind: 'present';
+        readonly value: PresentValueDimension;
+        readonly hyperlink: PresentHyperlinkDimension;
     };
 
 /**
  * A cell's overlay membership. `absent` is not "empty content" — it is the
  * absence of a map entry.
- *
- * A present overlay always has at least one present dimension: an entry with
- * neither would be an entry the save path has nothing to do with, and
- * {@link overlay_state_from_dirty_entry} refuses to build one.
  */
-export type CellOverlayState =
-    | { readonly kind: 'absent' }
-    | {
-        readonly kind: 'present';
-        readonly value: OverlayValueDimension;
-        readonly hyperlink: OverlayHyperlinkDimension;
-    };
+export type CellOverlayState = AbsentCellOverlayState | PresentCellOverlayState;
 
-const ABSENT: CellOverlayState = Object.freeze({ kind: 'absent' as const });
+const ABSENT: AbsentCellOverlayState = Object.freeze({ kind: 'absent' as const });
 
-export function absent_overlay(): CellOverlayState {
+export function absent_overlay(): AbsentCellOverlayState {
     return ABSENT;
 }
 
@@ -146,7 +175,7 @@ export function value_only_overlay(
     value: HistoryValue,
     base: HistoryValue,
     base_pending = false,
-): CellOverlayState {
+): PresentCellOverlayState {
     return {
         kind: 'present',
         value: { kind: 'present', value, base, basePending: base_pending },
@@ -158,7 +187,7 @@ export function hyperlink_only_overlay(
     anchor: HistoryValue,
     value: CellHyperlink | null,
     base: CellHyperlink | null,
-): CellOverlayState {
+): PresentCellOverlayState {
     return {
         kind: 'present',
         value: { kind: 'untouched', anchor },
@@ -172,7 +201,7 @@ export function combined_overlay(
     hyperlink: CellHyperlink | null,
     base_hyperlink: CellHyperlink | null,
     base_pending = false,
-): CellOverlayState {
+): PresentCellOverlayState {
     return {
         kind: 'present',
         value: { kind: 'present', value, base, basePending: base_pending },
@@ -183,13 +212,26 @@ export function combined_overlay(
 /**
  * Read a store entry into its overlay state.
  *
- * The value dimension is `untouched` only for a link-only entry — one that
- * carries a link change AND whose value side is not part of the overlay. Every
- * other present entry keeps a present value dimension, including one whose
- * value equals its base (a resolved legacy no-op) and one still awaiting its
- * true base.
+ * `value_dimension_in_overlay` resolves an ambiguity the entry alone cannot:
+ * `{value: 'A', base: 'A', link, baseLink}` is produced BOTH by attaching a
+ * link to an unedited cell (a genuine link-only entry, whose value fields are
+ * just the unedited text) AND by attaching a link to an existing resolved
+ * legacy no-op entry, which `use-editing.ts` `commit_hyperlink` builds by
+ * copying the pending entry. In the second case the value dimension really is
+ * part of the overlay, and dropping it would lose the entry's membership.
+ *
+ * Only the caller knows which happened, because only the caller knows whether
+ * a value dimension was already there. Pass `true` when the cell already had a
+ * value dimension in the overlay. The default is the common case: no prior
+ * entry, so a link-carrying entry is link-only.
+ *
+ * Every other present entry keeps a present value dimension, including one
+ * awaiting its true base.
  */
-export function overlay_state_from_dirty_entry(entry: HistoryDirtyEntry): CellOverlayState {
+export function overlay_state_from_dirty_entry(
+    entry: HistoryDirtyEntry,
+    value_dimension_in_overlay = false,
+): PresentCellOverlayState {
     const value = history_value(entry.value, entry.valueRuns);
     const base = history_value(entry.base, entry.baseRuns);
     const base_pending = entry.base_pending === true;
@@ -198,6 +240,7 @@ export function overlay_state_from_dirty_entry(entry: HistoryDirtyEntry): CellOv
     // value change: they are the unedited text the link was attached to.
     const value_untouched = link_present
         && !base_pending
+        && !value_dimension_in_overlay
         && !dirty_entry_value_changed(entry);
 
     if (value_untouched) {
@@ -215,9 +258,15 @@ export function overlay_state_from_dirty_entry(entry: HistoryDirtyEntry): CellOv
     return value_only_overlay(value, base, base_pending);
 }
 
+/** Whether a state carries a value dimension, for threading into
+ *  {@link overlay_state_from_dirty_entry} when reading the state that follows. */
+export function has_value_dimension(state: CellOverlayState): boolean {
+    return state.kind === 'present' && state.value.kind === 'present';
+}
+
 /** Rebuild the store entry a present overlay state describes. */
 export function dirty_entry_from_overlay_state(
-    state: Extract<CellOverlayState, { kind: 'present' }>,
+    state: PresentCellOverlayState,
 ): HistoryDirtyEntry {
     const value = state.value.kind === 'untouched' ? state.value.anchor : state.value.value;
     const base = state.value.kind === 'untouched' ? state.value.anchor : state.value.base;
@@ -244,13 +293,11 @@ function value_dimensions_equal(
     left: OverlayValueDimension,
     right: OverlayValueDimension,
 ): boolean {
-    if (left.kind !== right.kind) return false;
-    if (left.kind === 'untouched' || right.kind === 'untouched') {
-        return history_values_equal(
-            (left as Extract<OverlayValueDimension, { kind: 'untouched' }>).anchor,
-            (right as Extract<OverlayValueDimension, { kind: 'untouched' }>).anchor,
-        );
+    if (left.kind === 'untouched') {
+        return right.kind === 'untouched'
+            && history_values_equal(left.anchor, right.anchor);
     }
+    if (right.kind === 'untouched') return false;
     return left.basePending === right.basePending
         && history_values_equal(left.value, right.value)
         && history_values_equal(left.base, right.base);
@@ -316,17 +363,23 @@ export interface HyperlinkTransition {
  * which prefers `worksheetId`, then `sheetName`, and falls back to the index
  * only when neither is known.
  *
- * At least one dimension is present; a delta touching neither is not a delta.
+ * At least one dimension is touched, enforced by {@link TouchedDimensions}: a
+ * delta touching neither is not a delta.
  */
-export interface CellHistoryDelta {
+export interface CellHistoryDeltaBase {
     readonly worksheet: WorksheetTarget;
     readonly sourceRow: number;
     readonly sourceColumn: number;
     readonly beforeOverlay: CellOverlayState;
     readonly afterOverlay: CellOverlayState;
-    readonly value?: ValueTransition;
-    readonly hyperlink?: HyperlinkTransition;
 }
+
+export type TouchedDimensions =
+    | { readonly value: ValueTransition; readonly hyperlink?: never }
+    | { readonly value?: never; readonly hyperlink: HyperlinkTransition }
+    | { readonly value: ValueTransition; readonly hyperlink: HyperlinkTransition };
+
+export type CellHistoryDelta = CellHistoryDeltaBase & TouchedDimensions;
 
 export type HistoryDirection = 'undo' | 'redo';
 
@@ -380,31 +433,84 @@ export function build_cell_history_delta(args: {
     const before_link = effective_hyperlink_side(before, persistedHyperlink);
     const after_link = effective_hyperlink_side(after, persistedHyperlink);
 
-    // Membership mode whenever the action added or removed the overlay itself:
-    // the destination must be restored as absence, not as content.
-    const membership = before.kind !== after.kind;
-    const mode: CellHistoryTransitionMode = membership ? 'membership' : 'semantic';
-
     const value_moved = !history_values_equal(before_value.content, after_value.content)
-        || before_value.overlay !== after_value.overlay;
+        || before_value.overlay !== after_value.overlay
+        || value_metadata_moved(before, after);
     const link_moved = !hyperlinks_equal(before_link.content, after_link.content)
         || before_link.overlay !== after_link.overlay;
 
     if (!value_moved && !link_moved) return undefined;
 
-    return {
+    const base: CellHistoryDeltaBase = {
         worksheet: args.worksheet,
         sourceRow: args.sourceRow,
         sourceColumn: args.sourceColumn,
         beforeOverlay: before,
         afterOverlay: after,
-        ...(value_moved
-            ? { value: { mode, expected: before_value, desired: after_value } }
-            : {}),
-        ...(link_moved
-            ? { hyperlink: { mode, expected: before_link, desired: after_link } }
-            : {}),
     };
+    const value_transition: ValueTransition = {
+        mode: dimension_mode(before_value.overlay, after_value.overlay),
+        expected: before_value,
+        desired: after_value,
+    };
+    const link_transition: HyperlinkTransition = {
+        mode: dimension_mode(before_link.overlay, after_link.overlay),
+        expected: before_link,
+        desired: after_link,
+    };
+    const delta: CellHistoryDelta = value_moved && link_moved
+        ? { ...base, value: value_transition, hyperlink: link_transition }
+        : value_moved
+            ? { ...base, value: value_transition }
+            : { ...base, hyperlink: link_transition };
+    // History outlives the objects it was built from: the caller's RichText,
+    // CellHyperlink and WorksheetTarget stay reachable and mutable, and a later
+    // mutation would silently rewrite what undo replays. `readonly` is a
+    // compile-time claim only, so take an isolated frozen copy here — this
+    // function is history's ownership boundary.
+    return deep_clone_and_freeze(delta);
+}
+
+/**
+ * A dimension's replay mode, decided per DIMENSION rather than per cell.
+ *
+ * `membership` whenever this dimension entered or left the overlay, even if the
+ * cell kept an entry throughout: reverting a pending hyperlink while a value
+ * edit remains leaves the cell present but takes the link dimension out, and
+ * its destination must be restored as absence. Deciding from the cell's
+ * membership instead would mark that transition `semantic`, and a redo after an
+ * intervening save would replay the historical link as a fresh edit over the
+ * saved one — exactly the stale write membership mode exists to prevent.
+ */
+function dimension_mode(
+    before: 'absent' | 'present',
+    after: 'absent' | 'present',
+): CellHistoryTransitionMode {
+    return before === after ? 'semantic' : 'membership';
+}
+
+/**
+ * Whether the value dimension's conflict metadata moved while its effective
+ * content stayed put.
+ *
+ * Recommitting the same text against a base that changed underneath (disk moved
+ * from A to C, so `{value: B, base: A}` becomes `{value: B, base: C}`) leaves
+ * the effective value at B and its membership `present`, yet it is observable:
+ * the base decides whether the cell reads as conflicted and whether
+ * `validate_dirty_bases` will admit the save. The same goes for `basePending`,
+ * which blocks saving outright. Neither may be dropped from history, or undo
+ * could not restore the prior conflict state.
+ */
+function value_metadata_moved(before: CellOverlayState, after: CellOverlayState): boolean {
+    const left = before.kind === 'present' && before.value.kind === 'present'
+        ? before.value
+        : undefined;
+    const right = after.kind === 'present' && after.value.kind === 'present'
+        ? after.value
+        : undefined;
+    if (left === undefined || right === undefined) return left !== right;
+    return left.basePending !== right.basePending
+        || !history_values_equal(left.base, right.base);
 }
 
 /**
