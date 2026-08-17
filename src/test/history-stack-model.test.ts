@@ -4,12 +4,14 @@ import {
     absent_overlay,
     build_cell_history_delta,
     history_value,
+    hyperlink_only_overlay,
     value_only_overlay,
     type CellHistoryDelta,
 } from '../webview/history-cell-state-model';
 import {
     action_focus_worksheet,
     action_is_single_worksheet,
+    action_replay_changes,
     clear_history,
     commit_history_move,
     empty_history_stack,
@@ -20,10 +22,12 @@ import {
     record_history_action,
     type HistoryBounds,
     type HistoryChange,
+    type HistoryEntry,
     type HistoryStackState,
 } from '../webview/history-stack-model';
 
 const SHEET: WorksheetTarget = { sheetIndex: 0, sheetName: 'Data', worksheetId: 'rId1' };
+const LINK = { kind: 'external', target: 'https://example.com/' } as const;
 const OTHER_SHEET: WorksheetTarget = { sheetIndex: 1, sheetName: 'Notes', worksheetId: 'rId2' };
 
 function cell_change(
@@ -62,6 +66,37 @@ function highlight_change(
     };
 }
 
+/** A link attached to an unedited cell: the value dimension stays untouched. */
+function link_only_change(text: string): HistoryChange {
+    const anchor = history_value(text);
+    const delta = build_cell_history_delta({
+        worksheet: SHEET,
+        sourceRow: 0,
+        sourceColumn: 0,
+        before: absent_overlay(),
+        after: hyperlink_only_overlay(anchor, LINK, null),
+        persistedValue: anchor,
+        persistedHyperlink: null,
+    });
+    if (delta === undefined) throw new Error('fixture built a delta that moved nothing');
+    return { kind: 'cell', delta };
+}
+
+/** A short pending value recommitted against a base that moved underneath. */
+function rebased_change(before_base: string, after_base: string): HistoryChange {
+    const delta = build_cell_history_delta({
+        worksheet: SHEET,
+        sourceRow: 0,
+        sourceColumn: 0,
+        before: value_only_overlay(history_value('v'), history_value(before_base)),
+        after: value_only_overlay(history_value('v'), history_value(after_base)),
+        persistedValue: history_value(after_base),
+        persistedHyperlink: null,
+    });
+    if (delta === undefined) throw new Error('fixture built a delta that moved nothing');
+    return { kind: 'cell', delta };
+}
+
 /** Records a series of actions and returns the resulting state. */
 function record_all(
     labels: readonly string[],
@@ -74,6 +109,19 @@ function record_all(
         state = outcome.state;
     });
     return state;
+}
+
+/** Peeks and commits in one step, as a caller does once replay has landed. */
+function move(state: HistoryStackState, direction: 'undo' | 'redo'): HistoryStackState {
+    const peeked = peek_history(state, direction);
+    if (peeked.kind !== 'available') return state;
+    return commit_history_move(state, direction, peeked.entry);
+}
+
+function top(state: HistoryStackState, direction: 'undo' | 'redo'): HistoryEntry {
+    const peeked = peek_history(state, direction);
+    if (peeked.kind !== 'available') throw new Error(`nothing to ${direction}`);
+    return peeked.entry;
 }
 
 describe('record_history_action', () => {
@@ -98,7 +146,7 @@ describe('record_history_action', () => {
         // edited from an undone position. Keeping them would let redo write
         // stale content over the new edit.
         const two = record_all(['A', 'B']);
-        const undone = commit_history_move(two, 'undo');
+        const undone = move(two, 'undo');
         expect(undone.redoStack).toHaveLength(1);
 
         const outcome = record_history_action(undone, history_action('C', [cell_change(9, 0, 'c')]));
@@ -112,6 +160,59 @@ describe('record_history_action', () => {
         changes.push(cell_change(1, 0, 'w'));
         expect(action.changes).toHaveLength(1);
         expect(Object.isFrozen(action.changes)).toBe(true);
+    });
+
+    it('takes ownership of a directly constructed action', () => {
+        // Nothing in the type system forces a caller through `history_action`:
+        // a mutable array is assignable to a readonly property. Recording has to
+        // be the ownership boundary, because the costs are measured once and a
+        // later mutation would change what replay does while the bounds still
+        // described the old graph.
+        const changes: HistoryChange[] = [cell_change(0, 0, 'v')];
+        const outcome = record_history_action(empty_history_stack(), { label: 'Edit', changes });
+        const recorded = outcome.state.undoStack[0];
+        changes.push(cell_change(1, 0, 'w'));
+
+        expect(recorded?.action.changes).toHaveLength(1);
+        expect(recorded?.cellCount).toBe(1);
+        expect(Object.isFrozen(recorded?.action.changes)).toBe(true);
+    });
+
+    it('reuses an already-frozen action rather than copying it again', () => {
+        // A supported gesture is a million cells; cloning that graph a second
+        // time to freeze what is already frozen doubles peak memory exactly when
+        // there is least of it.
+        const action = history_action('Edit', [cell_change(0, 0, 'v')]);
+        const outcome = record_history_action(empty_history_stack(), action);
+        expect(outcome.state.undoStack[0]?.action).toBe(action);
+    });
+});
+
+describe('action_replay_changes', () => {
+    it('replays redo in application order', () => {
+        const first = cell_change(0, 0, 'B');
+        const second = cell_change(0, 0, 'C');
+        const action = history_action('Paste', [first, second]);
+        expect(action_replay_changes(action, 'redo').map((change) => change.delta)).toEqual(
+            [first.delta, second.delta],
+        );
+    });
+
+    it('replays undo in reverse, so an overlapping paste unwinds in order', () => {
+        // A->B then B->C on one cell. Undoing the A->B delta first would find C
+        // where its compare-and-swap expected B and refuse the whole replay.
+        const first = cell_change(0, 0, 'B');
+        const second = cell_change(0, 0, 'C');
+        const action = history_action('Paste', [first, second]);
+        expect(action_replay_changes(action, 'undo').map((change) => change.delta)).toEqual(
+            [second.delta, first.delta],
+        );
+    });
+
+    it('does not disturb the recorded order', () => {
+        const action = history_action('Paste', [cell_change(0, 0, 'B'), cell_change(1, 0, 'C')]);
+        action_replay_changes(action, 'undo');
+        expect(action_replay_changes(action, 'redo')).toEqual(action.changes);
     });
 });
 
@@ -146,6 +247,40 @@ describe('measure_history_action', () => {
         const small = measure_history_action(history_action('S', [cell_change(0, 0, 'x')]));
         const large = measure_history_action(history_action('L', [cell_change(0, 0, 'x'.repeat(5_000))]));
         expect(large.byteCost).toBeGreaterThan(small.byteCost);
+    });
+
+    it('charges a link-only edit for the long value it retains as an anchor', () => {
+        // The hyperlink transition is a few dozen bytes while the untouched
+        // value dimension retains the cell's whole string, twice. Charging only
+        // the transitions would let this slip past the hard bound by orders of
+        // magnitude.
+        const long = 'x'.repeat(50_000);
+        const entry = measure_history_action(history_action('Link', [link_only_change(long)]));
+        expect(entry.byteCost).toBeGreaterThan(long.length * 2);
+    });
+
+    it('charges a recommit for the long bases it retains behind a short value', () => {
+        // Disk moved from one long string to another; the pending value stayed
+        // short, but both bases are retained.
+        const entry = measure_history_action(history_action('Recommit', [
+            rebased_change('a'.repeat(50_000), 'b'.repeat(50_000)),
+        ]));
+        expect(entry.byteCost).toBeGreaterThan(100_000 * 2);
+    });
+
+    it('refuses a link-only edit whose retained anchor exceeds the hard bound', () => {
+        const hard: HistoryBounds = {
+            maxActions: 100,
+            maxCells: 1_000_000,
+            softMaxBytes: 10_000,
+            hardMaxBytes: 20_000,
+        };
+        const outcome = record_history_action(
+            empty_history_stack(),
+            history_action('Link', [link_only_change('x'.repeat(50_000))]),
+            hard,
+        );
+        expect(outcome.kind).toBe('refused');
     });
 });
 
@@ -227,7 +362,7 @@ describe('bounds', () => {
             hard,
         );
         const resumed = record_history_action(refused.state, history_action('After', [cell_change(1, 0, 'v')]), hard);
-        const undone = commit_history_move(resumed.state, 'undo');
+        const undone = move(resumed.state, 'undo');
         expect(undone.undoStack).toHaveLength(0);
         expect(peek_history(undone, 'undo').kind).toBe('blocked');
     });
@@ -249,27 +384,60 @@ describe('peek_history and commit_history_move', () => {
     });
 
     it('moves the entry to the other stack on commit', () => {
-        const state = commit_history_move(record_all(['A', 'B']), 'undo');
+        const state = move(record_all(['A', 'B']), 'undo');
         expect(state.undoStack.map((entry) => entry.action.label)).toEqual(['A']);
         expect(state.redoStack.map((entry) => entry.action.label)).toEqual(['B']);
 
-        const redone = commit_history_move(state, 'redo');
+        const redone = move(state, 'redo');
         expect(redone.undoStack.map((entry) => entry.action.label)).toEqual(['A', 'B']);
         expect(redone.redoStack).toHaveLength(0);
     });
 
-    it('is a no-op when the stack is empty, so a double commit cannot corrupt it', () => {
+    it('is a no-op when the stack is empty', () => {
         const state = empty_history_stack();
-        expect(commit_history_move(state, 'undo')).toBe(state);
-        expect(commit_history_move(state, 'redo')).toBe(state);
+        expect(move(state, 'undo')).toBe(state);
+        expect(move(state, 'redo')).toBe(state);
+    });
+
+    it('ignores a second commit of the same peeked entry', () => {
+        // Replay is asynchronous; a commit that ran twice must not carry a
+        // second, never-replayed gesture onto the redo stack, where redo would
+        // apply content the user never undid.
+        const start = record_all(['A', 'B']);
+        const entry = top(start, 'undo');
+        const once = commit_history_move(start, 'undo', entry);
+        const twice = commit_history_move(once, 'undo', entry);
+
+        expect(twice).toBe(once);
+        expect(twice.undoStack.map((item) => item.action.label)).toEqual(['A']);
+        expect(twice.redoStack.map((item) => item.action.label)).toEqual(['B']);
+    });
+
+    it('ignores a commit whose entry is no longer on top', () => {
+        // The user recorded a new edit while the replay was in flight. Popping
+        // whatever is on top now would move a gesture that never replayed.
+        const start = record_all(['A', 'B']);
+        const entry = top(start, 'undo');
+        const branched = record_history_action(start, history_action('C', [cell_change(9, 0, 'c')])).state;
+
+        expect(commit_history_move(branched, 'undo', entry)).toBe(branched);
+    });
+
+    it('ignores a commit after another undo already moved the stack', () => {
+        const start = record_all(['A', 'B']);
+        const entry = top(start, 'undo');
+        const moved = move(start, 'undo');
+
+        expect(commit_history_move(moved, 'undo', entry)).toBe(moved);
+        expect(moved.undoStack.map((item) => item.action.label)).toEqual(['A']);
     });
 
     it('round-trips a longer sequence back to where it started', () => {
         const start = record_all(['A', 'B', 'C']);
         let state = start;
-        for (const _ of [0, 1, 2]) state = commit_history_move(state, 'undo');
+        for (const _ of [0, 1, 2]) state = move(state, 'undo');
         expect(state.undoStack).toHaveLength(0);
-        for (const _ of [0, 1, 2]) state = commit_history_move(state, 'redo');
+        for (const _ of [0, 1, 2]) state = move(state, 'redo');
         expect(state.undoStack.map((entry) => entry.action.label)).toEqual(['A', 'B', 'C']);
         expect(state.redoStack).toHaveLength(0);
     });
@@ -277,7 +445,7 @@ describe('peek_history and commit_history_move', () => {
 
 describe('history_usage', () => {
     it('counts undone actions as still retained', () => {
-        const state = commit_history_move(record_all(['A', 'B']), 'undo');
+        const state = move(record_all(['A', 'B']), 'undo');
         expect(history_usage(state).actions).toBe(2);
         expect(history_usage(state).cells).toBe(2);
     });

@@ -6,7 +6,12 @@ import {
     type CellHighlightColor,
     type WorksheetTarget,
 } from '../types';
-import type { CellHistoryDelta, HistoryDirection, HistoryValue } from './history-cell-state-model';
+import type {
+    CellHistoryDelta,
+    CellOverlayState,
+    HistoryDirection,
+    HistoryValue,
+} from './history-cell-state-model';
 
 /**
  * A cell highlight moving under one gesture.
@@ -33,10 +38,13 @@ export type HistoryChange =
  *
  * A gesture is the grain the user thinks in — one paste, one fill, one
  * "Discard all" — so a paste over a thousand cells is one entry, not a
- * thousand. `label` names it in the menu ("Undo Paste"); `changes` is in
- * application order, which replay preserves so two deltas on the same cell
- * (possible within a paste that overlaps itself) settle where the gesture left
- * them.
+ * thousand. `label` names it in the menu ("Undo Paste").
+ *
+ * `changes` is in APPLICATION order. Replay must not use it directly: a gesture
+ * can contain two deltas for one cell (a paste whose target overlaps its own
+ * source), and undoing A->B then B->C has to run C->B before B->A or the first
+ * compare-and-swap finds C where it expected B and refuses. Ask
+ * `action_replay_changes` for the order a direction needs.
  */
 export interface HistoryAction {
     readonly label: string;
@@ -133,6 +141,29 @@ function estimate_hyperlink_bytes(link: CellHyperlink | null): number {
     return estimate_string_bytes(destination) + estimate_string_bytes(link.tooltip ?? '');
 }
 
+function estimate_overlay_bytes(overlay: CellOverlayState): number {
+    if (overlay.kind === 'absent') return 0;
+    const value = overlay.value.kind === 'present'
+        ? estimate_value_bytes(overlay.value.value) + estimate_value_bytes(overlay.value.base)
+        : estimate_value_bytes(overlay.value.anchor);
+    const link = overlay.hyperlink.kind === 'present'
+        ? estimate_hyperlink_bytes(overlay.hyperlink.value)
+            + estimate_hyperlink_bytes(overlay.hyperlink.base)
+        : 0;
+    return value + link;
+}
+
+/**
+ * A delta's retained cost, measured over everything it actually holds.
+ *
+ * The overlay snapshots are not second copies of the transition content, so
+ * they have to be measured rather than approximated from it. A link-only edit
+ * on a cell holding a very long string moves a few dozen bytes of hyperlink
+ * while retaining that whole string twice as the untouched dimension's anchor;
+ * a recommit against a base that moved underneath retains two long bases behind
+ * an unchanged short value. Charging only the transitions would let either slip
+ * past the hard bound by orders of magnitude.
+ */
 function estimate_cell_delta_bytes(delta: CellHistoryDelta): number {
     let total = CHANGE_OVERHEAD_BYTES;
     if (delta.value !== undefined) {
@@ -143,8 +174,9 @@ function estimate_cell_delta_bytes(delta: CellHistoryDelta): number {
         total += estimate_hyperlink_bytes(delta.hyperlink.expected.content)
             + estimate_hyperlink_bytes(delta.hyperlink.desired.content);
     }
-    // The overlay snapshots retain their own copies of the same content.
-    return total * 2;
+    return total
+        + estimate_overlay_bytes(delta.beforeOverlay)
+        + estimate_overlay_bytes(delta.afterOverlay);
 }
 
 function estimate_change_bytes(change: HistoryChange): number {
@@ -164,13 +196,14 @@ function change_cell_key(change: HistoryChange): string {
 
 /** Measures an action's costs. Both are estimates the bounds are applied to. */
 export function measure_history_action(action: HistoryAction): HistoryEntry {
+    const owned = own_history_action(action);
     const cells = new Set<string>();
     let byteCost = 0;
-    for (const change of action.changes) {
+    for (const change of owned.changes) {
         cells.add(change_cell_key(change));
         byteCost += estimate_change_bytes(change);
     }
-    return { action, cellCount: cells.size, byteCost };
+    return { action: owned, cellCount: cells.size, byteCost };
 }
 
 export interface RecordedOutcome {
@@ -310,17 +343,22 @@ export function peek_history(state: HistoryStackState, direction: HistoryDirecti
 }
 
 /**
- * Moves the top entry to the other stack. A no-op when that stack is empty, so
- * a caller that peeked and replayed cannot corrupt the stack by committing
- * twice.
+ * Moves the entry that was replayed to the other stack.
+ *
+ * `entry` is the one `peek_history` handed out, and it must still be on top or
+ * nothing moves. Popping whichever entry is on top now would be wrong in both
+ * directions: replay is asynchronous, so the stack can have been recorded onto
+ * or moved in the meantime, and a commit that ran twice would otherwise move a
+ * second, never-replayed gesture onto the redo stack — where redo would then
+ * apply content the user never undid.
  */
 export function commit_history_move(
     state: HistoryStackState,
     direction: HistoryDirection,
+    entry: HistoryEntry,
 ): HistoryStackState {
     const from = stack_for(state, direction);
-    const entry = from[from.length - 1];
-    if (entry === undefined) return state;
+    if (from[from.length - 1] !== entry) return state;
     const rest = from.slice(0, -1);
     const to = [...stack_for(state, direction === 'undo' ? 'redo' : 'undo'), entry];
     return direction === 'undo'
@@ -372,7 +410,65 @@ export function action_is_single_worksheet(action: HistoryAction): boolean {
     return action.changes.every((change) => worksheet_target_matches(change.delta.worksheet, first));
 }
 
+/**
+ * The action history will retain, isolated from the caller.
+ *
+ * History owning its own copy is not optional: `cellCount` and `byteCost` are
+ * measured once, so a caller that mutated a recorded action afterwards would
+ * change what replay does while the bounds still described the old graph.
+ *
+ * A change already frozen all the way down is reused rather than copied, which
+ * is the normal case — `build_cell_history_delta` returns a
+ * `deep_clone_and_freeze`d delta — and it matters at this size. A supported
+ * gesture can be a million cells and hundreds of MiB; cloning that graph a
+ * second time just to freeze what is already frozen doubles peak memory at the
+ * exact moment there is least of it, and does so even for a gesture about to be
+ * refused for being too large.
+ */
+function own_history_action(action: HistoryAction): HistoryAction {
+    if (Object.isFrozen(action) && Object.isFrozen(action.changes)
+        && action.changes.every(change_is_owned)) {
+        return action;
+    }
+    const changes = action.changes.map(
+        (change) => (change_is_owned(change) ? change : deep_clone_and_freeze(change)),
+    );
+    return Object.freeze({ label: action.label, changes: Object.freeze(changes) });
+}
+
+/**
+ * Whether a change is already deeply frozen.
+ *
+ * Only the mutable-by-construction shapes are inspected. Deltas arrive frozen
+ * whole from `build_cell_history_delta`, so the check is a few `isFrozen` calls
+ * rather than a traversal of the retained strings.
+ */
+function change_is_owned(change: HistoryChange): boolean {
+    if (!Object.isFrozen(change) || !Object.isFrozen(change.delta)) return false;
+    if (change.kind === 'highlight') return true;
+    const { beforeOverlay, afterOverlay, value, hyperlink } = change.delta;
+    return Object.isFrozen(beforeOverlay) && Object.isFrozen(afterOverlay)
+        && (value === undefined || Object.isFrozen(value))
+        && (hyperlink === undefined || Object.isFrozen(hyperlink));
+}
+
 /** Builds a frozen action, so a caller reusing its builders cannot mutate history. */
 export function history_action(label: string, changes: readonly HistoryChange[]): HistoryAction {
-    return deep_clone_and_freeze({ label, changes });
+    return own_history_action({ label, changes });
+}
+
+/**
+ * The changes a direction should replay, in the order it must replay them.
+ *
+ * Undo walks a gesture backwards. Within one gesture that only matters for a
+ * cell touched twice — a paste overlapping its own source gives A->B then
+ * B->C — but there it is the difference between restoring A and refusing the
+ * whole replay, because the compare-and-swap on the A->B delta expects to find
+ * B and the cell holds C until the later delta has been undone.
+ */
+export function action_replay_changes(
+    action: HistoryAction,
+    direction: HistoryDirection,
+): readonly HistoryChange[] {
+    return direction === 'undo' ? [...action.changes].reverse() : action.changes;
 }
