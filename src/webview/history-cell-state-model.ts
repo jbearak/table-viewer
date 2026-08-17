@@ -800,7 +800,7 @@ interface SourceMemo {
     readonly worksheetId: string | undefined;
     readonly canonical: WorksheetTarget;
 }
-const BY_SOURCE = new WeakMap<WorksheetTarget, SourceMemo>();
+let BY_SOURCE = new WeakMap<WorksheetTarget, SourceMemo>();
 const BY_IDENTITY = new Map<string, WorksheetTarget>();
 
 export function canonical_worksheet_target(
@@ -874,9 +874,17 @@ export function worksheet_token(target: WorksheetTarget): string {
 const TOKENS = new WeakMap<WorksheetTarget, string>();
 let NEXT_TOKEN = 0;
 
-/** Test seam: forgets the interned worksheet targets. */
+/**
+ * Test seam: forgets every interned worksheet target.
+ *
+ * Both caches, or the reset would leave tests order-dependent: a target object
+ * memoized before the reset would keep answering with its old canonical form
+ * without repopulating the identity map, so an equal target arriving afterwards
+ * would get a different object and be charged separately.
+ */
 export function reset_interned_worksheet_targets(): void {
     BY_IDENTITY.clear();
+    BY_SOURCE = new WeakMap<WorksheetTarget, SourceMemo>();
 }
 
 function canonical_value(value: HistoryValue, owner: RetainedStringOwner): HistoryValue {
