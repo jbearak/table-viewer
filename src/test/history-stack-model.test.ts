@@ -557,6 +557,21 @@ describe('measure_history_action', () => {
         expect(entry.byteCost).toBeLessThan(50_000 * 2 * 2);
     });
 
+    it('charges a multi-cell highlight gesture for one worksheet identity', () => {
+        // A target per highlighted cell would charge a long sheet name once per cell
+        // and refuse a gesture that retains exactly one copy of it — clearing valid
+        // history to protect memory that was never allocated.
+        const sheet: WorksheetTarget = { sheetIndex: 0, sheetName: 'n'.repeat(20_000) };
+        const entry = measure_history_action(history_action('Highlight', [
+            highlight_change(0, 0, sheet),
+            highlight_change(1, 0, sheet),
+            highlight_change(2, 0, sheet),
+        ]));
+        expect(entry.byteCost).toBeLessThan(20_000 * 2 * 2);
+        expect(entry.action.changes[1]?.delta.worksheet)
+            .toBe(entry.action.changes[0]?.delta.worksheet);
+    });
+
     it('charges an unshareable identity for every copy it really retains', () => {
         // An identity too long to key a lookup on cheaply is not interned across
         // distinct source objects, so each delta detaches its own copy — and each

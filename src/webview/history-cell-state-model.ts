@@ -785,25 +785,53 @@ function detached_chunk(text: string, start: number, end: number): string {
 const MAX_INTERNED_TARGETS = 4_096;
 /** Longest identity worth building a composite key for. Real names are tiny. */
 const MAX_INTERNED_IDENTITY_LENGTH = 512;
-const BY_SOURCE = new WeakMap<WorksheetTarget, WorksheetTarget>();
+/**
+ * A canonical target remembered against the source object it came from, WITH the
+ * field values it was built from.
+ *
+ * A caller's target is a mutable object — `readonly` is a compile-time claim — and
+ * one that gets renamed or reordered between two cells of a gesture would otherwise
+ * keep answering with the first snapshot, so later deltas would replay against the
+ * sheet it used to be.
+ */
+interface SourceMemo {
+    readonly sheetIndex: number;
+    readonly sheetName: string | undefined;
+    readonly worksheetId: string | undefined;
+    readonly canonical: WorksheetTarget;
+}
+const BY_SOURCE = new WeakMap<WorksheetTarget, SourceMemo>();
 const BY_IDENTITY = new Map<string, WorksheetTarget>();
 
-function canonical_worksheet_target(
+export function canonical_worksheet_target(
     target: WorksheetTarget,
     owner: RetainedStringOwner,
 ): WorksheetTarget {
-    // The common case: every delta of a gesture was handed the same target object.
-    const by_source = BY_SOURCE.get(target);
-    if (by_source !== undefined) return by_source;
-
+    // Each field is read exactly once, here, and everything below uses the locals:
+    // an accessor that answers differently on a second read must not be able to
+    // pair one field's value with another's.
     const { sheetIndex, sheetName, worksheetId } = target;
+
+    // The common case: every delta of a gesture was handed the same target object.
+    // Verified against the values it was built from, since the caller's object can
+    // be mutated between two cells of one gesture.
+    const memo = BY_SOURCE.get(target);
+    if (
+        memo !== undefined
+        && memo.sheetIndex === sheetIndex
+        && memo.sheetName === sheetName
+        && memo.worksheetId === worksheetId
+    ) {
+        return memo.canonical;
+    }
+
     const identity_length = (sheetName?.length ?? 0) + (worksheetId?.length ?? 0);
     const key = identity_length <= MAX_INTERNED_IDENTITY_LENGTH
         ? `${sheetIndex}\u0000${sheetName === undefined ? 0 : 1}${worksheetId === undefined ? 0 : 1}\u0000${sheetName ?? ''}\u0000${worksheetId ?? ''}`
         : undefined;
     const seen = key === undefined ? undefined : BY_IDENTITY.get(key);
     if (seen !== undefined) {
-        BY_SOURCE.set(target, seen);
+        BY_SOURCE.set(target, { sheetIndex, sheetName, worksheetId, canonical: seen });
         return seen;
     }
 
@@ -817,7 +845,7 @@ function canonical_worksheet_target(
     });
     // Always remembered against the source object, which retains nothing the source
     // was not already keeping alive.
-    BY_SOURCE.set(target, canonical);
+    BY_SOURCE.set(target, { sheetIndex, sheetName, worksheetId, canonical });
     if (key !== undefined && BY_IDENTITY.size < MAX_INTERNED_TARGETS) {
         // The key repeats the identity, so it is only ever a bounded few hundred
         // characters — which is what MAX_INTERNED_IDENTITY_LENGTH is for.
@@ -825,6 +853,26 @@ function canonical_worksheet_target(
     }
     return canonical;
 }
+
+/**
+ * A short stand-in for a canonical target's identity, unique for the session.
+ *
+ * Anything that needs to tell two worksheets apart — deduplicating a gesture's
+ * cells, say — would otherwise build a key holding the whole identity, once per
+ * cell, on fields nothing bounds. A token is a handful of characters, and it is
+ * exactly as discriminating: canonical targets are interned, so two deltas share a
+ * token if and only if they name the same sheet the same way.
+ */
+export function worksheet_token(target: WorksheetTarget): string {
+    const seen = TOKENS.get(target);
+    if (seen !== undefined) return seen;
+    const token = `w${NEXT_TOKEN++}`;
+    TOKENS.set(target, token);
+    return token;
+}
+
+const TOKENS = new WeakMap<WorksheetTarget, string>();
+let NEXT_TOKEN = 0;
 
 /** Test seam: forgets the interned worksheet targets. */
 export function reset_interned_worksheet_targets(): void {

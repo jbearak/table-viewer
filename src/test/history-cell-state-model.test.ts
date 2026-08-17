@@ -759,6 +759,20 @@ describe('interned worksheet targets', () => {
         expect(second.worksheet.sheetName).toBe(name);
     });
 
+    it('does not answer from the source memo after the caller mutated it', () => {
+        // A caller's target is a mutable object — `readonly` is a compile-time claim
+        // — and one renamed between two cells of a gesture would otherwise keep
+        // answering with the first snapshot, so later deltas would replay against
+        // the sheet it used to be.
+        const sheet = { sheetIndex: 0, sheetName: 'Before' };
+        const first = build_delta(sheet, 0);
+        sheet.sheetName = 'After';
+        const second = build_delta(sheet, 1);
+
+        expect(first.worksheet.sheetName).toBe('Before');
+        expect(second.worksheet.sheetName).toBe('After');
+    });
+
     it('does not conflate a name with an id of the same text', () => {
         const named = build_delta({ sheetIndex: 0, sheetName: 'x' }, 0);
         const identified = build_delta({ sheetIndex: 0, worksheetId: 'x' }, 0);

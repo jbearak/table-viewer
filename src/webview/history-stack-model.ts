@@ -1,13 +1,14 @@
 import type { CellHyperlink } from '../cell-content';
 import {
-    worksheet_target_key,
     type CellHighlightColor,
     type WorksheetTarget,
 } from '../types';
 import {
     canonical_cell_history_delta,
+    canonical_worksheet_target,
     detached_string,
     type RetainedStringOwner,
+    worksheet_token,
     type CellHistoryDelta,
     type CellOverlayState,
     type HistoryDirection,
@@ -342,11 +343,13 @@ function estimate_change_bytes(
 
 function change_cell_key(change: HistoryChange): string {
     const { worksheet, sourceRow, sourceColumn } = change.delta;
-    // `worksheet_target_key` prefers identity over index for the same reason
-    // replay does: an external reorder reassigns indices, and two sheets must
-    // never collapse into one counted cell. A cell's value and its highlight
-    // are separate changes, so the kind is part of the key.
-    return `${change.kind} ${worksheet_target_key(worksheet)} ${sourceRow}:${sourceColumn}`;
+    // A token rather than the identity itself: a sheet name is unbounded, and
+    // spelling it into a key per cell is O(changes x identity length) of work and of
+    // retained key. Canonical targets are interned, so the token is exactly as
+    // discriminating — which matters because an external reorder reassigns indices,
+    // and two sheets must never collapse into one counted cell. A cell's value and
+    // its highlight are separate changes, so the kind is part of the key.
+    return `${change.kind} ${worksheet_token(worksheet)} ${sourceRow}:${sourceColumn}`;
 }
 
 interface HistoryCosts {
@@ -941,13 +944,12 @@ function canonical_highlight_delta(
     delta: HighlightHistoryDelta,
     owner: RetainedStringOwner,
 ): HighlightHistoryDelta {
-    const { sheetIndex, sheetName, worksheetId } = delta.worksheet;
     return Object.freeze({
-        worksheet: Object.freeze({
-            sheetIndex,
-            ...(sheetName === undefined ? {} : { sheetName: owner.own(sheetName) }),
-            ...(worksheetId === undefined ? {} : { worksheetId: owner.own(worksheetId) }),
-        }),
+        // The same interning a cell delta gets, so a multi-cell highlight gesture
+        // holds one target and is charged for one — the estimator charges the
+        // object, and a target per highlighted cell would charge a long sheet name
+        // once per cell and refuse a gesture that retains one copy of it.
+        worksheet: canonical_worksheet_target(delta.worksheet, owner),
         sourceRow: delta.sourceRow,
         sourceColumn: delta.sourceColumn,
         before: delta.before,
