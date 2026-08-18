@@ -1,3 +1,4 @@
+import { cell_key } from '../cell-key';
 import React, {
     useCallback,
     useEffect,
@@ -1524,7 +1525,7 @@ export function GridShell({
         // the cell's markup (mirroring get_cell_content's `edit_value`), not
         // the plain raw text — comparing "**x**" against "x" would mark an
         // untouched bold cell as uncommitted the moment its editor opened.
-        const key = `${source_row}:${source_column}`;
+        const key = cell_key(source_row, source_column);
         let original: string;
         const dirty = store.get(key);
         if (dirty) {
@@ -1929,7 +1930,7 @@ export function GridShell({
             const source_row = get_source_row(row);
             const dirty = source_row === undefined
                 ? undefined
-                : store.get(`${source_row}:${source_column}`);
+                : store.get(cell_key(source_row, source_column));
             if (dirty) return dirty.value;
 
             // Merged blocks need no special case: the grid's hover hit-test
@@ -1978,7 +1979,7 @@ export function GridShell({
             const source_row = get_source_row(row);
             if (source_row !== undefined) {
                 // `link: null` is a pending *clear* — a real answer, not a miss.
-                const pending = store.get(`${source_row}:${source_column}`)?.link;
+                const pending = store.get(cell_key(source_row, source_column))?.link;
                 if (pending !== undefined) return pending ?? undefined;
             }
             return get_row(row)?.[source_column]?.hyperlink;
@@ -2030,7 +2031,7 @@ export function GridShell({
             const source_column = source_column_for_display(display_column);
             const source_row = get_source_row(row);
             const dirty = source_row !== undefined && source_column !== undefined
-                && store.get(`${source_row}:${source_column}`) !== undefined;
+                && store.get(cell_key(source_row, source_column)) !== undefined;
             const loaded = source_column === undefined
                 ? null
                 : get_row(row)?.[source_column] ?? null;
@@ -2207,7 +2208,7 @@ export function GridShell({
         source_row: number,
         source_column: number,
     ): string | undefined => {
-        const color = cell_highlights?.cells[`${source_row}:${source_column}`];
+        const color = cell_highlights?.cells[cell_key(source_row, source_column)];
         return color ? highlight_rgba(color, high_contrast) : undefined;
     }, [cell_highlights, high_contrast]);
 
@@ -2250,7 +2251,7 @@ export function GridShell({
             const source_row = get_source_row(row);
             const key = source_row === undefined
                 ? undefined
-                : `${source_row}:${source_column}`;
+                : cell_key(source_row, source_column);
             const dirty = key === undefined ? undefined : store.get(key);
             const highlight_bg = source_row === undefined
                 ? undefined
@@ -2380,6 +2381,12 @@ export function GridShell({
             // barrier `post_pending_edits` refuses to publish, so an edit
             // committed after it would sit in the store and never reach the host.
             if (close_barrier_ref.current || save_in_flight_ref.current) return true;
+            // The replay reservation belongs here too, and BEFORE the auto-grow
+            // below: `run_edit_gesture` drops a gesture that is not admitted, so a
+            // row grown on the way past would persist a durable height for text
+            // that never reached the store. `editable_cells` does not cover this —
+            // it excludes a save and a highlight in flight, not a replay.
+            if (gestures_admitted !== undefined && !gestures_admitted()) return true;
 
             const edits: CellValueEdit[] = [];
             const damaged: { cell: Item }[] = [];
@@ -2470,6 +2477,7 @@ export function GridShell({
             auto_grow_row_for_text,
             commit_edits,
             display_column_count,
+            gestures_admitted,
             source_column_for_display,
             commit_source_row,
             save_in_flight_ref,
@@ -2915,7 +2923,7 @@ export function GridShell({
             if (source_row === undefined) return undefined;
             let displayed_row: (RenderedCell | null)[] | undefined;
             for (const source_column of selection.source_columns) {
-                const key = `${source_row}:${source_column}`;
+                const key = cell_key(source_row, source_column);
                 const displayed_value = live?.key === key
                     ? live.value
                     : dirty.get(key)?.value;
@@ -3061,7 +3069,7 @@ export function GridShell({
             // some other row's edit.
             const source_row = get_source_row(row);
             if (source_row === undefined) return;
-            clear_dirty_keys(new Set([`${source_row}:${source_column}`]));
+            clear_dirty_keys(new Set([cell_key(source_row, source_column)]));
             grid_ref.current?.updateCells([{ cell: [display_column, row] }]);
         },
         [clear_dirty_keys, get_source_row, save_in_flight_ref],

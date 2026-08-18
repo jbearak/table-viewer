@@ -1,4 +1,5 @@
 import { cell_highlight_key } from '../cell-highlights';
+import { parse_cell_key } from '../cell-key';
 
 /**
  * The set of cell keys (`"row:col"`) whose dirty- or conflict-tint differs
@@ -72,10 +73,9 @@ export function visible_source_key_damage(
     const out: VisibleCellDamage[] = [];
     const seen = new Set<string>();
     for (const key of changed) {
-        const match = /^(0|[1-9]\d*):(0|[1-9]\d*)$/.exec(key);
-        if (!match) continue;
-        const source_row = Number(match[1]);
-        const source_column = Number(match[2]);
+        const coordinates = parse_cell_key(key);
+        if (coordinates === undefined) continue;
+        const { sourceRow: source_row, sourceColumn: source_column } = coordinates;
         const display_column = display_column_for_source(source_column);
         if (
             display_column === undefined

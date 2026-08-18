@@ -1099,6 +1099,26 @@ describe('peek_history and commit_history_move', () => {
         expect(again.state.undoStack.map((item) => item.action.label)).toEqual(['A', 'C', 'B']);
     });
 
+    it('does not adopt a redo entry a previous commit dropped', () => {
+        // The entry leaves the stack on the non-top drop path, so a duplicate
+        // delivery finds it in neither stack — indistinguishable, without the
+        // ledger, from a redo whose first commit never arrived. Adopting it here
+        // would resurrect a gesture this function already refused, and evict a
+        // newer action to make room for it.
+        const undone = move(move(record_all(['A', 'B']), 'undo'), 'undo');
+        const buried = undone.redoStack[0];
+        expect(buried.action.label).toBe('B');
+
+        const dropped = commit_history_move(undone, 'redo', buried);
+        expect(dropped.kind).toBe('dropped');
+        expect(dropped.state.redoStack.map((item) => item.action.label)).toEqual(['A']);
+
+        const again = commit_history_move(dropped.state, 'redo', buried);
+        expect(again.kind).toBe('already-committed');
+        expect(again.state).toBe(dropped.state);
+        expect(again.state.undoStack).toHaveLength(0);
+    });
+
     it('can unwind everything an adoption left applied', () => {
         const undone = move(record_all(['A', 'B']), 'undo');
         const entry = top(undone, 'redo');

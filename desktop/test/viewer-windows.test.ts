@@ -1444,6 +1444,68 @@ describe('what the Edit menu is told about a viewer s history', () => {
         expect(rebuilt).toEqual([]);
     });
 
+    it.each([
+        ['a navigation replaced the renderer', (
+            window: InstanceType<typeof electron_mock.BrowserWindow>,
+        ) => {
+            window.webContents.emit('did-navigate', {}, 'tv-app://viewer-1/index.html', 200, 'OK');
+        }],
+        ['the renderer terminated', (
+            window: InstanceType<typeof electron_mock.BrowserWindow>,
+        ) => {
+            window.webContents.emit('render-process-gone', {}, { reason: 'crashed', exitCode: 1 });
+        }],
+    ])('forgets the projection once %s', (_name, lose_renderer) => {
+        // The projection outlives focus changes by design, so nothing else would
+        // clear it — and an Edit menu offering Undo to a renderer that is gone
+        // sends the command nowhere.
+        const rebuilt: ElectronBrowserWindow[] = [];
+        const viewer_manager = manager(undefined, (window) => { rebuilt.push(window); });
+        viewer_manager.open_file(`/tmp/${_name}.csv`);
+        const window = latest_window();
+        emit_webview(window, {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                undoLabel: 'Paste',
+                textEditing: false,
+            },
+        });
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoAvailable: true });
+
+        lose_renderer(window);
+
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toBeUndefined();
+        // And the menu is rebuilt, or the stale labels stay on screen.
+        expect(rebuilt).toHaveLength(2);
+    });
+
+    it('keeps the projection while the renderer is merely unresponsive', () => {
+        // Retryable loss: the same renderer still holds the history and will not
+        // repost when it comes back, so dropping the state would blank Undo for
+        // the rest of the window's life.
+        const viewer_manager = manager(undefined, () => {});
+        viewer_manager.open_file('/tmp/hung.csv');
+        const window = latest_window();
+        emit_webview(window, {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                undoLabel: 'Paste',
+                textEditing: false,
+            },
+        });
+
+        window.emit('unresponsive');
+
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoAvailable: true, undoLabel: 'Paste' });
+    });
+
     it('stops listening once the window is gone', async () => {
         // The watcher is on the shared ipcMain channel, so a torn-down window that
         // kept listening would keep answering for a webContents nobody owns.

@@ -946,6 +946,13 @@ export function commit_history_move(
     }
     if (position !== from.length - 1) {
         const kept = [...from.slice(0, position), ...from.slice(position + 1)];
+        // Recorded even though nothing moved: this path is what takes the entry
+        // off the stack, so a duplicate delivery would find `position === -1`
+        // and — for a redo of the live epoch — ADOPT what this call just
+        // dropped, resurrecting a refused gesture and evicting a newer action to
+        // seat it. The other drop above needs no entry: an absent entry that
+        // failed the adoption test fails it identically next time.
+        COMMITTED_MOVES.set(entry.id, entry.moves + 1);
         return {
             kind: 'dropped',
             state: with_stacks(state, direction, kept, destination),

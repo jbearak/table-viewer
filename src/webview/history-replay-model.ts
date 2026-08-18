@@ -18,6 +18,7 @@
  * records in and the space durable edits live in.
  */
 
+import { cell_key } from '../cell-key';
 import {
     absent_overlay,
     dirty_entry_from_overlay_state,
@@ -247,7 +248,7 @@ function plan_cell_replay(
             worksheet,
             sourceRow,
             sourceColumn,
-            key: `${sourceRow}:${sourceColumn}`,
+            key: cell_key(sourceRow, sourceColumn),
             entry: result.kind === 'absent' ? undefined : dirty_entry_from_overlay_state(result),
         },
     };
