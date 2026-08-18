@@ -6641,6 +6641,19 @@ export function attach_viewer(
                     const operation = begin_edit_cleanup(msg.editSessionId);
                     if (!operation) return;
                     notify_edit_state();
+                    // Acknowledged either way, because a discard is undoable and
+                    // undoing one has to acquire a NEW session: until cleanup
+                    // settles the host refuses `requestEditSession`, so an undo in
+                    // that window would fail for a reason about timing rather than
+                    // about the document. The renderer waits for this rather than
+                    // racing it.
+                    const acknowledge = (cleared: boolean): void => {
+                        void post_to_receiver({
+                            type: 'discardEditSessionResult',
+                            editSessionId: msg.editSessionId,
+                            cleared,
+                        });
+                    };
                     try {
                         // The discard ends the workbook-scoped session, so every
                         // live sheet's slot goes at once — the one dialog the user
@@ -6648,8 +6661,12 @@ export function attach_viewer(
                         const snapshot = await clear_pending_edits({ type: 'workbook' });
                         finish_edit_cleanup(operation, true, snapshot);
                         if (!disposed) update_session_state_material(snapshot, false);
+                        acknowledge(true);
                     } catch (error) {
                         finish_edit_cleanup(operation, false);
+                        // A failed clear leaves the host `uncertain` and editing
+                        // disabled for the file, so undo has nothing to re-enter.
+                        acknowledge(false);
                         log_sanitized_failure('Failed to clear discarded CSV edits', error);
                         show_owner_warning(
                             'Table Viewer could not clear the discarded edit state. Editing remains disabled for this file.');
