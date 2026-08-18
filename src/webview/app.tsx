@@ -23,6 +23,7 @@ import {
     type CellHighlightMutation,
     type CellHighlightSelection,
     type CellHighlightState,
+    type HighlightCellDelta,
     dirty_entries_equal,
     type CsvDirtyEntry,
     type CsvSaveLifecycle,
@@ -117,6 +118,7 @@ import type { HistoryEntry } from './history-stack-model';
 import type { HistoryReplayCommitted } from '../history-replay-protocol';
 import { pending_signal, type PendingSignal } from './pending-signal';
 import { run_discard_transaction } from './discard-transaction-model';
+import { highlight_history_source } from './highlight-capture-model';
 import { commit_staged_transaction, type StagedMutation } from './staged-mutation';
 import { column_letter } from './grid-model';
 import {
@@ -521,6 +523,27 @@ export function App(): React.JSX.Element {
     }
 
     /**
+     * Record a highlight gesture this window made, once the host has applied it.
+     *
+     * A plain record with nothing staged alongside it: unlike a cell edit, the
+     * mutation has ALREADY happened on the host and in durable state by the time
+     * this window sees it, so there is nothing left to hold back. A refusal
+     * therefore cannot un-apply the gesture — it installs the barrier that makes a
+     * later undo explain itself, which is the same trade the discard makes.
+     */
+    const record_highlight_gesture = useCallback((
+        deltas: readonly HighlightCellDelta[],
+        label: string,
+    ) => {
+        if (deltas.length === 0) return;
+        const record = history_store_ref.current!.stage_record({
+            label,
+            changes: highlight_history_source(deltas, meta_ref.current?.sheets ?? []),
+        });
+        commit_staged_transaction([record]);
+    }, []);
+
+    /**
      * The one outstanding replay, if any.
      *
      * A ref rather than state, for the same reason as the history store: a replay
@@ -848,7 +871,17 @@ export function App(): React.JSX.Element {
         Array.from(crypto.getRandomValues(new Uint32Array(2)), (value) =>
             value.toString(36)).join('-'),
     );
-    const pending_highlight_request_ref = useRef<string | null>(null);
+    /**
+     * The highlight request awaiting the host, with the name to record it under.
+     *
+     * One ref and not two: the label is only ever read when a reply matching this
+     * id arrives, so carrying it here makes "which gesture" and "what it was
+     * called" impossible to get out of step.
+     */
+    const pending_highlight_request_ref = useRef<{
+        readonly requestId: string;
+        readonly label: string;
+    } | null>(null);
     const last_highlight_state_revision_ref = useRef(0);
 
     const { persist_immediate } = use_state_sync(
@@ -1005,6 +1038,38 @@ export function App(): React.JSX.Element {
 
     const discard_edit_session = useCallback(() => {
         if (!csv_edit_session_id) return;
+        // A discard is a recorded gesture, so it answers to the same reservation
+        // every other one does — and it does NOT reach `run_edit_gesture`, which is
+        // where the rest of them are gated. Recorded across a highlight round trip
+        // it would land ahead of the highlight the user made first, so the first
+        // undo would repaint cells instead of restoring the discarded edits.
+        //
+        // Refused rather than deferred: the window is one host round trip, and a
+        // discard queued behind a reply would fire after the user had moved on.
+        //
+        // Answered rather than silently dropped, because one caller is the save
+        // dialog's "discard" choice: the dialog has already closed by the time this
+        // runs, so a bare `return` would leave the user in edit mode with their
+        // edits intact and no account of why. The button caller is harmless either
+        // way — it is visibly still there to press again.
+        //
+        // Named per reservation, because the two are separate waits and telling the
+        // user the wrong one is worse than telling them nothing: a replay-busy
+        // discard has no highlight anywhere in it.
+        if (pending_highlight_request_ref.current !== null) {
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: 'A cell highlight is still being applied. Try discarding again in a moment.',
+            });
+            return;
+        }
+        if (!edit_gestures_admitted()) {
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: 'An undo is still being applied. Try discarding again in a moment.',
+            });
+            return;
+        }
         // Fold any open cell editor FIRST, so its text is part of what the discard
         // throws away and therefore part of what undoing it restores. Left open, it
         // would be dropped by the exit below with nothing in history describing it.
@@ -1270,8 +1335,9 @@ export function App(): React.JSX.Element {
                     || msg.physicalRevision !== identity.sourceBasis.physicalRevision
                     || msg.sourceGeneration !== source_generation_ref.current
                 ) return;
+                const pending_highlight = pending_highlight_request_ref.current;
                 const matching_request = !!msg.requestId
-                    && pending_highlight_request_ref.current === msg.requestId;
+                    && pending_highlight?.requestId === msg.requestId;
                 if (matching_request) {
                     pending_highlight_request_ref.current = null;
                     set_highlight_request_pending(false);
@@ -1290,6 +1356,18 @@ export function App(): React.JSX.Element {
                     return;
                 }
                 last_highlight_state_revision_ref.current = msg.stateRevision;
+                // Only this window's OWN gesture enters its history. The same
+                // message arrives for another window's highlight, an external
+                // reload, and a post-save rebase; recording those would let undo
+                // repaint cells this user never touched.
+                if (
+                    matching_request
+                    && !msg.error
+                    && msg.deltas !== undefined
+                    && pending_highlight !== null
+                ) {
+                    record_highlight_gesture(msg.deltas, pending_highlight.label);
+                }
                 state_ref.current = {
                     ...state_ref.current,
                     cellHighlights: msg.state,
@@ -1492,6 +1570,12 @@ export function App(): React.JSX.Element {
                     } else if (remounts_the_grid) {
                         editing_ref.current?.commit_live_edit();
                     }
+                    // The basis a pending highlight request was sent against, read
+                    // BEFORE this snapshot overwrites either — see the abandonment
+                    // check below.
+                    const pending_basis_physical_revision = snapshot_identity_ref
+                        .current?.sourceBasis.physicalRevision;
+                    const pending_basis_source_generation = source_generation_ref.current;
                     snapshot_identity_ref.current = snapshot.identity;
                     const previous_sheets_by_name = new Map(
                         previous_sheets.map((sheet) => [sheet.name, sheet]),
@@ -1871,13 +1955,33 @@ export function App(): React.JSX.Element {
                     generation_ref.current = snapshot.generation;
                     source_generation_ref.current = snapshot.sourceGeneration;
                     if (snapshot.presentation === 'initial') {
-                        pending_highlight_request_ref.current = null;
-                        set_highlight_request_pending(false);
                         set_highlight_status('');
                         set_highlight_selection_available(false);
                         set_edit_session_pending(false);
                         pending_edit_request_ref.current = null;
                         pending_save_dialog_ref.current = null;
+                    }
+                    // A highlight request names the basis it was sent against, and
+                    // its reply is filtered on that basis matching the live one — so
+                    // once this snapshot moves either, no reply can ever resolve the
+                    // request. Abandoning it is the only outcome left, and it must
+                    // not be limited to the 'initial' case: an external file change
+                    // arrives as a REFRESH with a new physical revision, and a
+                    // request stranded there would hold both the highlight panel and
+                    // — since the same reservation orders cell gestures against the
+                    // history — every subsequent cell edit, for the life of the
+                    // window.
+                    if (
+                        pending_highlight_request_ref.current !== null
+                        && (
+                            snapshot.presentation === 'initial'
+                            || snapshot.identity.sourceBasis.physicalRevision
+                                !== pending_basis_physical_revision
+                            || snapshot.sourceGeneration !== pending_basis_source_generation
+                        )
+                    ) {
+                        pending_highlight_request_ref.current = null;
+                        set_highlight_request_pending(false);
                     }
                     set_source_epoch((n) => n + 1);
                     // What the rows *are* changes with a new source, a new view
@@ -2958,14 +3062,34 @@ export function App(): React.JSX.Element {
     ]);
 
     /**
-     * The replay reservation, as the editing layer sees it.
+     * Whether a cell gesture may enter the history right now.
      *
-     * Stable across renders because a replay starts and ends inside event
+     * Two reservations, one predicate, because both are about the same thing —
+     * an edit must not be RECORDED while another gesture is mid-flight for the
+     * same history:
+     *
+     *   - A replay in flight owns the history's next move.
+     *   - A highlight round trip is recorded only when the host's deltas come
+     *     back, so an edit committed inside that window would enter the history
+     *     BEFORE the highlight the user made first, and undo would revert the
+     *     highlight instead of the typing.
+     *
+     * Here rather than in the grid because this is where every recorded gesture
+     * converges: `run_edit_gesture` gates the overlay editor, paste, Glide's
+     * fill hotkeys AND the hyperlink dialog, which reaches the store through
+     * `commit_hyperlinks` and no grid-side editability flag.
+     * GridShell's `highlight_in_flight` prop is the affordance, not the barrier —
+     * it stops a cell opening at all, so nothing the user types is silently
+     * swallowed.
+     *
+     * Stable across renders because a gesture starts and ends inside event
      * handlers: making this depend on rendered state would rebuild the editing
      * callbacks mid-gesture, and a wide paste is assembled across many of them.
+     * Both reservations therefore live in refs.
      */
-    const replay_gestures_admitted = useCallback(
-        () => !(replay_coordinator_ref.current?.is_busy() ?? false),
+    const edit_gestures_admitted = useCallback(
+        () => !(replay_coordinator_ref.current?.is_busy() ?? false)
+            && pending_highlight_request_ref.current === null,
         [],
     );
 
@@ -3993,7 +4117,13 @@ export function App(): React.JSX.Element {
             highlight_request_prefix_ref.current,
             ++highlight_request_seq_ref.current,
         ].join(':');
-        pending_highlight_request_ref.current = request_id;
+        // The gesture's own name goes with the request: the diff that comes back
+        // says which cells moved but not what the user asked for, and "Undo Clear
+        // highlight" reads as the action they took.
+        pending_highlight_request_ref.current = {
+            requestId: request_id,
+            label: mutation.type === 'clear' ? 'Clear highlight' : 'Highlight cells',
+        };
         set_highlight_request_pending(true);
         set_highlight_status('Updating cell highlights…');
         host_bridge.postMessage({
@@ -4021,7 +4151,10 @@ export function App(): React.JSX.Element {
             highlight_request_prefix_ref.current,
             ++highlight_request_seq_ref.current,
         ].join(':');
-        pending_highlight_request_ref.current = request_id;
+        pending_highlight_request_ref.current = {
+            requestId: request_id,
+            label: 'Clear all highlights',
+        };
         set_highlight_request_pending(true);
         set_highlight_status('Updating cell highlights…');
         host_bridge.postMessage({
@@ -4941,6 +5074,7 @@ export function App(): React.JSX.Element {
             merges={merges_flattened ? [] : current_sheet.merges}
             preview_mode={preview_mode}
             edit_mode={edit_mode_on_active_sheet}
+            highlight_in_flight={highlight_request_pending}
             csv_editable={csv_editable}
             edit_syntax={edit_syntax}
             edit_session_id={csv_edit_session_id}
@@ -4953,7 +5087,7 @@ export function App(): React.JSX.Element {
                 active_sheet_index,
             )}
             history_store={history_store_ref.current!}
-            gestures_admitted={replay_gestures_admitted}
+            gestures_admitted={edit_gestures_admitted}
             host_rejected_keys={live_rejected_keys}
             on_editing_change={handle_editing_change}
             editing_ref={editing_ref}

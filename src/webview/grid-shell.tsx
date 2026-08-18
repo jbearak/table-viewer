@@ -368,6 +368,23 @@ export interface GridShellProps {
     // only possible when csv_editable.
     edit_mode?: boolean;
     csv_editable?: boolean;
+    /**
+     * Whether a highlight gesture is awaiting the host's acknowledgement.
+     *
+     * Cells stop OFFERING an editor for that window, on the same reasoning as
+     * `save_in_flight`: a highlight round-trips through durable state, and it is
+     * recorded only when the host's deltas come back, so an edit recorded while
+     * one is outstanding would enter the history BEFORE the highlight the user
+     * made first — undo would then revert the highlight when the user expected
+     * their typing back. The window is one host round trip, and the highlight
+     * panel is already disabled across it.
+     *
+     * The affordance only. The barrier that actually keeps such an edit out of
+     * the history is App's `gestures_admitted`, which every recorded gesture
+     * passes through — including the hyperlink dialog, which reaches the store
+     * without consulting any editability flag here.
+     */
+    highlight_in_flight?: boolean;
     /** How this sheet's cells are edited ('markdown' for xlsx). Default 'plain'. */
     edit_syntax?: EditSyntax;
     edit_session_id?: string;
@@ -473,6 +490,7 @@ export function GridShell({
     preview_mode = false,
     edit_mode = false,
     csv_editable = false,
+    highlight_in_flight = false,
     edit_syntax = 'plain',
     edit_session_id,
     save_operation,
@@ -840,6 +858,7 @@ export function GridShell({
     const editable_cells = edit_mode
         && csv_editable
         && !save_in_flight
+        && !highlight_in_flight
         && !close_barrier_active;
 
     useEffect(() => {

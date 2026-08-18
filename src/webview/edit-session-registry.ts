@@ -176,7 +176,15 @@ export interface EditSessionRegistry {
     entries(): IterableIterator<[number, EditSessionStore]>;
 }
 
-function target_for_sheet(
+/**
+ * A sheet index plus its identity, as the whole target a history change records.
+ *
+ * Exported because highlight capture needs exactly this and building it by
+ * spreading a `WorksheetIdentity` is a trap: the identity's field is `name`,
+ * the target's is `sheetName`, so a spread yields a target that resolves by
+ * index alone — and an index silently names a different worksheet after a move.
+ */
+export function target_for_sheet(
     sheetIndex: number,
     sheet: WorksheetIdentityInput,
 ): WorksheetTarget {

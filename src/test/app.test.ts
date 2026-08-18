@@ -204,6 +204,17 @@ vi.mock('../webview/grid-shell', () => ({
                     props.row_height_overlay ?? null,
                 ),
                 'data-pending-preview-scroll': JSON.stringify(props.pending_preview_scroll ?? null),
+                // The history-ordering reservation App threads into the editing
+                // layer, sampled at render so a test can watch it open and close.
+                'data-gestures-admitted': String(props.gestures_admitted?.() ?? true),
+                // Undo labels, newest last: what a highlight gesture recorded
+                // itself as. The stub is App's only window onto the history it
+                // owns.
+                'data-undo-labels': JSON.stringify(
+                    props.history_store?.snapshot().undoStack
+                        .map((entry) => entry.action.label) ?? [],
+                ),
+                'data-highlight-in-flight': String(props.highlight_in_flight ?? false),
                 'data-merges': String(props.merges?.length ?? 0),
                 'data-merges-json': JSON.stringify(props.merges ?? []),
             },
@@ -935,6 +946,133 @@ describe('cell highlight clear-all wiring', () => {
         expect(status_id).not.toBeNull();
         expect(document.getElementById(status_id!)?.textContent)
             .toBe('Cell highlights updated.');
+    });
+});
+
+describe('the highlight round trip and the edit history', () => {
+    it('closes cell gestures across the round trip, and reopens on the reply', async () => {
+        const { post_message } = await render_app();
+        const snapshot = initial_snapshot_message(make_meta(['Sheet1']));
+        await dispatch_host_message(snapshot);
+        post_message.mockClear();
+
+        expect(grid_stub().getAttribute('data-gestures-admitted')).toBe('true');
+        expect(grid_stub().getAttribute('data-highlight-in-flight')).toBe('false');
+
+        await click_button('Highlight');
+        await click_button('Clear all highlights');
+        const request = [...post_message.mock.calls]
+            .reverse()
+            .map((call) => call[0])
+            .find((message: { type?: string } | undefined) => (
+                message?.type === 'clearAllCellHighlights'
+            ));
+        expect(request).toBeDefined();
+
+        // The highlight is recorded only when the host's deltas come back, so an
+        // edit committed inside the window would enter the history BEFORE it —
+        // undo would then revert the highlight instead of the user's typing.
+        // Both halves close: the grid stops offering an editor, and the
+        // reservation the editing layer consults refuses a gesture outright.
+        expect(grid_stub().getAttribute('data-highlight-in-flight')).toBe('true');
+        expect(grid_stub().getAttribute('data-gestures-admitted')).toBe('false');
+
+        await dispatch_host_message({
+            type: 'cellHighlightsChanged',
+            requestId: request.requestId,
+            stateRevision: snapshot.snapshot.identity.stateRevision + 1,
+            physicalRevision: snapshot.snapshot.identity.sourceBasis.physicalRevision,
+            state: undefined,
+            sourceGeneration: snapshot.snapshot.sourceGeneration,
+        });
+
+        expect(grid_stub().getAttribute('data-highlight-in-flight')).toBe('false');
+        expect(grid_stub().getAttribute('data-gestures-admitted')).toBe('true');
+    });
+
+    it('records the gesture under the name the user asked for', async () => {
+        const { post_message } = await render_app();
+        const snapshot = initial_snapshot_message(make_meta(['Sheet1']));
+        await dispatch_host_message(snapshot);
+        post_message.mockClear();
+
+        await click_button('Highlight');
+        await click_button('Clear all highlights');
+        const request = [...post_message.mock.calls]
+            .reverse()
+            .map((call) => call[0])
+            .find((message: { type?: string } | undefined) => (
+                message?.type === 'clearAllCellHighlights'
+            ));
+
+        // The label travels WITH the request. The deltas that come back say which
+        // cells moved but not what the user asked for, and "Undo Clear all
+        // highlights" has to name the action they took — not whichever gesture
+        // happened to be requested most recently.
+        await dispatch_host_message({
+            type: 'cellHighlightsChanged',
+            requestId: request.requestId,
+            stateRevision: snapshot.snapshot.identity.stateRevision + 1,
+            physicalRevision: snapshot.snapshot.identity.sourceBasis.physicalRevision,
+            state: undefined,
+            deltas: [{
+                sheetIndex: 0,
+                sourceRow: 0,
+                sourceColumn: 0,
+                before: 'yellow',
+                after: null,
+            }],
+            sourceGeneration: snapshot.snapshot.sourceGeneration,
+        });
+
+        expect(JSON.parse(grid_stub().getAttribute('data-undo-labels')!))
+            .toEqual(['Clear all highlights']);
+    });
+
+    it('abandons a request the file moved out from under, unwedging edits', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'])));
+        post_message.mockClear();
+
+        await click_button('Highlight');
+        await click_button('Clear all highlights');
+        expect(grid_stub().getAttribute('data-gestures-admitted')).toBe('false');
+
+        // An external file change arrives as a REFRESH carrying a new source
+        // generation. The request pinned the basis it was sent against, so no
+        // reply can ever satisfy the reply filter again — and the reservation it
+        // holds now orders CELL gestures too, so leaving it set would wedge every
+        // subsequent edit for the life of the window, not just the panel.
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1'])));
+
+        expect(grid_stub().getAttribute('data-gestures-admitted')).toBe('true');
+        expect(grid_stub().getAttribute('data-highlight-in-flight')).toBe('false');
+    });
+
+    it('records nothing for another window\'s highlight change', async () => {
+        const snapshot = initial_snapshot_message(make_meta(['Sheet1']));
+        await render_app();
+        await dispatch_host_message(snapshot);
+
+        // No requestId: this is the same message an external reload, a post-save
+        // rebase, or another window's gesture produces. Recording those would let
+        // undo repaint cells this user never touched.
+        await dispatch_host_message({
+            type: 'cellHighlightsChanged',
+            stateRevision: snapshot.snapshot.identity.stateRevision + 1,
+            physicalRevision: snapshot.snapshot.identity.sourceBasis.physicalRevision,
+            state: undefined,
+            deltas: [{
+                sheetIndex: 0,
+                sourceRow: 0,
+                sourceColumn: 0,
+                before: null,
+                after: 'yellow',
+            }],
+            sourceGeneration: snapshot.snapshot.sourceGeneration,
+        });
+
+        expect(JSON.parse(grid_stub().getAttribute('data-undo-labels')!)).toEqual([]);
     });
 });
 
@@ -7442,6 +7580,52 @@ describe('edit mode save exit', () => {
         expect(grid_shell_mock.stop_edit_admission.mock.invocationCallOrder[0])
             .toBeLessThan(discard_call!);
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+    });
+
+    it('refuses a discard while a highlight gesture awaits the host', async () => {
+        grid_shell_mock.is_dirty = true;
+        grid_shell_mock.has_uncommitted_changes = true;
+
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                },
+            })
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, ['0:0']);
+
+        await click_button('Highlight');
+        await click_button('Clear all highlights');
+        post_message.mockClear();
+
+        // A discard is a RECORDED gesture that never passes through
+        // `run_edit_gesture`, so it needs the reservation applied here. Recorded
+        // across the round trip it would land ahead of the highlight the user made
+        // first, and the first undo would repaint cells rather than restore the
+        // discarded edits.
+        await click_button('Discard All');
+
+        expect(post_message).not.toHaveBeenCalledWith(
+            expect.objectContaining({ type: 'discardEditSession' }),
+        );
+        // Answered, not silently dropped: the save dialog's "discard" answer also
+        // lands here, and by then the dialog has closed — so a bare refusal would
+        // leave the user in edit mode with no account of why.
+        // Named for the wait it is actually blocked on. A replay-busy discard is a
+        // different wait with no highlight in it, and is asserted where undo is
+        // drivable from the renderer.
+        expect(post_message).toHaveBeenCalledWith(
+            expect.objectContaining({
+                type: 'showWarning',
+                message: expect.stringContaining('cell highlight'),
+            }),
+        );
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(JSON.parse(grid_stub().getAttribute('data-undo-labels')!)).toEqual([]);
     });
 
     // Host-rejected saves. These are the deadlock case: the keys the host names are

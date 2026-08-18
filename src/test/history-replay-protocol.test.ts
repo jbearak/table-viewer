@@ -194,10 +194,30 @@ describe('sanitized_prepare_history_replay_request', () => {
         expect(parsed?.cells[0].sourceRow).toBe(3);
     });
 
-    it('rejects an empty cell list', () => {
-        // Nothing to prepare is not a replay; the caller should never have asked.
+    it('accepts an empty cell list when highlights carry the replay', () => {
+        // A highlight-only gesture writes no pending-edit state, so it has no
+        // cells — and needs no edit session, which the host decides from this very
+        // list rather than from anything the renderer claims.
+        const parsed = sanitized_prepare_history_replay_request(prepare_request({
+            cells: [],
+            highlights: [{
+                ordinal: 0,
+                worksheet: SHEET,
+                sourceRow: 1,
+                sourceColumn: 2,
+                expected: null,
+                desired: 'yellow',
+            }],
+        }));
+        expect(parsed?.cells).toEqual([]);
+        expect(parsed?.highlights).toHaveLength(1);
+    });
+
+    it('rejects a request with neither cells nor highlights', () => {
+        // Nothing to prepare is not a replay; it would take a lease authorizing
+        // nothing.
         expect(sanitized_prepare_history_replay_request(
-            prepare_request({ cells: [] }),
+            prepare_request({ cells: [], highlights: [] }),
         )).toBeUndefined();
     });
 

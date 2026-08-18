@@ -142,6 +142,7 @@ import {
 import {
     sanitized_abandon_history_replay_request,
     sanitized_commit_history_replay_request,
+    replay_request_requires_edit_session,
     sanitized_prepare_history_replay_request,
     type CommitHistoryReplayRequest,
     type HistoryReplayCommitRefused,
@@ -4161,8 +4162,12 @@ export function attach_viewer(
                 ...(receipt.scope.type === 'selection'
                     ? { sheetIndex: receipt.scope.sheetIndex }
                     : {}),
+                // The request id AND the gesture's deltas travel together, and
+                // only to the receiver that asked: a delta is the authority for
+                // entering something in THAT window's undo history, and another
+                // window's gesture must never enter it.
                 ...(receipt.originToken === cell_highlight_subscriber_token
-                    ? { requestId: receipt.requestId }
+                    ? { requestId: receipt.requestId, deltas: receipt.deltas }
                     : {}),
                 stateRevision: receipt.stateSnapshot.revision,
                 physicalRevision: receipt.authority.physicalRevision,
@@ -7042,11 +7047,25 @@ export function attach_viewer(
                     refuse('busy');
                     return;
                 }
-                if (!profile.editing || profile.previewMode === true) {
+                // A replay carrying cell writes mutates session-owned pending-edit
+                // state; one carrying only highlights mutates durable workbook
+                // state, which the ordinary highlight commands change with no
+                // session and outside edit mode. So the session requirement follows
+                // the cells — read through the shared derivation, so this gate and
+                // the lease binding below cannot disagree about what it admitted.
+                const requires_edit_session = replay_request_requires_edit_session(request);
+                if (profile.previewMode === true) {
                     refuse('unavailable');
                     return;
                 }
-                if (!owns_edit_session() || edit_cleanup_blocked()) {
+                if (requires_edit_session && !profile.editing) {
+                    refuse('unavailable');
+                    return;
+                }
+                if (
+                    requires_edit_session
+                    && (!owns_edit_session() || edit_cleanup_blocked())
+                ) {
                     refuse('edit-session-unavailable');
                     return;
                 }
@@ -7251,7 +7270,14 @@ export function attach_viewer(
         const expected_digest = session.acknowledged_physical_digest();
         const expected_authority = source_authority.authorityRevision;
         const expected_physical_revision = source_authority.physicalRevision;
-        const edit_session = active_edit_session_id;
+        // Bound only for a replay that writes pending edits. A highlight-only
+        // lease must be independent of the edit session in BOTH directions: it
+        // cannot require one, and it must not be invalidated by one starting or
+        // ending underneath it — highlights are not session state. The same
+        // derivation the admission gate used, so the lease cannot bind under
+        // assumptions the gate did not apply.
+        const requires_edit_session = replay_request_requires_edit_session(request);
+        const edit_session = requires_edit_session ? active_edit_session_id : undefined;
         const bound_source_generation = replay_core?.source_generation;
 
         /**
@@ -7277,9 +7303,18 @@ export function attach_viewer(
             && source_authority.authorityRevision === expected_authority
             && source_authority.physicalRevision === expected_physical_revision
             && file_coordinator.state_write_is_current(expected_authority)
-            && owns_edit_session()
-            && !edit_cleanup_blocked()
-            && active_edit_session_id === edit_session;
+            // Every term above is unconditional — the document, source, adoption,
+            // authority and digest identities bind every lease. Only the session
+            // terms are conditional, and a highlight-only lease is still
+            // self-invalidating without them.
+            && (
+                !requires_edit_session
+                || (
+                    owns_edit_session()
+                    && !edit_cleanup_blocked()
+                    && active_edit_session_id === edit_session
+                )
+            );
 
         if (
             src === undefined
@@ -7659,7 +7694,7 @@ export function attach_viewer(
         // the replay was in flight — and must leave history exactly where it is.
         let conflicted = false;
         let unavailable = false;
-        await update_file_state((current, updater_sheets) => {
+        const replay_committed = await update_file_state((current, updater_sheets) => {
             conflicted = false;
             unavailable = false;
             if (!payload.isCurrent()) {
@@ -7739,12 +7774,40 @@ export function attach_viewer(
         if (unavailable) return refused('unavailable');
         if (conflicted) return refused('conflict');
         if (!payload.isCurrent()) return refused('document-changed');
-        // The updater's own result is deliberately unused. An unchanged updater
-        // reports `undefined` — for a replay that means the document already held
-        // everything the replay would write, a byte-identical redo of a gesture
-        // that changed nothing durable, which is a success and not a refusal. The
-        // answer below is assembled from the retained preparation either way, so
-        // there is nothing to recover from the returned state.
+        // Highlights the replay wrote have to be PUBLISHED, not merely committed.
+        // `update_file_state` refreshes the session's state material without
+        // delivering it, which is right for pending edits — the renderer holds
+        // those in its own stores and applies the accepted writes itself — but a
+        // highlight lives only in durable state, so without this the cells would
+        // change on disk and never repaint.
+        //
+        // AFTER the currency check above, and never folded into the commit as a
+        // `deliver` flag: delivering supersedes the acknowledged snapshot, so
+        // `acknowledged_current()` — a term of `replay_is_current` — goes false
+        // the moment it happens. Delivering first would make this replay's own
+        // publication refuse it as `document-changed` with the highlight already
+        // durably written, leaving the renderer's history unmoved and every retry
+        // conflicting against the state the replay had in fact applied.
+        //
+        // Deliberately not the `cellHighlightsChanged` shape the highlight
+        // COMMANDS publish: that message carries a request id and the gesture's
+        // deltas, which are what enter a window's undo history. A replay is the
+        // history moving, so re-entering it would record undo as a new gesture.
+        if (highlight_patches.length > 0 && replay_committed !== undefined && !disposed) {
+            // The material already held, not `replay_committed` re-installed. An
+            // unrelated writer committing behind this replay installs a LATER
+            // revision, and `update_state_snapshot` refuses an older one — so
+            // re-installing to force the delivery would silently deliver nothing
+            // and leave the replayed highlight painted stale indefinitely. That
+            // newer material already contains this commit.
+            session.deliver_current_material();
+        }
+        // The updater's own result is used ONLY for that delivery. An unchanged
+        // updater reports `undefined` — for a replay that means the document
+        // already held everything the replay would write, a byte-identical redo of
+        // a gesture that changed nothing durable, which is a success and not a
+        // refusal, and needs no repaint. The answer below is assembled from the
+        // retained preparation either way.
         return Object.freeze({
             requestId: request.requestId,
             replayId: request.replayId,

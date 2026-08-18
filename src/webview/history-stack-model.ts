@@ -1140,6 +1140,19 @@ export function history_action(label: string, changes: readonly HistoryChange[])
 }
 
 /**
+ * Whether this action contains a cell change.
+ *
+ * Structural, deliberately: what a cell change IMPLIES about the edit session is
+ * replay policy and lives with the replay rules, not in the stack. Asked as a
+ * presence question and never as the absence of highlights, because one
+ * chronological history means a single action can carry both kinds and a caller
+ * reasoning from "no highlights" would answer wrongly for the mixed case.
+ */
+export function action_has_cell_changes(action: HistoryAction): boolean {
+    return action.changes.some((change) => change.kind === 'cell');
+}
+
+/**
  * The changes a direction should replay, in the order it must replay them.
  *
  * Undo walks a gesture backwards. Within one gesture that only matters for a
