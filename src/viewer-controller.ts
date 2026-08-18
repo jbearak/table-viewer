@@ -146,7 +146,6 @@ import {
     type CommitHistoryReplayRequest,
     type HistoryReplayCommitRefused,
     type HistoryReplayCommitted,
-    type HistoryReplayDirection,
     type HistoryReplayFocus,
     type HistoryReplayHighlightInput,
     type HistoryReplayPrepareRefused,
@@ -615,15 +614,33 @@ function materialize_replay_cells(
     requested: readonly { readonly sheet_index: number; readonly source_row: number; readonly source_column: number }[],
 ): Map<string, MaterializedReplayCell> {
     const observed = new Map<string, MaterializedReplayCell>();
-    const by_sheet = new Map<number, Map<number, { source_row: number; cols: number[] }>>();
+    // Group by SOURCE row first, so each distinct row is projected once. A wide
+    // action names many columns of one row, and projecting per cell would re-walk
+    // the source's row mapping once per column for no new information.
+    const requested_by_sheet = new Map<number, Map<number, number[]>>();
     for (const cell of requested) {
-        const projected = projected_row_for_source(src, cell.sheet_index, cell.source_row);
-        if (projected === undefined) continue;
-        const rows = by_sheet.get(cell.sheet_index) ?? new Map();
-        const entry = rows.get(projected);
-        if (entry) entry.cols.push(cell.source_column);
-        else rows.set(projected, { source_row: cell.source_row, cols: [cell.source_column] });
-        by_sheet.set(cell.sheet_index, rows);
+        let rows = requested_by_sheet.get(cell.sheet_index);
+        if (rows === undefined) {
+            rows = new Map();
+            requested_by_sheet.set(cell.sheet_index, rows);
+        }
+        const cols = rows.get(cell.source_row);
+        if (cols === undefined) rows.set(cell.source_row, [cell.source_column]);
+        else cols.push(cell.source_column);
+    }
+    const by_sheet = new Map<number, Map<number, { source_row: number; cols: number[] }>>();
+    for (const [sheet_index, source_rows] of requested_by_sheet) {
+        const rows = new Map<number, { source_row: number; cols: number[] }>();
+        for (const [source_row, cols] of source_rows) {
+            const projected = projected_row_for_source(src, sheet_index, source_row);
+            if (projected === undefined) continue;
+            const entry = rows.get(projected);
+            // Two source rows projecting to one row is not expected, but merging
+            // rather than overwriting keeps every requested column readable.
+            if (entry) entry.cols.push(...cols);
+            else rows.set(projected, { source_row, cols });
+        }
+        if (rows.size > 0) by_sheet.set(sheet_index, rows);
     }
     for (const [sheet_index, rows] of by_sheet) {
         const projected_rows = [...rows.keys()].sort((a, b) => a - b);
@@ -943,7 +960,6 @@ export function attach_viewer(
      * see the currency predicate built alongside each one.
      */
     interface ReplayLeasePayload {
-        readonly direction: HistoryReplayDirection;
         readonly cells: readonly HistoryReplayPreparedCell[];
         readonly highlights: readonly HistoryReplayHighlightInput[];
         /** Each prepared highlight's resolved sheet, by ordinal. */
@@ -7405,7 +7421,6 @@ export function attach_viewer(
                 replayId: request.replayId,
             },
             {
-                direction: request.direction,
                 cells: Object.freeze(prepared_cells),
                 highlights: request.highlights,
                 highlightSheetIndices: highlight_sheet_indices,
@@ -7431,8 +7446,6 @@ export function attach_viewer(
                 requestId: request.requestId,
                 replayId: request.replayId,
                 leaseId: lease.leaseId,
-                expiresAt: lease.expiresAt,
-                sourceGeneration: replay_core.source_generation,
                 focusSheetIndex: focus_sheet_index,
                 focus: request.focus,
                 cells: Object.freeze(prepared_cells),
@@ -7646,7 +7659,7 @@ export function attach_viewer(
         // the replay was in flight — and must leave history exactly where it is.
         let conflicted = false;
         let unavailable = false;
-        const committed = await update_file_state((current, updater_sheets) => {
+        await update_file_state((current, updater_sheets) => {
             conflicted = false;
             unavailable = false;
             if (!payload.isCurrent()) {
@@ -7672,9 +7685,11 @@ export function attach_viewer(
                 return current;
             }
             let next = current;
-            const by_sheet = new Map<number, typeof writes>();
+            const by_sheet = new Map<number, (typeof writes)[number][]>();
             for (const write of writes) {
-                by_sheet.set(write.sheetIndex, [...(by_sheet.get(write.sheetIndex) ?? []), write]);
+                const sheet_writes = by_sheet.get(write.sheetIndex);
+                if (sheet_writes === undefined) by_sheet.set(write.sheetIndex, [write]);
+                else sheet_writes.push(write);
             }
             for (const [sheet_index, sheet_writes] of by_sheet) {
                 const sheet = identities[sheet_index];
@@ -7724,24 +7739,18 @@ export function attach_viewer(
         if (unavailable) return refused('unavailable');
         if (conflicted) return refused('conflict');
         if (!payload.isCurrent()) return refused('document-changed');
-        // An unchanged updater reports undefined, which for a replay means the
-        // document already held everything the replay would write — a
-        // byte-identical redo of a gesture that changed nothing durable. The
-        // renderer still needs its answer, so recover the current revision.
-        const state = committed ?? await read_file_state(false);
-        if (!payload.isCurrent()) return refused('document-changed');
-
+        // The updater's own result is deliberately unused. An unchanged updater
+        // reports `undefined` — for a replay that means the document already held
+        // everything the replay would write, a byte-identical redo of a gesture
+        // that changed nothing durable, which is a success and not a refusal. The
+        // answer below is assembled from the retained preparation either way, so
+        // there is nothing to recover from the returned state.
         return Object.freeze({
             requestId: request.requestId,
             replayId: request.replayId,
             leaseId: request.leaseId,
             mutationId: request.mutationId,
-            stateRevision: state.revision,
             sourceGeneration: payload.sourceGeneration,
-            sheetIndices: Object.freeze([...new Set([
-                ...writes.map((write) => write.sheetIndex),
-                ...highlight_patches.map((patch) => patch.sheetIndex),
-            ])].sort((left, right) => left - right)),
             cells: Object.freeze(writes.map((write) => Object.freeze({
                 ordinal: write.ordinal,
                 resolvedSheetIndex: write.sheetIndex,

@@ -34,7 +34,7 @@
  */
 
 import { cell_highlight_key } from './cell-highlights';
-import { hyperlinks_equal, type CellHyperlink, type RichText } from './cell-content';
+import { hyperlinks_equal, rich_text_equal, type CellHyperlink, type RichText } from './cell-content';
 import type {
     WireCellOverlayState,
     WireHistoryValue,
@@ -47,9 +47,18 @@ import {
     type SheetPendingEditCells,
 } from './types';
 
-/** The `row:col` source key durable pending edits and highlights share. */
+/**
+ * The `row:col` source key durable pending edits and highlights share.
+ *
+ * Delegates to `cell_highlight_key` rather than formatting its own string: the
+ * two must agree, and a second formatter would let a key-format change reach
+ * highlights while leaving replayed pending edits addressing the old shape.
+ * Its coordinate guard is unreachable here — the protocol's `is_source_index`
+ * has already rejected anything that is not a non-negative safe integer — so it
+ * costs nothing and documents the shared invariant.
+ */
 export function replay_cell_key(source_row: number, source_column: number): string {
-    return `${source_row}:${source_column}`;
+    return cell_highlight_key(source_row, source_column);
 }
 
 /**
@@ -256,7 +265,19 @@ export function replay_highlight_patches(
         .map(([sheetIndex, cells]) => Object.freeze({ sheetIndex, cells })));
 }
 
-/** Whether two optional rich-text values carry the same runs. */
+/**
+ * Whether two optional rich-text values carry the same runs.
+ *
+ * Run comparison delegates to `rich_text_equal`, the shared normalizing
+ * comparison, rather than walking runs here: a private definition of run and
+ * style equality would drift from the one the rest of the editor uses, and a
+ * replay would then call formatting-identical content changed (or the reverse).
+ *
+ * Absence is compared before delegating, because "no runs" and "empty runs" are
+ * not the same observation: an unstyled cell records no runs at all, and reading
+ * a missing side as `{runs: []}` would call a styled cell equal to a plain one
+ * whose runs normalize away.
+ */
 function wire_values_equal(left: WireHistoryValue, right: WireHistoryValue): boolean {
     if (left.text !== right.text) return false;
     return runs_equal(left.runs, right.runs);
@@ -264,13 +285,7 @@ function wire_values_equal(left: WireHistoryValue, right: WireHistoryValue): boo
 
 function runs_equal(left: RichText | undefined, right: RichText | undefined): boolean {
     if (left === undefined || right === undefined) return left === right;
-    if (left.runs.length !== right.runs.length) return false;
-    return left.runs.every((run, index) => {
-        const other = right.runs[index];
-        return other !== undefined
-            && run.text === other.text
-            && JSON.stringify(run.style ?? {}) === JSON.stringify(other.style ?? {});
-    });
+    return rich_text_equal(left, right);
 }
 
 /**

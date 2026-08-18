@@ -35,7 +35,6 @@ function prepare_request(overrides: Record<string, unknown> = {}): unknown {
     return {
         requestId: 'req-1',
         replayId: 'replay-1',
-        direction: 'undo',
         cells: [{
             ordinal: 0,
             worksheet: SHEET,
@@ -177,7 +176,7 @@ describe('sanitized_wire_history_replay_focus', () => {
 describe('sanitized_prepare_history_replay_request', () => {
     it('accepts a well-formed request and owns it', () => {
         const parsed = sanitized_prepare_history_replay_request(prepare_request());
-        expect(parsed?.direction).toBe('undo');
+        expect(parsed?.requestId).toBe('req-1');
         expect(parsed?.cells).toHaveLength(1);
         expect(Object.isFrozen(parsed)).toBe(true);
         expect(Object.isFrozen(parsed?.cells)).toBe(true);
@@ -228,10 +227,15 @@ describe('sanitized_prepare_history_replay_request', () => {
         )).toBeUndefined();
     });
 
-    it('rejects an unknown direction', () => {
-        expect(sanitized_prepare_history_replay_request(
+    it('ignores a direction, which the wire deliberately does not carry', () => {
+        // Undo and redo are already resolved into each delta's expected/desired
+        // sides, so a direction on the wire would be a second account of the same
+        // intent. An old renderer that still sends one is not rejected for it.
+        const parsed = sanitized_prepare_history_replay_request(
             prepare_request({ direction: 'sideways' }),
-        )).toBeUndefined();
+        );
+        expect(parsed).not.toBeUndefined();
+        expect(parsed).not.toHaveProperty('direction');
     });
 
     it('rejects an empty correlation id', () => {

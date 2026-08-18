@@ -157,9 +157,17 @@ interface RunningReplay {
     readonly highlightCount: number;
     /** Set once the host has answered a prepare. */
     plan?: ReplayPlan;
-    /** Set once a commit has been sent, and retained if its answer is lost. */
+    /**
+     * Set once a commit has been sent, and retained if its answer is lost.
+     *
+     * The only record of a lease this replay keeps, and deliberately so: every
+     * pre-commit path — a store that moved, a plan that refused, a planned write
+     * with no ordinal — abandons the lease before returning, and the success path
+     * sets this synchronously. There is therefore no reachable state in which a
+     * lease is held but no commit was sent, and no second field is needed to
+     * describe one.
+     */
     commit?: CommitHistoryReplayRequest;
-    leaseId?: string;
 }
 
 export function create_history_replay_coordinator(
@@ -279,7 +287,6 @@ export function create_history_replay_coordinator(
             }
             replay.plan = result;
             replay.commit = commit;
-            replay.leaseId = prepared.leaseId;
             host.post({ type: 'commitHistoryReplay', request: commit });
         },
 
@@ -319,19 +326,11 @@ export function create_history_replay_coordinator(
         reset: () => {
             const replay = running;
             if (replay === undefined) return;
-            if (replay.commit === undefined && replay.leaseId !== undefined) {
-                host.post({
-                    type: 'abandonHistoryReplay',
-                    request: {
-                        requestId: replay.requestId,
-                        replayId: replay.replayId,
-                        leaseId: replay.leaseId,
-                    },
-                });
-            }
-            // Not abandoned once a commit has been sent: abandonment races that
-            // commit, and losing the race must not cancel a mutation that is
-            // already running. The document's answer is simply no longer wanted.
+            // Nothing to abandon, in either phase. Before a commit the replay
+            // holds no lease — every pre-commit exit in `on_prepared` abandons
+            // before returning — and after one, abandonment would race the commit
+            // it names, and losing that race must not cancel a mutation already
+            // running. The document's answer is simply no longer wanted.
             refuse('document-changed');
         },
     };
@@ -391,7 +390,6 @@ function build_prepare_request(
     return {
         requestId: host.next_id('replay-prepare'),
         replayId: host.next_id('replay'),
-        direction,
         cells: Object.freeze(cells),
         highlights: Object.freeze(highlights),
         focus,
@@ -525,9 +523,7 @@ function prepare_refusal_reason(
         case 'unavailable':
         case 'edit-session-unavailable':
             return 'unavailable';
-        default:
-            // `document-changed` and `expired` are the same fact to the caller:
-            // the state this replay was planned against is gone.
+        case 'document-changed':
             return 'document-changed';
     }
 }
@@ -541,7 +537,10 @@ function commit_refusal_reason(
         case 'proposal-mismatch':
             return 'malformed';
         case 'unavailable': return 'unavailable';
-        default:
+        case 'expired':
+        case 'document-changed':
+            // The same fact to the caller: the state this replay was planned
+            // against is gone, and a fresh preparation is the only way forward.
             return 'document-changed';
     }
 }

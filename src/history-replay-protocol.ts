@@ -66,18 +66,16 @@
 import { is_plain_record } from './plain-record';
 import { is_matching_rich_text, type CellHyperlink, type RichText } from './cell-content';
 import { is_valid_hyperlink } from './pending-changes';
+import { sanitize_cell_highlight_color } from './cell-highlights';
 import {
     is_strict_wire_dirty_entry,
     make_dirty_entry,
     sanitized_wire_worksheet_target,
-    CELL_HIGHLIGHT_COLORS,
     type CellHighlightColor,
     type CsvDirtyEntry,
     type WorksheetTarget,
 } from './types';
 
-/** Which way the action is being replayed. Mirrors the webview's own union. */
-export type HistoryReplayDirection = 'undo' | 'redo';
 
 /** How long an issued, unconsumed lease stays usable. */
 export const HISTORY_REPLAY_LEASE_TTL_MS = 30_000;
@@ -216,8 +214,17 @@ export interface HistoryReplayFocus {
     readonly sourceColumnEnd: number;
 }
 
+/**
+ * What a renderer asks the host to verify and lease.
+ *
+ * Deliberately direction-free. Undo and redo differ only in which side of each
+ * delta is `expected` and which is `desired`, and the renderer has already
+ * resolved that before building this request — every field below describes a
+ * transition, not a traversal. Sending the direction too would give the host a
+ * second, redundant account of the same intent that nothing reads and that could
+ * disagree with the deltas it accompanies.
+ */
 export interface PrepareHistoryReplayRequest extends HistoryReplayCorrelation {
-    readonly direction: HistoryReplayDirection;
     readonly cells: readonly HistoryReplayCellInput[];
     readonly highlights: readonly HistoryReplayHighlightInput[];
     readonly focus: HistoryReplayFocus;
@@ -240,21 +247,33 @@ export interface HistoryReplayPreparedCell {
 }
 
 export interface HistoryReplayPrepared extends HistoryReplayLeaseIdentity {
-    readonly expiresAt: number;
-    readonly sourceGeneration: number;
+    /**
+     * The focus the host resolved, echoed so the renderer plans against the
+     * region the LEASE covers rather than the one it asked for.
+     *
+     * No lease expiry is published. The TTL is the lease registry's own business
+     * and a renderer cannot act on it usefully: a lease that expires mid-round-trip
+     * refuses the commit, which is the same answer a countdown would have produced
+     * one round trip earlier.
+     */
     readonly focusSheetIndex: number;
     readonly focus: HistoryReplayFocus;
     readonly cells: readonly HistoryReplayPreparedCell[];
 }
 
+/**
+ * Why a preparation was refused.
+ *
+ * No `expired` arm: nothing can expire before a lease exists. Expiry is a
+ * commit-time outcome, where a lease issued a round trip ago may be gone.
+ */
 export type HistoryReplayPrepareRefusalReason =
     | 'malformed'
     | 'busy'
     | 'unavailable'
     | 'document-changed'
     | 'edit-session-unavailable'
-    | 'conflict'
-    | 'expired';
+    | 'conflict';
 
 export interface HistoryReplayPrepareRefused extends HistoryReplayCorrelation {
     readonly reason: HistoryReplayPrepareRefusalReason;
@@ -295,23 +314,35 @@ export interface HistoryReplayAcceptedCellWrite {
 
 export interface HistoryReplayCommitted extends HistoryReplayLeaseIdentity {
     readonly mutationId: string;
-    readonly stateRevision: number;
     readonly sourceGeneration: number;
     /**
-     * A plain frozen array, never a `Uint32Array`: `readonly` on a typed array
-     * is a claim the type system cannot keep — the elements stay writable — and
-     * this crosses a boundary where the receiver must be able to trust it.
+     * Every cell the host actually wrote, each named by the ordinal preparation
+     * assigned. This IS the renderer's instruction set — it applies exactly these
+     * and nothing it planned locally — so the accepted set is the response.
+     *
+     * Deliberately no `sheetIndices` summary and no resulting state revision: the
+     * sheets are derivable from `cells` and the focus, and the revision would
+     * force the no-op commit path to re-read durable state to fill a field no
+     * receiver has a use for.
      */
-    readonly sheetIndices: readonly number[];
     readonly cells: readonly HistoryReplayAcceptedCellWrite[];
     readonly focusSheetIndex: number;
     readonly focus: HistoryReplayFocus;
 }
 
+/**
+ * Why a commit was refused.
+ *
+ * `expired` covers every "no lease by that name" outcome at once — expired
+ * unspent, abandoned, or invalidated by an adoption — because all three are
+ * terminal for the renderer in exactly the same way: it must prepare afresh.
+ * There is deliberately no `already-consumed`: a consumed lease re-presented
+ * with the same proposal REPLAYS its retained answer, and one presented with a
+ * different proposal is a `proposal-mismatch`.
+ */
 export type HistoryReplayCommitRefusalReason =
     | 'malformed'
     | 'expired'
-    | 'already-consumed'
     | 'proposal-mismatch'
     | 'conflict'
     | 'document-changed'
@@ -423,13 +454,18 @@ export function sanitized_wire_cell_overlay_state(
     return undefined;
 }
 
+/**
+ * A wire highlight colour, or `null` for cleared.
+ *
+ * The palette check delegates to `sanitize_cell_highlight_color`, the same
+ * validator the highlight commands and persisted state use: a second list of
+ * accepted colours would let a palette change reach highlights but not replay.
+ * Only the `null` arm is replay's own — a delta's target may be "no highlight",
+ * which the shared sanitizer has no reason to accept.
+ */
 function sanitized_wire_highlight_color(value: unknown): CellHighlightColor | null | undefined {
     if (value === null) return null;
-    if (typeof value !== 'string') return undefined;
-    for (const color of CELL_HIGHLIGHT_COLORS) {
-        if (color === value) return color;
-    }
-    return undefined;
+    return sanitize_cell_highlight_color(value);
 }
 
 export function sanitized_wire_history_replay_focus(
@@ -513,7 +549,6 @@ export function sanitized_prepare_history_replay_request(
 ): PrepareHistoryReplayRequest | undefined {
     const correlation = sanitized_correlation(value);
     if (correlation === undefined || !is_plain_record(value)) return undefined;
-    if (value.direction !== 'undo' && value.direction !== 'redo') return undefined;
     const focus = sanitized_wire_history_replay_focus(value.focus);
     if (focus === undefined) return undefined;
 
@@ -565,7 +600,6 @@ export function sanitized_prepare_history_replay_request(
 
     return Object.freeze({
         ...correlation,
-        direction: value.direction,
         cells,
         highlights,
         focus,

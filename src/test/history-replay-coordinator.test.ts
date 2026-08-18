@@ -126,8 +126,6 @@ function prepared_for(request: PrepareHistoryReplayRequest): HistoryReplayPrepar
         requestId: request.requestId,
         replayId: request.replayId,
         leaseId: 'lease-1',
-        expiresAt: 30_000,
-        sourceGeneration: 7,
         focusSheetIndex: request.focus.worksheet.sheetIndex,
         focus: request.focus,
         cells: request.cells.map((cell) => ({
@@ -174,7 +172,6 @@ describe('beginning a replay', () => {
         const { coordinator, posted } = harness([cell_change(3, 4, 'typed')]);
         void coordinator.begin('undo');
         const request = last_prepare(posted);
-        expect(request.direction).toBe('undo');
         expect(request.cells).toHaveLength(1);
         expect(request.cells[0]?.sourceRow).toBe(3);
         // The CURRENT overlay, not the recorded before-side: the host compares it
@@ -353,9 +350,7 @@ describe('settling', () => {
             replayId: commit.replayId,
             leaseId: commit.leaseId,
             mutationId: commit.mutationId,
-            stateRevision: 12,
             sourceGeneration: 7,
-            sheetIndices: [0],
             cells: commit.cells.map((cell) => ({
                 ordinal: cell.ordinal,
                 resolvedSheetIndex: 0,
@@ -372,7 +367,7 @@ describe('settling', () => {
         const { outcome } = await committed_outcome();
         expect(outcome.kind).toBe('committed');
         if (outcome.kind !== 'committed') return;
-        expect(outcome.committed.stateRevision).toBe(12);
+        expect(outcome.committed.sourceGeneration).toBe(7);
         expect(outcome.plan.direction).toBe('undo');
     });
 
@@ -403,14 +398,14 @@ describe('settling', () => {
         expect(coordinator.is_busy()).toBe(false);
     });
 
-    it('reads an expired lease as the document having moved', async () => {
+    it('reads a moved document as the state it planned against being gone', async () => {
         const { coordinator, posted } = harness([cell_change(0, 0, 'typed')]);
         const pending = coordinator.begin('undo');
         const request = last_prepare(posted);
         coordinator.on_prepare_refused({
             requestId: request.requestId,
             replayId: request.replayId,
-            reason: 'expired',
+            reason: 'document-changed',
         });
         await expect(pending).resolves.toEqual({ kind: 'refused', reason: 'document-changed' });
     });

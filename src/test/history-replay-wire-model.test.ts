@@ -73,8 +73,6 @@ function prepared(cells: readonly HistoryReplayPreparedCell[]): HistoryReplayPre
         requestId: 'req-1',
         replayId: 'replay-1',
         leaseId: 'lease-1',
-        expiresAt: 30_000,
-        sourceGeneration: 7,
         focusSheetIndex: 0,
         focus: {
             worksheet: SHEET,
