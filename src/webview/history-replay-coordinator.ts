@@ -54,6 +54,7 @@ import {
     type ReplayRequestSources,
 } from './history-replay-request-model';
 import {
+    action_requires_edit_session,
     peek_history,
     type HistoryEntry,
     type HistoryStackState,
@@ -99,6 +100,11 @@ export interface ReplayCoordinatorHost extends ReplayRequestSources {
      * of one therefore has to acquire a session before it can prepare: there is
      * otherwise no session for the host to authorize a write against, and no
      * store the restored overlays could be installed into.
+     *
+     * Called only for an action that writes CELLS — see
+     * `action_requires_edit_session`. Highlights are durable workbook state, and
+     * putting the user into edit mode to undo one would be entering content-editing
+     * for a gesture that was never a content edit.
      *
      * Awaited before the prepare request is built, never alongside it. A grant
      * crosses a hydration boundary that replaces the stores wholesale, so a
@@ -275,28 +281,40 @@ export function create_history_replay_coordinator(
                 resolve({ kind: 'refused', reason: 'nothing-to-replay' });
                 return;
             }
+            // And acquire one only for a gesture that actually writes cells.
+            // Highlights are durable workbook state, changeable outside edit mode
+            // entirely, so undoing a highlight-only gesture must not put the user
+            // into editing — while a MIXED gesture carries a cell write and still
+            // must. Decided on this pre-grant read, which is sound for the purpose:
+            // a grant can move the history, but only a cell-carrying entry asks for
+            // one, and the post-grant read below is what the request is built from.
+            const needs_session = action_requires_edit_session(before_acquiring.entry.action);
             const held: AcquiringReplay = { kind: 'acquiring', direction, settle: resolve };
             active = held;
             void (async () => {
-                let granted: boolean;
-                try {
-                    granted = await host.ensure_session();
-                } catch {
-                    granted = false;
-                }
-                if (!granted) {
-                    // No session, so nothing to authorize a write against. An
-                    // ordinary refusal, not an error: the host may simply refuse,
-                    // and after a failed discard cleanup editing is disabled for
-                    // the whole file.
-                    release(held, { kind: 'refused', reason: 'unavailable' });
-                    return;
+                if (needs_session) {
+                    let granted: boolean;
+                    try {
+                        granted = await host.ensure_session();
+                    } catch {
+                        granted = false;
+                    }
+                    if (!granted) {
+                        // No session, so nothing to authorize a write against. An
+                        // ordinary refusal, not an error: the host may simply
+                        // refuse, and after a failed discard cleanup editing is
+                        // disabled for the whole file.
+                        release(held, { kind: 'refused', reason: 'unavailable' });
+                        return;
+                    }
                 }
                 if (active !== held) return;
-                // Read AFTER the acquisition, never carried across it: a grant
+                // Read AFTER any acquisition, never carried across it: a grant
                 // replaces the stores wholesale, so the overlays a request must
                 // describe are the post-install ones, and the epoch may have moved
-                // — which is what would make an entry read earlier stale.
+                // — which is what would make an entry read earlier stale. Re-read
+                // even when nothing was acquired, because this runs a turn later
+                // and a recording can have landed in between.
                 const peek = peek_history(host.history(), direction);
                 if (peek.kind === 'blocked') {
                     release(held, { kind: 'refused', reason: 'blocked' });

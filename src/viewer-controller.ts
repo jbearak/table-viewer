@@ -7046,11 +7046,29 @@ export function attach_viewer(
                     refuse('busy');
                     return;
                 }
-                if (!profile.editing || profile.previewMode === true) {
+                // A replay carrying cell writes mutates session-owned pending-edit
+                // state; one carrying only highlights mutates durable workbook
+                // state, which the ordinary highlight commands change with no
+                // session and outside edit mode. So the session requirement follows
+                // the cells.
+                //
+                // Decided from the SANITIZED request's own cell list, never from
+                // anything the renderer asserts: a claim of "highlights only" would
+                // otherwise be a way to write pending edits with no session behind
+                // them. A mixed request has cells, so it still requires one.
+                const requires_edit_session = request.cells.length > 0;
+                if (profile.previewMode === true) {
                     refuse('unavailable');
                     return;
                 }
-                if (!owns_edit_session() || edit_cleanup_blocked()) {
+                if (requires_edit_session && !profile.editing) {
+                    refuse('unavailable');
+                    return;
+                }
+                if (
+                    requires_edit_session
+                    && (!owns_edit_session() || edit_cleanup_blocked())
+                ) {
                     refuse('edit-session-unavailable');
                     return;
                 }
@@ -7255,7 +7273,12 @@ export function attach_viewer(
         const expected_digest = session.acknowledged_physical_digest();
         const expected_authority = source_authority.authorityRevision;
         const expected_physical_revision = source_authority.physicalRevision;
-        const edit_session = active_edit_session_id;
+        // Bound only for a replay that writes pending edits. A highlight-only
+        // lease must be independent of the edit session in BOTH directions: it
+        // cannot require one, and it must not be invalidated by one starting or
+        // ending underneath it — highlights are not session state.
+        const requires_edit_session = request.cells.length > 0;
+        const edit_session = requires_edit_session ? active_edit_session_id : undefined;
         const bound_source_generation = replay_core?.source_generation;
 
         /**
@@ -7281,9 +7304,18 @@ export function attach_viewer(
             && source_authority.authorityRevision === expected_authority
             && source_authority.physicalRevision === expected_physical_revision
             && file_coordinator.state_write_is_current(expected_authority)
-            && owns_edit_session()
-            && !edit_cleanup_blocked()
-            && active_edit_session_id === edit_session;
+            // Every term above is unconditional — the document, source, adoption,
+            // authority and digest identities bind every lease. Only the session
+            // terms are conditional, and a highlight-only lease is still
+            // self-invalidating without them.
+            && (
+                !requires_edit_session
+                || (
+                    owns_edit_session()
+                    && !edit_cleanup_blocked()
+                    && active_edit_session_id === edit_session
+                )
+            );
 
         if (
             src === undefined
@@ -7663,7 +7695,7 @@ export function attach_viewer(
         // the replay was in flight — and must leave history exactly where it is.
         let conflicted = false;
         let unavailable = false;
-        await update_file_state((current, updater_sheets) => {
+        const replay_committed = await update_file_state((current, updater_sheets) => {
             conflicted = false;
             unavailable = false;
             if (!payload.isCurrent()) {
@@ -7743,6 +7775,27 @@ export function attach_viewer(
         if (unavailable) return refused('unavailable');
         if (conflicted) return refused('conflict');
         if (!payload.isCurrent()) return refused('document-changed');
+        // Highlights the replay wrote have to be PUBLISHED, not merely committed.
+        // `update_file_state` refreshes the session's state material without
+        // delivering it, which is right for pending edits — the renderer already
+        // holds those in its own stores and applies the accepted writes itself —
+        // but a highlight lives only in durable state, so without this the cells
+        // would change on disk and never repaint.
+        //
+        // Deliberately not the `cellHighlightsChanged` shape the highlight
+        // COMMANDS publish: that message carries a request id and the gesture's
+        // deltas, which are what enter a window's undo history. A replay is the
+        // history moving, so re-entering it would record undo as a new gesture.
+        if (
+            highlight_patches.length > 0
+            && replay_committed !== undefined
+            && !disposed
+        ) {
+            session.update_state_snapshot(
+                project_state_for_panel(replay_committed),
+                { deliver: true },
+            );
+        }
         // The updater's own result is deliberately unused. An unchanged updater
         // reports `undefined` — for a replay that means the document already held
         // everything the replay would write, a byte-identical redo of a gesture

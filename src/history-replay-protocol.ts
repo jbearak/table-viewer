@@ -225,6 +225,12 @@ export interface HistoryReplayFocus {
  * disagree with the deltas it accompanies.
  */
 export interface PrepareHistoryReplayRequest extends HistoryReplayCorrelation {
+    /**
+     * May be EMPTY: a highlight-only gesture writes no pending-edit state. Such a
+     * replay also needs no edit session, which is why the host decides that
+     * requirement from this list's length rather than from a renderer-supplied
+     * claim. What is never valid is a request with neither cells nor highlights.
+     */
     readonly cells: readonly HistoryReplayCellInput[];
     readonly highlights: readonly HistoryReplayHighlightInput[];
     readonly focus: HistoryReplayFocus;
@@ -580,7 +586,7 @@ export function sanitized_prepare_history_replay_request(
             overlay,
         });
     });
-    if (cells === undefined || cells.length === 0) return undefined;
+    if (cells === undefined) return undefined;
 
     const highlights = sanitized_ordinal_list<HistoryReplayHighlightInput>(
         value.highlights,
@@ -606,7 +612,11 @@ export function sanitized_prepare_history_replay_request(
             });
         },
     );
+    // Empty cells are legitimate — a highlight-only replay has none — but a
+    // request empty of BOTH names no mutation at all, and would take a lease
+    // authorizing nothing.
     if (highlights === undefined) return undefined;
+    if (cells.length === 0 && highlights.length === 0) return undefined;
 
     return Object.freeze({
         ...correlation,

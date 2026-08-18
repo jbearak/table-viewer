@@ -119,7 +119,12 @@ export function build_prepare_request(
             overlay,
         ));
     }
-    if (cells.length === 0 || focus === undefined) return undefined;
+    // A highlight-only action has no cells, and is replayable: highlights are
+    // durable workbook state, not session-owned pending edits. What no request can
+    // be is empty of both — there would be nothing for the host to verify or apply.
+    if (focus === undefined || (cells.length === 0 && highlights.length === 0)) {
+        return undefined;
+    }
     return {
         requestId: sources.next_id('replay-prepare'),
         replayId: sources.next_id('replay'),

@@ -223,6 +223,34 @@ describe('beginning a replay', () => {
             expect(posted).toEqual([]);
         });
 
+        it('does not acquire one for a highlight-only gesture', async () => {
+            // Highlights are durable workbook state, changeable outside edit mode.
+            // Acquiring a session would put the user into content editing to undo a
+            // gesture that never edited content.
+            const { coordinator, session, posted } = harness([
+                highlight_change(2, 3, null, 'yellow'),
+            ]);
+            await started(coordinator, 'undo');
+
+            expect(session.calls).toBe(0);
+            // And it still goes out: a highlight-only replay is prepared like any
+            // other, with an empty cell list.
+            expect(posted).toHaveLength(1);
+            expect(coordinator.is_busy()).toBe(true);
+        });
+
+        it('acquires one for a mixed gesture, which carries a cell write', async () => {
+            // One chronological history means an action can hold both kinds. The
+            // cell write still needs a session behind it.
+            const { coordinator, session } = harness([
+                cell_change(0, 0, 'typed'),
+                highlight_change(2, 3, null, 'yellow'),
+            ]);
+            await started(coordinator, 'undo');
+
+            expect(session.calls).toBe(1);
+        });
+
         it('does not acquire one when there is nothing to replay', async () => {
             // Acquiring a session puts the window INTO edit mode. Pressing undo on
             // an empty history must not start editing the file and then refuse, so

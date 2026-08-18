@@ -206,8 +206,33 @@ describe('build_prepare_request', () => {
         expect(prepare([cell_change(0, 0, 'a')], 'undo', new Set(['0:0']))).toBeUndefined();
     });
 
-    it('refuses an action with no cells to replay', () => {
-        expect(prepare([highlight_change(0, 0, null, 'yellow')])).toBeUndefined();
+    it('builds a highlight-only request, which has no cells at all', () => {
+        // Highlights are durable workbook state, not session-owned pending edits,
+        // so a gesture that only painted cells is replayable with an empty cell
+        // list — and, on the host side, with no edit session.
+        const request = prepare([highlight_change(4, 5, null, 'yellow')]);
+        expect(request?.cells).toEqual([]);
+        expect(request?.highlights).toHaveLength(1);
+        // Focus still lands on the region the gesture touched: it is extended by
+        // every change, not only by cells.
+        expect(request?.focus).toMatchObject({
+            sourceRowStart: 4,
+            sourceRowEnd: 4,
+            sourceColumnStart: 5,
+            sourceColumnEnd: 5,
+        });
+    });
+
+    it('refuses an action with neither cells nor highlights', () => {
+        // Nothing for the host to verify or apply, so a lease would authorize
+        // nothing. The recorder refuses an empty gesture upstream, so this cannot
+        // arrive through the store — the guard is the request model's own, and is
+        // asserted against a hand-built entry for exactly that reason.
+        const empty: HistoryEntry = {
+            ...entry([cell_change(0, 0, 'a')]),
+            action: { label: 'Edit', changes: [] },
+        };
+        expect(build_prepare_request(empty, 'undo', sources([]))).toBeUndefined();
     });
 
     describe('highlight expectations', () => {
