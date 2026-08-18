@@ -546,15 +546,26 @@ function harvest_source_bases(
     // records an entry, `null` for linkless, and only an unobserved cell reads
     // as undefined.
     const observed_links = new Map<string, CellHyperlink | null>();
-    const by_projected_row = new Map<number, { source_row: number; cols: number[] }>();
+    // Group by SOURCE row first, so each distinct row is projected once. A wide
+    // edit or replay names many columns of one row, and projecting per key would
+    // re-walk the source's row mapping once per column for no new information.
+    const cols_by_source_row = new Map<number, number[]>();
     for (const key of wanted_bases) {
         const [source_row, col] = key.split(':').map(Number);
         if (!Number.isInteger(source_row) || !Number.isInteger(col)) continue;
+        const cols = cols_by_source_row.get(source_row);
+        if (cols) cols.push(col);
+        else cols_by_source_row.set(source_row, [col]);
+    }
+    const by_projected_row = new Map<number, { source_row: number; cols: number[] }>();
+    for (const [source_row, cols] of cols_by_source_row) {
         const projected = projected_row_for_source(src, sheet_index, source_row);
         if (projected === undefined) continue;
         const entry = by_projected_row.get(projected);
-        if (entry) entry.cols.push(col);
-        else by_projected_row.set(projected, { source_row, cols: [col] });
+        // Two source rows projecting to one row is not expected, but merging
+        // rather than overwriting keeps every requested column observable.
+        if (entry) entry.cols.push(...cols);
+        else by_projected_row.set(projected, { source_row, cols });
     }
     const projected_rows = [...by_projected_row.keys()].sort((a, b) => a - b);
     for (let start = 0; start < projected_rows.length; start += SAVE_WINDOW) {
@@ -598,12 +609,13 @@ export interface MaterializedReplayCell {
 }
 
 /**
- * Read the persisted content behind a set of replay cells, batched by row.
+ * Read the persisted content behind a set of replay cells.
  *
- * The same shape as `harvest_source_bases` and for the same reason: a
- * workbook-wide gesture can name thousands of cells, and reading them one call
- * at a time would make an undo keypress walk the source once per cell. Grouped
- * by projected row, chunked, and read through the source's indexed reader.
+ * `harvest_source_bases` per sheet, deliberately: the projection step, the row
+ * grouping, the `SAVE_WINDOW` batching and the rich/hyperlink derivation are
+ * exactly what a save's base validation needs, and a replay that read cells even
+ * slightly differently would refuse bases the save path accepts, or accept ones
+ * it refuses. One reader means the two cannot disagree.
  *
  * Renderer page residency has nothing to do with this. The host reads the source
  * directly, so a replay reaches a background sheet and rows the webview never
@@ -613,55 +625,26 @@ function materialize_replay_cells(
     src: DataSource,
     requested: readonly { readonly sheet_index: number; readonly source_row: number; readonly source_column: number }[],
 ): Map<string, MaterializedReplayCell> {
-    const observed = new Map<string, MaterializedReplayCell>();
-    // Group by SOURCE row first, so each distinct row is projected once. A wide
-    // action names many columns of one row, and projecting per cell would re-walk
-    // the source's row mapping once per column for no new information.
-    const requested_by_sheet = new Map<number, Map<number, number[]>>();
+    const wanted_by_sheet = new Map<number, Set<string>>();
     for (const cell of requested) {
-        let rows = requested_by_sheet.get(cell.sheet_index);
-        if (rows === undefined) {
-            rows = new Map();
-            requested_by_sheet.set(cell.sheet_index, rows);
-        }
-        const cols = rows.get(cell.source_row);
-        if (cols === undefined) rows.set(cell.source_row, [cell.source_column]);
-        else cols.push(cell.source_column);
+        const wanted = wanted_by_sheet.get(cell.sheet_index);
+        const key = `${cell.source_row}:${cell.source_column}`;
+        if (wanted === undefined) wanted_by_sheet.set(cell.sheet_index, new Set([key]));
+        else wanted.add(key);
     }
-    const by_sheet = new Map<number, Map<number, { source_row: number; cols: number[] }>>();
-    for (const [sheet_index, source_rows] of requested_by_sheet) {
-        const rows = new Map<number, { source_row: number; cols: number[] }>();
-        for (const [source_row, cols] of source_rows) {
-            const projected = projected_row_for_source(src, sheet_index, source_row);
-            if (projected === undefined) continue;
-            const entry = rows.get(projected);
-            // Two source rows projecting to one row is not expected, but merging
-            // rather than overwriting keeps every requested column readable.
-            if (entry) entry.cols.push(...cols);
-            else rows.set(projected, { source_row, cols });
-        }
-        if (rows.size > 0) by_sheet.set(sheet_index, rows);
-    }
-    for (const [sheet_index, rows] of by_sheet) {
-        const projected_rows = [...rows.keys()].sort((a, b) => a - b);
-        for (let start = 0; start < projected_rows.length; start += SAVE_WINDOW) {
-            const batch = projected_rows.slice(start, start + SAVE_WINDOW);
-            const { rows: read } = read_source_rows_indexed(src, sheet_index, batch);
-            batch.forEach((projected, offset) => {
-                const entry = rows.get(projected);
-                if (entry === undefined) return;
-                const row = read[offset] ?? [];
-                for (const col of entry.cols) {
-                    const cell = row[col];
-                    // An unread column stays absent rather than reading as empty.
-                    if (cell === undefined) continue;
-                    const base = cell === null ? undefined : cell_edit_base(cell);
-                    observed.set(`${sheet_index}:${entry.source_row}:${col}`, {
-                        text: cell === null ? '' : String(cell.raw ?? ''),
-                        ...(base?.rich ? { rich: base.rich } : {}),
-                        hyperlink: cell?.hyperlink ?? null,
-                    });
-                }
+    const observed = new Map<string, MaterializedReplayCell>();
+    for (const [sheet_index, wanted] of wanted_by_sheet) {
+        const { texts, rich, links } = harvest_source_bases(src, sheet_index, wanted);
+        for (const key of wanted) {
+            // `links` records every OBSERVED cell, `null` included, so its
+            // membership — not the text's emptiness — is what separates a blank
+            // cell from one the projection never showed us.
+            if (!links.has(key)) continue;
+            const rich_runs = rich.get(key);
+            observed.set(`${sheet_index}:${key}`, {
+                text: texts.get(key) ?? '',
+                ...(rich_runs ? { rich: rich_runs } : {}),
+                hyperlink: links.get(key) ?? null,
             });
         }
     }
