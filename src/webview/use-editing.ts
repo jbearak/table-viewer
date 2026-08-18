@@ -92,6 +92,20 @@ export interface UseEditingOptions {
      */
     readonly get_cell?: (source_row: number, col: number) => EditableSourceCell | null | undefined;
     /**
+     * Whether a gesture may start at all.
+     *
+     * Exists for the replay reservation: while an undo is in flight the document
+     * is mid-transaction, and a keystroke landing in that window would be planned
+     * against a state the replay is about to move — then either lost to the
+     * replay's own writes or, worse, silently overwritten by them.
+     *
+     * Refusing the gesture is deliberately NOT the same as leaving edit mode or
+     * releasing the session: the user stays exactly where they are, and the
+     * keystroke is dropped like one arriving with no session at all. A replay that
+     * ended edit mode to protect itself would lose the user's other unsaved work.
+     */
+    readonly gestures_admitted?: () => boolean;
+    /**
      * Where edits are recorded, absent for a consumer with no workbook around it
      * — the hook's own tests, and GridShell before App wires one down. Those
      * edit exactly as before, unrecorded.
@@ -283,6 +297,7 @@ export function use_editing(
 ) {
     const syntax: EditSyntax = options?.syntax ?? 'plain';
     const get_cell = options?.get_cell;
+    const gestures_admitted = options?.gestures_admitted;
     const own_store_ref = useRef<EditSessionStore | null>(null);
     // Only when no store was handed down, matching GridShell's fallback: building
     // one anyway would allocate a map per mount that nothing ever reads.
@@ -474,6 +489,7 @@ export function use_editing(
             ) => PlannedOverlayWrite | undefined,
         ): void => {
             if (edits.length === 0) return;
+            if (gestures_admitted !== undefined && !gestures_admitted()) return;
             const writes: StoreWrite[] = [];
             const changes: HistoryChange[] = [];
             // The store as this gesture found it, plus what the gesture has
@@ -552,7 +568,7 @@ export function use_editing(
             staged_writes.notify();
             staged_record?.notify();
         },
-        [active_store, capture, read_persisted_cell, session_id],
+        [active_store, capture, gestures_admitted, read_persisted_cell, session_id],
     );
 
     /**

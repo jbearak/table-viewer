@@ -96,7 +96,20 @@ import {
     create_edit_session_registry,
     type EditSessionRegistry,
 } from './edit-session-registry';
+import type { StoreWrite } from './edit-session-store';
 import { create_history_store, type HistoryStore } from './history-store';
+import {
+    create_history_replay_coordinator,
+    type HistoryReplayCoordinator,
+} from './history-replay-coordinator';
+import {
+    absent_overlay,
+    overlay_state_from_dirty_entry,
+    type HistoryDirection,
+} from './history-cell-state-model';
+import type { HistoryEntry } from './history-stack-model';
+import type { HistoryReplayCommitted } from '../history-replay-protocol';
+import { commit_staged_transaction, type StagedMutation } from './staged-mutation';
 import { column_letter } from './grid-model';
 import {
     clamp_row_height,
@@ -498,6 +511,84 @@ export function App(): React.JSX.Element {
     if (history_store_ref.current === null) {
         history_store_ref.current = create_history_store();
     }
+
+    /**
+     * The one outstanding replay, if any.
+     *
+     * A ref rather than state, for the same reason as the history store: a replay
+     * starts inside an event handler and the reservation has to be visible to the
+     * next keypress immediately, not after a render.
+     */
+    const replay_coordinator_ref = useRef<HistoryReplayCoordinator | null>(null);
+    if (replay_coordinator_ref.current === null) {
+        replay_coordinator_ref.current = create_history_replay_coordinator({
+            history: () => history_store_ref.current!.snapshot(),
+            read_overlay: (worksheet, source_row, source_column) => {
+                // Resolved through the live workbook rather than the target's own
+                // index, because history is workbook-wide: an action recorded
+                // before a reorder names its sheet by identity, and the index it
+                // carries may now be another sheet entirely.
+                const sheets = meta_ref.current?.sheets;
+                if (sheets === undefined) return undefined;
+                const sheet_index = worksheet_target_index(sheets, worksheet);
+                if (sheet_index === undefined) return undefined;
+                const store = edit_session_registry_ref.current!.for_sheet(sheet_index);
+                const entry = store.get(`${source_row}:${source_column}`);
+                // Absent is a fact about a cell we CAN see. The registry answers
+                // for every sheet in the workbook, so there is no third state
+                // here — an unopened sheet's store is simply empty.
+                return entry === undefined
+                    ? absent_overlay()
+                    : overlay_state_from_dirty_entry(entry);
+            },
+            post: (message) => { host_bridge.postMessage(message); },
+            next_id: (prefix) => `${prefix}-${++replay_id_counter_ref.current}`,
+        });
+    }
+    const replay_id_counter_ref = useRef(0);
+
+    /**
+     * Land a committed replay: the stores and the history move as ONE transaction.
+     *
+     * The history is a participant, not a consequence. If the edit stores moved
+     * and the history did not, the next undo would replay a gesture the document
+     * has already walked back; if the history moved and the stores did not, undo
+     * would have silently skipped one. Both are states no further undo or redo
+     * could describe, so the three passes decide together — and nothing between
+     * validating and committing may await or set React state.
+     */
+    const apply_committed_replay = useCallback((
+        committed: HistoryReplayCommitted,
+        entry: HistoryEntry,
+        direction: HistoryDirection,
+    ): boolean => {
+        const session_id = csv_edit_session_id_ref.current;
+        const registry = edit_session_registry_ref.current!;
+        // Grouped per store, because a store owns exactly one worksheet and a
+        // workbook-wide gesture spans several. The host's accepted writes carry
+        // the resolved sheet index, so this never re-resolves a target.
+        const by_sheet = new Map<number, StoreWrite[]>();
+        for (const write of committed.cells) {
+            const writes = by_sheet.get(write.resolvedSheetIndex) ?? [];
+            writes.push({ key: write.key, entry: write.entry ?? undefined });
+            by_sheet.set(write.resolvedSheetIndex, writes);
+        }
+        const staged: StagedMutation[] = [];
+        for (const [sheet_index, writes] of by_sheet) {
+            const staging = registry.for_sheet(sheet_index).stage_writes(session_id, writes);
+            // A store whose session moved on refuses to stage. Abandoning the
+            // whole transaction is right: a replay is one gesture, and applying
+            // the sheets that would still take it leaves half an undo.
+            if (staging === undefined) return false;
+            staged.push(staging);
+        }
+        const move = history_store_ref.current!.stage_move(direction, entry);
+        staged.push(move);
+        // Highlights need no participant here: they are the host's own durable
+        // state, and the renderer learns their new value from the
+        // `cellHighlightsChanged` the commit's write already produces.
+        return commit_staged_transaction(staged);
+    }, []);
 
     const set_csv_edit_session_id = useCallback((next: string | undefined) => {
         const previous = csv_edit_session_id_ref.current;
@@ -1531,6 +1622,12 @@ export function App(): React.JSX.Element {
                         // edits, waiting to be replayed through whatever
                         // worksheet identity happened to match here.
                         history_store_ref.current!.clear();
+                        // And any replay still in flight was planned against the
+                        // document that just left. Its caller is awaiting an
+                        // answer, so it is settled rather than dropped — a promise
+                        // that never resolved would hold the reservation, and the
+                        // user's undo, for the life of the window.
+                        replay_coordinator_ref.current?.reset();
                     } else {
                         const edit_session_id = csv_edit_session_id_ref.current;
                         const reconciliation = edit_session_registry_ref.current!
@@ -2808,6 +2905,18 @@ export function App(): React.JSX.Element {
         restore_blocker_epoch,
     ]);
 
+    /**
+     * The replay reservation, as the editing layer sees it.
+     *
+     * Stable across renders because a replay starts and ends inside event
+     * handlers: making this depend on rendered state would rebuild the editing
+     * callbacks mid-gesture, and a wide paste is assembled across many of them.
+     */
+    const replay_gestures_admitted = useCallback(
+        () => !(replay_coordinator_ref.current?.is_busy() ?? false),
+        [],
+    );
+
     const handle_sheet_select = useCallback(
         (sheet_index: number) => {
             // A Save/Discard/Cancel dialog is a question about *one* worksheet, and
@@ -2872,6 +2981,52 @@ export function App(): React.JSX.Element {
             handle_sheet_select(sheet_index);
         }
     }, [active_sheet_index, handle_sheet_select]);
+
+    /**
+     * Route the host's replay answers to the coordinator, and land a committed one.
+     *
+     * Its own effect rather than a branch in an existing handler: those handlers'
+     * dependency arrays already run to dozens of entries, and a replay needs none
+     * of what they close over.
+     */
+    useEffect(() => {
+        const handler = (event: MessageEvent) => {
+            const msg = event.data as HostMessage;
+            const coordinator = replay_coordinator_ref.current;
+            if (coordinator === null) return;
+            switch (msg.type) {
+                case 'historyReplayPrepared':
+                    coordinator.on_prepared(msg.prepared);
+                    return;
+                case 'historyReplayPrepareRefused':
+                    coordinator.on_prepare_refused(msg.refusal);
+                    return;
+                case 'historyReplayCommitted': {
+                    // Read BEFORE the coordinator settles: settling clears the
+                    // reservation, and the entry it was moving is what the staged
+                    // transaction needs.
+                    const pending = coordinator.pending_entry();
+                    coordinator.on_committed(msg.committed);
+                    if (pending === undefined) return;
+                    apply_committed_replay(msg.committed, pending.entry, pending.direction);
+                    // The cursor follows what changed, which for a workbook-wide
+                    // history can be a sheet the user is not looking at.
+                    if (msg.committed.focusSheetIndex !== active_sheet_index) {
+                        handle_sheet_select(msg.committed.focusSheetIndex);
+                    }
+                    return;
+                }
+                case 'historyReplayCommitRefused':
+                    coordinator.on_commit_refused(msg.refusal);
+                    return;
+                default:
+                    return;
+            }
+        };
+        window.addEventListener('message', handler);
+        return () => window.removeEventListener('message', handler);
+    }, [active_sheet_index, apply_committed_replay, handle_sheet_select]);
+
 
     // Release a deferred sheet action once the active sheet and the mounted grid
     // handle both match the target. Re-checked after any keyed grid remount.
@@ -4660,6 +4815,7 @@ export function App(): React.JSX.Element {
                 active_sheet_index,
             )}
             history_store={history_store_ref.current!}
+            gestures_admitted={replay_gestures_admitted}
             host_rejected_keys={live_rejected_keys}
             on_editing_change={handle_editing_change}
             editing_ref={editing_ref}
