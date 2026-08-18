@@ -9,7 +9,7 @@ import {
     type MeasurableCell,
 } from '../webview/fit-column-model';
 import type { RenderedCell } from '../data-source/interface';
-import { MAX_COLUMN_WIDTH_PX } from '../webview/grid-model';
+import { MAX_AUTO_FIT_COLUMN_WIDTH_PX } from '../webview/grid-model';
 
 const cell = (text: string, bold = false, italic = false): MeasurableCell => ({
     text,
@@ -104,9 +104,9 @@ describe('fit_column_width', () => {
         expect(fit_column_width([cell('abcde')], fake_measure, 0, 2)).toBe(52);
     });
 
-    it('never exceeds the shared maximum column width', () => {
+    it('never exceeds the auto-fit maximum column width', () => {
         expect(fit_column_width([cell('x'.repeat(1000))], fake_measure))
-            .toBe(MAX_COLUMN_WIDTH_PX);
+            .toBe(MAX_AUTO_FIT_COLUMN_WIDTH_PX);
     });
 
     it('normalizes a custom maximum below the minimum', () => {
@@ -169,7 +169,7 @@ describe('fit_column_widths', () => {
 
     it('returns capped widths for persistence', () => {
         expect(fit_column_widths([[cell('x'.repeat(1000))]], [0], fake_measure))
-            .toEqual({ 0: MAX_COLUMN_WIDTH_PX });
+            .toEqual({ 0: MAX_AUTO_FIT_COLUMN_WIDTH_PX });
     });
 });
 

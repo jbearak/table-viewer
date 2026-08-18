@@ -148,9 +148,20 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
                 const [col, row] = args.location;
                 if (args.kind === "out-of-bounds" && args.isEdge && canResize) {
                     const bounds = gridRef?.current?.getBounds(columns.length - 1, -1);
-                    if (bounds !== undefined) {
+                    const canvas = canvasRef?.current;
+                    if (bounds !== undefined && canvas) {
                         setResizeColStartX(bounds.x);
                         setResizeCol(columns.length - 1);
+                        const rect = canvas.getBoundingClientRect();
+                        const scale = rect.width / canvas.offsetWidth;
+                        const width = bounds.width / scale;
+                        const column = columns[columns.length - 1];
+                        onColumnResizeStart?.(
+                            column,
+                            width,
+                            columns.length - 1,
+                            width + (column.growOffset ?? 0)
+                        );
                     }
                 } else if (args.kind === "header" && col >= lockColumns) {
                     const canvas = canvasRef?.current;

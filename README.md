@@ -8,12 +8,18 @@ Follow the [setup and 10-minute try-out guide](docs/setup-guide.md) to choose th
 
 ## Why
 
-When I make tables, I make them in code — R, Stata, Python — and refine them by rerunning the script. The rest of my time with tables is spent reading them: reviewing output that I or colleagues generate programmatically, or sheets someone sent me. Excel and Numbers are built for authoring spreadsheets by hand, and for both of these workflows they add friction at every step. Iterating on a generated workbook means closing the file, reopening it, and finding your place again on every rerun — redoing highlights, column widths, and the rest each time:
+When I make tables, I make them in code — R, Stata, Python — and refine them by rerunning the script. The rest of my time with tables is spent reading them: reviewing output that I or colleagues generate programmatically, or sheets someone sent me. Excel and Numbers are built for authoring spreadsheets by hand, and for both of these workflows they add friction at every step.
 
-- **They're slow to open**, and every time a script re-outputs a file there are extra steps to get back to what you were looking at. Table Viewer opens fast, auto-refreshes when the file changes on disk, and keeps your scroll position, column widths, hidden columns, sorts, filters, and active sheet — across reloads and across sessions.
+The original reason I created Table Viewer was to make iteration on a generated workbook less painful. In Excel or Numbers, every rerun means closing the file, reopening it, finding your place again, and redoing highlights, column widths, and the rest. Table Viewer opens fast, reloads the file automatically when it changes, and keeps your scroll position, column widths, hidden columns, sorts, filters, and active sheet across reloads and sessions.
+
+It also removes other friction from reading tables:
+
+- **CSV and TSV files can exceed Excel's 1,048,576-row worksheet limit.** Table Viewer shows up to one million rows by default; when a file has more, you can raise the limit or choose **Load all rows** for that file. It indexes the file once and parses rows for the grid on demand.
 - **Sorting, filtering, and hiding modify the worksheet.** When you're reviewing output, the last thing you want is to change it. In Table Viewer these are view-only transforms: the file on disk is never touched, and there's no extra step to turn a range into a sortable/filterable list — every column already is one.
+- **Exported reports often put titles and notes above the real table.** Right-click the actual header row — even several rows down — and choose **Use row as header**. Table Viewer hides the preamble, promotes that row, remembers the choice, and handles common two-row vertically merged header labels.
 - **You can't easily control how files open.** Typeface, font size, colors — Table Viewer lets you set all of these in Preferences once, and every sheet you ever open respects them, so files are legible the moment they open.
-- **Overflowing cells mean resizing rows and columns**, often in ways that make the table awkward. Table Viewer shows the full contents in a tooltip on hover.
+- **Formatting can obscure the value you're auditing.** Switch between the workbook's formatted display and the underlying raw cell values without changing the workbook.
+- **Overflowing cells mean resizing rows and columns**, often in ways that make the table awkward. Table Viewer shows the full displayed value in a tooltip on hover.
 - **Highlighting a cell takes a trip through formatting menus.** Here you right-click a cell and pick a color. Highlights are annotations, not formatting: they survive saves, reloads, and file replacement without modifying the file.
 - **Many-sheet workbooks are painful**: when tabs overflow Excel's bottom bar you can't even scroll — you click left/right buttons to expose tabs. Table Viewer's sheet tabs scroll, and can be laid out vertically.
 - **Remote files must be downloaded first.** As a VS Code extension, Table Viewer works the same over SSH as locally, and uses your editor's theme and font.
@@ -26,8 +32,9 @@ The flip side is that Table Viewer is deliberately *not* a full spreadsheet edit
 - Opens `.xlsx`, `.xls`, `.csv`, and `.tsv` files
 - Multi-sheet workbooks with horizontal or vertical tab orientation
 - Merged cells with correct colspan/rowspan rendering
-- Bold and italic text styling from Excel formatting
-- Conservatively detects Excel column-name rows, with remembered per-sheet controls for promoting the first non-hidden row or a chosen row
+- `.xlsx` rich-text runs and whole-cell bold, italic, underline, and strikethrough styling
+- `.xlsx` hyperlinks, with destination information on hover and open/copy actions for external links
+- Conservatively detects Excel column-name rows, with remembered per-sheet controls for promoting the first non-hidden row or a chosen row, including column names inherited from simple two-row vertical merges
 - Hover briefly over horizontally truncated or vertically clipped cell content to see the displayed value in a tooltip
 - Stable, multi-column sorting with missing values kept last
 - Per-column filters for text, comparisons, ranges, distinct-value checklists, and empty/non-empty values
@@ -51,6 +58,8 @@ The flip side is that Table Viewer is deliberately *not* a full spreadsheet edit
 **CSV/TSV modes**
 - **Open as Table**: opens the file in its own viewer tab
 - **Open Preview to the Side**: split view with the source editor on the left and the table on the right, with synchronized scrolling between them
+- Large files are indexed once and parsed in windows as the grid requests them
+- Files beyond the configured row limit show a banner for changing the limit or loading every row for that view
 
 **Selection and copy**
 - Click, drag, or shift-click to select cells
@@ -94,6 +103,8 @@ The flip side is that Table Viewer is deliberately *not* a full spreadsheet edit
 - **Shift+Enter** or **Alt+Enter** inserts a line break within a cell
 - **Escape** cancels the current edit
 - **Ctrl+S** / **Cmd+S** saves all changes back to the file
+- `.xlsx` rich-text cells use a limited formatting syntax while editing: `**bold**`, `*italic*`, `<u>underline</u>`, and `~~strikethrough~~`
+- Add, edit, or remove `.xlsx` hyperlinks to a web address or a place in the workbook from the cell context menu
 - Edited cells are highlighted with a different background color until saved
 - Rows keep their position for the whole edit session, so a cell stays under your cursor while you work on it. You can enter edit mode with a sort or filter already applied, and add or change one while editing; neither moves the rows you are working on. A row you edit so that it no longer matches an active filter stays visible until you save; the view reflects your new values once the file is saved and reloaded
 - When exiting edit mode with unsaved changes, you're prompted to save or discard
@@ -102,7 +113,7 @@ The flip side is that Table Viewer is deliberately *not* a full spreadsheet edit
 
 ## Usage
 
-**Excel files** open automatically in Table Viewer when you open an `.xlsx` or `.xls` file. Modern `.xlsx` workbooks are editable; legacy `.xls` workbooks are read-only. When the first row strongly resembles column names, it is promoted automatically. Use the per-sheet **First Row as Header** toolbar toggle to override the detected choice; enabling it promotes the first non-hidden row.
+**Excel files** open automatically in Table Viewer when you open an `.xlsx` or `.xls` file. Modern `.xlsx` workbooks are editable; legacy `.xls` workbooks are read-only. When the first row strongly resembles column names, it is promoted automatically. Use the per-sheet **Header Row** toolbar toggle to override the detected choice; enabling it promotes the first non-hidden row.
 
 To choose a different header row, right-click its row number and select **Use row as header**. Table Viewer hides the rows above it, preserves any hidden rows below it, and promotes the chosen row to column names in one step. The action is available only when no sort or enabled filter is changing the displayed row order. Header choices and hidden rows are remembered for that file and worksheet.
 
@@ -127,8 +138,8 @@ Table Viewer uses VS Code's editor font (`editor.fontFamily` and `editor.fontSiz
 | `tableViewer.fontSize` | `0` (editor size) | Font size in pixels used in table views. Set to `0` to follow `editor.fontSize`. |
 | `tableViewer.tabOrientation` | `horizontal` | Default worksheet tab orientation (`horizontal` or `vertical`). Can be overridden per file. |
 | `tableViewer.maxStoredFiles` | `10000` | Maximum number of files whose layout state is remembered. Least recently used entries are evicted first. |
-| `tableViewer.csvMaxRows` | `1000000` | Maximum rows to display for CSV/TSV files. Excess rows are truncated with a banner. |
-| `tableViewer.maxFileSizeMiB` | `256` | Maximum file size in MiB. Applies to all supported file types. |
+| `tableViewer.csvMaxRows` | `1000000` | Rows to display by default for CSV/TSV files. A banner on larger files lets you change the limit or load all rows for that view. |
+| `tableViewer.maxFileSizeMiB` | `256` | File-size threshold in MiB. Above it, Table Viewer asks before opening the file and offers **Open Anyway**. |
 
 ## Standalone desktop app
 
