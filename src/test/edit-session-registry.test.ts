@@ -289,6 +289,98 @@ describe('edit session registry', () => {
         expect(second.size()).toBe(0);
     });
 
+    describe('stage_discard', () => {
+        const SHEETS = [
+            { name: 'People', worksheetId: '1' },
+            { name: 'Stock', worksheetId: '2' },
+        ];
+
+        it('snapshots every sheet\'s edits and empties them at the commit', () => {
+            const { registry } = make_session_ref('s');
+            registry.for_sheet(0).commit('s', '0:0', { value: 'x', base: 'a' });
+            registry.for_sheet(1).commit('s', '3:4', { value: 'y', base: 'b' });
+
+            const staged = registry.stage_discard('s', SHEETS)!;
+            // Nothing has moved: the caller still has the history recording to
+            // stage and validate.
+            expect(registry.for_sheet(0).size()).toBe(1);
+
+            expect(staged.worksheets.map((sheet) => [
+                sheet.target.sheetName,
+                [...sheet.entries.keys()],
+            ])).toEqual([['People', ['0:0']], ['Stock', ['3:4']]]);
+
+            for (const mutation of staged.mutations) mutation.commit();
+            expect(registry.for_sheet(0).size()).toBe(0);
+            expect(registry.for_sheet(1).size()).toBe(0);
+        });
+
+        it('omits a clean sheet from the snapshot but still stages it', () => {
+            const { registry } = make_session_ref('s');
+            registry.for_sheet(0).commit('s', '0:0', { value: 'x', base: 'a' });
+            registry.for_sheet(1);
+
+            const staged = registry.stage_discard('s', SHEETS)!;
+
+            expect(staged.worksheets).toHaveLength(1);
+            expect(staged.mutations).toHaveLength(2);
+        });
+
+        it('records the whole worksheet target, never a bare index', () => {
+            const { registry } = make_session_ref('s');
+            registry.for_sheet(1).commit('s', '0:0', { value: 'y', base: 'b' });
+
+            const staged = registry.stage_discard('s', SHEETS)!;
+
+            expect(staged.worksheets[0].target)
+                .toEqual({ sheetIndex: 1, sheetName: 'Stock', worksheetId: '2' });
+        });
+
+        it('empties a store whose sheet is gone without naming it in history', () => {
+            // A discard empties everything, but a store with no sheet left has no
+            // identity an undo could be authorized against.
+            const { registry } = make_session_ref('s');
+            registry.for_sheet(0).commit('s', '0:0', { value: 'x', base: 'a' });
+            registry.for_sheet(5).commit('s', '0:0', { value: 'orphan', base: 'b' });
+
+            const staged = registry.stage_discard('s', SHEETS)!;
+
+            expect(staged.worksheets.map((sheet) => sheet.target.sheetName)).toEqual(['People']);
+            for (const mutation of staged.mutations) mutation.commit();
+            expect(registry.for_sheet(5).size()).toBe(0);
+        });
+
+        it('stages nothing at all when a store refuses', () => {
+            // One gesture: emptying the sheets that would still take it leaves
+            // half a session.
+            const { registry } = make_session_ref('s');
+            const store = registry.for_sheet(0);
+            store.commit('s', '0:0', { value: 'x', base: 'a' });
+
+            expect(registry.stage_discard('stale', SHEETS)).toBeUndefined();
+            expect(store.size()).toBe(1);
+        });
+
+        it('reports a snapshot taken at the instant it fixed the state', () => {
+            // The reason snapshot and stage are one call. A keystroke landing
+            // between them would be missing from the recorded action, so undoing
+            // the discard would restore everything except the user's last edit —
+            // and the store's own valid() could not catch it, having been taken
+            // against a state that already included it.
+            const { registry } = make_session_ref('s');
+            const store = registry.for_sheet(0);
+            store.commit('s', '0:0', { value: 'x', base: 'a' });
+
+            const staged = registry.stage_discard('s', SHEETS)!;
+            store.commit('s', '9:9', { value: 'meanwhile', base: 'c' });
+
+            expect([...staged.worksheets[0].entries.keys()]).toEqual(['0:0']);
+            // And the staging is invalid, so the caller abandons rather than
+            // discarding an edit it never recorded.
+            expect(staged.mutations.every((mutation) => mutation.valid())).toBe(false);
+        });
+    });
+
     it('clear_all respects the session fence', () => {
         const { registry } = make_session_ref('s');
         const store = registry.for_sheet(0);
