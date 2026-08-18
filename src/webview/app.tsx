@@ -116,6 +116,7 @@ import {
 import type { HistoryEntry } from './history-stack-model';
 import type { HistoryReplayCommitted } from '../history-replay-protocol';
 import { pending_signal, type PendingSignal } from './pending-signal';
+import { run_discard_transaction } from './discard-transaction-model';
 import { commit_staged_transaction, type StagedMutation } from './staged-mutation';
 import { column_letter } from './grid-model';
 import {
@@ -1009,57 +1010,21 @@ export function App(): React.JSX.Element {
         // would be dropped by the exit below with nothing in history describing it.
         editing_ref.current?.commit_live_edit();
         fence_edit_session_exit(csv_edit_session_id);
-        // Every sheet's, not just the mounted grid's: the session covers the whole
-        // workbook and the host clears every live durable slot, so a store left
-        // full here would repaint edits the user just discarded the next time its
-        // sheet is opened.
-        //
-        // Staged rather than cleared outright, because the emptying and the
-        // history recording of what was emptied are ONE transaction. A clear that
-        // published first would leave the edits gone with no way back if the
-        // recording were then refused for exceeding the bounds.
-        const registry = edit_session_registry_ref.current!;
-        const discarded = registry.stage_discard(
-            csv_edit_session_id,
-            meta_ref.current?.sheets ?? [],
-        );
-        let recorded: StagedHistoryRecord | undefined;
-        if (discarded !== undefined) {
-            recorded = history_store_ref.current!.stage_record({
-                label: 'Discard edits',
-                // Streamed, not built: a workbook-wide discard is the gesture most
-                // likely to exceed the bounds, and the recorder stops mid-walk.
-                changes: discard_history_source(discarded.worksheets),
+        // Emptying the stores and recording what was emptied are ONE transaction;
+        // the invariant and its outcomes live in the model.
+        const outcome = run_discard_transaction({
+            registry: edit_session_registry_ref.current!,
+            history: history_store_ref.current!,
+            sessionId: csv_edit_session_id,
+            sheets: meta_ref.current?.sheets ?? [],
+        });
+        // Nothing was emptied and nothing recorded, so the user presses it again.
+        if (outcome.kind === 'abandoned') return;
+        if (outcome.kind === 'unrecordable') {
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: 'These edits were too large to keep in the undo history, so discarding them cannot be undone.',
             });
-            if (recorded.outcome.kind === 'refused') {
-                // The discard still happens — refusing a user's discard to protect
-                // a history buffer would be the wrong trade — but it is no longer
-                // undoable, and saying so is the only honest thing left. The
-                // recording installs the barrier that makes undo explain itself.
-                host_bridge.postMessage({
-                    type: 'showWarning',
-                    message: 'These edits were too large to keep in the undo history, so discarding them cannot be undone.',
-                });
-            }
-            const staged: readonly StagedMutation[] = [...discarded.mutations, recorded];
-            // Validity, not the commit's answer. `commit_staged_transaction`
-            // reports whether anything CHANGED, and a discard of an already-empty
-            // session changes nothing while being perfectly valid — abandoning on
-            // that would swallow the terminal message the host needs to clear its
-            // own durable slots.
-            if (!staged.every((mutation) => mutation.valid())) {
-                // A store moved between staging and committing — a keystroke, a
-                // save landing. Nothing was emptied and nothing recorded, so the
-                // discard is abandoned rather than half-applied; the user presses
-                // it again.
-                return;
-            }
-            commit_staged_transaction(staged);
-        } else {
-            // No store would stage, which is a session that has already moved on.
-            // The terminal message still goes, because the host's durable slots
-            // are its own to clear.
-            registry.clear_all(csv_edit_session_id);
         }
         set_edit_mode(false);
         // Every edit is being thrown away, including the rejected ones.

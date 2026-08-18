@@ -89,7 +89,14 @@ export type WireOverlayProjection =
      * place in the renderer that originates the flag — hydrating a bare durable
      * string, which by construction has no runs and no hyperlink. Every other
      * site only carries an existing flag forward. So writing the string back is a
-     * faithful round-trip for the shape that can actually occur, and a
+     * faithful round-trip for the shape that can actually occur.
+     *
+     * That is a PROVENANCE invariant, not a structural one: the store's hydration
+     * retains an explicit `base_pending` found on an incoming object
+     * (`edit-session-store.ts`), and persisted state tolerates properties it does
+     * not know, so a hand-edited or future-build slot could present a rich
+     * base-pending entry this module has never seen. Which is why the refusal
+     * below is a live boundary rather than dead code — a
      * base-pending overlay carrying runs or a link stays `unrepresentable`: those
      * would need a durable field that does not exist, and guessing at one would
      * promote an unobserved placeholder to a real base and let a later save
