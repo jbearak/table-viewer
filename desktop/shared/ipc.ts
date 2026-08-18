@@ -2,8 +2,10 @@
 // preload scripts. Keep in one place so both bundles agree.
 import type { ViewerSettingTarget } from '../../src/host-ports';
 
-/** Webview → host viewer protocol messages (WebviewMessage payloads). */
+/** Webview → host viewer protocol messages, wrapped with a document token. */
 export const CHANNEL_WEBVIEW_MESSAGE = 'tableViewer:webviewMessage';
+/** Sync viewer preload → main request for one loaded document's admission token. */
+export const CHANNEL_WEBVIEW_DOCUMENT_TOKEN = 'tableViewer:webviewDocumentToken';
 /** Host → viewer preload protocol messages. State-backend acknowledgements carry
  * a desktop receipt request so main waits for renderer delivery, not merely send(). */
 export const CHANNEL_HOST_MESSAGE = 'tableViewer:hostMessage';
@@ -21,6 +23,22 @@ export interface DesktopHostMessageEnvelope {
     rendererGeneration: number;
     message: unknown;
     receipt?: PendingEditAcknowledgementReceipt;
+}
+
+/** Desktop-only envelope proving which loaded document produced a viewer message. */
+export interface DesktopWebviewMessageEnvelope {
+    readonly documentToken: string;
+    readonly message: unknown;
+}
+
+export function is_desktop_webview_message_envelope(
+    value: unknown,
+): value is DesktopWebviewMessageEnvelope {
+    return typeof value === 'object'
+        && value !== null
+        && !Array.isArray(value)
+        && typeof (value as Record<string, unknown>).documentToken === 'string'
+        && Object.prototype.hasOwnProperty.call(value, 'message');
 }
 /** Sync request from the viewer preload for the initial theme payload. */
 export const CHANNEL_GET_THEME = 'tableViewer:getTheme';

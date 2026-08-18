@@ -5,8 +5,10 @@ import type { HostMessage, WebviewMessage } from '../../src/types';
 import {
     CHANNEL_HOST_MESSAGE,
     CHANNEL_HOST_MESSAGE_RECEIPT,
+    CHANNEL_WEBVIEW_DOCUMENT_TOKEN,
     CHANNEL_WEBVIEW_MESSAGE,
     type DesktopHostMessageEnvelope,
+    type DesktopWebviewMessageEnvelope,
     type PendingEditAcknowledgementReceipt,
 } from '../shared/ipc';
 
@@ -43,19 +45,26 @@ const electron_mock = vi.hoisted(() => {
 
     class WebContents extends FakeEmitter {
         destroyed = false;
+        mainFrame: object = {};
         readonly sent: Array<{
             channel: string;
             message: HostMessage;
             receipt?: PendingEditAcknowledgementReceipt;
         }> = [];
 
+        override emit(event: string, ...args: any[]): boolean {
+            if (event === 'did-navigate') this.mainFrame = {};
+            return super.emit(event, ...args);
+        }
+
         isDestroyed() { return this.destroyed; }
-        send(channel: string, payload: DesktopHostMessageEnvelope) {
+        send(channel: string, payload: unknown) {
             if (this.destroyed) throw new Error('transport destroyed');
+            const envelope = payload as DesktopHostMessageEnvelope;
             this.sent.push({
                 channel,
-                message: payload.message as HostMessage,
-                receipt: payload.receipt,
+                message: envelope.message as HostMessage,
+                receipt: envelope.receipt,
             });
         }
         loadURL = vi.fn(async () => {});
@@ -186,6 +195,7 @@ const electron_mock = vi.hoisted(() => {
         isDestroyed() { return this.destroyed; }
         /** Focus is not modelled otherwise; the menu-rebuild callback reads it. */
         focused = true;
+        documentEdited = false;
         isFocused() { return this.focused; }
         isMinimized() { return false; }
         isMaximized() { return false; }
@@ -195,7 +205,7 @@ const electron_mock = vi.hoisted(() => {
         focus() {}
         setRepresentedFilename(_file: string) {}
         setTitle(_title: string) {}
-        setDocumentEdited(_dirty: boolean) {}
+        setDocumentEdited(dirty: boolean) { this.documentEdited = dirty; }
         setBackgroundColor(_color: string) {}
         getBounds() { return { ...this.bounds }; }
         getNormalBounds() { return { ...this.bounds }; }
@@ -355,8 +365,61 @@ function viewer_entry(
     return entry;
 }
 
-function emit_webview(window: InstanceType<typeof electron_mock.BrowserWindow>, message: WebviewMessage) {
-    electron_mock.ipcMain.emit(CHANNEL_WEBVIEW_MESSAGE, { sender: window.webContents }, message);
+const document_tokens = new WeakMap<object, { frame: object; token: string }>();
+
+function request_document_token(
+    window: InstanceType<typeof electron_mock.BrowserWindow>,
+    sender_frame: unknown = window.webContents.mainFrame,
+): unknown {
+    const event = {
+        sender: window.webContents,
+        senderFrame: sender_frame,
+        returnValue: undefined as unknown,
+    };
+    electron_mock.ipcMain.emit(CHANNEL_WEBVIEW_DOCUMENT_TOKEN, event);
+    return event.returnValue;
+}
+
+function current_document_token(
+    window: InstanceType<typeof electron_mock.BrowserWindow>,
+): string {
+    const cached = document_tokens.get(window.webContents);
+    if (cached?.frame === window.webContents.mainFrame) return cached.token;
+    let token = request_document_token(window);
+    if (typeof token !== 'string') {
+        window.webContents.emit('did-navigate', {}, 'tv-app://viewer-1/index.html', 200, 'OK');
+        token = request_document_token(window);
+    }
+    if (typeof token !== 'string') throw new Error('viewer document token was not delivered');
+    document_tokens.set(window.webContents, {
+        frame: window.webContents.mainFrame,
+        token,
+    });
+    return token;
+}
+
+function emit_webview_envelope(
+    window: InstanceType<typeof electron_mock.BrowserWindow>,
+    envelope: unknown,
+    sender_frame: unknown = window.webContents.mainFrame,
+) {
+    electron_mock.ipcMain.emit(CHANNEL_WEBVIEW_MESSAGE, {
+        sender: window.webContents,
+        senderFrame: sender_frame,
+    }, envelope);
+}
+
+function emit_webview(
+    window: InstanceType<typeof electron_mock.BrowserWindow>,
+    message: WebviewMessage,
+    document_token = current_document_token(window),
+    sender_frame: unknown = window.webContents.mainFrame,
+) {
+    const envelope: DesktopWebviewMessageEnvelope = {
+        documentToken: document_token,
+        message,
+    };
+    emit_webview_envelope(window, envelope, sender_frame);
 }
 
 function acknowledge_last_delivery(window: InstanceType<typeof electron_mock.BrowserWindow>) {
@@ -1369,6 +1432,100 @@ describe('viewer window close protocol', () => {
         await vi.waitFor(() => expect(window.destroyed).toBe(true));
     });
 
+    it('closes safely after the initial document fails before admission', async () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/initial-load-failure-close.csv');
+        const window = latest_window();
+
+        window.webContents.emit(
+            'did-fail-load', {}, -2, 'ERR_FAILED', 'tv-app://viewer-1/index.html', true,
+        );
+        const closing = viewer_manager.close_all();
+
+        await expect(closing).resolves.toBe(true);
+        expect(window.destroyed).toBe(true);
+        expect(window.webContents.sent.filter(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        )).toEqual([]);
+        expect(controller_mock.controller.drain).toHaveBeenCalledTimes(2);
+        expect(electron_mock.dialog.showMessageBox).not.toHaveBeenCalled();
+    });
+
+    it('can reload after the initial document fails before admission', async () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/initial-load-failure-reload.csv');
+        const window = latest_window();
+
+        window.webContents.emit(
+            'did-fail-load', {}, -2, 'ERR_FAILED', 'tv-app://viewer-1/index.html', true,
+        );
+        expect(viewer_manager.reload(window as any, false)).toBe(true);
+
+        await vi.waitFor(() => expect(window.webContents.reload).toHaveBeenCalledOnce());
+        expect(window.destroyed).toBe(false);
+        expect(window.webContents.sent.filter(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        )).toEqual([]);
+        expect(controller_mock.controller.drain).toHaveBeenCalledTimes(2);
+        expect(electron_mock.dialog.showMessageBox).not.toHaveBeenCalled();
+    });
+
+    it('keeps a pending close live through an aborted provisional navigation', async () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/aborted-navigation-close.csv');
+        const window = latest_window();
+        const token = current_document_token(window);
+        emit_webview(window, { type: 'ready' }, token);
+
+        const closing = viewer_manager.close_all();
+        const request = window.webContents.sent.find(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        )?.message;
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
+
+        window.webContents.emit(
+            'did-fail-load', {}, -3, 'ERR_ABORTED', 'https://aborted.example/', true,
+        );
+        emit_webview(window, {
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            highestProducedSequence: 0,
+        }, token);
+
+        await expect(closing).resolves.toBe(true);
+        expect(window.destroyed).toBe(true);
+        expect(controller_mock.controller.drain).toHaveBeenCalledTimes(2);
+        expect(electron_mock.dialog.showMessageBox).not.toHaveBeenCalled();
+    });
+
+    it('keeps a pending reload live through an aborted provisional navigation', async () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/aborted-navigation-reload.csv');
+        const window = latest_window();
+        const token = current_document_token(window);
+        emit_webview(window, { type: 'ready' }, token);
+
+        expect(viewer_manager.reload(window as any, false)).toBe(true);
+        const request = window.webContents.sent.find(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        )?.message;
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
+
+        window.webContents.emit(
+            'did-fail-load', {}, -3, '', 'https://aborted.example/', true,
+        );
+        emit_webview(window, {
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            highestProducedSequence: 0,
+        }, token);
+
+        await vi.waitFor(() => expect(window.webContents.reload).toHaveBeenCalledOnce());
+        expect(window.destroyed).toBe(false);
+        expect(controller_mock.controller.drain).toHaveBeenCalledTimes(2);
+        expect(electron_mock.dialog.showMessageBox).not.toHaveBeenCalled();
+    });
+
     it.each([
         ['failed navigation', (window: InstanceType<typeof electron_mock.BrowserWindow>) => {
             window.webContents.emit(
@@ -1444,6 +1601,162 @@ describe('what the Edit menu is told about a viewer s history', () => {
         expect(rebuilt).toEqual([]);
     });
 
+    it('binds synchronous admission to the current committed frame', () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/frame-admission.csv');
+        const window = latest_window();
+        const first_frame = window.webContents.mainFrame;
+        const first_token = current_document_token(window);
+
+        window.webContents.emit('did-navigate', {}, 'tv-app://viewer-1/index.html', 200, 'OK');
+        const second_frame = window.webContents.mainFrame;
+        expect(second_frame).not.toBe(first_frame);
+        expect(request_document_token(window, first_frame)).toBeUndefined();
+
+        const second_token = request_document_token(window, second_frame);
+        expect(typeof second_token).toBe('string');
+        expect(second_token).not.toBe(first_token);
+        expect(request_document_token(window, second_frame)).toBeUndefined();
+
+        const projection: WebviewMessage = {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                textEditing: false,
+            },
+        };
+        emit_webview(window, projection, first_token, first_frame);
+        emit_webview(window, projection, first_token, second_frame);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toBeUndefined();
+
+        emit_webview(window, projection, second_token as string, second_frame);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoAvailable: true });
+    });
+
+    it('preserves the admitted document when a provisional navigation is aborted', () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/aborted-navigation.csv');
+        const window = latest_window();
+        const token = current_document_token(window);
+        const frame = window.webContents.mainFrame;
+        const projection: WebviewMessage = {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                undoLabel: 'Paste',
+                textEditing: false,
+            },
+        };
+        emit_webview(window, projection, token);
+
+        window.webContents.emit(
+            'did-fail-load', {}, -3, '', 'https://aborted.example/', true,
+        );
+
+        expect(window.webContents.mainFrame).toBe(frame);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoAvailable: true, undoLabel: 'Paste' });
+        expect(request_document_token(window)).toBeUndefined();
+
+        emit_webview(window, {
+            ...projection,
+            state: { ...projection.state, undoLabel: 'Delete' },
+        }, token);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoAvailable: true, undoLabel: 'Delete' });
+    });
+
+    it('rejects a late projection from the previous document', () => {
+        const rebuilt: ElectronBrowserWindow[] = [];
+        const viewer_manager = manager(undefined, (window) => { rebuilt.push(window); });
+        viewer_manager.open_file('/tmp/reloaded.csv');
+        const window = latest_window();
+        const first_token = current_document_token(window);
+        const projection: WebviewMessage = {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                undoLabel: 'Paste',
+                textEditing: false,
+            },
+        };
+        emit_webview(window, projection, first_token);
+
+        window.webContents.emit('did-navigate', {}, 'tv-app://viewer-1/index.html', 200, 'OK');
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toBeUndefined();
+
+        emit_webview(window, projection, first_token);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toBeUndefined();
+        expect(rebuilt).toHaveLength(2);
+
+        const second_token = current_document_token(window);
+        expect(second_token).not.toBe(first_token);
+        emit_webview(window, projection, second_token);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoAvailable: true, undoLabel: 'Paste' });
+        expect(rebuilt).toHaveLength(3);
+    });
+
+    it('admits only a current, well-formed main-frame envelope', () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/admission.csv');
+        const window = latest_window();
+        const projection: WebviewMessage = {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                textEditing: false,
+            },
+        };
+
+        emit_webview_envelope(window, { documentToken: 'not-admitted', message: projection });
+        emit_webview_envelope(window, projection);
+        emit_webview_envelope(window, { documentToken: 4, message: projection });
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toBeUndefined();
+
+        const token = current_document_token(window);
+        emit_webview(window, projection, token, {});
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toBeUndefined();
+
+        emit_webview(window, projection, token);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoAvailable: true });
+    });
+
+    it('rejects stale dirty-state messages through the common admission gate', () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/dirty.csv');
+        const window = latest_window();
+        const first_token = current_document_token(window);
+        emit_webview(window, {
+            type: 'pendingEditsChanged',
+            edits: { '0:0': { value: 'dirty', base: '' } },
+            editSessionId: 'session-a',
+            sequence: 1,
+        }, first_token);
+        expect(window.documentEdited).toBe(true);
+
+        window.webContents.emit('did-navigate', {}, 'tv-app://viewer-1/index.html', 200, 'OK');
+        emit_webview(window, {
+            type: 'pendingEditsChanged',
+            edits: null,
+            editSessionId: 'session-a',
+            sequence: 2,
+        }, first_token);
+
+        expect(window.documentEdited).toBe(true);
+    });
+
     it.each([
         ['a navigation replaced the renderer', (
             window: InstanceType<typeof electron_mock.BrowserWindow>,
@@ -1481,6 +1794,28 @@ describe('what the Edit menu is told about a viewer s history', () => {
             .toBeUndefined();
         // And the menu is rebuilt, or the stale labels stay on screen.
         expect(rebuilt).toHaveLength(2);
+    });
+
+    it('invalidates the document token when the renderer terminates', () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/crashed.csv');
+        const window = latest_window();
+        const token = current_document_token(window);
+        const projection: WebviewMessage = {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                textEditing: false,
+            },
+        };
+        emit_webview(window, projection, token);
+
+        window.webContents.emit('render-process-gone', {}, { reason: 'crashed', exitCode: 1 });
+        emit_webview(window, projection, token);
+
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toBeUndefined();
     });
 
     it('keeps the projection while the renderer is merely unresponsive', () => {

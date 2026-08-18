@@ -6,6 +6,7 @@
 // side by side with another one, which is both more flexible and what an Excel
 // user expects. It also means the window *is* the view — no tab strip to lay
 // out around, and zoom is simply per-window.
+import { randomUUID } from 'node:crypto';
 import * as path from 'path';
 import {
     BrowserWindow,
@@ -48,7 +49,9 @@ import {
     CHANNEL_HOST_MESSAGE_RECEIPT,
     CHANNEL_TITLEBAR_INFO,
     CHANNEL_TITLEBAR_PATH_MENU,
+    CHANNEL_WEBVIEW_DOCUMENT_TOKEN,
     CHANNEL_WEBVIEW_MESSAGE,
+    is_desktop_webview_message_envelope,
     type DesktopHostMessageEnvelope,
     type PendingEditAcknowledgementReceipt,
 } from '../shared/ipc';
@@ -61,6 +64,8 @@ import {
     next_window_bounds,
     type WindowSize,
 } from './window-geometry';
+
+const ERR_ABORTED = -3;
 
 interface ViewerWindow {
     readonly filePath: string;
@@ -474,6 +479,14 @@ export class ViewerWindowManager {
         const acknowledgement_receipt_listeners = new Set<(
             receipt: PendingEditAcknowledgementReceipt,
         ) => void>();
+        const webview_message_listeners = new Set<(message: WebviewMessage) => void>();
+        let admitted_document_token: string | undefined;
+        let document_admission_open = false;
+        let has_admitted_document = false;
+        const invalidate_document_admission = () => {
+            admitted_document_token = undefined;
+            document_admission_open = false;
+        };
         const report_renderer_generation_change = () => {
             const error = new Error('Viewer renderer was replaced by a successful navigation.');
             for (const listener of [...renderer_generation_listeners]) listener(error);
@@ -496,10 +509,19 @@ export class ViewerWindowManager {
         const report_renderer_loss = (error: Error, retryable = false) => {
             // Not on a retryable loss: an unresponsive renderer is still the one
             // holding the history, and it will not repost when it comes back.
-            if (!retryable) forget_history_menu();
+            if (!retryable) {
+                invalidate_document_admission();
+                forget_history_menu();
+            }
             for (const listener of [...renderer_loss_listeners]) listener(error, retryable);
         };
         const on_main_frame_navigated = () => {
+            // Opened only once Electron has committed the replacement. Its preload
+            // synchronously claims a token through the current main frame; messages
+            // still arriving from the prior document retain their old token and are
+            // rejected by the common inbound dispatcher below.
+            admitted_document_token = undefined;
+            document_admission_open = true;
             forget_history_menu();
             report_renderer_generation_change();
         };
@@ -510,7 +532,16 @@ export class ViewerWindowManager {
             validated_url: string,
             is_main_frame: boolean,
         ) => {
-            if (!is_main_frame) return;
+            // An aborted provisional navigation leaves the admitted document active.
+            // Before the first admission there cannot be renderer-owned edits to
+            // flush, so keeping the panel in its loading state also lets close or
+            // reload use the existing safe sequence-zero path. Reporting either as
+            // renderer loss would permanently fence the window out of that protocol.
+            if (
+                !is_main_frame
+                || error_code === ERR_ABORTED
+                || !has_admitted_document
+            ) return;
             report_renderer_loss(new Error(
                 `Viewer navigation failed (${error_code} ${error_description}): ${validated_url}`,
             ));
@@ -538,6 +569,25 @@ export class ViewerWindowManager {
             if (event.sender !== web_contents) return;
             for (const listener of [...acknowledgement_receipt_listeners]) listener(receipt);
         };
+        const document_token_watcher = (event: Electron.IpcMainEvent) => {
+            if (event.sender !== web_contents || event.senderFrame !== web_contents.mainFrame) return;
+            if (!document_admission_open) return;
+            admitted_document_token = randomUUID();
+            document_admission_open = false;
+            has_admitted_document = true;
+            event.returnValue = admitted_document_token;
+        };
+        const webview_message_watcher = (
+            event: Electron.IpcMainEvent,
+            envelope: unknown,
+        ) => {
+            if (event.sender !== web_contents || event.senderFrame !== web_contents.mainFrame) return;
+            if (!is_desktop_webview_message_envelope(envelope)) return;
+            if (envelope.documentToken !== admitted_document_token) return;
+            for (const listener of [...webview_message_listeners]) {
+                listener(envelope.message as WebviewMessage);
+            }
+        };
         web_contents.on('did-navigate', on_main_frame_navigated);
         web_contents.on('did-fail-load', on_failed_load);
         web_contents.on('render-process-gone', on_render_process_gone);
@@ -545,6 +595,8 @@ export class ViewerWindowManager {
         window.on('unresponsive', on_unresponsive);
         window.on('responsive', on_responsive);
         ipcMain.on(CHANNEL_HOST_MESSAGE_RECEIPT, acknowledgement_receipt_watcher);
+        ipcMain.on(CHANNEL_WEBVIEW_DOCUMENT_TOKEN, document_token_watcher);
+        ipcMain.on(CHANNEL_WEBVIEW_MESSAGE, webview_message_watcher);
 
         // macOS themed title bar: the strip's title. The inset is not sent —
         // the preload derives it from the platform (shared/titlebar.ts), the
@@ -589,15 +641,8 @@ export class ViewerWindowManager {
                 }
             },
             on_message: (listener: (message: WebviewMessage) => void) => {
-                const handler = (
-                    event: Electron.IpcMainEvent,
-                    message: WebviewMessage,
-                ) => {
-                    if (event.sender !== web_contents) return;
-                    listener(message);
-                };
-                ipcMain.on(CHANNEL_WEBVIEW_MESSAGE, handler);
-                return () => ipcMain.removeListener(CHANNEL_WEBVIEW_MESSAGE, handler);
+                webview_message_listeners.add(listener);
+                return () => webview_message_listeners.delete(listener);
             },
             on_renderer_generation_changed: (listener) => {
                 renderer_generation_listeners.add(listener);
@@ -619,23 +664,15 @@ export class ViewerWindowManager {
 
         // Watched independently of the panel's own subscriptions, which belong to
         // the controller and may come and go.
-        const dirty_watcher = (
-            event: Electron.IpcMainEvent,
-            message: WebviewMessage,
-        ) => {
-            if (event.sender !== web_contents) return;
+        const dirty_watcher = (message: WebviewMessage) => {
             set_dirty(dirty_from_webview_message(message));
         };
-        ipcMain.on(CHANNEL_WEBVIEW_MESSAGE, dirty_watcher);
+        webview_message_listeners.add(dirty_watcher);
 
         // Also independent of the panel's subscriptions, and for a sharper reason
         // than the dirty dot's: the Edit menu is application-wide chrome, so the
         // state has to be retained even while this window is not the focused one.
-        const history_menu_watcher = (
-            event: Electron.IpcMainEvent,
-            message: WebviewMessage,
-        ) => {
-            if (event.sender !== web_contents) return;
+        const history_menu_watcher = (message: WebviewMessage) => {
             if (message.type !== 'historyMenuStateChanged') return;
             const state = sanitized_history_menu_state(message.state);
             if (state === undefined) return;
@@ -645,7 +682,7 @@ export class ViewerWindowManager {
             // application menu. main.ts owns that, and it is what the callback is.
             this.on_history_menu_changed(window);
         };
-        ipcMain.on(CHANNEL_WEBVIEW_MESSAGE, history_menu_watcher);
+        webview_message_listeners.add(history_menu_watcher);
 
         let entry: ViewerWindow;
         // Format capabilities come from the same shared profile factory as the
@@ -688,10 +725,11 @@ export class ViewerWindowManager {
             controller,
             allowClose: false,
             stop_watching_dirty: () => {
-                ipcMain.removeListener(CHANNEL_WEBVIEW_MESSAGE, dirty_watcher);
-                ipcMain.removeListener(CHANNEL_WEBVIEW_MESSAGE, history_menu_watcher);
+                webview_message_listeners.delete(dirty_watcher);
+                webview_message_listeners.delete(history_menu_watcher);
             },
             stop_watching_renderer: () => {
+                invalidate_document_admission();
                 web_contents.removeListener('did-navigate', on_main_frame_navigated);
                 web_contents.removeListener('did-fail-load', on_failed_load);
                 web_contents.removeListener('render-process-gone', on_render_process_gone);
@@ -699,12 +737,15 @@ export class ViewerWindowManager {
                 window.removeListener('unresponsive', on_unresponsive);
                 window.removeListener('responsive', on_responsive);
                 ipcMain.removeListener(CHANNEL_HOST_MESSAGE_RECEIPT, acknowledgement_receipt_watcher);
+                ipcMain.removeListener(CHANNEL_WEBVIEW_DOCUMENT_TOKEN, document_token_watcher);
+                ipcMain.removeListener(CHANNEL_WEBVIEW_MESSAGE, webview_message_watcher);
                 ipcMain.removeListener(CHANNEL_TITLEBAR_INFO, titlebar_info_watcher);
                 ipcMain.removeListener(CHANNEL_TITLEBAR_PATH_MENU, titlebar_path_menu_watcher);
                 renderer_generation_listeners.clear();
                 renderer_loss_listeners.clear();
                 renderer_responsive_listeners.clear();
                 acknowledgement_receipt_listeners.clear();
+                webview_message_listeners.clear();
             },
             flush_size: () => {
                 if (!pending) return;
