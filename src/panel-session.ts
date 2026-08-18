@@ -418,6 +418,26 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
         return true;
     }
 
+    /**
+     * Deliver the material already installed, without replacing it.
+     *
+     * For a caller that changed durable state and needs the renderer to see it,
+     * but whose own committed snapshot may no longer be the newest: an unrelated
+     * writer committing behind it installs a LATER revision, and
+     * {@link update_state_snapshot} refuses an older one — so re-installing to
+     * force a delivery would silently deliver nothing. The newer material already
+     * contains the earlier commit, so delivering what is held is both sufficient
+     * and the only thing that cannot be rejected as stale.
+     *
+     * Answers whether a delivery was emitted; `false` means there is no live
+     * adoption or receiver to deliver to.
+     */
+    deliver_current_material(): boolean {
+        if (this._lifecycle === 'disposed' || !this.current) return false;
+        this.deliver_material_refresh();
+        return true;
+    }
+
     /** Re-sample only configuration/capabilities from the current adoption.
      * Source/core/authority identity and generations remain unchanged, while every
      * already-issued snapshot stays immutable. */

@@ -1044,10 +1044,21 @@ export function App(): React.JSX.Element {
         // it would land ahead of the highlight the user made first, so the first
         // undo would repaint cells instead of restoring the discarded edits.
         //
-        // Refused rather than deferred: the window is one host round trip, the
-        // affordances that reach here are a button and a dialog answer, and a
+        // Refused rather than deferred: the window is one host round trip, and a
         // discard queued behind a reply would fire after the user had moved on.
-        if (!edit_gestures_admitted()) return;
+        //
+        // Answered rather than silently dropped, because one caller is the save
+        // dialog's "discard" choice: the dialog has already closed by the time this
+        // runs, so a bare `return` would leave the user in edit mode with their
+        // edits intact and no account of why. The button caller is harmless either
+        // way — it is visibly still there to press again.
+        if (!edit_gestures_admitted()) {
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: 'A cell highlight is still being applied. Try discarding again in a moment.',
+            });
+            return;
+        }
         // Fold any open cell editor FIRST, so its text is part of what the discard
         // throws away and therefore part of what undoing it restores. Left open, it
         // would be dropped by the exit below with nothing in history describing it.

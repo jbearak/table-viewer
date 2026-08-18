@@ -295,7 +295,9 @@ export function create_history_replay_coordinator(
             // Acquiring a session for a highlight-only undo would put the user into
             // edit mode for a gesture that was never a content edit.
             const needs_session = action_requires_edit_session(before_acquiring.entry.action);
-            const decided_for = before_acquiring.entry;
+            // The entry's own id, never the object: `moves` rebuilds the object,
+            // so identity would report a spurious mismatch for the very same entry.
+            const decided_for = before_acquiring.entry.id;
             const held: AcquiringReplay = { kind: 'acquiring', direction, settle: resolve };
             active = held;
             void (async () => {
@@ -338,7 +340,7 @@ export function create_history_replay_coordinator(
                 // user can simply repeat is a better answer than replaying
                 // something they did not aim at. Reachable only through a gesture
                 // recorded from a host reply mid-await.
-                if (peek.entry !== decided_for) {
+                if (peek.entry.id !== decided_for) {
                     release(held, { kind: 'refused', reason: 'busy' });
                     return;
                 }

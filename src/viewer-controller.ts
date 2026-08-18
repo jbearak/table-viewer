@@ -7794,10 +7794,13 @@ export function attach_viewer(
         // deltas, which are what enter a window's undo history. A replay is the
         // history moving, so re-entering it would record undo as a new gesture.
         if (highlight_patches.length > 0 && replay_committed !== undefined && !disposed) {
-            session.update_state_snapshot(
-                project_state_for_panel(replay_committed),
-                { deliver: true },
-            );
+            // The material already held, not `replay_committed` re-installed. An
+            // unrelated writer committing behind this replay installs a LATER
+            // revision, and `update_state_snapshot` refuses an older one — so
+            // re-installing to force the delivery would silently deliver nothing
+            // and leave the replayed highlight painted stale indefinitely. That
+            // newer material already contains this commit.
+            session.deliver_current_material();
         }
         // The updater's own result is used ONLY for that delivery. An unchanged
         // updater reports `undefined` — for a replay that means the document

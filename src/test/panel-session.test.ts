@@ -1233,6 +1233,37 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
         expect(posted).toHaveLength(2);
     });
 
+    it('delivers the material it holds, even when a newer write installed it', async () => {
+        const { session, posted } = make_session();
+        session.replace_adoption(adoption());
+        session.ready();
+        await settle();
+        ack(session, snapshot(posted));
+        expect(session.acknowledged_current()).toBe(true);
+
+        // A caller that changed durable state at revision 8 and needs the change
+        // painted, but which an unrelated writer overtook at revision 9. Its own
+        // snapshot is refused as stale, so re-installing to force a delivery would
+        // silently deliver nothing — and the newer material already contains it.
+        expect(session.update_state_snapshot({
+            revision: 9,
+            state: { columnWidths: [{ 0: 199 }] },
+        })).toBe(true);
+        expect(session.update_state_snapshot({ revision: 8, state: {} })).toBe(false);
+        expect(posted).toHaveLength(1);
+
+        expect(session.deliver_current_material()).toBe(true);
+        await settle();
+        expect(posted).toHaveLength(2);
+        expect(snapshot(posted).identity.stateRevision).toBe(9);
+        expect(snapshot(posted).state.columnWidths).toEqual([{ 0: 199 }]);
+        expect(session.acknowledged_current()).toBe(false);
+
+        session.dispose();
+        expect(session.deliver_current_material()).toBe(false);
+        expect(posted).toHaveLength(2);
+    });
+
     it('isolates the immutable snapshot from later input mutation', async () => {
         const source = adoption();
         const mutable_state = source.stateSnapshot.state as PerFileState;

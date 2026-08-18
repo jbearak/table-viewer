@@ -7612,6 +7612,12 @@ describe('edit mode save exit', () => {
         expect(post_message).not.toHaveBeenCalledWith(
             expect.objectContaining({ type: 'discardEditSession' }),
         );
+        // Answered, not silently dropped: the save dialog's "discard" answer also
+        // lands here, and by then the dialog has closed — so a bare refusal would
+        // leave the user in edit mode with no account of why.
+        expect(post_message).toHaveBeenCalledWith(
+            expect.objectContaining({ type: 'showWarning' }),
+        );
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
         expect(JSON.parse(grid_stub().getAttribute('data-undo-labels')!)).toEqual([]);
     });
