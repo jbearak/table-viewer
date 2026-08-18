@@ -6,6 +6,7 @@ import {
     sanitized_commit_history_replay_request,
     sanitized_prepare_history_replay_request,
     sanitized_wire_cell_overlay_state,
+    sanitized_wire_history_replay_display_focus,
     sanitized_wire_history_replay_focus,
 } from '../history-replay-protocol';
 
@@ -168,6 +169,51 @@ describe('sanitized_wire_history_replay_focus', () => {
                 sourceRowEnd: 9,
                 sourceColumnStart: 0,
                 sourceColumnEnd: 0,
+            })).toBeUndefined();
+        }
+    });
+});
+
+describe('sanitized_wire_history_replay_display_focus', () => {
+    it('accepts an inclusive display-row interval with its mapping generation', () => {
+        const focus = sanitized_wire_history_replay_display_focus({
+            displayRowStart: 4,
+            displayRowEnd: 9,
+            mappingGeneration: 3,
+        });
+        expect(focus).toEqual({ displayRowStart: 4, displayRowEnd: 9, mappingGeneration: 3 });
+        expect(Object.isFrozen(focus)).toBe(true);
+    });
+
+    it('distinguishes "nowhere visible" from "malformed"', () => {
+        // `null` is an ANSWER: every row the replay touched is filtered out of the
+        // view, which is a successful replay with no truthful cursor target. A
+        // caller that conflated it with `undefined` would report a protocol fault
+        // for an ordinary filtered workbook.
+        expect(sanitized_wire_history_replay_display_focus(null)).toBeNull();
+        expect(sanitized_wire_history_replay_display_focus(undefined)).toBeUndefined();
+        expect(sanitized_wire_history_replay_display_focus('null')).toBeUndefined();
+    });
+
+    it('rejects an inverted interval', () => {
+        expect(sanitized_wire_history_replay_display_focus({
+            displayRowStart: 9,
+            displayRowEnd: 4,
+            mappingGeneration: 3,
+        })).toBeUndefined();
+    });
+
+    it('rejects rows and generations that cannot index anything', () => {
+        for (const bad of [-1, 1.5, Number.NaN, '3', null]) {
+            expect(sanitized_wire_history_replay_display_focus({
+                displayRowStart: bad,
+                displayRowEnd: 9,
+                mappingGeneration: 3,
+            })).toBeUndefined();
+            expect(sanitized_wire_history_replay_display_focus({
+                displayRowStart: 0,
+                displayRowEnd: 9,
+                mappingGeneration: bad,
             })).toBeUndefined();
         }
     });

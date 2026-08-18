@@ -215,6 +215,29 @@ export interface HistoryReplayFocus {
 }
 
 /**
+ * Where the replayed region sits in the view the user is actually looking at.
+ *
+ * A companion to {@link HistoryReplayFocus}, never a replacement: source
+ * coordinates are the durable identity of what changed, but a sort or filter
+ * moves a source row to a different display row or removes it from the view
+ * altogether, and only the host holds the installed mapping — the renderer's
+ * row loader maps display to source and has no inverse.
+ *
+ * Rows only. Column visibility is renderer-owned (`ColumnProjection`), so the
+ * source-column interval on the focus is what the renderer projects itself.
+ *
+ * `mappingGeneration` is the sheet's mapping generation at the moment the host
+ * resolved these rows. A renderer whose own generation for that sheet has moved
+ * on holds a projection of a view that no longer exists, and must decline to
+ * move the cursor rather than select the wrong row. Ends are inclusive.
+ */
+export interface HistoryReplayDisplayFocus {
+    readonly displayRowStart: number;
+    readonly displayRowEnd: number;
+    readonly mappingGeneration: number;
+}
+
+/**
  * What a renderer asks the host to verify and lease.
  *
  * Deliberately direction-free. Undo and redo differ only in which side of each
@@ -344,6 +367,12 @@ export interface HistoryReplayCommitted extends HistoryReplayLeaseIdentity {
     readonly cells: readonly HistoryReplayAcceptedCellWrite[];
     readonly focusSheetIndex: number;
     readonly focus: HistoryReplayFocus;
+    /**
+     * `null` when NO row the replay touched on the focus sheet has a position in
+     * the installed view — every one of them is filtered out. The replay still
+     * succeeded; there is simply nowhere visible to put the cursor.
+     */
+    readonly displayFocus: HistoryReplayDisplayFocus | null;
 }
 
 /**
@@ -506,6 +535,27 @@ export function sanitized_wire_history_replay_focus(
         sourceColumnStart,
         sourceColumnEnd,
     });
+}
+
+/**
+ * Host-to-renderer wire input, so sanitized like every other arm even though the
+ * host produced it: the renderer must not build a Glide selection out of a
+ * number it never checked. `null` is a valid answer and distinct from a
+ * malformed one, which is why the absent case is reported as `undefined`.
+ */
+export function sanitized_wire_history_replay_display_focus(
+    value: unknown,
+): HistoryReplayDisplayFocus | null | undefined {
+    if (value === null) return null;
+    if (!is_plain_record(value)) return undefined;
+    const { displayRowStart, displayRowEnd, mappingGeneration } = value;
+    if (
+        !is_source_index(displayRowStart)
+        || !is_source_index(displayRowEnd)
+        || displayRowEnd < displayRowStart
+        || !is_source_index(mappingGeneration)
+    ) return undefined;
+    return Object.freeze({ displayRowStart, displayRowEnd, mappingGeneration });
 }
 
 function sanitized_correlation(value: unknown): HistoryReplayCorrelation | undefined {

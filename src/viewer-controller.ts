@@ -153,6 +153,7 @@ import {
     type HistoryReplayPreparedCell,
     type PrepareHistoryReplayRequest,
 } from './history-replay-protocol';
+import { resolve_replay_display_focus } from './history-replay-focus-model';
 import { create_history_replay_lease_registry } from './history-replay-lease-model';
 import {
     pending_edits_with_replay_writes,
@@ -7822,6 +7823,20 @@ export function attach_viewer(
             }))),
             focusSheetIndex: payload.focusSheetIndex,
             focus: payload.focus,
+            // Resolved HERE and not at preparation: a replay waits on a keypress
+            // and a round trip, and a transform queued in that window would make a
+            // preparation-time answer name rows the user is no longer looking at.
+            // Serialized commands mean anything queued after this point publishes
+            // after the commit, and the generation stamp is what lets the renderer
+            // decline a projection that was overtaken anyway.
+            displayFocus: resolve_replay_display_focus(
+                payload,
+                (sheet_index, source_row) => replay_core.display_row_for_source(
+                    sheet_index,
+                    source_row,
+                ),
+                replay_core.mapping_generation(payload.focusSheetIndex),
+            ),
         });
     }
 
