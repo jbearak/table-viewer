@@ -893,6 +893,13 @@ export function GridShell({
         && !save_in_flight
         && !highlight_in_flight
         && !close_barrier_active;
+    // Edit callbacks can outlive the render that supplied them. Read admission
+    // through a render-current ref so a queued overlay finish cannot commit just
+    // because its callback closed over the previous editable state.
+    const editable_cells_ref = useRef(editable_cells);
+    editable_cells_ref.current = editable_cells;
+    const edit_session_id_ref = useRef(edit_session_id);
+    edit_session_id_ref.current = edit_session_id;
 
     useEffect(() => {
         if (
@@ -1256,12 +1263,18 @@ export function GridShell({
         merge_index,
     ]);
     const previous_projection_ref = useRef(column_projection);
-    useEffect(() => {
+    useLayoutEffect(() => {
         if (column_projections_equal(previous_projection_ref.current, column_projection)) {
             previous_projection_ref.current = column_projection;
             return;
         }
         previous_projection_ref.current = column_projection;
+        // A controlled selection reset and a new provideEditor callback do not
+        // reliably close an overlay Glide already mounted. App folds its live
+        // value before changing a projection; explicitly terminate the old
+        // display-coordinate lifetime before display columns acquire new
+        // meanings.
+        grid_ref.current?.dismissOverlay();
         const focused_source = focused_source_column_ref.current;
         focused_source_column_ref.current = focused_source !== undefined
             && visible_source_columns.includes(focused_source)
@@ -1424,8 +1437,15 @@ export function GridShell({
     const open_overlay_row_ref = useRef<{
         display_cell: Item;
         source_row: number;
+        source_column: number;
+        edit_session_id: string | undefined;
         pin: symbol;
     } | null>(null);
+    // Remains raised while an overlay lifetime is revoked, then clears when
+    // editing reopens or a newly mounted tracking editor captures admission.
+    // This closes the small window in which an already-queued finish can arrive
+    // after the old editor was unmounted.
+    const overlay_admission_revoked_ref = useRef(false);
     const pending_editor_navigation_ref = useRef<Item | null>(null);
     useEffect(() => {
         pending_editor_navigation_ref.current = null;
@@ -1439,6 +1459,8 @@ export function GridShell({
     unpin_rows_ref.current = unpin_rows;
     const get_source_row_ref = useRef(get_source_row);
     get_source_row_ref.current = get_source_row;
+    const source_column_for_display_ref = useRef(source_column_for_display);
+    source_column_for_display_ref.current = source_column_for_display;
 
     const release_open_overlay_row = useCallback(() => {
         const captured = open_overlay_row_ref.current;
@@ -1456,25 +1478,27 @@ export function GridShell({
         if (!loc) return;
         const display_row = loc[1];
         const source_row = get_source_row_ref.current(display_row);
+        const source_column = source_column_for_display_ref.current(loc[0]);
         // Unresolved identity: nothing to remember and nothing worth pinning. The
         // overlay-open gate means this is unreachable for a real editor mount, and
         // leaving the ref null keeps the commit guards' early return intact.
-        if (source_row === undefined) return;
+        if (source_row === undefined || source_column === undefined) return;
+        overlay_admission_revoked_ref.current = false;
         open_overlay_row_ref.current = {
             display_cell: [loc[0], display_row],
             source_row,
+            source_column,
+            edit_session_id: edit_session_id_ref.current,
             pin: pin_rows_ref.current(display_row, display_row),
         };
     }, [release_open_overlay_row]);
 
     /**
-     * Canonical source row for a commit arriving from the open overlay. Live
-     * residency first — that is the truth for every path that did not come through
-     * an overlay (Glide's paste path, most importantly, which never opens one).
-     * Only when the row is no longer resident does the identity captured at
-     * overlay-open time stand in, and only for the row it was captured for: a
-     * mismatched display row means this commit is not that overlay's, so the
-     * caller's early return still applies.
+     * Canonical source row for a current gesture. Live residency is the truth for
+     * paste/fill/delete, which do not belong to an open overlay. If the row has
+     * just been evicted, the overlay capture remains a safe fallback for its own
+     * display row. Exact overlay edits choose the full captured identity at their
+     * call sites so a newly resident row cannot steal a late finish.
      */
     const commit_source_row = useCallback((row: number): number | undefined => {
         const resident = get_source_row(row);
@@ -1490,11 +1514,34 @@ export function GridShell({
     // only if Glide re-renders the overlay. Releasing here too makes the lifecycle
     // independent of that: an unreleased pin would hold a page resident for the
     // rest of the session.
-    useEffect(() => {
-        if (editable_cells) return;
+    useLayoutEffect(() => {
+        if (editable_cells) {
+            // The revoked overlay was synchronously dismissed below. Reopening
+            // admission permits the next ordinary edit callback; a real overlay
+            // mount will replace the capture before it can finish in any case.
+            overlay_admission_revoked_ref.current = false;
+            return;
+        }
         pending_editor_navigation_ref.current = null;
+        overlay_admission_revoked_ref.current = true;
+        // `provideEditor` controls whether a *new* overlay may open; Glide does
+        // not consistently apply that change to one it already owns. The caller
+        // initiating an ordinary transition folds the live text first. This
+        // imperative dismissal is the final lifecycle boundary for revocation
+        // and other transitions where accepting a late edit would be unsafe.
+        grid_ref.current?.dismissOverlay();
         release_open_overlay_row();
     }, [editable_cells, release_open_overlay_row]);
+
+    const previous_overlay_session_ref = useRef(edit_session_id);
+    useLayoutEffect(() => {
+        if (previous_overlay_session_ref.current === edit_session_id) return;
+        previous_overlay_session_ref.current = edit_session_id;
+        pending_editor_navigation_ref.current = null;
+        overlay_admission_revoked_ref.current = true;
+        grid_ref.current?.dismissOverlay();
+        release_open_overlay_row();
+    }, [edit_session_id, release_open_overlay_row]);
 
     // Unmount (a generation/sheet remount, or the webview closing). The loader's
     // own unmount clears its pins as well, so this is the belt to that braces —
@@ -1510,7 +1557,13 @@ export function GridShell({
         const loc = grid_selection_ref.current.current?.cell;
         if (!loc) return null;
         const [display_column, row] = loc;
-        const source_column = source_column_for_display(display_column);
+        const captured = open_overlay_row_ref.current;
+        const captured_matches = captured !== null
+            && captured.display_cell[0] === display_column
+            && captured.display_cell[1] === row;
+        const source_column = captured_matches
+            ? captured.source_column
+            : source_column_for_display(display_column);
         if (source_column === undefined) return null;
         // The `key` is a durable edit key, so it must be fully source-keyed: the
         // save collectors (collect_save_payload) merge it
@@ -1518,7 +1571,9 @@ export function GridShell({
         // would poison them. Falls back to the identity captured when this overlay
         // opened, so an editor whose page left mid-edit still reaches the save
         // rather than being silently dropped (see commit_source_row).
-        const source_row = commit_source_row(row);
+        const source_row = captured_matches
+            ? captured.source_row
+            : commit_source_row(row);
         if (source_row === undefined) return null;
         // `original` is what the editor *opened with*, so cleanliness is a
         // comparison in the editor's own space. On a markdown sheet that is
@@ -1572,6 +1627,7 @@ export function GridShell({
             || operation.editSessionId !== edit_session_id
             || operation.saveRequestId.length === 0
         ) return false;
+        grid_ref.current?.dismissOverlay();
         const worksheet = worksheet_payload(operation);
         save_operation_ref.current = operation;
         saved_edits_ref.current = worksheet ? { ...worksheet.edits } : {};
@@ -1684,33 +1740,38 @@ export function GridShell({
     ]);
 
     const commit_live_edit = useCallback((): void => {
-        if (save_in_flight_ref.current) return;
+        if (save_in_flight_ref.current) {
+            grid_ref.current?.dismissOverlay();
+            return;
+        }
         const live = read_live_edit();
-        if (!live) return;
-        // Source-keyed already: `live.key` comes from read_live_edit and
-        // commit_edit's first parameter is a source row. No conversion here.
-        const [source_row, source_column] = live.key.split(':').map(Number);
-        if (!Number.isInteger(source_row) || !Number.isInteger(source_column)) return;
-        commit_edit(source_row, source_column, live.value);
-        // The display row for the same cell, read from the same selection `read_live_edit`
-        // derived `live.key` from and in the same synchronous block — so the two name one
-        // cell in the two spaces, with no mapping and no chance of drift.
-        //
-        // Whether the resize this posts is honoured depends on why the fold happened, and
-        // that is the honest state of it rather than a gap. A fold for a column-visibility
-        // change, or for a transform installing on *another* sheet, leaves this sheet's
-        // mapping alone, so the host accepts it (`mapping_generation`, in
-        // `viewer-controller`) and the height lands. A fold for a transform installing on
-        // *this* sheet is refused, and must be: the display row here belongs to the
-        // arrangement being left, and the reason resizes are never replayed is that
-        // replaying one resizes whatever rows have moved into those positions. The text is
-        // committed either way. No repaint, unlike `on_cells_edited`: every caller of this
-        // is about to remount or re-project the grid, which repaints everything.
-        const active_cell = grid_selection_ref.current.current?.cell;
-        if (active_cell !== undefined) {
-            auto_grow_row_for_text(active_cell[1], live.value, active_cell[0]);
+        if (live) {
+            // Source-keyed already: `live.key` comes from read_live_edit and
+            // commit_edit's first parameter is a source row. No conversion here.
+            const [source_row, source_column] = live.key.split(':').map(Number);
+            if (Number.isInteger(source_row) && Number.isInteger(source_column)) {
+                commit_edit(source_row, source_column, live.value);
+                // The display row for the same cell, read from the same selection
+                // `read_live_edit` derived `live.key` from and in the same
+                // synchronous block — so the two name one cell in the two spaces,
+                // with no mapping and no chance of drift.
+                //
+                // Whether the resize this posts is honoured depends on why the
+                // fold happened, and that is the honest state of it rather than a
+                // gap. No repaint, unlike `on_cells_edited`: every caller is about
+                // to remount, re-project, or make the grid read-only.
+                const active_cell = grid_selection_ref.current.current?.cell;
+                if (active_cell !== undefined) {
+                    auto_grow_row_for_text(active_cell[1], live.value, active_cell[0]);
+                }
+            }
         }
         set_live_uncommitted(false);
+        // Folding and terminating are one lifecycle operation. Merely changing
+        // provideEditor or the controlled selection can leave Glide's portalled
+        // overlay mounted, which is how a cell from the newly selected sheet
+        // appeared as a dialog after a highlight transition.
+        grid_ref.current?.dismissOverlay();
     }, [
         auto_grow_row_for_text,
         commit_edit,
@@ -2380,7 +2441,18 @@ export function GridShell({
             // The admission gates are the batch's, applied once: past the close
             // barrier `post_pending_edits` refuses to publish, so an edit
             // committed after it would sit in the store and never reach the host.
-            if (close_barrier_ref.current || save_in_flight_ref.current) return true;
+            if (
+                !editable_cells_ref.current
+                || close_barrier_ref.current
+                || save_in_flight_ref.current
+            ) return true;
+            if (source === 'edit' && overlay_admission_revoked_ref.current) return true;
+            const open_overlay = open_overlay_row_ref.current;
+            if (
+                source === 'edit'
+                && open_overlay !== null
+                && open_overlay.edit_session_id !== edit_session_id_ref.current
+            ) return true;
             // The replay reservation belongs here too, and BEFORE the auto-grow
             // below: `run_edit_gesture` drops a gesture that is not admitted, so a
             // row grown on the way past would persist a durable height for text
@@ -2406,7 +2478,18 @@ export function GridShell({
             };
             for (const { location, value } of items) {
                 const [display_column, row] = location;
-                const source_column = source_column_for_display(display_column);
+                // A late finish from an overlay belongs to the source column it
+                // opened on, even if a projection has since assigned its display
+                // slot to another column. Paste/fill/delete are current gestures,
+                // so they continue to resolve through the live projection.
+                const captured = open_overlay;
+                const captured_matches = source === 'edit'
+                    && captured !== null
+                    && captured.display_cell[0] === display_column
+                    && captured.display_cell[1] === row;
+                const source_column = captured_matches
+                    ? captured.source_column
+                    : source_column_for_display(display_column);
                 if (source_column === undefined) continue;
                 // Resolve source identity here as well as at overlay-open time.
                 // get_cell_content's `editable` gate covers the overlay and
@@ -2416,12 +2499,13 @@ export function GridShell({
                 // keeping an unresolvable row from landing an edit under the
                 // wrong key.
                 //
-                // Live residency first, then the identity this overlay opened
-                // with: Glide passes `overlay.cell` (the coordinates the editor
-                // opened on) to onFinishEditing, so the captured entry names
-                // exactly this commit's row and the guard keeps refusing only the
-                // genuinely unresolvable case.
-                const source_row = resolve_source_row(row);
+                // Glide passes `overlay.cell` (the coordinates the editor opened
+                // on) to onFinishEditing, so an exact late overlay finish uses the
+                // captured row as well as the captured column. Other gestures use
+                // current residency, with the capture only as an eviction fallback.
+                const source_row = captured_matches
+                    ? captured.source_row
+                    : resolve_source_row(row);
                 if (source_row === null) continue;
                 const text = value.kind === GridCellKind.Text ? value.data ?? '' : '';
                 edits.push({ source_row, source_col: source_column, value: text });
@@ -2477,6 +2561,8 @@ export function GridShell({
             auto_grow_row_for_text,
             commit_edits,
             display_column_count,
+            editable_cells_ref,
+            edit_session_id_ref,
             gestures_admitted,
             source_column_for_display,
             commit_source_row,
