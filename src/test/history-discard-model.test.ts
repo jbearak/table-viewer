@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { CellHyperlink } from '../cell-content';
+import type { CellHyperlink, RichText } from '../cell-content';
 import type { WorksheetTarget } from '../types';
 import {
     discard_history_source,
@@ -93,6 +93,40 @@ describe('discard_history_source', () => {
         ]);
         expect(delta.value?.desired.content).toEqual(history_value('A'));
         expect(delta.hyperlink?.desired.content).toBeNull();
+    });
+
+    it('captures every entry shape the store can hold, all as membership', () => {
+        // The persisted side now comes from the entry's own base, so a shape whose
+        // base carries runs or a link runs through content comparison that the
+        // fabricated empty never exercised. A shape that compared EQUAL would be
+        // dropped from the discard's history — the cell would silently not be
+        // undoable — and one that came out `semantic` would make redo write
+        // historical text back over disk.
+        const RUNS: RichText = { runs: [{ text: 'a', style: { bold: true } }] };
+        const shapes: Record<string, HistoryDirtyEntry> = {
+            plain: { value: 'a', base: 'A' },
+            unchanged_text: { value: 'a', base: 'a' },
+            link_only: { value: 'a', base: 'a', link: LINK, baseLink: null },
+            link_cleared: { value: 'a', base: 'a', link: null, baseLink: LINK },
+            base_pending: { value: 'a', base: '', base_pending: true },
+            base_runs: { value: 'a', base: 'A', baseRuns: RUNS },
+            both_runs: { value: 'a', base: 'a', valueRuns: RUNS, baseRuns: RUNS },
+            empty: { value: '', base: '' },
+            combined: {
+                value: 'b',
+                base: 'A',
+                link: LINK,
+                baseLink: LINK,
+                valueRuns: RUNS,
+                baseRuns: RUNS,
+            },
+        };
+        for (const [name, entry] of Object.entries(shapes)) {
+            const captured = deltas([worksheet(SHEET, { '0:0': entry })]);
+            expect(captured, name).toHaveLength(1);
+            expect(captured[0]!.value?.mode ?? 'membership', name).toBe('membership');
+            expect(captured[0]!.hyperlink?.mode ?? 'membership', name).toBe('membership');
+        }
     });
 
     it('records a link-only entry through its hyperlink dimension alone', () => {

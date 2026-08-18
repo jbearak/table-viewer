@@ -1668,6 +1668,18 @@ export function App(): React.JSX.Element {
                         // that never resolved would hold the reservation, and the
                         // user's undo, for the life of the window.
                         replay_coordinator_ref.current?.reset();
+                        // The outgoing document's discard cleanup, if one was
+                        // still unacknowledged. Settled as failed rather than
+                        // dropped: an awaiter would otherwise hold for an
+                        // acknowledgement that belongs to a file which has left.
+                        // Unreachable today — the cleared history refuses a replay
+                        // before it asks for a session — but that is another
+                        // mechanism's doing, not this one's.
+                        const discarding = discard_cleanup_ref.current;
+                        if (discarding !== undefined) {
+                            discard_cleanup_ref.current = undefined;
+                            discarding.settle(false);
+                        }
                     } else {
                         const edit_session_id = csv_edit_session_id_ref.current;
                         const reconciliation = edit_session_registry_ref.current!
