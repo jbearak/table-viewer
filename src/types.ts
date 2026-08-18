@@ -1655,6 +1655,33 @@ export function sanitized_wire_worksheet_target(
     });
 }
 
+/**
+ * What the renderer's history looks like to a native Edit menu.
+ *
+ * Deliberately not the history state itself: a menu needs two labels and two
+ * booleans, and shipping the stack would put an unbounded structure — the very
+ * one the byte bounds exist to cap — across a process boundary on every edit.
+ * The labels are already truncated by the stack that produced them
+ * (`MAX_BARRIER_LABEL_LENGTH`).
+ */
+export interface HistoryMenuProjection {
+    readonly undoAvailable: boolean;
+    readonly redoAvailable: boolean;
+    /** The gesture undo would walk back. Absent when unavailable. */
+    readonly undoLabel?: string;
+    /** The gesture redo would re-apply. Absent when unavailable. */
+    readonly redoLabel?: string;
+    /**
+     * Focus is in a text field, so the chord means the browser's text undo.
+     *
+     * The one thing about the *renderer's* moment-to-moment state that the menu
+     * needs and cannot derive from the stack. Notably a replay being in flight is
+     * NOT here: the items stay enabled and identically labelled throughout one, so
+     * a field for it would be a field no menu item reads.
+     */
+    readonly textEditing: boolean;
+}
+
 /** Immutable identity and complete payload for one accepted workbook save. */
 export interface CsvSaveOperation {
     readonly editSessionId: string;
@@ -1947,6 +1974,18 @@ export type WebviewMessage =
     | { type: 'pendingEditsFlush'; requestId: string; editSessionId?: string; highestProducedSequence: number }
     /** The renderer could not establish the requested close/reload barrier. */
     | { type: 'pendingEditsFlushFailed'; requestId: string }
+    /**
+     * What the desktop Edit menu's Undo and Redo items should read and whether
+     * they should be enabled.
+     *
+     * Desktop-only, and consumed by the main process rather than by the viewer
+     * controller: a native menu is chrome the extension host's webview does not
+     * have, so the VS Code side has nothing to do with this. It is a *projection*
+     * and not a command — nothing about it authorizes a replay, and a stale copy
+     * costs at most a menu item that reads a gesture behind (the click still
+     * routes to the renderer, which decides against its own live stack).
+     */
+    | { type: 'historyMenuStateChanged'; state: HistoryMenuProjection }
     // User-facing warning raised inside the webview (e.g. a clipped copy) that
     // the host surfaces via vscode.window.showWarningMessage.
     | { type: 'showWarning'; message: string }

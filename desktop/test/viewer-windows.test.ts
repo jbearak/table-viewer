@@ -184,6 +184,9 @@ const electron_mock = vi.hoisted(() => {
         }
 
         isDestroyed() { return this.destroyed; }
+        /** Focus is not modelled otherwise; the menu-rebuild callback reads it. */
+        focused = true;
+        isFocused() { return this.focused; }
         isMinimized() { return false; }
         isMaximized() { return false; }
         isFullScreen() { return false; }
@@ -296,6 +299,7 @@ function controlled_deadlines() {
 
 function manager(
     deadline_scheduler?: (callback: () => void, delayMs: number) => () => void,
+    on_history_menu_changed?: (window: ElectronBrowserWindow) => void,
 ) {
     const config = {
         settings: () => ({
@@ -314,6 +318,8 @@ function manager(
         config as any,
         '/viewer-preload.js',
         deadline_scheduler,
+        undefined,
+        on_history_menu_changed,
     );
 }
 
@@ -1390,6 +1396,85 @@ describe('viewer window close protocol', () => {
         await vi.waitFor(() => expect(electron_mock.dialog.showMessageBox).toHaveBeenCalledTimes(1));
         expect(window.destroyed).toBe(false);
         expect(controller_mock.controller.drain).not.toHaveBeenCalled();
+    });
+});
+
+describe('what the Edit menu is told about a viewer s history', () => {
+    it('retains the state per window and rebuilds for the focused one', () => {
+        const rebuilt: ElectronBrowserWindow[] = [];
+        const viewer_manager = manager(undefined, (window) => { rebuilt.push(window); });
+        viewer_manager.open_file('/tmp/a.csv');
+        const first = latest_window();
+        viewer_manager.open_file('/tmp/b.csv');
+        const second = latest_window();
+
+        emit_webview(first, {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                undoLabel: 'Paste',
+                textEditing: false,
+            },
+        });
+
+        // Retained against the window that reported it, and only that one: the
+        // menu shows the focused window's history, and two files have two.
+        expect(viewer_manager.history_menu_state(first as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoAvailable: true, undoLabel: 'Paste' });
+        expect(viewer_manager.history_menu_state(second as unknown as ElectronBrowserWindow))
+            .toBeUndefined();
+        expect(rebuilt).toHaveLength(1);
+    });
+
+    it('drops a malformed payload rather than retaining it', () => {
+        const rebuilt: ElectronBrowserWindow[] = [];
+        const viewer_manager = manager(undefined, (window) => { rebuilt.push(window); });
+        viewer_manager.open_file('/tmp/bad.csv');
+        const window = latest_window();
+
+        emit_webview(window, {
+            type: 'historyMenuStateChanged',
+            state: { undoAvailable: 'yes' } as never,
+        });
+
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toBeUndefined();
+        // And no rebuild either: the menu it would build is the one already up.
+        expect(rebuilt).toEqual([]);
+    });
+
+    it('stops listening once the window is gone', async () => {
+        // The watcher is on the shared ipcMain channel, so a torn-down window that
+        // kept listening would keep answering for a webContents nobody owns.
+        const rebuilt: ElectronBrowserWindow[] = [];
+        const viewer_manager = manager(undefined, (window) => { rebuilt.push(window); });
+        viewer_manager.open_file('/tmp/gone.csv');
+        const window = latest_window();
+        emit_webview(window, { type: 'ready' });
+
+        const closing = viewer_manager.close_all();
+        const request = window.webContents.sent.filter(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        ).at(-1)?.message;
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
+        emit_webview(window, {
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            highestProducedSequence: 0,
+        });
+        await expect(closing).resolves.toBe(true);
+        expect(window.destroyed).toBe(true);
+
+        emit_webview(window, {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                textEditing: false,
+            },
+        });
+        expect(rebuilt).toEqual([]);
     });
 });
 

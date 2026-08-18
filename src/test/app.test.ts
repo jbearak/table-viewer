@@ -12608,7 +12608,13 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
      * no edit session, so these tests are about the command path rather than about
      * standing up an edit lifecycle.
      */
-    async function record_highlight(post_message: ReturnType<typeof vi.fn>) {
+    async function record_highlight(
+        post_message: ReturnType<typeof vi.fn>,
+        // The gesture's own posts are usually noise, and clearing them is what
+        // lets `sent` mean "since the gesture". A test about those posts asks to
+        // keep them.
+        options: { readonly keep_posts?: boolean } = {},
+    ) {
         const snapshot = initial_snapshot_message(make_meta(['Sheet1', 'Sheet2']));
         await dispatch_host_message(snapshot);
         await click_button('Highlight');
@@ -12636,7 +12642,7 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         });
         expect(JSON.parse(grid_stub().getAttribute('data-undo-labels')!))
             .toEqual(['Clear all highlights']);
-        post_message.mockClear();
+        if (!options.keep_posts) post_message.mockClear();
     }
 
     function sent<T extends string>(post_message: ReturnType<typeof vi.fn>, type: T) {
@@ -12790,6 +12796,54 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
 
         await click_stub_button('.stub-history-focus-applied');
         expect(grid_stub().getAttribute('data-history-focus')).toBe('null');
+    });
+
+    it('tells the desktop menu what its Undo item should read', async () => {
+        const { post_message } = await render_app();
+        // Before any gesture, and it still has to be said: the menu was built with
+        // enabled items, and a window with an empty history has to correct that.
+        expect(sent(post_message, 'historyMenuStateChanged').state).toEqual({
+            undoAvailable: false,
+            redoAvailable: false,
+            textEditing: false,
+        });
+
+        await record_highlight(post_message, { keep_posts: true });
+        expect(sent(post_message, 'historyMenuStateChanged').state).toMatchObject({
+            undoAvailable: true,
+            undoLabel: 'Clear all highlights',
+            redoAvailable: false,
+        });
+        post_message.mockClear();
+
+        // And after the replay lands, the two stacks have swapped.
+        await undo_via_menu();
+        await complete_replay(post_message);
+        expect(sent(post_message, 'historyMenuStateChanged').state).toMatchObject({
+            undoAvailable: false,
+            redoAvailable: true,
+            redoLabel: 'Clear all highlights',
+        });
+    });
+
+    it('does not repost a projection that would build the same menu', async () => {
+        const { post_message } = await render_app();
+        await record_highlight(post_message, { keep_posts: true });
+        const count = () => post_message.mock.calls.filter(
+            (call) => call[0]?.type === 'historyMenuStateChanged',
+        ).length;
+        // A real baseline rather than zero: the gesture's own posts are counted, so
+        // this cannot pass by nothing ever being published.
+        const before = count();
+        expect(before).toBeGreaterThan(0);
+
+        // A focus event that does not cross the text/grid boundary. Rebuilding an
+        // application menu is not free, and these arrive on every click.
+        await act(async () => {
+            window.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
+        });
+
+        expect(count()).toBe(before);
     });
 
     it('keeps a newer request when the grid answers an older one', async () => {

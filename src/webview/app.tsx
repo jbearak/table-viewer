@@ -32,6 +32,7 @@ import {
     type DisplayRowInterval,
     type PerFileState,
     type SheetPendingEditCells,
+    type HistoryMenuProjection,
     type HostMessage,
     type SheetTransformState,
     type FilterEntry,
@@ -110,6 +111,10 @@ import {
     type HistoryReplayCoordinator,
 } from './history-replay-coordinator';
 import { history_refusal_warning } from './history-command-model';
+import {
+    history_menu_projection,
+    history_menu_projections_equal,
+} from './history-menu-projection';
 import {
     history_focus_request,
     type HistoryFocusOutcome,
@@ -3176,6 +3181,8 @@ export function App(): React.JSX.Element {
      * honour it.
      */
     const [history_focus, set_history_focus] = useState<PendingHistoryFocus | null>(null);
+    /** The last projection posted, so an unchanged one is not posted again. */
+    const history_menu_state_ref = useRef<HistoryMenuProjection | undefined>(undefined);
     const history_focus_sequence_ref = useRef(0);
 
     const handle_history_focus_applied = useCallback((
@@ -3250,6 +3257,59 @@ export function App(): React.JSX.Element {
             handle_sheet_select(accepted.committed.focusSheetIndex);
         }
     }, [active_sheet_index, apply_committed_replay, handle_sheet_select]);
+
+    /**
+     * Keep the desktop's native Edit menu in step with the history.
+     *
+     * Posted rather than derived, because the menu is in another process and
+     * cannot read the stack. Diffed against the last post, because rebuilding an
+     * application menu is not free and the three inputs move for reasons that
+     * usually change nothing: a keystroke that dirties a cell moves neither
+     * label, and a focus change between two grid elements is not a change of
+     * text-editing state.
+     *
+     * Harmless in the VS Code webview, which has no native menu — the host
+     * ignores a message type it does not handle — and cheap enough not to be
+     * worth a platform test that the renderer cannot make reliably anyway.
+     */
+    const publish_history_menu_state = useCallback(() => {
+        const store = history_store_ref.current;
+        if (store === null) return;
+        const projection = history_menu_projection(
+            store.snapshot(),
+            edit_command_target(document.activeElement) === 'text',
+        );
+        if (history_menu_state_ref.current !== undefined
+            && history_menu_projections_equal(history_menu_state_ref.current, projection)
+        ) return;
+        history_menu_state_ref.current = projection;
+        host_bridge.postMessage({ type: 'historyMenuStateChanged', state: projection });
+    }, []);
+
+    /**
+     * Both things the projection is built from, watched where each moves.
+     *
+     * The stack has a subscription — and a landed replay moves it, so that is also
+     * what keeps the labels fresh across an undo. Text-editing focus has
+     * capture-phase focus events, because focusin/focusout do not bubble from every
+     * element the CSV editor uses.
+     *
+     * The initial publish is the effect body, not a separate call: a window whose
+     * history is empty still has to say so, or the menu would keep the enabled
+     * items it was built with before any viewer reported.
+     */
+    useEffect(() => {
+        publish_history_menu_state();
+        const unsubscribe = history_store_ref.current!.subscribe(publish_history_menu_state);
+        const on_focus_change = () => publish_history_menu_state();
+        window.addEventListener('focusin', on_focus_change, true);
+        window.addEventListener('focusout', on_focus_change, true);
+        return () => {
+            unsubscribe();
+            window.removeEventListener('focusin', on_focus_change, true);
+            window.removeEventListener('focusout', on_focus_change, true);
+        };
+    }, [publish_history_menu_state]);
 
     /**
      * Undo or redo, from a keystroke or the desktop Edit menu.
