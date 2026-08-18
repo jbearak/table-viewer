@@ -361,6 +361,21 @@ describe('edit session registry', () => {
             expect(store.size()).toBe(1);
         });
 
+        it('hands back a snapshot the commit cannot empty under it', () => {
+            // `snapshot()` returns the store's own map by reference, so this holds
+            // only because every mutator REPLACES the map rather than mutating it.
+            // If one ever cleared in place, the discard would record an empty
+            // gesture and the edits would be unrecoverable.
+            const { registry } = make_session_ref('s');
+            registry.for_sheet(0).commit('s', '0:0', { value: 'x', base: 'a' });
+
+            const staged = registry.stage_discard('s', SHEETS)!;
+            for (const mutation of staged.mutations) mutation.commit();
+
+            expect([...staged.worksheets[0].entries.entries()])
+                .toEqual([['0:0', { value: 'x', base: 'a' }]]);
+        });
+
         it('reports a snapshot taken at the instant it fixed the state', () => {
             // The reason snapshot and stage are one call. A keystroke landing
             // between them would be missing from the recorded action, so undoing
