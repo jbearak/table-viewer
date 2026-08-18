@@ -7570,10 +7570,25 @@ export function attach_viewer(
         ) return refused('document-changed');
 
         // The file again, because preparation's check is old by now: a replay
-        // waits on a user keypress and a round trip. The residual window between
-        // this and the write below is the same one the save path documents and
-        // accepts, and it is bounded by the compare-and-swap: a change landing
-        // inside it costs a refusal, never a mutation against unseen bytes.
+        // waits on a user keypress and a round trip.
+        //
+        // What this re-verification does NOT close, and cannot — the same
+        // filesystem TOCTOU the save path documents at its pre-write stat:
+        //  - A write landing between this check and the compare-and-swap below
+        //    is not detected here. The gap is the filesystem's own plus the
+        //    event-loop turns that resume these continuations. Only an advisory
+        //    lock or an OS-level compare-and-swap would close it, and
+        //    `FileSystemPort` exposes no handle to build either on.
+        //  - A same-size write within the same coarse mtime tick is invisible to
+        //    any {size, mtime} comparison; it is caught only by the digest, and
+        //    only if it lands before the read.
+        //
+        // What bounds the consequence is that this is not a write path. The
+        // replay mutates only durable pending-edit and highlight state, and it
+        // does so under a compare-and-swap whose expectations were recorded at
+        // preparation. A file that changed inside the residual window costs the
+        // replay a refusal — the user retries after the reload lands — never a
+        // mutation against bytes nobody read, and never a partial application.
         if (!await replay_physical_source_is_current(
             observation,
             expected_digest,
@@ -7808,10 +7823,9 @@ export function attach_viewer(
      * the digest and the authority. The two stats bracket the read so a write
      * landing mid-read is caught rather than digested.
      *
-     * The residual race is accepted and is the same one the save path documents:
-     * the file can change between this check and the commit's own. The commit
-     * repeats it, and durable state is compare-and-swapped regardless, so the
-     * worst outcome is a refusal rather than a mutation against bytes nobody saw.
+     * The residual race is accepted and is the same one the save path documents.
+     * The commit repeats this check and spells out exactly what the repetition
+     * does and does not close; see the comment above its call.
      */
     async function replay_physical_source_is_current(
         observation: Readonly<PhysicalSourceObservation>,
