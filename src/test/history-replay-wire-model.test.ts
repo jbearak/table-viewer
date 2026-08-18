@@ -21,9 +21,9 @@ import {
     prepared_cell_ordinals,
     prepared_overlays_match_store,
     read_state_from_prepared_replay,
-    replay_cell_address,
     wire_overlay_from_cell_overlay_state,
 } from '../webview/history-replay-wire-model';
+import { cell_address as replay_cell_address } from '../webview/history-replay-model';
 
 const LINK: CellHyperlink = { kind: 'external', target: 'https://example.com/' };
 const OTHER: CellHyperlink = { kind: 'internal', location: 'B2' };

@@ -161,8 +161,7 @@ export function plan_history_replay(
 }
 
 /**
- * A cell's address for the plan's own bookkeeping, built from the whole target
- * rather than the sheet index.
+ * A cell's address, built from the whole target rather than the sheet index.
  *
  * Object identity would be tempting — an owned action shares one target per
  * tuple — but a plan must not depend on how its action was built, and two
@@ -176,8 +175,15 @@ export function plan_history_replay(
  * tuple would file them as two cells, so the second delta would miss the first's
  * planned state, read a store that has not moved, and refuse a replay that is
  * consistent with itself.
+ *
+ * Exported because the planner's own bookkeeping and the prepared-response
+ * lookup it reads through must key cells IDENTICALLY: the planner asks for an
+ * address and the wire reader answers from a map built under the same rule, so
+ * two implementations that merely agree today would, on drifting apart, make
+ * every prepared cell invisible to the delta that addresses it and turn a sound
+ * replay into `unavailable`. One function makes the agreement structural.
  */
-function cell_address(worksheet: WorksheetTarget, row: number, column: number): string {
+export function cell_address(worksheet: WorksheetTarget, row: number, column: number): string {
     const { sheetIndex, sheetName, worksheetId } = worksheet;
     const identity: readonly [string, string | number] = worksheetId !== undefined
         ? ['id', worksheetId]

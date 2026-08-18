@@ -37,7 +37,11 @@ import {
     type CellOverlayState,
     type HistoryValue,
 } from './history-cell-state-model';
-import type { CellReplayState, ReadCellState } from './history-replay-model';
+import {
+    cell_address as replay_cell_address,
+    type CellReplayState,
+    type ReadCellState,
+} from './history-replay-model';
 
 function wire_history_value(value: HistoryValue): WireHistoryValue {
     return value.runs === undefined ? { text: value.text } : { text: value.text, runs: value.runs };
@@ -115,30 +119,6 @@ export function cell_overlay_state_from_wire(
     );
 }
 
-/**
- * A cell's key for the prepared-response lookup, built from the STRONGEST
- * identity its target carries — id, then name, then index, the hierarchy
- * `worksheet_target_lookup` resolves by.
- *
- * The same reasoning as `history-replay-model`'s own `cell_address`: two targets
- * naming one worksheet may disagree on the weaker fields (a sheet renamed or
- * moved between the two gestures an action merged), and keying on the whole
- * tuple would file them as two cells — so a delta would miss the prepared entry
- * for the very cell it addresses and the replay would refuse as `unavailable`.
- */
-export function replay_cell_address(
-    worksheet: WorksheetTarget,
-    source_row: number,
-    source_column: number,
-): string {
-    const { sheetIndex, sheetName, worksheetId } = worksheet;
-    const identity: readonly [string, string | number] = worksheetId !== undefined
-        ? ['id', worksheetId]
-        : sheetName !== undefined
-            ? ['name', sheetName]
-            : ['index', sheetIndex];
-    return JSON.stringify([...identity, source_row, source_column]);
-}
 
 /**
  * The planner's reader, over one prepared response.
