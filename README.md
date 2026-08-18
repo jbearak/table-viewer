@@ -66,6 +66,16 @@ The flip side is that Table Viewer is deliberately *not* a full spreadsheet edit
 - Only these explicit user clear actions remove highlights
 - Unlike highlights, Sort and Filter are schema-bound view transforms and can be invalidated when their column schema is no longer meaningful
 
+**Undo and redo**
+- `Ctrl+Z` / `Cmd+Z` undoes your last change; `Ctrl+Y` or `Cmd+Shift+Z` redoes it. In the desktop app the **Edit** menu carries both, named after what they would apply — "Undo Paste", "Redo Clear all highlights" — and greyed out when there is nothing left
+- Covers cell edits (values, line breaks, formatting, hyperlinks), cell highlights, and discards. A discarded edit session can be undone in full
+- One history per workbook, in the order you worked: undoing a change on another worksheet switches to it. The cursor moves to what changed and the region flashes briefly, so an undo you cannot see is still findable
+- Undo reaches back past a save. Doing so re-enters edit mode if you had left it, and re-saves are yours to make; undo never exits edit mode or discards an open session
+- If a change is hidden by an active filter or a hidden column, it is still applied and you are told where it went rather than left watching a still cursor
+- Sorts, filters, and column visibility are not part of history — they are view state, with their own toolbar chips and **Columns** menu for undoing them
+- `Ctrl+Z` / `Cmd+Z` **inside** an open cell editor is ordinary text undo for what you are typing, and does not touch the workbook's history
+- History lives with the window: closing the tab, window, or app clears it. Unsaved edits are cached and survive that, so a reopened file can show edits that can no longer be undone
+
 **Sorting and filtering** — the [filtering guide](docs/filtering.md) explains each filter condition and how to use them
 - Right-click a column header to sort ascending or descending, add a secondary sort, or open that column's filter editor
 - Sorted headers show direction arrows and multi-column priority badges; toolbar chips let you flip, reorder, remove, enable, disable, or edit active rules
