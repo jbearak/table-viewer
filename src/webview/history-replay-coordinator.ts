@@ -285,10 +285,17 @@ export function create_history_replay_coordinator(
             // Highlights are durable workbook state, changeable outside edit mode
             // entirely, so undoing a highlight-only gesture must not put the user
             // into editing — while a MIXED gesture carries a cell write and still
-            // must. Decided on this pre-grant read, which is sound for the purpose:
-            // a grant can move the history, but only a cell-carrying entry asks for
-            // one, and the post-grant read below is what the request is built from.
+            // must.
+            //
+            // Read pre-grant, and the entry it was read from is re-checked after
+            // the await. That is not belt-and-braces: a gesture already sent to the
+            // host but not yet recorded — a highlight awaiting its deltas — can land
+            // on top of the stack while `ensure_session` is in flight, and then the
+            // entry actually replayed is not the one this decision was made about.
+            // Acquiring a session for a highlight-only undo would put the user into
+            // edit mode for a gesture that was never a content edit.
             const needs_session = action_requires_edit_session(before_acquiring.entry.action);
+            const decided_for = before_acquiring.entry;
             const held: AcquiringReplay = { kind: 'acquiring', direction, settle: resolve };
             active = held;
             void (async () => {
@@ -322,6 +329,17 @@ export function create_history_replay_coordinator(
                 }
                 if (peek.kind === 'exhausted') {
                     release(held, { kind: 'refused', reason: 'nothing-to-replay' });
+                    return;
+                }
+                // A different entry than the session decision was made about, so
+                // that decision no longer describes this replay. Refused rather
+                // than re-decided: re-deciding cannot give back an edit session
+                // already granted for the entry that moved, and a keypress the
+                // user can simply repeat is a better answer than replaying
+                // something they did not aim at. Reachable only through a gesture
+                // recorded from a host reply mid-await.
+                if (peek.entry !== decided_for) {
+                    release(held, { kind: 'refused', reason: 'busy' });
                     return;
                 }
                 const request = build_prepare_request(peek.entry, direction, host);

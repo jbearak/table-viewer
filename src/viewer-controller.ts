@@ -2878,13 +2878,9 @@ export function attach_viewer(
     function update_session_state_material(
         snapshot: Readonly<FileStateSnapshot>,
         allow_claim = false,
-        deliver = false,
     ): boolean {
         observe_durable_state(snapshot);
-        return session.update_state_snapshot(
-            project_state_for_panel(snapshot, allow_claim),
-            { deliver },
-        );
+        return session.update_state_snapshot(project_state_for_panel(snapshot, allow_claim));
     }
 
     async function refresh_session_state_material(
@@ -2924,14 +2920,6 @@ export function attach_viewer(
         write_basis: FileStateWriteBasis | null = {
             expectedAuthorityRevision: source_authority.authorityRevision,
         },
-        // Whether a commit must be DELIVERED, not merely refreshed into the
-        // session's material. Off by default, which is right for pending edits:
-        // the renderer holds those in its own stores and applies the accepted
-        // writes itself, so pushing a whole workbook snapshot per edit would be
-        // pure cost. A caller writing durable state the renderer can learn about
-        // no other way — a replayed cell highlight — turns it on, and pays for
-        // one projection rather than two by not re-delivering afterwards.
-        deliver = false,
     ): Promise<FileStateSnapshot | undefined> {
         let snapshot = await read_file_state(false);
         for (;;) {
@@ -2948,7 +2936,7 @@ export function attach_viewer(
             );
             if (result.type === 'committed') {
                 observe_durable_state(result.snapshot);
-                if (!disposed) update_session_state_material(result.snapshot, false, deliver);
+                if (!disposed) update_session_state_material(result.snapshot);
                 return result.snapshot;
             }
             file_coordinator.observe_state_authority(result.authority);
@@ -7706,7 +7694,7 @@ export function attach_viewer(
         // the replay was in flight — and must leave history exactly where it is.
         let conflicted = false;
         let unavailable = false;
-        await update_file_state((current, updater_sheets) => {
+        const replay_committed = await update_file_state((current, updater_sheets) => {
             conflicted = false;
             unavailable = false;
             if (!payload.isCurrent()) {
@@ -7781,30 +7769,42 @@ export function attach_viewer(
         }, undefined, payload.isCurrent, {
             expectedAuthorityRevision: expected_authority,
             expectedPhysicalRevision: source_authority.physicalRevision,
-        },
-        // Highlights the replay writes have to be PUBLISHED, not merely
-        // committed. A pending edit needs no delivery — the renderer holds it in
-        // its own stores and applies the accepted writes itself — but a highlight
-        // lives only in durable state, so without this the cells would change on
-        // disk and never repaint. Asked of the commit itself so the snapshot is
-        // projected once; delivering afterwards would clone and freeze the same
-        // state a second time.
+        });
+
+        if (unavailable) return refused('unavailable');
+        if (conflicted) return refused('conflict');
+        if (!payload.isCurrent()) return refused('document-changed');
+        // Highlights the replay wrote have to be PUBLISHED, not merely committed.
+        // `update_file_state` refreshes the session's state material without
+        // delivering it, which is right for pending edits — the renderer holds
+        // those in its own stores and applies the accepted writes itself — but a
+        // highlight lives only in durable state, so without this the cells would
+        // change on disk and never repaint.
+        //
+        // AFTER the currency check above, and never folded into the commit as a
+        // `deliver` flag: delivering supersedes the acknowledged snapshot, so
+        // `acknowledged_current()` — a term of `replay_is_current` — goes false
+        // the moment it happens. Delivering first would make this replay's own
+        // publication refuse it as `document-changed` with the highlight already
+        // durably written, leaving the renderer's history unmoved and every retry
+        // conflicting against the state the replay had in fact applied.
         //
         // Deliberately not the `cellHighlightsChanged` shape the highlight
         // COMMANDS publish: that message carries a request id and the gesture's
         // deltas, which are what enter a window's undo history. A replay is the
         // history moving, so re-entering it would record undo as a new gesture.
-        highlight_patches.length > 0);
-
-        if (unavailable) return refused('unavailable');
-        if (conflicted) return refused('conflict');
-        if (!payload.isCurrent()) return refused('document-changed');
-        // The updater's own result is deliberately unused. An unchanged updater
-        // reports `undefined` — for a replay that means the document already held
-        // everything the replay would write, a byte-identical redo of a gesture
-        // that changed nothing durable, which is a success and not a refusal. The
-        // answer below is assembled from the retained preparation either way, so
-        // there is nothing to recover from the returned state.
+        if (highlight_patches.length > 0 && replay_committed !== undefined && !disposed) {
+            session.update_state_snapshot(
+                project_state_for_panel(replay_committed),
+                { deliver: true },
+            );
+        }
+        // The updater's own result is used ONLY for that delivery. An unchanged
+        // updater reports `undefined` — for a replay that means the document
+        // already held everything the replay would write, a byte-identical redo of
+        // a gesture that changed nothing durable, which is a success and not a
+        // refusal, and needs no repaint. The answer below is assembled from the
+        // retained preparation either way.
         return Object.freeze({
             requestId: request.requestId,
             replayId: request.replayId,

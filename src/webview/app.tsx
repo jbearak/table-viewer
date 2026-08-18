@@ -1038,6 +1038,16 @@ export function App(): React.JSX.Element {
 
     const discard_edit_session = useCallback(() => {
         if (!csv_edit_session_id) return;
+        // A discard is a recorded gesture, so it answers to the same reservation
+        // every other one does — and it does NOT reach `run_edit_gesture`, which is
+        // where the rest of them are gated. Recorded across a highlight round trip
+        // it would land ahead of the highlight the user made first, so the first
+        // undo would repaint cells instead of restoring the discarded edits.
+        //
+        // Refused rather than deferred: the window is one host round trip, the
+        // affordances that reach here are a button and a dialog answer, and a
+        // discard queued behind a reply would fire after the user had moved on.
+        if (!edit_gestures_admitted()) return;
         // Fold any open cell editor FIRST, so its text is part of what the discard
         // throws away and therefore part of what undoing it restores. Left open, it
         // would be dropped by the exit below with nothing in history describing it.
@@ -1538,6 +1548,12 @@ export function App(): React.JSX.Element {
                     } else if (remounts_the_grid) {
                         editing_ref.current?.commit_live_edit();
                     }
+                    // The basis a pending highlight request was sent against, read
+                    // BEFORE this snapshot overwrites either — see the abandonment
+                    // check below.
+                    const pending_basis_physical_revision = snapshot_identity_ref
+                        .current?.sourceBasis.physicalRevision;
+                    const pending_basis_source_generation = source_generation_ref.current;
                     snapshot_identity_ref.current = snapshot.identity;
                     const previous_sheets_by_name = new Map(
                         previous_sheets.map((sheet) => [sheet.name, sheet]),
@@ -1917,13 +1933,33 @@ export function App(): React.JSX.Element {
                     generation_ref.current = snapshot.generation;
                     source_generation_ref.current = snapshot.sourceGeneration;
                     if (snapshot.presentation === 'initial') {
-                        pending_highlight_request_ref.current = null;
-                        set_highlight_request_pending(false);
                         set_highlight_status('');
                         set_highlight_selection_available(false);
                         set_edit_session_pending(false);
                         pending_edit_request_ref.current = null;
                         pending_save_dialog_ref.current = null;
+                    }
+                    // A highlight request names the basis it was sent against, and
+                    // its reply is filtered on that basis matching the live one — so
+                    // once this snapshot moves either, no reply can ever resolve the
+                    // request. Abandoning it is the only outcome left, and it must
+                    // not be limited to the 'initial' case: an external file change
+                    // arrives as a REFRESH with a new physical revision, and a
+                    // request stranded there would hold both the highlight panel and
+                    // — since the same reservation orders cell gestures against the
+                    // history — every subsequent cell edit, for the life of the
+                    // window.
+                    if (
+                        pending_highlight_request_ref.current !== null
+                        && (
+                            snapshot.presentation === 'initial'
+                            || snapshot.identity.sourceBasis.physicalRevision
+                                !== pending_basis_physical_revision
+                            || snapshot.sourceGeneration !== pending_basis_source_generation
+                        )
+                    ) {
+                        pending_highlight_request_ref.current = null;
+                        set_highlight_request_pending(false);
                     }
                     set_source_epoch((n) => n + 1);
                     // What the rows *are* changes with a new source, a new view

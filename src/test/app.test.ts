@@ -1029,6 +1029,26 @@ describe('the highlight round trip and the edit history', () => {
             .toEqual(['Clear all highlights']);
     });
 
+    it('abandons a request the file moved out from under, unwedging edits', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'])));
+        post_message.mockClear();
+
+        await click_button('Highlight');
+        await click_button('Clear all highlights');
+        expect(grid_stub().getAttribute('data-gestures-admitted')).toBe('false');
+
+        // An external file change arrives as a REFRESH carrying a new source
+        // generation. The request pinned the basis it was sent against, so no
+        // reply can ever satisfy the reply filter again — and the reservation it
+        // holds now orders CELL gestures too, so leaving it set would wedge every
+        // subsequent edit for the life of the window, not just the panel.
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1'])));
+
+        expect(grid_stub().getAttribute('data-gestures-admitted')).toBe('true');
+        expect(grid_stub().getAttribute('data-highlight-in-flight')).toBe('false');
+    });
+
     it('records nothing for another window\'s highlight change', async () => {
         const snapshot = initial_snapshot_message(make_meta(['Sheet1']));
         await render_app();
@@ -7560,6 +7580,40 @@ describe('edit mode save exit', () => {
         expect(grid_shell_mock.stop_edit_admission.mock.invocationCallOrder[0])
             .toBeLessThan(discard_call!);
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+    });
+
+    it('refuses a discard while a highlight gesture awaits the host', async () => {
+        grid_shell_mock.is_dirty = true;
+        grid_shell_mock.has_uncommitted_changes = true;
+
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                },
+            })
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, ['0:0']);
+
+        await click_button('Highlight');
+        await click_button('Clear all highlights');
+        post_message.mockClear();
+
+        // A discard is a RECORDED gesture that never passes through
+        // `run_edit_gesture`, so it needs the reservation applied here. Recorded
+        // across the round trip it would land ahead of the highlight the user made
+        // first, and the first undo would repaint cells rather than restore the
+        // discarded edits.
+        await click_button('Discard All');
+
+        expect(post_message).not.toHaveBeenCalledWith(
+            expect.objectContaining({ type: 'discardEditSession' }),
+        );
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(JSON.parse(grid_stub().getAttribute('data-undo-labels')!)).toEqual([]);
     });
 
     // Host-rejected saves. These are the deadlock case: the keys the host names are

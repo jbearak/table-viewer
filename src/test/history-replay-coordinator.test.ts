@@ -70,6 +70,8 @@ interface Harness {
     readonly overlays: Map<string, CellOverlayState>;
     /** Cells the reader refuses to answer for. */
     readonly invisible: Set<string>;
+    /** Record another gesture into the same history, as a host reply would. */
+    readonly record: (changes: readonly HistoryChange[]) => void;
     /** The session the coordinator acquires before preparing. */
     readonly session: {
         /** How many times a replay asked for one. */
@@ -140,6 +142,11 @@ function harness(
         posted,
         overlays,
         invisible,
+        record: (next) => {
+            const staged = store.stage_record({ label: 'Highlight cells', changes: next });
+            staged.commit();
+            staged.notify();
+        },
         session,
     };
 }
@@ -332,6 +339,27 @@ describe('beginning a replay', () => {
 
             expect(read_before_grant).toBe(false);
             expect(posted).toHaveLength(1);
+        });
+
+        it('refuses when a gesture lands on the stack mid-acquisition', async () => {
+            // A highlight already sent to the host is recorded when its deltas come
+            // back, which can be while `ensure_session` is in flight — so the entry
+            // actually on top afterwards is not the one the session decision was
+            // made about. Replaying it would undo a gesture the user did not aim at,
+            // having put them into edit mode for a highlight along the way.
+            const { coordinator, session, posted, record } = harness([
+                cell_change(0, 0, 'typed'),
+            ]);
+            session.gate = () => {};
+            const pending = coordinator.begin('undo');
+            for (let index = 0; index < 5; index += 1) await Promise.resolve();
+
+            record([highlight_change(9, 9, null, 'yellow')]);
+            session.gate?.();
+
+            await expect(pending).resolves.toEqual({ kind: 'refused', reason: 'busy' });
+            expect(posted).toEqual([]);
+            expect(coordinator.is_busy()).toBe(false);
         });
 
         it('abandons an acquisition whose document went away', async () => {
