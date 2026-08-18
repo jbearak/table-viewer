@@ -10,7 +10,6 @@ import {
 } from './edit-session-store';
 import {
     copy_dirty_entry,
-    dirty_entry_value_changed,
     make_dirty_entry,
     type CsvDirtyEntry,
     type WorksheetTarget,
@@ -201,9 +200,18 @@ function plan_value_write(
  * `persisted_link` is the cell's link on disk. The base recorded is the already
  * pending `baseLink` when there is one, never the pending value, so re-editing
  * one cell's link keeps a single honest conflict base.
+ *
+ * Whether the value dimension survives is read off `before_overlay`, never off
+ * whether the entry's value differs from its base. Membership and semantic
+ * inequality are different facts: `resolve_pending_bases` can leave a legacy
+ * entry at `{value: A, base: A}` that is genuinely in the map — tinted,
+ * persisted and saved — and a value/base comparison would call that cell
+ * untouched, record a value dimension leaving the overlay that never entered
+ * it, and drop the entry on a later link revert.
  */
 function plan_hyperlink_write(
     before_entry: DirtyEntry | undefined,
+    before_overlay: CellOverlayState,
     next: CellHyperlink | null,
     base: ParsedCellEdit,
     persisted_link: CellHyperlink | null,
@@ -211,12 +219,13 @@ function plan_hyperlink_write(
     const base_link = before_entry?.link !== undefined
         ? before_entry.baseLink ?? null
         : persisted_link;
-    const value_changed = before_entry !== undefined && dirty_entry_value_changed(before_entry);
+    const value_in_overlay = before_overlay.kind === 'present'
+        && before_overlay.value.kind === 'present';
     const base_value = history_value(base.text, base.rich);
 
     if (hyperlinks_equal(next, base_link)) {
-        // Link reverted. Drop the dimension, keep any value change.
-        if (!value_changed) return { entry: undefined, overlay: absent_overlay() };
+        // Link reverted. Drop the dimension, keep any value dimension.
+        if (!value_in_overlay) return { entry: undefined, overlay: absent_overlay() };
         const entry = copy_dirty_entry(before_entry!, { link: undefined, baseLink: undefined });
         return {
             entry,
@@ -230,12 +239,13 @@ function plan_hyperlink_write(
     if (before_entry !== undefined) {
         const entry = copy_dirty_entry(before_entry, { link: next, baseLink: base_link });
         const value = history_value(entry.value, entry.valueRuns);
-        // The value dimension's intent survives from the entry being extended:
-        // a cell whose value never moved keeps a link-only value dimension even
-        // as its link changes, so undo does not restore text it never wrote.
+        // The value dimension's intent carries over from the entry being
+        // extended: a cell whose value was never in the overlay keeps a
+        // link-only value dimension as its link changes, so undo does not
+        // restore text it never wrote.
         return {
             entry,
-            overlay: value_changed
+            overlay: value_in_overlay
                 ? combined_overlay(
                     value, history_value(entry.base, entry.baseRuns), next, base_link,
                 )
@@ -441,6 +451,7 @@ export function use_editing(
             plan: (
                 edit: T,
                 before_entry: DirtyEntry | undefined,
+                before_overlay: CellOverlayState,
                 persisted: PersistedCellHistoryState | undefined,
             ) => PlannedOverlayWrite | undefined,
         ): void => {
@@ -450,8 +461,9 @@ export function use_editing(
             // The store as this gesture found it, plus what the gesture has
             // written so far: a paste whose target overlaps a cell it already
             // wrote has to plan against its own earlier write, not against the
-            // state the batch began in.
-            const working = new Map<string, DirtyEntry | undefined>();
+            // state the batch began in. Both the entry and the overlay it means,
+            // because a planner needs the intent as much as the fields.
+            const working = new Map<string, PlannedOverlayWrite>();
 
             for (const edit of edits) {
                 const { source_row, source_col } = edit;
@@ -463,26 +475,30 @@ export function use_editing(
                 // that cell does not move either — an applied edit history could
                 // not describe would let undo cross an unrecorded change.
                 if (capturing && persisted === undefined) continue;
-                const before_entry = working.has(key) ? working.get(key) : active_store.get(key);
+                const earlier = working.get(key);
+                const before_entry = earlier !== undefined
+                    ? earlier.entry
+                    : active_store.get(key);
+                // The exact overlay an earlier write in this gesture left, when
+                // there was one; otherwise what the store holds, read with
+                // `'infer'` because its writer's intent is long gone.
+                const before_overlay = earlier?.overlay
+                    ?? (before_entry === undefined
+                        ? absent_overlay()
+                        : overlay_state_from_dirty_entry(before_entry));
 
-                const planned = plan(edit, before_entry, persisted);
+                const planned = plan(edit, before_entry, before_overlay, persisted);
                 if (planned === undefined) continue;
 
                 writes.push({ key, entry: planned.entry });
-                working.set(key, planned.entry);
+                working.set(key, planned);
 
                 if (!capturing || persisted === undefined) continue;
                 gesture.record(key, {
                     worksheet,
                     sourceRow: source_row,
                     sourceColumn: source_col,
-                    // The exact overlay an earlier write in this gesture left,
-                    // when there was one; otherwise what the store holds, read
-                    // with `'infer'` because its writer's intent is long gone.
-                    before: gesture.overlay_at(key)
-                        ?? (before_entry === undefined
-                            ? absent_overlay()
-                            : overlay_state_from_dirty_entry(before_entry)),
+                    before: before_overlay,
                     after: planned.overlay,
                     persisted,
                 });
@@ -538,12 +554,13 @@ export function use_editing(
      */
     const commit_hyperlinks = useCallback(
         (edits: readonly CellHyperlinkEdit[], label = 'Edit hyperlink'): void => {
-            run_edit_gesture(edits, label, (edit, before_entry, persisted) => {
+            run_edit_gesture(edits, label, (edit, before_entry, before_overlay, persisted) => {
                 const loaded_link = persisted !== undefined
                     ? persisted.hyperlink
                     : get_cell?.(edit.source_row, edit.source_col)?.hyperlink ?? null;
                 return plan_hyperlink_write(
                     before_entry,
+                    before_overlay,
                     edit.value,
                     edit_base_at(edit.source_row, edit.source_col),
                     loaded_link,

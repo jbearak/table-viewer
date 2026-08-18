@@ -1093,10 +1093,11 @@ describe('use_editing — hyperlink capture', () => {
         { raw: 'plain', formatted: 'plain', bold: false, italic: false },
     ]];
     let history: HistoryStore | null = null;
+    let link_store: EditSessionStore | null = null;
 
     function LinkCaptureHarness({ rows }: { rows: (CellData | null)[][] }) {
         const get_cell_raw = React.useMemo(() => make_get_cell_raw(rows), [rows]);
-        hook_result = use_editing(get_cell_raw, 0, undefined, undefined, {
+        hook_result = use_editing(get_cell_raw, 0, undefined, link_store!, {
             syntax: 'markdown',
             get_cell: (r, c) => {
                 const row = rows[r];
@@ -1111,6 +1112,7 @@ describe('use_editing — hyperlink capture', () => {
 
     async function render_linked(rows: (CellData | null)[][] = linked_rows) {
         history = create_history_store();
+        link_store = create_edit_session_store();
         container = document.createElement('div');
         document.body.appendChild(container);
         root = createRoot(container);
@@ -1187,6 +1189,51 @@ describe('use_editing — hyperlink capture', () => {
         const delta = only_change();
         expect(delta.hyperlink?.expected.content).toEqual(site);
         expect(delta.hyperlink?.desired.content).toBeNull();
+    });
+
+    it('keeps a resolved no-op entry\'s value dimension in the overlay', async () => {
+        // resolve_pending_bases can leave a legacy entry at {value: A, base: A}:
+        // genuinely in the map — tinted, persisted, saved — while comparing
+        // equal. Membership and semantic inequality are different facts, and
+        // reading membership off the comparison would record a value dimension
+        // leaving an overlay it never entered.
+        await render_linked();
+        await act(async () => {
+            link_store!.install(
+                { session_id: undefined },
+                { '0:1': { value: 'plain', base: 'plain' } },
+            );
+        });
+        await act(async () => { hook_result!.commit_hyperlink(0, 1, site); });
+
+        const delta = only_change();
+        // The link moved; the value dimension did not, but it stays IN the
+        // overlay, so a later transition off this state knows it is there.
+        expect(delta.value).toBeUndefined();
+        expect(delta.afterOverlay.kind === 'present'
+            && delta.afterOverlay.value.kind).toBe('present');
+    });
+
+    it('carries a value dimension written earlier in the same gesture', async () => {
+        // The planner reads membership off the overlay the gesture itself left,
+        // not off a value/base comparison — a formatting-only edit moves no
+        // text but is genuinely a value edit.
+        await render_linked();
+        await act(async () => {
+            hook_result!.commit_edits([{ source_row: 0, source_col: 1, value: '**plain**' }]);
+        });
+        await act(async () => { hook_result!.commit_hyperlink(0, 1, site); });
+
+        expect(hook_result!.dirty_cells.get('0:1')).toEqual({
+            value: 'plain',
+            base: 'plain',
+            valueRuns: { runs: [{ text: 'plain', style: { bold: true } }] },
+            link: site,
+            baseLink: null,
+        });
+        const delta = only_change();
+        expect(delta.afterOverlay.kind === 'present'
+            && delta.afterOverlay.value.kind).toBe('present');
     });
 
     it('records several cells\' links as one action', async () => {
