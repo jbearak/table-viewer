@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { CellHighlightColor, WorksheetTarget } from '../types';
+import type { RichText } from '../cell-content';
 import {
     absent_overlay,
     build_cell_history_delta,
@@ -21,12 +22,14 @@ import {
     build_prepare_request,
     commit_refusal_reason,
     prepare_refusal_reason,
+    replayed_store_entry,
     type ReplayRequestSources,
 } from '../webview/history-replay-request-model';
 import type { HistoryReplayPrepared, PrepareHistoryReplayRequest } from '../history-replay-protocol';
 
 const SHEET: WorksheetTarget = { sheetIndex: 0, sheetName: 'Data', worksheetId: 'rId1' };
 const OTHER: WorksheetTarget = { sheetIndex: 1, sheetName: 'Notes', worksheetId: 'rId2' };
+const BOLD: RichText = { runs: [{ text: 'typed', style: { bold: true } }] };
 
 /** A cell going from unedited to typed, so undo removes the overlay. */
 function cell_change(
@@ -42,6 +45,33 @@ function cell_change(
         before: absent_overlay(),
         after: value_only_overlay(history_value(text), history_value('base')),
         persistedValue: history_value('base'),
+        persistedHyperlink: null,
+    });
+    if (delta === undefined) throw new Error('fixture built a delta that moved nothing');
+    return { kind: 'cell', delta };
+}
+
+/**
+ * A cell whose overlay base was never observed, both before and after: a legacy
+ * durable entry retyped. Undoing lands on a base-pending destination.
+ */
+function pending_base_change(
+    before_text: string,
+    after_text: string,
+    before_runs?: RichText,
+): HistoryChange {
+    const pending = (text: string, runs?: RichText) => value_only_overlay(
+        history_value(text, runs),
+        history_value(''),
+        true,
+    );
+    const delta = build_cell_history_delta({
+        worksheet: SHEET,
+        sourceRow: 3,
+        sourceColumn: 4,
+        before: pending(before_text, before_runs),
+        after: pending(after_text),
+        persistedValue: history_value(''),
         persistedHyperlink: null,
     });
     if (delta === undefined) throw new Error('fixture built a delta that moved nothing');
@@ -283,6 +313,28 @@ describe('build_commit_request', () => {
             .toBeUndefined();
     });
 
+    it('sends a plain base-pending destination as the bare legacy string', () => {
+        // An entry has no field for an unobserved base, so sending one would tell
+        // a later save the placeholder base was real. The bare string is the only
+        // durable form that records the fact.
+        const changes = [pending_base_change('typed', 'retyped')];
+        const request = prepare(changes)!;
+        const prepared = prepared_for(request);
+        const commit = build_commit_request(prepared, plan_for(changes, prepared), 'm-1', 0);
+        expect(commit?.cells).toEqual([{ ordinal: 0, entry: 'typed' }]);
+    });
+
+    it('refuses a base-pending destination no durable shape can hold', () => {
+        // Styled text plus an unobserved base: writing it as a bare string would
+        // drop the styling, and as an entry would invent the base. Refused, and
+        // history is left where it is.
+        const changes = [pending_base_change('typed', 'retyped', BOLD)];
+        const request = prepare(changes)!;
+        const prepared = prepared_for(request);
+        expect(build_commit_request(prepared, plan_for(changes, prepared), 'm-1', 0))
+            .toBeUndefined();
+    });
+
     it('refuses a planned write the preparation has no ordinal for', () => {
         const changes = [cell_change(0, 0, 'a')];
         const request = prepare(changes)!;
@@ -344,5 +396,33 @@ describe('refusal vocabularies', () => {
         expect(commit_refusal_reason('unavailable')).toBe('unavailable');
         expect(commit_refusal_reason('expired')).toBe('document-changed');
         expect(commit_refusal_reason('document-changed')).toBe('document-changed');
+    });
+});
+
+describe('replayed_store_entry', () => {
+    it('removes the slot for a null write', () => {
+        expect(replayed_store_entry(null)).toBeUndefined();
+    });
+
+    it('keeps an entry as it arrived', () => {
+        const entry = { value: 'typed', base: 'disk' };
+        expect(replayed_store_entry(entry)).toBe(entry);
+    });
+
+    it('rehydrates a legacy string with the base still pending', () => {
+        // The round trip's other half: without the flag, conflict detection would
+        // read the placeholder base as one that was actually observed, and the
+        // next save would compare the edit against a base nobody ever saw.
+        expect(replayed_store_entry('typed'))
+            .toEqual({ value: 'typed', base: '', base_pending: true });
+    });
+
+    it('inverts wire_entry_for_destination for a plain base-pending cell', () => {
+        const changes = [pending_base_change('typed', 'retyped')];
+        const request = prepare(changes)!;
+        const prepared = prepared_for(request);
+        const commit = build_commit_request(prepared, plan_for(changes, prepared), 'm-1', 0)!;
+        expect(replayed_store_entry(commit.cells[0].entry))
+            .toEqual({ value: 'typed', base: '', base_pending: true });
     });
 });

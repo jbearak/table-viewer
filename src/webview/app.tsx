@@ -96,12 +96,18 @@ import {
     create_edit_session_registry,
     type EditSessionRegistry,
 } from './edit-session-registry';
-import type { StoreWrite } from './edit-session-store';
-import { create_history_store, type HistoryStore } from './history-store';
+import type { DirtyEntry, StoreWrite } from './edit-session-store';
+import {
+    create_history_store,
+    type HistoryStore,
+    type StagedHistoryRecord,
+} from './history-store';
+import { discard_history_source } from './history-discard-model';
 import {
     create_history_replay_coordinator,
     type HistoryReplayCoordinator,
 } from './history-replay-coordinator';
+import { replayed_store_entry } from './history-replay-request-model';
 import {
     absent_overlay,
     overlay_state_from_dirty_entry,
@@ -109,6 +115,8 @@ import {
 } from './history-cell-state-model';
 import type { HistoryEntry } from './history-stack-model';
 import type { HistoryReplayCommitted } from '../history-replay-protocol';
+import { pending_signal, type PendingSignal } from './pending-signal';
+import { run_discard_transaction } from './discard-transaction-model';
 import { commit_staged_transaction, type StagedMutation } from './staged-mutation';
 import { column_letter } from './grid-model';
 import {
@@ -520,9 +528,19 @@ export function App(): React.JSX.Element {
      * next keypress immediately, not after a render.
      */
     const replay_coordinator_ref = useRef<HistoryReplayCoordinator | null>(null);
+    /**
+     * Acquire an edit session for a replay that has none.
+     *
+     * Reached through a ref because the coordinator is built during the first
+     * render, before the callback this delegates to exists — and it must not be
+     * rebuilt when that callback's dependencies move, since it holds the
+     * reservation the next keypress is refused against.
+     */
+    const ensure_replay_session_ref = useRef<(() => Promise<boolean>) | null>(null);
     if (replay_coordinator_ref.current === null) {
         replay_coordinator_ref.current = create_history_replay_coordinator({
             history: () => history_store_ref.current!.snapshot(),
+            ensure_session: () => ensure_replay_session_ref.current?.() ?? Promise.resolve(false),
             read_overlay: (worksheet, source_row, source_column) => {
                 // Resolved through the live workbook rather than the target's own
                 // index, because history is workbook-wide: an action recorded
@@ -570,7 +588,7 @@ export function App(): React.JSX.Element {
         const by_sheet = new Map<number, StoreWrite[]>();
         for (const write of committed.cells) {
             const writes = by_sheet.get(write.resolvedSheetIndex) ?? [];
-            writes.push({ key: write.key, entry: write.entry ?? undefined });
+            writes.push({ key: write.key, entry: replayed_store_entry(write.entry) });
             by_sheet.set(write.resolvedSheetIndex, writes);
         }
         const staged: StagedMutation[] = [];
@@ -987,15 +1005,37 @@ export function App(): React.JSX.Element {
 
     const discard_edit_session = useCallback(() => {
         if (!csv_edit_session_id) return;
+        // Fold any open cell editor FIRST, so its text is part of what the discard
+        // throws away and therefore part of what undoing it restores. Left open, it
+        // would be dropped by the exit below with nothing in history describing it.
+        editing_ref.current?.commit_live_edit();
         fence_edit_session_exit(csv_edit_session_id);
+        // Emptying the stores and recording what was emptied are ONE transaction;
+        // the invariant and its outcomes live in the model.
+        const outcome = run_discard_transaction({
+            registry: edit_session_registry_ref.current!,
+            history: history_store_ref.current!,
+            sessionId: csv_edit_session_id,
+            sheets: meta_ref.current?.sheets ?? [],
+        });
+        // Nothing was emptied and nothing recorded, so the user presses it again.
+        if (outcome.kind === 'abandoned') return;
+        if (outcome.kind === 'unrecordable') {
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: 'These edits were too large to keep in the undo history, so discarding them cannot be undone.',
+            });
+        }
         set_edit_mode(false);
         // Every edit is being thrown away, including the rejected ones.
         clear_save_verdict();
-        // Every sheet's, not just the mounted grid's: the session covers the
-        // whole workbook and the host clears every live durable slot, so a
-        // store left full here would repaint edits the user just discarded
-        // the next time its sheet is opened.
-        edit_session_registry_ref.current!.clear_all(csv_edit_session_id);
+        // Undo of this discard must wait for the host's cleanup: until it settles,
+        // a request for the new session it needs would be refused for a reason
+        // about timing rather than about the document.
+        discard_cleanup_ref.current = {
+            session: csv_edit_session_id,
+            ...pending_signal<boolean>(),
+        };
         host_bridge.postMessage({
             type: 'discardEditSession',
             editSessionId: csv_edit_session_id,
@@ -1628,6 +1668,18 @@ export function App(): React.JSX.Element {
                         // that never resolved would hold the reservation, and the
                         // user's undo, for the life of the window.
                         replay_coordinator_ref.current?.reset();
+                        // The outgoing document's discard cleanup, if one was
+                        // still unacknowledged. Settled as failed rather than
+                        // dropped: an awaiter would otherwise hold for an
+                        // acknowledgement that belongs to a file which has left.
+                        // Unreachable today — the cleared history refuses a replay
+                        // before it asks for a session — but that is another
+                        // mechanism's doing, not this one's.
+                        const discarding = discard_cleanup_ref.current;
+                        if (discarding !== undefined) {
+                            discard_cleanup_ref.current = undefined;
+                            discarding.settle(false);
+                        }
                     } else {
                         const edit_session_id = csv_edit_session_id_ref.current;
                         const reconciliation = edit_session_registry_ref.current!
@@ -3270,6 +3322,83 @@ export function App(): React.JSX.Element {
         request_excel_header(true, false, display_row);
     }, [active_sheet_index, request_excel_header]);
 
+    /**
+     * The discard whose host-side cleanup has not been acknowledged yet.
+     *
+     * A discard is undoable, and the host refuses `requestEditSession` until its
+     * cleanup settles — so undoing one awaits the acknowledgement rather than
+     * asking into that window and being refused for a reason about timing.
+     *
+     * One shared promise per discard, not a list of waiters: the replay
+     * coordinator admits a single outstanding replay, so a collection would model
+     * a concurrency that cannot arise, and every additional awaiter can simply
+     * await the same promise.
+     */
+    const discard_cleanup_ref = useRef<PendingSignal<boolean> & { readonly session: string }>();
+    /** The same, for the next `editSessionResult` a replay is waiting on. */
+    const session_grant_ref = useRef<PendingSignal<boolean>>();
+
+    const settle_session_grant_waiters = useCallback((granted: boolean) => {
+        const pending = session_grant_ref.current;
+        if (pending === undefined) return;
+        session_grant_ref.current = undefined;
+        pending.settle(granted);
+    }, []);
+
+    /**
+     * Hold an edit session, acquiring one if there is none, for a replay.
+     *
+     * Three waits, and the order is the point. A discard's host-side cleanup has
+     * to settle first, because a request sent into that window is refused for a
+     * reason about timing rather than about the document. Then a session is
+     * requested if one is not already held. Only then does the replay build its
+     * prepare request, because the grant crosses a hydration boundary that
+     * replaces the stores wholesale.
+     *
+     * Re-entering edit mode is deliberate and one-directional: undo may put the
+     * user back into editing, and must never take them out of it — the grant
+     * handler sets edit mode as it does for the Edit button.
+     */
+    const ensure_replay_session = useCallback(async (): Promise<boolean> => {
+        const discarding = discard_cleanup_ref.current;
+        if (discarding !== undefined) {
+            // A clear that failed leaves editing disabled for the whole file, so
+            // there is no session to be had and undo must not promise one.
+            if (!await discarding.settled) return false;
+        }
+        if (csv_edit_session_id_ref.current !== undefined) return true;
+        // A request already in flight — the Edit button pressed a moment ago —
+        // is joined rather than duplicated: the host answers one request, and a
+        // second would be refused while the first is outstanding.
+        const already_requested = pending_edit_request_ref.current !== null;
+        const grant = session_grant_ref.current ?? pending_signal<boolean>();
+        session_grant_ref.current = grant;
+        if (!already_requested) {
+            set_edit_session_pending(true);
+            const request_id = [
+                'edit',
+                edit_request_prefix_ref.current,
+                ++edit_request_seq_ref.current,
+            ].join(':');
+            pending_edit_request_ref.current = request_id;
+            // The sheet the discarded session was last editing, which is the
+            // pointer the restored one should resume on. Not the active tab: the
+            // grant's only use for the field is to set the initial pointer, and
+            // the replay's own focus decides where the cursor lands.
+            const sheet_index = edit_session_sheet_index_ref.current;
+            const requested_sheet = meta_ref.current?.sheets[sheet_index];
+            host_bridge.postMessage({
+                type: 'requestEditSession',
+                requestId: request_id,
+                sheetIndex: sheet_index,
+                sheetName: requested_sheet?.name,
+                worksheetId: requested_sheet?.worksheetId,
+            });
+        }
+        return grant.settled;
+    }, []);
+    ensure_replay_session_ref.current = ensure_replay_session;
+
     const handle_toggle_edit_mode = useCallback(() => {
         const entering = !edit_mode;
         if (entering) {
@@ -3692,6 +3821,16 @@ export function App(): React.JSX.Element {
                     set_csv_edit_session_id(undefined);
                     set_edit_mode(false);
                 }
+                // After the install and the edit-mode transition, so a replay
+                // resuming here reads the stores the grant just replaced rather
+                // than the ones it is about to.
+                settle_session_grant_waiters(msg.granted && !!msg.editSessionId);
+            } else if (msg.type === 'discardEditSessionResult') {
+                const pending = discard_cleanup_ref.current;
+                if (pending !== undefined && pending.session === msg.editSessionId) {
+                    discard_cleanup_ref.current = undefined;
+                    pending.settle(msg.cleared);
+                }
             } else if (msg.type === 'editSessionRevoked') {
                 apply_save_lifecycle(msg.lifecycle);
             } else if (msg.type === 'saveDialogResult') {
@@ -3709,7 +3848,6 @@ export function App(): React.JSX.Element {
                         leave_edit_mode();
                     }
                 } else if (msg.choice === 'discard') {
-                    editing_ref.current?.clear_dirty();
                     discard_edit_session();
                 }
                 // 'cancel' → stay in edit mode, keep edits.
@@ -3794,6 +3932,7 @@ export function App(): React.JSX.Element {
         persist_immediate,
         request_save_or_remain_dirty,
         run_edit_command,
+        settle_session_grant_waiters,
     ]);
 
     // If editing becomes unavailable (e.g. a reload disables CSV editing), leave
@@ -5095,10 +5234,7 @@ export function App(): React.JSX.Element {
                             Discard Conflicted
                         </button>
                         <button
-                            onClick={() => {
-                                editing_ref.current?.clear_dirty();
-                                discard_edit_session();
-                            }}
+                            onClick={() => { discard_edit_session(); }}
                         >
                             Discard All
                         </button>

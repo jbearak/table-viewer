@@ -24,7 +24,11 @@ import {
     action_replay_changes,
     type HistoryEntry,
 } from './history-stack-model';
-import type { CellOverlayState, HistoryDirection } from './history-cell-state-model';
+import type {
+    CellOverlayState,
+    HistoryDirection,
+    HistoryDirtyEntry,
+} from './history-cell-state-model';
 import type {
     CommitHistoryReplayRequest,
     HistoryReplayCellInput,
@@ -35,7 +39,7 @@ import type {
     HistoryReplayPrepareRefused,
     PrepareHistoryReplayRequest,
 } from '../history-replay-protocol';
-import type { WorksheetTarget } from '../types';
+import type { CsvDirtyEntry, WorksheetTarget } from '../types';
 
 /**
  * Why a replay did not happen.
@@ -184,15 +188,26 @@ export function build_commit_request(
             cell_address(write.worksheet, write.sourceRow, write.sourceColumn),
         );
         if (cell === undefined) return undefined;
-        planned.set(cell.ordinal, {
-            ordinal: cell.ordinal,
-            entry: write.entry === undefined ? null : write.entry,
-        });
+        const entry = wire_entry_for_destination(write.entry);
+        // A destination the durable schema cannot hold. Refused here rather than
+        // sent and rejected: the host would answer `malformed`, which reads as a
+        // renderer bug, and history must be left exactly where it is either way.
+        if (entry === undefined) return undefined;
+        planned.set(cell.ordinal, { ordinal: cell.ordinal, entry });
     }
-    const cells = prepared.cells.map((cell) => planned.get(cell.ordinal)
+    const cells: CommitHistoryReplayRequest['cells'][number][] = [];
+    for (const cell of prepared.cells) {
+        const write = planned.get(cell.ordinal);
+        if (write !== undefined) {
+            cells.push(write);
+            continue;
+        }
         // A prepared cell the plan does not write keeps whatever it holds, which
-        // on the wire is the entry its own overlay projects to.
-        ?? { ordinal: cell.ordinal, entry: entry_for_unwritten_cell(cell.overlay) });
+        // on the wire is what its own overlay projects to.
+        const entry = entry_for_unwritten_cell(cell.overlay);
+        if (entry === undefined) return undefined;
+        cells.push({ ordinal: cell.ordinal, entry });
+    }
     // The plan carries the action's highlight deltas through untouched and in
     // replay order, which is the order preparation assigned ordinals in, so the
     // two lists must be the same length. They cannot differ for a plan built from
@@ -227,19 +242,65 @@ export function build_commit_request(
  */
 function entry_for_unwritten_cell(
     overlay: HistoryReplayPrepared['cells'][number]['overlay'],
-): CommitHistoryReplayRequest['cells'][number]['entry'] {
+): CommitHistoryReplayRequest['cells'][number]['entry'] | undefined {
     if (overlay.kind === 'absent') return null;
     const dimension = overlay.value;
     const value = dimension.kind === 'untouched' ? dimension.anchor : dimension.value;
     const base = dimension.kind === 'untouched' ? dimension.anchor : dimension.base;
     const link = overlay.hyperlink;
-    return {
+    return wire_entry_for_destination({
         value: value.text,
         base: base.text,
+        ...(dimension.kind === 'present' && dimension.basePending
+            ? { base_pending: true }
+            : {}),
         ...(value.runs !== undefined ? { valueRuns: value.runs } : {}),
         ...(base.runs !== undefined ? { baseRuns: base.runs } : {}),
         ...(link.kind === 'present' ? { link: link.value, baseLink: link.base } : {}),
-    };
+    });
+}
+
+/**
+ * The wire form of one cell's destination, or `undefined` if there is none.
+ *
+ * `null` removes the slot. An entry whose base has NOT been observed is sent as a
+ * bare string, the legacy slot form and the only durable shape that records that
+ * fact — an entry has no field for it, so sending one would tell a later save the
+ * placeholder base was real. That form holds only plain text with no hyperlink,
+ * which is exactly the shape the flag can occur in: it originates in one place,
+ * hydrating a bare durable string, and every other site only carries it forward.
+ * A richer base-pending entry has no representation, and is refused rather than
+ * written with the pending bit quietly dropped.
+ */
+function wire_entry_for_destination(
+    entry: HistoryDirtyEntry | undefined,
+): CommitHistoryReplayRequest['cells'][number]['entry'] | undefined {
+    if (entry === undefined) return null;
+    if (entry.base_pending !== true) return entry;
+    const plain = entry.valueRuns === undefined
+        && entry.baseRuns === undefined
+        && entry.base === ''
+        && entry.link === undefined
+        && entry.baseLink === undefined;
+    return plain ? entry.value : undefined;
+}
+
+/**
+ * The store entry a host-accepted write installs: the inverse of
+ * `wire_entry_for_destination`.
+ *
+ * A legacy bare string becomes the entry the store's own hydration would have
+ * produced for it — an unobserved base, flagged pending — because that is the
+ * fact the string form carries. Reading it as `{value, base: ''}` without the
+ * flag would tell conflict detection the base was observed and empty, so the
+ * next save would compare the user's edit against a base nobody ever saw.
+ */
+export function replayed_store_entry(
+    entry: string | CsvDirtyEntry | null,
+): HistoryDirtyEntry | undefined {
+    if (entry === null) return undefined;
+    if (typeof entry !== 'string') return entry;
+    return { value: entry, base: '', base_pending: true };
 }
 
 export function prepare_refusal_reason(

@@ -325,6 +325,81 @@ describe('record_history_action', () => {
         expect(outcome.state.barrier?.label.length).toBe(MAX_BARRIER_LABEL_LENGTH);
     });
 
+    describe('a streamed action source', () => {
+        const hard: HistoryBounds = {
+            maxActions: 100,
+            maxCells: 1_000_000,
+            softMaxBytes: 1_000,
+            hardMaxBytes: 5_000,
+        };
+
+        it('records a generator the same as an array', () => {
+            function* changes(): Generator<HistoryChange> {
+                yield cell_change(0, 0, 'a');
+                yield cell_change(1, 0, 'b');
+            }
+            const outcome = record_history_action(
+                empty_history_stack(),
+                { label: 'Streamed', changes: changes() },
+                hard,
+            );
+            expect(outcome.kind).toBe('recorded');
+            expect(outcome.state.undoStack[0]?.action.changes).toHaveLength(2);
+        });
+
+        it('stops consuming the source at the first oversized prefix', () => {
+            // The point of streaming: a workbook-wide discard must not be walked
+            // to the end just to be refused. The generator THROWS if asked for
+            // one change past the prefix that busts the bound, so a recorder that
+            // merely reported a refusal after draining would fail here rather
+            // than pass quietly.
+            let yielded = 0;
+            function* changes(): Generator<HistoryChange> {
+                while (true) {
+                    if (yielded > 3) throw new Error('recorder read past the bound');
+                    yielded += 1;
+                    yield cell_change(yielded, 0, 'x'.repeat(4_000));
+                }
+            }
+            const outcome = record_history_action(
+                empty_history_stack(),
+                { label: 'Discard All', changes: changes() },
+                hard,
+            );
+            expect(outcome.kind).toBe('refused');
+            expect(yielded).toBeLessThanOrEqual(3);
+        });
+
+        it('answers an empty source without installing a barrier', () => {
+            function* changes(): Generator<HistoryChange> {}
+            const outcome = record_history_action(
+                empty_history_stack(),
+                { label: 'Discard All', changes: changes() },
+                hard,
+            );
+            expect(outcome.kind).toBe('empty');
+            expect(outcome.state.barrier).toBeUndefined();
+        });
+
+        it('walks the source once, so the retained action can be replayed twice', () => {
+            // A retained action is read again by every replay. Holding an
+            // exhausted iterator would make the second undo see no changes at
+            // all, so what is retained must be the walked array.
+            function* changes(): Generator<HistoryChange> {
+                yield cell_change(0, 0, 'a');
+            }
+            const outcome = record_history_action(
+                empty_history_stack(),
+                { label: 'Streamed', changes: changes() },
+                hard,
+            );
+            const entry = outcome.state.undoStack[0];
+            expect(entry?.action.changes).toHaveLength(1);
+            expect(entry?.action.changes).toHaveLength(1);
+            expect([...(entry?.action.changes ?? [])]).toHaveLength(1);
+        });
+    });
+
     it('refuses a pre-built action that exceeds the hard bound', () => {
         // The short circuit does not apply to an already-owned action, but the
         // bound still does.

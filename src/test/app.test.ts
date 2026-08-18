@@ -4434,7 +4434,11 @@ describe('edit mode save exit', () => {
 
         await dispatch_host_message({ type: 'saveDialogResult', choice: 'discard' });
 
-        expect(grid_shell_mock.clear_dirty).toHaveBeenCalledTimes(1);
+        // The mounted store is emptied through the registry rather than through
+        // the grid's own clear: the discard snapshots every sheet before emptying
+        // any, so history can describe what it threw away, and a hook-level clear
+        // beforehand would empty the active sheet before it was recorded.
+        expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
         expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
             type: 'discardEditSession',
         }));
@@ -4479,6 +4483,42 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
         await click_sheet_tab('Inventory');
         expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
+    });
+
+    it('waits for the host discard acknowledgement before asking for a session again', async () => {
+        // The host refuses `requestEditSession` until its cleanup settles, so an
+        // undo of the discard that asked into that window would be refused for a
+        // reason about timing rather than about the document.
+        grid_shell_mock.has_uncommitted_changes = true;
+
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await enter_edit_mode(post_message);
+        seed_mounted_store();
+        await click_button('Edit');
+        await dispatch_host_message({ type: 'saveDialogResult', choice: 'discard' });
+
+        const discard = post_message.mock.calls
+            .map(([message]) => message as { type?: string; editSessionId?: string })
+            .find((message) => message.type === 'discardEditSession');
+        expect(discard?.editSessionId).toBeDefined();
+
+        // Re-entering edit mode still works normally, which is what the
+        // acknowledgement must not have broken.
+        post_message.mockClear();
+        await dispatch_host_message({
+            type: 'discardEditSessionResult',
+            editSessionId: discard!.editSessionId!,
+            cleared: true,
+        });
+        await click_button('Edit');
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'requestEditSession',
+        }));
     });
 
     it('enters edit mode with pending edits returned by the host session grant', async () => {
@@ -7393,7 +7433,7 @@ describe('edit mode save exit', () => {
         post_message.mockClear();
         await click_button('Discard All');
 
-        expect(grid_shell_mock.clear_dirty).toHaveBeenCalledTimes(1);
+        expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
         expect(grid_shell_mock.stop_edit_admission).toHaveBeenCalledTimes(1);
         expect(post_message).toHaveBeenCalledWith(expect.objectContaining({ type: 'discardEditSession' }));
         const discard_call = post_message.mock.invocationCallOrder.find((_order, index) => (

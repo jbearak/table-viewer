@@ -878,6 +878,81 @@ describe('edit session store', () => {
         });
     });
 
+    describe('stage_clear', () => {
+        it('empties the whole map, once, at the commit', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+                '9:9': { value: 'b', base: 'B' },
+            });
+            const notifications = count_notifications(store);
+
+            const staged = store.stage_clear('s');
+            expect(store.size()).toBe(2);
+            expect(notifications.n).toBe(0);
+
+            expect(staged?.commit()).toBe(true);
+            expect(store.size()).toBe(0);
+            expect(notifications.n).toBe(0);
+
+            staged?.notify();
+            expect(notifications.n).toBe(1);
+        });
+
+        it('clears the pending-base flag with the entries that carried it', () => {
+            const store = create_edit_session_store({ session_id: 's' }, { '0:0': 'legacy' });
+            expect(store.has_pending_base()).toBe(true);
+
+            const staged = store.stage_clear('s');
+            staged?.commit();
+
+            expect(store.has_pending_base()).toBe(false);
+        });
+
+        it('refuses to stage for a session that moved on', () => {
+            const store = create_edit_session_store({ session_id: 'current' }, {
+                '0:0': { value: 'a', base: 'A' },
+            });
+            expect(store.stage_clear('stale')).toBeUndefined();
+        });
+
+        it('invalidates a staging whose store moved under it', () => {
+            // A discard stages every sheet before any of them swaps, so a
+            // keystroke can land in between — and it must not be swallowed by a
+            // clear that was staged before it existed.
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+            });
+            const staged = store.stage_clear('s');
+
+            store.commit('s', '0:1', { value: 'meanwhile', base: 'B' });
+
+            expect(staged?.valid()).toBe(false);
+            expect(staged?.commit()).toBe(false);
+            expect(store.size()).toBe(2);
+        });
+
+        it('stays silent when there was nothing to clear', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {});
+            const notifications = count_notifications(store);
+
+            const staged = store.stage_clear('s');
+
+            expect(staged?.commit()).toBe(false);
+            staged?.notify();
+            expect(notifications.n).toBe(0);
+        });
+
+        it('leaves the store untouched when a staging is abandoned', () => {
+            const store = create_edit_session_store({ session_id: 's' }, {
+                '0:0': { value: 'a', base: 'A' },
+            });
+
+            store.stage_clear('s');
+
+            expect(store.size()).toBe(1);
+        });
+    });
+
     it('retain filters by the caller predicate', () => {
         const store = create_edit_session_store({ session_id: 's' }, {
             '0:0': { value: 'a', base: 'A' },

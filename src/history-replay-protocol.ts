@@ -284,10 +284,19 @@ export interface HistoryReplayPrepareRefused extends HistoryReplayCorrelation {
 
 // --- Commit ---
 
-/** `null` removes the cell's pending-edit entry. */
+/**
+ * What one cell's pending-edit slot becomes.
+ *
+ * `null` removes it. A bare `string` is the legacy slot form, and the only shape
+ * durable state has for "this edit's base has not been observed yet" — an entry
+ * has no field for it. Restoring such an edit as an entry would promote the
+ * placeholder base to an observed one and let a later save compare against
+ * content the user never saw, so the string form is carried deliberately rather
+ * than normalized away.
+ */
 export interface HistoryReplayCellWrite {
     readonly ordinal: number;
-    readonly entry: CsvDirtyEntry | null;
+    readonly entry: string | CsvDirtyEntry | null;
 }
 
 export interface HistoryReplayHighlightWrite {
@@ -309,7 +318,8 @@ export interface HistoryReplayAcceptedCellWrite {
     readonly ordinal: number;
     readonly resolvedSheetIndex: number;
     readonly key: string;
-    readonly entry: CsvDirtyEntry | null;
+    /** As written durably, legacy string form included. See `HistoryReplayCellWrite`. */
+    readonly entry: string | CsvDirtyEntry | null;
 }
 
 export interface HistoryReplayCommitted extends HistoryReplayLeaseIdentity {
@@ -622,6 +632,12 @@ export function sanitized_commit_history_replay_request(
         if (raw.entry === null) {
             return Object.freeze({ ordinal: raw.ordinal, entry: null });
         }
+        // A legacy slot's own form. Accepted as-is: it is one string, there is
+        // nothing in it to validate beyond its type, and it is the only way an
+        // unobserved base survives the round trip.
+        if (typeof raw.entry === 'string') {
+            return Object.freeze({ ordinal: raw.ordinal, entry: raw.entry });
+        }
         // The STRICT guard, not the save path's `sanitized_wire_dirty_entry`,
         // which drops a malformed run side and keeps the entry. That is the
         // right policy for a save — the plain projection is still the text the
@@ -681,7 +697,10 @@ export function history_replay_proposal_digest(
         .sort((left, right) => left.ordinal - right.ordinal)
         .map((write) => [
             write.ordinal,
-            write.entry === null ? null : [
+            // Tagged, so a legacy string and an entry whose value happens to
+            // equal it cannot digest alike: they differ in whether the base is
+            // observed, which is exactly what a proposal must not blur.
+            write.entry === null ? null : typeof write.entry === 'string' ? ['legacy', write.entry] : [
                 write.entry.value,
                 write.entry.base,
                 write.entry.valueRuns ?? null,

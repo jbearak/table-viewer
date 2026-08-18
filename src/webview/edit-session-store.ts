@@ -238,6 +238,21 @@ export interface EditSessionStore {
         session_id: string | undefined,
         writes: Iterable<StoreWrite>,
     ): StagedWrites | undefined;
+    /**
+     * Stage emptying the whole map, held back exactly as {@link stage_writes} is.
+     *
+     * Exists for the discard, which is one transaction spanning every sheet's
+     * store AND the history recording of what it threw away. {@link clear}
+     * publishes outright, so a discard built on it would empty the first sheet
+     * before the recording had been validated — and a recording refused for
+     * exceeding the bounds would then leave the edits gone with no way back.
+     *
+     * Distinct from `stage_writes` over every key rather than sugar for it: a
+     * workbook-wide discard would otherwise enumerate the whole map into a write
+     * list, and the point of clearing is that the next state is known without
+     * naming a single cell.
+     */
+    stage_clear(session_id: string | undefined): StagedWrites | undefined;
 }
 
 /**
@@ -552,6 +567,19 @@ export function create_edit_session_store(
                         || !entries_equal(state.entries, next.entries);
                     if (changed) state = next;
                     return changed;
+                },
+                notify,
+            );
+        },
+        stage_clear: (session_id) => {
+            if (!owns(session_id)) return undefined;
+            const staged_from = state;
+            return stage_mutation(
+                () => state === staged_from && owns(session_id),
+                () => {
+                    if (state.entries.size === 0 && !state.pending_base) return false;
+                    state = { entries: new Map(), pending_base: false };
+                    return true;
                 },
                 notify,
             );

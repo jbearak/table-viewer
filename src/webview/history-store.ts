@@ -26,6 +26,7 @@ import {
     record_history_action,
     type CommitOutcome,
     type HistoryAction,
+    type HistoryActionSource,
     type HistoryBounds,
     type HistoryEntry,
     type HistoryStackState,
@@ -76,7 +77,14 @@ export interface HistoryStore {
      * soon as the hard bound is passed, so handing it a pre-owned action makes a
      * gesture too large to keep get fully copied before being refused.
      */
-    stage_record(action: HistoryAction, bounds?: HistoryBounds): StagedHistoryRecord;
+    /**
+     * Stage a recording. Accepts a streamed source so an unbounded gesture — a
+     * workbook-wide discard — is only materialized as far as the bounds allow.
+     */
+    stage_record(
+        action: HistoryAction | HistoryActionSource,
+        bounds?: HistoryBounds,
+    ): StagedHistoryRecord;
     /**
      * Record that a replayed entry has landed, without publishing it.
      *

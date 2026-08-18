@@ -1782,6 +1782,21 @@ export type HostMessage =
     // a single-sheet source has. Every host answer echoes back the sheet it was
     // asked about, so the webview can route a grant to the right worksheet store.
     | { type: 'editSessionResult'; requestId: string; granted: boolean; editSessionId?: string; sheetIndex?: number; pendingEdits?: SheetPendingEditCells }
+    /**
+     * A discard's host-side cleanup has settled.
+     *
+     * Sent because a discard is undoable, and undoing one needs a NEW edit
+     * session — the discard released the old one. Between the discard and this
+     * message the host sits in `cleanupPending`, where a fresh
+     * `requestEditSession` is refused, so an undo pressed in that window would
+     * fail for a reason that has nothing to do with the document and everything
+     * to do with timing. The renderer waits for this instead of racing it.
+     *
+     * `cleared` is false when the clear itself failed, which leaves the host
+     * `uncertain` and editing disabled for the file: an undo then has nothing to
+     * re-enter and must not offer to.
+     */
+    | { type: 'discardEditSessionResult'; editSessionId: string; cleared: boolean }
     | { type: 'editSessionRevoked'; reason: 'saved'; sheetIndex: number; lifecycle: Extract<TerminalCsvSaveLifecycle, { state: 'succeeded' }> }
     | { type: 'saveDialogResult'; requestId: string; editSessionId: string; choice: 'save' | 'discard' | 'cancel' }
     /** The current state backend accepted a pending-edit full map through this sequence. */

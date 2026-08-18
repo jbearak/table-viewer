@@ -50,6 +50,24 @@ export interface HistoryAction {
     readonly changes: readonly HistoryChange[];
 }
 
+/**
+ * A gesture offered for recording, whose changes may still be being generated.
+ *
+ * The recorder walks `changes` exactly once and stops at the first oversized
+ * prefix, so a caller whose gesture is unbounded — discarding a whole workbook's
+ * edits, where every edited cell on every sheet contributes a change — can pass a
+ * generator and never materialize more of it than history is willing to keep.
+ * Passing an array is the same thing with the walk already done.
+ *
+ * The RETAINED action is always `HistoryAction`, with a real array: replay indexes
+ * it, walks it in both directions, and must get the same answer every time. An
+ * iterable is how a gesture ARRIVES, never how it is held.
+ */
+export interface HistoryActionSource {
+    readonly label: string;
+    readonly changes: Iterable<HistoryChange>;
+}
+
 /** An action history owns, with the costs the bounds are enforced against. */
 export interface MeasuredAction {
     readonly action: HistoryAction;
@@ -564,7 +582,10 @@ function map_entry<K, V>(map: Map<K, V>, key: K, make: () => V): V {
  * the change's cost, not the cost itself: `estimate_change_bytes` still has the
  * last word below, since it also charges the shape.
  */
-function own_and_measure(action: HistoryAction, budget = Infinity): MeasuredAction | undefined {
+function own_and_measure(
+    action: HistoryActionSource,
+    budget = Infinity,
+): MeasuredAction | undefined {
     const cells = cell_count_index();
     const charge = action_charger();
     const owned: HistoryChange[] = [];
@@ -610,6 +631,21 @@ function own_and_measure(action: HistoryAction, budget = Infinity): MeasuredActi
  * remembering an action never keeps it alive.
  */
 const OWNED_ACTIONS = new WeakSet<HistoryAction>();
+
+/**
+ * Whether this is an action this module already built and measured.
+ *
+ * The membership test doubles as the narrowing: only `own_and_measure` adds to
+ * the set, and everything it adds has an array of changes. A streamed source can
+ * never be in it, so a generator cannot reach the no-rebuild path — where it
+ * would be walked by `measure_costs` and then walked AGAIN by whatever read the
+ * retained action, the second walk finding an exhausted iterator.
+ */
+function is_owned_action(
+    action: HistoryAction | HistoryActionSource,
+): action is HistoryAction {
+    return OWNED_ACTIONS.has(action as HistoryAction);
+}
 
 /**
  * Measures an action's costs and takes ownership of it. Both costs are estimates.
@@ -695,7 +731,7 @@ function evict_to_fit(
  */
 export function record_history_action(
     state: HistoryStackState,
-    action: HistoryAction,
+    action: HistoryAction | HistoryActionSource,
     bounds: HistoryBounds = DEFAULT_HISTORY_BOUNDS,
 ): RecordOutcome {
     const label = barrier_label(String(action.label));
@@ -714,7 +750,7 @@ export function record_history_action(
     // budget could stop at the first oversized prefix, which is the peak-memory
     // spike the budget exists to avoid. The walk reads the array once and retains
     // only what it visited.
-    const owned = OWNED_ACTIONS.has(action)
+    const owned = is_owned_action(action)
         ? { action, ...measure_costs(action) }
         : own_and_measure({ label, changes: action.changes }, bounds.hardMaxBytes);
     if (owned === undefined) return refused(state, label, bounds.hardMaxBytes);
