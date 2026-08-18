@@ -9,11 +9,12 @@
  * overlay it means, and capture never re-derives one.
  *
  * A gesture is one invocation of a batch editing API — one paste, one fill, one
- * typed commit — and it accumulates here rather than in a long-lived ref. Glide
- * delivers each operation as a complete array, so the accumulator can be born
- * and die inside a single synchronous call; a ref spanning the asynchronous
- * clipboard and cell-loading work in paste and fill could be overwritten by a
- * second operation before the first one's batch arrived.
+ * typed commit — and it accumulates in the caller's own loop rather than in a
+ * long-lived ref. Glide delivers each operation as a complete array, so the
+ * accumulation can be born and die inside a single synchronous call; a ref
+ * spanning the asynchronous clipboard and cell-loading work in paste and fill
+ * could be overwritten by a second operation before the first one's batch
+ * arrived.
  */
 
 import type { CellHyperlink } from '../cell-content';
@@ -23,7 +24,7 @@ import {
     type CellOverlayState,
     type HistoryValue,
 } from './history-cell-state-model';
-import type { HistoryAction, HistoryChange } from './history-stack-model';
+import type { HistoryChange } from './history-stack-model';
 
 /**
  * A cell's state on disk: what the overlay is an edit ON TOP OF.
@@ -48,42 +49,12 @@ export interface CellHistoryCapture {
 }
 
 /**
- * One gesture under assembly.
+ * One cell's transition, as the change history will record.
  *
- * Also the gesture's memory of what it has already done: a paste whose target
- * overlaps a cell it wrote earlier in the same batch must transition from the
- * overlay that earlier write produced, not from the one the store held when the
- * batch began.
+ * `undefined` when nothing semantically moved — retyping a cell's current text,
+ * say. Undo of a keypress that changed nothing would look to the user like a
+ * dropped keypress, so it is not recorded at all.
  */
-export interface GestureCapture {
-    /** The exact overlay an earlier transition in this gesture left, if any. */
-    overlay_at(key: string): CellOverlayState | undefined;
-    /** Records the transition and remembers `capture.after` for `key`. */
-    record(key: string, capture: CellHistoryCapture): void;
-    /** Changes so far, in application order. */
-    readonly changes: readonly HistoryChange[];
-    /** Builds the action to record. See {@link capture_history_action}. */
-    action(label: string): HistoryAction;
-}
-
-export function begin_gesture_capture(): GestureCapture {
-    const overlays = new Map<string, CellOverlayState>();
-    const changes: HistoryChange[] = [];
-    return {
-        overlay_at: (key) => overlays.get(key),
-        record: (key, capture) => {
-            overlays.set(key, capture.after);
-            const change = build_cell_history_change(capture);
-            // Absent when nothing semantically moved — retyping a cell's current
-            // text, say. Undo of a keypress that changed nothing would look like
-            // a dropped keypress, so it is not recorded at all.
-            if (change !== undefined) changes.push(change);
-        },
-        get changes() { return changes; },
-        action: (label) => capture_history_action(label, changes),
-    };
-}
-
 export function build_cell_history_change(
     capture: CellHistoryCapture,
 ): HistoryChange | undefined {
@@ -97,19 +68,4 @@ export function build_cell_history_change(
         persistedHyperlink: capture.persisted.hyperlink,
     });
     return delta === undefined ? undefined : { kind: 'cell', delta };
-}
-
-/**
- * The action to hand `record_history_action` — plain, deliberately not owned.
- *
- * `history_action` would build the whole owned graph eagerly. Recording owns as
- * it walks and abandons the walk the moment the hard bound is passed, so an
- * oversized paste that history will refuse anyway must reach it unowned; owning
- * it first would allocate the entire copy that the budget exists to avoid.
- */
-export function capture_history_action(
-    label: string,
-    changes: readonly HistoryChange[],
-): HistoryAction {
-    return { label, changes };
 }

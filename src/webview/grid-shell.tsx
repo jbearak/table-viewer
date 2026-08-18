@@ -41,7 +41,6 @@ import {
     type SheetCellHighlightState,
     type SheetTransformState,
     type SortDirection,
-    type WorksheetTarget,
 } from '../types';
 import {
     column_projections_equal,
@@ -105,7 +104,12 @@ import {
 } from './cell-overflow-model';
 import { browserIsOSX } from './glide-data-grid/common/browser-detect.js';
 import { count_lines, has_line_break } from './line-breaks';
-import { use_editing, type CellValueEdit, type DirtyEntry } from './use-editing';
+import {
+    use_editing,
+    type CellValueEdit,
+    type DirtyEntry,
+    type HistoryCaptureOptions,
+} from './use-editing';
 import type { HistoryStore } from './history-store';
 import { cell_edit_text, dirty_value_edit_text, type EditSyntax } from '../cell-edit-model';
 import {
@@ -764,11 +768,18 @@ export function GridShell({
     // Full identity, all three fields, on every recorded change: a workbook-wide
     // undo has to find its way back to the sheet an edit was made on, and a bare
     // index cannot survive a reorder between the edit and the undo.
-    const history_worksheet = useMemo((): WorksheetTarget => ({
-        sheetIndex: sheet_index,
-        ...(sheet_meta.name === undefined ? {} : { sheetName: sheet_meta.name }),
-        ...(sheet_meta.worksheetId === undefined ? {} : { worksheetId: sheet_meta.worksheetId }),
-    }), [sheet_index, sheet_meta.name, sheet_meta.worksheetId]);
+    const history_capture = useMemo((): HistoryCaptureOptions | undefined => (
+        history_store === undefined ? undefined : {
+            worksheet: {
+                sheetIndex: sheet_index,
+                ...(sheet_meta.name === undefined ? {} : { sheetName: sheet_meta.name }),
+                ...(sheet_meta.worksheetId === undefined
+                    ? {}
+                    : { worksheetId: sheet_meta.worksheetId }),
+            },
+            history: history_store,
+        }
+    ), [history_store, sheet_index, sheet_meta.name, sheet_meta.worksheetId]);
 
     const {
         dirty_cells,
@@ -782,8 +793,7 @@ export function GridShell({
         commit_hyperlinks,
     } = use_editing(get_cell_raw, generation, edit_session_id, store, {
         syntax: edit_syntax,
-        worksheet: history_worksheet,
-        history: history_store,
+        capture: history_capture,
         // Same identity discipline as get_cell_raw: rebinds with `version` so
         // freshly-loaded pages refresh markdown edit text and bases.
         get_cell: useCallback(
@@ -2172,6 +2182,19 @@ export function GridShell({
             const edits: CellValueEdit[] = [];
             const damaged: { cell: Item }[] = [];
             const grown_rows = new Set<number>();
+            // Rectangular gestures repeat each display row across every column
+            // they cover, and resolving one costs a page-map lookup and a
+            // temporary location object; a 10x100 paste would pay for ten rows a
+            // thousand times. `null` is cached too — an unresolvable row is
+            // unresolvable for the whole batch.
+            const source_rows = new Map<number, number | null>();
+            const resolve_source_row = (row: number): number | null => {
+                const cached = source_rows.get(row);
+                if (cached !== undefined) return cached;
+                const resolved = commit_source_row(row) ?? null;
+                source_rows.set(row, resolved);
+                return resolved;
+            };
             for (const { location, value } of items) {
                 const [display_column, row] = location;
                 const source_column = source_column_for_display(display_column);
@@ -2189,8 +2212,8 @@ export function GridShell({
                 // opened on) to onFinishEditing, so the captured entry names
                 // exactly this commit's row and the guard keeps refusing only the
                 // genuinely unresolvable case.
-                const source_row = commit_source_row(row);
-                if (source_row === undefined) continue;
+                const source_row = resolve_source_row(row);
+                if (source_row === null) continue;
                 const text = value.kind === GridCellKind.Text ? value.data ?? '' : '';
                 edits.push({ source_row, source_col: source_column, value: text });
 
@@ -2224,10 +2247,16 @@ export function GridShell({
             commit_edits(edits, edit_history_label(source, edits.length));
 
             // A grown row repaints whole: its other columns are laid out at the
-            // new height too.
-            for (const row of grown_rows) {
-                for (let column = 0; column < display_column_count; column++) {
-                    damaged.push({ cell: [column, row] });
+            // new height too. Its own cells' individual entries drop out first —
+            // a row is repainted once, not once plus once per cell in it.
+            if (grown_rows.size > 0) {
+                const cell_damage = damaged.filter(({ cell }) => !grown_rows.has(cell[1]));
+                damaged.length = 0;
+                damaged.push(...cell_damage);
+                for (const row of grown_rows) {
+                    for (let column = 0; column < display_column_count; column++) {
+                        damaged.push({ cell: [column, row] });
+                    }
                 }
             }
             if (damaged.length > 0) grid_ref.current?.updateCells(damaged);

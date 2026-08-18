@@ -15,18 +15,17 @@ import {
     type WorksheetTarget,
 } from '../types';
 import {
-    begin_gesture_capture,
+    build_cell_history_change,
     type PersistedCellHistoryState,
 } from './history-capture-model';
 import {
     absent_overlay,
-    combined_overlay,
     history_value,
-    hyperlink_only_overlay,
     overlay_state_from_dirty_entry,
-    value_only_overlay,
     type CellOverlayState,
+    type ValueDimensionIntent,
 } from './history-cell-state-model';
+import type { HistoryChange } from './history-stack-model';
 import type { HistoryStore } from './history-store';
 import { hyperlinks_equal, type CellHyperlink } from '../cell-content';
 import {
@@ -93,17 +92,27 @@ export interface UseEditingOptions {
      */
     readonly get_cell?: (source_row: number, col: number) => EditableSourceCell | null | undefined;
     /**
+     * Where edits are recorded, absent for a consumer with no workbook around it
+     * — the hook's own tests, and GridShell before App wires one down. Those
+     * edit exactly as before, unrecorded.
+     *
+     * One object rather than two optional fields because capture needs both
+     * halves and neither is any use alone: the pairing is the type's to enforce,
+     * not a runtime check's.
+     */
+    readonly capture?: HistoryCaptureOptions;
+}
+
+/** What capturing an edit into the workbook's history needs. */
+export interface HistoryCaptureOptions {
+    /**
      * Which sheet these edits belong to. Recorded on every history change, so
      * an undo can find its way back to the sheet the edit was made on — the
      * history is workbook-wide and its entries have to say where they landed.
      */
-    readonly worksheet?: WorksheetTarget;
-    /**
-     * The workbook's history. Capture is on only when this and `worksheet` are
-     * both supplied, so the hook's own tests and any consumer with no workbook
-     * around it keep working unchanged, editing without recording.
-     */
-    readonly history?: HistoryStore;
+    readonly worksheet: WorksheetTarget;
+    /** The workbook's history. */
+    readonly history: HistoryStore;
 }
 
 /** One cell's new text, in source space. */
@@ -111,6 +120,16 @@ export interface CellValueEdit {
     readonly source_row: number;
     readonly source_col: number;
     readonly value: string;
+}
+
+/**
+ * A cell's persisted side, read once and answering for both consumers of it —
+ * see {@link use_editing}'s `read_persisted_cell`.
+ */
+interface PersistedCellRead {
+    readonly base: ParsedCellEdit;
+    /** `undefined` when the cell's page is not resident. */
+    readonly history: PersistedCellHistoryState | undefined;
 }
 
 /** One cell's new whole-cell hyperlink, or `null` to clear it. */
@@ -134,6 +153,18 @@ interface PlannedOverlayWrite {
 }
 
 /**
+ * A planned write from the entry it stores, tagged with the intent that made it.
+ *
+ * The overlay is derived by the one function that reads an entry as an overlay,
+ * rather than re-assembled by hand at each return: what a planner uniquely knows
+ * is the *intent* behind the ambiguous `{value: A, base: A, link}` shape, and the
+ * intent is exactly what it passes.
+ */
+function planned(entry: DirtyEntry, intent: ValueDimensionIntent): PlannedOverlayWrite {
+    return { entry, overlay: overlay_state_from_dirty_entry(entry, intent) };
+}
+
+/**
  * What a text commit should leave in the store — decided, not applied.
  *
  * Pure so a batch can plan every cell of a paste before any of them mutates:
@@ -153,7 +184,6 @@ function plan_value_write(
     const link_dimension = before_entry?.link !== undefined
         ? { link: before_entry.link, baseLink: before_entry.baseLink ?? null }
         : undefined;
-    const base_value = history_value(base.text, base.rich);
 
     // Semantic comparison: retyping a bold cell's own `**markup**`, however
     // spelled, is a revert; deleting the `**` is an edit.
@@ -165,33 +195,24 @@ function plan_value_write(
         // its value dimension back at the base — and `link-only` is exactly
         // what the overlay has to say, since the entry it writes is the
         // ambiguous `{value: A, base: A, link}` shape.
-        return {
-            entry: make_dirty_entry(
+        return planned(
+            make_dirty_entry(
                 base.text, base.text, base.rich, base.rich,
                 link_dimension.link, link_dimension.baseLink,
             ),
-            overlay: hyperlink_only_overlay(
-                base_value, link_dimension.link, link_dimension.baseLink,
-            ),
-        };
+            'link-only',
+        );
     }
 
     // Explicit plain runs when the user stripped a styled base's markup — see
     // committed_value_runs.
-    const value_runs = committed_value_runs(parsed, base);
-    const entry = make_dirty_entry(
-        parsed.text, base.text, value_runs, base.rich,
-        link_dimension?.link, link_dimension?.baseLink,
+    return planned(
+        make_dirty_entry(
+            parsed.text, base.text, committed_value_runs(parsed, base), base.rich,
+            link_dimension?.link, link_dimension?.baseLink,
+        ),
+        'in-overlay',
     );
-    const value = history_value(parsed.text, value_runs);
-    return {
-        entry,
-        overlay: link_dimension === undefined
-            ? value_only_overlay(value, base_value)
-            : combined_overlay(
-                value, base_value, link_dimension.link, link_dimension.baseLink,
-            ),
-    };
 }
 
 /**
@@ -219,45 +240,38 @@ function plan_hyperlink_write(
     const base_link = before_entry?.link !== undefined
         ? before_entry.baseLink ?? null
         : persisted_link;
-    const value_in_overlay = before_overlay.kind === 'present'
-        && before_overlay.value.kind === 'present';
-    const base_value = history_value(base.text, base.rich);
+    // The value dimension's intent carries over from the entry being extended:
+    // a cell whose value was never in the overlay keeps a link-only value
+    // dimension as its link changes, so undo does not restore text it never
+    // wrote.
+    const value_intent: ValueDimensionIntent = before_overlay.kind === 'present'
+        && before_overlay.value.kind === 'present'
+        ? 'in-overlay'
+        : 'link-only';
 
     if (hyperlinks_equal(next, base_link)) {
         // Link reverted. Drop the dimension, keep any value dimension.
-        if (!value_in_overlay) return { entry: undefined, overlay: absent_overlay() };
-        const entry = copy_dirty_entry(before_entry!, { link: undefined, baseLink: undefined });
-        return {
-            entry,
-            overlay: value_only_overlay(
-                history_value(entry.value, entry.valueRuns),
-                history_value(entry.base, entry.baseRuns),
-            ),
-        };
+        if (value_intent !== 'in-overlay') {
+            return { entry: undefined, overlay: absent_overlay() };
+        }
+        return planned(
+            copy_dirty_entry(before_entry!, { link: undefined, baseLink: undefined }),
+            'in-overlay',
+        );
     }
 
     if (before_entry !== undefined) {
-        const entry = copy_dirty_entry(before_entry, { link: next, baseLink: base_link });
-        const value = history_value(entry.value, entry.valueRuns);
-        // The value dimension's intent carries over from the entry being
-        // extended: a cell whose value was never in the overlay keeps a
-        // link-only value dimension as its link changes, so undo does not
-        // restore text it never wrote.
-        return {
-            entry,
-            overlay: value_in_overlay
-                ? combined_overlay(
-                    value, history_value(entry.base, entry.baseRuns), next, base_link,
-                )
-                : hyperlink_only_overlay(value, next, base_link),
-        };
+        return planned(
+            copy_dirty_entry(before_entry, { link: next, baseLink: base_link }),
+            value_intent,
+        );
     }
 
     // Link-only entry: value dimension pinned at the base text.
-    return {
-        entry: make_dirty_entry(base.text, base.text, base.rich, base.rich, next, base_link),
-        overlay: hyperlink_only_overlay(base_value, next, base_link),
-    };
+    return planned(
+        make_dirty_entry(base.text, base.text, base.rich, base.rich, next, base_link),
+        'link-only',
+    );
 }
 
 export function use_editing(
@@ -330,16 +344,61 @@ export function use_editing(
         [get_cell],
     );
 
-    const edit_base_at = useCallback(
-        (source_row: number, source_col: number): ParsedCellEdit => {
-            const raw = get_cell_raw(source_row, source_col) ?? '';
-            if (syntax === 'markdown') {
-                const cell = get_cell?.(source_row, source_col);
-                if (cell && (cell.raw ?? '') === raw) return cell_edit_base(cell);
+    /**
+     * One read of a cell's persisted side, answering both questions about it.
+     *
+     * `base` is what an edit is compared against and what an editor opens on; it
+     * falls back to `''` for a cell whose page is not resident, because a wrong
+     * base there only means the user retypes. `history` is the same content as
+     * the side of an undo transition, and is `undefined` for exactly that cell:
+     * as a history base the fallback would fabricate the missing side, and undo
+     * would write an empty cell over content it never saw.
+     *
+     * Both come off one pair of loader reads. Asking twice per cell is a
+     * thousand extra reads on a thousand-cell paste, and the rich-consistency
+     * rule below — the loaded cell contributes styling only while its plain
+     * projection still agrees with the raw reader, which sees an in-flight
+     * save's values — is a policy that must not be spelled out in two places.
+     */
+    const read_persisted_cell = useCallback(
+        (source_row: number, source_col: number): PersistedCellRead => {
+            const raw = get_cell_raw(source_row, source_col);
+            const text = raw ?? '';
+            if (syntax !== 'markdown') {
+                // CSV and TSV cannot carry an editable whole-cell hyperlink, so
+                // `null` here is a known persisted state rather than a guess.
+                return {
+                    base: { text },
+                    history: raw === undefined
+                        ? undefined
+                        : { value: history_value(text), hyperlink: null },
+                };
             }
-            return { text: raw };
+            const cell = get_cell?.(source_row, source_col);
+            const base = cell != null && (cell.raw ?? '') === text
+                ? cell_edit_base(cell)
+                : { text };
+            // `get_cell === undefined` is a consumer that supplies no rich
+            // reader at all, not a page that has not arrived: the raw read is
+            // then the whole persisted side, and residency is its answer alone.
+            const resident = raw !== undefined && (get_cell === undefined || cell !== undefined);
+            return {
+                base,
+                history: resident
+                    ? {
+                        value: history_value(base.text, base.rich),
+                        hyperlink: cell?.hyperlink ?? null,
+                    }
+                    : undefined,
+            };
         },
         [get_cell_raw, get_cell, syntax],
+    );
+
+    const edit_base_at = useCallback(
+        (source_row: number, source_col: number): ParsedCellEdit =>
+            read_persisted_cell(source_row, source_col).base,
+        [read_persisted_cell],
     );
 
     // Every coordinate below is a source coordinate. The store's keys, the
@@ -387,48 +446,7 @@ export function use_editing(
         [begin_editing],
     );
 
-    // Capture needs both: a history to record into, and the sheet identity to
-    // record. Consumers without a workbook around them (the hook's own tests,
-    // GridShell before App wires one down) edit exactly as before, unrecorded.
-    const worksheet = options?.worksheet;
-    const history = options?.history;
-    const capturing = worksheet !== undefined && history !== undefined;
-
-    /**
-     * The cell's state on disk — the side of an undo transition the overlay is
-     * an edit ON TOP OF.
-     *
-     * `undefined` when the page is not resident, and the caller must then refuse
-     * that cell rather than mutate it. `edit_base_at`'s `?? ''` fallback is fine
-     * for opening an editor, where a wrong base only means the user retypes; as
-     * a history base it would fabricate the missing side, and undo would write
-     * an empty cell over content it never saw.
-     */
-    const persisted_history_state_at = useCallback(
-        (source_row: number, source_col: number): PersistedCellHistoryState | undefined => {
-            const raw = get_cell_raw(source_row, source_col);
-            if (raw === undefined) return undefined;
-            if (syntax !== 'markdown') {
-                // CSV and TSV cannot carry an editable whole-cell hyperlink, so
-                // `null` here is a known persisted state rather than a guess.
-                return { value: history_value(raw), hyperlink: null };
-            }
-            const cell = get_cell?.(source_row, source_col);
-            if (cell === undefined) return undefined;
-            // Same rich-text consistency rule as `edit_base_at`: the loaded cell
-            // contributes styling only while its plain projection still agrees
-            // with the raw reader, which sees an in-flight save's values.
-            if (cell !== null && (cell.raw ?? '') === raw) {
-                const base = cell_edit_base(cell);
-                return {
-                    value: history_value(base.text, base.rich),
-                    hyperlink: cell.hyperlink ?? null,
-                };
-            }
-            return { value: history_value(raw), hyperlink: cell?.hyperlink ?? null };
-        },
-        [get_cell_raw, get_cell, syntax],
-    );
+    const capture = options?.capture;
 
     /**
      * Apply one gesture: plan every cell, then swap the edits and the history
@@ -452,12 +470,12 @@ export function use_editing(
                 edit: T,
                 before_entry: DirtyEntry | undefined,
                 before_overlay: CellOverlayState,
-                persisted: PersistedCellHistoryState | undefined,
+                persisted: PersistedCellRead,
             ) => PlannedOverlayWrite | undefined,
         ): void => {
             if (edits.length === 0) return;
             const writes: StoreWrite[] = [];
-            const gesture = begin_gesture_capture();
+            const changes: HistoryChange[] = [];
             // The store as this gesture found it, plus what the gesture has
             // written so far: a paste whose target overlaps a cell it already
             // wrote has to plan against its own earlier write, not against the
@@ -470,11 +488,18 @@ export function use_editing(
                 if (!Number.isInteger(source_row) || source_row < 0) continue;
                 if (!Number.isInteger(source_col) || source_col < 0) continue;
                 const key = `${source_row}:${source_col}`;
-                const persisted = persisted_history_state_at(source_row, source_col);
+                const persisted = read_persisted_cell(source_row, source_col);
                 // Capture cannot represent a cell with no persisted side, so
-                // that cell does not move either — an applied edit history could
-                // not describe would let undo cross an unrecorded change.
-                if (capturing && persisted === undefined) continue;
+                // while capturing that cell does not move either — an applied
+                // edit history could not describe would let undo cross an
+                // unrecorded change.
+                //
+                // Deliberately gated on capture rather than unconditional: a
+                // non-resident cell is exactly the evicted-overlay case, where
+                // committing under the key the editor opened with is the
+                // behaviour the projection tests pin. Refusing it outright would
+                // drop the user's own open edit.
+                if (capture !== undefined && persisted.history === undefined) continue;
                 const earlier = working.get(key);
                 const before_entry = earlier !== undefined
                     ? earlier.entry
@@ -493,24 +518,26 @@ export function use_editing(
                 writes.push({ key, entry: planned.entry });
                 working.set(key, planned);
 
-                if (!capturing || persisted === undefined) continue;
-                gesture.record(key, {
-                    worksheet,
+                if (capture === undefined || persisted.history === undefined) continue;
+                const change = build_cell_history_change({
+                    worksheet: capture.worksheet,
                     sourceRow: source_row,
                     sourceColumn: source_col,
                     before: before_overlay,
                     after: planned.overlay,
-                    persisted,
+                    persisted: persisted.history,
                 });
+                if (change !== undefined) changes.push(change);
             }
 
             const staged_writes = active_store.stage_writes(session_id, writes);
             // The session moved on: this hook's writes belong to a session that
             // is no longer current, so nothing lands and nothing is recorded.
             if (staged_writes === undefined) return;
-            const staged_record = capturing
-                ? history.stage_record(gesture.action(label))
-                : undefined;
+            // A plain action, deliberately not owned: recording owns as it walks
+            // and abandons the walk the moment the hard bound is passed, so an
+            // oversized paste it will refuse anyway must reach it unowned.
+            const staged_record = capture?.history.stage_record({ label, changes });
 
             // Validate both before moving either: committing the edits and then
             // finding the history unrecordable would leave the two out of step.
@@ -525,7 +552,7 @@ export function use_editing(
             staged_writes.notify();
             staged_record?.notify();
         },
-        [active_store, capturing, history, persisted_history_state_at, session_id, worksheet],
+        [active_store, capture, read_persisted_cell, session_id],
     );
 
     /**
@@ -537,14 +564,10 @@ export function use_editing(
      */
     const commit_edits = useCallback(
         (edits: readonly CellValueEdit[], label = 'Edit cell'): void => {
-            run_edit_gesture(edits, label, (edit, before_entry) => plan_value_write(
-                before_entry,
-                edit.value,
-                edit_base_at(edit.source_row, edit.source_col),
-                syntax,
-            ));
+            run_edit_gesture(edits, label, (edit, before_entry, _before_overlay, persisted) =>
+                plan_value_write(before_entry, edit.value, persisted.base, syntax));
         },
-        [run_edit_gesture, edit_base_at, syntax],
+        [run_edit_gesture, syntax],
     );
 
     /**
@@ -554,20 +577,20 @@ export function use_editing(
      */
     const commit_hyperlinks = useCallback(
         (edits: readonly CellHyperlinkEdit[], label = 'Edit hyperlink'): void => {
-            run_edit_gesture(edits, label, (edit, before_entry, before_overlay, persisted) => {
-                const loaded_link = persisted !== undefined
-                    ? persisted.hyperlink
-                    : get_cell?.(edit.source_row, edit.source_col)?.hyperlink ?? null;
-                return plan_hyperlink_write(
+            run_edit_gesture(edits, label, (edit, before_entry, before_overlay, persisted) =>
+                plan_hyperlink_write(
                     before_entry,
                     before_overlay,
                     edit.value,
-                    edit_base_at(edit.source_row, edit.source_col),
-                    loaded_link,
-                );
-            });
+                    persisted.base,
+                    // `??` would be wrong here: a resident cell with no link
+                    // reads `null`, which is an answer, not a missing one.
+                    persisted.history !== undefined
+                        ? persisted.history.hyperlink
+                        : get_cell?.(edit.source_row, edit.source_col)?.hyperlink ?? null,
+                ));
         },
-        [run_edit_gesture, edit_base_at, get_cell],
+        [run_edit_gesture, get_cell],
     );
 
     const commit_hyperlink = useCallback(

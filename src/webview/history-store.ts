@@ -28,25 +28,18 @@ import {
     type HistoryStackState,
     type RecordOutcome,
 } from './history-stack-model';
+import { stage_mutation, type StagedMutation } from './staged-mutation';
 
 /**
- * A recording held back from the store's subscribers.
+ * A recording held back from the store's subscribers — a {@link StagedMutation}
+ * that also says what recording WOULD do.
  *
- * `outcome` is available before the commit, so a caller can see what recording
- * WOULD do — refused, empty, or recorded — while it is still deciding whether to
+ * `outcome` is available before the commit, so a caller can see whether the
+ * action was refused, empty, or recorded while it is still deciding whether to
  * go through with the transaction it belongs to.
- *
- * `valid()` asks whether the staging may still be committed: false once the
- * history has moved for any other reason since it was staged. It changes
- * nothing, so a caller may ask about every participant before moving any of
- * them. `commit()` swaps without notifying and answers whether anything changed;
- * `notify()` publishes. Both are idempotent.
  */
-export interface StagedHistoryRecord {
+export interface StagedHistoryRecord extends StagedMutation {
     readonly outcome: RecordOutcome;
-    valid(): boolean;
-    commit(): boolean;
-    notify(): void;
 }
 
 export interface HistoryStore {
@@ -92,29 +85,18 @@ export function create_history_store(initial?: HistoryStackState): HistoryStore 
             // between, or resurrect a redo stack that recording should clear.
             const staged_from = state;
             const outcome = record_history_action(staged_from, action, bounds);
-            let changed = false;
-            let committed = false;
-            let notified = false;
-            const valid = (): boolean => state === staged_from;
-            return {
-                outcome,
-                valid,
-                commit: () => {
-                    if (committed) return changed;
-                    if (!valid()) return false;
-                    committed = true;
+            const staged = stage_mutation(
+                () => state === staged_from,
+                () => {
                     // An empty action leaves the state object identical, so this
                     // is also what makes a no-op gesture publish nothing.
-                    changed = outcome.state !== state;
-                    if (changed) state = outcome.state;
-                    return changed;
+                    if (outcome.state === state) return false;
+                    state = outcome.state;
+                    return true;
                 },
-                notify: () => {
-                    if (notified || !changed) return;
-                    notified = true;
-                    notify();
-                },
-            };
+                notify,
+            );
+            return { outcome, ...staged };
         },
         clear: () => {
             if (state.undoStack.length === 0

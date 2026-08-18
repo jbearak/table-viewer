@@ -895,8 +895,7 @@ describe('use_editing — history capture', () => {
     function CaptureHarness({ rows }: { rows: (CellData | null)[][] }) {
         const get_cell_raw = React.useMemo(() => make_get_cell_raw(rows), [rows]);
         hook_result = use_editing(get_cell_raw, 0, undefined, capture_store!, {
-            worksheet: SHEET,
-            history: history!,
+            capture: { worksheet: SHEET, history: history! },
         });
         return null;
     }
@@ -1104,8 +1103,7 @@ describe('use_editing — hyperlink capture', () => {
                 if (row === undefined) return undefined;
                 return row[c] ?? null;
             },
-            worksheet: SHEET,
-            history: history!,
+            capture: { worksheet: SHEET, history: history! },
         });
         return null;
     }

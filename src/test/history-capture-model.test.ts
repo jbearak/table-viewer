@@ -10,9 +10,7 @@ import {
     type CellOverlayState,
 } from '../webview/history-cell-state-model';
 import {
-    begin_gesture_capture,
     build_cell_history_change,
-    capture_history_action,
     type CellHistoryCapture,
     type PersistedCellHistoryState,
 } from '../webview/history-capture-model';
@@ -120,68 +118,14 @@ describe('build_cell_history_change', () => {
     });
 });
 
-describe('begin_gesture_capture', () => {
-    it('keeps changes in application order', () => {
-        const gesture = begin_gesture_capture();
-        gesture.record('0:0', capture(
-            absent_overlay(), value_only_overlay(history_value('a'), history_value('disk')), DISK, 0, 0));
-        gesture.record('1:0', capture(
-            absent_overlay(), value_only_overlay(history_value('b'), history_value('disk')), DISK, 1, 0));
-
-        const rows = gesture.changes.map((change) =>
-            change.kind === 'cell' ? change.delta.sourceRow : -1);
-        expect(rows).toEqual([0, 1]);
-    });
-
-    it('remembers the exact overlay it left, so a second touch transitions from it', () => {
-        const gesture = begin_gesture_capture();
-        const first = value_only_overlay(history_value('a'), history_value('disk'));
-        gesture.record('0:0', capture(absent_overlay(), first));
-
-        expect(gesture.overlay_at('0:0')).toBe(first);
-        expect(gesture.overlay_at('1:0')).toBeUndefined();
-
-        gesture.record('0:0', capture(
-            gesture.overlay_at('0:0') ?? absent_overlay(),
-            value_only_overlay(history_value('b'), history_value('disk')),
-        ));
-        const second = gesture.changes[1];
-        if (second?.kind !== 'cell') throw new Error('expected a cell change');
-        // Not 'disk': the second write starts from where the first one left it.
-        expect(second.delta.value?.expected.content.text).toBe('a');
-        expect(second.delta.value?.mode).toBe('semantic');
-    });
-
-    it('drops a no-op transition but still remembers the overlay', () => {
-        const gesture = begin_gesture_capture();
-        const overlay = value_only_overlay(history_value('a'), history_value('disk'));
-        gesture.record('0:0', capture(overlay, overlay));
-
-        expect(gesture.changes).toEqual([]);
-        expect(gesture.overlay_at('0:0')).toBe(overlay);
-    });
-
-    it('builds one action for the whole gesture', () => {
-        const gesture = begin_gesture_capture();
-        gesture.record('0:0', capture(
-            absent_overlay(), value_only_overlay(history_value('a'), history_value('disk')), DISK, 0, 0));
-        gesture.record('1:0', capture(
-            absent_overlay(), value_only_overlay(history_value('b'), history_value('disk')), DISK, 1, 0));
-
-        const action = gesture.action('Paste');
-        expect(action.label).toBe('Paste');
-        expect(action.changes).toHaveLength(2);
-    });
-});
-
-describe('capture_history_action', () => {
-    it('returns a plain action, leaving ownership to recording', () => {
+describe('a gesture assembled from cell changes', () => {
+    it('reaches recording as a plain action, leaving ownership to recording', () => {
         const change = build_cell_history_change(capture(
             absent_overlay(),
             value_only_overlay(history_value('typed'), history_value('disk')),
         ));
         if (change === undefined) throw new Error('expected a change');
-        const action = capture_history_action('Edit cell', [change]);
+        const action = { label: 'Edit cell', changes: [change] };
         expect(Object.isFrozen(action)).toBe(false);
 
         // Recording is what owns it, and it accepts the plain action.
@@ -192,9 +136,8 @@ describe('capture_history_action', () => {
         expect(outcome.state.undoStack[0].action).not.toBe(action);
     });
 
-    it('an empty gesture records nothing', () => {
-        const gesture = begin_gesture_capture();
-        const outcome = record_history_action(empty_history_stack(), gesture.action('Paste'));
+    it('a gesture that moved nothing records nothing', () => {
+        const outcome = record_history_action(empty_history_stack(), { label: 'Paste', changes: [] });
         expect(outcome.kind).toBe('empty');
     });
 });

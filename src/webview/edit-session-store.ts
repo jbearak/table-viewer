@@ -20,6 +20,7 @@ import {
 } from '../types';
 import { hyperlinks_equal, type CellHyperlink } from '../cell-content';
 import { is_plain_record } from '../plain-record';
+import { stage_mutation, type StagedMutation } from './staged-mutation';
 
 export interface DirtyEntry extends CsvDirtyEntry {
     // When true, `base` has not yet been captured against a resident page (an
@@ -244,25 +245,11 @@ export interface EditSessionStore {
  *
  * `valid()` asks whether this staging may still be committed: false once the
  * store has crossed a hydration boundary or been mutated by anything else since
- * it was staged. It changes nothing, so a caller can ask about every store
- * before moving any of them.
- *
- * `commit` swaps the staged state in; `notify` publishes. Both are idempotent,
- * so a caller may run the list twice without double-notifying. Nothing here
- * holds the store's listeners open — an abandoned staging is simply dropped.
+ * it was staged. See {@link StagedMutation} for the protocol these participate
+ * in: this store's writes and the history's recording of them stage, validate
+ * and commit together, because they are one transaction.
  */
-export interface StagedWrites {
-    /** Whether the staging still describes a swap this store will accept. */
-    valid(): boolean;
-    /**
-     * Swap the staged state in without notifying. Answers whether it changed.
-     * Refuses — answering false — if the staging is no longer {@link valid}, but
-     * a caller that validated the whole list first can never reach that.
-     */
-    commit(): boolean;
-    /** Notify this store's subscribers, once, if the commit changed anything. */
-    notify(): void;
-}
+export type StagedWrites = StagedMutation;
 
 /**
  * One key's write: the entry to set, or `undefined` to remove the key.
@@ -558,27 +545,16 @@ export function create_edit_session_store(
             // rather than silently rebasing it onto a map it never saw.
             const staged_from = state;
             const next = staged_state(writes);
-            let changed = false;
-            let committed = false;
-            let notified = false;
-            const valid = (): boolean => state === staged_from && owns(session_id);
-            return {
-                valid,
-                commit: () => {
-                    if (committed) return changed;
-                    if (!valid()) return false;
-                    committed = true;
-                    changed = next.pending_base !== state.pending_base
+            return stage_mutation(
+                () => state === staged_from && owns(session_id),
+                () => {
+                    const changed = next.pending_base !== state.pending_base
                         || !entries_equal(state.entries, next.entries);
                     if (changed) state = next;
                     return changed;
                 },
-                notify: () => {
-                    if (notified || !changed) return;
-                    notified = true;
-                    notify();
-                },
-            };
+                notify,
+            );
         },
         resolve_pending_bases: (session_id, get_cell_raw) => {
             if (!owns(session_id)) return;
