@@ -30,6 +30,7 @@ const grid_shell_mock = vi.hoisted(() => ({
     discard_conflicted: vi.fn(),
     discard_keys: vi.fn((_keys: readonly string[]) => {}),
     commit_live_edit: vi.fn(),
+    commit_live_edit_at_close_barrier: vi.fn(),
     flush_live_edit: vi.fn(),
     stop_edit_admission: vi.fn(),
     focus_grid: vi.fn(),
@@ -174,6 +175,8 @@ vi.mock('../webview/grid-shell', () => ({
                 discard_keys: grid_shell_mock.discard_keys,
                 stop_edit_admission: grid_shell_mock.stop_edit_admission,
                 commit_live_edit: grid_shell_mock.commit_live_edit,
+                commit_live_edit_at_close_barrier:
+                    grid_shell_mock.commit_live_edit_at_close_barrier,
                 flush_live_edit: grid_shell_mock.flush_live_edit,
                 has_uncommitted_changes: () => grid_shell_mock.has_uncommitted_changes,
             };
@@ -193,6 +196,7 @@ vi.mock('../webview/grid-shell', () => ({
                 'data-show-formatting': String(props.show_formatting),
                 'data-preview': String(props.preview_mode ?? false),
                 'data-edit-mode': String(props.edit_mode ?? false),
+                'data-edit-activation-id': String(props.edit_activation_id),
                 'data-host-rejected-keys': JSON.stringify(props.host_rejected_keys ?? []),
                 'data-store-edits': JSON.stringify(Object.fromEntries(store_edits)),
                 'data-mount-id': String(mount_id.current),
@@ -822,6 +826,7 @@ function cleanup() {
     grid_shell_mock.discard_conflicted.mockReset();
     grid_shell_mock.discard_keys.mockReset();
     grid_shell_mock.commit_live_edit.mockReset();
+    grid_shell_mock.commit_live_edit_at_close_barrier.mockReset();
     grid_shell_mock.flush_live_edit.mockReset();
     grid_shell_mock.stop_edit_admission.mockReset();
     grid_shell_mock.focus_grid.mockReset();
@@ -4516,6 +4521,58 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-mount-id')).toBe(first_mount_id);
     });
 
+    it('advances the committed activation when the same session re-enters edit mode', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                },
+            }),
+        );
+        expect(grid_stub().getAttribute('data-edit-activation-id')).toBe('0');
+
+        await enter_edit_mode(post_message, 'same-session');
+        expect(grid_stub().getAttribute('data-edit-activation-id')).toBe('1');
+
+        await click_button('Edit');
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        await enter_edit_mode(post_message, 'same-session');
+
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-edit-activation-id')).toBe('2');
+    });
+
+    it('advances the committed activation when an active session is replaced', async () => {
+        await render_app();
+        const first = initial_snapshot_message(make_meta(['First'], false), {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'session-a',
+            },
+        });
+        await dispatch_host_message(first);
+        expect(grid_stub().getAttribute('data-edit-activation-id')).toBe('1');
+
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Second'], false), {
+            identity: {
+                authority: { fileId: 'file:replacement', revision: 1 },
+                stateRevision: 1,
+                sourceBasis: { physicalRevision: 1, projectionRevision: 0 },
+            },
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'session-b',
+            },
+        }));
+
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(grid_stub().getAttribute('data-edit-activation-id')).toBe('2');
+    });
+
     it('continues the workbook session when Edit is pressed on another worksheet', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(
@@ -5543,6 +5600,39 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
     });
 
+    it('folds the open overlay through the privileged close barrier before publishing', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['People'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'close-session',
+                },
+            }),
+        );
+        grid_shell_mock.commit_live_edit_at_close_barrier.mockImplementation(() => {
+            (grid_shell_mock.latest_props?.edit_session as EditSessionStore)
+                .commit('close-session', '0:0', { value: 'typed', base: 'Alice' });
+        });
+
+        post_message.mockClear();
+        await dispatch_host_message({
+            type: 'requestPendingEditsFlush',
+            requestId: 'fold-open-overlay',
+        });
+        await vi.waitUntil(() => post_message.mock.calls.some(
+            ([message]) => message?.type === 'pendingEditsFlush',
+        ));
+
+        expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
+            type: 'pendingEditsChanged',
+            editSessionId: 'close-session',
+            edits: { '0:0': { value: 'typed', base: 'Alice' } },
+        }));
+        expect(grid_shell_mock.commit_live_edit).not.toHaveBeenCalled();
+    });
+
     it('publishes every worksheet\u2019s store at the close flush', async () => {
         // The close/reload boundary is the last chance for unacknowledged local
         // edits to reach the host. The session is workbook-scoped, so a store on
@@ -5582,6 +5672,9 @@ describe('edit mode save exit', () => {
         // The reply itself is the observable result, so wait for *it* rather
         // than for a tick that happens to be long enough on this machine.
         await vi.waitUntil(() => posted_types('pendingEditsFlush').length > 0);
+        expect(grid_shell_mock.stop_edit_admission).toHaveBeenCalledTimes(1);
+        expect(grid_shell_mock.commit_live_edit_at_close_barrier).toHaveBeenCalledTimes(1);
+        expect(grid_shell_mock.commit_live_edit).not.toHaveBeenCalled();
         expect(posted_types('pendingEditsFlush')).toHaveLength(1);
         const published = posted_types('pendingEditsChanged') as {
             sheetName?: string;
