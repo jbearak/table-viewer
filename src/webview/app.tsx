@@ -23,6 +23,7 @@ import {
     type CellHighlightMutation,
     type CellHighlightSelection,
     type CellHighlightState,
+    type HighlightCellDelta,
     dirty_entries_equal,
     type CsvDirtyEntry,
     type CsvSaveLifecycle,
@@ -117,6 +118,7 @@ import type { HistoryEntry } from './history-stack-model';
 import type { HistoryReplayCommitted } from '../history-replay-protocol';
 import { pending_signal, type PendingSignal } from './pending-signal';
 import { run_discard_transaction } from './discard-transaction-model';
+import { highlight_history_source } from './highlight-capture-model';
 import { commit_staged_transaction, type StagedMutation } from './staged-mutation';
 import { column_letter } from './grid-model';
 import {
@@ -521,6 +523,28 @@ export function App(): React.JSX.Element {
     }
 
     /**
+     * Record a highlight gesture this window made, once the host has applied it.
+     *
+     * A plain record with nothing staged alongside it: unlike a cell edit, the
+     * mutation has ALREADY happened on the host and in durable state by the time
+     * this window sees it, so there is nothing left to hold back. A refusal
+     * therefore cannot un-apply the gesture — it installs the barrier that makes a
+     * later undo explain itself, which is the same trade the discard makes.
+     */
+    const record_highlight_gesture = useCallback((
+        deltas: readonly HighlightCellDelta[],
+    ) => {
+        if (deltas.length === 0) return;
+        const record = history_store_ref.current!.stage_record({
+            label: highlight_gesture_label_ref.current,
+            changes: highlight_history_source(deltas, meta_ref.current?.sheets ?? []),
+        });
+        if (!record.valid()) return;
+        record.commit();
+        record.notify();
+    }, []);
+
+    /**
      * The one outstanding replay, if any.
      *
      * A ref rather than state, for the same reason as the history store: a replay
@@ -849,6 +873,8 @@ export function App(): React.JSX.Element {
             value.toString(36)).join('-'),
     );
     const pending_highlight_request_ref = useRef<string | null>(null);
+    /** What to call the highlight gesture in flight, in the undo menu. */
+    const highlight_gesture_label_ref = useRef('Highlight cells');
     const last_highlight_state_revision_ref = useRef(0);
 
     const { persist_immediate } = use_state_sync(
@@ -1290,6 +1316,13 @@ export function App(): React.JSX.Element {
                     return;
                 }
                 last_highlight_state_revision_ref.current = msg.stateRevision;
+                // Only this window's OWN gesture enters its history. The same
+                // message arrives for another window's highlight, an external
+                // reload, and a post-save rebase; recording those would let undo
+                // repaint cells this user never touched.
+                if (matching_request && !msg.error && msg.deltas !== undefined) {
+                    record_highlight_gesture(msg.deltas);
+                }
                 state_ref.current = {
                     ...state_ref.current,
                     cellHighlights: msg.state,
@@ -3994,6 +4027,12 @@ export function App(): React.JSX.Element {
             ++highlight_request_seq_ref.current,
         ].join(':');
         pending_highlight_request_ref.current = request_id;
+        // The gesture's own name, kept from the request: the diff that comes back
+        // says which cells moved but not what the user asked for, and "Undo Clear
+        // highlight" reads as the action they took.
+        highlight_gesture_label_ref.current = mutation.type === 'clear'
+            ? 'Clear highlight'
+            : 'Highlight cells';
         set_highlight_request_pending(true);
         set_highlight_status('Updating cell highlights…');
         host_bridge.postMessage({
@@ -4022,6 +4061,7 @@ export function App(): React.JSX.Element {
             ++highlight_request_seq_ref.current,
         ].join(':');
         pending_highlight_request_ref.current = request_id;
+        highlight_gesture_label_ref.current = 'Clear all highlights';
         set_highlight_request_pending(true);
         set_highlight_status('Updating cell highlights…');
         host_bridge.postMessage({

@@ -351,6 +351,22 @@ export interface SheetCellHighlightState {
     cells: Record<string, CellHighlightColor>;
 }
 
+/**
+ * One cell whose highlight a gesture moved.
+ *
+ * Names a sheet INDEX rather than a worksheet identity, because that is what both
+ * sides of the host's compare-and-set agree on; a renderer resolves it against
+ * the sheet list it holds. Computed by `highlight_state_deltas`.
+ */
+export interface HighlightCellDelta {
+    readonly sheetIndex: number;
+    readonly sourceRow: number;
+    readonly sourceColumn: number;
+    /** `null` for "no highlight" on either side. */
+    readonly before: CellHighlightColor | null;
+    readonly after: CellHighlightColor | null;
+}
+
 export interface CellHighlightState {
     /** Most recent physical file content observed for these positional annotations. */
     sourceDigest: string;
@@ -1804,7 +1820,15 @@ export type HostMessage =
     /** Stop accepting edits and report the highest full-map sequence produced. */
     | { type: 'requestPendingEditsFlush'; requestId: string }
     | { type: 'filterHistogram'; sheetIndex: number; columnIndex: number; bins: HistogramBin[]; columnKind?: FilterColumnKind; distinctValues: (string | null)[]; distinctValuesExceeded: boolean; requestId: string; generation: number; sourceGeneration: number; error?: string }
-    | { type: 'cellHighlightsChanged'; sheetIndex?: number; requestId?: string; stateRevision: number; physicalRevision: number; state: CellHighlightState | undefined; sourceGeneration: number; error?: string }
+    /**
+     * `deltas` is the gesture's own change set, and is present ONLY on the
+     * successful answer to a request this receiver made. Computed by the host at
+     * its compare-and-set, where both sides of the transition are in hand: the
+     * `state` field carries the WHOLE state, so a change another window committed
+     * while the request was in flight is indistinguishable within it — and an undo
+     * built by diffing would revert that other window's highlight.
+     */
+    | { type: 'cellHighlightsChanged'; sheetIndex?: number; requestId?: string; stateRevision: number; physicalRevision: number; state: CellHighlightState | undefined; deltas?: readonly HighlightCellDelta[]; sourceGeneration: number; error?: string }
     /**
      * The host installed a view. This is the *only* answer that describes one, and
      * the only message that can move the view generation, so a consumer that reads

@@ -4161,8 +4161,12 @@ export function attach_viewer(
                 ...(receipt.scope.type === 'selection'
                     ? { sheetIndex: receipt.scope.sheetIndex }
                     : {}),
+                // The request id AND the gesture's deltas travel together, and
+                // only to the receiver that asked: a delta is the authority for
+                // entering something in THAT window's undo history, and another
+                // window's gesture must never enter it.
                 ...(receipt.originToken === cell_highlight_subscriber_token
-                    ? { requestId: receipt.requestId }
+                    ? { requestId: receipt.requestId, deltas: receipt.deltas }
                     : {}),
                 stateRevision: receipt.stateSnapshot.revision,
                 physicalRevision: receipt.authority.physicalRevision,
