@@ -96,12 +96,13 @@ import {
     create_edit_session_registry,
     type EditSessionRegistry,
 } from './edit-session-registry';
-import type { StoreWrite } from './edit-session-store';
+import type { DirtyEntry, StoreWrite } from './edit-session-store';
 import { create_history_store, type HistoryStore } from './history-store';
 import {
     create_history_replay_coordinator,
     type HistoryReplayCoordinator,
 } from './history-replay-coordinator';
+import { replayed_store_entry } from './history-replay-request-model';
 import {
     absent_overlay,
     overlay_state_from_dirty_entry,
@@ -570,7 +571,7 @@ export function App(): React.JSX.Element {
         const by_sheet = new Map<number, StoreWrite[]>();
         for (const write of committed.cells) {
             const writes = by_sheet.get(write.resolvedSheetIndex) ?? [];
-            writes.push({ key: write.key, entry: write.entry ?? undefined });
+            writes.push({ key: write.key, entry: replayed_store_entry(write.entry) });
             by_sheet.set(write.resolvedSheetIndex, writes);
         }
         const staged: StagedMutation[] = [];

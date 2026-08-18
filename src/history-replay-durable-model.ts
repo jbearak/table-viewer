@@ -80,7 +80,22 @@ export function replay_cell_key(source_row: number, source_column: number): stri
 export type WireOverlayProjection =
     | { readonly kind: 'absent' }
     | { readonly kind: 'unrepresentable' }
-    | { readonly kind: 'entry'; readonly entry: CsvDirtyEntry };
+    | { readonly kind: 'entry'; readonly entry: CsvDirtyEntry }
+    /**
+     * A durable bare string: the legacy slot form, which is the ONLY durable
+     * shape carrying "this edit's base has not been observed yet".
+     *
+     * `base_pending` is not a field of `CsvDirtyEntry`, and there is exactly one
+     * place in the renderer that originates the flag — hydrating a bare durable
+     * string, which by construction has no runs and no hyperlink. Every other
+     * site only carries an existing flag forward. So writing the string back is a
+     * faithful round-trip for the shape that can actually occur, and a
+     * base-pending overlay carrying runs or a link stays `unrepresentable`: those
+     * would need a durable field that does not exist, and guessing at one would
+     * promote an unobserved placeholder to a real base and let a later save
+     * compare against content the user never saw.
+     */
+    | { readonly kind: 'legacy'; readonly value: string };
 
 export function entry_from_wire_overlay(
     overlay: WireCellOverlayState,
@@ -88,7 +103,16 @@ export function entry_from_wire_overlay(
     if (overlay.kind === 'absent') return { kind: 'absent' };
     const dimension = overlay.value;
     if (dimension.kind === 'present' && dimension.basePending) {
-        return { kind: 'unrepresentable' };
+        // Representable only as the legacy bare string, and only for the shape
+        // that string can hold: plain text, no runs on either side, no hyperlink.
+        // Anything richer has no durable home for the pending bit.
+        const plain = dimension.value.runs === undefined
+            && dimension.base.runs === undefined
+            && dimension.base.text === ''
+            && overlay.hyperlink.kind === 'untouched';
+        return plain
+            ? { kind: 'legacy', value: dimension.value.text }
+            : { kind: 'unrepresentable' };
     }
     const value: WireHistoryValue = dimension.kind === 'untouched'
         ? dimension.anchor
@@ -164,15 +188,29 @@ export function replay_cell_matches(
     if (expected.kind === 'absent' || actual === undefined) {
         return expected.kind === 'absent' && actual === undefined;
     }
-    return dirty_entries_equal(expected.entry, actual);
+    // A legacy expectation is canonicalized against the same persisted content a
+    // legacy STORED slot is, so the two forms of the one fact compare equal
+    // rather than one of them reading as a conflict.
+    const expected_entry = expected.kind === 'legacy'
+        ? stored_entry(expected.value, expectation.persisted)
+        : expected.entry;
+    if (expected_entry === undefined) return false;
+    return dirty_entries_equal(expected_entry, actual);
 }
 
-/** One cell's replay write: the entry to store, or `null` to remove it. */
+/**
+ * One cell's replay write: what to store, or `null` to remove the slot.
+ *
+ * A bare `string` is the legacy slot form, which the renderer's own hydration
+ * reads back as an entry whose base has not been observed. It is how an
+ * unresolved base survives a round trip through durable state at all — see
+ * `WireOverlayProjection`.
+ */
 export interface ReplayCellWrite {
     readonly sheetIndex: number;
     readonly sourceRow: number;
     readonly sourceColumn: number;
-    readonly entry: CsvDirtyEntry | null;
+    readonly entry: string | CsvDirtyEntry | null;
 }
 
 /**
@@ -199,7 +237,14 @@ export function pending_edits_with_replay_writes(
             continue;
         }
         const stored = had ? next[key] : undefined;
-        if (
+        // Compared in each form's own terms rather than canonicalized: the point
+        // is only to skip a write that changes nothing durable, and this function
+        // has no persisted content to canonicalize a legacy slot against. A
+        // string replacing an equal entry (or the reverse) is written, which is
+        // correct — the two forms differ in whether the base is observed.
+        if (typeof write.entry === 'string') {
+            if (stored === write.entry) continue;
+        } else if (
             stored !== undefined
             && typeof stored !== 'string'
             && dirty_entries_equal(stored, write.entry)

@@ -108,12 +108,35 @@ describe('entry_from_wire_overlay', () => {
         expect(projection.entry.link).toBeUndefined();
     });
 
-    it('refuses a base-pending overlay, which durable state cannot represent', () => {
-        // The renderer's own planner refuses such a cell; reaching here is a
-        // stale renderer, and matching nothing is the safe answer.
+    it('projects a plain base-pending overlay as the bare string it came from', () => {
+        // A pending base has exactly one origin in durable state: a bare string,
+        // whose base is the empty placeholder and which carries neither runs nor
+        // a link. Writing that shape back as a bare string is a faithful round
+        // trip, so restoring the edit does not promote the placeholder base into
+        // a real one.
         expect(entry_from_wire_overlay(
             value_overlay({ text: 'new' }, { text: '' }, true),
+        )).toEqual({ kind: 'legacy', value: 'new' });
+    });
+
+    it('refuses a base-pending overlay that durable state has no shape for', () => {
+        // Richer than a bare string in any dimension, so no durable form both
+        // keeps the pending base and carries the rest. Matching nothing is the
+        // safe answer.
+        expect(entry_from_wire_overlay(
+            value_overlay({ text: 'new', runs: BOLD }, { text: '' }, true),
         )).toEqual({ kind: 'unrepresentable' });
+        expect(entry_from_wire_overlay(
+            value_overlay({ text: 'new' }, { text: '', runs: BOLD }, true),
+        )).toEqual({ kind: 'unrepresentable' });
+        expect(entry_from_wire_overlay(
+            value_overlay({ text: 'new' }, { text: 'disk' }, true),
+        )).toEqual({ kind: 'unrepresentable' });
+        expect(entry_from_wire_overlay({
+            kind: 'present',
+            value: { kind: 'present', value: { text: 'new' }, base: { text: '' }, basePending: true },
+            hyperlink: { kind: 'present', value: LINK, base: null },
+        })).toEqual({ kind: 'unrepresentable' });
     });
 
     it('distinguishes a cleared link from an untouched one', () => {
@@ -199,10 +222,20 @@ describe('replay_cell_matches', () => {
         )).toBe(false);
     });
 
-    it('refuses a base-pending overlay however the cell looks', () => {
+    it('matches a plain base-pending expectation against the stored bare string', () => {
         const pending = expectation(value_overlay({ text: 'new' }, { text: '' }, true));
+        // Canonicalized against the persisted content, exactly as the store
+        // hydrates a bare string, so the two spellings of the same cell agree.
+        expect(replay_cell_matches(cells({ '3:4': 'new' }), pending)).toBe(true);
         expect(replay_cell_matches(cells({}), pending)).toBe(false);
-        expect(replay_cell_matches(cells({ '3:4': make_dirty_entry('new', '') }), pending)).toBe(false);
+        expect(replay_cell_matches(cells({ '3:4': 'other' }), pending)).toBe(false);
+    });
+
+    it('refuses an unrepresentable base-pending expectation however the cell looks', () => {
+        const rich = expectation(value_overlay({ text: 'new', runs: BOLD }, { text: '' }, true));
+        expect(replay_cell_matches(cells({}), rich)).toBe(false);
+        expect(replay_cell_matches(cells({ '3:4': 'new' }), rich)).toBe(false);
+        expect(replay_cell_matches(cells({ '3:4': make_dirty_entry('new', '') }), rich)).toBe(false);
     });
 
     it('distinguishes the link dimension', () => {
@@ -279,6 +312,27 @@ describe('pending_edits_with_replay_writes', () => {
         expect(pending_edits_with_replay_writes(cells({ '3:4': 'new' }), [
             { sheetIndex: 0, sourceRow: 3, sourceColumn: 4, entry },
         ])).toEqual({ '3:4': entry });
+    });
+
+    it('writes a legacy string, restoring the unobserved base with it', () => {
+        expect(pending_edits_with_replay_writes(undefined, [
+            { sheetIndex: 0, sourceRow: 3, sourceColumn: 4, entry: 'new' },
+        ])).toEqual({ '3:4': 'new' });
+    });
+
+    it('reports no change when the legacy string is already stored', () => {
+        const before = cells({ '3:4': 'new' });
+        expect(pending_edits_with_replay_writes(before, [
+            { sheetIndex: 0, sourceRow: 3, sourceColumn: 4, entry: 'new' },
+        ])).toBe(before);
+    });
+
+    it('writes a legacy string over an equal-valued entry', () => {
+        // Not a no-op: the two forms differ in whether the base was observed,
+        // and downgrading to the string is exactly what restoring the edit means.
+        expect(pending_edits_with_replay_writes(cells({ '3:4': make_dirty_entry('new', '') }), [
+            { sheetIndex: 0, sourceRow: 3, sourceColumn: 4, entry: 'new' },
+        ])).toEqual({ '3:4': 'new' });
     });
 
     it('does not mutate the map it was given', () => {

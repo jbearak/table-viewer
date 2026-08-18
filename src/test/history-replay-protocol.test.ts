@@ -285,7 +285,8 @@ describe('sanitized_commit_history_replay_request', () => {
                 { ordinal: 1, entry: null },
             ],
         }));
-        expect(parsed?.cells[0].entry?.value).toBe('typed');
+        const first = parsed?.cells[0].entry;
+        expect(typeof first === 'object' && first !== null ? first.value : undefined).toBe('typed');
         expect(parsed?.cells[1].entry).toBeNull();
         expect(Object.isFrozen(parsed)).toBe(true);
     });
@@ -348,7 +349,9 @@ describe('sanitized_commit_history_replay_request', () => {
             commit_request({ cells: [{ ordinal: 0, entry }] }),
         );
         expect(parsed?.cells[0].entry).not.toBe(entry);
-        expect(parsed?.cells[0].entry?.value).toBe('typed');
+        const copied = parsed?.cells[0].entry;
+        expect(typeof copied === 'object' && copied !== null ? copied.value : undefined)
+            .toBe('typed');
     });
 
     it('rejects sparse and duplicate ordinals', () => {
@@ -358,6 +361,21 @@ describe('sanitized_commit_history_replay_request', () => {
         expect(sanitized_commit_history_replay_request(commit_request({
             cells: [{ ordinal: 0, entry: null }, { ordinal: 0, entry: null }],
         }))).toBeUndefined();
+    });
+
+    it('accepts a legacy bare string, the one durable form with an unobserved base', () => {
+        const parsed = sanitized_commit_history_replay_request(
+            commit_request({ cells: [{ ordinal: 0, entry: 'typed' }] }),
+        );
+        expect(parsed?.cells[0].entry).toBe('typed');
+    });
+
+    it('rejects an entry that is neither a string, a record, nor null', () => {
+        for (const entry of [7, true, [], undefined]) {
+            expect(sanitized_commit_history_replay_request(
+                commit_request({ cells: [{ ordinal: 0, entry }] }),
+            )).toBeUndefined();
+        }
     });
 
     it('accepts a commit that writes nothing, which a pure highlight action is', () => {
@@ -411,6 +429,19 @@ describe('history_replay_proposal_digest', () => {
         }));
         expect(history_replay_proposal_digest(plain!))
             .not.toBe(history_replay_proposal_digest(styled!));
+    });
+
+    it('separates a legacy string from an entry whose value equals it', () => {
+        // The two differ only in whether the base was observed, which is exactly
+        // the fact a proposal must not blur.
+        const legacy = sanitized_commit_history_replay_request(commit_request({
+            cells: [{ ordinal: 0, entry: 'typed' }],
+        }));
+        const full = sanitized_commit_history_replay_request(commit_request({
+            cells: [{ ordinal: 0, entry: { value: 'typed', base: '' } }],
+        }));
+        expect(history_replay_proposal_digest(legacy!))
+            .not.toBe(history_replay_proposal_digest(full!));
     });
 
     it('separates two mutation ids over the same writes', () => {
