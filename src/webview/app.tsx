@@ -96,6 +96,7 @@ import {
     create_edit_session_registry,
     type EditSessionRegistry,
 } from './edit-session-registry';
+import { create_history_store, type HistoryStore } from './history-store';
 import { column_letter } from './grid-model';
 import {
     clamp_row_height,
@@ -483,6 +484,21 @@ export function App(): React.JSX.Element {
             () => csv_edit_session_id_ref.current,
         );
     }
+    /**
+     * The workbook's undo history — one, for the whole workbook, because undoing
+     * an edit made on another sheet switches to that sheet.
+     *
+     * A ref rather than state: capture reads the current stack synchronously
+     * mid-gesture, with no re-render between reading it and recording into it,
+     * and a wide paste must not rebuild App's callbacks while it is being
+     * assembled. The object also has to survive a GridShell remount, which is
+     * keyed by generation and by sheet.
+     */
+    const history_store_ref = useRef<HistoryStore | null>(null);
+    if (history_store_ref.current === null) {
+        history_store_ref.current = create_history_store();
+    }
+
     const set_csv_edit_session_id = useCallback((next: string | undefined) => {
         const previous = csv_edit_session_id_ref.current;
         if (next && next !== previous) {
@@ -1510,6 +1526,11 @@ export function App(): React.JSX.Element {
                     let locally_retained_sheet_indices: ReadonlySet<number> = new Set();
                     if (snapshot.presentation === 'initial') {
                         edit_session_registry_ref.current!.replace_document();
+                        // A different file is under the history now. Any
+                        // surviving action would be the previous workbook's
+                        // edits, waiting to be replayed through whatever
+                        // worksheet identity happened to match here.
+                        history_store_ref.current!.clear();
                     } else {
                         const edit_session_id = csv_edit_session_id_ref.current;
                         const reconciliation = edit_session_registry_ref.current!
@@ -4638,6 +4659,7 @@ export function App(): React.JSX.Element {
             edit_session={edit_session_registry_ref.current!.for_sheet(
                 active_sheet_index,
             )}
+            history_store={history_store_ref.current!}
             host_rejected_keys={live_rejected_keys}
             on_editing_change={handle_editing_change}
             editing_ref={editing_ref}

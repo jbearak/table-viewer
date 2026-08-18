@@ -11,6 +11,7 @@ import type {
 import { matches_filter } from '../table-transform';
 import type { CsvSaveOperation, FilterEntry, SheetTransformState } from '../types';
 import { create_edit_session_store } from '../webview/edit-session-store';
+import { create_history_store, type HistoryStore } from '../webview/history-store';
 import { MAX_COLUMN_WIDTH_PX } from '../webview/grid-model';
 import { button, field, find_button, set_input_value } from './helpers/dom-interaction';
 import {
@@ -62,6 +63,23 @@ const make_compact = vi.hoisted(() => {
     };
     return make;
 });
+
+/**
+ * Drive one cell through the grid's batch edit callback.
+ *
+ * The shell takes edits as batches now — that is what makes a paste one
+ * undoable gesture — so a test that means "the user typed into this cell"
+ * sends a one-item batch tagged 'edit'.
+ */
+function edit_one(
+    on_cells_edited: unknown,
+): (cell: [number, number], value: { kind: string; data: string }) => void {
+    const handler = on_cells_edited as (
+        items: readonly { location: [number, number]; value: { kind: string; data: string } }[],
+        source: string,
+    ) => void;
+    return (cell, value) => handler([{ location: cell, value }], 'edit');
+}
 
 const grid_mock = vi.hoisted(() => ({
     props: null as null | Record<string, unknown>,
@@ -2351,8 +2369,7 @@ describe('GridShell source-row edit identity', () => {
         expect(grid_mock.pin_rows).toHaveBeenCalledWith(0, 0);
 
         evict_everything();
-        const on_cell_edited = grid_mock.props!.onCellEdited as
-            (cell: [number, number], value: { kind: string; data: string }) => void;
+        const on_cell_edited = edit_one(grid_mock.props!.onCellsEdited);
         await act(async () => on_cell_edited([0, 0], { kind: 'text', data: 'typed' }));
 
         // Under the captured identity, not a guess and not nothing: '0:0' would be
@@ -2428,8 +2445,7 @@ describe('GridShell source-row edit identity', () => {
             csv_editable: true,
             editing_ref,
         }));
-        const on_cell_edited = grid_mock.props!.onCellEdited as
-            (cell: [number, number], value: { kind: string; data: string }) => void;
+        const on_cell_edited = edit_one(grid_mock.props!.onCellsEdited);
 
         // Glide's paste path can reach onCellEdited without an overlay, so this is
         // the second guard: an unresolvable row must land no edit at all rather
@@ -2676,8 +2692,7 @@ describe('GridShell stable rows during an edit session', () => {
 
         // 'zzz' sorts after every other value, so a view that recomputed would move
         // this row from display 0 to display 3.
-        const on_cell_edited = grid_mock.props!.onCellEdited as
-            (cell: [number, number], value: { kind: string; data: string }) => void;
+        const on_cell_edited = edit_one(grid_mock.props!.onCellsEdited);
         await act(async () => on_cell_edited([0, 0], { kind: 'text', data: 'zzz' }));
         await vi.waitUntil(() => statuses.some(
             (status) => status.edits['1:0']?.value === 'zzz',
@@ -2731,8 +2746,7 @@ describe('GridShell stable rows during an edit session', () => {
         const before = displayed_column_0(display_to_source.length);
         expect(before).toEqual(['a', 'z', 'm']);
 
-        const on_cell_edited = grid_mock.props!.onCellEdited as
-            (cell: [number, number], value: { kind: string; data: string }) => void;
+        const on_cell_edited = edit_one(grid_mock.props!.onCellsEdited);
         await act(async () => on_cell_edited([0, 0], { kind: 'text', data: 'q' }));
         await vi.waitUntil(() => statuses.some(
             (status) => status.edits['1:0']?.value === 'q',
@@ -2778,8 +2792,7 @@ describe('GridShell stable rows during an edit session', () => {
             { on_row_resize },
         ));
         grid_mock.update_cells.mockClear();
-        const on_cell_edited = grid_mock.props!.onCellEdited as
-            (cell: [number, number], value: { kind: string; data: string }) => void;
+        const on_cell_edited = edit_one(grid_mock.props!.onCellsEdited);
         await act(async () => on_cell_edited([0, 0], { kind: 'text', data: MULTILINE }));
     }
 
@@ -2930,9 +2943,8 @@ describe('GridShell stable rows during an edit session', () => {
             { sort: [], filters: [] },
             { on_row_resize: from_default },
         ));
-        await act(async () => (grid_mock.props!.onCellEdited as
-            (cell: [number, number], value: { kind: string; data: string }) => void
-        )([0, 0], { kind: 'text', data: huge }));
+        await act(async () => edit_one(grid_mock.props!.onCellsEdited)(
+            [0, 0], { kind: 'text', data: huge }));
 
         expect(from_default).toHaveBeenCalledWith(
             [{ start: 0, end: 0 }],
@@ -2946,9 +2958,8 @@ describe('GridShell stable rows during an edit session', () => {
             { sort: [], filters: [] },
             { on_row_resize: already_capped, row_heights: { 0: MAX_ROW_HEIGHT_PX } },
         ));
-        await act(async () => (grid_mock.props!.onCellEdited as
-            (cell: [number, number], value: { kind: string; data: string }) => void
-        )([0, 0], { kind: 'text', data: huge }));
+        await act(async () => edit_one(grid_mock.props!.onCellsEdited)(
+            [0, 0], { kind: 'text', data: huge }));
 
         expect(already_capped).not.toHaveBeenCalled();
     });
@@ -3179,5 +3190,149 @@ describe('GridShell hyperlink dialog admission', () => {
         await act(async () => editing_ref.current!.stop_edit_admission());
         await save_link();
         expect(editing_ref.current!.has_uncommitted_changes()).toBe(false);
+    });
+});
+
+describe('GridShell history capture', () => {
+    function capture_props(history_store: HistoryStore, overrides: Partial<GridShellProps> = {}) {
+        return props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                name: 'Sheet1',
+                worksheetId: 'rId1',
+                rowCount: 3,
+                sourceRowCount: 3,
+            },
+            row_count: 3,
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session-1',
+            history_store,
+            ...overrides,
+        });
+    }
+
+    function cells_edited(
+        items: readonly { location: [number, number]; value: string }[],
+        source: string,
+    ) {
+        const handler = grid_mock.props!.onCellsEdited as (
+            batch: readonly { location: [number, number]; value: { kind: string; data: string } }[],
+            gesture: string,
+        ) => boolean;
+        return handler(
+            items.map(({ location, value }) => ({
+                location,
+                value: { kind: 'text', data: value },
+            })),
+            source,
+        );
+    }
+
+    it('offers paste and the fill handle only while cells are editable', async () => {
+        const history = create_history_store();
+        await render_grid(capture_props(history));
+        // A bare `true`, not a vetting callback: every refusal paste needs is
+        // already made per cell (see the prop's comment in grid-shell).
+        expect(grid_mock.props!.onPaste).toBe(true);
+        expect(grid_mock.props!.fillHandle).toBe(true);
+
+        await render_grid(capture_props(history, { edit_mode: false }));
+        expect(grid_mock.props!.onPaste).toBe(false);
+        expect(grid_mock.props!.fillHandle).toBe(false);
+
+        await render_grid(capture_props(history, { csv_editable: false }));
+        expect(grid_mock.props!.onPaste).toBe(false);
+        expect(grid_mock.props!.fillHandle).toBe(false);
+    });
+
+    it('records a multi-cell paste as one action, named for the gesture', async () => {
+        const history = create_history_store();
+        await render_grid(capture_props(history));
+
+        await act(async () => {
+            cells_edited([
+                { location: [0, 0], value: 'x' },
+                { location: [0, 1], value: 'y' },
+            ], 'paste');
+        });
+
+        const stack = history.snapshot().undoStack;
+        expect(stack).toHaveLength(1);
+        expect(stack[0].action.label).toBe('Paste');
+        expect(stack[0].action.changes).toHaveLength(2);
+    });
+
+    it('names a gesture from what the user did, not from what the cells became', async () => {
+        const history = create_history_store();
+        await render_grid(capture_props(history));
+
+        await act(async () => {
+            cells_edited([
+                { location: [0, 0], value: '' },
+                { location: [0, 1], value: '' },
+            ], 'delete');
+        });
+        await act(async () => { cells_edited([{ location: [0, 2], value: '' }], 'delete'); });
+        await act(async () => { cells_edited([{ location: [1, 0], value: 'z' }], 'fill'); });
+
+        expect(history.snapshot().undoStack.map((entry) => entry.action.label))
+            .toEqual(['Clear cells', 'Clear cell', 'Fill']);
+    });
+
+    it('claims the batch, so Glide does not replay it per cell', async () => {
+        const history = create_history_store();
+        await render_grid(capture_props(history));
+        let claimed: boolean | undefined;
+        await act(async () => {
+            claimed = cells_edited([{ location: [0, 0], value: 'x' }], 'edit');
+        });
+        expect(claimed).toBe(true);
+    });
+
+    it('records the full worksheet identity, not just the index', async () => {
+        const history = create_history_store();
+        await render_grid(capture_props(history, { sheet_index: 2 }));
+
+        await act(async () => { cells_edited([{ location: [0, 0], value: 'x' }], 'edit'); });
+
+        const change = history.snapshot().undoStack[0].action.changes[0];
+        if (change.kind !== 'cell') throw new Error('expected a cell change');
+        // A bare index cannot survive a sheet reorder between the edit and the
+        // undo, which is a real possibility for a workbook-wide history.
+        expect(change.delta.worksheet).toEqual({
+            sheetIndex: 2, sheetName: 'Sheet1', worksheetId: 'rId1',
+        });
+    });
+
+    it('records nothing once the close barrier is raised', async () => {
+        const history = create_history_store();
+        const editing_ref = React.createRef<EditingHandle | null>();
+        await render_grid(capture_props(history, { editing_ref }));
+        await act(async () => editing_ref.current!.stop_edit_admission());
+
+        await act(async () => { cells_edited([{ location: [0, 0], value: 'x' }], 'edit'); });
+
+        expect(history.snapshot().undoStack).toEqual([]);
+        expect(editing_ref.current!.has_uncommitted_changes()).toBe(false);
+    });
+
+    it('records only the cells whose rows resolve', async () => {
+        const history = create_history_store();
+        // Display row 1's source identity is unresolved (its page has not landed).
+        grid_mock.source_row_for_display = (display_row: number) => (
+            display_row === 1 ? undefined : display_row
+        );
+        await render_grid(capture_props(history));
+
+        await act(async () => {
+            cells_edited([
+                { location: [0, 0], value: 'x' },
+                { location: [0, 1], value: 'y' },
+            ], 'paste');
+        });
+
+        const stack = history.snapshot().undoStack;
+        expect(stack[0].action.changes).toHaveLength(1);
     });
 });

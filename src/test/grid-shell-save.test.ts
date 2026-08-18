@@ -12,7 +12,10 @@ import {
 
 const grid_mock = vi.hoisted(() => ({
     props: null as null | {
-        onCellEdited?: (cell: [number, number], value: { kind: string; data: string }) => void;
+        onCellsEdited?: (
+            items: readonly { location: [number, number]; value: { kind: string; data: string } }[],
+            source: string,
+        ) => boolean | void;
         onGridSelectionChange?: (selection: unknown) => void;
         getCellContent?: (cell: [number, number]) => { data?: string };
     },
@@ -268,7 +271,10 @@ async function render_grid(
 
 async function edit_cell(value: string) {
     await act(async () => {
-        grid_mock.props!.onCellEdited!([0, 0], { kind: 'text', data: value });
+        grid_mock.props!.onCellsEdited!(
+            [{ location: [0, 0], value: { kind: 'text', data: value } }],
+            'edit',
+        );
     });
 }
 
