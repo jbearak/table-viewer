@@ -21,13 +21,17 @@
  */
 
 import {
+    commit_history_move,
     empty_history_stack,
     record_history_action,
+    type CommitOutcome,
     type HistoryAction,
     type HistoryBounds,
+    type HistoryEntry,
     type HistoryStackState,
     type RecordOutcome,
 } from './history-stack-model';
+import type { HistoryDirection } from './history-cell-state-model';
 import { stage_mutation, type StagedMutation } from './staged-mutation';
 
 /**
@@ -40,6 +44,24 @@ import { stage_mutation, type StagedMutation } from './staged-mutation';
  */
 export interface StagedHistoryRecord extends StagedMutation {
     readonly outcome: RecordOutcome;
+}
+
+/**
+ * A replayed entry's move, held back from the store's subscribers.
+ *
+ * Staged for the same reason a recording is, and more urgently: a replay moves
+ * cells across possibly several worksheet stores AND moves the entry between the
+ * undo and redo stacks, and those are one transaction. A subscriber that saw the
+ * entry change stacks before the cells moved would offer to redo a change that
+ * is not applied yet.
+ */
+export interface StagedHistoryMove extends StagedMutation {
+    /**
+     * What the move WOULD do — moved, already-committed, or dropped — available
+     * before the commit, so a caller can see which case it has while it is still
+     * deciding whether to go through with the transaction.
+     */
+    readonly outcome: CommitOutcome;
 }
 
 export interface HistoryStore {
@@ -55,6 +77,20 @@ export interface HistoryStore {
      * gesture too large to keep get fully copied before being refused.
      */
     stage_record(action: HistoryAction, bounds?: HistoryBounds): StagedHistoryRecord;
+    /**
+     * Record that a replayed entry has landed, without publishing it.
+     *
+     * `entry` is the one `peek_history` handed out. ONE REPLAY AT A TIME remains
+     * the caller's obligation — see `commit_history_move`: the stack tolerates a
+     * commit that is late, duplicated or out of order and says which it was, but
+     * two replays of the same entry in flight together are indistinguishable
+     * from one whose commit is merely slow.
+     */
+    stage_move(
+        direction: HistoryDirection,
+        entry: HistoryEntry,
+        bounds?: HistoryBounds,
+    ): StagedHistoryMove;
     /**
      * Empty the history. For a different document replacing this one, where any
      * surviving action would be another file's edits waiting to be replayed
@@ -98,6 +134,23 @@ export function create_history_store(initial?: HistoryStackState): HistoryStore 
             );
             return { outcome, ...staged };
         },
+        stage_move: (direction, entry, bounds) => {
+            const staged_from = state;
+            const outcome = commit_history_move(staged_from, direction, entry, bounds);
+            const staged = stage_mutation(
+                () => state === staged_from,
+                () => {
+                    // `already-committed` returns the state unchanged, so this is
+                    // also what makes a duplicate commit publish nothing.
+                    if (outcome.state === state) return false;
+                    state = outcome.state;
+                    return true;
+                },
+                notify,
+            );
+            return { outcome, ...staged };
+        },
+
         clear: () => {
             if (state.undoStack.length === 0
                 && state.redoStack.length === 0

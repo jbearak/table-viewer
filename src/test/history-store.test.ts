@@ -6,8 +6,17 @@ import {
     history_value,
     value_only_overlay,
 } from '../webview/history-cell-state-model';
-import type { HistoryAction, HistoryBounds, HistoryChange } from '../webview/history-stack-model';
+import {
+    peek_history,
+    type HistoryAction,
+    type HistoryBounds,
+    type HistoryChange,
+    type HistoryEntry,
+} from '../webview/history-stack-model';
 import { create_history_store } from '../webview/history-store';
+import { create_edit_session_store } from '../webview/edit-session-store';
+import { commit_staged_transaction, type StagedMutation } from '../webview/staged-mutation';
+import { make_dirty_entry } from '../types';
 
 const SHEET: WorksheetTarget = { sheetIndex: 0, sheetName: 'Data', worksheetId: 'rId1' };
 
@@ -210,3 +219,173 @@ describe('create_history_store', () => {
         expect(store.snapshot().undoStack).toHaveLength(1);
     });
 });
+
+describe('create_history_store — stage_move', () => {
+    /** Record one action and hand back the entry a replay would be given. */
+    function with_recorded_entry(): {
+        readonly store: ReturnType<typeof create_history_store>;
+        readonly entry: HistoryEntry;
+    } {
+        const store = create_history_store();
+        const staged = store.stage_record(typed('Edit cell'));
+        staged.commit();
+        staged.notify();
+        const peeked = peek_history(store.snapshot(), 'undo');
+        if (peeked.kind !== 'available') throw new Error('fixture recorded nothing');
+        return { store, entry: peeked.entry };
+    }
+
+    it('moves the entry to the other stack on commit', () => {
+        const { store, entry } = with_recorded_entry();
+        const staged = store.stage_move('undo', entry);
+        expect(staged.outcome.kind).toBe('moved');
+        // Nothing has moved yet: staging decides, committing applies.
+        expect(store.snapshot().undoStack).toHaveLength(1);
+        expect(staged.commit()).toBe(true);
+        expect(store.snapshot().undoStack).toHaveLength(0);
+        expect(store.snapshot().redoStack).toHaveLength(1);
+    });
+
+    it('publishes once, and only after the commit', () => {
+        const { store, entry } = with_recorded_entry();
+        let notifications = 0;
+        store.subscribe(() => { notifications += 1; });
+        const staged = store.stage_move('undo', entry);
+        expect(notifications).toBe(0);
+        staged.commit();
+        expect(notifications).toBe(0);
+        staged.notify();
+        staged.notify();
+        expect(notifications).toBe(1);
+    });
+
+    it('is invalidated by anything else moving the history first', () => {
+        const { store, entry } = with_recorded_entry();
+        const staged = store.stage_move('undo', entry);
+        const interloper = store.stage_record(typed('Edit cell', 'later'));
+        interloper.commit();
+        expect(staged.valid()).toBe(false);
+        expect(staged.commit()).toBe(false);
+        // The interloping recording stands; the stale move did not rebase onto it.
+        expect(store.snapshot().undoStack).toHaveLength(2);
+    });
+
+    it('reports a duplicate commit as already-committed and publishes nothing', () => {
+        const { store, entry } = with_recorded_entry();
+        const first = store.stage_move('undo', entry);
+        first.commit();
+        first.notify();
+
+        let notifications = 0;
+        store.subscribe(() => { notifications += 1; });
+        const second = store.stage_move('undo', entry);
+        expect(second.outcome.kind).toBe('already-committed');
+        expect(second.commit()).toBe(false);
+        second.notify();
+        expect(notifications).toBe(0);
+        expect(store.snapshot().redoStack).toHaveLength(1);
+    });
+
+    it('a clear across the move is a dropped commit', () => {
+        const { store, entry } = with_recorded_entry();
+        store.clear();
+        const staged = store.stage_move('undo', entry);
+        // The entry's content HAS been replayed, so it cannot go back on a stack
+        // a clear deliberately discarded — the caller is told rather than left
+        // to infer it from an unchanged state.
+        expect(staged.outcome.kind).toBe('dropped');
+        staged.commit();
+        expect(store.snapshot().undoStack).toHaveLength(0);
+        expect(store.snapshot().redoStack).toHaveLength(0);
+    });
+});
+
+describe('commit_staged_transaction', () => {
+    function stub(valid: boolean, changes = true): StagedMutation & {
+        readonly log: string[];
+    } {
+        const log: string[] = [];
+        return {
+            log,
+            valid: () => valid,
+            commit: () => { log.push('commit'); return changes; },
+            notify: () => { log.push('notify'); },
+        };
+    }
+
+    it('commits nothing when any participant is invalid', () => {
+        const good = stub(true);
+        const bad = stub(false);
+        expect(commit_staged_transaction([good, bad])).toBe(false);
+        expect(good.log).toEqual([]);
+        expect(bad.log).toEqual([]);
+    });
+
+    it('every store has swapped before the first notification runs', () => {
+        // The reason notification is its own pass: a listener woken by the first
+        // store would read the others still holding their old state.
+        const order: string[] = [];
+        const participant = (name: string): StagedMutation => ({
+            valid: () => true,
+            commit: () => { order.push(`commit:${name}`); return true; },
+            notify: () => { order.push(`notify:${name}`); },
+        });
+        commit_staged_transaction([participant('edits'), participant('history')]);
+        expect(order).toEqual([
+            'commit:edits', 'commit:history', 'notify:edits', 'notify:history',
+        ]);
+    });
+
+    it('answers true when any participant changed and false when none did', () => {
+        expect(commit_staged_transaction([stub(true, false), stub(true, true)])).toBe(true);
+        expect(commit_staged_transaction([stub(true, false), stub(true, false)])).toBe(false);
+    });
+
+    it('an empty transaction changes nothing and is not an error', () => {
+        expect(commit_staged_transaction([])).toBe(false);
+    });
+
+    it('moves a real history store and edit store together', () => {
+        const store = create_edit_session_store();
+        store.adopt_session('session-1');
+        const { store: history, entry } = (() => {
+            const created = create_history_store();
+            const staged = created.stage_record(typed('Edit cell'));
+            staged.commit();
+            const peeked = peek_history(created.snapshot(), 'undo');
+            if (peeked.kind !== 'available') throw new Error('fixture recorded nothing');
+            return { store: created, entry: peeked.entry };
+        })();
+
+        const writes = store.stage_writes('session-1', [
+            { key: '0:0', entry: make_dirty_entry('typed', 'base') },
+        ]);
+        const move = history.stage_move('undo', entry);
+        expect(writes).toBeDefined();
+        expect(commit_staged_transaction([writes!, move])).toBe(true);
+        expect(store.size()).toBe(1);
+        expect(history.snapshot().redoStack).toHaveLength(1);
+    });
+
+    it('leaves both stores untouched when one has moved on', () => {
+        const store = create_edit_session_store();
+        store.adopt_session('session-1');
+        const history = create_history_store();
+        const recorded = history.stage_record(typed('Edit cell'));
+        recorded.commit();
+        const peeked = peek_history(history.snapshot(), 'undo');
+        if (peeked.kind !== 'available') throw new Error('fixture recorded nothing');
+
+        const writes = store.stage_writes('session-1', [
+            { key: '0:0', entry: make_dirty_entry('typed', 'base') },
+        ]);
+        const move = history.stage_move('undo', peeked.entry);
+        // The history moves under the staging — a fresh edit was recorded.
+        history.stage_record(typed('Edit cell', 'later')).commit();
+
+        expect(commit_staged_transaction([writes!, move])).toBe(false);
+        expect(store.size()).toBe(0);
+        expect(history.snapshot().redoStack).toHaveLength(0);
+    });
+});
+

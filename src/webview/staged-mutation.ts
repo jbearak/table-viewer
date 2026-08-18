@@ -63,3 +63,35 @@ export function stage_mutation(
         },
     };
 }
+
+/**
+ * Run several stores' stagings as one transaction.
+ *
+ * The three passes are the contract, and running them in this order across ALL
+ * participants is what the contract is for. Nothing between pass one and pass
+ * two may `await`, update React state, post a message, or run a callback that
+ * could re-enter mutation code: a store that moved in that window would have
+ * been validated in one state and committed in another, which is exactly the
+ * split the protocol exists to prevent.
+ *
+ * Answers whether anything changed. `false` with nothing committed is the
+ * ordinary outcome when a participant has moved on — the caller keeps its old
+ * state and does not retry — so the caller must not read `false` as an error.
+ */
+export function commit_staged_transaction(
+    mutations: readonly StagedMutation[],
+): boolean {
+    for (const mutation of mutations) {
+        if (!mutation.valid()) return false;
+    }
+    let changed = false;
+    for (const mutation of mutations) {
+        if (mutation.commit()) changed = true;
+    }
+    // Notification is its own pass, after every store has swapped: a listener
+    // woken by the first store would read the others still holding their old
+    // state, and a subscriber that saw an edit map move before the history did
+    // would render a menu that disagrees with the cells.
+    for (const mutation of mutations) mutation.notify();
+    return changed;
+}
