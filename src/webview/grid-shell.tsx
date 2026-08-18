@@ -3612,6 +3612,23 @@ export function GridShell({
                 onColumnResize={handle_column_resize}
                 onItemHovered={on_item_hovered}
                 onCellsEdited={on_cells_edited}
+                // Both gated on `editable_cells`, so a read-only or
+                // save-in-flight sheet offers neither.
+                //
+                // `onPaste` as a bare `true` rather than a callback: the
+                // callback exists to VET a paste before Glide splits it, and
+                // there is nothing to vet here that the per-cell path does not
+                // already refuse — `readonly` closes a cell the projection
+                // cannot resolve (see cell-renderer's `refused`), the fork skips
+                // covered merge cells, and `on_cells_edited` drops any row whose
+                // source identity does not resolve. Left undefined, Glide pastes
+                // the entire clipboard into the single focused cell, tabs and
+                // newlines and all.
+                onPaste={editable_cells}
+                // The pointer affordance only. Fill's keyboard hotkeys need no
+                // prop and have always been live; this adds the drag handle, and
+                // both arrive through `onCellsEdited` as one `"fill"` batch.
+                fillHandle={editable_cells}
                 onCellClicked={on_cell_clicked}
                 customRenderers={custom_renderers}
                 onCellContextMenu={on_cell_context_menu}
