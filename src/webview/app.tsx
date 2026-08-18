@@ -4981,6 +4981,7 @@ export function App(): React.JSX.Element {
             merges={merges_flattened ? [] : current_sheet.merges}
             preview_mode={preview_mode}
             edit_mode={edit_mode_on_active_sheet}
+            highlight_in_flight={highlight_request_pending}
             csv_editable={csv_editable}
             edit_syntax={edit_syntax}
             edit_session_id={csv_edit_session_id}
