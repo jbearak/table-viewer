@@ -480,12 +480,67 @@ export class ViewerWindowManager {
             receipt: PendingEditAcknowledgementReceipt,
         ) => void>();
         const webview_message_listeners = new Set<(message: WebviewMessage) => void>();
-        let admitted_document_token: string | undefined;
-        let document_admission_open = false;
+        interface NavigationAttempt {
+            readonly sequence: number;
+            readonly url: string;
+            readonly frameProcessId?: number;
+            readonly frameRoutingId?: number;
+        }
+        interface FailureSignature {
+            readonly errorCode: number;
+            readonly validatedUrl: string;
+            readonly frameProcessId?: number;
+            readonly frameRoutingId?: number;
+        }
+        type StableDocumentAdmission =
+            | {
+                readonly kind: 'idle';
+                readonly token?: string;
+                readonly lastSuccessfulUrl?: string;
+            }
+            | { readonly kind: 'committed-awaiting-claim'; readonly url: string }
+            | {
+                readonly kind: 'claimed-awaiting-navigation';
+                readonly token: string;
+                readonly url: string;
+            }
+            | { readonly kind: 'unavailable' };
+        type DocumentAdmission = StableDocumentAdmission | {
+            readonly kind: 'provisional';
+            readonly predecessor: StableDocumentAdmission;
+            readonly attempts: readonly NavigationAttempt[];
+        };
+        let document_admission: DocumentAdmission = { kind: 'idle' };
+        let next_navigation_sequence = 0;
         let has_admitted_document = false;
+        let loading_epoch_active = false;
+        let failed_navigation_attempts: FailureSignature[] = [];
+        const active_document_token = (): string | undefined => {
+            if (
+                document_admission.kind === 'idle'
+                || document_admission.kind === 'claimed-awaiting-navigation'
+            ) return document_admission.token;
+            return undefined;
+        };
+        const successful_document_url = (): string | undefined => {
+            if (document_admission.kind === 'idle') {
+                return document_admission.lastSuccessfulUrl;
+            }
+            if (
+                document_admission.kind === 'claimed-awaiting-navigation'
+                || document_admission.kind === 'committed-awaiting-claim'
+            ) return document_admission.url;
+            return undefined;
+        };
+        const begin_loading_epoch = () => {
+            if (loading_epoch_active) return;
+            failed_navigation_attempts = [];
+            loading_epoch_active = true;
+        };
         const invalidate_document_admission = () => {
-            admitted_document_token = undefined;
-            document_admission_open = false;
+            document_admission = { kind: 'unavailable' };
+            failed_navigation_attempts = [];
+            loading_epoch_active = false;
         };
         const report_renderer_generation_change = () => {
             const error = new Error('Viewer renderer was replaced by a successful navigation.');
@@ -515,36 +570,163 @@ export class ViewerWindowManager {
             }
             for (const listener of [...renderer_loss_listeners]) listener(error, retryable);
         };
-        const on_main_frame_navigated = () => {
-            // Opened only once Electron has committed the replacement. Its preload
-            // synchronously claims a token through the current main frame; messages
-            // still arriving from the prior document retain their old token and are
-            // rejected by the common inbound dispatcher below.
-            admitted_document_token = undefined;
-            document_admission_open = true;
+        const finalize_document_replacement = () => {
             forget_history_menu();
             report_renderer_generation_change();
         };
+        const on_main_frame_navigation_started = (
+            details: Electron.Event<Electron.WebContentsDidStartNavigationEventParams>,
+        ) => {
+            if (!details.isMainFrame || details.isSameDocument) return;
+            begin_loading_epoch();
+            const attempt: NavigationAttempt = {
+                sequence: ++next_navigation_sequence,
+                url: details.url,
+                frameProcessId: details.frame?.processId,
+                frameRoutingId: details.frame?.routingId,
+            };
+            if (document_admission.kind === 'provisional') {
+                document_admission = {
+                    ...document_admission,
+                    attempts: [...document_admission.attempts, attempt],
+                };
+                return;
+            }
+            // The old document stops being authoritative as soon as a replacement
+            // starts. Preserve its complete admission state only as a rollback
+            // target; never expose it while any replacement remains provisional.
+            document_admission = {
+                kind: 'provisional',
+                predecessor: document_admission,
+                attempts: [attempt],
+            };
+        };
+        const on_main_frame_navigated = (
+            _event: Electron.Event,
+            url: string,
+        ) => {
+            if (document_admission.kind === 'unavailable') return;
+            if (document_admission.kind === 'provisional') {
+                document_admission = { kind: 'committed-awaiting-claim', url };
+                finalize_document_replacement();
+                return;
+            }
+            if (document_admission.kind === 'claimed-awaiting-navigation') {
+                if (url === document_admission.url) {
+                    document_admission = {
+                        kind: 'idle',
+                        token: document_admission.token,
+                        lastSuccessfulUrl: url,
+                    };
+                    return;
+                }
+                document_admission = { kind: 'committed-awaiting-claim', url };
+                finalize_document_replacement();
+                return;
+            }
+            if (document_admission.kind === 'committed-awaiting-claim') {
+                if (url === document_admission.url) return;
+                document_admission = { kind: 'committed-awaiting-claim', url };
+                finalize_document_replacement();
+                return;
+            }
+            if (
+                document_admission.token !== undefined
+                && url === document_admission.lastSuccessfulUrl
+            ) return;
+            // Defensive fallback for a different-URL commit whose start event was
+            // missed. Same-URL commits remain ambiguous with duplicate did-navigate,
+            // so preserving the active document is the fail-safe choice there.
+            document_admission = { kind: 'committed-awaiting-claim', url };
+            finalize_document_replacement();
+        };
+        const same_failure = (
+            left: FailureSignature | undefined,
+            right: FailureSignature,
+        ): boolean => left !== undefined
+            && left.errorCode === right.errorCode
+            && left.validatedUrl === right.validatedUrl
+            && left.frameProcessId === right.frameProcessId
+            && left.frameRoutingId === right.frameRoutingId;
+        const record_failed_navigation_attempt = (failure: FailureSignature) => {
+            if (failed_navigation_attempts.some((known) => same_failure(known, failure))) return;
+            failed_navigation_attempts.push(failure);
+        };
+        const is_safely_ignorable_old_failure = (failure: FailureSignature): boolean => {
+            const successful_url = successful_document_url();
+            return successful_url !== undefined
+                && successful_url !== failure.validatedUrl
+                && failed_navigation_attempts.some((known) => same_failure(known, failure));
+        };
+        const attempt_matches_failure = (
+            attempt: NavigationAttempt,
+            failure: FailureSignature,
+        ): boolean => attempt.url === failure.validatedUrl
+            && (
+                attempt.frameProcessId === undefined
+                || failure.frameProcessId === undefined
+                || attempt.frameProcessId === failure.frameProcessId
+            )
+            && (
+                attempt.frameRoutingId === undefined
+                || failure.frameRoutingId === undefined
+                || attempt.frameRoutingId === failure.frameRoutingId
+            );
         const on_failed_load = (
             _event: Electron.Event,
             error_code: number,
             error_description: string,
             validated_url: string,
             is_main_frame: boolean,
+            frame_process_id?: number,
+            frame_routing_id?: number,
         ) => {
-            // An aborted provisional navigation leaves the admitted document active.
-            // Before the first admission there cannot be renderer-owned edits to
-            // flush, so keeping the panel in its loading state also lets close or
-            // reload use the existing safe sequence-zero path. Reporting either as
-            // renderer loss would permanently fence the window out of that protocol.
-            if (
-                !is_main_frame
-                || error_code === ERR_ABORTED
-                || !has_admitted_document
-            ) return;
+            if (!is_main_frame || document_admission.kind === 'unavailable') return;
+            const failure: FailureSignature = {
+                errorCode: error_code,
+                validatedUrl: validated_url,
+                frameProcessId: frame_process_id,
+                frameRoutingId: frame_routing_id,
+            };
+            if (document_admission.kind === 'provisional') {
+                const failed_index = document_admission.attempts.findIndex(
+                    (attempt) => attempt_matches_failure(attempt, failure),
+                );
+                if (failed_index < 0) return;
+                record_failed_navigation_attempt(failure);
+                const remaining = document_admission.attempts.filter(
+                    (_attempt, index) => index !== failed_index,
+                );
+                if (remaining.length > 0) {
+                    document_admission = {
+                        ...document_admission,
+                        attempts: remaining,
+                    };
+                    return;
+                }
+                document_admission = document_admission.predecessor;
+                return;
+            }
+            if (error_code === ERR_ABORTED) {
+                // A missed start can still abort while the current document remains
+                // live. After claim or commit, success also forbids restoring its
+                // predecessor.
+                return;
+            }
+            if (is_safely_ignorable_old_failure(failure)) return;
+            // Before the first admission there are no renderer-owned edits, so
+            // close/reload keeps its sequence-zero path.
+            if (!has_admitted_document) return;
             report_renderer_loss(new Error(
                 `Viewer navigation failed (${error_code} ${error_description}): ${validated_url}`,
             ));
+        };
+        const on_loading_started = () => begin_loading_epoch();
+        const on_loading_stopped = () => {
+            if (document_admission.kind === 'provisional') {
+                document_admission = document_admission.predecessor;
+            }
+            loading_epoch_active = false;
         };
         const on_render_process_gone = (
             _event: Electron.Event,
@@ -566,16 +748,40 @@ export class ViewerWindowManager {
             event: Electron.IpcMainEvent,
             receipt: PendingEditAcknowledgementReceipt,
         ) => {
-            if (event.sender !== web_contents) return;
+            if (
+                event.sender !== web_contents
+                || event.senderFrame !== web_contents.mainFrame
+                || active_document_token() === undefined
+            ) return;
             for (const listener of [...acknowledgement_receipt_listeners]) listener(receipt);
         };
         const document_token_watcher = (event: Electron.IpcMainEvent) => {
             if (event.sender !== web_contents || event.senderFrame !== web_contents.mainFrame) return;
-            if (!document_admission_open) return;
-            admitted_document_token = randomUUID();
-            document_admission_open = false;
+            if (
+                document_admission.kind !== 'provisional'
+                && document_admission.kind !== 'committed-awaiting-claim'
+            ) return;
+            const token = randomUUID();
             has_admitted_document = true;
-            event.returnValue = admitted_document_token;
+            if (document_admission.kind === 'provisional') {
+                // A claim proves that the newest replacement attempt committed even
+                // when its main-process did-navigate notification has not arrived yet.
+                const url = document_admission.attempts.at(-1)?.url;
+                if (url === undefined) return;
+                document_admission = {
+                    kind: 'claimed-awaiting-navigation',
+                    token,
+                    url,
+                };
+                finalize_document_replacement();
+            } else {
+                document_admission = {
+                    kind: 'idle',
+                    token,
+                    lastSuccessfulUrl: document_admission.url,
+                };
+            }
+            event.returnValue = token;
         };
         const webview_message_watcher = (
             event: Electron.IpcMainEvent,
@@ -583,13 +789,16 @@ export class ViewerWindowManager {
         ) => {
             if (event.sender !== web_contents || event.senderFrame !== web_contents.mainFrame) return;
             if (!is_desktop_webview_message_envelope(envelope)) return;
-            if (envelope.documentToken !== admitted_document_token) return;
+            if (envelope.documentToken !== active_document_token()) return;
             for (const listener of [...webview_message_listeners]) {
                 listener(envelope.message as WebviewMessage);
             }
         };
+        web_contents.on('did-start-loading', on_loading_started);
+        web_contents.on('did-start-navigation', on_main_frame_navigation_started);
         web_contents.on('did-navigate', on_main_frame_navigated);
         web_contents.on('did-fail-load', on_failed_load);
+        web_contents.on('did-stop-loading', on_loading_stopped);
         web_contents.on('render-process-gone', on_render_process_gone);
         web_contents.on('destroyed', on_transport_destroyed);
         window.on('unresponsive', on_unresponsive);
@@ -730,8 +939,14 @@ export class ViewerWindowManager {
             },
             stop_watching_renderer: () => {
                 invalidate_document_admission();
+                web_contents.removeListener('did-start-loading', on_loading_started);
+                web_contents.removeListener(
+                    'did-start-navigation',
+                    on_main_frame_navigation_started,
+                );
                 web_contents.removeListener('did-navigate', on_main_frame_navigated);
                 web_contents.removeListener('did-fail-load', on_failed_load);
+                web_contents.removeListener('did-stop-loading', on_loading_stopped);
                 web_contents.removeListener('render-process-gone', on_render_process_gone);
                 web_contents.removeListener('destroyed', on_transport_destroyed);
                 window.removeListener('unresponsive', on_unresponsive);

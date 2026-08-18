@@ -98,6 +98,9 @@ describe('viewer preload document admission', () => {
         bridge.postMessage({ type: 'ready' });
         bridge.postMessage({ type: 'visibleRowChanged', row: 4 });
         expect(sent_envelopes()).toEqual([]);
+        expect(electron_mock.ipcRenderer.sendSync.mock.calls.filter(
+            ([channel]) => channel === CHANNEL_WEBVIEW_DOCUMENT_TOKEN,
+        )).toHaveLength(0);
 
         electron_mock.state.documentTokenResponse = 'document-a';
         dispatch_dom_content_loaded();
@@ -109,6 +112,9 @@ describe('viewer preload document admission', () => {
                 message: { type: 'visibleRowChanged', row: 4 },
             },
         ]);
+        expect(electron_mock.ipcRenderer.sendSync.mock.calls.filter(
+            ([channel]) => channel === CHANNEL_WEBVIEW_DOCUMENT_TOKEN,
+        )).toHaveLength(1);
     });
 
     it('wraps later messages with the installed token', async () => {

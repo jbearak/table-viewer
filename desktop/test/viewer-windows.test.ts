@@ -52,11 +52,6 @@ const electron_mock = vi.hoisted(() => {
             receipt?: PendingEditAcknowledgementReceipt;
         }> = [];
 
-        override emit(event: string, ...args: any[]): boolean {
-            if (event === 'did-navigate') this.mainFrame = {};
-            return super.emit(event, ...args);
-        }
-
         isDestroyed() { return this.destroyed; }
         send(channel: string, payload: unknown) {
             if (this.destroyed) throw new Error('transport destroyed');
@@ -67,7 +62,15 @@ const electron_mock = vi.hoisted(() => {
                 receipt: envelope.receipt,
             });
         }
-        loadURL = vi.fn(async () => {});
+        loadURL = vi.fn(async (url: string) => {
+            this.emit('did-start-loading');
+            this.emit('did-start-navigation', {
+                url,
+                isSameDocument: false,
+                isMainFrame: true,
+                frame: this.mainFrame,
+            });
+        });
         reload = vi.fn();
         reloadIgnoringCache = vi.fn();
     }
@@ -365,7 +368,7 @@ function viewer_entry(
     return entry;
 }
 
-const document_tokens = new WeakMap<object, { frame: object; token: string }>();
+const document_tokens = new WeakMap<object, string>();
 
 function request_document_token(
     window: InstanceType<typeof electron_mock.BrowserWindow>,
@@ -380,21 +383,49 @@ function request_document_token(
     return event.returnValue;
 }
 
+function start_loading(
+    window: InstanceType<typeof electron_mock.BrowserWindow>,
+): void {
+    window.webContents.emit('did-start-loading');
+}
+
+function start_main_document_navigation(
+    window: InstanceType<typeof electron_mock.BrowserWindow>,
+    url = 'tv-app://viewer-1/index.html',
+): void {
+    document_tokens.delete(window.webContents);
+    start_loading(window);
+    window.webContents.emit('did-start-navigation', {
+        url,
+        isSameDocument: false,
+        isMainFrame: true,
+        frame: window.webContents.mainFrame,
+    });
+}
+
+function commit_main_document_navigation(
+    window: InstanceType<typeof electron_mock.BrowserWindow>,
+    url = 'tv-app://viewer-1/index.html',
+): void {
+    window.webContents.emit('did-navigate', {}, url, 200, 'OK');
+}
+
+function replace_main_document(
+    window: InstanceType<typeof electron_mock.BrowserWindow>,
+    url = 'tv-app://viewer-1/index.html',
+): void {
+    start_main_document_navigation(window, url);
+    commit_main_document_navigation(window, url);
+}
+
 function current_document_token(
     window: InstanceType<typeof electron_mock.BrowserWindow>,
 ): string {
     const cached = document_tokens.get(window.webContents);
-    if (cached?.frame === window.webContents.mainFrame) return cached.token;
-    let token = request_document_token(window);
-    if (typeof token !== 'string') {
-        window.webContents.emit('did-navigate', {}, 'tv-app://viewer-1/index.html', 200, 'OK');
-        token = request_document_token(window);
-    }
+    if (cached !== undefined) return cached;
+    const token = request_document_token(window);
     if (typeof token !== 'string') throw new Error('viewer document token was not delivered');
-    document_tokens.set(window.webContents, {
-        frame: window.webContents.mainFrame,
-        token,
-    });
+    document_tokens.set(window.webContents, token);
     return token;
 }
 
@@ -431,7 +462,10 @@ function acknowledge_last_delivery(window: InstanceType<typeof electron_mock.Bro
     if (!receipt) throw new Error('missing acknowledgement receipt request');
     electron_mock.ipcMain.emit(
         CHANNEL_HOST_MESSAGE_RECEIPT,
-        { sender: window.webContents },
+        {
+            sender: window.webContents,
+            senderFrame: window.webContents.mainFrame,
+        },
         receipt,
     );
 }
@@ -1174,7 +1208,7 @@ describe('viewer window close protocol', () => {
         emit_webview(window, { type: 'ready' });
         window.close();
 
-        window.webContents.emit('did-navigate', {}, 'tv-app://viewer-1/index.html', 200, 'OK');
+        replace_main_document(window);
 
         await vi.waitFor(() => expect(electron_mock.dialog.showMessageBox).toHaveBeenCalledTimes(1));
         expect(window.destroyed).toBe(false);
@@ -1223,6 +1257,50 @@ describe('viewer window close protocol', () => {
         await vi.waitFor(() => expect(window.webContents.reload).toHaveBeenCalledTimes(1));
         expect(window.webContents.reloadIgnoringCache).not.toHaveBeenCalled();
         expect(window.destroyed).toBe(false);
+    });
+
+    it('suspends acknowledgement receipts during provisional navigation', async () => {
+        const first_drain = deferred();
+        const second_drain = deferred();
+        controller_mock.controller.drain
+            .mockImplementationOnce(() => first_drain.promise)
+            .mockImplementationOnce(() => second_drain.promise);
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/provisional-receipt.csv');
+        const window = latest_window();
+        emit_webview(window, { type: 'ready' });
+
+        viewer_manager.reload(window as any, false);
+        const request = window.webContents.sent.find(
+            ({ message }) => message.type === 'requestPendingEditsFlush',
+        )?.message;
+        if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
+        emit_webview(window, {
+            type: 'pendingEditsFlush',
+            requestId: request.requestId,
+            editSessionId: 'edit:receipt',
+            highestProducedSequence: 4,
+        });
+        await vi.waitFor(() => expect(controller_mock.controller.drain).toHaveBeenCalledOnce());
+        controller_mock.panel.webview.postMessage({
+            type: 'pendingEditsAcknowledged',
+            editSessionId: 'edit:receipt',
+            sequence: 4,
+        });
+
+        start_main_document_navigation(window, 'https://provisional.example/');
+        acknowledge_last_delivery(window);
+        first_drain.resolve();
+        await new Promise<void>((resolve) => queueMicrotask(resolve));
+        expect(controller_mock.controller.drain).toHaveBeenCalledTimes(1);
+
+        window.webContents.emit(
+            'did-fail-load', {}, -2, 'ERR_FAILED', 'https://provisional.example/', true,
+        );
+        acknowledge_last_delivery(window);
+        await vi.waitFor(() => expect(controller_mock.controller.drain).toHaveBeenCalledTimes(2));
+        second_drain.resolve();
+        await vi.waitFor(() => expect(window.webContents.reload).toHaveBeenCalledOnce());
     });
 
     it('allows reload retry after the renderer flush deadline expires', async () => {
@@ -1470,9 +1548,9 @@ describe('viewer window close protocol', () => {
         expect(electron_mock.dialog.showMessageBox).not.toHaveBeenCalled();
     });
 
-    it('keeps a pending close live through an aborted provisional navigation', async () => {
+    it('keeps a pending close live through a failed provisional navigation', async () => {
         const viewer_manager = manager();
-        viewer_manager.open_file('/tmp/aborted-navigation-close.csv');
+        viewer_manager.open_file('/tmp/failed-navigation-close.csv');
         const window = latest_window();
         const token = current_document_token(window);
         emit_webview(window, { type: 'ready' }, token);
@@ -1483,8 +1561,9 @@ describe('viewer window close protocol', () => {
         )?.message;
         if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
 
+        start_main_document_navigation(window, 'https://failed.example/');
         window.webContents.emit(
-            'did-fail-load', {}, -3, 'ERR_ABORTED', 'https://aborted.example/', true,
+            'did-fail-load', {}, -2, 'ERR_FAILED', 'https://failed.example/', true,
         );
         emit_webview(window, {
             type: 'pendingEditsFlush',
@@ -1511,6 +1590,7 @@ describe('viewer window close protocol', () => {
         )?.message;
         if (request?.type !== 'requestPendingEditsFlush') throw new Error('missing flush request');
 
+        start_main_document_navigation(window, 'https://aborted.example/');
         window.webContents.emit(
             'did-fail-load', {}, -3, '', 'https://aborted.example/', true,
         );
@@ -1601,47 +1681,82 @@ describe('what the Edit menu is told about a viewer s history', () => {
         expect(rebuilt).toEqual([]);
     });
 
-    it('binds synchronous admission to the current committed frame', () => {
-        const viewer_manager = manager();
+    it('admits a replacement before did-navigate exactly once without frame rotation', () => {
+        const rebuilt: ElectronBrowserWindow[] = [];
+        const viewer_manager = manager(undefined, (window) => { rebuilt.push(window); });
         viewer_manager.open_file('/tmp/frame-admission.csv');
         const window = latest_window();
-        const first_frame = window.webContents.mainFrame;
+        const frame = window.webContents.mainFrame;
         const first_token = current_document_token(window);
-
-        window.webContents.emit('did-navigate', {}, 'tv-app://viewer-1/index.html', 200, 'OK');
-        const second_frame = window.webContents.mainFrame;
-        expect(second_frame).not.toBe(first_frame);
-        expect(request_document_token(window, first_frame)).toBeUndefined();
-
-        const second_token = request_document_token(window, second_frame);
-        expect(typeof second_token).toBe('string');
-        expect(second_token).not.toBe(first_token);
-        expect(request_document_token(window, second_frame)).toBeUndefined();
-
         const projection: WebviewMessage = {
             type: 'historyMenuStateChanged',
             state: {
                 undoAvailable: true,
                 redoAvailable: false,
+                undoLabel: 'Paste',
                 textEditing: false,
             },
         };
-        emit_webview(window, projection, first_token, first_frame);
-        emit_webview(window, projection, first_token, second_frame);
+        emit_webview(window, projection, first_token, frame);
+        expect(rebuilt).toHaveLength(1);
+
+        start_main_document_navigation(window);
+        emit_webview(window, {
+            ...projection,
+            state: { ...projection.state, undoLabel: 'Ignored' },
+        }, first_token, frame);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoLabel: 'Paste' });
+        expect(rebuilt).toHaveLength(1);
+        expect(request_document_token(window, {})).toBeUndefined();
+
+        const second_token = request_document_token(window, frame);
+        expect(typeof second_token).toBe('string');
+        expect(second_token).not.toBe(first_token);
+        expect(request_document_token(window, frame)).toBeUndefined();
         expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
             .toBeUndefined();
+        expect(rebuilt).toHaveLength(2);
 
-        emit_webview(window, projection, second_token as string, second_frame);
+        // The successful claim discarded the predecessor, so aggregate loading
+        // completion cannot roll the old document back into admission.
+        window.webContents.emit('did-stop-loading');
+        emit_webview(window, projection, first_token, frame);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toBeUndefined();
+        expect(rebuilt).toHaveLength(2);
+        emit_webview(window, projection, second_token as string, frame);
         expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
             .toMatchObject({ undoAvailable: true });
+        expect(rebuilt).toHaveLength(3);
+
+        window.webContents.emit(
+            'did-fail-load', {}, -3, 'ERR_ABORTED', 'tv-app://viewer-1/index.html', true,
+        );
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoAvailable: true });
+        expect(rebuilt).toHaveLength(3);
+
+        commit_main_document_navigation(window);
+        commit_main_document_navigation(window);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoAvailable: true });
+        expect(rebuilt).toHaveLength(3);
+
+        emit_webview(window, {
+            ...projection,
+            state: { ...projection.state, undoLabel: 'Delete' },
+        }, second_token as string, frame);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoAvailable: true, undoLabel: 'Delete' });
+        expect(rebuilt).toHaveLength(4);
     });
 
-    it('preserves the admitted document when a provisional navigation is aborted', () => {
+    it('keeps the admitted token through same-document and subframe navigation', () => {
         const viewer_manager = manager();
-        viewer_manager.open_file('/tmp/aborted-navigation.csv');
+        viewer_manager.open_file('/tmp/in-page-navigation.csv');
         const window = latest_window();
         const token = current_document_token(window);
-        const frame = window.webContents.mainFrame;
         const projection: WebviewMessage = {
             type: 'historyMenuStateChanged',
             state: {
@@ -1653,14 +1768,388 @@ describe('what the Edit menu is told about a viewer s history', () => {
         };
         emit_webview(window, projection, token);
 
+        window.webContents.emit('did-start-navigation', {
+            url: 'tv-app://viewer-1/index.html#selection',
+            isSameDocument: true,
+            isMainFrame: true,
+            frame: window.webContents.mainFrame,
+        });
+        window.webContents.emit('did-start-navigation', {
+            url: 'https://frame.example/',
+            isSameDocument: false,
+            isMainFrame: false,
+            frame: {},
+        });
+
+        expect(request_document_token(window)).toBeUndefined();
+        emit_webview(window, {
+            ...projection,
+            state: { ...projection.state, undoLabel: 'Delete' },
+        }, token);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoAvailable: true, undoLabel: 'Delete' });
+    });
+
+    it.each([
+        [-3, 'ERR_ABORTED'],
+        [-2, 'ERR_FAILED'],
+    ])('restores the admitted document after provisional failure %s', (
+        error_code,
+        error_description,
+    ) => {
+        const viewer_manager = manager();
+        viewer_manager.open_file(`/tmp/provisional-${error_code}.csv`);
+        const window = latest_window();
+        const original_url = window.webContents.loadURL.mock.calls[0]?.[0];
+        if (typeof original_url !== 'string') throw new Error('missing initial viewer URL');
+        const token = current_document_token(window);
+        const projection: WebviewMessage = {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                undoLabel: 'Paste',
+                textEditing: false,
+            },
+        };
+        emit_webview(window, projection, token);
+
+        start_main_document_navigation(window, 'https://failed.example/');
+        emit_webview(window, {
+            ...projection,
+            state: { ...projection.state, undoLabel: 'Ignored' },
+        }, token);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoLabel: 'Paste' });
+
         window.webContents.emit(
-            'did-fail-load', {}, -3, '', 'https://aborted.example/', true,
+            'did-fail-load', {}, error_code, error_description, 'https://failed.example/', true,
         );
 
-        expect(window.webContents.mainFrame).toBe(frame);
         expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
             .toMatchObject({ undoAvailable: true, undoLabel: 'Paste' });
         expect(request_document_token(window)).toBeUndefined();
+
+        // Rollback restores the predecessor's successful URL as well as its token,
+        // so a delayed duplicate commit for that document remains idempotent.
+        commit_main_document_navigation(window, original_url);
+        emit_webview(window, {
+            ...projection,
+            state: { ...projection.state, undoLabel: 'Delete' },
+        }, token);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoAvailable: true, undoLabel: 'Delete' });
+    });
+
+    it('keeps a committed replacement claimable after ERR_ABORTED', () => {
+        const rebuilt: ElectronBrowserWindow[] = [];
+        const viewer_manager = manager(undefined, (window) => { rebuilt.push(window); });
+        viewer_manager.open_file('/tmp/commit-first-abort.csv');
+        const window = latest_window();
+        const frame = window.webContents.mainFrame;
+        const first_token = current_document_token(window);
+        const projection: WebviewMessage = {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                undoLabel: 'Paste',
+                textEditing: false,
+            },
+        };
+        emit_webview(window, projection, first_token, frame);
+        expect(rebuilt).toHaveLength(1);
+
+        start_main_document_navigation(window, 'https://committed.example/');
+        commit_main_document_navigation(window, 'https://committed.example/');
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toBeUndefined();
+        expect(rebuilt).toHaveLength(2);
+
+        window.webContents.emit(
+            'did-fail-load', {}, -3, 'ERR_ABORTED', 'https://committed.example/', true,
+        );
+        expect(request_document_token(window, {})).toBeUndefined();
+        const second_token = request_document_token(window, frame);
+        expect(typeof second_token).toBe('string');
+        expect(second_token).not.toBe(first_token);
+        expect(rebuilt).toHaveLength(2);
+
+        commit_main_document_navigation(window, 'https://committed.example/');
+        emit_webview(window, projection, second_token as string, frame);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoAvailable: true, undoLabel: 'Paste' });
+        expect(rebuilt).toHaveLength(3);
+    });
+
+    it('restores a committed predecessor after a provisional failure', () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/committed-predecessor-failure.csv');
+        const window = latest_window();
+        const frame = window.webContents.mainFrame;
+        const original_url = window.webContents.loadURL.mock.calls[0]?.[0];
+        if (typeof original_url !== 'string') throw new Error('missing initial viewer URL');
+        commit_main_document_navigation(window, original_url);
+
+        start_main_document_navigation(window, 'https://failed.example/');
+        window.webContents.emit(
+            'did-fail-load', {}, -2, 'ERR_FAILED', 'https://failed.example/', true,
+        );
+
+        const token = request_document_token(window, frame);
+        expect(typeof token).toBe('string');
+        emit_webview(window, {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                undoLabel: 'Paste',
+                textEditing: false,
+            },
+        }, token as string, frame);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoAvailable: true, undoLabel: 'Paste' });
+    });
+
+    it('restores a committed predecessor when unresolved loading stops', () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/committed-predecessor-stop.csv');
+        const window = latest_window();
+        const frame = window.webContents.mainFrame;
+        const original_url = window.webContents.loadURL.mock.calls[0]?.[0];
+        if (typeof original_url !== 'string') throw new Error('missing initial viewer URL');
+        commit_main_document_navigation(window, original_url);
+
+        start_main_document_navigation(window, 'https://stopped.example/');
+        window.webContents.emit('did-stop-loading');
+
+        const token = request_document_token(window, frame);
+        expect(typeof token).toBe('string');
+        emit_webview(window, {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                undoLabel: 'Paste',
+                textEditing: false,
+            },
+        }, token as string, frame);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoAvailable: true, undoLabel: 'Paste' });
+    });
+
+    it('preserves a committed predecessor across overlapping failures', () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/committed-predecessor-overlap.csv');
+        const window = latest_window();
+        const frame = window.webContents.mainFrame;
+        const original_url = window.webContents.loadURL.mock.calls[0]?.[0];
+        if (typeof original_url !== 'string') throw new Error('missing initial viewer URL');
+        commit_main_document_navigation(window, original_url);
+
+        start_main_document_navigation(window, 'https://first-failed.example/');
+        start_main_document_navigation(window, 'https://second-failed.example/');
+        window.webContents.emit(
+            'did-fail-load', {}, -2, 'ERR_FAILED', 'https://first-failed.example/', true,
+        );
+        window.webContents.emit(
+            'did-fail-load', {}, -2, 'ERR_FAILED', 'https://second-failed.example/', true,
+        );
+
+        const token = request_document_token(window, frame);
+        expect(typeof token).toBe('string');
+        emit_webview(window, {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                undoLabel: 'Paste',
+                textEditing: false,
+            },
+        }, token as string, frame);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoAvailable: true, undoLabel: 'Paste' });
+    });
+
+    it('restores unavailable after a provisional recovery fails', () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/failed-recovery.csv');
+        const window = latest_window();
+        const frame = window.webContents.mainFrame;
+        current_document_token(window);
+        window.webContents.emit('render-process-gone', {}, { reason: 'crashed', exitCode: 1 });
+
+        start_main_document_navigation(window, 'https://failed-recovery.example/');
+        window.webContents.emit(
+            'did-fail-load', {}, -2, 'ERR_FAILED', 'https://failed-recovery.example/', true,
+        );
+        commit_main_document_navigation(window, 'https://failed-recovery.example/');
+        expect(request_document_token(window, frame)).toBeUndefined();
+
+        start_main_document_navigation(window, 'https://recovered.example/');
+        commit_main_document_navigation(window, 'https://recovered.example/');
+        expect(typeof request_document_token(window, frame)).toBe('string');
+    });
+
+    it('discards a committed predecessor after a newer commit succeeds', () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/discarded-committed-predecessor.csv');
+        const window = latest_window();
+        const frame = window.webContents.mainFrame;
+        const original_url = window.webContents.loadURL.mock.calls[0]?.[0];
+        if (typeof original_url !== 'string') throw new Error('missing initial viewer URL');
+        commit_main_document_navigation(window, original_url);
+
+        start_main_document_navigation(window, 'https://winner.example/');
+        commit_main_document_navigation(window, 'https://winner.example/');
+        window.webContents.emit('did-stop-loading');
+        const token = request_document_token(window, frame);
+        expect(typeof token).toBe('string');
+        window.webContents.emit(
+            'did-fail-load', {}, -2, 'ERR_FAILED', 'https://winner.example/', true,
+        );
+
+        emit_webview(window, {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                undoLabel: 'Ignored',
+                textEditing: false,
+            },
+        }, token as string, frame);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toBeUndefined();
+        expect(request_document_token(window, frame)).toBeUndefined();
+    });
+
+    it('ignores a retired overlap failure after a newer claim-first replacement', () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/claim-first-retired-failure.csv');
+        const window = latest_window();
+        const frame = window.webContents.mainFrame;
+        current_document_token(window);
+
+        start_main_document_navigation(window, 'https://retired.example/');
+        start_main_document_navigation(window, 'https://claimed.example/');
+        window.webContents.emit(
+            'did-fail-load', {}, -2, 'ERR_FAILED', 'https://retired.example/', true,
+        );
+        const token = request_document_token(window, frame);
+        expect(typeof token).toBe('string');
+
+        window.webContents.emit(
+            'did-fail-load', {}, -2, 'ERR_FAILED', 'https://retired.example/', true,
+        );
+        commit_main_document_navigation(window, 'https://claimed.example/');
+        emit_webview(window, {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                undoLabel: 'Paste',
+                textEditing: false,
+            },
+        }, token as string, frame);
+
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoAvailable: true, undoLabel: 'Paste' });
+    });
+
+    it('ignores a retired overlap failure after a newer commit-first replacement', () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/commit-first-retired-failure.csv');
+        const window = latest_window();
+        const frame = window.webContents.mainFrame;
+        current_document_token(window);
+
+        start_main_document_navigation(window, 'https://retired.example/');
+        start_main_document_navigation(window, 'https://committed.example/');
+        window.webContents.emit(
+            'did-fail-load', {}, -2, 'ERR_FAILED', 'https://retired.example/', true,
+        );
+        commit_main_document_navigation(window, 'https://committed.example/');
+        window.webContents.emit(
+            'did-fail-load', {}, -2, 'ERR_FAILED', 'https://retired.example/', true,
+        );
+
+        const token = request_document_token(window, frame);
+        expect(typeof token).toBe('string');
+        emit_webview(window, {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                undoLabel: 'Paste',
+                textEditing: false,
+            },
+        }, token as string, frame);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoAvailable: true, undoLabel: 'Paste' });
+    });
+
+    it('retains every retired failure from one overlapping loading epoch', () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/multiple-retired-failures.csv');
+        const window = latest_window();
+        const frame = window.webContents.mainFrame;
+        current_document_token(window);
+
+        start_main_document_navigation(window, 'https://first-retired.example/');
+        start_main_document_navigation(window, 'https://second-retired.example/');
+        start_main_document_navigation(window, 'https://winner.example/');
+        window.webContents.emit(
+            'did-fail-load', {}, -2, 'ERR_FAILED', 'https://first-retired.example/', true,
+        );
+        window.webContents.emit(
+            'did-fail-load', {}, -2, 'ERR_FAILED', 'https://second-retired.example/', true,
+        );
+        commit_main_document_navigation(window, 'https://winner.example/');
+        window.webContents.emit(
+            'did-fail-load', {}, -2, 'ERR_FAILED', 'https://first-retired.example/', true,
+        );
+        window.webContents.emit(
+            'did-fail-load', {}, -2, 'ERR_FAILED', 'https://second-retired.example/', true,
+        );
+
+        const token = request_document_token(window, frame);
+        expect(typeof token).toBe('string');
+        emit_webview(window, {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                undoLabel: 'Paste',
+                textEditing: false,
+            },
+        }, token as string, frame);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoAvailable: true, undoLabel: 'Paste' });
+    });
+
+    it('ignores a duplicate non-aborted failure after provisional rollback', () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/duplicate-failure.csv');
+        const window = latest_window();
+        const token = current_document_token(window);
+        const projection: WebviewMessage = {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                undoLabel: 'Paste',
+                textEditing: false,
+            },
+        };
+        emit_webview(window, projection, token);
+
+        start_main_document_navigation(window, 'https://failed.example/');
+        window.webContents.emit(
+            'did-fail-load', {}, -2, 'ERR_FAILED', 'https://failed.example/', true,
+        );
+        window.webContents.emit(
+            'did-fail-load', {}, -2, 'ERR_FAILED', 'https://failed.example/', true,
+        );
 
         emit_webview(window, {
             ...projection,
@@ -1668,6 +2157,291 @@ describe('what the Edit menu is told about a viewer s history', () => {
         }, token);
         expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
             .toMatchObject({ undoAvailable: true, undoLabel: 'Delete' });
+        expect(request_document_token(window)).toBeUndefined();
+    });
+
+    it('keeps admission suspended until every overlapping navigation fails', () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/overlapping-navigation.csv');
+        const window = latest_window();
+        const token = current_document_token(window);
+        const projection: WebviewMessage = {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                undoLabel: 'Paste',
+                textEditing: false,
+            },
+        };
+        emit_webview(window, projection, token);
+
+        start_main_document_navigation(window, 'https://first.example/');
+        start_main_document_navigation(window, 'https://second.example/');
+        window.webContents.emit(
+            'did-fail-load', {}, -3, 'ERR_ABORTED', 'https://first.example/', true,
+        );
+        emit_webview(window, {
+            ...projection,
+            state: { ...projection.state, undoLabel: 'Ignored' },
+        }, token);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoLabel: 'Paste' });
+
+        window.webContents.emit(
+            'did-fail-load', {}, -2, 'ERR_FAILED', 'https://second.example/', true,
+        );
+        emit_webview(window, {
+            ...projection,
+            state: { ...projection.state, undoLabel: 'Delete' },
+        }, token);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoAvailable: true, undoLabel: 'Delete' });
+    });
+
+    it('removes the oldest ambiguous matching navigation attempt first', () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/ambiguous-navigation.csv');
+        const window = latest_window();
+        const token = current_document_token(window);
+        const projection: WebviewMessage = {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                undoLabel: 'Paste',
+                textEditing: false,
+            },
+        };
+        emit_webview(window, projection, token);
+
+        window.webContents.emit('did-start-navigation', {
+            url: 'https://same.example/',
+            isSameDocument: false,
+            isMainFrame: true,
+            frame: { processId: 1, routingId: 10 },
+        });
+        window.webContents.emit('did-start-navigation', {
+            url: 'https://same.example/',
+            isSameDocument: false,
+            isMainFrame: true,
+            frame: {},
+        });
+        window.webContents.emit(
+            'did-fail-load', {}, -3, 'ERR_ABORTED', 'https://same.example/', true, 1, 10,
+        );
+        window.webContents.emit(
+            'did-fail-load', {}, -2, 'ERR_FAILED', 'https://same.example/', true, 2, 20,
+        );
+
+        emit_webview(window, {
+            ...projection,
+            state: { ...projection.state, undoLabel: 'Delete' },
+        }, token);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoAvailable: true, undoLabel: 'Delete' });
+    });
+
+    it('rolls back an unresolved same-URL overlap when loading stops', () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/stopped-overlap.csv');
+        const window = latest_window();
+        const token = current_document_token(window);
+        const projection: WebviewMessage = {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                undoLabel: 'Paste',
+                textEditing: false,
+            },
+        };
+        emit_webview(window, projection, token);
+
+        start_main_document_navigation(window, 'https://same.example/');
+        start_main_document_navigation(window, 'https://same.example/');
+        window.webContents.emit(
+            'did-fail-load', {}, -3, 'ERR_ABORTED', 'https://same.example/', true,
+        );
+        emit_webview(window, {
+            ...projection,
+            state: { ...projection.state, undoLabel: 'Ignored' },
+        }, token);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoLabel: 'Paste' });
+
+        window.webContents.emit('did-stop-loading');
+        emit_webview(window, {
+            ...projection,
+            state: { ...projection.state, undoLabel: 'Delete' },
+        }, token);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoAvailable: true, undoLabel: 'Delete' });
+    });
+
+    it('expires retired failures when a new loading epoch begins', () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/expired-retired-failure.csv');
+        const window = latest_window();
+        const frame = window.webContents.mainFrame;
+        current_document_token(window);
+
+        start_main_document_navigation(window, 'https://retired.example/');
+        start_main_document_navigation(window, 'https://winner.example/');
+        window.webContents.emit(
+            'did-fail-load', {}, -2, 'ERR_FAILED', 'https://retired.example/', true,
+        );
+        commit_main_document_navigation(window, 'https://winner.example/');
+        const token = request_document_token(window, frame);
+        expect(typeof token).toBe('string');
+        emit_webview(window, {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                undoLabel: 'Paste',
+                textEditing: false,
+            },
+        }, token as string, frame);
+
+        window.webContents.emit('did-stop-loading');
+        start_loading(window);
+        window.webContents.emit(
+            'did-fail-load', {}, -2, 'ERR_FAILED', 'https://retired.example/', true,
+        );
+
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toBeUndefined();
+        expect(request_document_token(window, frame)).toBeUndefined();
+    });
+
+    it('fails closed when a retired failure has the current document URL', () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/same-url-retired-failure.csv');
+        const window = latest_window();
+        const frame = window.webContents.mainFrame;
+        current_document_token(window);
+
+        start_main_document_navigation(window, 'https://same.example/');
+        start_main_document_navigation(window, 'https://same.example/');
+        window.webContents.emit(
+            'did-fail-load', {}, -2, 'ERR_FAILED', 'https://same.example/', true,
+        );
+        const token = request_document_token(window, frame);
+        expect(typeof token).toBe('string');
+        commit_main_document_navigation(window, 'https://same.example/');
+        emit_webview(window, {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                undoLabel: 'Paste',
+                textEditing: false,
+            },
+        }, token as string, frame);
+
+        window.webContents.emit(
+            'did-fail-load', {}, -2, 'ERR_FAILED', 'https://same.example/', true,
+        );
+
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toBeUndefined();
+        emit_webview(window, {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                undoLabel: 'Ignored',
+                textEditing: false,
+            },
+        }, token as string, frame);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toBeUndefined();
+    });
+
+    it('treats a different-URL commit without a start as a replacement', () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/missed-navigation-start.csv');
+        const window = latest_window();
+        const frame = window.webContents.mainFrame;
+        const first_token = current_document_token(window);
+        commit_main_document_navigation(window, 'tv-app://viewer-1/index.html');
+
+        start_main_document_navigation(window, 'https://second.example/');
+        commit_main_document_navigation(window, 'https://second.example/');
+        const second_token = request_document_token(window, frame);
+        expect(typeof second_token).toBe('string');
+        expect(second_token).not.toBe(first_token);
+        emit_webview(window, {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                undoLabel: 'Paste',
+                textEditing: false,
+            },
+        }, second_token as string, frame);
+
+        // There is no supported late duplicate for a different URL. With no
+        // navigation ID, this event must be treated as a replacement whose start
+        // was missed rather than leave the second document authoritative.
+        commit_main_document_navigation(window, 'tv-app://viewer-1/index.html');
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toBeUndefined();
+        emit_webview(window, {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                undoLabel: 'Ignored',
+                textEditing: false,
+            },
+        }, second_token as string, frame);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toBeUndefined();
+
+        const replacement_token = request_document_token(window, frame);
+        expect(typeof replacement_token).toBe('string');
+        expect(replacement_token).not.toBe(second_token);
+    });
+
+    it('requires a fresh navigation after renderer loss', () => {
+        const viewer_manager = manager();
+        viewer_manager.open_file('/tmp/provisional-crash.csv');
+        const window = latest_window();
+        const frame = window.webContents.mainFrame;
+        const token = current_document_token(window);
+        const projection: WebviewMessage = {
+            type: 'historyMenuStateChanged',
+            state: {
+                undoAvailable: true,
+                redoAvailable: false,
+                undoLabel: 'Paste',
+                textEditing: false,
+            },
+        };
+        emit_webview(window, projection, token);
+
+        start_main_document_navigation(window, 'https://crashed.example/');
+        window.webContents.emit('render-process-gone', {}, { reason: 'crashed', exitCode: 1 });
+        window.webContents.emit(
+            'did-fail-load', {}, -2, 'ERR_FAILED', 'https://crashed.example/', true,
+        );
+        commit_main_document_navigation(window, 'https://crashed.example/');
+        emit_webview(window, projection, token);
+
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toBeUndefined();
+        expect(request_document_token(window, frame)).toBeUndefined();
+
+        start_main_document_navigation(window, 'https://recovered.example/');
+        commit_main_document_navigation(window, 'https://recovered.example/');
+        const recovered_token = request_document_token(window, frame);
+        expect(typeof recovered_token).toBe('string');
+        expect(recovered_token).not.toBe(token);
+        emit_webview(window, projection, recovered_token as string, frame);
+        expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
+            .toMatchObject({ undoAvailable: true, undoLabel: 'Paste' });
     });
 
     it('rejects a late projection from the previous document', () => {
@@ -1687,7 +2461,7 @@ describe('what the Edit menu is told about a viewer s history', () => {
         };
         emit_webview(window, projection, first_token);
 
-        window.webContents.emit('did-navigate', {}, 'tv-app://viewer-1/index.html', 200, 'OK');
+        replace_main_document(window);
         expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
             .toBeUndefined();
 
@@ -1716,6 +2490,7 @@ describe('what the Edit menu is told about a viewer s history', () => {
                 textEditing: false,
             },
         };
+        const token = current_document_token(window);
 
         emit_webview_envelope(window, { documentToken: 'not-admitted', message: projection });
         emit_webview_envelope(window, projection);
@@ -1723,7 +2498,6 @@ describe('what the Edit menu is told about a viewer s history', () => {
         expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
             .toBeUndefined();
 
-        const token = current_document_token(window);
         emit_webview(window, projection, token, {});
         expect(viewer_manager.history_menu_state(window as unknown as ElectronBrowserWindow))
             .toBeUndefined();
@@ -1746,7 +2520,7 @@ describe('what the Edit menu is told about a viewer s history', () => {
         }, first_token);
         expect(window.documentEdited).toBe(true);
 
-        window.webContents.emit('did-navigate', {}, 'tv-app://viewer-1/index.html', 200, 'OK');
+        replace_main_document(window);
         emit_webview(window, {
             type: 'pendingEditsChanged',
             edits: null,
@@ -1761,7 +2535,7 @@ describe('what the Edit menu is told about a viewer s history', () => {
         ['a navigation replaced the renderer', (
             window: InstanceType<typeof electron_mock.BrowserWindow>,
         ) => {
-            window.webContents.emit('did-navigate', {}, 'tv-app://viewer-1/index.html', 200, 'OK');
+            replace_main_document(window);
         }],
         ['the renderer terminated', (
             window: InstanceType<typeof electron_mock.BrowserWindow>,
