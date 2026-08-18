@@ -939,6 +939,33 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         });
     });
 
+    test("Toggling a boolean reports an edit gesture", async () => {
+        const editSpy = vi.fn();
+
+        vi.useFakeTimers();
+        render(<DataEditor {...basicProps} onCellsEdited={editSpy} />, {
+            wrapper: Context,
+        });
+        prep(false);
+
+        const canvas = screen.getByTestId("data-grid-canvas");
+        sendClick(canvas, {
+            clientX: 850, // Col Boolean
+            clientY: 36 * 2 + 32 + 16, // Row 2 (0 indexed)
+        });
+
+        fireEvent.keyDown(canvas, {
+            key: "Enter",
+        });
+
+        vi.runAllTimers();
+
+        expect(editSpy).toHaveBeenCalledWith(
+            [{ location: [7, 2], value: expect.objectContaining({ data: true }) }],
+            "edit"
+        );
+    });
+
     test("Emits activated event on Space key", async () => {
         const spy = vi.fn();
 
@@ -2643,16 +2670,19 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         vi.useRealTimers();
         await vi.waitFor(() => expect(navigator.clipboard.writeText).toHaveBeenCalled());
         expect(navigator.clipboard.writeText).toBeCalledWith("1, 2\t2, 2");
-        expect(editSpy).toHaveBeenCalledWith([
-            {
-                location: [1, 2],
-                value: expect.objectContaining({ data: "" }),
-            },
-            {
-                location: [2, 2],
-                value: expect.objectContaining({ data: "" }),
-            },
-        ]);
+        expect(editSpy).toHaveBeenCalledWith(
+            [
+                {
+                    location: [1, 2],
+                    value: expect.objectContaining({ data: "" }),
+                },
+                {
+                    location: [2, 2],
+                    value: expect.objectContaining({ data: "" }),
+                },
+            ],
+            "delete"
+        );
     });
 
     test("Paste custom cell does not crash", async () => {
@@ -2838,8 +2868,9 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
 
     test("onCellsEdited blocks onCellEdited", async () => {
         const spy = vi.fn();
+        const editSpy = vi.fn(() => true);
         vi.useFakeTimers();
-        render(<EventedDataEditor {...basicProps} onCellEdited={spy} onCellsEdited={() => true} />, {
+        render(<EventedDataEditor {...basicProps} onCellEdited={spy} onCellsEdited={editSpy} />, {
             wrapper: Context,
         });
         prep(false);
@@ -2862,6 +2893,7 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         vi.useRealTimers();
         await drainEventLoop();
         expect(spy).not.toBeCalled();
+        expect(editSpy).toHaveBeenCalledWith(expect.anything(), "paste");
     });
 
     test("Copy/paste with simple getCellsForSelection", async () => {
@@ -3432,7 +3464,7 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         });
 
         expect(spy).toHaveBeenCalledTimes(8);
-        expect(multiSpy).toHaveBeenCalled();
+        expect(multiSpy).toHaveBeenCalledWith(expect.anything(), "fill");
     });
 
     test("Fill right", async () => {
@@ -3470,7 +3502,7 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         });
 
         expect(spy).toHaveBeenCalledTimes(5);
-        expect(multiSpy).toHaveBeenCalled();
+        expect(multiSpy).toHaveBeenCalledWith(expect.anything(), "fill");
     });
 
     test("Clear selection", async () => {

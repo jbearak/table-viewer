@@ -27,6 +27,7 @@ import {
     BooleanIndeterminate,
     type FillHandleDirection,
     type EditListItem,
+    type CellEditSource,
     type CellActiviationBehavior,
 } from "../internal/data-grid/data-grid-types.js";
 import DataGridSearch, { type DataGridSearchProps } from "../internal/data-grid-search/data-grid-search.js";
@@ -211,9 +212,18 @@ export interface DataEditorProps extends Props, Pick<DataGridSearchProps, "image
      */
     readonly onCellEdited?: (cell: Item, newValue: EditableGridCell) => void;
     /** Emitted whenever a cell mutation is completed and provides all edits inbound as a single batch.
+     *
+     * `source` names the gesture the batch came from. A consumer that groups
+     * edits — an undo history, say — needs it to label and bound the operation,
+     * and cannot recover it afterwards: paste and fill both cross asynchronous
+     * clipboard and cell-loading work, so a marker set before the operation
+     * could be overwritten by a second one before this callback arrived.
      * @group Editing
      */
-    readonly onCellsEdited?: (newValues: readonly EditListItem[]) => boolean | void;
+    readonly onCellsEdited?: (
+        newValues: readonly EditListItem[],
+        source: CellEditSource
+    ) => boolean | void;
     /** Emitted whenever a row append operation is requested. Append location can be set in callback.
      * @group Editing
      */
@@ -1212,7 +1222,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
     const mangledRows = showTrailingBlankRow ? rows + 1 : rows;
 
     const mangledOnCellsEdited = React.useCallback<NonNullable<typeof onCellsEdited>>(
-        (items: readonly EditListItem[]) => {
+        (items: readonly EditListItem[], source: CellEditSource) => {
             const mangledItems =
                 rowMarkerOffset === 0
                     ? items
@@ -1220,7 +1230,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                           ...x,
                           location: [x.location[0] - rowMarkerOffset, x.location[1]] as const,
                       }));
-            const r = onCellsEdited?.(mangledItems);
+            const r = onCellsEdited?.(mangledItems, source);
 
             if (r !== true) {
                 for (const i of mangledItems) onCellEdited?.(i.location, i.value);
@@ -1493,15 +1503,18 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                     forceEditMode: initialValue !== undefined,
                 });
             } else if (c.kind === GridCellKind.Boolean && fromKeyboard && c.readonly !== true) {
-                mangledOnCellsEdited([
-                    {
-                        location: gridSelection.current.cell,
-                        value: {
-                            ...c,
-                            data: toggleBoolean(c.data),
+                mangledOnCellsEdited(
+                    [
+                        {
+                            location: gridSelection.current.cell,
+                            value: {
+                                ...c,
+                                data: toggleBoolean(c.data),
+                            },
                         },
-                    },
-                ]);
+                    ],
+                    "edit"
+                );
                 gridRef.current?.damage([{ cell: gridSelection.current.cell }]);
             }
         },
@@ -2204,7 +2217,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                     });
                 }
             }
-            mangledOnCellsEdited(editItemList);
+            mangledOnCellsEdited(editItemList, "fill");
 
             gridRef.current?.damage(
                 editItemList.map(c => ({
@@ -2307,7 +2320,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                             preventDefault,
                         });
                         if (newVal !== undefined && !isInnerOnlyCell(newVal) && isEditableGridCell(newVal)) {
-                            mangledOnCellsEdited([{ location: a.location, value: newVal }]);
+                            mangledOnCellsEdited([{ location: a.location, value: newVal }], "edit");
                             gridRef.current?.damage([
                                 {
                                     cell: a.location,
@@ -3012,7 +3025,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
     const onFinishEditing = React.useCallback(
         (newValue: GridCell | undefined, movement: readonly [-1 | 0 | 1, -1 | 0 | 1]) => {
             if (overlay?.cell !== undefined && newValue !== undefined && isEditableGridCell(newValue)) {
-                mangledOnCellsEdited([{ location: overlay.cell, value: newValue }]);
+                mangledOnCellsEdited([{ location: overlay.cell, value: newValue }], "edit");
                 window.requestAnimationFrame(() => {
                     gridRef.current?.damage([
                         {
@@ -3087,7 +3100,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                     }
                 }
             }
-            mangledOnCellsEdited(editList);
+            mangledOnCellsEdited(editList, "delete");
             gridRef.current?.damage(editList.map(x => ({ cell: x.location })));
         },
         [focus, getCellContent, getCellRenderer, mangledOnCellsEdited, rowMarkerOffset, mergedCells]
@@ -3611,7 +3624,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                     // eslint-disable-next-line no-constant-condition
                 } while (false);
 
-                mangledOnCellsEdited(editList);
+                mangledOnCellsEdited(editList, "paste");
 
                 gridRef.current?.damage(
                     editList.map(c => ({
