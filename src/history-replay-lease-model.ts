@@ -116,10 +116,10 @@ export interface HistoryReplayLeaseRegistry<TPayload, TResult> {
     /**
      * Issue a lease for a verified preparation.
      *
-     * At most one lease is live at a time: a replay is a document-wide operation
-     * behind a fresh verified source, and two of them interleaving would each be
-     * planning against a document the other is moving. Returns `undefined` when
-     * one is already outstanding.
+     * At most one lease is live at a time: a replay is a document-wide
+     * operation, and two of them interleaving would each be planning against a
+     * document the other is moving. Returns `undefined` when one is already
+     * outstanding.
      */
     issue(
         identity: { readonly leaseId: string; readonly requestId: string; readonly replayId: string },

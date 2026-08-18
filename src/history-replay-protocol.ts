@@ -26,6 +26,41 @@
  * come only from the retained prepared request, so a commit cannot reach a cell
  * preparation never verified — which is what makes the lease a capability
  * rather than a token attached to an otherwise trusted message.
+ *
+ * ## What preparation verifies, and what it deliberately does not do
+ *
+ * Preparation works against the CURRENTLY ACKNOWLEDGED adoption. It does not
+ * build a source, adopt one, or wait for the renderer to acknowledge a snapshot
+ * it would only have created for its own benefit — an adoption bumps the source
+ * generation and document epoch, so a replay that forced one would invalidate
+ * its own lease and then have to work around the invalidation. Nor does it need
+ * to: the host reads any row of the current source directly (see
+ * `harvest_source_bases`), so renderer page residency never limits which cells
+ * it can materialize. The save path is the precedent — it admits against the
+ * current adoption and never rebuilds.
+ *
+ * What that leaves is three independent classes of check, none of which
+ * subsumes another:
+ *
+ *   1. **Agreement.** The host and renderer must be describing one document:
+ *      `acknowledged_current()`, and the adoption must still own exactly the
+ *      `source` and `core` the preparation captured.
+ *   2. **Physical currency.** The acknowledged source must still be an accurate
+ *      parse of the bytes on disk — the save path's stat, read, re-stat, digest
+ *      and authority-revision sequence. The watcher may not yet have seen an
+ *      external write. This proves nothing about any individual edit.
+ *   3. **Compare-and-swap.** Every requested overlay must still equal durable
+ *      pending-edit state and every highlight its `expected` value, checked
+ *      again inside the commit's atomic update. This proves nothing about the
+ *      file.
+ *
+ * The lease binds the adoption, source, core, source generation, receiver epoch,
+ * source observation, acknowledged digest, file authority and edit-session
+ * identity — but NOT `core.generation` (a transform can advance the view without
+ * moving the source rows a replay addresses) and NOT the whole durable-state
+ * revision, which is used only for the compare-and-swap itself: a replay that
+ * switches to the action's sheet persists `activeSheetIndex`, and a lease
+ * pinning the whole revision would be invalidated by its own focus change.
  */
 
 import { is_plain_record } from './plain-record';
@@ -171,7 +206,7 @@ export interface HistoryReplayHighlightInput {
  * Carried through the whole protocol although nothing in stage 5 reads it:
  * undo moves the cursor to what it changed and briefly flashes it, and the
  * response is the only place that knows where that is once sheets have been
- * resolved against a fresh workbook. Ends are inclusive.
+ * resolved against the acknowledged workbook. Ends are inclusive.
  */
 export interface HistoryReplayFocus {
     readonly worksheet: WorksheetTarget;
@@ -196,7 +231,10 @@ export interface HistoryReplayPreparedCell {
     readonly sourceColumn: number;
     /** The request's overlay, validated and owned by the host. */
     readonly overlay: WireCellOverlayState;
-    /** The cell's content in the freshly built and verified source. */
+    /**
+     * The cell's content in the acknowledged source, whose bytes the host
+     * verified still match the file before issuing the lease.
+     */
     readonly persisted: WireHistoryValue;
     readonly persistedHyperlink: CellHyperlink | null;
 }
