@@ -91,6 +91,26 @@ export type { ReplayRefusalReason };
 export interface ReplayCoordinatorHost extends ReplayRequestSources {
     /** The live history, read at the moment a replay starts. */
     readonly history: () => HistoryStackState;
+    /**
+     * Make sure an edit session is held, acquiring one if it is not, and answer
+     * whether one is held now.
+     *
+     * Exists because a discard is undoable and a discard ENDS the session. Undo
+     * of one therefore has to acquire a session before it can prepare: there is
+     * otherwise no session for the host to authorize a write against, and no
+     * store the restored overlays could be installed into.
+     *
+     * Awaited before the prepare request is built, never alongside it. A grant
+     * crosses a hydration boundary that replaces the stores wholesale, so a
+     * request built beforehand would describe overlays that no longer exist — and
+     * the history may itself have moved across the await, which is why the entry
+     * is re-read afterwards rather than carried over.
+     *
+     * `false` is an ordinary refusal: the host would not grant one, or its cleanup
+     * after the discard failed and editing is disabled for the file. Undo does not
+     * retry, and never re-enters edit mode on a promise it cannot keep.
+     */
+    readonly ensure_session: () => Promise<boolean>;
     readonly post: (
         message:
             | { readonly type: 'prepareHistoryReplay'; readonly request: PrepareHistoryReplayRequest }
@@ -173,9 +193,31 @@ interface RunningReplay {
     commit?: CommitHistoryReplayRequest;
 }
 
+/**
+ * A replay that has reserved the slot but has no entry yet, because it is waiting
+ * on an edit session.
+ *
+ * Its own state rather than a half-filled {@link RunningReplay}: everything that
+ * identifies a replay — the entry, the correlation ids, the highlight count — is
+ * only knowable AFTER the session is granted, since the grant may move the
+ * history. A running replay whose fields were still to be filled in would make
+ * every response handler check whether they had been.
+ *
+ * The slot is held from the moment the user presses undo, which is what the
+ * reservation has always been for: acquiring a session awaits a round trip, and a
+ * second undo in that window must be refused rather than start a replay of its
+ * own.
+ */
+interface AcquiringReplay {
+    readonly kind: 'acquiring';
+    readonly direction: HistoryDirection;
+    readonly settle: (outcome: ReplayOutcome) => void;
+}
+
 export function create_history_replay_coordinator(
     host: ReplayCoordinatorHost,
 ): HistoryReplayCoordinator {
+    let reservation: AcquiringReplay | undefined;
     let running: RunningReplay | undefined;
 
     const settle = (outcome: ReplayOutcome): void => {
@@ -189,44 +231,74 @@ export function create_history_replay_coordinator(
         settle({ kind: 'refused', reason });
     };
 
+    /** Release the reservation, if it is still the one that took it. */
+    const release = (held: AcquiringReplay, outcome: ReplayOutcome): void => {
+        if (reservation !== held) return;
+        reservation = undefined;
+        held.settle(outcome);
+    };
+
     return {
-        is_busy: () => running !== undefined,
+        is_busy: () => running !== undefined || reservation !== undefined,
 
         begin: (direction) => new Promise<ReplayOutcome>((resolve) => {
-            if (running !== undefined) {
+            if (running !== undefined || reservation !== undefined) {
                 resolve({ kind: 'refused', reason: 'busy' });
                 return;
             }
-            const peek = peek_history(host.history(), direction);
-            if (peek.kind === 'blocked') {
-                resolve({ kind: 'refused', reason: 'blocked' });
-                return;
-            }
-            if (peek.kind === 'exhausted') {
-                resolve({ kind: 'refused', reason: 'nothing-to-replay' });
-                return;
-            }
-            const request = build_prepare_request(
-                peek.entry,
-                direction,
-                host,
-            );
-            if (request === undefined) {
-                // A cell the renderer cannot see right now. Refusing beats
-                // sending a request the host would have to answer `unavailable`
-                // for, and beats guessing an overlay the store does not hold.
-                resolve({ kind: 'refused', reason: 'unavailable' });
-                return;
-            }
-            running = {
-                direction,
-                entry: peek.entry,
-                requestId: request.requestId,
-                replayId: request.replayId,
-                highlightCount: request.highlights.length,
-                settle: resolve,
-            };
-            host.post({ type: 'prepareHistoryReplay', request });
+            const held: AcquiringReplay = { kind: 'acquiring', direction, settle: resolve };
+            reservation = held;
+            void (async () => {
+                let granted: boolean;
+                try {
+                    granted = await host.ensure_session();
+                } catch {
+                    granted = false;
+                }
+                if (!granted) {
+                    // No session, so nothing to authorize a write against. An
+                    // ordinary refusal, not an error: the host may simply refuse,
+                    // and after a failed discard cleanup editing is disabled for
+                    // the whole file.
+                    release(held, { kind: 'refused', reason: 'unavailable' });
+                    return;
+                }
+                if (reservation !== held) return;
+                // Read AFTER the acquisition, never carried across it: a grant
+                // replaces the stores wholesale, so the overlays a request must
+                // describe are the post-install ones, and the epoch may have moved
+                // — which is what would make an entry read earlier stale.
+                const peek = peek_history(host.history(), direction);
+                if (peek.kind === 'blocked') {
+                    release(held, { kind: 'refused', reason: 'blocked' });
+                    return;
+                }
+                if (peek.kind === 'exhausted') {
+                    release(held, { kind: 'refused', reason: 'nothing-to-replay' });
+                    return;
+                }
+                const request = build_prepare_request(peek.entry, direction, host);
+                if (request === undefined) {
+                    // A cell the renderer cannot see right now. Refusing beats
+                    // sending a request the host would have to answer
+                    // `unavailable` for, and beats guessing an overlay the store
+                    // does not hold.
+                    release(held, { kind: 'refused', reason: 'unavailable' });
+                    return;
+                }
+                // The slot passes from the reservation to the replay itself, in one
+                // step, so no window exists in which neither holds it.
+                reservation = undefined;
+                running = {
+                    direction,
+                    entry: peek.entry,
+                    requestId: request.requestId,
+                    replayId: request.replayId,
+                    highlightCount: request.highlights.length,
+                    settle: resolve,
+                };
+                host.post({ type: 'prepareHistoryReplay', request });
+            })();
         }),
 
         on_prepared: (prepared) => {
@@ -331,6 +403,15 @@ export function create_history_replay_coordinator(
         },
 
         reset: () => {
+            const held = reservation;
+            if (held !== undefined) {
+                // Still waiting on a session for a document that has gone. Its
+                // caller is awaiting an answer, so it is refused rather than left
+                // for the acquisition to resolve into nothing — and the guard
+                // there sees the cleared reservation and stops.
+                release(held, { kind: 'refused', reason: 'document-changed' });
+                return;
+            }
             const replay = running;
             if (replay === undefined) return;
             // Nothing to abandon, in either phase. Before a commit the replay

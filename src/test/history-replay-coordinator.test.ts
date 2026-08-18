@@ -70,6 +70,15 @@ interface Harness {
     readonly overlays: Map<string, CellOverlayState>;
     /** Cells the reader refuses to answer for. */
     readonly invisible: Set<string>;
+    /** The session the coordinator acquires before preparing. */
+    readonly session: {
+        /** How many times a replay asked for one. */
+        calls: number;
+        /** What the next acquisition answers. */
+        granted: boolean;
+        /** Held open when set, so a test can act mid-acquisition. */
+        gate: (() => void) | undefined;
+    };
 }
 
 /**
@@ -109,8 +118,16 @@ function harness(
     }
 
     let counter = 0;
+    const session: Harness['session'] = { calls: 0, granted: true, gate: undefined };
     const host: ReplayCoordinatorHost = {
         history: () => store.snapshot(),
+        ensure_session: async () => {
+            session.calls += 1;
+            if (session.gate !== undefined) {
+                await new Promise<void>((open) => { session.gate = open; });
+            }
+            return session.granted;
+        },
         read_overlay: (_worksheet, row, column) => {
             const key = `${row}:${column}`;
             return invisible.has(key) ? undefined : overlays.get(key) ?? absent_overlay();
@@ -118,7 +135,13 @@ function harness(
         post: (message) => { posted.push(message); },
         next_id: (prefix) => `${prefix}-${++counter}`,
     };
-    return { coordinator: create_history_replay_coordinator(host), posted, overlays, invisible };
+    return {
+        coordinator: create_history_replay_coordinator(host),
+        posted,
+        overlays,
+        invisible,
+        session,
+    };
 }
 
 /** The prepared response a compliant host would send for a prepare request. */
@@ -154,11 +177,32 @@ function last_commit(posted: readonly Posted[]): CommitHistoryReplayRequest {
     return message.request;
 }
 
+/**
+ * Begin a replay and let its session acquisition settle.
+ *
+ * `begin` acquires an edit session before it prepares — undo of a discard has to,
+ * since the discard ended the session — so the prepare is posted a microtask
+ * later. Draining the microtask queue rather than waiting a delay: there is no
+ * timer involved, so there is nothing to race.
+ */
+async function started(
+    coordinator: ReturnType<typeof create_history_replay_coordinator>,
+    direction: 'undo' | 'redo',
+): Promise<{ readonly outcome: Promise<ReplayOutcome> }> {
+    const outcome = coordinator.begin(direction);
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
+    // Wrapped, because a promise RETURNED from an async function is flattened
+    // into it: answering with the outcome directly would make every caller await
+    // the whole replay rather than just its start.
+    return { outcome };
+}
+
 describe('beginning a replay', () => {
     it('refuses when the history has nothing to replay', async () => {
         const store = create_history_store();
         const coordinator = create_history_replay_coordinator({
             history: () => store.snapshot(),
+            ensure_session: async () => true,
             read_overlay: () => absent_overlay(),
             post: () => {},
             next_id: (prefix) => prefix,
@@ -169,9 +213,110 @@ describe('beginning a replay', () => {
         });
     });
 
-    it('posts a prepare carrying each cell current overlay', () => {
+    describe('acquiring an edit session first', () => {
+        it('acquires one before preparing, because undoing a discard has no session', () => {
+            const { coordinator, posted, session } = harness([cell_change(0, 0, 'typed')]);
+            void coordinator.begin('undo');
+            // Synchronously: the acquisition is asked for first, and the prepare
+            // waits on it rather than racing it.
+            expect(session.calls).toBe(1);
+            expect(posted).toEqual([]);
+        });
+
+        it('refuses when no session can be had, and sends nothing', async () => {
+            // The host may simply refuse, and after a failed discard cleanup
+            // editing is disabled for the whole file.
+            const { coordinator, posted, session } = harness([cell_change(0, 0, 'typed')]);
+            session.granted = false;
+            await expect(coordinator.begin('undo')).resolves.toEqual({
+                kind: 'refused',
+                reason: 'unavailable',
+            });
+            expect(posted).toEqual([]);
+            expect(coordinator.is_busy()).toBe(false);
+        });
+
+        it('refuses rather than throwing when the acquisition itself fails', async () => {
+            const store = create_history_store();
+            const record = store.stage_record({ label: 'Edit', changes: [cell_change(0, 0, 'a')] });
+            record.commit();
+            record.notify();
+            const coordinator = create_history_replay_coordinator({
+                history: () => store.snapshot(),
+                ensure_session: () => Promise.reject(new Error('bridge is gone')),
+                read_overlay: () => absent_overlay(),
+                post: () => {},
+                next_id: (prefix) => prefix,
+            });
+            await expect(coordinator.begin('undo')).resolves.toEqual({
+                kind: 'refused',
+                reason: 'unavailable',
+            });
+        });
+
+        it('holds the slot across the acquisition, so a second undo is refused', async () => {
+            // The reason the reservation is separate from the host's lease: it is
+            // taken on the keypress, before any message exists.
+            const { coordinator, session } = harness([cell_change(0, 0, 'typed')]);
+            session.gate = () => {};
+            const first = coordinator.begin('undo');
+            for (let index = 0; index < 5; index += 1) await Promise.resolve();
+
+            expect(coordinator.is_busy()).toBe(true);
+            await expect(coordinator.begin('undo')).resolves.toEqual({
+                kind: 'refused',
+                reason: 'busy',
+            });
+            // Only the first ever asked for a session.
+            expect(session.calls).toBe(1);
+
+            session.gate?.();
+            await Promise.resolve();
+            void first;
+        });
+
+        it('reads the history AFTER the grant, never across it', async () => {
+            // A grant crosses a hydration boundary and may move the epoch, so an
+            // entry read before it could name a gesture the stack no longer holds.
+            const { coordinator, session, posted } = harness([cell_change(0, 0, 'typed')]);
+            let read_before_grant = false;
+            session.gate = () => {};
+            void coordinator.begin('undo');
+            for (let index = 0; index < 5; index += 1) await Promise.resolve();
+            read_before_grant = posted.length > 0;
+
+            session.gate?.();
+            for (let index = 0; index < 20; index += 1) await Promise.resolve();
+
+            expect(read_before_grant).toBe(false);
+            expect(posted).toHaveLength(1);
+        });
+
+        it('abandons an acquisition whose document went away', async () => {
+            // Its caller is awaiting an answer, so it is refused rather than left
+            // for the acquisition to resolve into nothing.
+            const { coordinator, session, posted } = harness([cell_change(0, 0, 'typed')]);
+            session.gate = () => {};
+            const pending = coordinator.begin('undo');
+            for (let index = 0; index < 5; index += 1) await Promise.resolve();
+
+            coordinator.reset();
+            await expect(pending).resolves.toEqual({
+                kind: 'refused',
+                reason: 'document-changed',
+            });
+            expect(coordinator.is_busy()).toBe(false);
+
+            // And the late grant posts nothing into the document that replaced it.
+            session.gate?.();
+            for (let index = 0; index < 20; index += 1) await Promise.resolve();
+            expect(posted).toEqual([]);
+        });
+    });
+
+    it('posts a prepare carrying each cell current overlay', async () => {
         const { coordinator, posted } = harness([cell_change(3, 4, 'typed')]);
-        void coordinator.begin('undo');
+        await started(coordinator, 'undo');
         const request = last_prepare(posted);
         expect(request.cells).toHaveLength(1);
         expect(request.cells[0]?.sourceRow).toBe(3);
@@ -184,21 +329,21 @@ describe('beginning a replay', () => {
         );
     });
 
-    it('assigns one dense ordinal per address, not per change', () => {
+    it('assigns one dense ordinal per address, not per change', async () => {
         // A paste overlapping its own source touches a cell twice.
         const { coordinator, posted } = harness([
             cell_change(0, 0, 'first'),
             cell_change(0, 0, 'second'),
             cell_change(1, 0, 'other'),
         ]);
-        void coordinator.begin('undo');
+        await started(coordinator, 'undo');
         const request = last_prepare(posted);
         expect(request.cells.map((cell) => cell.ordinal)).toEqual([0, 1]);
     });
 
     it('refuses a second replay while one is outstanding', async () => {
         const { coordinator } = harness([cell_change(0, 0, 'typed')]);
-        void coordinator.begin('undo');
+        await started(coordinator, 'undo');
         expect(coordinator.is_busy()).toBe(true);
         await expect(coordinator.begin('undo')).resolves.toEqual({
             kind: 'refused',
@@ -218,12 +363,12 @@ describe('beginning a replay', () => {
 });
 
 describe('the focus region', () => {
-    it('spans the cells of the first worksheet the replay touches', () => {
+    it('spans the cells of the first worksheet the replay touches', async () => {
         const { coordinator, posted } = harness([
             cell_change(2, 3, 'a'),
             cell_change(5, 1, 'b'),
         ], 'redo');
-        void coordinator.begin('redo');
+        await started(coordinator, 'redo');
         const { focus } = last_prepare(posted);
         expect(focus.sourceRowStart).toBe(2);
         expect(focus.sourceRowEnd).toBe(5);
@@ -231,12 +376,12 @@ describe('the focus region', () => {
         expect(focus.sourceColumnEnd).toBe(3);
     });
 
-    it('ignores cells on other sheets, which no single rectangle could cover', () => {
+    it('ignores cells on other sheets, which no single rectangle could cover', async () => {
         const { coordinator, posted } = harness([
             cell_change(2, 2, 'a'),
             cell_change(9, 9, 'b', OTHER),
         ], 'redo');
-        void coordinator.begin('redo');
+        await started(coordinator, 'redo');
         const { focus } = last_prepare(posted);
         expect(focus.worksheet.worksheetId).toBe('rId1');
         expect(focus.sourceRowEnd).toBe(2);
@@ -244,24 +389,24 @@ describe('the focus region', () => {
 });
 
 describe('highlight inputs', () => {
-    it('expects the side the direction is moving away from', () => {
+    it('expects the side the direction is moving away from', async () => {
         const { coordinator, posted } = harness([
             cell_change(0, 0, 'typed'),
             highlight_change(1, 1, null, 'yellow'),
         ]);
-        void coordinator.begin('undo');
+        await started(coordinator, 'undo');
         const request = last_prepare(posted);
         // Undo restores `before`, so it must find `after` in the cell now.
         expect(request.highlights[0]?.expected).toBe('yellow');
         expect(request.highlights[0]?.desired).toBeNull();
     });
 
-    it('swaps both sides for a redo', () => {
+    it('swaps both sides for a redo', async () => {
         const { coordinator, posted } = harness([
             cell_change(0, 0, 'typed'),
             highlight_change(1, 1, null, 'yellow'),
         ], 'redo');
-        void coordinator.begin('redo');
+        await started(coordinator, 'redo');
         const request = last_prepare(posted);
         expect(request.highlights[0]?.expected).toBeNull();
         expect(request.highlights[0]?.desired).toBe('yellow');
@@ -269,12 +414,12 @@ describe('highlight inputs', () => {
 });
 
 describe('receiving a prepared response', () => {
-    it('posts a commit naming every prepared cell', () => {
+    it('posts a commit naming every prepared cell', async () => {
         const { coordinator, posted } = harness([
             cell_change(0, 0, 'a'),
             cell_change(1, 0, 'b'),
         ]);
-        void coordinator.begin('undo');
+        await started(coordinator, 'undo');
         coordinator.on_prepared(prepared_for(last_prepare(posted)));
         const commit = last_commit(posted);
         // Exactly the prepared set: the host refuses a partial proposal, since it
@@ -283,21 +428,21 @@ describe('receiving a prepared response', () => {
         expect(commit.leaseId).toBe('lease-1');
     });
 
-    it('sends a highlight write per prepared highlight, by ordinal only', () => {
+    it('sends a highlight write per prepared highlight, by ordinal only', async () => {
         const { coordinator, posted } = harness([
             cell_change(0, 0, 'typed'),
             highlight_change(1, 1, null, 'yellow'),
             highlight_change(2, 2, 'green', null),
         ]);
-        void coordinator.begin('undo');
+        await started(coordinator, 'undo');
         coordinator.on_prepared(prepared_for(last_prepare(posted)));
         const commit = last_commit(posted);
         expect(commit.highlights).toEqual([{ ordinal: 0 }, { ordinal: 1 }]);
     });
 
-    it('undoes a typed cell by removing its entry', () => {
+    it('undoes a typed cell by removing its entry', async () => {
         const { coordinator, posted } = harness([cell_change(0, 0, 'typed')]);
-        void coordinator.begin('undo');
+        await started(coordinator, 'undo');
         coordinator.on_prepared(prepared_for(last_prepare(posted)));
         // The recorded before-side was absent, so undo removes the overlay.
         expect(last_commit(posted).cells[0]?.entry).toBeNull();
@@ -305,7 +450,7 @@ describe('receiving a prepared response', () => {
 
     it('abandons the lease and refuses when the store moved during the round trip', async () => {
         const { coordinator, posted, overlays } = harness([cell_change(0, 0, 'typed')]);
-        const outcome = coordinator.begin('undo');
+        const { outcome: outcome } = await started(coordinator, 'undo');
         const request = last_prepare(posted);
         // A keystroke lands while the prepare was in flight.
         overlays.set('0:0', value_only_overlay(history_value('newer'), history_value('base')));
@@ -314,17 +459,17 @@ describe('receiving a prepared response', () => {
         expect(posted.some((entry) => entry.type === 'abandonHistoryReplay')).toBe(true);
     });
 
-    it('ignores a response for a replay it is not running', () => {
+    it('ignores a response for a replay it is not running', async () => {
         const { coordinator, posted } = harness([cell_change(0, 0, 'typed')]);
-        void coordinator.begin('undo');
+        await started(coordinator, 'undo');
         const stale = { ...prepared_for(last_prepare(posted)), replayId: 'someone-else' };
         coordinator.on_prepared(stale);
         expect(posted.some((entry) => entry.type === 'commitHistoryReplay')).toBe(false);
     });
 
-    it('ignores a duplicate prepared response', () => {
+    it('ignores a duplicate prepared response', async () => {
         const { coordinator, posted } = harness([cell_change(0, 0, 'typed')]);
-        void coordinator.begin('undo');
+        await started(coordinator, 'undo');
         const prepared = prepared_for(last_prepare(posted));
         coordinator.on_prepared(prepared);
         coordinator.on_prepared(prepared);
@@ -339,7 +484,7 @@ describe('settling', () => {
         readonly accepted: AcceptedReplay | undefined;
     }> {
         const { coordinator, posted } = harness([cell_change(0, 0, 'typed')]);
-        const pending = coordinator.begin('undo');
+        const { outcome: pending } = await started(coordinator, 'undo');
         coordinator.on_prepared(prepared_for(last_prepare(posted)));
         const commit = last_commit(posted);
         const accepted = coordinator.on_committed({
@@ -377,7 +522,7 @@ describe('settling', () => {
 
     it('frees the reservation once settled, so the next gesture is admitted', async () => {
         const { coordinator, posted } = harness([cell_change(0, 0, 'typed')]);
-        const pending = coordinator.begin('undo');
+        const { outcome: pending } = await started(coordinator, 'undo');
         const request = last_prepare(posted);
         coordinator.on_prepare_refused({
             requestId: request.requestId,
@@ -390,7 +535,7 @@ describe('settling', () => {
 
     it('translates a prepare refusal into the caller vocabulary', async () => {
         const { coordinator, posted } = harness([cell_change(0, 0, 'typed')]);
-        const pending = coordinator.begin('undo');
+        const { outcome: pending } = await started(coordinator, 'undo');
         const request = last_prepare(posted);
         coordinator.on_prepare_refused({
             requestId: request.requestId,
@@ -403,7 +548,7 @@ describe('settling', () => {
 
     it('reads a moved document as the state it planned against being gone', async () => {
         const { coordinator, posted } = harness([cell_change(0, 0, 'typed')]);
-        const pending = coordinator.begin('undo');
+        const { outcome: pending } = await started(coordinator, 'undo');
         const request = last_prepare(posted);
         coordinator.on_prepare_refused({
             requestId: request.requestId,
@@ -415,7 +560,7 @@ describe('settling', () => {
 
     it('translates a commit conflict, leaving history where it was', async () => {
         const { coordinator, posted } = harness([cell_change(0, 0, 'typed')]);
-        const pending = coordinator.begin('undo');
+        const { outcome: pending } = await started(coordinator, 'undo');
         coordinator.on_prepared(prepared_for(last_prepare(posted)));
         const commit = last_commit(posted);
         coordinator.on_commit_refused({
@@ -428,9 +573,9 @@ describe('settling', () => {
         await expect(pending).resolves.toEqual({ kind: 'refused', reason: 'conflict' });
     });
 
-    it('ignores a commit answer for a different mutation', () => {
+    it('ignores a commit answer for a different mutation', async () => {
         const { coordinator, posted } = harness([cell_change(0, 0, 'typed')]);
-        void coordinator.begin('undo');
+        await started(coordinator, 'undo');
         coordinator.on_prepared(prepared_for(last_prepare(posted)));
         const commit = last_commit(posted);
         coordinator.on_commit_refused({
@@ -447,7 +592,7 @@ describe('settling', () => {
 describe('reset', () => {
     it('settles a running replay rather than leaving its caller waiting', async () => {
         const { coordinator } = harness([cell_change(0, 0, 'typed')]);
-        const pending = coordinator.begin('undo');
+        const { outcome: pending } = await started(coordinator, 'undo');
         coordinator.reset();
         await expect(pending).resolves.toEqual({
             kind: 'refused',
@@ -456,9 +601,9 @@ describe('reset', () => {
         expect(coordinator.is_busy()).toBe(false);
     });
 
-    it('does not abandon a lease whose commit is already in flight', () => {
+    it('does not abandon a lease whose commit is already in flight', async () => {
         const { coordinator, posted } = harness([cell_change(0, 0, 'typed')]);
-        void coordinator.begin('undo');
+        await started(coordinator, 'undo');
         coordinator.on_prepared(prepared_for(last_prepare(posted)));
         const before = posted.filter((entry) => entry.type === 'abandonHistoryReplay').length;
         coordinator.reset();

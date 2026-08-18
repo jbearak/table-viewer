@@ -6,10 +6,21 @@ import {
     type DiscardedWorksheet,
 } from '../webview/history-discard-model';
 import {
+    absent_overlay,
+    history_value,
     overlay_for_direction,
+    overlay_state_from_dirty_entry,
     type CellHistoryDelta,
     type HistoryDirtyEntry,
 } from '../webview/history-cell-state-model';
+import { create_history_store } from '../webview/history-store';
+import {
+    DEFAULT_HISTORY_BOUNDS,
+    empty_history_stack,
+    peek_history,
+    record_history_action,
+} from '../webview/history-stack-model';
+import { plan_history_replay } from '../webview/history-replay-model';
 import type { HistoryChange } from '../webview/history-stack-model';
 
 const SHEET: WorksheetTarget = { sheetIndex: 0, sheetName: 'Data', worksheetId: 'rId1' };
@@ -125,5 +136,171 @@ describe('discard_history_source', () => {
         source.next();
         source.next();
         expect(visited).toBe(2);
+    });
+});
+
+describe('undoing a captured discard', () => {
+    /** Plan the undo of a discard of these worksheets, against emptied stores. */
+    function undo_plan(worksheets: readonly DiscardedWorksheet[]) {
+        const store = create_history_store();
+        const record = store.stage_record({
+            label: 'Discard edits',
+            changes: discard_history_source(worksheets),
+        });
+        record.commit();
+        record.notify();
+        const peek = peek_history(store.snapshot(), 'undo');
+        if (peek.kind !== 'available') throw new Error('the discard recorded nothing');
+        // Every cell is now unedited, which is what the discard left behind, and
+        // the persisted content is whatever is on disk NOW.
+        return plan_history_replay(peek.entry.action, 'undo', () => ({
+            overlay: absent_overlay(),
+            persisted: history_value('disk'),
+        }));
+    }
+
+    it('restores every entry the discard removed', () => {
+        const result = undo_plan([
+            worksheet(SHEET, { '0:0': { value: 'a', base: 'A' } }),
+            worksheet(OTHER, { '3:4': { value: 'b', base: 'B' } }),
+        ]);
+        if (result.kind !== 'plan') throw new Error(`refused: ${result.reason}`);
+        expect(result.writes.map((write) => [write.key, write.entry])).toEqual([
+            // Backwards: undo walks the gesture in reverse, so the discard's last
+            // removal is the first restoration.
+            ['3:4', { value: 'b', base: 'B' }],
+            ['0:0', { value: 'a', base: 'A' }],
+        ]);
+    });
+
+    it('restores the recorded base, not the content on disk now', () => {
+        // The conflict base is session state the discard threw away; taking the
+        // current disk content instead would silently bless an external change as
+        // the base the next save is validated against.
+        const result = undo_plan([worksheet(SHEET, { '0:0': { value: 'a', base: 'A' } })]);
+        if (result.kind !== 'plan') throw new Error(`refused: ${result.reason}`);
+        expect(result.writes[0].entry?.base).toBe('A');
+    });
+
+    it('restores an entry whose base was never observed, still unobserved', () => {
+        const result = undo_plan([
+            worksheet(SHEET, { '0:0': { value: 'a', base: '', base_pending: true } }),
+        ]);
+        if (result.kind !== 'plan') throw new Error(`refused: ${result.reason}`);
+        expect(result.writes[0].entry).toEqual({ value: 'a', base: '', base_pending: true });
+    });
+
+    it('restores a link-only entry onto the content that is there now', () => {
+        // Its value fields are the unedited anchor, and the recorded one was the
+        // disk content at capture time — which an intervening save may have moved.
+        const result = undo_plan([
+            worksheet(SHEET, { '0:0': { value: 'a', base: 'a', link: LINK, baseLink: null } }),
+        ]);
+        if (result.kind !== 'plan') throw new Error(`refused: ${result.reason}`);
+        expect(result.writes[0].entry)
+            .toEqual({ value: 'disk', base: 'disk', link: LINK, baseLink: null });
+    });
+
+    it('refuses when a cell was edited again after the discard', () => {
+        // Replaying over it would silently throw away whatever the user typed
+        // since.
+        const store = create_history_store();
+        const record = store.stage_record({
+            label: 'Discard edits',
+            changes: discard_history_source([
+                worksheet(SHEET, { '0:0': { value: 'a', base: 'A' } }),
+            ]),
+        });
+        record.commit();
+        record.notify();
+        const peek = peek_history(store.snapshot(), 'undo');
+        if (peek.kind !== 'available') throw new Error('the discard recorded nothing');
+
+        const result = plan_history_replay(peek.entry.action, 'undo', () => ({
+            overlay: overlay_state_from_dirty_entry({ value: 'retyped', base: 'disk' }),
+            persisted: history_value('disk'),
+        }));
+
+        expect(result).toMatchObject({ kind: 'refused', reason: 'conflict' });
+    });
+
+    it('redoes the discard by removing the overlay, writing nothing back', () => {
+        // The membership transition's whole point: a `semantic` redo would write
+        // the historical persisted text over whatever is on disk now.
+        const store = create_history_store();
+        const record = store.stage_record({
+            label: 'Discard edits',
+            changes: discard_history_source([
+                worksheet(SHEET, { '0:0': { value: 'a', base: 'A' } }),
+            ]),
+        });
+        record.commit();
+        record.notify();
+        const peek = peek_history(store.snapshot(), 'undo');
+        if (peek.kind !== 'available') throw new Error('the discard recorded nothing');
+
+        const result = plan_history_replay(peek.entry.action, 'redo', () => ({
+            overlay: overlay_state_from_dirty_entry({ value: 'a', base: 'A' }),
+            persisted: history_value('disk'),
+        }));
+
+        if (result.kind !== 'plan') throw new Error(`refused: ${result.reason}`);
+        expect(result.writes.map((write) => write.entry)).toEqual([undefined]);
+    });
+});
+
+describe('a discard too large to keep', () => {
+    it('is refused behind a barrier, so undo can explain itself', () => {
+        // A workbook-wide discard is the gesture most likely to exceed the bounds,
+        // and it is the one whose loss matters most: the edits are gone either way,
+        // so history that silently dropped it would leave them unrecoverable with
+        // nothing saying why.
+        const entries = new Map<string, HistoryDirtyEntry>();
+        for (let row = 0; row < 200; row += 1) {
+            entries.set(`${row}:0`, { value: 'x'.repeat(64), base: 'y'.repeat(64) });
+        }
+        const outcome = record_history_action(
+            empty_history_stack(),
+            {
+                label: 'Discard edits',
+                changes: discard_history_source([{ target: SHEET, entries }]),
+            },
+            { ...DEFAULT_HISTORY_BOUNDS, hardMaxBytes: 1024 },
+        );
+
+        expect(outcome.kind).toBe('refused');
+        expect(outcome.state.barrier)
+            .toEqual({ reason: 'action-too-large', label: 'Discard edits' });
+    });
+
+    it('stops walking the discard at the bound rather than materializing it', () => {
+        // The reason the source is a generator. A drain-first recorder would
+        // allocate every sheet's changes before the budget could refuse them,
+        // which is exactly the peak the budget exists to avoid.
+        let visited = 0;
+        const entries: Iterable<[string, HistoryDirtyEntry]> = {
+            *[Symbol.iterator]() {
+                for (let row = 0; row < 100000; row += 1) {
+                    visited += 1;
+                    yield [`${row}:0`, {
+                        value: 'x'.repeat(64),
+                        base: 'y'.repeat(64),
+                    }] as [string, HistoryDirtyEntry];
+                }
+            },
+        };
+        record_history_action(
+            empty_history_stack(),
+            {
+                label: 'Discard edits',
+                changes: discard_history_source([{
+                    target: SHEET,
+                    entries: entries as ReadonlyMap<string, HistoryDirtyEntry>,
+                }]),
+            },
+            { ...DEFAULT_HISTORY_BOUNDS, hardMaxBytes: 1024 },
+        );
+
+        expect(visited).toBeLessThan(100);
     });
 });
