@@ -3002,17 +3002,16 @@ export function App(): React.JSX.Element {
                     coordinator.on_prepare_refused(msg.refusal);
                     return;
                 case 'historyReplayCommitted': {
-                    // Read BEFORE the coordinator settles: settling clears the
-                    // reservation, and the entry it was moving is what the staged
-                    // transaction needs.
-                    const pending = coordinator.pending_entry();
-                    coordinator.on_committed(msg.committed);
-                    if (pending === undefined) return;
-                    apply_committed_replay(msg.committed, pending.entry, pending.direction);
+                    // Apply only what the coordinator ACCEPTED, and only the entry
+                    // it accepted for: a stale correlation returns undefined here
+                    // rather than letting this handler decide on its own.
+                    const accepted = coordinator.on_committed(msg.committed);
+                    if (accepted === undefined) return;
+                    apply_committed_replay(accepted.committed, accepted.entry, accepted.direction);
                     // The cursor follows what changed, which for a workbook-wide
                     // history can be a sheet the user is not looking at.
-                    if (msg.committed.focusSheetIndex !== active_sheet_index) {
-                        handle_sheet_select(msg.committed.focusSheetIndex);
+                    if (accepted.committed.focusSheetIndex !== active_sheet_index) {
+                        handle_sheet_select(accepted.committed.focusSheetIndex);
                     }
                     return;
                 }

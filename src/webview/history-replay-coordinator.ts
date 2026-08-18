@@ -69,6 +69,18 @@ import type {
 } from '../history-replay-protocol';
 import type { WorksheetTarget } from '../types';
 
+/**
+ * A committed replay the coordinator has accepted, and what it moves.
+ *
+ * Returned by `on_committed` so the caller applies exactly the replay that was
+ * accepted, with the entry and direction it was accepted for.
+ */
+export interface AcceptedReplay {
+    readonly committed: HistoryReplayCommitted;
+    readonly entry: HistoryEntry;
+    readonly direction: HistoryDirection;
+}
+
 /** How a replay ended, for the caller to report or ignore. */
 export type ReplayOutcome =
     | { readonly kind: 'committed'; readonly committed: HistoryReplayCommitted; readonly plan: ReplayPlan }
@@ -120,12 +132,23 @@ export interface HistoryReplayCoordinator {
     begin(direction: HistoryDirection): Promise<ReplayOutcome>;
     /** Whether a replay is outstanding, so the caller can refuse new gestures. */
     is_busy(): boolean;
-    /** The entry a running replay is moving, for the caller's staged transaction. */
-    pending_entry(): { readonly entry: HistoryEntry; readonly direction: HistoryDirection } | undefined;
     /** Deliver a host response. Unrecognized correlations are ignored. */
     on_prepared(prepared: HistoryReplayPrepared): void;
     on_prepare_refused(refusal: HistoryReplayPrepareRefused): void;
-    on_committed(committed: HistoryReplayCommitted): void;
+    /**
+     * Accept a committed answer, returning what the caller must now apply.
+     *
+     * The accepted replay is RETURNED rather than left for the caller to read
+     * back, because settling clears the reservation the entry lives in: an
+     * accessor would have to be consulted before this call and never after, which
+     * is a temporal coupling between React wiring and this state machine's
+     * internals. Returning it makes acceptance and application one step, so the
+     * caller cannot apply a document mutation this coordinator did not accept.
+     *
+     * `undefined` for an answer that does not match the running replay — a stale
+     * correlation, or none running at all — and nothing should be applied then.
+     */
+    on_committed(committed: HistoryReplayCommitted): AcceptedReplay | undefined;
     on_commit_refused(refusal: HistoryReplayCommitRefused): void;
     /**
      * Abandon anything outstanding, because the document this history belongs to
@@ -188,10 +211,6 @@ export function create_history_replay_coordinator(
 
     return {
         is_busy: () => running !== undefined,
-
-        pending_entry: () => running === undefined
-            ? undefined
-            : { entry: running.entry, direction: running.direction },
 
         begin: (direction) => new Promise<ReplayOutcome>((resolve) => {
             if (running !== undefined) {
@@ -308,8 +327,16 @@ export function create_history_replay_coordinator(
                 || replay.plan === undefined
                 || replay.commit.leaseId !== committed.leaseId
                 || replay.commit.mutationId !== committed.mutationId
-            ) return;
+            ) return undefined;
+            // Read off the reservation BEFORE settling clears it, and handed back
+            // rather than left for the caller to fetch.
+            const accepted: AcceptedReplay = {
+                committed,
+                entry: replay.entry,
+                direction: replay.direction,
+            };
             settle({ kind: 'committed', committed, plan: replay.plan });
+            return accepted;
         },
 
         on_commit_refused: (refusal) => {

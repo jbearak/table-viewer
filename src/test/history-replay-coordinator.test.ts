@@ -12,6 +12,7 @@ import { create_history_store } from '../webview/history-store';
 import {
     create_history_replay_coordinator,
     type ReplayCoordinatorHost,
+    type AcceptedReplay,
     type ReplayOutcome,
 } from '../webview/history-replay-coordinator';
 import type {
@@ -214,11 +215,6 @@ describe('beginning a replay', () => {
         });
     });
 
-    it('reports the entry it is replaying, for the caller transaction', () => {
-        const { coordinator } = harness([cell_change(0, 0, 'typed')]);
-        void coordinator.begin('undo');
-        expect(coordinator.pending_entry()?.direction).toBe('undo');
-    });
 });
 
 describe('the focus region', () => {
@@ -340,12 +336,13 @@ describe('settling', () => {
     async function committed_outcome(): Promise<{
         readonly outcome: ReplayOutcome;
         readonly posted: readonly Posted[];
+        readonly accepted: AcceptedReplay | undefined;
     }> {
         const { coordinator, posted } = harness([cell_change(0, 0, 'typed')]);
         const pending = coordinator.begin('undo');
         coordinator.on_prepared(prepared_for(last_prepare(posted)));
         const commit = last_commit(posted);
-        coordinator.on_committed({
+        const accepted = coordinator.on_committed({
             requestId: commit.requestId,
             replayId: commit.replayId,
             leaseId: commit.leaseId,
@@ -360,8 +357,15 @@ describe('settling', () => {
             focusSheetIndex: 0,
             focus: last_prepare(posted).focus,
         });
-        return { outcome: await pending, posted };
+        return { outcome: await pending, posted, accepted };
     }
+
+    it('hands back the entry it accepted, for the caller transaction', async () => {
+        const { accepted } = await committed_outcome();
+        expect(accepted?.direction).toBe('undo');
+        expect(accepted?.entry.action.changes).toHaveLength(1);
+        expect(accepted?.committed.sourceGeneration).toBe(7);
+    });
 
     it('resolves with the committed answer and the plan that produced it', async () => {
         const { outcome } = await committed_outcome();
@@ -382,7 +386,6 @@ describe('settling', () => {
         });
         await pending;
         expect(coordinator.is_busy()).toBe(false);
-        expect(coordinator.pending_entry()).toBeUndefined();
     });
 
     it('translates a prepare refusal into the caller vocabulary', async () => {
