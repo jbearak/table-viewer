@@ -27,6 +27,7 @@ import {
     BooleanIndeterminate,
     type FillHandleDirection,
     type EditListItem,
+    type CellEditSource,
     type CellActiviationBehavior,
 } from "../internal/data-grid/data-grid-types.js";
 import DataGridSearch, { type DataGridSearchProps } from "../internal/data-grid-search/data-grid-search.js";
@@ -211,9 +212,18 @@ export interface DataEditorProps extends Props, Pick<DataGridSearchProps, "image
      */
     readonly onCellEdited?: (cell: Item, newValue: EditableGridCell) => void;
     /** Emitted whenever a cell mutation is completed and provides all edits inbound as a single batch.
+     *
+     * `source` names the gesture the batch came from. A consumer that groups
+     * edits — an undo history, say — needs it to label and bound the operation,
+     * and cannot recover it afterwards: paste and fill both cross asynchronous
+     * clipboard and cell-loading work, so a marker set before the operation
+     * could be overwritten by a second one before this callback arrived.
      * @group Editing
      */
-    readonly onCellsEdited?: (newValues: readonly EditListItem[]) => boolean | void;
+    readonly onCellsEdited?: (
+        newValues: readonly EditListItem[],
+        source: CellEditSource
+    ) => boolean | void;
     /** Emitted whenever a row append operation is requested. Append location can be set in callback.
      * @group Editing
      */
@@ -1212,7 +1222,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
     const mangledRows = showTrailingBlankRow ? rows + 1 : rows;
 
     const mangledOnCellsEdited = React.useCallback<NonNullable<typeof onCellsEdited>>(
-        (items: readonly EditListItem[]) => {
+        (items: readonly EditListItem[], source: CellEditSource) => {
             const mangledItems =
                 rowMarkerOffset === 0
                     ? items
@@ -1220,7 +1230,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                           ...x,
                           location: [x.location[0] - rowMarkerOffset, x.location[1]] as const,
                       }));
-            const r = onCellsEdited?.(mangledItems);
+            const r = onCellsEdited?.(mangledItems, source);
 
             if (r !== true) {
                 for (const i of mangledItems) onCellEdited?.(i.location, i.value);
@@ -1493,15 +1503,18 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                     forceEditMode: initialValue !== undefined,
                 });
             } else if (c.kind === GridCellKind.Boolean && fromKeyboard && c.readonly !== true) {
-                mangledOnCellsEdited([
-                    {
-                        location: gridSelection.current.cell,
-                        value: {
-                            ...c,
-                            data: toggleBoolean(c.data),
+                mangledOnCellsEdited(
+                    [
+                        {
+                            location: gridSelection.current.cell,
+                            value: {
+                                ...c,
+                                data: toggleBoolean(c.data),
+                            },
                         },
-                    },
-                ]);
+                    ],
+                    "edit"
+                );
                 gridRef.current?.damage([{ cell: gridSelection.current.cell }]);
             }
         },
@@ -2204,7 +2217,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                     });
                 }
             }
-            mangledOnCellsEdited(editItemList);
+            mangledOnCellsEdited(editItemList, "fill");
 
             gridRef.current?.damage(
                 editItemList.map(c => ({
@@ -2307,7 +2320,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                             preventDefault,
                         });
                         if (newVal !== undefined && !isInnerOnlyCell(newVal) && isEditableGridCell(newVal)) {
-                            mangledOnCellsEdited([{ location: a.location, value: newVal }]);
+                            mangledOnCellsEdited([{ location: a.location, value: newVal }], "edit");
                             gridRef.current?.damage([
                                 {
                                     cell: a.location,
@@ -3012,7 +3025,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
     const onFinishEditing = React.useCallback(
         (newValue: GridCell | undefined, movement: readonly [-1 | 0 | 1, -1 | 0 | 1]) => {
             if (overlay?.cell !== undefined && newValue !== undefined && isEditableGridCell(newValue)) {
-                mangledOnCellsEdited([{ location: overlay.cell, value: newValue }]);
+                mangledOnCellsEdited([{ location: overlay.cell, value: newValue }], "edit");
                 window.requestAnimationFrame(() => {
                     gridRef.current?.damage([
                         {
@@ -3054,10 +3067,17 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
         return `gdg-overlay-${idCounter++}`;
     }, []);
 
-    const deleteRange = React.useCallback(
-        (r: Rectangle) => {
-            focus();
-            const editList: EditListItem[] = [];
+    /**
+     * Fork addition: collect a range's deletions without emitting them.
+     *
+     * Split out of `deleteRange` because ONE Delete keypress can cover a primary
+     * range, a stack of secondary ranges, whole rows and whole columns, and the
+     * consumer records one undoable action per emitted batch — so emitting per
+     * range made a single keypress take several undos to walk back. The caller
+     * accumulates across every range it is clearing and emits once.
+     */
+    const collectRangeDeletions = React.useCallback(
+        (r: Rectangle, editList: EditListItem[], seen?: Set<string>) => {
             for (let x = r.x; x < r.x + r.width; x++) {
                 for (let y = r.y; y < r.y + r.height; y++) {
                     // Fork addition: a merged block deletes as one cell — clear the
@@ -3083,14 +3103,43 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                         newVal = toDelete?.onDelete?.(cellValue);
                     }
                     if (newVal !== undefined && !isInnerOnlyCell(newVal) && isEditableGridCell(newVal)) {
+                        // Range stacks and whole-row/column selections can overlap.
+                        // One gesture still edits a cell once: duplicate entries
+                        // would make history account and replay the same location
+                        // twice inside its now-single action.
+                        const key = `${x}:${y}`;
+                        if (seen?.has(key) === true) continue;
+                        seen?.add(key);
                         editList.push({ location: [x, y], value: newVal });
                     }
                 }
             }
-            mangledOnCellsEdited(editList);
+        },
+        [getCellContent, getCellRenderer, rowMarkerOffset, mergedCells]
+    );
+
+    /**
+     * Fork addition: emit one `"delete"` batch for everything a keypress clears.
+     *
+     * Called even for an empty list, matching what a single-range delete of
+     * unclearable cells did before the split.
+     */
+    const emitDeletions = React.useCallback(
+        (editList: EditListItem[]) => {
+            mangledOnCellsEdited(editList, "delete");
             gridRef.current?.damage(editList.map(x => ({ cell: x.location })));
         },
-        [focus, getCellContent, getCellRenderer, mangledOnCellsEdited, rowMarkerOffset, mergedCells]
+        [mangledOnCellsEdited]
+    );
+
+    const deleteRange = React.useCallback(
+        (r: Rectangle) => {
+            focus();
+            const editList: EditListItem[] = [];
+            collectRangeDeletions(r, editList);
+            emitDeletions(editList);
+        },
+        [collectRangeDeletions, emitDeletions, focus]
     );
 
     const overlayOpen = overlay !== undefined;
@@ -3147,30 +3196,39 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                     // 3) columns
                     // 4) rows
 
+                    // Fork change: accumulated across every range this ONE
+                    // keypress clears, then emitted once. The consumer records an
+                    // undoable action per batch, so a batch per range meant a
+                    // multi-range or whole-row Delete took several undos to walk
+                    // back — one gesture, one entry.
+                    focus();
+                    const editList: EditListItem[] = [];
+                    const seen = new Set<string>();
                     if (toDelete.current !== undefined) {
-                        deleteRange(toDelete.current.range);
+                        collectRangeDeletions(toDelete.current.range, editList, seen);
                         for (const r of toDelete.current.rangeStack) {
-                            deleteRange(r);
+                            collectRangeDeletions(r, editList, seen);
                         }
                     }
 
                     for (const r of toDelete.rows) {
-                        deleteRange({
+                        collectRangeDeletions({
                             x: rowMarkerOffset,
                             y: r,
                             width: columnsIn.length,
                             height: 1,
-                        });
+                        }, editList, seen);
                     }
 
                     for (const col of toDelete.columns) {
-                        deleteRange({
+                        collectRangeDeletions({
                             x: col,
                             y: 0,
                             width: 1,
                             height: rows,
-                        });
+                        }, editList, seen);
                     }
+                    emitDeletions(editList);
                 }
             }
 
@@ -3340,6 +3398,8 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
             onDelete,
             trapFocus,
             deleteRange,
+            collectRangeDeletions,
+            emitDeletions,
             setSelectedColumns,
             setSelectedRows,
             showTrailingBlankRow,
@@ -3611,7 +3671,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                     // eslint-disable-next-line no-constant-condition
                 } while (false);
 
-                mangledOnCellsEdited(editList);
+                mangledOnCellsEdited(editList, "paste");
 
                 gridRef.current?.damage(
                     editList.map(c => ({

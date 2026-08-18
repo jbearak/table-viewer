@@ -22,8 +22,10 @@ import {
     CHANNEL_THEME_CHANGED,
     CHANNEL_TITLEBAR_INFO,
     CHANNEL_TITLEBAR_PATH_MENU,
+    CHANNEL_WEBVIEW_DOCUMENT_TOKEN,
     CHANNEL_WEBVIEW_MESSAGE,
     type DesktopHostMessageEnvelope,
+    type DesktopWebviewMessageEnvelope,
     type PendingEditAcknowledgementReceipt,
 } from '../shared/ipc';
 import { apply_theme_to_document, type ThemePayload } from '../main/theme';
@@ -34,12 +36,41 @@ import {
 } from '../shared/titlebar';
 import { titlebar_preload_api } from './titlebar-api';
 
+const MAX_PENDING_WEBVIEW_MESSAGES = 1024;
+let document_token: string | undefined;
+const pending_webview_messages: unknown[] = [];
+
+const send_webview_message = (message: unknown): void => {
+    if (document_token === undefined) {
+        if (pending_webview_messages.length >= MAX_PENDING_WEBVIEW_MESSAGES) {
+            throw new Error('Viewer document admission did not arrive before its message queue filled.');
+        }
+        pending_webview_messages.push(message);
+        return;
+    }
+    const envelope: DesktopWebviewMessageEnvelope = {
+        documentToken: document_token,
+        message,
+    };
+    ipcRenderer.send(CHANNEL_WEBVIEW_MESSAGE, envelope);
+};
+
+const request_document_admission = (): void => {
+    if (document_token !== undefined) return;
+    // Synchronous by design: the response belongs to this exact document's IPC
+    // call and cannot be delivered later to a replacement preload.
+    const token = ipcRenderer.sendSync(CHANNEL_WEBVIEW_DOCUMENT_TOKEN) as unknown;
+    if (typeof token !== 'string' || token.length === 0) return;
+    document_token = token;
+    for (const message of pending_webview_messages.splice(0)) send_webview_message(message);
+};
+window.addEventListener('DOMContentLoaded', request_document_admission, { once: true });
+
 // contextBridge clones the object into the main world, so the shared bundle
-// (which only calls postMessage) works across the isolation boundary.
+// (which only calls postMessage) works across the isolation boundary. The token
+// remains in the isolated preload and cannot be supplied or replaced by page code.
 contextBridge.exposeInMainWorld('__tableViewerHostBridge', {
-    postMessage(msg: unknown): void {
-        ipcRenderer.send(CHANNEL_WEBVIEW_MESSAGE, msg);
-    },
+    postMessage: send_webview_message,
 });
 
 const RECEIPT_FIELD = '__tableViewerDesktopAcknowledgementReceipt';

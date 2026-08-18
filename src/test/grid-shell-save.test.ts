@@ -12,9 +12,18 @@ import {
 
 const grid_mock = vi.hoisted(() => ({
     props: null as null | {
-        onCellEdited?: (cell: [number, number], value: { kind: string; data: string }) => void;
+        onCellsEdited?: (
+            items: readonly { location: [number, number]; value: { kind: string; data: string } }[],
+            source: string,
+        ) => boolean | void;
         onGridSelectionChange?: (selection: unknown) => void;
-        getCellContent?: (cell: [number, number]) => { data?: string };
+        getCellContent?: (cell: [number, number]) => {
+            data?: string;
+            allowOverlay?: boolean;
+            readonly?: boolean;
+        };
+        onPaste?: boolean | ((target: [number, number], values: readonly (readonly string[])[]) => boolean);
+        fillHandle?: boolean;
     },
     // Display row → canonical source row, and source row → that row's raw text.
     //
@@ -159,6 +168,7 @@ async function render_grid(
             conflicted: readonly string[];
         }) => void;
         generation?: number;
+        highlight_in_flight?: boolean;
         on_save_request?: () => CsvSaveOperation | undefined;
     } = {},
 ) {
@@ -246,6 +256,14 @@ async function render_grid(
             }));
         });
     };
+    const rerender_highlight_in_flight = async (highlight_in_flight: boolean) => {
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...props,
+                highlight_in_flight,
+            }));
+        });
+    };
     // Model what App does on a transform/refresh ack: the generation bump moves
     // GridShell's key, so the mount is destroyed and rebuilt. The key lives in
     // App, so the test has to supply one to force the unmount.
@@ -263,12 +281,21 @@ async function render_grid(
         root!.render(React.createElement(GridShell, props));
     });
 
-    return { post_message, editing_ref, rerender_save_lifecycle, remount_at_generation };
+    return {
+        post_message,
+        editing_ref,
+        rerender_save_lifecycle,
+        rerender_highlight_in_flight,
+        remount_at_generation,
+    };
 }
 
 async function edit_cell(value: string) {
     await act(async () => {
-        grid_mock.props!.onCellEdited!([0, 0], { kind: 'text', data: value });
+        grid_mock.props!.onCellsEdited!(
+            [{ location: [0, 0], value: { kind: 'text', data: value } }],
+            'edit',
+        );
     });
 }
 
@@ -423,6 +450,30 @@ describe('GridShell CSV save', () => {
         post_message.mockClear();
         expect(await request_save(editing_ref)).toBe(false);
         expect(save_messages(post_message)).toEqual([]);
+    });
+
+    it('stops offering an editor while a highlight gesture awaits the host', async () => {
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        const { rerender_highlight_in_flight } = await render_grid(undefined, {
+            edit_session: store,
+        });
+
+        // The affordance, not the barrier: a cell must not OPEN across the
+        // highlight round trip, so nothing the user types is silently swallowed.
+        // Keeping such an edit out of the history is App's `gestures_admitted`
+        // (see use-editing.test.ts) — which also covers the hyperlink dialog,
+        // reaching the store with no editability flag here to consult.
+        await rerender_highlight_in_flight(true);
+        expect(grid_mock.props!.getCellContent!([0, 0]).allowOverlay).toBe(false);
+        expect(grid_mock.props!.onPaste).toBe(false);
+        expect(grid_mock.props!.fillHandle).toBe(false);
+
+        // The window is one host round trip. The ack reopens editing.
+        await rerender_highlight_in_flight(false);
+        expect(grid_mock.props!.getCellContent!([0, 0]).allowOverlay).toBe(true);
+        expect(grid_mock.props!.onPaste).toBe(true);
+        await edit_cell('after ack');
+        expect(Object.fromEntries(store.snapshot())).toHaveProperty('0:0');
     });
 
     it('blocks edit and clear mutations until a failed save re-enables editing', async () => {

@@ -8412,6 +8412,56 @@ describe('CSV edit sessions', () => {
         expect(state.get_state(file_path).pendingEdits).toBeUndefined();
     });
 
+    it('acknowledges a discard once its cleanup has settled', async () => {
+        // Undoing a discard needs a NEW session, and the host refuses
+        // `requestEditSession` until cleanup leaves `cleanupPending` — so the
+        // renderer waits for this rather than racing it.
+        const file_path = '/tmp/discard-ack.csv';
+        const state = state_store({
+            pendingEdits: sheet_edits({ '0:0': { value: 'draft', base: 'a' } }),
+        });
+        const panel = open_csv_table(uri(file_path), state.store);
+        await panel.__receive({ type: 'ready' });
+        const session = latest_snapshot(panel).capabilities.csvEditSessionId!;
+
+        await panel.__receive({ type: 'discardEditSession', editSessionId: session } as never);
+
+        expect(panel.__messages).toContainEqual({
+            type: 'discardEditSessionResult',
+            editSessionId: session,
+            cleared: true,
+        });
+        // And the session really is re-acquirable, which is the fact the
+        // acknowledgement is a promise about.
+        await panel.__receive({ type: 'requestEditSession' });
+        expect(edit_session_results(panel)).toContainEqual({
+            type: 'editSessionResult',
+            sheetIndex: 0,
+            granted: true,
+        });
+    });
+
+    it('acknowledges a failed discard as uncleared rather than staying silent', async () => {
+        // The failure leaves the host `uncertain` and editing disabled for the
+        // file, so undo has nothing to re-enter. Saying so is what stops the
+        // renderer waiting on a message that would never come.
+        const file_path = '/tmp/discard-ack-failed.csv';
+        const cleanup = uncertain_cleanup_store({
+            pendingEdits: sheet_edits({ '0:0': { value: 'draft', base: 'a' } }),
+        });
+        const panel = open_csv_table(uri(file_path), cleanup.store);
+        await panel.__receive({ type: 'ready' });
+        const session = latest_snapshot(panel).capabilities.csvEditSessionId!;
+
+        await panel.__receive({ type: 'discardEditSession', editSessionId: session } as never);
+
+        expect(panel.__messages).toContainEqual({
+            type: 'discardEditSessionResult',
+            editSessionId: session,
+            cleared: false,
+        });
+    });
+
     it('clears pending edits and releases ownership atomically on discard', async () => {
         const file_path = '/tmp/session.csv';
         const file_uri = uri(file_path);

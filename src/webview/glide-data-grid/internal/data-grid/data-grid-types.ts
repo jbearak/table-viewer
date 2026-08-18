@@ -486,6 +486,15 @@ export enum InnerGridCellKind {
 
 export type EditListItem = { location: Item; value: EditableGridCell };
 
+/**
+ * The gesture a batch of edits came from.
+ *
+ * The grid knows this at the moment it assembles the batch and nowhere
+ * afterwards, so it travels with the batch. A consumer that groups edits into
+ * one undoable operation needs it both to label the operation and to bound it.
+ */
+export type CellEditSource = "edit" | "paste" | "fill" | "delete";
+
 /** @category Cells */
 export interface NewRowCell extends BaseGridCell {
     readonly kind: InnerGridCellKind.NewRow;

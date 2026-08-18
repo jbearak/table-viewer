@@ -6,6 +6,7 @@
 // side by side with another one, which is both more flexible and what an Excel
 // user expects. It also means the window *is* the view — no tab strip to lay
 // out around, and zoom is simply per-window.
+import { randomUUID } from 'node:crypto';
 import * as path from 'path';
 import {
     BrowserWindow,
@@ -29,6 +30,10 @@ import {
 import { canonical_file_key } from '../../src/resource-identity';
 import { node_file_refresh_watcher_factory } from '../../src/node-file-refresh-watcher';
 import type { HostMessage, WebviewMessage } from '../../src/types';
+import {
+    sanitized_history_menu_state,
+    type HistoryMenuState,
+} from './history-menu-model';
 import { create_desktop_ui_port, node_file_system_port } from './desktop-host-ports';
 import type { DesktopConfigStore } from './desktop-config';
 import {
@@ -44,7 +49,9 @@ import {
     CHANNEL_HOST_MESSAGE_RECEIPT,
     CHANNEL_TITLEBAR_INFO,
     CHANNEL_TITLEBAR_PATH_MENU,
+    CHANNEL_WEBVIEW_DOCUMENT_TOKEN,
     CHANNEL_WEBVIEW_MESSAGE,
+    is_desktop_webview_message_envelope,
     type DesktopHostMessageEnvelope,
     type PendingEditAcknowledgementReceipt,
 } from '../shared/ipc';
@@ -57,6 +64,8 @@ import {
     next_window_bounds,
     type WindowSize,
 } from './window-geometry';
+
+const ERR_ABORTED = -3;
 
 interface ViewerWindow {
     readonly filePath: string;
@@ -74,6 +83,14 @@ interface ViewerWindow {
     allowClose: boolean;
     /** Drops the unsaved-edits watcher (see `dirty_from_webview_message`). */
     readonly stop_watching_dirty: () => void;
+    /**
+     * What this window's renderer last said its Undo/Redo menu items should read.
+     *
+     * Undefined until the first `historyMenuStateChanged` — a viewer that has not
+     * posted yet is indistinguishable from a non-viewer window as far as the menu
+     * is concerned, and `history_menu_item` answers both the same way.
+     */
+    history_menu?: HistoryMenuState;
     /** Drops renderer navigation/process/transport lifecycle watchers. */
     readonly stop_watching_renderer: () => void;
     /** Persists a resize still inside its settle window, and cancels it.
@@ -363,7 +380,24 @@ export class ViewerWindowManager {
         private readonly viewer_preload_path: string,
         private readonly viewer_panel_deadline_scheduler?: ViewerPanelDeadlineScheduler,
         private readonly open_preferences: (target: PreferencesTarget) => void = () => {},
+        /**
+         * Rebuild the application menu, because one window's Undo/Redo items have
+         * changed. Called with the window that reported, so main.ts can skip the
+         * rebuild when it is not the focused one — the menu only ever shows the
+         * focused window's history.
+         */
+        private readonly on_history_menu_changed: (window: BrowserWindow) => void = () => {},
     ) {}
+
+    /**
+     * What `window`'s Undo/Redo items should read, or undefined for a window with
+     * no history model — a non-viewer window, or a viewer whose renderer has not
+     * reported yet. Both mean "leave the items to the native text undo"; see
+     * `history_menu_item`.
+     */
+    history_menu_state(window: BrowserWindow): HistoryMenuState | undefined {
+        return this.windows.find((entry) => entry.window === window)?.history_menu;
+    }
 
     /**
      * Show `file_path` in its own window, or focus the window already showing
@@ -445,25 +479,254 @@ export class ViewerWindowManager {
         const acknowledgement_receipt_listeners = new Set<(
             receipt: PendingEditAcknowledgementReceipt,
         ) => void>();
+        const webview_message_listeners = new Set<(message: WebviewMessage) => void>();
+        interface NavigationAttempt {
+            readonly sequence: number;
+            readonly url: string;
+            readonly frameProcessId?: number;
+            readonly frameRoutingId?: number;
+        }
+        interface FailureSignature {
+            readonly errorCode: number;
+            readonly validatedUrl: string;
+            readonly frameProcessId?: number;
+            readonly frameRoutingId?: number;
+        }
+        type StableDocumentAdmission =
+            | {
+                readonly kind: 'idle';
+                readonly token?: string;
+                readonly lastSuccessfulUrl?: string;
+            }
+            | { readonly kind: 'committed-awaiting-claim'; readonly url: string }
+            | {
+                readonly kind: 'claimed-awaiting-navigation';
+                readonly token: string;
+                readonly url: string;
+            }
+            | { readonly kind: 'unavailable' };
+        type DocumentAdmission = StableDocumentAdmission | {
+            readonly kind: 'provisional';
+            readonly predecessor: StableDocumentAdmission;
+            readonly attempts: readonly NavigationAttempt[];
+        };
+        let document_admission: DocumentAdmission = { kind: 'idle' };
+        let next_navigation_sequence = 0;
+        let has_admitted_document = false;
+        let loading_epoch_active = false;
+        let failed_navigation_attempts: FailureSignature[] = [];
+        const active_document_token = (): string | undefined => {
+            if (
+                document_admission.kind === 'idle'
+                || document_admission.kind === 'claimed-awaiting-navigation'
+            ) return document_admission.token;
+            return undefined;
+        };
+        const successful_document_url = (): string | undefined => {
+            if (document_admission.kind === 'idle') {
+                return document_admission.lastSuccessfulUrl;
+            }
+            if (
+                document_admission.kind === 'claimed-awaiting-navigation'
+                || document_admission.kind === 'committed-awaiting-claim'
+            ) return document_admission.url;
+            return undefined;
+        };
+        const begin_loading_epoch = () => {
+            if (loading_epoch_active) return;
+            failed_navigation_attempts = [];
+            loading_epoch_active = true;
+        };
+        const invalidate_document_admission = () => {
+            document_admission = { kind: 'unavailable' };
+            failed_navigation_attempts = [];
+            loading_epoch_active = false;
+        };
         const report_renderer_generation_change = () => {
             const error = new Error('Viewer renderer was replaced by a successful navigation.');
             for (const listener of [...renderer_generation_listeners]) listener(error);
         };
+        /**
+         * Drops this window's Undo/Redo projection and rebuilds the menu.
+         *
+         * The projection is retained across focus changes on purpose, so nothing
+         * else clears it — which means a renderer that has gone away leaves its
+         * last words standing, and the Edit menu offers an Undo that no renderer
+         * is listening for. A replacement renderer posts its own state as soon as
+         * it has one; until then the items read as they do for any non-viewer
+         * window.
+         */
+        const forget_history_menu = () => {
+            if (entry === undefined || entry.history_menu === undefined) return;
+            entry.history_menu = undefined;
+            this.on_history_menu_changed(window);
+        };
         const report_renderer_loss = (error: Error, retryable = false) => {
+            // Not on a retryable loss: an unresponsive renderer is still the one
+            // holding the history, and it will not repost when it comes back.
+            if (!retryable) {
+                invalidate_document_admission();
+                forget_history_menu();
+            }
             for (const listener of [...renderer_loss_listeners]) listener(error, retryable);
         };
-        const on_main_frame_navigated = () => report_renderer_generation_change();
+        const finalize_document_replacement = () => {
+            forget_history_menu();
+            report_renderer_generation_change();
+        };
+        const on_main_frame_navigation_started = (
+            details: Electron.Event<Electron.WebContentsDidStartNavigationEventParams>,
+        ) => {
+            if (!details.isMainFrame || details.isSameDocument) return;
+            begin_loading_epoch();
+            const attempt: NavigationAttempt = {
+                sequence: ++next_navigation_sequence,
+                url: details.url,
+                frameProcessId: details.frame?.processId,
+                frameRoutingId: details.frame?.routingId,
+            };
+            if (document_admission.kind === 'provisional') {
+                document_admission = {
+                    ...document_admission,
+                    attempts: [...document_admission.attempts, attempt],
+                };
+                return;
+            }
+            // The old document stops being authoritative as soon as a replacement
+            // starts. Preserve its complete admission state only as a rollback
+            // target; never expose it while any replacement remains provisional.
+            document_admission = {
+                kind: 'provisional',
+                predecessor: document_admission,
+                attempts: [attempt],
+            };
+        };
+        const on_main_frame_navigated = (
+            _event: Electron.Event,
+            url: string,
+        ) => {
+            if (document_admission.kind === 'unavailable') return;
+            if (document_admission.kind === 'provisional') {
+                document_admission = { kind: 'committed-awaiting-claim', url };
+                finalize_document_replacement();
+                return;
+            }
+            if (document_admission.kind === 'claimed-awaiting-navigation') {
+                if (url === document_admission.url) {
+                    document_admission = {
+                        kind: 'idle',
+                        token: document_admission.token,
+                        lastSuccessfulUrl: url,
+                    };
+                    return;
+                }
+                document_admission = { kind: 'committed-awaiting-claim', url };
+                finalize_document_replacement();
+                return;
+            }
+            if (document_admission.kind === 'committed-awaiting-claim') {
+                if (url === document_admission.url) return;
+                document_admission = { kind: 'committed-awaiting-claim', url };
+                finalize_document_replacement();
+                return;
+            }
+            if (
+                document_admission.token !== undefined
+                && url === document_admission.lastSuccessfulUrl
+            ) return;
+            // Defensive fallback for a different-URL commit whose start event was
+            // missed. Same-URL commits remain ambiguous with duplicate did-navigate,
+            // so preserving the active document is the fail-safe choice there.
+            document_admission = { kind: 'committed-awaiting-claim', url };
+            finalize_document_replacement();
+        };
+        const same_failure = (
+            left: FailureSignature | undefined,
+            right: FailureSignature,
+        ): boolean => left !== undefined
+            && left.errorCode === right.errorCode
+            && left.validatedUrl === right.validatedUrl
+            && left.frameProcessId === right.frameProcessId
+            && left.frameRoutingId === right.frameRoutingId;
+        const record_failed_navigation_attempt = (failure: FailureSignature) => {
+            if (failed_navigation_attempts.some((known) => same_failure(known, failure))) return;
+            failed_navigation_attempts.push(failure);
+        };
+        const is_safely_ignorable_old_failure = (failure: FailureSignature): boolean => {
+            const successful_url = successful_document_url();
+            return successful_url !== undefined
+                && successful_url !== failure.validatedUrl
+                && failed_navigation_attempts.some((known) => same_failure(known, failure));
+        };
+        const attempt_matches_failure = (
+            attempt: NavigationAttempt,
+            failure: FailureSignature,
+        ): boolean => attempt.url === failure.validatedUrl
+            && (
+                attempt.frameProcessId === undefined
+                || failure.frameProcessId === undefined
+                || attempt.frameProcessId === failure.frameProcessId
+            )
+            && (
+                attempt.frameRoutingId === undefined
+                || failure.frameRoutingId === undefined
+                || attempt.frameRoutingId === failure.frameRoutingId
+            );
         const on_failed_load = (
             _event: Electron.Event,
             error_code: number,
             error_description: string,
             validated_url: string,
             is_main_frame: boolean,
+            frame_process_id?: number,
+            frame_routing_id?: number,
         ) => {
-            if (!is_main_frame) return;
+            if (!is_main_frame || document_admission.kind === 'unavailable') return;
+            const failure: FailureSignature = {
+                errorCode: error_code,
+                validatedUrl: validated_url,
+                frameProcessId: frame_process_id,
+                frameRoutingId: frame_routing_id,
+            };
+            if (document_admission.kind === 'provisional') {
+                const failed_index = document_admission.attempts.findIndex(
+                    (attempt) => attempt_matches_failure(attempt, failure),
+                );
+                if (failed_index < 0) return;
+                record_failed_navigation_attempt(failure);
+                const remaining = document_admission.attempts.filter(
+                    (_attempt, index) => index !== failed_index,
+                );
+                if (remaining.length > 0) {
+                    document_admission = {
+                        ...document_admission,
+                        attempts: remaining,
+                    };
+                    return;
+                }
+                document_admission = document_admission.predecessor;
+                return;
+            }
+            if (error_code === ERR_ABORTED) {
+                // A missed start can still abort while the current document remains
+                // live. After claim or commit, success also forbids restoring its
+                // predecessor.
+                return;
+            }
+            if (is_safely_ignorable_old_failure(failure)) return;
+            // Before the first admission there are no renderer-owned edits, so
+            // close/reload keeps its sequence-zero path.
+            if (!has_admitted_document) return;
             report_renderer_loss(new Error(
                 `Viewer navigation failed (${error_code} ${error_description}): ${validated_url}`,
             ));
+        };
+        const on_loading_started = () => begin_loading_epoch();
+        const on_loading_stopped = () => {
+            if (document_admission.kind === 'provisional') {
+                document_admission = document_admission.predecessor;
+            }
+            loading_epoch_active = false;
         };
         const on_render_process_gone = (
             _event: Electron.Event,
@@ -485,16 +748,64 @@ export class ViewerWindowManager {
             event: Electron.IpcMainEvent,
             receipt: PendingEditAcknowledgementReceipt,
         ) => {
-            if (event.sender !== web_contents) return;
+            if (
+                event.sender !== web_contents
+                || event.senderFrame !== web_contents.mainFrame
+                || active_document_token() === undefined
+            ) return;
             for (const listener of [...acknowledgement_receipt_listeners]) listener(receipt);
         };
+        const document_token_watcher = (event: Electron.IpcMainEvent) => {
+            if (event.sender !== web_contents || event.senderFrame !== web_contents.mainFrame) return;
+            if (
+                document_admission.kind !== 'provisional'
+                && document_admission.kind !== 'committed-awaiting-claim'
+            ) return;
+            const token = randomUUID();
+            has_admitted_document = true;
+            if (document_admission.kind === 'provisional') {
+                // A claim proves that the newest replacement attempt committed even
+                // when its main-process did-navigate notification has not arrived yet.
+                const url = document_admission.attempts.at(-1)?.url;
+                if (url === undefined) return;
+                document_admission = {
+                    kind: 'claimed-awaiting-navigation',
+                    token,
+                    url,
+                };
+                finalize_document_replacement();
+            } else {
+                document_admission = {
+                    kind: 'idle',
+                    token,
+                    lastSuccessfulUrl: document_admission.url,
+                };
+            }
+            event.returnValue = token;
+        };
+        const webview_message_watcher = (
+            event: Electron.IpcMainEvent,
+            envelope: unknown,
+        ) => {
+            if (event.sender !== web_contents || event.senderFrame !== web_contents.mainFrame) return;
+            if (!is_desktop_webview_message_envelope(envelope)) return;
+            if (envelope.documentToken !== active_document_token()) return;
+            for (const listener of [...webview_message_listeners]) {
+                listener(envelope.message as WebviewMessage);
+            }
+        };
+        web_contents.on('did-start-loading', on_loading_started);
+        web_contents.on('did-start-navigation', on_main_frame_navigation_started);
         web_contents.on('did-navigate', on_main_frame_navigated);
         web_contents.on('did-fail-load', on_failed_load);
+        web_contents.on('did-stop-loading', on_loading_stopped);
         web_contents.on('render-process-gone', on_render_process_gone);
         web_contents.on('destroyed', on_transport_destroyed);
         window.on('unresponsive', on_unresponsive);
         window.on('responsive', on_responsive);
         ipcMain.on(CHANNEL_HOST_MESSAGE_RECEIPT, acknowledgement_receipt_watcher);
+        ipcMain.on(CHANNEL_WEBVIEW_DOCUMENT_TOKEN, document_token_watcher);
+        ipcMain.on(CHANNEL_WEBVIEW_MESSAGE, webview_message_watcher);
 
         // macOS themed title bar: the strip's title. The inset is not sent —
         // the preload derives it from the platform (shared/titlebar.ts), the
@@ -539,15 +850,8 @@ export class ViewerWindowManager {
                 }
             },
             on_message: (listener: (message: WebviewMessage) => void) => {
-                const handler = (
-                    event: Electron.IpcMainEvent,
-                    message: WebviewMessage,
-                ) => {
-                    if (event.sender !== web_contents) return;
-                    listener(message);
-                };
-                ipcMain.on(CHANNEL_WEBVIEW_MESSAGE, handler);
-                return () => ipcMain.removeListener(CHANNEL_WEBVIEW_MESSAGE, handler);
+                webview_message_listeners.add(listener);
+                return () => webview_message_listeners.delete(listener);
             },
             on_renderer_generation_changed: (listener) => {
                 renderer_generation_listeners.add(listener);
@@ -569,14 +873,25 @@ export class ViewerWindowManager {
 
         // Watched independently of the panel's own subscriptions, which belong to
         // the controller and may come and go.
-        const dirty_watcher = (
-            event: Electron.IpcMainEvent,
-            message: WebviewMessage,
-        ) => {
-            if (event.sender !== web_contents) return;
+        const dirty_watcher = (message: WebviewMessage) => {
             set_dirty(dirty_from_webview_message(message));
         };
-        ipcMain.on(CHANNEL_WEBVIEW_MESSAGE, dirty_watcher);
+        webview_message_listeners.add(dirty_watcher);
+
+        // Also independent of the panel's subscriptions, and for a sharper reason
+        // than the dirty dot's: the Edit menu is application-wide chrome, so the
+        // state has to be retained even while this window is not the focused one.
+        const history_menu_watcher = (message: WebviewMessage) => {
+            if (message.type !== 'historyMenuStateChanged') return;
+            const state = sanitized_history_menu_state(message.state);
+            if (state === undefined) return;
+            entry.history_menu = state;
+            // Rebuilt rather than mutated in place: an Electron MenuItem's label
+            // is read-only after construction, so a changing label means a new
+            // application menu. main.ts owns that, and it is what the callback is.
+            this.on_history_menu_changed(window);
+        };
+        webview_message_listeners.add(history_menu_watcher);
 
         let entry: ViewerWindow;
         // Format capabilities come from the same shared profile factory as the
@@ -618,22 +933,34 @@ export class ViewerWindowManager {
             panel,
             controller,
             allowClose: false,
-            stop_watching_dirty: () =>
-                ipcMain.removeListener(CHANNEL_WEBVIEW_MESSAGE, dirty_watcher),
+            stop_watching_dirty: () => {
+                webview_message_listeners.delete(dirty_watcher);
+                webview_message_listeners.delete(history_menu_watcher);
+            },
             stop_watching_renderer: () => {
+                invalidate_document_admission();
+                web_contents.removeListener('did-start-loading', on_loading_started);
+                web_contents.removeListener(
+                    'did-start-navigation',
+                    on_main_frame_navigation_started,
+                );
                 web_contents.removeListener('did-navigate', on_main_frame_navigated);
                 web_contents.removeListener('did-fail-load', on_failed_load);
+                web_contents.removeListener('did-stop-loading', on_loading_stopped);
                 web_contents.removeListener('render-process-gone', on_render_process_gone);
                 web_contents.removeListener('destroyed', on_transport_destroyed);
                 window.removeListener('unresponsive', on_unresponsive);
                 window.removeListener('responsive', on_responsive);
                 ipcMain.removeListener(CHANNEL_HOST_MESSAGE_RECEIPT, acknowledgement_receipt_watcher);
+                ipcMain.removeListener(CHANNEL_WEBVIEW_DOCUMENT_TOKEN, document_token_watcher);
+                ipcMain.removeListener(CHANNEL_WEBVIEW_MESSAGE, webview_message_watcher);
                 ipcMain.removeListener(CHANNEL_TITLEBAR_INFO, titlebar_info_watcher);
                 ipcMain.removeListener(CHANNEL_TITLEBAR_PATH_MENU, titlebar_path_menu_watcher);
                 renderer_generation_listeners.clear();
                 renderer_loss_listeners.clear();
                 renderer_responsive_listeners.clear();
                 acknowledgement_receipt_listeners.clear();
+                webview_message_listeners.clear();
             },
             flush_size: () => {
                 if (!pending) return;
@@ -778,7 +1105,10 @@ export class ViewerWindowManager {
      * a viewer window, so the caller can fall back to the native editing
      * command (see `route_edit_command` in main.ts).
      */
-    send_edit_command(window: BrowserWindow, command: 'copy' | 'selectAll'): boolean {
+    send_edit_command(
+        window: BrowserWindow,
+        command: 'copy' | 'selectAll' | 'undo' | 'redo',
+    ): boolean {
         const entry = this.windows.find((candidate) => candidate.window === window);
         if (!entry || entry.window.webContents.isDestroyed()) return false;
         // postMessage is Thenable in the shared panel contract, but delivery to

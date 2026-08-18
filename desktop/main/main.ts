@@ -35,6 +35,10 @@ import {
     type AppQuitShutdownPort,
 } from './viewer-windows';
 import {
+    history_menu_item,
+    type HistoryMenuState,
+} from './history-menu-model';
+import {
     create_desktop_lifecycle,
     create_desktop_state_backend,
     launcher_steps_aside,
@@ -824,7 +828,7 @@ function show_state_inspector_window(): void {
  * sampling focus separately is racy and can silently drop the command.
  */
 function route_edit_command(
-    command: 'copy' | 'selectAll',
+    command: 'copy' | 'selectAll' | 'undo' | 'redo',
     window: Electron.BaseWindow | undefined,
 ): void {
     const target = (window as BrowserWindow | undefined) ?? BrowserWindow.getFocusedWindow();
@@ -832,8 +836,13 @@ function route_edit_command(
     if (viewer_windows?.send_edit_command(target, command)) return;
     const contents = target.webContents;
     if (!contents || contents.isDestroyed()) return;
+    // The native fallback, for the windows with no viewer in them — welcome,
+    // preferences, the state inspector. Their undo is the page's own text undo,
+    // which is the only undo they have.
     if (command === 'copy') contents.copy();
-    else contents.selectAll();
+    else if (command === 'selectAll') contents.selectAll();
+    else if (command === 'undo') contents.undo();
+    else contents.redo();
 }
 
 /** Viewer reloads must use the same state-backend fence as close. */
@@ -848,6 +857,20 @@ function route_reload(
     if (!contents || contents.isDestroyed()) return;
     if (ignore_cache) contents.reloadIgnoringCache();
     else contents.reload();
+}
+
+/**
+ * The Undo/Redo menu state of whichever window is focused, or undefined.
+ *
+ * The application menu shows one window's history, and the focused window is the
+ * one whose keystrokes it stands for. A window with no viewer in it answers
+ * undefined, which `history_menu_item` reads as "leave the items to the native
+ * text undo" — see `route_edit_command`'s fallback.
+ */
+function focused_history_menu_state(): HistoryMenuState | undefined {
+    const focused = BrowserWindow.getFocusedWindow();
+    if (!focused) return undefined;
+    return viewer_windows?.history_menu_state(focused);
 }
 
 function build_menu(): void {
@@ -934,15 +957,37 @@ function build_menu(): void {
             ],
         },
         {
-            // Not `role: 'editMenu'`: its Undo/Redo/Delete/Paste-and-Match-Style
-            // items have nothing to act on (there is no undo model, and the grid
-            // is a canvas with no DOM selection), and its Copy/Select All roles
-            // would claim Cmd/Ctrl+C and Cmd/Ctrl+A before the page could run
-            // its own. Cut and Paste keep their native roles because the only
-            // place they mean anything — the CSV cell editor's text field — is
-            // exactly what those roles operate on.
+            // Not `role: 'editMenu'`: its Delete and Paste-and-Match-Style items
+            // have nothing to act on (the grid is a canvas with no DOM selection),
+            // its Copy/Select All roles would claim Cmd/Ctrl+C and Cmd/Ctrl+A
+            // before the page could run its own, and its Undo/Redo roles reach
+            // only the focused page's *text* undo — never the workbook history,
+            // which lives in the renderer's own stack. Cut and Paste keep their
+            // native roles because the only place they mean anything — the CSV
+            // cell editor's text field — is exactly what those roles operate on.
             label: 'Edit',
             submenu: [
+                // Labelled and enabled from what the focused viewer last
+                // reported, which is why the whole menu is rebuilt on focus
+                // change and on every history move: a MenuItem's label cannot be
+                // changed after construction.
+                {
+                    id: 'edit.undo',
+                    ...history_menu_item('undo', focused_history_menu_state()),
+                    accelerator: 'CmdOrCtrl+Z',
+                    click: (_item, window) => route_edit_command('undo', window),
+                },
+                {
+                    id: 'edit.redo',
+                    ...history_menu_item('redo', focused_history_menu_state()),
+                    // Both platform conventions, each on its own platform. The
+                    // renderer accepts either chord when it sees a keystroke
+                    // directly, but a menu item carries exactly one accelerator,
+                    // so this is where the platform is chosen.
+                    accelerator: is_mac ? 'Cmd+Shift+Z' : 'Ctrl+Y',
+                    click: (_item, window) => route_edit_command('redo', window),
+                },
+                { type: 'separator' },
                 { role: 'cut' },
                 {
                     label: 'Copy',
@@ -1059,7 +1104,12 @@ function watch_window_activation(): void {
             const contents = window.webContents;
             if (!contents.isDestroyed()) contents.send(CHANNEL_TITLEBAR_ACTIVE_CHANGED, active);
         };
-        window.on('focus', () => send(true));
+        window.on('focus', () => {
+            send(true);
+            // The Edit menu's Undo/Redo items name the focused window's history,
+            // so switching windows changes what they read.
+            build_menu();
+        });
         window.on('blur', () => send(false));
     });
 }
@@ -1473,6 +1523,12 @@ if (!got_lock) {
             VIEWER_PRELOAD,
             undefined,
             (target) => show_preferences_window(target),
+            // Only the focused window's history is on the menu, so a background
+            // window's move costs nothing but the retained state — which
+            // `focused_history_menu_state` will read next time it comes forward.
+            (window) => {
+                if (window.isFocused()) build_menu();
+            },
         );
         // After the window manager exists, and before the argv files below: the
         // flush releases whatever `open-file` / `second-instance` / `activate`

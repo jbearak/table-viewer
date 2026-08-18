@@ -18,6 +18,20 @@ import {
 } from './cell-content';
 import { is_valid_hyperlink } from './pending-changes';
 import { is_plain_record } from './plain-record';
+import { is_canonical_cell_key } from './cell-key';
+// Type-only, and deliberately so: `history-replay-protocol.ts` imports this
+// module's sanitizers, so a value import here would close a runtime cycle. The
+// `import type` is erased, and the protocol module stays the one place that
+// knows how to validate its own payloads.
+import type {
+    AbandonHistoryReplayRequest,
+    CommitHistoryReplayRequest,
+    HistoryReplayCommitRefused,
+    HistoryReplayCommitted,
+    HistoryReplayPrepareRefused,
+    HistoryReplayPrepared,
+    PrepareHistoryReplayRequest,
+} from './history-replay-protocol';
 
 export interface WorkbookData {
     sheets: SheetData[];
@@ -336,6 +350,22 @@ export interface SheetCellHighlightState {
     schema: string;
     /** Canonical `"sourceRow:sourceColumn"` keys. */
     cells: Record<string, CellHighlightColor>;
+}
+
+/**
+ * One cell whose highlight a gesture moved.
+ *
+ * Names a sheet INDEX rather than a worksheet identity, because that is what both
+ * sides of the host's compare-and-set agree on; a renderer resolves it against
+ * the sheet list it holds. Computed by `highlight_state_deltas`.
+ */
+export interface HighlightCellDelta {
+    readonly sheetIndex: number;
+    readonly sourceRow: number;
+    readonly sourceColumn: number;
+    /** `null` for "no highlight" on either side. */
+    readonly before: CellHighlightColor | null;
+    readonly after: CellHighlightColor | null;
 }
 
 export interface CellHighlightState {
@@ -719,13 +749,6 @@ function validate_column_visibility(value: unknown): void {
             invalid_leaf('columnVisibility');
         }
     }
-}
-
-function is_canonical_cell_key(value: string): boolean {
-    const match = /^(0|[1-9]\d*):(0|[1-9]\d*)$/.exec(value);
-    return match !== null
-        && Number.isSafeInteger(Number(match[1]))
-        && Number.isSafeInteger(Number(match[2]));
 }
 
 function validate_cell_highlights(value: unknown): void {
@@ -1626,6 +1649,33 @@ export function sanitized_wire_worksheet_target(
     });
 }
 
+/**
+ * What the renderer's history looks like to a native Edit menu.
+ *
+ * Deliberately not the history state itself: a menu needs two labels and two
+ * booleans, and shipping the stack would put an unbounded structure — the very
+ * one the byte bounds exist to cap — across a process boundary on every edit.
+ * The labels are already truncated by the stack that produced them
+ * (`MAX_BARRIER_LABEL_LENGTH`).
+ */
+export interface HistoryMenuProjection {
+    readonly undoAvailable: boolean;
+    readonly redoAvailable: boolean;
+    /** The gesture undo would walk back. Absent when unavailable. */
+    readonly undoLabel?: string;
+    /** The gesture redo would re-apply. Absent when unavailable. */
+    readonly redoLabel?: string;
+    /**
+     * Focus is in a text field, so the chord means the browser's text undo.
+     *
+     * The one thing about the *renderer's* moment-to-moment state that the menu
+     * needs and cannot derive from the stack. Notably a replay being in flight is
+     * NOT here: the items stay enabled and identically labelled throughout one, so
+     * a field for it would be a field no menu item reads.
+     */
+    readonly textEditing: boolean;
+}
+
 /** Immutable identity and complete payload for one accepted workbook save. */
 export interface CsvSaveOperation {
     readonly editSessionId: string;
@@ -1750,9 +1800,12 @@ export type HostMessage =
     | { type: 'fontChanged'; fontFamily: string | null; fontSize: number | null }
     /** Select a worksheet after the renderer has acknowledged its workbook snapshot. */
     | { type: 'selectSheet'; sheetIndex: number }
-    // Desktop only: the native Edit menu consumes Cmd/Ctrl+C and Cmd/Ctrl+A
-    // before the page sees them, so it forwards the intent instead.
-    | { type: 'editCommand'; command: 'copy' | 'selectAll' }
+    // Desktop only: the native Edit menu consumes Cmd/Ctrl+C, Cmd/Ctrl+A and
+    // Cmd/Ctrl+Z before the page sees them, so it forwards the intent instead.
+    // Undo and redo especially: the renderer's focus check when this arrives is
+    // the only thing that can keep Cmd+Z inside an open cell editor meaning the
+    // browser's text undo rather than the workbook's.
+    | { type: 'editCommand'; command: 'copy' | 'selectAll' | 'undo' | 'redo' }
     | { type: 'workbookSnapshot'; snapshot: WorkbookSnapshot }
     | { type: 'rowData'; sheetIndex: number; startRow: number; rows: (RenderedCell | null)[][]; sourceRows: number[]; requestId: string; generation: number }
     | { type: 'scrollToRow'; row: number }
@@ -1769,6 +1822,21 @@ export type HostMessage =
     // a single-sheet source has. Every host answer echoes back the sheet it was
     // asked about, so the webview can route a grant to the right worksheet store.
     | { type: 'editSessionResult'; requestId: string; granted: boolean; editSessionId?: string; sheetIndex?: number; pendingEdits?: SheetPendingEditCells }
+    /**
+     * A discard's host-side cleanup has settled.
+     *
+     * Sent because a discard is undoable, and undoing one needs a NEW edit
+     * session — the discard released the old one. Between the discard and this
+     * message the host sits in `cleanupPending`, where a fresh
+     * `requestEditSession` is refused, so an undo pressed in that window would
+     * fail for a reason that has nothing to do with the document and everything
+     * to do with timing. The renderer waits for this instead of racing it.
+     *
+     * `cleared` is false when the clear itself failed, which leaves the host
+     * `uncertain` and editing disabled for the file: an undo then has nothing to
+     * re-enter and must not offer to.
+     */
+    | { type: 'discardEditSessionResult'; editSessionId: string; cleared: boolean }
     | { type: 'editSessionRevoked'; reason: 'saved'; sheetIndex: number; lifecycle: Extract<TerminalCsvSaveLifecycle, { state: 'succeeded' }> }
     | { type: 'saveDialogResult'; requestId: string; editSessionId: string; choice: 'save' | 'discard' | 'cancel' }
     /** The current state backend accepted a pending-edit full map through this sequence. */
@@ -1776,7 +1844,15 @@ export type HostMessage =
     /** Stop accepting edits and report the highest full-map sequence produced. */
     | { type: 'requestPendingEditsFlush'; requestId: string }
     | { type: 'filterHistogram'; sheetIndex: number; columnIndex: number; bins: HistogramBin[]; columnKind?: FilterColumnKind; distinctValues: (string | null)[]; distinctValuesExceeded: boolean; requestId: string; generation: number; sourceGeneration: number; error?: string }
-    | { type: 'cellHighlightsChanged'; sheetIndex?: number; requestId?: string; stateRevision: number; physicalRevision: number; state: CellHighlightState | undefined; sourceGeneration: number; error?: string }
+    /**
+     * `deltas` is the gesture's own change set, and is present ONLY on the
+     * successful answer to a request this receiver made. Computed by the host at
+     * its compare-and-set, where both sides of the transition are in hand: the
+     * `state` field carries the WHOLE state, so a change another window committed
+     * while the request was in flight is indistinguishable within it — and an undo
+     * built by diffing would revert that other window's highlight.
+     */
+    | { type: 'cellHighlightsChanged'; sheetIndex?: number; requestId?: string; stateRevision: number; physicalRevision: number; state: CellHighlightState | undefined; deltas?: readonly HighlightCellDelta[]; sourceGeneration: number; error?: string }
     /**
      * The host installed a view. This is the *only* answer that describes one, and
      * the only message that can move the view generation, so a consumer that reads
@@ -1848,7 +1924,14 @@ export type HostMessage =
      * instead, which is how a saved transform this sheet can no longer support stops
      * being asked for.
      */
-    | { type: 'transformRefused'; sheetIndex: number; requestId: string; intent: TransformIntent; reason: string; terminal: boolean };
+    | { type: 'transformRefused'; sheetIndex: number; requestId: string; intent: TransformIntent; reason: string; terminal: boolean }
+    // Undo/redo replay. The payloads are structural claims, not evidence: every
+    // one is re-parsed from `unknown` at its handler through
+    // `history-replay-protocol.ts`'s sanitizers, exactly as `saveCsv`'s is.
+    | { type: 'historyReplayPrepared'; prepared: HistoryReplayPrepared }
+    | { type: 'historyReplayPrepareRefused'; refusal: HistoryReplayPrepareRefused }
+    | { type: 'historyReplayCommitted'; committed: HistoryReplayCommitted }
+    | { type: 'historyReplayCommitRefused'; refusal: HistoryReplayCommitRefused };
 
 /** Messages from webview to extension host */
 export type WebviewMessage =
@@ -1885,6 +1968,18 @@ export type WebviewMessage =
     | { type: 'pendingEditsFlush'; requestId: string; editSessionId?: string; highestProducedSequence: number }
     /** The renderer could not establish the requested close/reload barrier. */
     | { type: 'pendingEditsFlushFailed'; requestId: string }
+    /**
+     * What the desktop Edit menu's Undo and Redo items should read and whether
+     * they should be enabled.
+     *
+     * Desktop-only, and consumed by the main process rather than by the viewer
+     * controller: a native menu is chrome the extension host's webview does not
+     * have, so the VS Code side has nothing to do with this. It is a *projection*
+     * and not a command — nothing about it authorizes a replay, and a stale copy
+     * costs at most a menu item that reads a gesture behind (the click still
+     * routes to the renderer, which decides against its own live stack).
+     */
+    | { type: 'historyMenuStateChanged'; state: HistoryMenuProjection }
     // User-facing warning raised inside the webview (e.g. a clipped copy) that
     // the host surfaces via vscode.window.showWarningMessage.
     | { type: 'showWarning'; message: string }
@@ -1898,6 +1993,17 @@ export type WebviewMessage =
     | { type: 'setExcelFirstRowHeader'; sheetIndex: number; sheetName: string; enabled: boolean; unhideAll?: boolean; headerRow?: number; requestId: string; generation: number; sourceGeneration: number }
     | { type: 'setTransform'; sheetIndex: number; state: SheetTransformState; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent }
     | { type: 'hideRows'; sheetIndex: number; displayRows: DisplayRowInterval[]; requestId: string; generation: number; sourceGeneration: number }
+    /** Ask the host to authorize replaying one history action. */
+    | { type: 'prepareHistoryReplay'; request: PrepareHistoryReplayRequest }
+    /** Spend the lease that preparation issued. */
+    | { type: 'commitHistoryReplay'; request: CommitHistoryReplayRequest }
+    /**
+     * Best-effort release of an unspent lease. Correctness must not depend on
+     * this arriving — expiry is the authoritative cleanup — but a planner
+     * refusal knows immediately that the lease is dead, and saying so frees the
+     * host's one-replay slot without a thirty-second wait.
+     */
+    | { type: 'abandonHistoryReplay'; request: AbandonHistoryReplayRequest }
     /**
      * Set one height on every row of a completed resize, named in display space.
      *

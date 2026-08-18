@@ -3,12 +3,13 @@
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { describe, it, expect, afterEach } from 'vitest';
-import type { CellData } from '../types';
+import type { CellData, WorksheetTarget } from '../types';
 import { clear_saved_dirty_entries, use_editing } from '../webview/use-editing';
 import {
     create_edit_session_store,
     type EditSessionStore,
 } from '../webview/edit-session-store';
+import { create_history_store, type HistoryStore } from '../webview/history-store';
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -883,5 +884,455 @@ describe('use_editing — commit_hyperlink', () => {
         // Row 9 was never loaded; an unknown cell is not a conflict.
         await act(async () => { hook_result!.commit_hyperlink(9, 0, site); });
         expect(hook_result!.conflicted_keys.has('9:0')).toBe(false);
+    });
+});
+
+describe('use_editing — history capture', () => {
+    const SHEET: WorksheetTarget = { sheetIndex: 0, sheetName: 'Data', worksheetId: 'rId1' };
+    let history: HistoryStore | null = null;
+    let capture_store: EditSessionStore | null = null;
+
+    function CaptureHarness({ rows }: { rows: (CellData | null)[][] }) {
+        const get_cell_raw = React.useMemo(() => make_get_cell_raw(rows), [rows]);
+        hook_result = use_editing(get_cell_raw, 0, undefined, capture_store!, {
+            capture: { worksheet: SHEET, history: history! },
+        });
+        return null;
+    }
+
+    async function render_capturing(rows: (CellData | null)[][] = base_rows) {
+        history = create_history_store();
+        capture_store = create_edit_session_store();
+        container = document.createElement('div');
+        document.body.appendChild(container);
+        root = createRoot(container);
+        await act(async () => {
+            root!.render(React.createElement(CaptureHarness, { rows }));
+        });
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+    }
+
+    function undo_stack() {
+        return history!.snapshot().undoStack;
+    }
+
+    it('records one action per gesture, however many cells it touched', async () => {
+        await render_capturing();
+        await act(async () => {
+            hook_result!.commit_edits([
+                { source_row: 0, source_col: 0, value: 'A' },
+                { source_row: 0, source_col: 1, value: 'B' },
+                { source_row: 1, source_col: 0, value: 'C' },
+            ], 'Paste');
+        });
+
+        expect(undo_stack()).toHaveLength(1);
+        expect(undo_stack()[0].action.label).toBe('Paste');
+        expect(undo_stack()[0].action.changes).toHaveLength(3);
+        expect(hook_result!.dirty_cells.size).toBe(3);
+    });
+
+    it('publishes a whole batch as one notification from each store', async () => {
+        await render_capturing();
+        // Subscribed below React, so every intermediate map a per-cell loop
+        // would have published gets counted — each one is a re-render, a
+        // pendingEdits post and a host-side workspace-state write.
+        let edits_published = 0;
+        let history_published = 0;
+        capture_store!.subscribe(() => { edits_published += 1; });
+        history!.subscribe(() => { history_published += 1; });
+
+        await act(async () => {
+            hook_result!.commit_edits([
+                { source_row: 0, source_col: 0, value: 'A' },
+                { source_row: 0, source_col: 1, value: 'B' },
+                { source_row: 1, source_col: 0, value: 'C' },
+            ], 'Paste');
+        });
+
+        expect(edits_published).toBe(1);
+        expect(history_published).toBe(1);
+        expect(hook_result!.dirty_cells.size).toBe(3);
+    });
+
+    it('records a single typed commit', async () => {
+        await render_capturing();
+        await act(async () => { hook_result!.commit_edit(0, 0, 'A'); });
+
+        expect(undo_stack()).toHaveLength(1);
+        expect(undo_stack()[0].action.label).toBe('Edit cell');
+        const change = undo_stack()[0].action.changes[0];
+        if (change.kind !== 'cell') throw new Error('expected a cell change');
+        expect(change.delta.value?.expected.content.text).toBe('a');
+        expect(change.delta.value?.desired.content.text).toBe('A');
+        expect(change.delta.worksheet).toEqual(SHEET);
+    });
+
+    it('records nothing for a commit that reverts to the persisted text', async () => {
+        await render_capturing();
+        await act(async () => { hook_result!.commit_edit(0, 0, 'a'); });
+
+        expect(undo_stack()).toEqual([]);
+        expect(hook_result!.is_dirty).toBe(false);
+    });
+
+    it('records a revert of a previous edit as leaving the overlay', async () => {
+        await render_capturing();
+        await act(async () => { hook_result!.commit_edit(0, 0, 'A'); });
+        await act(async () => { hook_result!.commit_edit(0, 0, 'a'); });
+
+        expect(undo_stack()).toHaveLength(2);
+        const change = undo_stack()[1].action.changes[0];
+        if (change.kind !== 'cell') throw new Error('expected a cell change');
+        expect(change.delta.value?.mode).toBe('membership');
+        expect(change.delta.value?.desired.overlay).toBe('absent');
+    });
+
+    it('transitions a twice-touched cell from its own earlier write', async () => {
+        await render_capturing();
+        await act(async () => {
+            hook_result!.commit_edits([
+                { source_row: 0, source_col: 0, value: 'A' },
+                { source_row: 0, source_col: 0, value: 'B' },
+            ], 'Paste');
+        });
+
+        const [first, second] = undo_stack()[0].action.changes;
+        if (first.kind !== 'cell' || second.kind !== 'cell') {
+            throw new Error('expected cell changes');
+        }
+        expect(first.delta.value?.desired.content.text).toBe('A');
+        // Not 'a': the second write starts where the first one left the cell.
+        expect(second.delta.value?.expected.content.text).toBe('A');
+        expect(hook_result!.dirty_cells.get('0:0')?.value).toBe('B');
+    });
+
+    it('refuses a cell whose page is not resident rather than editing it blind', async () => {
+        await render_capturing();
+        await act(async () => {
+            hook_result!.commit_edits([
+                { source_row: 0, source_col: 0, value: 'A' },
+                { source_row: 99, source_col: 0, value: 'B' },
+            ], 'Paste');
+        });
+
+        // The resident cell moved; the one with no readable persisted side did
+        // not, because an applied edit history cannot describe would let undo
+        // cross an unrecorded change.
+        expect(hook_result!.dirty_cells.get('0:0')?.value).toBe('A');
+        expect(hook_result!.dirty_cells.has('99:0')).toBe(false);
+        expect(undo_stack()[0].action.changes).toHaveLength(1);
+    });
+
+    it('ignores negative and fractional coordinates', async () => {
+        await render_capturing();
+        await act(async () => {
+            hook_result!.commit_edits([
+                { source_row: -1, source_col: 0, value: 'A' },
+                { source_row: 0.5, source_col: 0, value: 'B' },
+            ], 'Paste');
+        });
+
+        expect(hook_result!.dirty_cells.size).toBe(0);
+        expect(undo_stack()).toEqual([]);
+    });
+
+    it('records nothing for an empty batch', async () => {
+        await render_capturing();
+        await act(async () => { hook_result!.commit_edits([], 'Paste'); });
+        expect(undo_stack()).toEqual([]);
+    });
+
+    it('records a gesture whose cells all reverted as no action at all', async () => {
+        await render_capturing();
+        await act(async () => {
+            hook_result!.commit_edits([
+                { source_row: 0, source_col: 0, value: 'a' },
+                { source_row: 0, source_col: 1, value: 'b' },
+            ], 'Paste');
+        });
+        expect(undo_stack()).toEqual([]);
+        expect(hook_result!.is_dirty).toBe(false);
+    });
+
+    it('does not capture a discard', async () => {
+        await render_capturing();
+        await act(async () => { hook_result!.commit_edit(0, 0, 'A'); });
+        await act(async () => { hook_result!.discard_edit('0:0'); });
+
+        // Discard capture is a later stage; until then a discard leaves the
+        // history exactly as the edit left it.
+        expect(undo_stack()).toHaveLength(1);
+        expect(hook_result!.is_dirty).toBe(false);
+    });
+
+    it('does not capture a save-lifecycle clear', async () => {
+        await render_capturing();
+        await act(async () => { hook_result!.commit_edit(0, 0, 'A'); });
+        await act(async () => { hook_result!.clear_dirty_saved_edits({ '0:0': 'A' }); });
+
+        expect(undo_stack()).toHaveLength(1);
+    });
+
+    it('leaves history alone when no worksheet identity is supplied', async () => {
+        // The default harness supplies neither worksheet nor history.
+        await render();
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+        await act(async () => { hook_result!.commit_edit(0, 0, 'A'); });
+        expect(hook_result!.dirty_cells.get('0:0')?.value).toBe('A');
+    });
+});
+
+describe('use_editing — hyperlink capture', () => {
+    const SHEET: WorksheetTarget = { sheetIndex: 2, sheetName: 'Links' };
+    const site = { kind: 'external' as const, target: 'https://example.com/' };
+    const other = { kind: 'external' as const, target: 'https://other.example/' };
+    const linked_rows: (CellData | null)[][] = [[
+        { raw: 'site', formatted: 'site', bold: false, italic: false, hyperlink: site },
+        { raw: 'plain', formatted: 'plain', bold: false, italic: false },
+    ]];
+    let history: HistoryStore | null = null;
+    let link_store: EditSessionStore | null = null;
+
+    function LinkCaptureHarness({ rows }: { rows: (CellData | null)[][] }) {
+        const get_cell_raw = React.useMemo(() => make_get_cell_raw(rows), [rows]);
+        hook_result = use_editing(get_cell_raw, 0, undefined, link_store!, {
+            syntax: 'markdown',
+            get_cell: (r, c) => {
+                const row = rows[r];
+                if (row === undefined) return undefined;
+                return row[c] ?? null;
+            },
+            capture: { worksheet: SHEET, history: history! },
+        });
+        return null;
+    }
+
+    async function render_linked(rows: (CellData | null)[][] = linked_rows) {
+        history = create_history_store();
+        link_store = create_edit_session_store();
+        container = document.createElement('div');
+        document.body.appendChild(container);
+        root = createRoot(container);
+        await act(async () => {
+            root!.render(React.createElement(LinkCaptureHarness, { rows }));
+        });
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+    }
+
+    function only_change() {
+        const stack = history!.snapshot().undoStack;
+        const change = stack[stack.length - 1].action.changes[0];
+        if (change.kind !== 'cell') throw new Error('expected a cell change');
+        return change.delta;
+    }
+
+    it('records a link attached to an unedited cell without touching its value', async () => {
+        await render_linked();
+        await act(async () => { hook_result!.commit_hyperlink(0, 1, site); });
+
+        const delta = only_change();
+        // The entry it writes is the ambiguous {value: 'plain', base: 'plain',
+        // link} shape; only the writer's own overlay says the value dimension
+        // is not in the overlay, so undo leaves the text alone.
+        expect(delta.value).toBeUndefined();
+        expect(delta.hyperlink?.desired.content).toEqual(site);
+        expect(delta.hyperlink?.expected.content).toBeNull();
+    });
+
+    it('records only the link when it joins an existing text edit', async () => {
+        await render_linked();
+        await act(async () => { hook_result!.commit_edit(0, 1, 'edited'); });
+        await act(async () => { hook_result!.commit_hyperlink(0, 1, site); });
+
+        const delta = only_change();
+        // The text moved under the PREVIOUS action, so this one leaves it
+        // alone — undoing the link must not also undo the typing.
+        expect(delta.value).toBeUndefined();
+        expect(delta.hyperlink?.desired.content).toEqual(site);
+        // But the overlay it records still has the value dimension in it, so a
+        // later transition off this state knows the text was edited.
+        expect(delta.afterOverlay.kind === 'present'
+            && delta.afterOverlay.value.kind).toBe('present');
+    });
+
+    it('records the text when a later edit joins an existing link', async () => {
+        await render_linked();
+        await act(async () => { hook_result!.commit_hyperlink(0, 1, site); });
+        await act(async () => { hook_result!.commit_edit(0, 1, 'edited'); });
+
+        const delta = only_change();
+        expect(delta.value?.desired.content.text).toBe('edited');
+        expect(delta.value?.expected.content.text).toBe('plain');
+        expect(delta.hyperlink).toBeUndefined();
+        expect(hook_result!.dirty_cells.get('0:1')).toEqual({
+            value: 'edited', base: 'plain', link: site, baseLink: null,
+        });
+    });
+
+    it('records a link revert that leaves the cell entirely', async () => {
+        await render_linked();
+        await act(async () => { hook_result!.commit_hyperlink(0, 1, site); });
+        await act(async () => { hook_result!.commit_hyperlink(0, 1, null); });
+
+        const delta = only_change();
+        expect(delta.hyperlink?.mode).toBe('membership');
+        expect(hook_result!.is_dirty).toBe(false);
+    });
+
+    it('records clearing a cell\'s persisted link against that link', async () => {
+        await render_linked();
+        await act(async () => { hook_result!.commit_hyperlink(0, 0, null); });
+
+        const delta = only_change();
+        expect(delta.hyperlink?.expected.content).toEqual(site);
+        expect(delta.hyperlink?.desired.content).toBeNull();
+    });
+
+    it('keeps a resolved no-op entry\'s value dimension in the overlay', async () => {
+        // resolve_pending_bases can leave a legacy entry at {value: A, base: A}:
+        // genuinely in the map — tinted, persisted, saved — while comparing
+        // equal. Membership and semantic inequality are different facts, and
+        // reading membership off the comparison would record a value dimension
+        // leaving an overlay it never entered.
+        await render_linked();
+        await act(async () => {
+            link_store!.install(
+                { session_id: undefined },
+                { '0:1': { value: 'plain', base: 'plain' } },
+            );
+        });
+        await act(async () => { hook_result!.commit_hyperlink(0, 1, site); });
+
+        const delta = only_change();
+        // The link moved; the value dimension did not, but it stays IN the
+        // overlay, so a later transition off this state knows it is there.
+        expect(delta.value).toBeUndefined();
+        expect(delta.afterOverlay.kind === 'present'
+            && delta.afterOverlay.value.kind).toBe('present');
+    });
+
+    it('carries a value dimension written earlier in the same gesture', async () => {
+        // The planner reads membership off the overlay the gesture itself left,
+        // not off a value/base comparison — a formatting-only edit moves no
+        // text but is genuinely a value edit.
+        await render_linked();
+        await act(async () => {
+            hook_result!.commit_edits([{ source_row: 0, source_col: 1, value: '**plain**' }]);
+        });
+        await act(async () => { hook_result!.commit_hyperlink(0, 1, site); });
+
+        expect(hook_result!.dirty_cells.get('0:1')).toEqual({
+            value: 'plain',
+            base: 'plain',
+            valueRuns: { runs: [{ text: 'plain', style: { bold: true } }] },
+            link: site,
+            baseLink: null,
+        });
+        const delta = only_change();
+        expect(delta.afterOverlay.kind === 'present'
+            && delta.afterOverlay.value.kind).toBe('present');
+    });
+
+    it('records several cells\' links as one action', async () => {
+        await render_linked();
+        await act(async () => {
+            hook_result!.commit_hyperlinks([
+                { source_row: 0, source_col: 0, value: other },
+                { source_row: 0, source_col: 1, value: other },
+            ], 'Edit hyperlinks');
+        });
+
+        const stack = history!.snapshot().undoStack;
+        expect(stack).toHaveLength(1);
+        expect(stack[0].action.label).toBe('Edit hyperlinks');
+        expect(stack[0].action.changes).toHaveLength(2);
+    });
+});
+
+describe('the history-ordering reservation', () => {
+    let admitted = true;
+    let session_store: EditSessionStore | null = null;
+
+    function GateHarness({ rows }: { rows: (CellData | null)[][] }) {
+        const get_cell_raw = React.useMemo(() => make_get_cell_raw(rows), [rows]);
+        hook_result = use_editing(get_cell_raw, 0, 'session-1', session_store!, {
+            gestures_admitted: () => admitted,
+        });
+        return null;
+    }
+
+    async function render_gate() {
+        admitted = true;
+        session_store = create_edit_session_store({ session_id: 'session-1' });
+        container = document.createElement('div');
+        document.body.appendChild(container);
+        root = createRoot(container);
+        await act(async () => {
+            root!.render(React.createElement(GateHarness, { rows: base_rows }));
+        });
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+    }
+
+    it('admits a gesture when nothing is replaying', async () => {
+        await render_gate();
+        await act(async () => { hook_result!.commit_edits([
+            { source_row: 0, source_col: 0, value: 'typed' },
+        ]); });
+        expect(session_store!.get('0:0')?.value).toBe('typed');
+    });
+
+    it('drops a gesture that lands while a replay is in flight', async () => {
+        await render_gate();
+        admitted = false;
+        await act(async () => { hook_result!.commit_edits([
+            { source_row: 0, source_col: 0, value: 'typed' },
+        ]); });
+        // Dropped like a keystroke arriving with no session — not an error, and
+        // not a reason to leave edit mode.
+        expect(session_store!.get('0:0')).toBeUndefined();
+        expect(hook_result!.edit_mode).toBe(true);
+    });
+
+    it('admits again once the replay has settled', async () => {
+        await render_gate();
+        admitted = false;
+        await act(async () => { hook_result!.commit_edits([
+            { source_row: 0, source_col: 0, value: 'lost' },
+        ]); });
+        admitted = true;
+        await act(async () => { hook_result!.commit_edits([
+            { source_row: 0, source_col: 0, value: 'kept' },
+        ]); });
+        expect(session_store!.get('0:0')?.value).toBe('kept');
+    });
+
+    it('drops a hyperlink gesture too, which no grid flag gates', async () => {
+        // The reason this predicate lives in App rather than in GridShell's
+        // `editable_cells`: the hyperlink dialog commits straight through
+        // `commit_hyperlink`, consulting no per-cell editability at all. A
+        // highlight round trip in flight has to close THIS path as well, or an
+        // edit enters the history ahead of the highlight the user made first.
+        await render_gate();
+        admitted = false;
+        await act(async () => {
+            hook_result!.commit_hyperlink(0, 0, {
+                kind: 'external',
+                target: 'https://example.com/',
+            });
+        });
+        expect(session_store!.get('0:0')).toBeUndefined();
+
+        admitted = true;
+        await act(async () => {
+            hook_result!.commit_hyperlink(0, 0, {
+                kind: 'external',
+                target: 'https://example.com/',
+            });
+        });
+        expect(session_store!.get('0:0')?.link).toEqual({
+            kind: 'external',
+            target: 'https://example.com/',
+        });
     });
 });
