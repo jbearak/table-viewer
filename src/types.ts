@@ -1779,9 +1779,12 @@ export type HostMessage =
     | { type: 'fontChanged'; fontFamily: string | null; fontSize: number | null }
     /** Select a worksheet after the renderer has acknowledged its workbook snapshot. */
     | { type: 'selectSheet'; sheetIndex: number }
-    // Desktop only: the native Edit menu consumes Cmd/Ctrl+C and Cmd/Ctrl+A
-    // before the page sees them, so it forwards the intent instead.
-    | { type: 'editCommand'; command: 'copy' | 'selectAll' }
+    // Desktop only: the native Edit menu consumes Cmd/Ctrl+C, Cmd/Ctrl+A and
+    // Cmd/Ctrl+Z before the page sees them, so it forwards the intent instead.
+    // Undo and redo especially: the renderer's focus check when this arrives is
+    // the only thing that can keep Cmd+Z inside an open cell editor meaning the
+    // browser's text undo rather than the workbook's.
+    | { type: 'editCommand'; command: 'copy' | 'selectAll' | 'undo' | 'redo' }
     | { type: 'workbookSnapshot'; snapshot: WorkbookSnapshot }
     | { type: 'rowData'; sheetIndex: number; startRow: number; rows: (RenderedCell | null)[][]; sourceRows: number[]; requestId: string; generation: number }
     | { type: 'scrollToRow'; row: number }

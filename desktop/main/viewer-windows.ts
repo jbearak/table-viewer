@@ -778,7 +778,10 @@ export class ViewerWindowManager {
      * a viewer window, so the caller can fall back to the native editing
      * command (see `route_edit_command` in main.ts).
      */
-    send_edit_command(window: BrowserWindow, command: 'copy' | 'selectAll'): boolean {
+    send_edit_command(
+        window: BrowserWindow,
+        command: 'copy' | 'selectAll' | 'undo' | 'redo',
+    ): boolean {
         const entry = this.windows.find((candidate) => candidate.window === window);
         if (!entry || entry.window.webContents.isDestroyed()) return false;
         // postMessage is Thenable in the shared panel contract, but delivery to

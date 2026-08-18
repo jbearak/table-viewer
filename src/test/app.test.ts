@@ -215,6 +215,12 @@ vi.mock('../webview/grid-shell', () => ({
                         .map((entry) => entry.action.label) ?? [],
                 ),
                 'data-highlight-in-flight': String(props.highlight_in_flight ?? false),
+                // Where App says an undo landed, and against which mapping. The
+                // real shell resolves this into a selection; the stub only has to
+                // show that App produced the right request and held it across the
+                // sheet switch a cross-sheet replay causes.
+                'data-history-focus': JSON.stringify(props.history_focus ?? null),
+                'data-mapping-generation': String(props.mapping_generation ?? ''),
                 'data-merges': String(props.merges?.length ?? 0),
                 'data-merges-json': JSON.stringify(props.merges ?? []),
             },
@@ -225,6 +231,46 @@ vi.mock('../webview/grid-shell', () => ({
                     onClick: () => props.on_column_resize(2, 222),
                 },
                 'resize'
+            ),
+            // Stands in for the grid consuming a focus request. Two buttons,
+            // because App's two jobs here are clearing the request it holds and
+            // reporting a region the view is hiding.
+            React.createElement(
+                'button',
+                {
+                    className: 'stub-history-focus-applied',
+                    onClick: () => props.history_focus && props.on_history_focus_applied?.(
+                        props.history_focus.sequence,
+                        { kind: 'applied', cell: [0, 0], range: { x: 0, y: 0, width: 1, height: 1 } },
+                    ),
+                },
+                'focus applied'
+            ),
+            // A LATE answer: the grid reporting the request it was handed one
+            // replay ago, while a newer one is already installed. `sequence - 1`
+            // rather than a captured value because the stub has no memory, and the
+            // only thing App must do with it is not mistake it for the current one.
+            React.createElement(
+                'button',
+                {
+                    className: 'stub-history-focus-applied-stale',
+                    onClick: () => props.history_focus && props.on_history_focus_applied?.(
+                        props.history_focus.sequence - 1,
+                        { kind: 'applied', cell: [0, 0], range: { x: 0, y: 0, width: 1, height: 1 } },
+                    ),
+                },
+                'stale focus applied'
+            ),
+            React.createElement(
+                'button',
+                {
+                    className: 'stub-history-focus-hidden',
+                    onClick: () => props.history_focus && props.on_history_focus_applied?.(
+                        props.history_focus.sequence,
+                        { kind: 'columns-hidden' },
+                    ),
+                },
+                'focus hidden'
             ),
             React.createElement(
                 'button',
@@ -476,6 +522,13 @@ async function click_button(label: string) {
     await act(async () => {
         get_button(label).click();
     });
+}
+
+/** Click a button the GridShell stub renders, by selector. */
+async function click_stub_button(selector: string) {
+    const button = container!.querySelector<HTMLButtonElement>(selector);
+    expect(button).not.toBeNull();
+    await act(async () => { button!.click(); });
 }
 
 /** The tab-orientation control, which lives on the sheet tab strip rather than the toolbar. */
@@ -12544,5 +12597,422 @@ describe('per-sheet view records', () => {
         expect(view()).toEqual({ sheet: '1', rows: '4' });
         await click_button('First');
         expect(view()).toEqual({ sheet: '0', rows: '3' });
+    });
+});
+
+describe('undo and redo, from the keyboard and the desktop menu', () => {
+    /**
+     * Record one highlight gesture, so there is something on the undo stack.
+     *
+     * A highlight, deliberately: it is the one recorded gesture whose replay needs
+     * no edit session, so these tests are about the command path rather than about
+     * standing up an edit lifecycle.
+     */
+    async function record_highlight(post_message: ReturnType<typeof vi.fn>) {
+        const snapshot = initial_snapshot_message(make_meta(['Sheet1', 'Sheet2']));
+        await dispatch_host_message(snapshot);
+        await click_button('Highlight');
+        await click_button('Clear all highlights');
+        const request = [...post_message.mock.calls]
+            .reverse()
+            .map((call) => call[0])
+            .find((message: { type?: string } | undefined) => (
+                message?.type === 'clearAllCellHighlights'
+            ));
+        await dispatch_host_message({
+            type: 'cellHighlightsChanged',
+            requestId: request.requestId,
+            stateRevision: snapshot.snapshot.identity.stateRevision + 1,
+            physicalRevision: snapshot.snapshot.identity.sourceBasis.physicalRevision,
+            state: undefined,
+            deltas: [{
+                sheetIndex: 0,
+                sourceRow: 3,
+                sourceColumn: 2,
+                before: 'yellow',
+                after: null,
+            }],
+            sourceGeneration: snapshot.snapshot.sourceGeneration,
+        });
+        expect(JSON.parse(grid_stub().getAttribute('data-undo-labels')!))
+            .toEqual(['Clear all highlights']);
+        post_message.mockClear();
+    }
+
+    function sent<T extends string>(post_message: ReturnType<typeof vi.fn>, type: T) {
+        return [...post_message.mock.calls]
+            .reverse()
+            .map((call) => call[0])
+            .find((message: { type?: string } | undefined) => message?.type === type);
+    }
+
+    function undo_via_menu() {
+        return dispatch_host_message({ type: 'editCommand', command: 'undo' });
+    }
+
+    function press(key: string, modifiers: Partial<KeyboardEventInit> = {}) {
+        return act(async () => {
+            window.dispatchEvent(new KeyboardEvent('keydown', {
+                key,
+                bubbles: true,
+                cancelable: true,
+                metaKey: true,
+                ...modifiers,
+            }));
+        });
+    }
+
+    /** Answer a prepare, then a commit, as the host would. */
+    async function complete_replay(
+        post_message: ReturnType<typeof vi.fn>,
+        options: {
+            readonly focusSheetIndex?: number;
+            readonly displayFocus?: {
+                displayRowStart: number;
+                displayRowEnd: number;
+                mappingGeneration: number;
+            } | null;
+        } = {},
+    ) {
+        const prepare = sent(post_message, 'prepareHistoryReplay');
+        expect(prepare).toBeDefined();
+        const focus_sheet = options.focusSheetIndex ?? 0;
+        await dispatch_host_message({
+            type: 'historyReplayPrepared',
+            prepared: {
+                requestId: prepare.request.requestId,
+                replayId: prepare.request.replayId,
+                leaseId: 'lease-1',
+                focusSheetIndex: focus_sheet,
+                focus: prepare.request.focus,
+                cells: [],
+            },
+        });
+        const commit = sent(post_message, 'commitHistoryReplay');
+        expect(commit).toBeDefined();
+        await dispatch_host_message({
+            type: 'historyReplayCommitted',
+            committed: {
+                requestId: commit.request.requestId,
+                replayId: commit.request.replayId,
+                leaseId: commit.request.leaseId,
+                mutationId: commit.request.mutationId,
+                sourceGeneration: 1,
+                cells: [],
+                focusSheetIndex: focus_sheet,
+                focus: prepare.request.focus,
+                displayFocus: options.displayFocus === undefined
+                    ? { displayRowStart: 3, displayRowEnd: 3, mappingGeneration: 1 }
+                    : options.displayFocus,
+            },
+        });
+    }
+
+    async function refuse_prepare(
+        post_message: ReturnType<typeof vi.fn>,
+        reason: Extract<
+            HostMessage,
+            { type: 'historyReplayPrepareRefused' }
+        >['refusal']['reason'],
+    ) {
+        const prepare = sent(post_message, 'prepareHistoryReplay');
+        expect(prepare).toBeDefined();
+        await dispatch_host_message({
+            type: 'historyReplayPrepareRefused',
+            refusal: {
+                requestId: prepare.request.requestId,
+                replayId: prepare.request.replayId,
+                reason,
+            },
+        });
+    }
+
+    it('asks the host to replay, from the menu and from the keyboard alike', async () => {
+        const { post_message } = await render_app();
+        await record_highlight(post_message);
+
+        await undo_via_menu();
+        expect(sent(post_message, 'prepareHistoryReplay')).toBeDefined();
+        await complete_replay(post_message);
+        expect(JSON.parse(grid_stub().getAttribute('data-undo-labels')!)).toEqual([]);
+
+        // The same command, reached by keystroke instead. Redo now, because the
+        // undo above emptied the undo stack.
+        post_message.mockClear();
+        await press('z', { shiftKey: true });
+        expect(sent(post_message, 'prepareHistoryReplay')).toBeDefined();
+    });
+
+    it('hands the grid the region the host resolved', async () => {
+        const { post_message } = await render_app();
+        await record_highlight(post_message);
+        await undo_via_menu();
+        await complete_replay(post_message);
+
+        // Host rows, renderer columns: the source-column interval comes off the
+        // focus, because column visibility is state the host has no copy of.
+        expect(JSON.parse(grid_stub().getAttribute('data-history-focus')!)).toEqual({
+            sequence: 1,
+            sheetIndex: 0,
+            displayRowStart: 3,
+            displayRowEnd: 3,
+            sourceColumnStart: 2,
+            sourceColumnEnd: 2,
+            mappingGeneration: 1,
+        });
+        expect(grid_stub().getAttribute('data-mapping-generation')).toBe('1');
+    });
+
+    it('holds the request across the sheet switch a cross-sheet undo causes', async () => {
+        // The history is workbook-wide, so undo can land on a sheet the user is
+        // not looking at. The request has to outlive the remount to reach the grid
+        // that can honour it.
+        const { post_message } = await render_app();
+        await record_highlight(post_message);
+        await undo_via_menu();
+        await complete_replay(post_message, {
+            focusSheetIndex: 1,
+            displayFocus: { displayRowStart: 5, displayRowEnd: 5, mappingGeneration: 1 },
+        });
+
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+        const focus = JSON.parse(grid_stub().getAttribute('data-history-focus')!);
+        expect(focus.sheetIndex).toBe(1);
+        expect(focus.displayRowStart).toBe(5);
+    });
+
+    it('clears the request once the grid has consumed it', async () => {
+        const { post_message } = await render_app();
+        await record_highlight(post_message);
+        await undo_via_menu();
+        await complete_replay(post_message);
+        expect(grid_stub().getAttribute('data-history-focus')).not.toBe('null');
+
+        await click_stub_button('.stub-history-focus-applied');
+        expect(grid_stub().getAttribute('data-history-focus')).toBe('null');
+    });
+
+    it('keeps a newer request when the grid answers an older one', async () => {
+        // Two replays in a row, and the answer to the first arriving after the
+        // second was installed. Clearing on any answer would drop the live
+        // request, leaving the cursor where the first undo put it.
+        const { post_message } = await render_app();
+        await record_highlight(post_message);
+        await undo_via_menu();
+        await complete_replay(post_message);
+        post_message.mockClear();
+        await press('z', { shiftKey: true });
+        await complete_replay(post_message, {
+            displayFocus: { displayRowStart: 7, displayRowEnd: 7, mappingGeneration: 1 },
+        });
+        expect(JSON.parse(grid_stub().getAttribute('data-history-focus')!).sequence).toBe(2);
+
+        await click_stub_button('.stub-history-focus-applied-stale');
+
+        const focus = JSON.parse(grid_stub().getAttribute('data-history-focus')!);
+        expect(focus.sequence).toBe(2);
+        expect(focus.displayRowStart).toBe(7);
+    });
+
+    it('moves nothing when the local transaction could not land', async () => {
+        // A commit carrying a cell write while no edit session is held: the stores
+        // refuse to stage it, so the host has committed and the renderer has not.
+        // The guard exists for exactly that divergence — moving the cursor and
+        // flashing would advertise a change this view does not hold.
+        const { post_message } = await render_app();
+        await record_highlight(post_message);
+        await undo_via_menu();
+        const prepare = sent(post_message, 'prepareHistoryReplay');
+        await dispatch_host_message({
+            type: 'historyReplayPrepared',
+            prepared: {
+                requestId: prepare.request.requestId,
+                replayId: prepare.request.replayId,
+                leaseId: 'lease-1',
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                cells: [],
+            },
+        });
+        const commit = sent(post_message, 'commitHistoryReplay');
+        // Move the store's session out from under the write that is about to
+        // arrive. `install` is the hydration boundary that re-stamps it, and a
+        // store stamped for another session refuses to stage — the one way the
+        // renderer half of the transaction can fail while the host half succeeded.
+        (grid_shell_mock.latest_props!.edit_session as EditSessionStore)
+            .install({ session_id: 'moved-on' });
+        post_message.mockClear();
+        await dispatch_host_message({
+            type: 'historyReplayCommitted',
+            committed: {
+                requestId: commit.request.requestId,
+                replayId: commit.request.replayId,
+                leaseId: commit.request.leaseId,
+                mutationId: commit.request.mutationId,
+                sourceGeneration: 1,
+                cells: [{ ordinal: 0, resolvedSheetIndex: 0, key: '3:2', entry: null }],
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                displayFocus: { displayRowStart: 3, displayRowEnd: 3, mappingGeneration: 1 },
+            },
+        });
+
+        expect(grid_stub().getAttribute('data-history-focus')).toBe('null');
+        expect(sent(post_message, 'showWarning').message).toContain('could not be updated');
+        // And the history did not move either: the transaction is all-or-nothing.
+        expect(JSON.parse(grid_stub().getAttribute('data-undo-labels')!))
+            .toEqual(['Clear all highlights']);
+    });
+
+    it('says so when the replayed region is hidden by the view', async () => {
+        const { post_message } = await render_app();
+        await record_highlight(post_message);
+        await undo_via_menu();
+        // Every touched row filtered out: the replay landed, and the cursor has
+        // nowhere truthful to go.
+        await complete_replay(post_message, { displayFocus: null });
+
+        expect(sent(post_message, 'showWarning').message).toContain('hidden by the current view');
+        expect(grid_stub().getAttribute('data-history-focus')).toBe('null');
+    });
+
+    it('says so when the grid reports the region hidden after the fact', async () => {
+        const { post_message } = await render_app();
+        await record_highlight(post_message);
+        await undo_via_menu();
+        await complete_replay(post_message);
+        post_message.mockClear();
+
+        await click_stub_button('.stub-history-focus-hidden');
+        expect(sent(post_message, 'showWarning').message).toContain('hidden by the current view');
+    });
+
+    it('stays silent for the refusals that are not the user\'s problem', async () => {
+        for (const reason of ['busy', 'document-changed', 'malformed'] as const) {
+            const { post_message } = await render_app();
+            await record_highlight(post_message);
+            await undo_via_menu();
+            await refuse_prepare(post_message, reason);
+
+            // A held-down chord walking back a run of edits refuses as `busy` on
+            // every repeat; a warning per repeat would be unusable.
+            expect(sent(post_message, 'showWarning')).toBeUndefined();
+            cleanup();
+        }
+    });
+
+    it('reports a conflict, naming what was not applied', async () => {
+        const { post_message } = await render_app();
+        await record_highlight(post_message);
+        await undo_via_menu();
+        await refuse_prepare(post_message, 'conflict');
+
+        const warning = sent(post_message, 'showWarning');
+        expect(warning.message).toContain('the workbook changed');
+        expect(warning.message).toContain('No changes were applied');
+    });
+
+    it('reports an unreachable change without claiming a conflict', async () => {
+        const { post_message } = await render_app();
+        await record_highlight(post_message);
+        await undo_via_menu();
+        await refuse_prepare(post_message, 'unavailable');
+
+        const warning = sent(post_message, 'showWarning');
+        expect(warning.message).toContain('unavailable');
+        expect(warning.message).not.toContain('changed');
+    });
+
+    it('does nothing at all when there is nothing to undo', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'])));
+        post_message.mockClear();
+
+        await undo_via_menu();
+
+        expect(sent(post_message, 'prepareHistoryReplay')).toBeUndefined();
+        expect(sent(post_message, 'showWarning')).toBeUndefined();
+    });
+
+    it('leaves Cmd+Z to the text editor when one has focus', async () => {
+        // Decision 4. Inside an open cell editor the chord is the browser's text
+        // undo, and the history must not intercept it.
+        const { post_message } = await render_app();
+        await record_highlight(post_message);
+        const field = document.createElement('input');
+        document.body.appendChild(field);
+        field.focus();
+
+        const event = new KeyboardEvent('keydown', {
+            key: 'z',
+            metaKey: true,
+            bubbles: true,
+            cancelable: true,
+        });
+        await act(async () => { field.dispatchEvent(event); });
+
+        expect(event.defaultPrevented).toBe(false);
+        expect(sent(post_message, 'prepareHistoryReplay')).toBeUndefined();
+        field.remove();
+    });
+
+    it('routes a menu-issued undo to the text editor too, where the OS ate the chord', async () => {
+        // On the desktop the accelerator never reaches the page, so the focus check
+        // in the command handler is the only thing that can honour decision 4.
+        const exec = vi.fn(() => true);
+        // jsdom does not implement execCommand at all, so it is installed rather
+        // than spied on.
+        (document as unknown as { execCommand: unknown }).execCommand = exec;
+        const clipboard = vi.fn(async () => {});
+        vi.stubGlobal('navigator', { ...navigator, clipboard: { writeText: clipboard } });
+        try {
+            const { post_message } = await render_app();
+            await record_highlight(post_message);
+            const field = document.createElement('input');
+            field.value = 'half-typed';
+            document.body.appendChild(field);
+            field.focus();
+
+            await undo_via_menu();
+
+            // The browser's own text undo, and nothing else. Falling through to the
+            // copy path would put the editor's text on the clipboard, which is a
+            // different command entirely.
+            expect(exec).toHaveBeenCalledWith('undo');
+            expect(clipboard).not.toHaveBeenCalled();
+            expect(sent(post_message, 'prepareHistoryReplay')).toBeUndefined();
+            field.remove();
+        } finally {
+            delete (document as unknown as { execCommand?: unknown }).execCommand;
+            vi.unstubAllGlobals();
+        }
+    });
+
+    it('never leaves edit mode, and never releases the session', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message);
+        await click_button('Highlight');
+        await click_button('Clear all highlights');
+        const request = sent(post_message, 'clearAllCellHighlights');
+        await dispatch_host_message({
+            type: 'cellHighlightsChanged',
+            requestId: request.requestId,
+            stateRevision: 99,
+            physicalRevision: 1,
+            state: undefined,
+            deltas: [{ sheetIndex: 0, sourceRow: 0, sourceColumn: 0, before: 'yellow', after: null }],
+            sourceGeneration: 1,
+        });
+        post_message.mockClear();
+
+        await undo_via_menu();
+        await complete_replay(post_message);
+
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(sent(post_message, 'releaseEditSession')).toBeUndefined();
+        expect(sent(post_message, 'discardEditSession')).toBeUndefined();
     });
 });

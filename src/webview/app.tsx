@@ -106,8 +106,15 @@ import {
 import { discard_history_source } from './history-discard-model';
 import {
     create_history_replay_coordinator,
+    type AcceptedReplay,
     type HistoryReplayCoordinator,
 } from './history-replay-coordinator';
+import { history_refusal_warning } from './history-command-model';
+import {
+    history_focus_request,
+    type HistoryFocusOutcome,
+    type PendingHistoryFocus,
+} from './history-focus-model';
 import { replayed_store_entry } from './history-replay-request-model';
 import {
     absent_overlay,
@@ -147,6 +154,8 @@ import {
 import { apply_font_family, apply_font_size } from './vscode-theme';
 import {
     edit_command_target,
+    history_hotkey_command,
+    run_native_text_history,
     text_field_selection,
     type EditCommand,
 } from './edit-command';
@@ -3159,6 +3168,143 @@ export function App(): React.JSX.Element {
     }, [active_sheet_index, handle_sheet_select]);
 
     /**
+     * Where the last undo or redo landed, held until a GridShell consumes it.
+     *
+     * Held rather than applied directly, because a workbook-wide history can
+     * replay onto a sheet the user is not looking at: the switch below remounts
+     * the grid, and the request has to outlive that to reach the grid that can
+     * honour it.
+     */
+    const [history_focus, set_history_focus] = useState<PendingHistoryFocus | null>(null);
+    const history_focus_sequence_ref = useRef(0);
+
+    const handle_history_focus_applied = useCallback((
+        sequence: number,
+        outcome: HistoryFocusOutcome,
+    ) => {
+        // Only the request that was answered: a newer replay may already have
+        // replaced it, and clearing unconditionally would drop that one unapplied.
+        set_history_focus((current) => (current?.sequence === sequence ? null : current));
+        if (outcome.kind === 'rows-hidden' || outcome.kind === 'columns-hidden') {
+            // Said out loud, because the replay DID land: the durable state
+            // changed and the cursor did not move, and silence would read as
+            // nothing having happened. The filters are deliberately left alone —
+            // they are not part of history, and clearing one to expose the row
+            // would make undo mutate view state the user never asked about.
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: 'The change was undone, but the affected cells are hidden by the current view.',
+            });
+        }
+    }, []);
+
+    /**
+     * Land an accepted replay, then send the cursor after it.
+     *
+     * The focus is installed only if the local transaction COMMITTED. A focus
+     * request for writes that never landed would move the cursor to a region and
+     * flash it to advertise a change the renderer does not hold.
+     */
+    const handle_committed_history_replay = useCallback((accepted: AcceptedReplay) => {
+        const applied = apply_committed_replay(
+            accepted.committed,
+            accepted.entry,
+            accepted.direction,
+        );
+        if (!applied) {
+            // The host committed and the renderer could not follow, which no
+            // further undo can describe: the two are now telling different stories
+            // about the document.
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: 'The change was undone in the file, but this view could not be updated. Reopen the file to resynchronize.',
+            });
+            return;
+        }
+        const display_focus = accepted.committed.displayFocus;
+        if (display_focus !== null) {
+            set_history_focus(history_focus_request(
+                history_focus_sequence_ref.current += 1,
+                accepted.committed.focusSheetIndex,
+                display_focus,
+                accepted.committed.focus.sourceColumnStart,
+                accepted.committed.focus.sourceColumnEnd,
+            ));
+        } else {
+            // Every touched row is filtered out of the view. The replay succeeded;
+            // there is simply nowhere truthful for the cursor to go.
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: 'The change was undone, but the affected cells are hidden by the current view.',
+            });
+        }
+        // The cursor follows what changed, which for a workbook-wide history can be
+        // a sheet the user is not looking at.
+        //
+        // Order relative to the focus install above does not matter — both are
+        // state updates React batches into the one render, so no grid ever observes
+        // a switched sheet without the request. What DOES matter is that the
+        // request is state and not a call: the grid for that sheet has yet to
+        // mount, and it finds the request waiting when it does.
+        if (accepted.committed.focusSheetIndex !== active_sheet_index) {
+            handle_sheet_select(accepted.committed.focusSheetIndex);
+        }
+    }, [active_sheet_index, apply_committed_replay, handle_sheet_select]);
+
+    /**
+     * Undo or redo, from a keystroke or the desktop Edit menu.
+     *
+     * The one entry point into the coordinator. Everything that LANDS a replay is
+     * in the committed handler above, driven by the host's answer — this only
+     * starts one and reports why it did not happen.
+     *
+     * It never releases the edit session and never leaves edit mode: undo may put
+     * the user back into editing to restore an overlay, but it is not a way out of
+     * it.
+     */
+    const run_history_command = useCallback(async (direction: HistoryDirection) => {
+        const coordinator = replay_coordinator_ref.current;
+        if (coordinator === null) return;
+        // Read BEFORE the replay: a `blocked` refusal is about the barrier that was
+        // in the way, and the stack may move under the await.
+        const barrier_label = history_store_ref.current?.snapshot().barrier?.label;
+        const outcome = await coordinator.begin(direction);
+        if (outcome.kind !== 'refused') return;
+        const warning = history_refusal_warning(outcome.reason, direction, barrier_label);
+        if (warning !== null) host_bridge.postMessage({ type: 'showWarning', message: warning });
+    }, []);
+
+    /**
+     * Undo and redo from the keyboard, for the VS Code webview.
+     *
+     * Capture phase, because Glide consumes key events on the way up and would
+     * eat these before a bubbling listener saw them.
+     *
+     * A text target is left entirely alone — not prevented, not stopped, not
+     * acted on — so the browser's own text undo runs inside an open cell editor.
+     * That is decision 4, and here it costs nothing but an early return; on the
+     * desktop the same rule has to be enforced in `run_edit_command`, because the
+     * OS eats the accelerator before this listener could ever run.
+     *
+     * Key repeat is not filtered. Holding the chord down to walk back a run of
+     * edits is how the feature is used, and the coordinator's own busy refusal is
+     * already the throttle — a silent one, by design.
+     */
+    useEffect(() => {
+        const handler = (event: KeyboardEvent) => {
+            const command = history_hotkey_command(event);
+            if (command === undefined) return;
+            const target = event.target instanceof Element ? event.target : document.activeElement;
+            if (edit_command_target(target) === 'text') return;
+            event.preventDefault();
+            event.stopPropagation();
+            void run_history_command(command);
+        };
+        window.addEventListener('keydown', handler, true);
+        return () => window.removeEventListener('keydown', handler, true);
+    }, [run_history_command]);
+
+    /**
      * Route the host's replay answers to the coordinator, and land a committed one.
      *
      * Its own effect rather than a branch in an existing handler: those handlers'
@@ -3183,12 +3329,7 @@ export function App(): React.JSX.Element {
                     // rather than letting this handler decide on its own.
                     const accepted = coordinator.on_committed(msg.committed);
                     if (accepted === undefined) return;
-                    apply_committed_replay(accepted.committed, accepted.entry, accepted.direction);
-                    // The cursor follows what changed, which for a workbook-wide
-                    // history can be a sheet the user is not looking at.
-                    if (accepted.committed.focusSheetIndex !== active_sheet_index) {
-                        handle_sheet_select(accepted.committed.focusSheetIndex);
-                    }
+                    handle_committed_history_replay(accepted);
                     return;
                 }
                 case 'historyReplayCommitRefused':
@@ -3200,7 +3341,7 @@ export function App(): React.JSX.Element {
         };
         window.addEventListener('message', handler);
         return () => window.removeEventListener('message', handler);
-    }, [active_sheet_index, apply_committed_replay, handle_sheet_select]);
+    }, [handle_committed_history_replay]);
 
 
     // Release a deferred sheet action once the active sheet and the mounted grid
@@ -3231,6 +3372,14 @@ export function App(): React.JSX.Element {
     const run_edit_command = useCallback((command: EditCommand) => {
         const active = document.activeElement;
         if (edit_command_target(active) === 'text') {
+            // Decision 4, and the whole reason undo comes through here: inside an
+            // open cell editor Cmd/Ctrl+Z is the browser's text undo, not the
+            // workbook's. The OS consumed the accelerator before the page saw it,
+            // so this focus check is the only place that distinction can be made.
+            if (command === 'undo' || command === 'redo') {
+                run_native_text_history(command);
+                return;
+            }
             const field = active as HTMLInputElement | HTMLTextAreaElement;
             if (command === 'selectAll') {
                 field.select?.();
@@ -3246,10 +3395,14 @@ export function App(): React.JSX.Element {
             }
             return;
         }
+        if (command === 'undo' || command === 'redo') {
+            void run_history_command(command);
+            return;
+        }
         const handle = grid_actions_ref.current;
         if (command === 'selectAll') handle?.select_all();
         else handle?.copy_selection();
-    }, []);
+    }, [run_history_command]);
 
     /**
      * The only writer, so the live array and the persisted copy cannot drift.
@@ -5061,6 +5214,12 @@ export function App(): React.JSX.Element {
             row_count={effective_row_count}
             show_formatting={show_formatting}
             column_projection={current_column_projection}
+            // Read from the ref during render, which is sound because every writer
+            // of it also moves `generation` — the state this component re-renders
+            // on and the grid is keyed by — in the same message handler.
+            mapping_generation={mapping_generations_ref.current[active_sheet_index] ?? 1}
+            history_focus={history_focus}
+            on_history_focus_applied={handle_history_focus_applied}
             column_widths={column_widths[active_sheet_index] ?? {}}
             on_column_resize={handle_column_resize}
             // The host's display-keyed projection for this sheet — never `{}` under a
