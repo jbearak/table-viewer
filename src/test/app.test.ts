@@ -12613,9 +12613,17 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         // The gesture's own posts are usually noise, and clearing them is what
         // lets `sent` mean "since the gesture". A test about those posts asks to
         // keep them.
-        options: { readonly keep_posts?: boolean } = {},
+        options: {
+            readonly keep_posts?: boolean;
+            // Snapshot fields the gesture itself does not care about, for the one
+            // test that needs an edit session standing before it records.
+            readonly snapshot_extra?: SnapshotExtra;
+        } = {},
     ) {
-        const snapshot = initial_snapshot_message(make_meta(['Sheet1', 'Sheet2']));
+        const snapshot = initial_snapshot_message(
+            make_meta(['Sheet1', 'Sheet2']),
+            options.snapshot_extra ?? {},
+        );
         await dispatch_host_message(snapshot);
         await click_button('Highlight');
         await click_button('Clear all highlights');
@@ -12759,6 +12767,7 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         // focus, because column visibility is state the host has no copy of.
         expect(JSON.parse(grid_stub().getAttribute('data-history-focus')!)).toEqual({
             sequence: 1,
+            direction: 'undo',
             sheetIndex: 0,
             displayRowStart: 3,
             displayRowEnd: 3,
@@ -12866,6 +12875,189 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         const focus = JSON.parse(grid_stub().getAttribute('data-history-focus')!);
         expect(focus.sequence).toBe(2);
         expect(focus.displayRowStart).toBe(7);
+
+        // And the live request is still answerable. Not a second way of asking the
+        // same question: dropping the request is only half of what a stale answer
+        // must not do — it must also not consume the bookkeeping the real answer
+        // needs, or the second replay lands silently where the first one spoke.
+        post_message.mockClear();
+        await click_stub_button('.stub-history-focus-hidden');
+        expect(sent(post_message, 'showWarning').message)
+            .toContain('hidden by the current view');
+        expect(grid_stub().getAttribute('data-history-focus')).toBe('null');
+    });
+
+    it('describes a redo as redone, not undone', async () => {
+        // The wording is the whole point: these strings are the only account the
+        // user gets of what just happened to their document, and a redo announced
+        // as an undo says the opposite of the truth.
+        const { post_message } = await render_app();
+        await record_highlight(post_message);
+        await undo_via_menu();
+        await complete_replay(post_message);
+        post_message.mockClear();
+
+        // Redo, landing on rows the view is filtering out — the path that warns.
+        await press('z', { shiftKey: true });
+        await complete_replay(post_message, { displayFocus: null });
+        expect(sent(post_message, 'showWarning').message)
+            .toBe('The change was redone, but the affected cells are hidden by the current view.');
+
+        // And the same question asked the other way: the grid, not App, discovering
+        // the region is hidden once it tries to resolve it.
+        await record_highlight(post_message);
+        await undo_via_menu();
+        await complete_replay(post_message);
+        post_message.mockClear();
+        await press('z', { shiftKey: true });
+        await complete_replay(post_message);
+        await click_stub_button('.stub-history-focus-hidden');
+        expect(sent(post_message, 'showWarning').message)
+            .toBe('The change was redone, but the affected cells are hidden by the current view.');
+    });
+
+    it('shows the replayed sheet once the save dialog it waited behind closes', async () => {
+        // A cross-sheet replay while a Save/Discard dialog is open. The switch is
+        // refused at the time — answering that dialog against the wrong worksheet
+        // is the worse bug — and if nothing retries it, the focus request outlives
+        // the replay forever: the mounted grid correctly declines a request for
+        // another sheet, so the cursor never moves.
+        const { post_message } = await render_app();
+        await record_highlight(post_message, {
+            snapshot_extra: {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            },
+        });
+        await enter_edit_mode(post_message);
+        seed_mounted_store();
+        await click_button('Edit');
+        expect(sent(post_message, 'showSaveDialog')).toBeDefined();
+
+        await undo_via_menu();
+        await complete_replay(post_message, {
+            focusSheetIndex: 1,
+            displayFocus: { displayRowStart: 5, displayRowEnd: 5, mappingGeneration: 1 },
+        });
+        // Still on the sheet the dialog is about.
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+        expect(JSON.parse(grid_stub().getAttribute('data-history-focus')!).sheetIndex).toBe(1);
+
+        // Cancel, deliberately: it is the answer that changes nothing else, so a
+        // switch that happens after it can only be the deferred one.
+        await dispatch_host_message({ type: 'saveDialogResult', choice: 'cancel' });
+
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+        const focus = JSON.parse(grid_stub().getAttribute('data-history-focus')!);
+        expect(focus.sheetIndex).toBe(1);
+        expect(focus.displayRowStart).toBe(5);
+    });
+
+    it('forgets a waiting sheet switch when the document is replaced', async () => {
+        // The deferred switch describes a workbook that is no longer loaded: an
+        // initial snapshot clears history along with everything else, and honouring
+        // the switch would move the new document's active sheet on its behalf.
+        const { post_message } = await render_app();
+        await record_highlight(post_message, {
+            snapshot_extra: {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            },
+        });
+        await enter_edit_mode(post_message);
+        seed_mounted_store();
+        await click_button('Edit');
+        expect(sent(post_message, 'showSaveDialog')).toBeDefined();
+        await undo_via_menu();
+        await complete_replay(post_message, {
+            focusSheetIndex: 1,
+            displayFocus: { displayRowStart: 5, displayRowEnd: 5, mappingGeneration: 1 },
+        });
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1', 'Sheet2'])),
+        );
+
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+    });
+
+    it('shows the replayed sheet when the session is revoked from under the dialog', async () => {
+        // The other way the dialog goes away: the host revokes the session while it
+        // is on screen, so no answer to it ever arrives and the handler that drains
+        // the deferred switch never runs. Left there, the focus request would be
+        // stranded for the life of the window.
+        const { post_message } = await render_app();
+        await record_highlight(post_message, {
+            snapshot_extra: {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            },
+        });
+        await enter_edit_mode(post_message);
+        seed_mounted_store();
+        await click_button('Edit');
+        expect(sent(post_message, 'showSaveDialog')).toBeDefined();
+
+        await undo_via_menu();
+        await complete_replay(post_message, {
+            focusSheetIndex: 1,
+            displayFocus: { displayRowStart: 5, displayRowEnd: 5, mappingGeneration: 1 },
+        });
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('0');
+
+        // The helper builds the terminal lifecycle for this session, the way the
+        // host would after saving it out from under the dialog.
+        await dispatch_host_message({ type: 'editSessionRevoked', reason: 'saved' });
+
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+    });
+
+    it('describes a redo the view could not follow as redone', async () => {
+        // The third and last of the replay warnings, and the one that needs the
+        // divergence set up: the host committed and the renderer could not stage
+        // it. Same requirement as the other two — the verb has to match what the
+        // user asked for.
+        const { post_message } = await render_app();
+        await record_highlight(post_message);
+        await undo_via_menu();
+        await complete_replay(post_message);
+        post_message.mockClear();
+
+        await press('z', { shiftKey: true });
+        const prepare = sent(post_message, 'prepareHistoryReplay');
+        await dispatch_host_message({
+            type: 'historyReplayPrepared',
+            prepared: {
+                requestId: prepare.request.requestId,
+                replayId: prepare.request.replayId,
+                leaseId: 'lease-2',
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                cells: [],
+            },
+        });
+        const commit = sent(post_message, 'commitHistoryReplay');
+        (grid_shell_mock.latest_props!.edit_session as EditSessionStore)
+            .install({ session_id: 'moved-on' });
+        post_message.mockClear();
+        await dispatch_host_message({
+            type: 'historyReplayCommitted',
+            committed: {
+                requestId: commit.request.requestId,
+                replayId: commit.request.replayId,
+                leaseId: commit.request.leaseId,
+                mutationId: commit.request.mutationId,
+                sourceGeneration: 1,
+                cells: [{ ordinal: 0, resolvedSheetIndex: 0, key: '3:2', entry: null }],
+                focusSheetIndex: 0,
+                focus: prepare.request.focus,
+                displayFocus: { displayRowStart: 3, displayRowEnd: 3, mappingGeneration: 1 },
+            },
+        });
+
+        expect(sent(post_message, 'showWarning').message).toBe(
+            'The change was redone in the file, but this view could not be updated.'
+            + ' Reopen the file to resynchronize.',
+        );
     });
 
     it('moves nothing when the local transaction could not land', async () => {

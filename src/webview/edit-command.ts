@@ -57,14 +57,18 @@ export function text_field_selection(
  * all. Deprecated for most purposes and still the only way to reach that stack
  * from script.
  *
- * Answers whether it ran, so a caller can fall back rather than swallow the
- * command in a context where the document declined it.
+ * Best effort, and returns nothing on purpose. There is no fallback to make: the
+ * whole point of routing here is that the workbook's history must NOT move for a
+ * chord typed inside a cell editor, so a document that declines the command
+ * leaves the text as it was and that is the correct outcome. An answer would only
+ * advertise a branch no caller can act on.
  */
-export function run_native_text_history(command: 'undo' | 'redo'): boolean {
+export function run_native_text_history(command: 'undo' | 'redo'): void {
     try {
-        return document.execCommand(command);
+        document.execCommand(command);
     } catch {
-        return false;
+        // A document that refuses the command leaves the text alone, which is the
+        // same outcome as an undo with nothing to undo.
     }
 }
 

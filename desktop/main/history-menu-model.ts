@@ -18,22 +18,25 @@
  * that case would take text undo away from the CSV cell editor.
  */
 
-/** What one viewer's renderer last said about its history. */
-export interface HistoryMenuState {
-    readonly undoAvailable: boolean;
-    readonly redoAvailable: boolean;
-    /** The gesture undo would walk back, for the label. Absent when unavailable. */
-    readonly undoLabel: string | undefined;
-    /** The gesture redo would re-apply, for the label. Absent when unavailable. */
-    readonly redoLabel: string | undefined;
-    /**
-     * Focus is in a text field, so the chord means the browser's text undo. The
-     * items must be enabled regardless of the workbook stack, and labelled
-     * plainly: naming a workbook gesture on an item that will undo a keystroke
-     * inside a cell editor is worse than saying nothing.
-     */
-    readonly textEditing: boolean;
-}
+import { is_plain_record } from '../../src/plain-record';
+import type { HistoryMenuProjection } from '../../src/types';
+
+/**
+ * What one viewer's renderer last said about its history.
+ *
+ * The wire type itself, not a copy of it. The renderer builds this payload and
+ * the main process reads it, so a second declaration here would be two contracts
+ * for one message — and the first thing to drift would be whether a label is
+ * absent or present-and-undefined, which is exactly the distinction the menu
+ * turns into "Undo" versus "Undo Paste".
+ *
+ * The field worth knowing before reading the rest of this file is `textEditing`:
+ * focus is in a text field, so the chord means the browser's text undo. The items
+ * must then be enabled regardless of the workbook stack, and labelled plainly —
+ * naming a workbook gesture on an item that will undo a keystroke inside a cell
+ * editor is worse than saying nothing.
+ */
+export type HistoryMenuState = HistoryMenuProjection;
 
 /** How one menu item should read and behave. */
 export interface HistoryMenuItem {
@@ -77,15 +80,18 @@ export function history_menu_item(
  *
  * Sanitized rather than trusted, like every other message crossing the renderer
  * boundary: the payload reaches a native menu, and a label is built from workbook
- * data. Both labels are capped here as well as at the source — the renderer's
- * stack truncates them, and a menu is not the place to discover it did not.
+ * data. `is_plain_record` is the shared guard the other wire decoders use: a
+ * hand-rolled `typeof value === 'object'` would admit an array or a class
+ * instance, and would need a cast from `unknown` to read a field off it.
+ *
+ * Both labels are capped here as well as at the source — the renderer's stack
+ * truncates them, and a menu is not the place to discover it did not.
  */
 export function sanitized_history_menu_state(
     value: unknown,
 ): HistoryMenuState | undefined {
-    if (typeof value !== 'object' || value === null) return undefined;
-    const record = value as Record<string, unknown>;
-    const { undoAvailable, redoAvailable, textEditing } = record;
+    if (!is_plain_record(value)) return undefined;
+    const { undoAvailable, redoAvailable, textEditing } = value;
     if (
         typeof undoAvailable !== 'boolean'
         || typeof redoAvailable !== 'boolean'
@@ -97,8 +103,8 @@ export function sanitized_history_menu_state(
     return Object.freeze({
         undoAvailable,
         redoAvailable,
-        undoLabel: label(record.undoLabel),
-        redoLabel: label(record.redoLabel),
+        undoLabel: label(value.undoLabel),
+        redoLabel: label(value.redoLabel),
         textEditing,
     });
 }

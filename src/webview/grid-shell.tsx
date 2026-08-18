@@ -1141,6 +1141,20 @@ export function GridShell({
     const history_flash_timer_ref = useRef<number | null>(null);
     const applied_history_sequence_ref = useRef<number | null>(null);
 
+    /**
+     * Repaint the cells a flash covers, whatever `history_flash_ref` now holds.
+     *
+     * Both callers pass the same flash and want the same cells; what differs is
+     * only when they run relative to installing or clearing it. Bounded by the
+     * viewport, which is what keeps a select-all-sized replay from enumerating a
+     * million cells — `history_flash_damage` intersects with the visible rect.
+     */
+    const repaint_history_flash = useCallback((flash: HistoryFlash) => {
+        const cells = history_flash_damage(flash, visible_ref.current)
+            .map(({ cell }) => ({ cell: cell as Item }));
+        if (cells.length > 0) grid_ref.current?.updateCells(cells);
+    }, []);
+
     const clear_history_flash = useCallback(() => {
         if (history_flash_timer_ref.current !== null) {
             window.clearTimeout(history_flash_timer_ref.current);
@@ -1149,13 +1163,11 @@ export function GridShell({
         const flash = history_flash_ref.current;
         history_flash_ref.current = null;
         if (flash === null) return;
-        // Damaged AFTER clearing, so the repaint reads the cleared state and the
-        // cells come back with whatever persistent tint they actually have —
-        // conflict, dirty, or a cell highlight.
-        const cells = history_flash_damage(flash, visible_ref.current)
-            .map(({ cell }) => ({ cell: cell as Item }));
-        if (cells.length > 0) grid_ref.current?.updateCells(cells);
-    }, []);
+        // Repainted AFTER clearing, so it reads the cleared state and the cells
+        // come back with whatever persistent tint they actually have — conflict,
+        // dirty, or a cell highlight.
+        repaint_history_flash(flash);
+    }, [repaint_history_flash]);
 
     useEffect(() => clear_history_flash, [clear_history_flash]);
 
@@ -1169,16 +1181,15 @@ export function GridShell({
     useLayoutEffect(() => {
         if (history_focus === null) return;
         if (applied_history_sequence_ref.current === history_focus.sequence) return;
+        // Before resolving, not after: a request for another sheet is not this
+        // grid's to answer OR to refuse — App is mid-switch and the grid that can
+        // honour it has yet to mount — so there is nothing to resolve.
+        if (history_focus.sheetIndex !== sheet_index) return;
         const outcome = resolve_history_focus(history_focus, {
-            sheetIndex: sheet_index,
             rowCount: row_count,
-            displayColumnCount: display_column_count,
             mappingGeneration: mapping_generation,
             columnProjection: column_projection,
         });
-        // A request for another sheet is not this grid's to answer OR to refuse:
-        // App is mid-switch and the grid for that sheet has yet to mount.
-        if (history_focus.sheetIndex !== sheet_index) return;
         applied_history_sequence_ref.current = history_focus.sequence;
         if (outcome.kind !== 'applied') {
             on_history_focus_applied(history_focus.sequence, outcome);
@@ -1197,11 +1208,9 @@ export function GridShell({
         focus_grid();
 
         clear_history_flash();
-        const flash = begin_history_flash(history_focus.sequence, range, Date.now());
+        const flash = begin_history_flash(range, Date.now());
         history_flash_ref.current = flash;
-        const cells = history_flash_damage(flash, visible_ref.current)
-            .map(({ cell: damaged }) => ({ cell: damaged as Item }));
-        if (cells.length > 0) grid_ref.current?.updateCells(cells);
+        repaint_history_flash(flash);
         // No same-flash guard in the callback: a newer replay reaches
         // `clear_history_flash` above before installing its own flash, and that
         // cancels this timer — so if this ever runs, the flash it was armed for is

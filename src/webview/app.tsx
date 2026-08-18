@@ -110,7 +110,7 @@ import {
     type AcceptedReplay,
     type HistoryReplayCoordinator,
 } from './history-replay-coordinator';
-import { history_refusal_warning } from './history-command-model';
+import { history_refusal_warning, replayed_verb } from './history-command-model';
 import {
     history_menu_projection,
     history_menu_projections_equal,
@@ -1300,6 +1300,12 @@ export function App(): React.JSX.Element {
                 || incoming.operation.editSessionId === current_session_id
             ) {
                 hydrate_and_install(incoming.operation, 'tombstone');
+                // A Save/Discard dialog still on screen names a session that no
+                // longer exists, so no answer to it can ever match — and the ref
+                // is what makes `handle_sheet_select` decline. Left set, tab
+                // switching stays blocked for the life of the window, and any
+                // switch deferred behind it never runs.
+                pending_save_dialog_ref.current = null;
                 set_csv_edit_session_id(undefined);
                 set_edit_session_pending(false);
                 set_edit_mode(false);
@@ -1974,6 +1980,10 @@ export function App(): React.JSX.Element {
                         set_edit_session_pending(false);
                         pending_edit_request_ref.current = null;
                         pending_save_dialog_ref.current = null;
+                        // The document is being replaced, which clears history with
+                        // it: a switch a replay asked for describes a workbook that
+                        // is no longer loaded.
+                        deferred_history_sheet_ref.current = null;
                     }
                     // A highlight request names the basis it was sent against, and
                     // its reply is filtered on that basis matching the live one — so
@@ -3184,6 +3194,45 @@ export function App(): React.JSX.Element {
     /** The last projection posted, so an unchanged one is not posted again. */
     const history_menu_state_ref = useRef<HistoryMenuProjection | undefined>(undefined);
     const history_focus_sequence_ref = useRef(0);
+    /**
+     * The live request, mirrored so a callback can read it without depending on
+     * it. `handle_history_focus_applied` is handed to the grid and must not be
+     * rebuilt every time a replay installs a new request.
+     */
+    const history_focus_ref = useRef<PendingHistoryFocus | null>(null);
+
+    /**
+     * A sheet a committed replay wants shown, still waiting for its turn.
+     *
+     * A ref rather than state because the thing that unblocks it — the save
+     * dialog closing — is itself a ref, so no render is guaranteed to follow and
+     * an effect would not re-run. The drain is therefore explicit, from the
+     * handler that answers the dialog.
+     */
+    const deferred_history_sheet_ref = useRef<number | null>(null);
+
+    /**
+     * Show the sheet a replay landed on, if we are allowed to right now.
+     *
+     * Idempotent and safe to call from either side: it clears the request only
+     * once the switch has actually been made.
+     */
+    const switch_to_history_sheet = useCallback(() => {
+        const sheet_index = deferred_history_sheet_ref.current;
+        if (sheet_index === null) return;
+        if (pending_save_dialog_ref.current) return;
+        deferred_history_sheet_ref.current = null;
+        handle_sheet_select(sheet_index);
+    }, [handle_sheet_select]);
+
+    // Retried on every render, because the drain in the save-dialog handler covers
+    // the ordinary case but not every way that dialog can go away: the host can
+    // revoke the session underneath it, and editing can become unavailable. Those
+    // paths all change state, so a render follows, and this is a ref read and a
+    // return whenever there is nothing waiting.
+    useEffect(() => {
+        switch_to_history_sheet();
+    });
 
     const handle_history_focus_applied = useCallback((
         sequence: number,
@@ -3191,6 +3240,13 @@ export function App(): React.JSX.Element {
     ) => {
         // Only the request that was answered: a newer replay may already have
         // replaced it, and clearing unconditionally would drop that one unapplied.
+        // Matched against the ref rather than inside the updater, because the
+        // answer decides whether to warn as well as what to clear, and a state
+        // updater that also posted a message would post it twice under
+        // StrictMode's double invocation.
+        const answered = history_focus_ref.current;
+        if (answered === null || answered.sequence !== sequence) return;
+        history_focus_ref.current = null;
         set_history_focus((current) => (current?.sequence === sequence ? null : current));
         if (outcome.kind === 'rows-hidden' || outcome.kind === 'columns-hidden') {
             // Said out loud, because the replay DID land: the durable state
@@ -3200,7 +3256,7 @@ export function App(): React.JSX.Element {
             // would make undo mutate view state the user never asked about.
             host_bridge.postMessage({
                 type: 'showWarning',
-                message: 'The change was undone, but the affected cells are hidden by the current view.',
+                message: `The change was ${replayed_verb(answered.direction)}, but the affected cells are hidden by the current view.`,
             });
         }
     }, []);
@@ -3224,25 +3280,28 @@ export function App(): React.JSX.Element {
             // about the document.
             host_bridge.postMessage({
                 type: 'showWarning',
-                message: 'The change was undone in the file, but this view could not be updated. Reopen the file to resynchronize.',
+                message: `The change was ${replayed_verb(accepted.direction)} in the file, but this view could not be updated. Reopen the file to resynchronize.`,
             });
             return;
         }
         const display_focus = accepted.committed.displayFocus;
         if (display_focus !== null) {
-            set_history_focus(history_focus_request(
+            const request = history_focus_request(
                 history_focus_sequence_ref.current += 1,
+                accepted.direction,
                 accepted.committed.focusSheetIndex,
                 display_focus,
                 accepted.committed.focus.sourceColumnStart,
                 accepted.committed.focus.sourceColumnEnd,
-            ));
+            );
+            history_focus_ref.current = request;
+            set_history_focus(request);
         } else {
             // Every touched row is filtered out of the view. The replay succeeded;
             // there is simply nowhere truthful for the cursor to go.
             host_bridge.postMessage({
                 type: 'showWarning',
-                message: 'The change was undone, but the affected cells are hidden by the current view.',
+                message: `The change was ${replayed_verb(accepted.direction)}, but the affected cells are hidden by the current view.`,
             });
         }
         // The cursor follows what changed, which for a workbook-wide history can be
@@ -3254,9 +3313,20 @@ export function App(): React.JSX.Element {
         // request is state and not a call: the grid for that sheet has yet to
         // mount, and it finds the request waiting when it does.
         if (accepted.committed.focusSheetIndex !== active_sheet_index) {
-            handle_sheet_select(accepted.committed.focusSheetIndex);
+            // Remembered, not fired and forgotten: `handle_sheet_select` declines
+            // while a Save/Discard dialog is open — answering that dialog against
+            // the wrong worksheet is the worse bug — and nothing else would retry.
+            // Without this the focus request outlives the replay forever, because
+            // the mounted grid correctly refuses a request for another sheet, so
+            // the cursor never moves and the flash never fires.
+            deferred_history_sheet_ref.current = accepted.committed.focusSheetIndex;
+            switch_to_history_sheet();
         }
-    }, [active_sheet_index, apply_committed_replay, handle_sheet_select]);
+    }, [
+        active_sheet_index,
+        apply_committed_replay,
+        switch_to_history_sheet,
+    ]);
 
     /**
      * Keep the desktop's native Edit menu in step with the history.
@@ -3279,9 +3349,9 @@ export function App(): React.JSX.Element {
             store.snapshot(),
             edit_command_target(document.activeElement) === 'text',
         );
-        if (history_menu_state_ref.current !== undefined
-            && history_menu_projections_equal(history_menu_state_ref.current, projection)
-        ) return;
+        // The helper already answers false for a ref that has never been posted,
+        // which is what makes the first publish happen.
+        if (history_menu_projections_equal(history_menu_state_ref.current, projection)) return;
         history_menu_state_ref.current = projection;
         host_bridge.postMessage({ type: 'historyMenuStateChanged', state: projection });
     }, []);
@@ -4178,6 +4248,12 @@ export function App(): React.JSX.Element {
                     || pending_dialog.editSessionId !== msg.editSessionId
                 ) return;
                 pending_save_dialog_ref.current = null;
+                // A cross-sheet replay that arrived while this dialog was open is
+                // still waiting to be shown. Drained before the choice is acted
+                // on, so the switch happens whatever the answer was — including
+                // 'cancel', which otherwise returns control with the cursor
+                // stranded on the wrong sheet.
+                switch_to_history_sheet();
                 if (msg.choice === 'save') {
                     if (request_save_or_remain_dirty()) {
                         pending_exit_ref.current = true;
@@ -4265,6 +4341,7 @@ export function App(): React.JSX.Element {
         discard_edit_session,
         install_edit_session,
         handle_sheet_select,
+        switch_to_history_sheet,
         leave_edit_mode,
         persist_immediate,
         request_save_or_remain_dirty,

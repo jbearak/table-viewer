@@ -3370,6 +3370,9 @@ describe('the cursor and flash an undo leaves behind', () => {
 
     const request = {
         sequence: 1,
+        // The grid does not read this — it is App that turns it into wording — but
+        // the request type carries it, so the fixture does too.
+        direction: 'undo' as const,
         sheetIndex: 0,
         displayRowStart: 4,
         displayRowEnd: 5,

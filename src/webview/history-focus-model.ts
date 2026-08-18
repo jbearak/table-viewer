@@ -11,6 +11,7 @@
 import type { CellRect } from './selection-glide';
 import type { ColumnProjection } from './column-projection';
 import type { HistoryReplayDisplayFocus } from '../history-replay-protocol';
+import type { HistoryDirection } from './history-cell-state-model';
 
 /**
  * How long the replayed region stays tinted.
@@ -24,6 +25,14 @@ export const HISTORY_FLASH_DURATION_MS = 550;
 export interface PendingHistoryFocus {
     /** Monotonic, so a GridShell acknowledges exactly the request it applied. */
     readonly sequence: number;
+    /**
+     * Which way the replay that produced this went.
+     *
+     * Carried on the request rather than read off the live stack when the answer
+     * comes back: the grid may answer one replay while a second is already out,
+     * and the warning has to describe the replay it is answering for.
+     */
+    readonly direction: HistoryDirection;
     readonly sheetIndex: number;
     readonly displayRowStart: number;
     readonly displayRowEnd: number;
@@ -48,9 +57,7 @@ export type HistoryFocusOutcome =
     | { readonly kind: 'empty-grid' };
 
 export interface HistoryFocusView {
-    readonly sheetIndex: number;
     readonly rowCount: number;
-    readonly displayColumnCount: number;
     readonly mappingGeneration: number;
     readonly columnProjection: ColumnProjection;
 }
@@ -70,11 +77,15 @@ export function resolve_history_focus(
     request: PendingHistoryFocus,
     view: HistoryFocusView,
 ): HistoryFocusOutcome {
-    if (request.sheetIndex !== view.sheetIndex) return { kind: 'stale-mapping' };
     // The host resolved these display rows against a mapping that has since
     // moved, so they describe a view that no longer exists.
+    //
+    // Whether the request is even for THIS sheet is the caller's question, not
+    // this one's: a grid that is not the target must neither apply the request nor
+    // refuse it, because the grid that can honour it has yet to mount.
     if (request.mappingGeneration !== view.mappingGeneration) return { kind: 'stale-mapping' };
-    if (view.rowCount <= 0 || view.displayColumnCount <= 0) return { kind: 'empty-grid' };
+    const display_column_count = view.columnProjection.visible_to_source.length;
+    if (view.rowCount <= 0 || display_column_count <= 0) return { kind: 'empty-grid' };
 
     // Clamped rather than refused: rows arrive from the host and the renderer's
     // own row count is what Glide will index, so a request that overhangs it is
@@ -91,7 +102,7 @@ export function resolve_history_focus(
         source_column += 1
     ) {
         const display_column = view.columnProjection.source_to_visible[source_column];
-        if (display_column === undefined || display_column >= view.displayColumnCount) continue;
+        if (display_column === undefined || display_column >= display_column_count) continue;
         if (column_start === undefined || display_column < column_start) {
             column_start = display_column;
         }
@@ -119,17 +130,21 @@ export function resolve_history_focus(
  * test can ask what the grid paints at any instant without waiting for one.
  */
 export interface HistoryFlash {
-    readonly sequence: number;
     readonly range: CellRect;
     readonly expiresAt: number;
 }
 
+/**
+ * No replay identity in here, deliberately. A flash is a range and a deadline:
+ * the only code that could have wanted to know WHICH replay it belonged to was a
+ * guard in the expiry callback, and that guard was unreachable — a newer replay
+ * cancels the pending timer before installing its own flash.
+ */
 export function begin_history_flash(
-    sequence: number,
     range: CellRect,
     now: number,
 ): HistoryFlash {
-    return Object.freeze({ sequence, range, expiresAt: now + HISTORY_FLASH_DURATION_MS });
+    return Object.freeze({ range, expiresAt: now + HISTORY_FLASH_DURATION_MS });
 }
 
 /** Whether a display cell is tinted by this flash at `now`. */
@@ -174,6 +189,7 @@ export function history_flash_damage(
 /** The display focus a committed replay reported, as a request App can hold. */
 export function history_focus_request(
     sequence: number,
+    direction: HistoryDirection,
     sheet_index: number,
     display_focus: HistoryReplayDisplayFocus,
     source_column_start: number,
@@ -181,6 +197,7 @@ export function history_focus_request(
 ): PendingHistoryFocus {
     return Object.freeze({
         sequence,
+        direction,
         sheetIndex: sheet_index,
         displayRowStart: display_focus.displayRowStart,
         displayRowEnd: display_focus.displayRowEnd,

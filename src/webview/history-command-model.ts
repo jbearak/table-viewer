@@ -14,6 +14,18 @@ function verb(direction: HistoryDirection): string {
 }
 
 /**
+ * How to describe a replay that already landed: "undone" or "redone".
+ *
+ * Direction-aware because these strings tell the user what happened to their
+ * document, and a redo announced as an undo says the opposite of the truth. It
+ * lives here rather than at the call sites for the same reason the refusal
+ * warnings do — the wording is the policy.
+ */
+export function replayed_verb(direction: HistoryDirection): string {
+    return direction === 'undo' ? 'undone' : 'redone';
+}
+
+/**
  * The warning a refusal deserves, or `null` for the ones that deserve silence.
  *
  * Silent, deliberately:

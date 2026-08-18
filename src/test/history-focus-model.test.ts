@@ -14,6 +14,7 @@ import {
 function request(overrides: Partial<PendingHistoryFocus> = {}): PendingHistoryFocus {
     return {
         sequence: 1,
+        direction: 'undo',
         sheetIndex: 0,
         displayRowStart: 2,
         displayRowEnd: 4,
@@ -26,9 +27,7 @@ function request(overrides: Partial<PendingHistoryFocus> = {}): PendingHistoryFo
 
 function view(overrides: Partial<HistoryFocusView> = {}): HistoryFocusView {
     return {
-        sheetIndex: 0,
         rowCount: 100,
-        displayColumnCount: 5,
         mappingGeneration: 3,
         columnProjection: create_column_projection(5),
         ...overrides,
@@ -80,11 +79,6 @@ describe('resolve_history_focus', () => {
             .toEqual({ kind: 'stale-mapping' });
     });
 
-    it('declines a request for another sheet', () => {
-        expect(resolve_history_focus(request({ sheetIndex: 1 }), view()))
-            .toEqual({ kind: 'stale-mapping' });
-    });
-
     it('clamps rows to what the grid will actually index', () => {
         const outcome = resolve_history_focus(
             request({ displayRowStart: 8, displayRowEnd: 40 }),
@@ -100,8 +94,11 @@ describe('resolve_history_focus', () => {
     it('reports an empty grid rather than selecting into one', () => {
         expect(resolve_history_focus(request(), view({ rowCount: 0 })))
             .toEqual({ kind: 'empty-grid' });
-        expect(resolve_history_focus(request(), view({ displayColumnCount: 0 })))
-            .toEqual({ kind: 'empty-grid' });
+        // No visible column at all, which the projection is the only witness to:
+        // the column count is derived from it rather than passed alongside it.
+        expect(resolve_history_focus(request(), view({
+            columnProjection: create_column_projection(0),
+        }))).toEqual({ kind: 'empty-grid' });
     });
 });
 
@@ -109,7 +106,7 @@ describe('the history flash', () => {
     const range = { x: 1, y: 2, width: 2, height: 2 };
 
     it('covers its own rectangle until the deadline, and nothing after', () => {
-        const flash = begin_history_flash(7, range, 1_000);
+        const flash = begin_history_flash(range, 1_000);
         expect(flash.expiresAt).toBe(1_000 + HISTORY_FLASH_DURATION_MS);
         expect(history_flash_covers(flash, 1, 2, 1_000)).toBe(true);
         expect(history_flash_covers(flash, 2, 3, flash.expiresAt - 1)).toBe(true);
@@ -118,7 +115,7 @@ describe('the history flash', () => {
     });
 
     it('covers nothing outside the rectangle, and nothing when absent', () => {
-        const flash = begin_history_flash(7, range, 0);
+        const flash = begin_history_flash(range, 0);
         expect(history_flash_covers(flash, 0, 2, 0)).toBe(false);
         expect(history_flash_covers(flash, 3, 2, 0)).toBe(false);
         expect(history_flash_covers(flash, 1, 4, 0)).toBe(false);
@@ -129,7 +126,7 @@ describe('the history flash', () => {
         // A replay can span far more than the screen. Repainting off-screen cells
         // costs exactly as much as repainting visible ones and shows the user
         // nothing.
-        const flash = begin_history_flash(1, { x: 0, y: 0, width: 500, height: 200_000 }, 0);
+        const flash = begin_history_flash({ x: 0, y: 0, width: 500, height: 200_000 }, 0);
         const damage = history_flash_damage(flash, { x: 2, y: 10, width: 3, height: 2 });
         expect(damage.map((item) => item.cell)).toEqual([
             [2, 10], [2, 11], [3, 10], [3, 11], [4, 10], [4, 11],
@@ -137,7 +134,7 @@ describe('the history flash', () => {
     });
 
     it('damages nothing when the flash is scrolled out of view', () => {
-        const flash = begin_history_flash(1, { x: 0, y: 0, width: 2, height: 2 }, 0);
+        const flash = begin_history_flash({ x: 0, y: 0, width: 2, height: 2 }, 0);
         expect(history_flash_damage(flash, { x: 40, y: 900, width: 5, height: 5 })).toEqual([]);
     });
 });
@@ -146,6 +143,7 @@ describe('history_focus_request', () => {
     it('carries the host rows and the renderer-resolved columns together', () => {
         const built = history_focus_request(
             9,
+            'redo',
             1,
             { displayRowStart: 4, displayRowEnd: 6, mappingGeneration: 2 },
             3,
@@ -153,6 +151,9 @@ describe('history_focus_request', () => {
         );
         expect(built).toEqual({
             sequence: 9,
+            // The direction rides along so the warning for a hidden region can say
+            // "redone" rather than guessing from a stack that may already have moved.
+            direction: 'redo',
             sheetIndex: 1,
             displayRowStart: 4,
             displayRowEnd: 6,
