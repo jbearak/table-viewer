@@ -497,6 +497,27 @@ describe('history_replay_proposal_digest', () => {
             .not.toBe(history_replay_proposal_digest(styled!));
     });
 
+    it('separates a link left alone from a link cleared', () => {
+        // Absent and `null` are different instructions on the link dimension —
+        // "leave it" versus "clear it" (see `CsvDirtyEntry`) — so they must not
+        // digest alike, or a link-only difference reads as a duplicate commit.
+        const untouched = sanitized_commit_history_replay_request(commit_request({
+            cells: [{ ordinal: 0, entry: { value: 'typed', base: 'disk' } }],
+        }));
+        const cleared = sanitized_commit_history_replay_request(commit_request({
+            // Both link keys, because the strict guard takes the dimension as a
+            // pair — that is what "clear it" looks like on the wire.
+            cells: [{
+                ordinal: 0,
+                entry: { value: 'typed', base: 'disk', link: null, baseLink: null },
+            }],
+        }));
+        expect(untouched).toBeDefined();
+        expect(cleared).toBeDefined();
+        expect(history_replay_proposal_digest(untouched!))
+            .not.toBe(history_replay_proposal_digest(cleared!));
+    });
+
     it('separates a legacy string from an entry whose value equals it', () => {
         // The two differ only in whether the base was observed, which is exactly
         // the fact a proposal must not blur.

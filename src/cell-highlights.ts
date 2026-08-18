@@ -1,4 +1,5 @@
 import type { SheetMeta, WorkbookMeta } from './data-source/interface';
+import { cell_key, parse_cell_key, type CellKeyCoordinates } from './cell-key';
 import {
     CELL_HIGHLIGHT_COLORS,
     transform_schema_for_sheet,
@@ -15,10 +16,11 @@ export interface CellHighlightPatch {
     readonly cells: Readonly<Record<string, CellHighlightColor | null | undefined>>;
 }
 
-export interface ParsedCellHighlightKey {
-    readonly sourceRow: number;
-    readonly sourceColumn: number;
-}
+/**
+ * Retained as an alias of the shared shape: highlight keys ARE cell keys, and the
+ * name is what the highlight call sites read by.
+ */
+export type ParsedCellHighlightKey = CellKeyCoordinates;
 
 const HIGHLIGHT_COLORS = new Set<CellHighlightColor>(CELL_HIGHLIGHT_COLORS);
 
@@ -34,31 +36,14 @@ export function sanitize_cell_highlight_color(
 export function parse_cell_highlight_key(
     key: unknown,
 ): ParsedCellHighlightKey | undefined {
-    if (typeof key !== 'string' || !/^(0|[1-9]\d*):(0|[1-9]\d*)$/.test(key)) {
-        return undefined;
-    }
-    const separator = key.indexOf(':');
-    const source_row = Number(key.slice(0, separator));
-    const source_column = Number(key.slice(separator + 1));
-    if (!Number.isSafeInteger(source_row) || !Number.isSafeInteger(source_column)) {
-        return undefined;
-    }
-    return { sourceRow: source_row, sourceColumn: source_column };
+    return parse_cell_key(key);
 }
 
 export function cell_highlight_key(
     source_row: number,
     source_column: number,
 ): string {
-    if (
-        !Number.isSafeInteger(source_row)
-        || source_row < 0
-        || !Number.isSafeInteger(source_column)
-        || source_column < 0
-    ) {
-        throw new RangeError('Cell highlight coordinates must be non-negative safe integers.');
-    }
-    return `${source_row}:${source_column}`;
+    return cell_key(source_row, source_column);
 }
 
 export function sanitize_sheet_cell_highlights(

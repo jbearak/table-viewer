@@ -2896,6 +2896,25 @@ describe('GridShell stable rows during an edit session', () => {
         );
     });
 
+    it('grows no row for a gesture the replay reservation refuses', async () => {
+        // `run_edit_gesture` drops a batch that is not admitted, so nothing reaches
+        // the store or the history. The row resize is a DURABLE host write and runs
+        // per item on the way there, so without the same gate a refused paste
+        // persisted a height for text the document never took.
+        const on_row_resize = vi.fn();
+        const display_to_source = [1, 3, 0, 2];
+        install_permutation(display_to_source);
+        await render_grid(stable_props(
+            display_to_source,
+            { sort: [], filters: [] },
+            { on_row_resize, gestures_admitted: () => false },
+        ));
+        const on_cell_edited = edit_one(grid_mock.props!.onCellsEdited);
+        await act(async () => on_cell_edited([0, 0], { kind: 'text', data: MULTILINE }));
+
+        expect(on_row_resize).not.toHaveBeenCalled();
+    });
+
     it('grows the row for a multiline edit when not transformed', async () => {
         const on_row_resize = vi.fn();
         await commit_multiline(false, on_row_resize);

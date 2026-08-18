@@ -785,8 +785,15 @@ export function history_replay_proposal_digest(
                 write.entry.base,
                 write.entry.valueRuns ?? null,
                 write.entry.baseRuns ?? null,
-                write.entry.link ?? null,
-                write.entry.baseLink ?? null,
+                // Presence-tagged, not `?? null`: for the link dimensions ABSENT
+                // and `null` are different instructions — "leave the cell's link
+                // alone" versus "clear it" (see `CsvDirtyEntry`) — so collapsing
+                // them made two genuinely different proposals digest alike, and a
+                // link-only difference read as a duplicate commit. The run sides
+                // above carry no such distinction: absent and null both mean no
+                // runs.
+                'link' in write.entry ? ['set', write.entry.link] : ['absent'],
+                'baseLink' in write.entry ? ['set', write.entry.baseLink] : ['absent'],
             ],
         ]);
     const highlights = [...request.highlights]

@@ -478,10 +478,31 @@ export class ViewerWindowManager {
             const error = new Error('Viewer renderer was replaced by a successful navigation.');
             for (const listener of [...renderer_generation_listeners]) listener(error);
         };
+        /**
+         * Drops this window's Undo/Redo projection and rebuilds the menu.
+         *
+         * The projection is retained across focus changes on purpose, so nothing
+         * else clears it — which means a renderer that has gone away leaves its
+         * last words standing, and the Edit menu offers an Undo that no renderer
+         * is listening for. A replacement renderer posts its own state as soon as
+         * it has one; until then the items read as they do for any non-viewer
+         * window.
+         */
+        const forget_history_menu = () => {
+            if (entry === undefined || entry.history_menu === undefined) return;
+            entry.history_menu = undefined;
+            this.on_history_menu_changed(window);
+        };
         const report_renderer_loss = (error: Error, retryable = false) => {
+            // Not on a retryable loss: an unresponsive renderer is still the one
+            // holding the history, and it will not repost when it comes back.
+            if (!retryable) forget_history_menu();
             for (const listener of [...renderer_loss_listeners]) listener(error, retryable);
         };
-        const on_main_frame_navigated = () => report_renderer_generation_change();
+        const on_main_frame_navigated = () => {
+            forget_history_menu();
+            report_renderer_generation_change();
+        };
         const on_failed_load = (
             _event: Electron.Event,
             error_code: number,

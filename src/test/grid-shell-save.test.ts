@@ -256,9 +256,6 @@ async function render_grid(
             }));
         });
     };
-    // Model what App does on a transform/refresh ack: the generation bump moves
-    // GridShell's key, so the mount is destroyed and rebuilt. The key lives in
-    // App, so the test has to supply one to force the unmount.
     const rerender_highlight_in_flight = async (highlight_in_flight: boolean) => {
         await act(async () => {
             root!.render(React.createElement(GridShell, {
@@ -267,6 +264,9 @@ async function render_grid(
             }));
         });
     };
+    // Model what App does on a transform/refresh ack: the generation bump moves
+    // GridShell's key, so the mount is destroyed and rebuilt. The key lives in
+    // App, so the test has to supply one to force the unmount.
     const remount_at_generation = async (generation: number) => {
         await act(async () => {
             root!.render(React.createElement(GridShell, {

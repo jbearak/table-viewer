@@ -1,3 +1,4 @@
+import { cell_key } from '../cell-key';
 import React, {
     useState,
     useEffect,
@@ -574,6 +575,10 @@ export function App(): React.JSX.Element {
      * reservation the next keypress is refused against.
      */
     const ensure_replay_session_ref = useRef<(() => Promise<boolean>) | null>(null);
+    // Declared before the block below rather than after it: the block closes over
+    // this ref, and while `next_id` is only ever called later, a `const` read from
+    // its own TDZ is a throw waiting for someone to move a call.
+    const replay_id_counter_ref = useRef(0);
     if (replay_coordinator_ref.current === null) {
         replay_coordinator_ref.current = create_history_replay_coordinator({
             history: () => history_store_ref.current!.snapshot(),
@@ -588,7 +593,7 @@ export function App(): React.JSX.Element {
                 const sheet_index = worksheet_target_index(sheets, worksheet);
                 if (sheet_index === undefined) return undefined;
                 const store = edit_session_registry_ref.current!.for_sheet(sheet_index);
-                const entry = store.get(`${source_row}:${source_column}`);
+                const entry = store.get(cell_key(source_row, source_column));
                 // Absent is a fact about a cell we CAN see. The registry answers
                 // for every sheet in the workbook, so there is no third state
                 // here — an unopened sheet's store is simply empty.
@@ -600,7 +605,6 @@ export function App(): React.JSX.Element {
             next_id: (prefix) => `${prefix}-${++replay_id_counter_ref.current}`,
         });
     }
-    const replay_id_counter_ref = useRef(0);
 
     /**
      * Land a committed replay: the stores and the history move as ONE transaction.
@@ -1088,7 +1092,6 @@ export function App(): React.JSX.Element {
         // throws away and therefore part of what undoing it restores. Left open, it
         // would be dropped by the exit below with nothing in history describing it.
         editing_ref.current?.commit_live_edit();
-        fence_edit_session_exit(csv_edit_session_id);
         // Emptying the stores and recording what was emptied are ONE transaction;
         // the invariant and its outcomes live in the model.
         const outcome = run_discard_transaction({
@@ -1097,8 +1100,16 @@ export function App(): React.JSX.Element {
             sessionId: csv_edit_session_id,
             sheets: meta_ref.current?.sheets ?? [],
         });
-        // Nothing was emptied and nothing recorded, so the user presses it again.
+        // Nothing was emptied and nothing recorded, so the user presses it again —
+        // which is why the fence comes AFTER this and not before. Fenced first,
+        // this return would leave the session alive but its admission stopped and
+        // its publication silenced: the user stays in edit mode with their edits,
+        // unable to type, and nothing else lowers the fence for a session that is
+        // never leaving.
         if (outcome.kind === 'abandoned') return;
+        // Past the point of no return, and before the terminal message reaches the
+        // host, which is the ordering the fence exists for.
+        fence_edit_session_exit(csv_edit_session_id);
         if (outcome.kind === 'unrecordable') {
             host_bridge.postMessage({
                 type: 'showWarning',
@@ -3804,7 +3815,12 @@ export function App(): React.JSX.Element {
         }
         return grant.settled;
     }, []);
-    ensure_replay_session_ref.current = ensure_replay_session;
+    // In an effect, not the render body: a render-phase write is a side effect,
+    // and StrictMode's double render makes that a rule with teeth. A layout effect
+    // is early enough — nothing calls this before the user asks for a replay.
+    useLayoutEffect(() => {
+        ensure_replay_session_ref.current = ensure_replay_session;
+    }, [ensure_replay_session]);
 
     const handle_toggle_edit_mode = useCallback(() => {
         const entering = !edit_mode;

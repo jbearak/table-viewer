@@ -43,6 +43,25 @@ const grid_shell_mock = vi.hoisted(() => ({
     listen_for_save_result: false,
 }));
 
+// A discard transaction that can be made to abandon on demand. `abandoned` is the
+// concurrent-keystroke outcome — a staging invalidated before it could commit —
+// and it is unreachable from outside without racing the store, so the outcome is
+// forced instead. Off by default: every other test wants the real transaction.
+const discard_transaction_mock = vi.hoisted(() => ({ abandon: false }));
+vi.mock('../webview/discard-transaction-model', async (import_original) => {
+    const actual = await import_original<
+        typeof import('../webview/discard-transaction-model')
+    >();
+    return {
+        ...actual,
+        run_discard_transaction: (
+            args: Parameters<typeof actual.run_discard_transaction>[0],
+        ) => (discard_transaction_mock.abandon
+            ? { kind: 'abandoned' as const }
+            : actual.run_discard_transaction(args)),
+    };
+});
+
 // Stand-in store for the handful of renders that don't pass one, so the stub can
 // call useSyncExternalStore unconditionally. Both functions are constants: an
 // unstable subscribe would resubscribe every render, and an unstable snapshot
@@ -901,6 +920,7 @@ function cleanup() {
 }
 
 afterEach(() => {
+    discard_transaction_mock.abandon = false;
     cleanup();
 });
 
@@ -7633,6 +7653,38 @@ describe('edit mode save exit', () => {
         expect(grid_shell_mock.stop_edit_admission.mock.invocationCallOrder[0])
             .toBeLessThan(discard_call!);
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('false');
+    });
+
+    it('leaves editing usable when a discard abandons', async () => {
+        // The abandoned outcome means nothing was emptied and nothing recorded, so
+        // the user is expected to press Discard again. Fencing before the
+        // transaction stopped edit admission for a session that is not leaving:
+        // still in edit mode, still holding the edits, unable to type, and nothing
+        // lowers the fence.
+        discard_transaction_mock.abandon = true;
+        grid_shell_mock.is_dirty = true;
+        grid_shell_mock.has_uncommitted_changes = true;
+
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                },
+            })
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, ['0:0']);
+
+        post_message.mockClear();
+        await click_button('Discard All');
+
+        expect(grid_shell_mock.stop_edit_admission).not.toHaveBeenCalled();
+        expect(post_message).not.toHaveBeenCalledWith(
+            expect.objectContaining({ type: 'discardEditSession' }),
+        );
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
     });
 
     it('refuses a discard while a highlight gesture awaits the host', async () => {

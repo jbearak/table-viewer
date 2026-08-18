@@ -18,6 +18,7 @@ import {
 } from './cell-content';
 import { is_valid_hyperlink } from './pending-changes';
 import { is_plain_record } from './plain-record';
+import { is_canonical_cell_key } from './cell-key';
 // Type-only, and deliberately so: `history-replay-protocol.ts` imports this
 // module's sanitizers, so a value import here would close a runtime cycle. The
 // `import type` is erased, and the protocol module stays the one place that
@@ -748,13 +749,6 @@ function validate_column_visibility(value: unknown): void {
             invalid_leaf('columnVisibility');
         }
     }
-}
-
-function is_canonical_cell_key(value: string): boolean {
-    const match = /^(0|[1-9]\d*):(0|[1-9]\d*)$/.exec(value);
-    return match !== null
-        && Number.isSafeInteger(Number(match[1]))
-        && Number.isSafeInteger(Number(match[2]));
 }
 
 function validate_cell_highlights(value: unknown): void {

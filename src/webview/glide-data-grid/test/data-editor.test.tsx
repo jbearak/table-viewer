@@ -11,7 +11,7 @@ import {
     isSizedGridColumn,
     type Item,
 } from "../index.js";
-import type { CustomCell, SizedGridColumn } from "../internal/data-grid/data-grid-types.js";
+import type { CustomCell, EditListItem, SizedGridColumn } from "../internal/data-grid/data-grid-types.js";
 import type { DataEditorRef } from "../data-editor/data-editor.js";
 import { assert } from "../common/support.js";
 import { vi, type Mock, expect, describe, test, beforeEach, afterEach } from "vitest";
@@ -1639,6 +1639,63 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
                 rangeStack: [],
             },
         });
+    });
+
+    test("Fork: one Delete keypress emits one batch across ranges and rows", async () => {
+        // The consumer records one undoable action per batch, so a batch per
+        // cleared range meant a multi-range Delete took several undos to walk
+        // back. One keypress is one gesture.
+        const editSpy = vi.fn();
+
+        vi.useFakeTimers();
+        render(
+            <DataEditor
+                {...basicProps}
+                onCellsEdited={editSpy}
+                gridSelection={{
+                    columns: CompactSelection.empty(),
+                    // A whole row on top of a primary range and a secondary one:
+                    // three separate deleteRange calls before the fix.
+                    rows: CompactSelection.fromSingleSelection(5),
+                    current: {
+                        // Columns 1 and 2 are ordinary text cells; several others
+                        // in this fixture are non-overlay kinds that clear to
+                        // nothing, which would make the assertion about the
+                        // fixture rather than about the batching.
+                        cell: [2, 2],
+                        range: { x: 2, y: 2, width: 1, height: 1 },
+                        // The first repeats the primary range, proving an
+                        // overlap is edited once inside the one emitted batch.
+                        rangeStack: [
+                            { x: 2, y: 2, width: 1, height: 1 },
+                            { x: 1, y: 3, width: 1, height: 1 },
+                        ],
+                    },
+                }}
+                rowMarkers="both"
+            />,
+            {
+                wrapper: Context,
+            }
+        );
+        prep();
+
+        const canvas = screen.getByTestId("data-grid-canvas");
+        fireEvent.keyDown(canvas, {
+            key: "Delete",
+        });
+
+        expect(editSpy).toHaveBeenCalledTimes(1);
+        const [editList, source] = editSpy.mock.calls[0];
+        expect(source).toBe("delete");
+        // Every region reached the one batch: the two single cells plus the row.
+        expect(editList.length).toBeGreaterThan(2);
+        const locations = editList.map((item: EditListItem) => item.location);
+        expect(new Set(locations.map(([x, y]: [number, number]) => `${x}:${y}`)).size)
+            .toBe(locations.length);
+        expect(locations).toEqual(expect.arrayContaining([[2, 2], [1, 3]]));
+        expect(locations.filter(([, y]: [number, number]) => y === 5).length)
+            .toBeGreaterThan(0);
     });
 
     test("Open and close overlay", async () => {

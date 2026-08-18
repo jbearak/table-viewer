@@ -3067,10 +3067,17 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
         return `gdg-overlay-${idCounter++}`;
     }, []);
 
-    const deleteRange = React.useCallback(
-        (r: Rectangle) => {
-            focus();
-            const editList: EditListItem[] = [];
+    /**
+     * Fork addition: collect a range's deletions without emitting them.
+     *
+     * Split out of `deleteRange` because ONE Delete keypress can cover a primary
+     * range, a stack of secondary ranges, whole rows and whole columns, and the
+     * consumer records one undoable action per emitted batch — so emitting per
+     * range made a single keypress take several undos to walk back. The caller
+     * accumulates across every range it is clearing and emits once.
+     */
+    const collectRangeDeletions = React.useCallback(
+        (r: Rectangle, editList: EditListItem[], seen?: Set<string>) => {
             for (let x = r.x; x < r.x + r.width; x++) {
                 for (let y = r.y; y < r.y + r.height; y++) {
                     // Fork addition: a merged block deletes as one cell — clear the
@@ -3096,14 +3103,43 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                         newVal = toDelete?.onDelete?.(cellValue);
                     }
                     if (newVal !== undefined && !isInnerOnlyCell(newVal) && isEditableGridCell(newVal)) {
+                        // Range stacks and whole-row/column selections can overlap.
+                        // One gesture still edits a cell once: duplicate entries
+                        // would make history account and replay the same location
+                        // twice inside its now-single action.
+                        const key = `${x}:${y}`;
+                        if (seen?.has(key) === true) continue;
+                        seen?.add(key);
                         editList.push({ location: [x, y], value: newVal });
                     }
                 }
             }
+        },
+        [getCellContent, getCellRenderer, rowMarkerOffset, mergedCells]
+    );
+
+    /**
+     * Fork addition: emit one `"delete"` batch for everything a keypress clears.
+     *
+     * Called even for an empty list, matching what a single-range delete of
+     * unclearable cells did before the split.
+     */
+    const emitDeletions = React.useCallback(
+        (editList: EditListItem[]) => {
             mangledOnCellsEdited(editList, "delete");
             gridRef.current?.damage(editList.map(x => ({ cell: x.location })));
         },
-        [focus, getCellContent, getCellRenderer, mangledOnCellsEdited, rowMarkerOffset, mergedCells]
+        [mangledOnCellsEdited]
+    );
+
+    const deleteRange = React.useCallback(
+        (r: Rectangle) => {
+            focus();
+            const editList: EditListItem[] = [];
+            collectRangeDeletions(r, editList);
+            emitDeletions(editList);
+        },
+        [collectRangeDeletions, emitDeletions, focus]
     );
 
     const overlayOpen = overlay !== undefined;
@@ -3160,30 +3196,39 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                     // 3) columns
                     // 4) rows
 
+                    // Fork change: accumulated across every range this ONE
+                    // keypress clears, then emitted once. The consumer records an
+                    // undoable action per batch, so a batch per range meant a
+                    // multi-range or whole-row Delete took several undos to walk
+                    // back — one gesture, one entry.
+                    focus();
+                    const editList: EditListItem[] = [];
+                    const seen = new Set<string>();
                     if (toDelete.current !== undefined) {
-                        deleteRange(toDelete.current.range);
+                        collectRangeDeletions(toDelete.current.range, editList, seen);
                         for (const r of toDelete.current.rangeStack) {
-                            deleteRange(r);
+                            collectRangeDeletions(r, editList, seen);
                         }
                     }
 
                     for (const r of toDelete.rows) {
-                        deleteRange({
+                        collectRangeDeletions({
                             x: rowMarkerOffset,
                             y: r,
                             width: columnsIn.length,
                             height: 1,
-                        });
+                        }, editList, seen);
                     }
 
                     for (const col of toDelete.columns) {
-                        deleteRange({
+                        collectRangeDeletions({
                             x: col,
                             y: 0,
                             width: 1,
                             height: rows,
-                        });
+                        }, editList, seen);
                     }
+                    emitDeletions(editList);
                 }
             }
 
@@ -3353,6 +3398,8 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
             onDelete,
             trapFocus,
             deleteRange,
+            collectRangeDeletions,
+            emitDeletions,
             setSelectedColumns,
             setSelectedRows,
             showTrailingBlankRow,
