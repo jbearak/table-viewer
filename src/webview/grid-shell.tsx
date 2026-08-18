@@ -156,7 +156,17 @@ import {
     highlight_selection_from_grid,
     selected_display_row_intervals,
 } from './highlight-selection-model';
-import { highlight_rgba } from './highlight-theme';
+import { highlight_rgba, history_flash_rgba } from './highlight-theme';
+import {
+    HISTORY_FLASH_DURATION_MS,
+    begin_history_flash,
+    history_flash_covers,
+    history_flash_damage,
+    resolve_history_focus,
+    type HistoryFlash,
+    type HistoryFocusOutcome,
+    type PendingHistoryFocus,
+} from './history-focus-model';
 import {
     clamp_row_height,
     default_row_height_for_font,
@@ -435,6 +445,23 @@ export interface GridShellProps {
     grid_focus_ref?: MutableRefObject<GridFocusHandle | null>;
     /** App-owned bridge for sheet-tab actions (select all / copy sheet). */
     grid_actions_ref?: MutableRefObject<GridActionsHandle | null>;
+    /**
+     * Where an undo or redo landed, retained by App across the sheet switch and
+     * the generation-keyed remount a cross-sheet replay causes.
+     *
+     * Declarative rather than a method on `grid_actions_ref`: that handle carries
+     * repeatable user actions, while this is a one-shot state transition with a
+     * correlation that has to survive a remount to be delivered at all.
+     */
+    history_focus?: PendingHistoryFocus | null;
+    /** Clears the App-owned request, reporting what the grid was able to do. */
+    on_history_focus_applied?: (sequence: number, outcome: HistoryFocusOutcome) => void;
+    /**
+     * This sheet's mapping generation, for checking a host-resolved focus against
+     * the view actually installed. A projection resolved against a mapping that
+     * has since moved names rows that are no longer the ones the replay touched.
+     */
+    mapping_generation?: number;
     /** Latest preview scroll request, retained by App across GridShell remounts. */
     pending_preview_scroll?: PendingPreviewScroll | null;
     /** Clears the App-owned request only after Glide accepts the scroll. */
@@ -507,6 +534,9 @@ export function GridShell({
     on_auto_fit_sample_change,
     grid_focus_ref,
     grid_actions_ref,
+    history_focus = null,
+    on_history_focus_applied = () => {},
+    mapping_generation = 1,
     pending_preview_scroll = null,
     on_preview_scroll_applied = () => {},
     on_preview_visible_row_change = () => {},
@@ -1104,6 +1134,97 @@ export function GridShell({
         write_grid_selection(selection);
         grid_ref.current?.scrollTo(cell[0], cell[1]);
     }, [merges, write_grid_selection]);
+    // The flash lives in a ref, not state: `get_cell_content` reads it during
+    // paint, and a re-render is neither needed nor wanted — the visible cells are
+    // damaged explicitly, twice, on entry and at the deadline.
+    const history_flash_ref = useRef<HistoryFlash | null>(null);
+    const history_flash_timer_ref = useRef<number | null>(null);
+    const applied_history_sequence_ref = useRef<number | null>(null);
+
+    const clear_history_flash = useCallback(() => {
+        if (history_flash_timer_ref.current !== null) {
+            window.clearTimeout(history_flash_timer_ref.current);
+            history_flash_timer_ref.current = null;
+        }
+        const flash = history_flash_ref.current;
+        history_flash_ref.current = null;
+        if (flash === null) return;
+        // Damaged AFTER clearing, so the repaint reads the cleared state and the
+        // cells come back with whatever persistent tint they actually have —
+        // conflict, dirty, or a cell highlight.
+        const cells = history_flash_damage(flash, visible_ref.current)
+            .map(({ cell }) => ({ cell: cell as Item }));
+        if (cells.length > 0) grid_ref.current?.updateCells(cells);
+    }, []);
+
+    useEffect(() => clear_history_flash, [clear_history_flash]);
+
+    /**
+     * Move the cursor to what an undo or redo changed, and flash it.
+     *
+     * A layout effect so the selection is written before the browser paints: a
+     * cross-sheet replay arrives with this grid freshly mounted, and a visible
+     * frame at the old cursor before it jumps reads as a glitch.
+     */
+    useLayoutEffect(() => {
+        if (history_focus === null) return;
+        if (applied_history_sequence_ref.current === history_focus.sequence) return;
+        const outcome = resolve_history_focus(history_focus, {
+            sheetIndex: sheet_index,
+            rowCount: row_count,
+            displayColumnCount: display_column_count,
+            mappingGeneration: mapping_generation,
+            columnProjection: column_projection,
+        });
+        // A request for another sheet is not this grid's to answer OR to refuse:
+        // App is mid-switch and the grid for that sheet has yet to mount.
+        if (history_focus.sheetIndex !== sheet_index) return;
+        applied_history_sequence_ref.current = history_focus.sequence;
+        if (outcome.kind !== 'applied') {
+            on_history_focus_applied(history_focus.sequence, outcome);
+            return;
+        }
+        // Merge snapping, for the reason `select_active_display_cell` documents:
+        // controlled writes bypass the grid's own canonicalization, so a region
+        // overlapping a merge would render as a partial block.
+        const { cell, range } = expand_glide_selection(outcome.cell, outcome.range, merges);
+        write_grid_selection({
+            columns: CompactSelection.empty(),
+            rows: CompactSelection.empty(),
+            current: { cell, range, rangeStack: [] },
+        });
+        grid_ref.current?.scrollTo(cell[0], cell[1]);
+        focus_grid();
+
+        clear_history_flash();
+        const flash = begin_history_flash(history_focus.sequence, range, Date.now());
+        history_flash_ref.current = flash;
+        const cells = history_flash_damage(flash, visible_ref.current)
+            .map(({ cell: damaged }) => ({ cell: damaged as Item }));
+        if (cells.length > 0) grid_ref.current?.updateCells(cells);
+        // No same-flash guard in the callback: a newer replay reaches
+        // `clear_history_flash` above before installing its own flash, and that
+        // cancels this timer — so if this ever runs, the flash it was armed for is
+        // still the installed one.
+        history_flash_timer_ref.current = window.setTimeout(
+            clear_history_flash,
+            HISTORY_FLASH_DURATION_MS,
+        );
+        on_history_focus_applied(history_focus.sequence, outcome);
+    }, [
+        clear_history_flash,
+        column_projection,
+        display_column_count,
+        focus_grid,
+        history_focus,
+        mapping_generation,
+        merges,
+        on_history_focus_applied,
+        row_count,
+        sheet_index,
+        write_grid_selection,
+    ]);
+
     const select_active_display_cell_ref = useRef(select_active_display_cell);
     const focus_grid_ref = useRef(focus_grid);
     const row_count_ref = useRef(row_count);
@@ -2128,8 +2249,18 @@ export function GridShell({
                     }
                 }
             }
+            // Read at paint time against the deadline, so no re-render is needed
+            // to end it: the timer damages these cells and this returns false.
+            const flash_bg = history_flash_covers(
+                history_flash_ref.current,
+                display_column,
+                row,
+                Date.now(),
+            )
+                ? history_flash_rgba(high_contrast)
+                : undefined;
             let overlay: CellEditOverlay | undefined;
-            if (editable_cells || dirty || highlight_bg) {
+            if (editable_cells || dirty || highlight_bg || flash_bg) {
                 overlay = {
                     editable,
                     ...(edit_value !== undefined ? { edit_value } : {}),
@@ -2148,11 +2279,16 @@ export function GridShell({
                     ...(dirty && dirty_entry_value_changed(dirty)
                         ? { dirty_value: dirty.value }
                         : {}),
-                    bg: dirty
+                    // The flash outranks every persistent tint for its half
+                    // second, so the region an undo changed is legible even where
+                    // the cells are also dirty, conflicted, or highlighted — which
+                    // after an undo of a cell edit they usually are. All of those
+                    // come back when it expires; nothing about them is lost.
+                    bg: flash_bg ?? (dirty
                         ? key !== undefined && conflicted_keys_ref.current.has(key)
                             ? conflict_bg
                             : dirty_bg
-                        : highlight_bg,
+                        : highlight_bg),
                 };
             }
             return build_grid_cell(
@@ -2188,6 +2324,7 @@ export function GridShell({
             // damages the cells already painted with the old ones).
             dirty_bg,
             conflict_bg,
+            high_contrast,
         ],
     );
 
