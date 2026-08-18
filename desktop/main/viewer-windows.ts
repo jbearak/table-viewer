@@ -29,6 +29,10 @@ import {
 import { canonical_file_key } from '../../src/resource-identity';
 import { node_file_refresh_watcher_factory } from '../../src/node-file-refresh-watcher';
 import type { HostMessage, WebviewMessage } from '../../src/types';
+import {
+    sanitized_history_menu_state,
+    type HistoryMenuState,
+} from './history-menu-model';
 import { create_desktop_ui_port, node_file_system_port } from './desktop-host-ports';
 import type { DesktopConfigStore } from './desktop-config';
 import {
@@ -74,6 +78,14 @@ interface ViewerWindow {
     allowClose: boolean;
     /** Drops the unsaved-edits watcher (see `dirty_from_webview_message`). */
     readonly stop_watching_dirty: () => void;
+    /**
+     * What this window's renderer last said its Undo/Redo menu items should read.
+     *
+     * Undefined until the first `historyMenuStateChanged` — a viewer that has not
+     * posted yet is indistinguishable from a non-viewer window as far as the menu
+     * is concerned, and `history_menu_item` answers both the same way.
+     */
+    history_menu?: HistoryMenuState;
     /** Drops renderer navigation/process/transport lifecycle watchers. */
     readonly stop_watching_renderer: () => void;
     /** Persists a resize still inside its settle window, and cancels it.
@@ -363,7 +375,24 @@ export class ViewerWindowManager {
         private readonly viewer_preload_path: string,
         private readonly viewer_panel_deadline_scheduler?: ViewerPanelDeadlineScheduler,
         private readonly open_preferences: (target: PreferencesTarget) => void = () => {},
+        /**
+         * Rebuild the application menu, because one window's Undo/Redo items have
+         * changed. Called with the window that reported, so main.ts can skip the
+         * rebuild when it is not the focused one — the menu only ever shows the
+         * focused window's history.
+         */
+        private readonly on_history_menu_changed: (window: BrowserWindow) => void = () => {},
     ) {}
+
+    /**
+     * What `window`'s Undo/Redo items should read, or undefined for a window with
+     * no history model — a non-viewer window, or a viewer whose renderer has not
+     * reported yet. Both mean "leave the items to the native text undo"; see
+     * `history_menu_item`.
+     */
+    history_menu_state(window: BrowserWindow): HistoryMenuState | undefined {
+        return this.windows.find((entry) => entry.window === window)?.history_menu;
+    }
 
     /**
      * Show `file_path` in its own window, or focus the window already showing
@@ -578,6 +607,25 @@ export class ViewerWindowManager {
         };
         ipcMain.on(CHANNEL_WEBVIEW_MESSAGE, dirty_watcher);
 
+        // Also independent of the panel's subscriptions, and for a sharper reason
+        // than the dirty dot's: the Edit menu is application-wide chrome, so the
+        // state has to be retained even while this window is not the focused one.
+        const history_menu_watcher = (
+            event: Electron.IpcMainEvent,
+            message: WebviewMessage,
+        ) => {
+            if (event.sender !== web_contents) return;
+            if (message.type !== 'historyMenuStateChanged') return;
+            const state = sanitized_history_menu_state(message.state);
+            if (state === undefined) return;
+            entry.history_menu = state;
+            // Rebuilt rather than mutated in place: an Electron MenuItem's label
+            // is read-only after construction, so a changing label means a new
+            // application menu. main.ts owns that, and it is what the callback is.
+            this.on_history_menu_changed(window);
+        };
+        ipcMain.on(CHANNEL_WEBVIEW_MESSAGE, history_menu_watcher);
+
         let entry: ViewerWindow;
         // Format capabilities come from the same shared profile factory as the
         // VS Code extension: CSV/TSV and .xlsx worksheets are editable, .xls is not.
@@ -618,8 +666,10 @@ export class ViewerWindowManager {
             panel,
             controller,
             allowClose: false,
-            stop_watching_dirty: () =>
-                ipcMain.removeListener(CHANNEL_WEBVIEW_MESSAGE, dirty_watcher),
+            stop_watching_dirty: () => {
+                ipcMain.removeListener(CHANNEL_WEBVIEW_MESSAGE, dirty_watcher);
+                ipcMain.removeListener(CHANNEL_WEBVIEW_MESSAGE, history_menu_watcher);
+            },
             stop_watching_renderer: () => {
                 web_contents.removeListener('did-navigate', on_main_frame_navigated);
                 web_contents.removeListener('did-fail-load', on_failed_load);
@@ -778,7 +828,10 @@ export class ViewerWindowManager {
      * a viewer window, so the caller can fall back to the native editing
      * command (see `route_edit_command` in main.ts).
      */
-    send_edit_command(window: BrowserWindow, command: 'copy' | 'selectAll'): boolean {
+    send_edit_command(
+        window: BrowserWindow,
+        command: 'copy' | 'selectAll' | 'undo' | 'redo',
+    ): boolean {
         const entry = this.windows.find((candidate) => candidate.window === window);
         if (!entry || entry.window.webContents.isDestroyed()) return false;
         // postMessage is Thenable in the shared panel contract, but delivery to

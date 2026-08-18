@@ -13,6 +13,8 @@ import type { CsvSaveOperation, FilterEntry, SheetTransformState } from '../type
 import { create_edit_session_store } from '../webview/edit-session-store';
 import { create_history_store, type HistoryStore } from '../webview/history-store';
 import { MAX_COLUMN_WIDTH_PX } from '../webview/grid-model';
+import { highlight_rgba, history_flash_rgba } from '../webview/highlight-theme';
+import { HISTORY_FLASH_DURATION_MS } from '../webview/history-focus-model';
 import { button, field, find_button, set_input_value } from './helpers/dom-interaction';
 import {
     MAX_ROW_HEIGHT_PX,
@@ -3334,5 +3336,287 @@ describe('GridShell history capture', () => {
 
         const stack = history.snapshot().undoStack;
         expect(stack[0].action.changes).toHaveLength(1);
+    });
+});
+
+describe('the cursor and flash an undo leaves behind', () => {
+    /** The whole visible viewport, so damage is not clipped away to nothing. */
+    async function report_visible(range: { x: number; y: number; width: number; height: number }) {
+        const on_visible_region_changed = grid_mock.props!.onVisibleRegionChanged as
+            (r: { x: number; y: number; width: number; height: number }) => void;
+        await act(async () => on_visible_region_changed(range));
+    }
+
+    function cell_background(cell: [number, number]): string | undefined {
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (item: [number, number]) => { themeOverride?: { bgCell?: string } };
+        return get_cell_content(cell).themeOverride?.bgCell;
+    }
+
+    function focus_props(overrides: Partial<GridShellProps> = {}): GridShellProps {
+        return props({
+            row_count: 40,
+            // Identity projection, so the source-column interval a request carries
+            // reads directly as display columns and the assertions stay about rows.
+            column_projection: {
+                visible_to_source: [0, 1, 2],
+                source_to_visible: [0, 1, 2],
+                hidden_count: 0,
+            },
+            mapping_generation: 3,
+            ...overrides,
+        });
+    }
+
+    const request = {
+        sequence: 1,
+        // The grid does not read this — it is App that turns it into wording — but
+        // the request type carries it, so the fixture does too.
+        direction: 'undo' as const,
+        sheetIndex: 0,
+        displayRowStart: 4,
+        displayRowEnd: 5,
+        sourceColumnStart: 1,
+        sourceColumnEnd: 2,
+        mappingGeneration: 3,
+    };
+
+    it('selects the replayed region, scrolls to it, and tints it', async () => {
+        vi.useFakeTimers();
+        try {
+            const on_applied = vi.fn();
+            const GridShell = await render_grid(focus_props());
+            await report_visible({ x: 0, y: 0, width: 3, height: 20 });
+            grid_mock.update_cells.mockClear();
+
+            await act(async () => {
+                root!.render(React.createElement(GridShell, focus_props({
+                    history_focus: request,
+                    on_history_focus_applied: on_applied,
+                })));
+            });
+
+            const selection = grid_mock.props!.gridSelection as {
+                current?: { cell: [number, number]; range: { x: number; y: number; width: number; height: number } };
+            };
+            expect(selection.current?.cell).toEqual([1, 4]);
+            expect(selection.current?.range).toEqual({ x: 1, y: 4, width: 2, height: 2 });
+            expect(grid_mock.scroll_to).toHaveBeenCalledWith(1, 4);
+            expect(on_applied).toHaveBeenCalledWith(1, expect.objectContaining({ kind: 'applied' }));
+
+            // Every cell of the region, and only those: the flash outranks whatever
+            // persistent tint the cells carry, and a cell outside it is untouched.
+            expect(cell_background([1, 4])).toBe(history_flash_rgba(false));
+            expect(cell_background([2, 5])).toBe(history_flash_rgba(false));
+            expect(cell_background([0, 4])).toBeUndefined();
+            expect(cell_background([1, 6])).toBeUndefined();
+            expect(grid_mock.update_cells.mock.calls.at(-1)![0]).toEqual([
+                { cell: [1, 4] }, { cell: [1, 5] }, { cell: [2, 4] }, { cell: [2, 5] },
+            ]);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('stops tinting at the deadline, without waiting for one in the test', async () => {
+        // The timer is the production mechanism; the assertion advances a fake
+        // clock. A real delay here would be a CI flake already written.
+        vi.useFakeTimers();
+        try {
+            const GridShell = await render_grid(focus_props());
+            await report_visible({ x: 0, y: 0, width: 3, height: 20 });
+            await act(async () => {
+                root!.render(React.createElement(GridShell, focus_props({
+                    history_focus: request,
+                })));
+            });
+            expect(cell_background([1, 4])).toBe(history_flash_rgba(false));
+
+            await act(async () => { vi.advanceTimersByTime(HISTORY_FLASH_DURATION_MS - 1); });
+            expect(cell_background([1, 4])).toBe(history_flash_rgba(false));
+
+            grid_mock.update_cells.mockClear();
+            await act(async () => { vi.advanceTimersByTime(1); });
+            expect(cell_background([1, 4])).toBeUndefined();
+            // The same cells damaged again, so the persistent tint underneath comes
+            // back rather than waiting for an unrelated repaint.
+            expect(grid_mock.update_cells.mock.calls.at(-1)![0]).toEqual([
+                { cell: [1, 4] }, { cell: [1, 5] }, { cell: [2, 4] }, { cell: [2, 5] },
+            ]);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('applies one request once, however often it rerenders', async () => {
+        vi.useFakeTimers();
+        try {
+            const on_applied = vi.fn();
+            const GridShell = await render_grid(focus_props());
+            await report_visible({ x: 0, y: 0, width: 3, height: 20 });
+            const with_focus = () => React.createElement(GridShell, focus_props({
+                history_focus: request,
+                on_history_focus_applied: on_applied,
+            }));
+            await act(async () => { root!.render(with_focus()); });
+            grid_mock.scroll_to.mockClear();
+            await act(async () => { root!.render(with_focus()); });
+
+            expect(on_applied).toHaveBeenCalledTimes(1);
+            expect(grid_mock.scroll_to).not.toHaveBeenCalled();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('lets a newer replay supersede an older flash, including its deadline', async () => {
+        vi.useFakeTimers();
+        try {
+            const GridShell = await render_grid(focus_props());
+            await report_visible({ x: 0, y: 0, width: 3, height: 20 });
+            await act(async () => {
+                root!.render(React.createElement(GridShell, focus_props({
+                    history_focus: request,
+                })));
+            });
+            await act(async () => { vi.advanceTimersByTime(HISTORY_FLASH_DURATION_MS - 50); });
+            await act(async () => {
+                root!.render(React.createElement(GridShell, focus_props({
+                    history_focus: {
+                        ...request,
+                        sequence: 2,
+                        displayRowStart: 9,
+                        displayRowEnd: 9,
+                    },
+                })));
+            });
+
+            // The first flash's timer is about to fire. It must not clear the
+            // second flash, which has only just begun.
+            await act(async () => { vi.advanceTimersByTime(50); });
+            expect(cell_background([1, 9])).toBe(history_flash_rgba(false));
+            expect(cell_background([1, 4])).toBeUndefined();
+
+            await act(async () => { vi.advanceTimersByTime(HISTORY_FLASH_DURATION_MS); });
+            expect(cell_background([1, 9])).toBeUndefined();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('outranks the persistent tint a flashed cell already carries', async () => {
+        // The common case, not an edge one: undoing a cell edit leaves the cell
+        // dirty or highlighted, and a flash that lost to those tints would never
+        // be visible on the region it exists to point at.
+        vi.useFakeTimers();
+        try {
+            const GridShell = await render_grid(focus_props());
+            await report_visible({ x: 0, y: 0, width: 3, height: 20 });
+            const highlighted = focus_props({
+                cell_highlights: { schema: 'accepted', cells: { '4:1': 'yellow' } },
+            });
+            await act(async () => { root!.render(React.createElement(GridShell, highlighted)); });
+            const persistent = cell_background([1, 4]);
+            expect(persistent).toBe(highlight_rgba('yellow', false));
+
+            await act(async () => {
+                root!.render(React.createElement(GridShell, focus_props({
+                    cell_highlights: { schema: 'accepted', cells: { '4:1': 'yellow' } },
+                    history_focus: request,
+                })));
+            });
+            expect(cell_background([1, 4])).toBe(history_flash_rgba(false));
+
+            // And the highlight is not lost — it is underneath, and comes back.
+            await act(async () => { vi.advanceTimersByTime(HISTORY_FLASH_DURATION_MS); });
+            expect(cell_background([1, 4])).toBe(persistent);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('moves nothing when every affected column is hidden', async () => {
+        const on_applied = vi.fn();
+        const GridShell = await render_grid(focus_props());
+        await report_visible({ x: 0, y: 0, width: 3, height: 20 });
+        grid_mock.scroll_to.mockClear();
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, focus_props({
+                // Only source column 0 is visible; the request names 1-2.
+                column_projection: {
+                    visible_to_source: [0],
+                    source_to_visible: [0, undefined, undefined],
+                    hidden_count: 2,
+                },
+                history_focus: request,
+                on_history_focus_applied: on_applied,
+            })));
+        });
+
+        expect(on_applied).toHaveBeenCalledWith(1, { kind: 'columns-hidden' });
+        expect(grid_mock.scroll_to).not.toHaveBeenCalled();
+        expect(cell_background([0, 4])).toBeUndefined();
+    });
+
+    it('declines a focus resolved against a mapping that has since moved', async () => {
+        const on_applied = vi.fn();
+        const GridShell = await render_grid(focus_props());
+        await report_visible({ x: 0, y: 0, width: 3, height: 20 });
+        grid_mock.scroll_to.mockClear();
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, focus_props({
+                mapping_generation: 4,
+                history_focus: request,
+                on_history_focus_applied: on_applied,
+            })));
+        });
+
+        expect(on_applied).toHaveBeenCalledWith(1, { kind: 'stale-mapping' });
+        expect(grid_mock.scroll_to).not.toHaveBeenCalled();
+    });
+
+    it('cancels a pending flash timer when the grid goes away', async () => {
+        // A cross-sheet undo unmounts this grid while its flash is still running.
+        // A timer left armed would fire against a disposed grid.
+        vi.useFakeTimers();
+        try {
+            await render_grid(focus_props());
+            await report_visible({ x: 0, y: 0, width: 3, height: 20 });
+            const GridShell = await render_grid(focus_props({ history_focus: request }));
+            void GridShell;
+            grid_mock.update_cells.mockClear();
+
+            const armed = vi.getTimerCount();
+            expect(armed).toBeGreaterThan(0);
+
+            await act(async () => { root!.unmount(); });
+            root = null;
+
+            // Asserted on the timer, not on a repaint: `grid_ref.current` is null
+            // after unmount, so a leaked timer firing would be silent here — and
+            // still a leak. Cancelling it is what the cleanup is for.
+            expect(vi.getTimerCount()).toBeLessThan(armed);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('leaves a request for another sheet unanswered, mid-switch', async () => {
+        // App switches sheets first and this grid unmounts; answering here would
+        // clear the request before the grid that can honour it ever mounts.
+        const on_applied = vi.fn();
+        const GridShell = await render_grid(focus_props());
+        await report_visible({ x: 0, y: 0, width: 3, height: 20 });
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, focus_props({
+                history_focus: { ...request, sheetIndex: 1 },
+                on_history_focus_applied: on_applied,
+            })));
+        });
+
+        expect(on_applied).not.toHaveBeenCalled();
     });
 });

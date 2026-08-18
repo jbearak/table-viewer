@@ -571,6 +571,7 @@ describe('settling', () => {
             })),
             focusSheetIndex: 0,
             focus: last_prepare(posted).focus,
+            displayFocus: null,
         });
         return { outcome: await pending, posted, accepted };
     }

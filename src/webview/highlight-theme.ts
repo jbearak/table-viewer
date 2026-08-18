@@ -29,3 +29,17 @@ export function highlight_rgba(
 export function highlight_label(color: CellHighlightColor): string {
     return color[0].toUpperCase() + color.slice(1);
 }
+
+/**
+ * The tint an undo or redo briefly paints over the region it changed.
+ *
+ * Deliberately not one of the persistent highlight colours: a flash that looked
+ * like a yellow cell highlight would read as "the undo highlighted these cells"
+ * for as long as it lasted. Stronger than the persistent tints too, since it has
+ * under a second to be noticed — including on a sheet the switch just revealed.
+ */
+export function history_flash_rgba(high_contrast: boolean): string {
+    return high_contrast
+        ? 'rgba(137, 87, 229, 0.52)'
+        : 'rgba(137, 87, 229, 0.34)';
+}
