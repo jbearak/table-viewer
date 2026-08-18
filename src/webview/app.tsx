@@ -4418,6 +4418,12 @@ export function App(): React.JSX.Element {
             || preview_mode_ref.current
             || pending_highlight_request_ref.current
         ) return;
+        // Highlight admission makes every cell read-only until the host replies.
+        // Glide does not reliably close an overlay it already mounted when
+        // provideEditor changes, so fold and terminate it before reserving the
+        // history slot. Doing this after setting the pending ref would make the
+        // gesture gate reject the user's already-typed text.
+        editing_ref.current?.commit_live_edit();
         const request_id = [
             'highlight',
             highlight_request_prefix_ref.current,
@@ -4452,6 +4458,7 @@ export function App(): React.JSX.Element {
             || preview_mode_ref.current
             || pending_highlight_request_ref.current
         ) return;
+        editing_ref.current?.commit_live_edit();
         const request_id = [
             'highlight',
             highlight_request_prefix_ref.current,

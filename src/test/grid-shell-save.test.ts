@@ -47,6 +47,7 @@ vi.mock('../webview/glide-data-grid', () => {
             React.useImperativeHandle(ref, () => ({
                 updateCells: vi.fn(),
                 scrollTo: vi.fn(),
+                dismissOverlay: vi.fn(),
             }));
             return React.createElement('div', { className: 'data-editor-stub' });
         }),

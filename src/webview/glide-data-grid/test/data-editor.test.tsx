@@ -1700,7 +1700,8 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
 
     test("Open and close overlay", async () => {
         vi.useFakeTimers();
-        render(<DataEditor {...basicProps} />, {
+        const editSpy = vi.fn();
+        render(<DataEditor {...basicProps} onCellEdited={editSpy} />, {
             wrapper: Context,
         });
         prep();
@@ -1729,8 +1730,60 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         });
 
         expect(document.body.contains(overlay)).toBe(false);
+        expect(editSpy).not.toHaveBeenCalled();
     });
 
+    test("Imperatively dismiss revoked custom overlay without falling back or committing", async () => {
+        vi.useFakeTimers();
+        const editSpy = vi.fn();
+        const ref = React.createRef<DataEditorRef>();
+        const CustomEditor = () => (
+            <input aria-label="custom cell editor" defaultValue="custom overlay" />
+        );
+        const rendered = render(
+            <DataEditor
+                {...basicProps}
+                ref={ref}
+                onCellEdited={editSpy}
+                provideEditor={() => CustomEditor}
+            />,
+            {
+                wrapper: Context,
+            }
+        );
+        prep();
+
+        const canvas = screen.getByTestId("data-grid-canvas");
+        sendClick(canvas, {
+            clientX: 300,
+            clientY: 36 + 32 + 16,
+        });
+        sendClick(canvas, {
+            clientX: 300,
+            clientY: 36 + 32 + 16,
+        });
+
+        const overlay = await screen.findByRole("textbox", { name: "custom cell editor" });
+        expect(document.body.contains(overlay)).toBe(true);
+        act(() => {
+            // GridShell's editability transition changes this provider to
+            // undefined. Without an explicit dismissal Glide keeps the overlay
+            // alive and swaps in the built-in editor for the old cell value.
+            rendered.rerender(
+                <DataEditor
+                    {...basicProps}
+                    ref={ref}
+                    onCellEdited={editSpy}
+                    provideEditor={() => undefined}
+                />
+            );
+            ref.current?.dismissOverlay();
+        });
+
+        expect(document.body.contains(overlay)).toBe(false);
+        expect(screen.queryByDisplayValue("Data: 1, 1")).toBeNull();
+        expect(editSpy).not.toHaveBeenCalled();
+    });
 
     test("Open overlay with keypress", async () => {
         vi.useFakeTimers();

@@ -1063,6 +1063,30 @@ describe('the highlight round trip and the edit history', () => {
         expect(grid_stub().getAttribute('data-gestures-admitted')).toBe('true');
     });
 
+    it('folds the live cell editor before reserving a highlight gesture', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'])));
+        post_message.mockClear();
+        grid_shell_mock.commit_live_edit.mockClear();
+
+        const apply = grid_shell_mock.latest_props?.on_highlight_selection as (
+            selection: { displayRows: { start: number; end: number }[]; sourceColumns: number[] },
+            mutation: { type: 'set'; color: 'yellow' },
+        ) => void;
+        await act(async () => apply(
+            { displayRows: [{ start: 0, end: 0 }], sourceColumns: [0] },
+            { type: 'set', color: 'yellow' },
+        ));
+
+        const request_index = post_message.mock.calls.findIndex(
+            ([message]) => message?.type === 'applyCellHighlights',
+        );
+        expect(request_index).toBeGreaterThanOrEqual(0);
+        expect(grid_shell_mock.commit_live_edit).toHaveBeenCalledOnce();
+        expect(grid_shell_mock.commit_live_edit.mock.invocationCallOrder[0])
+            .toBeLessThan(post_message.mock.invocationCallOrder[request_index]);
+    });
+
     it('records the gesture under the name the user asked for', async () => {
         const { post_message } = await render_app();
         const snapshot = initial_snapshot_message(make_meta(['Sheet1']));

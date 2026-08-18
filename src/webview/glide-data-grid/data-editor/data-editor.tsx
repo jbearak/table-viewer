@@ -695,6 +695,15 @@ export interface DataEditorRef {
      */
     focus: DataGridRef["focus"];
     /**
+     * Closes the active overlay editor without emitting an edit.
+     *
+     * Consumers that need to preserve the live value must snapshot it before
+     * calling this. This is intentionally imperative: changing provideEditor or
+     * the controlled selection does not reliably unmount an overlay Glide has
+     * already opened.
+     */
+    dismissOverlay: () => void;
+    /**
      * Generic API for emitting events as if they had been triggered via user interaction.
      */
     emit: (eventName: EmitEvents) => Promise<void>;
@@ -3969,6 +3978,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                 return gridRef.current?.getBounds((col ?? 0) + rowMarkerOffset, row);
             },
             focus: () => gridRef.current?.focus(),
+            dismissOverlay: () => setOverlay(undefined),
             emit: async e => {
                 switch (e) {
                     case "delete":

@@ -96,6 +96,7 @@ const grid_mock = vi.hoisted(() => ({
     update_cells: vi.fn(),
     scroll_to: vi.fn(),
     focus: vi.fn(),
+    dismiss_overlay: vi.fn(),
     get_bounds: vi.fn((): { x: number; y: number; width: number; height: number } | undefined => ({
         x: 30, y: 10, width: 100, height: 36,
     })),
@@ -140,6 +141,7 @@ vi.mock('../webview/glide-data-grid', () => {
                 updateCells: grid_mock.update_cells,
                 scrollTo: grid_mock.scroll_to,
                 focus: grid_mock.focus,
+                dismissOverlay: grid_mock.dismiss_overlay,
                 getBounds: grid_mock.get_bounds,
             }));
             return React.createElement('div', {
@@ -348,6 +350,7 @@ afterEach(() => {
     grid_mock.update_cells.mockReset();
     grid_mock.scroll_to.mockReset();
     grid_mock.focus.mockReset();
+    grid_mock.dismiss_overlay.mockReset();
     grid_mock.get_bounds.mockReset();
     grid_mock.get_bounds.mockImplementation(() => ({
         x: 30, y: 10, width: 100, height: 36,
@@ -730,6 +733,106 @@ describe('GridShell column projection', () => {
         const selection = grid_mock.props!.gridSelection as { current?: unknown };
         expect(selection.current).toBeUndefined();
         expect(editing_ref.current?.has_uncommitted_changes()).toBe(true);
+    });
+
+    it('dismisses an open overlay and keeps a late finish on its original source column', async () => {
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        const initial = props({
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session-1',
+            edit_session: store,
+        });
+        const GridShell = await render_grid(initial);
+        const close_overlay = await open_tracking_overlay([0, 0], 'typed');
+        grid_mock.dismiss_overlay.mockClear();
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...initial,
+                // Display column 0 used to mean source A; it now means C.
+                column_projection: {
+                    visible_to_source: [2],
+                    source_to_visible: [undefined, undefined, 0],
+                    hidden_count: 2,
+                },
+            }));
+        });
+        expect(grid_mock.dismiss_overlay).toHaveBeenCalled();
+
+        // Model an already-queued onFinishedEditing callback from the overlay
+        // whose dismissal raced the projection commit. It must not write A's
+        // text into the source column now occupying display slot 0.
+        const on_cell_edited = edit_one(grid_mock.props!.onCellsEdited);
+        await act(async () => on_cell_edited([0, 0], { kind: 'text', data: 'typed' }));
+        expect(Object.fromEntries(store.snapshot())).toEqual({
+            '0:0': { value: 'typed', base: 'source-a' },
+        });
+
+        await close_overlay();
+    });
+
+    it('dismisses and rejects an open overlay when a highlight revokes editing', async () => {
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        const initial = props({
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session-1',
+            edit_session: store,
+        });
+        const GridShell = await render_grid(initial);
+        const close_overlay = await open_tracking_overlay([0, 0], 'typed');
+        const pin = grid_mock.pin_rows.mock.results.at(-1)!.value as symbol;
+        grid_mock.dismiss_overlay.mockClear();
+        grid_mock.unpin_rows.mockClear();
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...initial,
+                highlight_in_flight: true,
+            }));
+        });
+
+        expect(grid_mock.dismiss_overlay).toHaveBeenCalled();
+        expect(grid_mock.unpin_rows).toHaveBeenCalledWith(pin);
+        const on_cell_edited = edit_one(grid_mock.props!.onCellsEdited);
+        await act(async () => on_cell_edited([0, 0], { kind: 'text', data: 'late' }));
+        expect(store.snapshot().size).toBe(0);
+
+        await close_overlay();
+    });
+
+    it('dismisses and rejects an overlay owned by a replaced edit session', async () => {
+        const old_store = create_edit_session_store({ session_id: 'session-1' });
+        const next_store = create_edit_session_store({ session_id: 'session-2' });
+        const initial = props({
+            edit_mode: true,
+            csv_editable: true,
+            edit_session_id: 'session-1',
+            edit_session: old_store,
+        });
+        const GridShell = await render_grid(initial);
+        const close_overlay = await open_tracking_overlay([0, 0], 'typed');
+        const pin = grid_mock.pin_rows.mock.results.at(-1)!.value as symbol;
+        grid_mock.dismiss_overlay.mockClear();
+        grid_mock.unpin_rows.mockClear();
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...initial,
+                edit_session_id: 'session-2',
+                edit_session: next_store,
+            }));
+        });
+
+        expect(grid_mock.dismiss_overlay).toHaveBeenCalled();
+        expect(grid_mock.unpin_rows).toHaveBeenCalledWith(pin);
+        const on_cell_edited = edit_one(grid_mock.props!.onCellsEdited);
+        await act(async () => on_cell_edited([0, 0], { kind: 'text', data: 'late' }));
+        expect(old_store.snapshot().size).toBe(0);
+        expect(next_store.snapshot().size).toBe(0);
+
+        await close_overlay();
     });
 
     it('retains display selection when a projection is recreated unchanged', async () => {
