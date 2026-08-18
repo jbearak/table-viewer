@@ -139,6 +139,22 @@ import {
     derive_layout_state_patch,
 } from './layout-state-patch';
 import {
+    sanitized_prepare_history_replay_request,
+    type HistoryReplayCommitRefused,
+    type HistoryReplayCommitted,
+    type HistoryReplayDirection,
+    type HistoryReplayFocus,
+    type HistoryReplayHighlightInput,
+    type HistoryReplayPrepareRefused,
+    type HistoryReplayPreparedCell,
+    type PrepareHistoryReplayRequest,
+} from './history-replay-protocol';
+import { create_history_replay_lease_registry } from './history-replay-lease-model';
+import {
+    replay_cell_matches,
+    replay_highlight_matches,
+} from './history-replay-durable-model';
+import {
     complete_normalized_per_file_state,
     normalize_workbook_snapshot_state,
     type NormalizedPerFileState,
@@ -559,6 +575,74 @@ function harvest_source_bases(
 }
 
 /**
+ * One replay cell's content as read from a verified source.
+ *
+ * `undefined` for a cell the source cannot answer for — a source row outside the
+ * worksheet, or one no longer in the projection. Distinguished from an empty
+ * cell, because substituting `''` for an unanswerable cell would fabricate the
+ * missing side of an undo transition: undo would write emptiness over content it
+ * never saw.
+ */
+export interface MaterializedReplayCell {
+    readonly text: string;
+    readonly rich?: RichText;
+    readonly hyperlink: CellHyperlink | null;
+}
+
+/**
+ * Read the persisted content behind a set of replay cells, batched by row.
+ *
+ * The same shape as `harvest_source_bases` and for the same reason: a
+ * workbook-wide gesture can name thousands of cells, and reading them one call
+ * at a time would make an undo keypress walk the source once per cell. Grouped
+ * by projected row, chunked, and read through the source's indexed reader.
+ *
+ * Renderer page residency has nothing to do with this. The host reads the source
+ * directly, so a replay reaches a background sheet and rows the webview never
+ * loaded — which is what makes a workbook-wide history possible at all.
+ */
+function materialize_replay_cells(
+    src: DataSource,
+    requested: readonly { readonly sheet_index: number; readonly source_row: number; readonly source_column: number }[],
+): Map<string, MaterializedReplayCell> {
+    const observed = new Map<string, MaterializedReplayCell>();
+    const by_sheet = new Map<number, Map<number, { source_row: number; cols: number[] }>>();
+    for (const cell of requested) {
+        const projected = projected_row_for_source(src, cell.sheet_index, cell.source_row);
+        if (projected === undefined) continue;
+        const rows = by_sheet.get(cell.sheet_index) ?? new Map();
+        const entry = rows.get(projected);
+        if (entry) entry.cols.push(cell.source_column);
+        else rows.set(projected, { source_row: cell.source_row, cols: [cell.source_column] });
+        by_sheet.set(cell.sheet_index, rows);
+    }
+    for (const [sheet_index, rows] of by_sheet) {
+        const projected_rows = [...rows.keys()].sort((a, b) => a - b);
+        for (let start = 0; start < projected_rows.length; start += SAVE_WINDOW) {
+            const batch = projected_rows.slice(start, start + SAVE_WINDOW);
+            const { rows: read } = read_source_rows_indexed(src, sheet_index, batch);
+            batch.forEach((projected, offset) => {
+                const entry = rows.get(projected);
+                if (entry === undefined) return;
+                const row = read[offset] ?? [];
+                for (const col of entry.cols) {
+                    const cell = row[col];
+                    // An unread column stays absent rather than reading as empty.
+                    if (cell === undefined) continue;
+                    const base = cell === null ? undefined : cell_edit_base(cell);
+                    observed.set(`${sheet_index}:${entry.source_row}:${col}`, {
+                        text: cell === null ? '' : String(cell.raw ?? ''),
+                        ...(base?.rich ? { rich: base.rich } : {}),
+                        hyperlink: cell?.hyperlink ?? null,
+                    });
+                }
+            });
+        }
+    }
+    return observed;
+}
+
+/**
  * `putexcel`-shaped save: rewrite exactly the edited cells, leave the rest of
  * the package alone.
  *
@@ -839,6 +923,33 @@ export function attach_viewer(
     let load_seq = 0;
     let latest_refresh_event: FileRefreshEvent | undefined;
     let disposed = false;
+    /**
+     * What a replay lease retains, so a commit mutates only what preparation
+     * verified.
+     *
+     * Everything a commit needs is here, and a commit message contributes NO
+     * coordinates of its own: it names cells by the ordinal preparation assigned,
+     * so a stale or hostile renderer cannot reach a cell the host never checked.
+     * The captured host identities are what make the lease self-invalidating —
+     * see the currency predicate built alongside each one.
+     */
+    interface ReplayLeasePayload {
+        readonly direction: HistoryReplayDirection;
+        readonly cells: readonly HistoryReplayPreparedCell[];
+        readonly highlights: readonly HistoryReplayHighlightInput[];
+        /** Each prepared highlight's resolved sheet, by ordinal. */
+        readonly highlightSheetIndices: ReadonlyMap<number, number>;
+        readonly focus: HistoryReplayFocus;
+        readonly focusSheetIndex: number;
+        readonly sourceGeneration: number;
+        /** Whether the host state the lease was bound to is still in place. */
+        readonly isCurrent: () => boolean;
+    }
+    const replay_leases = create_history_replay_lease_registry<
+        ReplayLeasePayload,
+        HistoryReplayCommitted | HistoryReplayCommitRefused
+    >();
+    let replay_preparation_in_flight = false;
     let active_save_operation: CsvSaveHostOperation | undefined;
     let active_save_drain: Promise<void> = Promise.resolve();
     let disposal_edit_release_drain: Promise<void> = Promise.resolve();
@@ -6838,6 +6949,68 @@ export function attach_viewer(
                 await write;
                 return;
             }
+            case 'prepareHistoryReplay': {
+                const request = sanitized_prepare_history_replay_request(msg.request);
+                const receiver_epoch = session.current_receiver_epoch;
+                if (request === undefined) {
+                    // A malformed request may still carry a usable correlation,
+                    // and answering it is what keeps the renderer from hanging on
+                    // a replay that will never be prepared. Without one there is
+                    // nothing to answer to, and inventing an id would refuse a
+                    // replay nobody is waiting on while leaving the real one hung.
+                    const raw = msg.request;
+                    if (
+                        !is_plain_record(raw)
+                        || typeof raw.requestId !== 'string'
+                        || typeof raw.replayId !== 'string'
+                    ) return;
+                    void post_to_receiver({
+                        type: 'historyReplayPrepareRefused',
+                        refusal: {
+                            requestId: raw.requestId,
+                            replayId: raw.replayId,
+                            reason: 'malformed',
+                        },
+                    }, receiver_epoch);
+                    return;
+                }
+                const refuse = (
+                    reason: HistoryReplayPrepareRefused['reason'],
+                ): void => {
+                    void post_to_receiver({
+                        type: 'historyReplayPrepareRefused',
+                        refusal: {
+                            requestId: request.requestId,
+                            replayId: request.replayId,
+                            reason,
+                        },
+                    }, receiver_epoch);
+                };
+                // One preparation at a time, and none while a lease is already
+                // live: two replays interleaving would each plan against a
+                // document the other is moving. The renderer serializes too, so
+                // reaching this is a stale request rather than a race worth
+                // queueing.
+                if (replay_preparation_in_flight || replay_leases.current(Date.now()) !== undefined) {
+                    refuse('busy');
+                    return;
+                }
+                if (!profile.editing || profile.previewMode === true) {
+                    refuse('unavailable');
+                    return;
+                }
+                if (!owns_edit_session() || edit_cleanup_blocked()) {
+                    refuse('edit-session-unavailable');
+                    return;
+                }
+                replay_preparation_in_flight = true;
+                try {
+                    await prepare_history_replay(request, receiver_epoch, refuse);
+                } finally {
+                    replay_preparation_in_flight = false;
+                }
+                return;
+            }
             case 'pendingEditsFlush': {
                 const waiter = pending_edit_flush_waiters.get(msg.requestId);
                 if (!waiter || !Number.isSafeInteger(msg.highestProducedSequence)) return;
@@ -6900,6 +7073,350 @@ export function attach_viewer(
         edit_admission_closed = true;
         active_edit_session_request = undefined;
         cancel_edit_claim(active_edit_claim);
+    }
+
+    /**
+     * Verify a replay against the acknowledged document, then issue its lease.
+     *
+     * Three independent classes of check, in the order that makes each one cheap
+     * to reach. None subsumes another; see the protocol module's header.
+     *
+     *   1. AGREEMENT — the host and renderer must be describing one document, so
+     *      the coordinates in the request mean what the renderer meant by them.
+     *   2. COMPARE-AND-SWAP — every requested overlay must equal durable pending
+     *      -edit state and every highlight its expected colour. This is what
+     *      makes a replay refuse rather than overwrite an edit it never saw.
+     *   3. PHYSICAL CURRENCY — the acknowledged source must still be an accurate
+     *      parse of the bytes on disk, since the watcher may not yet have seen an
+     *      external write. Done last because it costs a read of the whole file.
+     *
+     * Deliberately does NOT build or adopt a source. An adoption bumps the source
+     * generation and the document epoch, so a replay that forced one would
+     * invalidate its own lease; and it would buy nothing, because the host reads
+     * any row of the current source directly. The save path is the precedent.
+     *
+     * Deliberately does NOT run `establish_pending_edit_flush_boundary` either.
+     * That protocol stops edit admission and republishes every store — it is a
+     * close/reload mechanism, and running it per undo keypress would both cost a
+     * round trip and reject the whole pending-edit protocol on its timeout.
+     * Draining `pending_edit_writes` is what soundness actually needs: it
+     * establishes that every edit the host has ADMITTED is durable, and an
+     * unpublished local overlay that disagrees with durable state is caught by
+     * the compare-and-swap as a conflict rather than guessed at.
+     */
+    async function prepare_history_replay(
+        request: PrepareHistoryReplayRequest,
+        receiver_epoch: number,
+        refuse: (reason: HistoryReplayPrepareRefused['reason']) => void,
+    ): Promise<void> {
+        // Every edit the host has already admitted becomes durable before
+        // anything is compared against durable state. A message still in the
+        // renderer's own queue is not covered, and does not need to be: it will
+        // disagree with what is read here and refuse as a conflict.
+        await pending_edit_writes.catch(() => {});
+
+        const adoption = session.current_adoption();
+        const src = source;
+        const replay_core = core;
+        const observation = source_observation;
+        const expected_digest = session.acknowledged_physical_digest();
+        const expected_authority = source_authority.authorityRevision;
+        const expected_physical_revision = source_authority.physicalRevision;
+        const edit_session = active_edit_session_id;
+        const bound_source_generation = replay_core?.source_generation;
+
+        /**
+         * Whether everything the lease is bound to is still in place.
+         *
+         * Rechecked after every await here and again at commit. Binds
+         * `source_generation` and not `core.generation`: a transform advances the
+         * view without moving the source rows a replay addresses, so pinning the
+         * view generation would refuse replays that are perfectly sound.
+         */
+        const replay_is_current = (): boolean => !disposed
+            && session.current_receiver_epoch === receiver_epoch
+            && src !== undefined
+            && replay_core !== undefined
+            && core === replay_core
+            && source === src
+            && session.current_adoption() === adoption
+            && adoption?.resources.source === src
+            && adoption.resources.core === replay_core
+            && replay_core.source_generation === bound_source_generation
+            && source_observation === observation
+            && session.acknowledged_current()
+            && source_authority.authorityRevision === expected_authority
+            && source_authority.physicalRevision === expected_physical_revision
+            && file_coordinator.state_write_is_current(expected_authority)
+            && owns_edit_session()
+            && !edit_cleanup_blocked()
+            && active_edit_session_id === edit_session;
+
+        if (
+            src === undefined
+            || replay_core === undefined
+            || observation === undefined
+            || expected_digest === undefined
+            || !!src.truncationMessage
+            || !replay_is_current()
+        ) {
+            refuse('document-changed');
+            return;
+        }
+
+        // 1. AGREEMENT. Resolve every worksheet the request names against the
+        // acknowledged workbook, by the same identity hierarchy durable state is
+        // reconciled by, so a renamed or reordered sheet resolves or refuses
+        // rather than silently addressing its new occupant.
+        const sheets = src.meta().sheets;
+        const lookup = worksheet_target_lookup(sheets);
+        const resolved_cells: { readonly input: typeof request.cells[number]; readonly sheetIndex: number }[] = [];
+        for (const cell of request.cells) {
+            const sheet_index = lookup(cell.worksheet);
+            const sheet = sheet_index === undefined ? undefined : sheets[sheet_index];
+            if (
+                sheet_index === undefined
+                || sheet === undefined
+                || cell.sourceRow >= sheet.sourceRowCount
+                || cell.sourceColumn >= sheet.columnCount
+            ) {
+                refuse('unavailable');
+                return;
+            }
+            resolved_cells.push({ input: cell, sheetIndex: sheet_index });
+        }
+        const highlight_sheet_indices = new Map<number, number>();
+        for (const highlight of request.highlights) {
+            const sheet_index = lookup(highlight.worksheet);
+            const sheet = sheet_index === undefined ? undefined : sheets[sheet_index];
+            if (
+                sheet_index === undefined
+                || sheet === undefined
+                || highlight.sourceRow >= sheet.sourceRowCount
+                || highlight.sourceColumn >= sheet.columnCount
+            ) {
+                refuse('unavailable');
+                return;
+            }
+            highlight_sheet_indices.set(highlight.ordinal, sheet_index);
+        }
+        const focus_sheet_index = lookup(request.focus.worksheet);
+        if (focus_sheet_index === undefined) {
+            refuse('unavailable');
+            return;
+        }
+
+        // Materialize the content each cell's overlay sits on top of, batched by
+        // row rather than one read per cell: a workbook-wide gesture can name
+        // thousands, and an undo keypress must not walk the source once each.
+        const materialized = materialize_replay_cells(
+            src,
+            resolved_cells.map(({ input, sheetIndex }) => ({
+                sheet_index: sheetIndex,
+                source_row: input.sourceRow,
+                source_column: input.sourceColumn,
+            })),
+        );
+        if (!replay_is_current()) {
+            refuse('document-changed');
+            return;
+        }
+        const prepared_cells: HistoryReplayPreparedCell[] = [];
+        for (const { input, sheetIndex } of resolved_cells) {
+            const content = materialized.get(
+                `${sheetIndex}:${input.sourceRow}:${input.sourceColumn}`,
+            );
+            // A cell the source cannot answer for is refused, never defaulted to
+            // empty: an undo would otherwise write emptiness over content it
+            // never saw.
+            if (content === undefined) {
+                refuse('unavailable');
+                return;
+            }
+            prepared_cells.push(Object.freeze({
+                ordinal: input.ordinal,
+                worksheet: input.worksheet,
+                resolvedSheetIndex: sheetIndex,
+                sourceRow: input.sourceRow,
+                sourceColumn: input.sourceColumn,
+                overlay: input.overlay,
+                persisted: content.rich === undefined
+                    ? { text: content.text }
+                    : { text: content.text, runs: content.rich },
+                persistedHyperlink: content.hyperlink,
+            }));
+        }
+
+        // 2. COMPARE-AND-SWAP against durable state.
+        const state = await read_file_state(false);
+        if (!replay_is_current()) {
+            refuse('document-changed');
+            return;
+        }
+        const current = normalize_host_state(state.state, sheets);
+        if (!replay_overlays_match_durable(current, prepared_cells, sheets)) {
+            refuse('conflict');
+            return;
+        }
+        if (!replay_highlights_match_durable(
+            current,
+            request.highlights,
+            highlight_sheet_indices,
+            sheets,
+        )) {
+            refuse('conflict');
+            return;
+        }
+
+        // 3. PHYSICAL CURRENCY. Last because it reads the whole file, and a
+        // conflict found above would have made the read wasted work.
+        const physical = await replay_physical_source_is_current(
+            observation,
+            expected_digest,
+            expected_authority,
+        );
+        if (!replay_is_current()) {
+            refuse('document-changed');
+            return;
+        }
+        if (!physical) {
+            refuse('document-changed');
+            return;
+        }
+
+        const now = Date.now();
+        const lease = replay_leases.issue(
+            {
+                leaseId: `${request.requestId}:${now}`,
+                requestId: request.requestId,
+                replayId: request.replayId,
+            },
+            {
+                direction: request.direction,
+                cells: Object.freeze(prepared_cells),
+                highlights: request.highlights,
+                highlightSheetIndices: highlight_sheet_indices,
+                focus: request.focus,
+                focusSheetIndex: focus_sheet_index,
+                sourceGeneration: replay_core.source_generation,
+                isCurrent: replay_is_current,
+            },
+            now,
+        );
+        if (lease === undefined) {
+            refuse('busy');
+            return;
+        }
+        void post_to_receiver({
+            type: 'historyReplayPrepared',
+            prepared: {
+                requestId: request.requestId,
+                replayId: request.replayId,
+                leaseId: lease.leaseId,
+                expiresAt: lease.expiresAt,
+                sourceGeneration: replay_core.source_generation,
+                focusSheetIndex: focus_sheet_index,
+                focus: request.focus,
+                cells: Object.freeze(prepared_cells),
+            },
+        }, receiver_epoch);
+    }
+
+    /** Whether every prepared cell still holds the overlay the request reported. */
+    function replay_overlays_match_durable(
+        current: PerFileState,
+        cells: readonly HistoryReplayPreparedCell[],
+        sheets: readonly WorksheetIdentity[],
+    ): boolean {
+        // One map read per sheet rather than per cell: `pending_edits_for_sheet`
+        // walks the slot to answer, and a wide gesture would walk it thousands of
+        // times.
+        const by_sheet = new Map<number, SheetPendingEditCells | undefined>();
+        for (const cell of cells) {
+            const index = cell.resolvedSheetIndex;
+            if (!by_sheet.has(index)) {
+                const sheet = sheets[index];
+                by_sheet.set(index, pending_edits_for_sheet(
+                    current.pendingEdits,
+                    index,
+                    sheet?.name,
+                    sheet?.worksheetId,
+                ));
+            }
+            if (!replay_cell_matches(by_sheet.get(index), {
+                sheetIndex: index,
+                sourceRow: cell.sourceRow,
+                sourceColumn: cell.sourceColumn,
+                overlay: cell.overlay,
+                persisted: cell.persisted,
+            })) return false;
+        }
+        return true;
+    }
+
+    /** Whether every prepared highlight still holds its expected colour. */
+    function replay_highlights_match_durable(
+        current: PerFileState,
+        highlights: readonly HistoryReplayHighlightInput[],
+        sheet_indices: ReadonlyMap<number, number>,
+        sheets: readonly WorksheetIdentity[],
+    ): boolean {
+        const digest = source_authority.physicalDigest;
+        if (digest === undefined) return false;
+        const renderable = normalize_workbook_snapshot_state(
+            current,
+            { sheets } as WorkbookMeta,
+            digest,
+        ).cellHighlights;
+        for (const highlight of highlights) {
+            const index = sheet_indices.get(highlight.ordinal);
+            if (index === undefined) return false;
+            if (!replay_highlight_matches(
+                renderable?.sheets[index]?.cells,
+                {
+                    sheetIndex: index,
+                    sourceRow: highlight.sourceRow,
+                    sourceColumn: highlight.sourceColumn,
+                    expected: highlight.expected,
+                    desired: highlight.desired,
+                },
+            )) return false;
+        }
+        return true;
+    }
+
+    /**
+     * Whether the file still holds the bytes this session parsed.
+     *
+     * The save path's sequence, for the same reason: stat, read, re-stat, compare
+     * the digest and the authority. The two stats bracket the read so a write
+     * landing mid-read is caught rather than digested.
+     *
+     * The residual race is accepted and is the same one the save path documents:
+     * the file can change between this check and the commit's own. The commit
+     * repeats it, and durable state is compare-and-swapped regardless, so the
+     * worst outcome is a refusal rather than a mutation against bytes nobody saw.
+     */
+    async function replay_physical_source_is_current(
+        observation: Readonly<PhysicalSourceObservation>,
+        expected_digest: string,
+        expected_authority: number,
+    ): Promise<boolean> {
+        try {
+            const before = await host.fs.stat(uri);
+            if (`${before.mtime}:${before.size}` !== observation.fingerprint) return false;
+            const raw = await host.fs.read_file(uri);
+            const after = await host.fs.stat(uri);
+            return before.mtime === after.mtime
+                && before.size === after.size
+                && content_digest(raw) === expected_digest
+                && source_authority.authorityRevision === expected_authority
+                && expected_authority === file_coordinator.authority().authorityRevision;
+        } catch {
+            // An unreadable file is not a current one. Refusing is right either
+            // way: a replay that cannot verify its basis must not mutate.
+            return false;
+        }
     }
 
     async function establish_pending_edit_flush_boundary(
