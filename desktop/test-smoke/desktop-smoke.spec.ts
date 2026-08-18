@@ -1,7 +1,8 @@
 // Smoke test for the standalone desktop app: launches the built Electron
 // bundle (dist/desktop/main.js) with a csv and an xlsx fixture, asserts each
 // file opened in its own window and rendered the data grid, and exercises
-// editing and saving, sorting, and the Edit menu's grid-routed Copy / Select All.
+// editing and saving, sorting, undo through the Edit menu, and the Edit menu's
+// grid-routed Copy / Select All.
 //
 // One window per file, so Playwright surfaces one page per opened file; the
 // welcome window only appears when the app is launched with no file.
@@ -855,4 +856,84 @@ test('CSV edits are marked dirty and save to the opened file', async () => {
         title: 'basic.csv',
         edited: false,
     });
+});
+
+/** How the Edit menu's item for one direction currently reads. */
+const history_menu_item = (label: 'Undo' | 'Redo') => app.evaluate(({ Menu }, direction) => {
+    const edit = Menu.getApplicationMenu()?.items.find((item) => item.label === 'Edit');
+    // By id rather than by label, which is the thing under test.
+    const target = edit?.submenu?.items.find(
+        (item) => item.id === `edit.${direction.toLowerCase()}`,
+    );
+    return target === undefined
+        ? undefined
+        : { label: target.label, enabled: target.enabled };
+}, label);
+
+/** Click the Edit menu's item for one direction, whatever it is currently labelled. */
+const click_history_menu_item = async (label: 'Undo' | 'Redo') => {
+    const clicked = await app.evaluate(({ BrowserWindow, Menu }, direction) => {
+        const edit = Menu.getApplicationMenu()?.items.find((item) => item.label === 'Edit');
+        const target = edit?.submenu?.items.find(
+            (item) => item.id === `edit.${direction.toLowerCase()}`,
+        );
+        if (!target?.click) return false;
+        target.click(target, BrowserWindow.getFocusedWindow() ?? undefined, {});
+        return true;
+    }, label);
+    expect(clicked, `Edit > ${label} exists`).toBe(true);
+};
+
+// The menu's Undo item is the only place a desktop user can see what undo would
+// do, and its label comes from the renderer's history across a process boundary.
+// Both halves are here: the label naming the gesture, and the click walking the
+// edit back. Nothing else in the suite covers the `historyMenuStateChanged`
+// projection reaching a real Electron menu.
+//
+// Last in the file on purpose. It ends inside edit mode — undo is never a way out
+// of it — and re-entering edit mode in an already-granted window does not
+// immediately admit an overlay editor, which would strand any test that followed.
+test('Edit menu Undo names the gesture and walks it back', async () => {
+    const page = await focus_viewer('basic.csv');
+
+    // No assertion on an empty stack here: history is window-scoped and this
+    // suite shares one app, so earlier tests in this file have already recorded
+    // gestures in this window. What is testable end to end is that the label
+    // tracks the newest one, which is the part that crosses the process boundary.
+    const edit_toggle = page.getByRole('button', { name: 'Edit' });
+    await edit_toggle.click();
+    await expect(edit_toggle).toHaveAttribute('aria-pressed', 'true');
+    await click_grid_cell(page, { column: 1, row: 0 }, { x: 120, y: 50 });
+    await page.keyboard.press('Enter');
+    const cell_editor = page.locator('.cell-editor-input');
+    await expect(cell_editor).toBeVisible();
+    const original = await cell_editor.inputValue();
+    await cell_editor.fill('Undone');
+    await cell_editor.press('Enter');
+    await expect(cell_editor).toBeHidden();
+    await expect(page.locator('#glide-cell-1-0')).toHaveText('Undone');
+
+    // Now it names the gesture. The label is what the rebuild exists for — a
+    // MenuItem's label cannot change in place, so a stale one here would mean the
+    // menu was never rebuilt.
+    await expect.poll(() => history_menu_item('Undo'), { timeout: 15_000 })
+        .toEqual({ label: 'Undo Edit cell', enabled: true });
+
+    // By id, not by label: `click_menu_item` finds items by label, and this one's
+    // label is the thing under test — it is no longer the word "Undo".
+    await click_history_menu_item('Undo');
+    await expect(page.locator('#glide-cell-1-0')).toHaveText(original);
+    // And the cursor followed it, which is what makes an off-screen undo findable.
+    await expect(page.locator('#glide-cell-1-0')).toHaveAttribute('aria-selected', 'true');
+
+    // Redo now offers back the gesture just walked back, which is the other half
+    // of the same projection: the two stacks swapped, and the menu says so.
+    await expect.poll(() => history_menu_item('Redo'), { timeout: 15_000 })
+        .toEqual({ label: 'Redo Edit cell', enabled: true });
+
+    // The undo walked the only edit back, so the fixture is pristine again and
+    // this leaves no draft for anything downstream. Edit mode is deliberately
+    // NOT left here: undo may put the user back into editing but is never a way
+    // out of it, and this test is last in the file.
+    await expect(edit_toggle).not.toHaveClass(/has-unsaved/);
 });
