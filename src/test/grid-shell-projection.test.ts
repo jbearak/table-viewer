@@ -2339,6 +2339,69 @@ describe('GridShell link-only edits', () => {
     });
 });
 
+describe('GridShell edit-admission lifetime', () => {
+    const editable = (overrides: Partial<GridShellProps> = {}) => props({
+        edit_mode: true,
+        csv_editable: true,
+        edit_session_id: 'session-1',
+        ...overrides,
+    });
+    const cell_is_editable = () => {
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => { allowOverlay: boolean };
+        return get_cell_content([0, 0]).allowOverlay;
+    };
+
+    it('keeps an edit admission fenced across an ordinary rerender', async () => {
+        // A failed close/reload remains fenced. The boundary is a real new
+        // activation, not "some render happened after stop_edit_admission".
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const initial = editable({ editing_ref });
+        const GridShell = await render_grid(initial);
+        expect(cell_is_editable()).toBe(true);
+
+        await act(async () => editing_ref.current!.stop_edit_admission());
+        expect(cell_is_editable()).toBe(false);
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, { ...initial }));
+        });
+        expect(cell_is_editable()).toBe(false);
+    });
+
+    it('reopens cell editing for a new edit-mode activation in the same session', async () => {
+        // The desktop host deliberately reuses an already-owned session ID. The
+        // close fence belongs to the activation that raised it, so false→true
+        // must open a new one without requiring a remount or a different ID.
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const initial = editable({ editing_ref });
+        const GridShell = await render_grid(initial);
+        expect(cell_is_editable()).toBe(true);
+
+        await act(async () => editing_ref.current!.stop_edit_admission());
+        expect(cell_is_editable()).toBe(false);
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...initial,
+                edit_mode: false,
+            }));
+        });
+        expect(cell_is_editable()).toBe(false);
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...initial,
+                edit_mode: true,
+            }));
+        });
+        expect(cell_is_editable()).toBe(true);
+        const close_overlay = await open_tracking_overlay([0, 0], 'source-a');
+        expect(document.querySelector('.cell-editor-input')).not.toBeNull();
+        await close_overlay();
+    });
+});
+
 // Every test here installs a NON-IDENTITY display→source mapping. Under identity
 // a display-keyed and a source-keyed implementation are indistinguishable, so an
 // identity fixture would make each of these assertions vacuous.

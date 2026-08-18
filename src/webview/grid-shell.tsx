@@ -690,19 +690,43 @@ export function GridShell({
         restored_save_operation,
     );
     const save_in_flight_ref = useRef(restored_save_operation !== undefined);
-    const close_barrier_ref = useRef(false);
-    const [close_barrier_active, set_close_barrier_active] = useState(false);
-    const close_barrier_session_ref = useRef(edit_session_id);
-    if (close_barrier_session_ref.current !== edit_session_id) {
-        // A close/release fence belongs to one edit session. A later grant can reuse
-        // this mounted GridShell, so reopen the synchronous mutation boundary during
-        // render rather than leaving the new session permanently read-only.
-        close_barrier_session_ref.current = edit_session_id;
-        close_barrier_ref.current = false;
+    // A fence belongs to one EDIT-ADMISSION activation, not merely one host
+    // session. The host may grant a new edit-mode activation with the session ID
+    // this window already owns; session-keying the old boolean left that new
+    // activation fenced forever. A monotonically increasing generation gives
+    // every session change and every false→true edit-mode transition a fresh
+    // lifetime, while an ordinary rerender leaves the current fence in force.
+    const edit_admission_generation_ref = useRef(0);
+    const edit_admission_identity_ref = useRef({
+        session: edit_session_id,
+        active: edit_mode,
+    });
+    const previous_admission = edit_admission_identity_ref.current;
+    if (
+        previous_admission.session !== edit_session_id
+        || (!previous_admission.active && edit_mode)
+    ) {
+        edit_admission_generation_ref.current += 1;
     }
-    useEffect(() => {
-        set_close_barrier_active(false);
-    }, [edit_session_id]);
+    edit_admission_identity_ref.current = {
+        session: edit_session_id,
+        active: edit_mode,
+    };
+
+    // The ref closes mutation paths synchronously before App crosses an async host
+    // boundary. State only requests the render that closes Glide's declarative
+    // affordances (`allowOverlay`, paste, fill handle); both name the same
+    // generation, so there is no independent boolean to forget to reset.
+    const fenced_edit_admission_generation_ref = useRef<number | null>(null);
+    const [fenced_edit_admission_generation, set_fenced_edit_admission_generation] =
+        useState<number | null>(null);
+    const edit_admission_is_fenced = useCallback(
+        () => fenced_edit_admission_generation_ref.current
+            === edit_admission_generation_ref.current,
+        [],
+    );
+    const close_barrier_active = fenced_edit_admission_generation
+        === edit_admission_generation_ref.current;
 
     // Read a cell's persisted raw text from the paged cache for the editing hook.
     // Stabilized against the loader's per-render callback identities; `version` in
@@ -907,7 +931,7 @@ export function GridShell({
         force = false,
     ): number => {
         if (!edit_session_id) return 0;
-        if (close_barrier_ref.current) {
+        if (edit_admission_is_fenced()) {
             return pending_edit_durability.snapshot(edit_session_id)
                 .highestProducedSequence;
         }
@@ -1348,7 +1372,7 @@ export function GridShell({
     // and post one atomic workbook operation. GridShell never assembles a partial
     // operation: the registry and operation identity both live above this mount.
     const request_save = useCallback((): boolean => {
-        if (close_barrier_ref.current || save_in_flight_ref.current || !edit_session_id) {
+        if (edit_admission_is_fenced() || save_in_flight_ref.current || !edit_session_id) {
             return false;
         }
         const live = read_live_edit();
@@ -1539,15 +1563,15 @@ export function GridShell({
     }, [editable_cells, request_save]);
 
     const guarded_clear_dirty = useCallback(() => {
-        if (close_barrier_ref.current || save_in_flight_ref.current) return;
+        if (edit_admission_is_fenced() || save_in_flight_ref.current) return;
         clear_dirty();
     }, [clear_dirty, save_in_flight_ref]);
     const guarded_discard_conflicted = useCallback(() => {
-        if (close_barrier_ref.current || save_in_flight_ref.current) return;
+        if (edit_admission_is_fenced() || save_in_flight_ref.current) return;
         discard_conflicted();
     }, [discard_conflicted, save_in_flight_ref]);
     const guarded_discard_keys = useCallback((keys: readonly string[]) => {
-        if (close_barrier_ref.current || save_in_flight_ref.current) return;
+        if (edit_admission_is_fenced() || save_in_flight_ref.current) return;
         if (keys.length === 0) return;
         // Host-named keys are already source-keyed, so they go straight into the
         // source-keyed store with no conversion — the payoff for having moved
@@ -1564,8 +1588,9 @@ export function GridShell({
             discard_conflicted: guarded_discard_conflicted,
             discard_keys: guarded_discard_keys,
             stop_edit_admission() {
-                close_barrier_ref.current = true;
-                set_close_barrier_active(true);
+                const generation = edit_admission_generation_ref.current;
+                fenced_edit_admission_generation_ref.current = generation;
+                set_fenced_edit_admission_generation(generation);
             },
             commit_live_edit,
             flush_live_edit,
@@ -2146,7 +2171,7 @@ export function GridShell({
     // with the cell location, which we fold into the dirty map.
     const on_cell_edited = useCallback(
         (cell: Item, new_value: EditableGridCell) => {
-            if (close_barrier_ref.current || save_in_flight_ref.current) return;
+            if (edit_admission_is_fenced() || save_in_flight_ref.current) return;
             const [display_column, row] = cell;
             const source_column = source_column_for_display(display_column);
             if (source_column === undefined) return;
@@ -2237,7 +2262,7 @@ export function GridShell({
                 };
             }, []);
             const handle_change = (next: GridCell) => {
-                if (save_in_flight_ref.current || close_barrier_ref.current) return;
+                if (save_in_flight_ref.current || edit_admission_is_fenced()) return;
                 props.onChange(next);
                 // Keep the live overlay in the renderer snapshot without turning
                 // every keystroke into a host state write. A close/reload flush reads
@@ -2835,7 +2860,7 @@ export function GridShell({
             // host — a silently dropped edit rather than a refused one.
             if (
                 !target
-                || close_barrier_ref.current
+                || edit_admission_is_fenced()
                 || save_in_flight_ref.current
             ) return;
             commit_hyperlink(target.source_row, target.source_col, next);
