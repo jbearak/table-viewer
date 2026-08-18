@@ -533,15 +533,14 @@ export function App(): React.JSX.Element {
      */
     const record_highlight_gesture = useCallback((
         deltas: readonly HighlightCellDelta[],
+        label: string,
     ) => {
         if (deltas.length === 0) return;
         const record = history_store_ref.current!.stage_record({
-            label: highlight_gesture_label_ref.current,
+            label,
             changes: highlight_history_source(deltas, meta_ref.current?.sheets ?? []),
         });
-        if (!record.valid()) return;
-        record.commit();
-        record.notify();
+        commit_staged_transaction([record]);
     }, []);
 
     /**
@@ -872,9 +871,17 @@ export function App(): React.JSX.Element {
         Array.from(crypto.getRandomValues(new Uint32Array(2)), (value) =>
             value.toString(36)).join('-'),
     );
-    const pending_highlight_request_ref = useRef<string | null>(null);
-    /** What to call the highlight gesture in flight, in the undo menu. */
-    const highlight_gesture_label_ref = useRef('Highlight cells');
+    /**
+     * The highlight request awaiting the host, with the name to record it under.
+     *
+     * One ref and not two: the label is only ever read when a reply matching this
+     * id arrives, so carrying it here makes "which gesture" and "what it was
+     * called" impossible to get out of step.
+     */
+    const pending_highlight_request_ref = useRef<{
+        readonly requestId: string;
+        readonly label: string;
+    } | null>(null);
     const last_highlight_state_revision_ref = useRef(0);
 
     const { persist_immediate } = use_state_sync(
@@ -1296,8 +1303,9 @@ export function App(): React.JSX.Element {
                     || msg.physicalRevision !== identity.sourceBasis.physicalRevision
                     || msg.sourceGeneration !== source_generation_ref.current
                 ) return;
+                const pending_highlight = pending_highlight_request_ref.current;
                 const matching_request = !!msg.requestId
-                    && pending_highlight_request_ref.current === msg.requestId;
+                    && pending_highlight?.requestId === msg.requestId;
                 if (matching_request) {
                     pending_highlight_request_ref.current = null;
                     set_highlight_request_pending(false);
@@ -1320,8 +1328,13 @@ export function App(): React.JSX.Element {
                 // message arrives for another window's highlight, an external
                 // reload, and a post-save rebase; recording those would let undo
                 // repaint cells this user never touched.
-                if (matching_request && !msg.error && msg.deltas !== undefined) {
-                    record_highlight_gesture(msg.deltas);
+                if (
+                    matching_request
+                    && !msg.error
+                    && msg.deltas !== undefined
+                    && pending_highlight !== null
+                ) {
+                    record_highlight_gesture(msg.deltas, pending_highlight.label);
                 }
                 state_ref.current = {
                     ...state_ref.current,
@@ -2991,14 +3004,34 @@ export function App(): React.JSX.Element {
     ]);
 
     /**
-     * The replay reservation, as the editing layer sees it.
+     * Whether a cell gesture may enter the history right now.
      *
-     * Stable across renders because a replay starts and ends inside event
+     * Two reservations, one predicate, because both are about the same thing —
+     * an edit must not be RECORDED while another gesture is mid-flight for the
+     * same history:
+     *
+     *   - A replay in flight owns the history's next move.
+     *   - A highlight round trip is recorded only when the host's deltas come
+     *     back, so an edit committed inside that window would enter the history
+     *     BEFORE the highlight the user made first, and undo would revert the
+     *     highlight instead of the typing.
+     *
+     * Here rather than in the grid because this is where every recorded gesture
+     * converges: `run_edit_gesture` gates the overlay editor, paste, Glide's
+     * fill hotkeys AND the hyperlink dialog, which reaches the store through
+     * `commit_hyperlinks` and no grid-side editability flag.
+     * GridShell's `highlight_in_flight` prop is the affordance, not the barrier —
+     * it stops a cell opening at all, so nothing the user types is silently
+     * swallowed.
+     *
+     * Stable across renders because a gesture starts and ends inside event
      * handlers: making this depend on rendered state would rebuild the editing
      * callbacks mid-gesture, and a wide paste is assembled across many of them.
+     * Both reservations therefore live in refs.
      */
-    const replay_gestures_admitted = useCallback(
-        () => !(replay_coordinator_ref.current?.is_busy() ?? false),
+    const edit_gestures_admitted = useCallback(
+        () => !(replay_coordinator_ref.current?.is_busy() ?? false)
+            && pending_highlight_request_ref.current === null,
         [],
     );
 
@@ -4026,13 +4059,13 @@ export function App(): React.JSX.Element {
             highlight_request_prefix_ref.current,
             ++highlight_request_seq_ref.current,
         ].join(':');
-        pending_highlight_request_ref.current = request_id;
-        // The gesture's own name, kept from the request: the diff that comes back
+        // The gesture's own name goes with the request: the diff that comes back
         // says which cells moved but not what the user asked for, and "Undo Clear
         // highlight" reads as the action they took.
-        highlight_gesture_label_ref.current = mutation.type === 'clear'
-            ? 'Clear highlight'
-            : 'Highlight cells';
+        pending_highlight_request_ref.current = {
+            requestId: request_id,
+            label: mutation.type === 'clear' ? 'Clear highlight' : 'Highlight cells',
+        };
         set_highlight_request_pending(true);
         set_highlight_status('Updating cell highlights…');
         host_bridge.postMessage({
@@ -4060,8 +4093,10 @@ export function App(): React.JSX.Element {
             highlight_request_prefix_ref.current,
             ++highlight_request_seq_ref.current,
         ].join(':');
-        pending_highlight_request_ref.current = request_id;
-        highlight_gesture_label_ref.current = 'Clear all highlights';
+        pending_highlight_request_ref.current = {
+            requestId: request_id,
+            label: 'Clear all highlights',
+        };
         set_highlight_request_pending(true);
         set_highlight_status('Updating cell highlights…');
         host_bridge.postMessage({
@@ -4994,7 +5029,7 @@ export function App(): React.JSX.Element {
                 active_sheet_index,
             )}
             history_store={history_store_ref.current!}
-            gestures_admitted={replay_gestures_admitted}
+            gestures_admitted={edit_gestures_admitted}
             host_rejected_keys={live_rejected_keys}
             on_editing_change={handle_editing_change}
             editing_ref={editing_ref}

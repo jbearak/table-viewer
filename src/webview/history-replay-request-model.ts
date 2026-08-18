@@ -21,6 +21,7 @@ import {
 } from './history-replay-wire-model';
 import { cell_address, type ReplayPlan } from './history-replay-model';
 import {
+    action_has_cell_changes,
     action_replay_changes,
     type HistoryEntry,
 } from './history-stack-model';
@@ -67,6 +68,26 @@ export interface ReplayRequestSources {
     ) => CellOverlayState | undefined;
     /** Correlation ids. Injected so tests are deterministic. */
     readonly next_id: (prefix: string) => string;
+}
+
+/**
+ * Whether replaying this action needs an edit session held.
+ *
+ * A cell change writes pending-edit state, which is session-owned: replaying one
+ * without a session would have nothing to authorize the write against. A
+ * highlight change does not — highlights are durable workbook state, governed by
+ * file authority and digest currency, and changeable outside edit mode entirely.
+ *
+ * The one renderer-side statement of that rule, and it lives here rather than
+ * with the stack because it is replay policy over a structural fact the stack
+ * reports ({@link action_has_cell_changes}) — the same rule the host reaches
+ * independently from the sanitized request's own `cells.length`. Two derivations
+ * of one rule, deliberately: the host must never take the renderer's word for
+ * it, or a claim of "highlights only" would be a way to write pending edits with
+ * no session behind them.
+ */
+export function action_requires_edit_session(action: HistoryEntry['action']): boolean {
+    return action_has_cell_changes(action);
 }
 
 /**

@@ -371,12 +371,18 @@ export interface GridShellProps {
     /**
      * Whether a highlight gesture is awaiting the host's acknowledgement.
      *
-     * Cells stop accepting edits for that window, on the same reasoning as
-     * `save_in_flight`: a highlight round-trips through durable state, and an edit
-     * recorded while one is outstanding would enter the history BEFORE the
-     * highlight that the user made first — so undo would revert the highlight when
-     * the user expected their typing back. The window is one host round trip, and
-     * the highlight panel is already disabled across it.
+     * Cells stop OFFERING an editor for that window, on the same reasoning as
+     * `save_in_flight`: a highlight round-trips through durable state, and it is
+     * recorded only when the host's deltas come back, so an edit recorded while
+     * one is outstanding would enter the history BEFORE the highlight the user
+     * made first — undo would then revert the highlight when the user expected
+     * their typing back. The window is one host round trip, and the highlight
+     * panel is already disabled across it.
+     *
+     * The affordance only. The barrier that actually keeps such an edit out of
+     * the history is App's `gestures_admitted`, which every recorded gesture
+     * passes through — including the hyperlink dialog, which reaches the store
+     * without consulting any editability flag here.
      */
     highlight_in_flight?: boolean;
     /** How this sheet's cells are edited ('markdown' for xlsx). Default 'plain'. */
@@ -739,12 +745,6 @@ export function GridShell({
         restored_save_operation,
     );
     const save_in_flight_ref = useRef(restored_save_operation !== undefined);
-    // Mirrors the prop for `on_cells_edited`'s batch gate. `editable_cells`
-    // covers the overlay editor, the paste path and the fill *handle*, but
-    // Glide's fill HOTKEYS (Ctrl+D / Ctrl+R) need no prop and stay live — they
-    // reach `on_cells_edited` directly, so that gate reads the flag itself.
-    const highlight_in_flight_ref = useRef(highlight_in_flight);
-    highlight_in_flight_ref.current = highlight_in_flight;
     const close_barrier_ref = useRef(false);
     const [close_barrier_active, set_close_barrier_active] = useState(false);
     const close_barrier_session_ref = useRef(edit_session_id);
@@ -2205,11 +2205,7 @@ export function GridShell({
             // The admission gates are the batch's, applied once: past the close
             // barrier `post_pending_edits` refuses to publish, so an edit
             // committed after it would sit in the store and never reach the host.
-            if (
-                close_barrier_ref.current
-                || save_in_flight_ref.current
-                || highlight_in_flight_ref.current
-            ) return true;
+            if (close_barrier_ref.current || save_in_flight_ref.current) return true;
 
             const edits: CellValueEdit[] = [];
             const damaged: { cell: Item }[] = [];
@@ -2303,7 +2299,6 @@ export function GridShell({
             source_column_for_display,
             commit_source_row,
             save_in_flight_ref,
-            highlight_in_flight_ref,
         ],
     );
 

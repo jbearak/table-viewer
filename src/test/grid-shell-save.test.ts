@@ -452,24 +452,21 @@ describe('GridShell CSV save', () => {
         expect(save_messages(post_message)).toEqual([]);
     });
 
-    it('blocks edits while a highlight gesture is awaiting the host', async () => {
+    it('stops offering an editor while a highlight gesture awaits the host', async () => {
         const store = create_edit_session_store({ session_id: 'session-1' });
         const { rerender_highlight_in_flight } = await render_grid(undefined, {
             edit_session: store,
         });
 
-        // Every affordance a cell edit can arrive through is closed for the
-        // window: the overlay editor and the paste path via the cell's
-        // `allowOverlay`/`onPaste`, and Glide's fill HOTKEYS — which need no
-        // prop and stay live — via `on_cells_edited`'s own gate. Without all
-        // three an edit would enter the history BEFORE the highlight the user
-        // made first, so undo would revert the highlight instead of the typing.
+        // The affordance, not the barrier: a cell must not OPEN across the
+        // highlight round trip, so nothing the user types is silently swallowed.
+        // Keeping such an edit out of the history is App's `gestures_admitted`
+        // (see use-editing.test.ts) — which also covers the hyperlink dialog,
+        // reaching the store with no editability flag here to consult.
         await rerender_highlight_in_flight(true);
         expect(grid_mock.props!.getCellContent!([0, 0]).allowOverlay).toBe(false);
         expect(grid_mock.props!.onPaste).toBe(false);
         expect(grid_mock.props!.fillHandle).toBe(false);
-        await edit_cell('during highlight');
-        expect(Object.fromEntries(store.snapshot())).toEqual({});
 
         // The window is one host round trip. The ack reopens editing.
         await rerender_highlight_in_flight(false);

@@ -7,8 +7,8 @@ import {
     overlay_state_from_dirty_entry,
 } from '../webview/history-cell-state-model';
 import { build_cell_history_change } from '../webview/history-capture-model';
+import { action_requires_edit_session } from '../webview/history-replay-request-model';
 import {
-    action_requires_edit_session,
     type HighlightHistoryDelta,
     type HistoryChange,
 } from '../webview/history-stack-model';

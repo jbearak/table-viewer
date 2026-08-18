@@ -47,6 +47,7 @@ import {
 } from './history-replay-model';
 import {
     build_commit_request,
+    action_requires_edit_session,
     build_prepare_request,
     commit_refusal_reason,
     prepare_refusal_reason,
@@ -54,7 +55,6 @@ import {
     type ReplayRequestSources,
 } from './history-replay-request-model';
 import {
-    action_requires_edit_session,
     peek_history,
     type HistoryEntry,
     type HistoryStackState,

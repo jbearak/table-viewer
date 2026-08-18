@@ -626,6 +626,26 @@ export function sanitized_prepare_history_replay_request(
     });
 }
 
+/**
+ * Whether this request's replay needs an edit session held.
+ *
+ * The host's ONE derivation of that rule, over a request the host itself
+ * sanitized: admission gates on it and the lease binds to it, and if those two
+ * read it differently a lease could be issued under session assumptions the gate
+ * never applied. Deliberately a function of the sanitized request rather than
+ * anything the renderer asserts — a claim of "highlights only" would otherwise be
+ * a way to write pending edits with no session behind them.
+ *
+ * Cells, never the absence of highlights: one chronological history means a
+ * single action can carry both kinds, and a mixed request writes pending edits
+ * and so still requires a session.
+ */
+export function replay_request_requires_edit_session(
+    request: PrepareHistoryReplayRequest,
+): boolean {
+    return request.cells.length > 0;
+}
+
 export function sanitized_commit_history_replay_request(
     value: unknown,
 ): CommitHistoryReplayRequest | undefined {

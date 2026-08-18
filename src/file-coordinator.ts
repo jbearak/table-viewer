@@ -288,6 +288,10 @@ interface FileCoordinatorEntry {
     readonly warnedKeys: Set<string>;
 }
 
+/** Shared, because a no-op gesture is the common case and every one of them
+ *  would otherwise allocate and freeze its own empty array. */
+const NO_HIGHLIGHT_DELTAS: readonly HighlightCellDelta[] = Object.freeze([]);
+
 const entries = new Map<string, FileCoordinatorEntry>();
 
 export { canonical_file_key } from './file-refresh-watcher';
@@ -898,12 +902,12 @@ export function acquire_file_coordinator(
                     affectedCells: affected_cells,
                     // Empty when nothing changed, which is what a no-op gesture
                     // should record in a history: nothing.
-                    deltas: Object.freeze(changed
-                        ? [...highlight_state_deltas(
+                    deltas: changed
+                        ? Object.freeze([...highlight_state_deltas(
                             previous_highlights,
                             next.cellHighlights,
-                        )]
-                        : []),
+                        )])
+                        : NO_HIGHLIGHT_DELTAS,
                 });
                 for (const subscriber of [...entry.cellHighlightSubscribers]) {
                     try {

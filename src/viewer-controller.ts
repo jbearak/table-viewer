@@ -142,6 +142,7 @@ import {
 import {
     sanitized_abandon_history_replay_request,
     sanitized_commit_history_replay_request,
+    replay_request_requires_edit_session,
     sanitized_prepare_history_replay_request,
     type CommitHistoryReplayRequest,
     type HistoryReplayCommitRefused,
@@ -2877,9 +2878,13 @@ export function attach_viewer(
     function update_session_state_material(
         snapshot: Readonly<FileStateSnapshot>,
         allow_claim = false,
+        deliver = false,
     ): boolean {
         observe_durable_state(snapshot);
-        return session.update_state_snapshot(project_state_for_panel(snapshot, allow_claim));
+        return session.update_state_snapshot(
+            project_state_for_panel(snapshot, allow_claim),
+            { deliver },
+        );
     }
 
     async function refresh_session_state_material(
@@ -2919,6 +2924,14 @@ export function attach_viewer(
         write_basis: FileStateWriteBasis | null = {
             expectedAuthorityRevision: source_authority.authorityRevision,
         },
+        // Whether a commit must be DELIVERED, not merely refreshed into the
+        // session's material. Off by default, which is right for pending edits:
+        // the renderer holds those in its own stores and applies the accepted
+        // writes itself, so pushing a whole workbook snapshot per edit would be
+        // pure cost. A caller writing durable state the renderer can learn about
+        // no other way — a replayed cell highlight — turns it on, and pays for
+        // one projection rather than two by not re-delivering afterwards.
+        deliver = false,
     ): Promise<FileStateSnapshot | undefined> {
         let snapshot = await read_file_state(false);
         for (;;) {
@@ -2935,7 +2948,7 @@ export function attach_viewer(
             );
             if (result.type === 'committed') {
                 observe_durable_state(result.snapshot);
-                if (!disposed) update_session_state_material(result.snapshot);
+                if (!disposed) update_session_state_material(result.snapshot, false, deliver);
                 return result.snapshot;
             }
             file_coordinator.observe_state_authority(result.authority);
@@ -7050,13 +7063,9 @@ export function attach_viewer(
                 // state; one carrying only highlights mutates durable workbook
                 // state, which the ordinary highlight commands change with no
                 // session and outside edit mode. So the session requirement follows
-                // the cells.
-                //
-                // Decided from the SANITIZED request's own cell list, never from
-                // anything the renderer asserts: a claim of "highlights only" would
-                // otherwise be a way to write pending edits with no session behind
-                // them. A mixed request has cells, so it still requires one.
-                const requires_edit_session = request.cells.length > 0;
+                // the cells — read through the shared derivation, so this gate and
+                // the lease binding below cannot disagree about what it admitted.
+                const requires_edit_session = replay_request_requires_edit_session(request);
                 if (profile.previewMode === true) {
                     refuse('unavailable');
                     return;
@@ -7276,8 +7285,10 @@ export function attach_viewer(
         // Bound only for a replay that writes pending edits. A highlight-only
         // lease must be independent of the edit session in BOTH directions: it
         // cannot require one, and it must not be invalidated by one starting or
-        // ending underneath it — highlights are not session state.
-        const requires_edit_session = request.cells.length > 0;
+        // ending underneath it — highlights are not session state. The same
+        // derivation the admission gate used, so the lease cannot bind under
+        // assumptions the gate did not apply.
+        const requires_edit_session = replay_request_requires_edit_session(request);
         const edit_session = requires_edit_session ? active_edit_session_id : undefined;
         const bound_source_generation = replay_core?.source_generation;
 
@@ -7695,7 +7706,7 @@ export function attach_viewer(
         // the replay was in flight — and must leave history exactly where it is.
         let conflicted = false;
         let unavailable = false;
-        const replay_committed = await update_file_state((current, updater_sheets) => {
+        await update_file_state((current, updater_sheets) => {
             conflicted = false;
             unavailable = false;
             if (!payload.isCurrent()) {
@@ -7770,32 +7781,24 @@ export function attach_viewer(
         }, undefined, payload.isCurrent, {
             expectedAuthorityRevision: expected_authority,
             expectedPhysicalRevision: source_authority.physicalRevision,
-        });
-
-        if (unavailable) return refused('unavailable');
-        if (conflicted) return refused('conflict');
-        if (!payload.isCurrent()) return refused('document-changed');
-        // Highlights the replay wrote have to be PUBLISHED, not merely committed.
-        // `update_file_state` refreshes the session's state material without
-        // delivering it, which is right for pending edits — the renderer already
-        // holds those in its own stores and applies the accepted writes itself —
-        // but a highlight lives only in durable state, so without this the cells
-        // would change on disk and never repaint.
+        },
+        // Highlights the replay writes have to be PUBLISHED, not merely
+        // committed. A pending edit needs no delivery — the renderer holds it in
+        // its own stores and applies the accepted writes itself — but a highlight
+        // lives only in durable state, so without this the cells would change on
+        // disk and never repaint. Asked of the commit itself so the snapshot is
+        // projected once; delivering afterwards would clone and freeze the same
+        // state a second time.
         //
         // Deliberately not the `cellHighlightsChanged` shape the highlight
         // COMMANDS publish: that message carries a request id and the gesture's
         // deltas, which are what enter a window's undo history. A replay is the
         // history moving, so re-entering it would record undo as a new gesture.
-        if (
-            highlight_patches.length > 0
-            && replay_committed !== undefined
-            && !disposed
-        ) {
-            session.update_state_snapshot(
-                project_state_for_panel(replay_committed),
-                { deliver: true },
-            );
-        }
+        highlight_patches.length > 0);
+
+        if (unavailable) return refused('unavailable');
+        if (conflicted) return refused('conflict');
+        if (!payload.isCurrent()) return refused('document-changed');
         // The updater's own result is deliberately unused. An unchanged updater
         // reports `undefined` — for a replay that means the document already held
         // everything the replay would write, a byte-identical redo of a gesture

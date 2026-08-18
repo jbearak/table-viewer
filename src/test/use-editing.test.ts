@@ -1250,7 +1250,7 @@ describe('use_editing — hyperlink capture', () => {
     });
 });
 
-describe('the replay reservation', () => {
+describe('the history-ordering reservation', () => {
     let admitted = true;
     let session_store: EditSessionStore | null = null;
 
@@ -1305,5 +1305,34 @@ describe('the replay reservation', () => {
             { source_row: 0, source_col: 0, value: 'kept' },
         ]); });
         expect(session_store!.get('0:0')?.value).toBe('kept');
+    });
+
+    it('drops a hyperlink gesture too, which no grid flag gates', async () => {
+        // The reason this predicate lives in App rather than in GridShell's
+        // `editable_cells`: the hyperlink dialog commits straight through
+        // `commit_hyperlink`, consulting no per-cell editability at all. A
+        // highlight round trip in flight has to close THIS path as well, or an
+        // edit enters the history ahead of the highlight the user made first.
+        await render_gate();
+        admitted = false;
+        await act(async () => {
+            hook_result!.commit_hyperlink(0, 0, {
+                kind: 'external',
+                target: 'https://example.com/',
+            });
+        });
+        expect(session_store!.get('0:0')).toBeUndefined();
+
+        admitted = true;
+        await act(async () => {
+            hook_result!.commit_hyperlink(0, 0, {
+                kind: 'external',
+                target: 'https://example.com/',
+            });
+        });
+        expect(session_store!.get('0:0')?.link).toEqual({
+            kind: 'external',
+            target: 'https://example.com/',
+        });
     });
 });

@@ -1140,6 +1140,19 @@ export function history_action(label: string, changes: readonly HistoryChange[])
 }
 
 /**
+ * Whether this action contains a cell change.
+ *
+ * Structural, deliberately: what a cell change IMPLIES about the edit session is
+ * replay policy and lives with the replay rules, not in the stack. Asked as a
+ * presence question and never as the absence of highlights, because one
+ * chronological history means a single action can carry both kinds and a caller
+ * reasoning from "no highlights" would answer wrongly for the mixed case.
+ */
+export function action_has_cell_changes(action: HistoryAction): boolean {
+    return action.changes.some((change) => change.kind === 'cell');
+}
+
+/**
  * The changes a direction should replay, in the order it must replay them.
  *
  * Undo walks a gesture backwards. Within one gesture that only matters for a
@@ -1148,23 +1161,6 @@ export function history_action(label: string, changes: readonly HistoryChange[])
  * whole replay, because the compare-and-swap on the A->B delta expects to find
  * B and the cell holds C until the later delta has been undone.
  */
-/**
- * Whether replaying this action needs an edit session held.
- *
- * A cell change writes pending-edit state, which is session-owned: undoing one
- * without a session would have nothing to authorize the write against. A
- * highlight change does not — highlights are durable workbook state, governed by
- * file authority and digest currency, and changeable outside edit mode entirely.
- *
- * Decided on the presence of CELL changes, never the absence of highlights: a
- * mixed gesture — one chronological history means a single action can carry both —
- * contains a cell write and therefore still needs a session. Getting that
- * backwards would let a mixed undo write pending edits with no session behind it.
- */
-export function action_requires_edit_session(action: HistoryAction): boolean {
-    return action.changes.some((change) => change.kind === 'cell');
-}
-
 export function action_replay_changes(
     action: HistoryAction,
     direction: HistoryDirection,
