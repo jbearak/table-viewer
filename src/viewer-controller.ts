@@ -959,6 +959,13 @@ export function attach_viewer(
         HistoryReplayCommitted | HistoryReplayCommitRefused
     >();
     let replay_preparation_in_flight = false;
+    /**
+     * The commit operation a taken lease is running, so a retransmission can join
+     * the one mutation instead of waiting on an answer that may never come.
+     */
+    let active_replay_commit:
+        | Promise<HistoryReplayCommitted | HistoryReplayCommitRefused>
+        | undefined;
     let active_save_operation: CsvSaveHostOperation | undefined;
     let active_save_drain: Promise<void> = Promise.resolve();
     let disposal_edit_release_drain: Promise<void> = Promise.resolve();
@@ -7086,14 +7093,26 @@ export function attach_viewer(
                     return;
                 }
                 if (decision.kind === 'join') {
-                    // The commit is already running. Its own completion posts the
-                    // answer, and posting a second one here would tell the
-                    // renderer the mutation happened twice.
+                    // The commit is already running. Await the SAME operation
+                    // rather than returning silently: the mutation must not run
+                    // twice, but the renderer that retried is waiting for an
+                    // answer, and a `join` that answered nothing would leave it
+                    // waiting forever if the original post was the one that got
+                    // lost. Awaiting the shared promise gives both callers the one
+                    // outcome the single mutation produced.
+                    const running = active_replay_commit;
+                    if (running === undefined) return;
+                    void post_to_receiver(
+                        history_replay_result_message(await running),
+                        receiver_epoch,
+                    );
                     return;
                 }
-                const result = await commit_history_replay(request, decision.lease.payload);
-                replay_leases.settle(request.leaseId, result, Date.now());
-                void post_to_receiver(history_replay_result_message(result), receiver_epoch);
+                const operation = run_history_replay_commit(request, decision.lease.payload);
+                void post_to_receiver(
+                    history_replay_result_message(await operation),
+                    receiver_epoch,
+                );
                 return;
             }
             case 'abandonHistoryReplay': {
@@ -7401,7 +7420,12 @@ export function attach_viewer(
             refuse('busy');
             return;
         }
-        void post_to_receiver({
+        // Awaited, unlike most posts here: the lease is already live, and a
+        // renderer that never learned its id can neither spend nor abandon it —
+        // it would hold the one-at-a-time slot and refuse every replay as `busy`
+        // until its TTL ran out. Abandoning on a failed delivery is what keeps the
+        // slot's occupancy tied to a renderer that actually knows about it.
+        const delivered = await post_to_receiver({
             type: 'historyReplayPrepared',
             prepared: {
                 requestId: request.requestId,
@@ -7414,6 +7438,11 @@ export function attach_viewer(
                 cells: Object.freeze(prepared_cells),
             },
         }, receiver_epoch);
+        // Conditional on this exact lease, so a newer one issued in the meantime
+        // is never the thing dropped.
+        if (!delivered && replay_leases.current(Date.now())?.leaseId === lease.leaseId) {
+            replay_leases.abandon(lease.leaseId);
+        }
     }
 
     /** The answer for a settled replay, whichever way it went. */
@@ -7423,6 +7452,48 @@ export function attach_viewer(
         return 'reason' in result
             ? { type: 'historyReplayCommitRefused', refusal: result }
             : { type: 'historyReplayCommitted', committed: result };
+    }
+
+    /**
+     * Run a taken commit to a terminal answer, exactly once, and settle its lease.
+     *
+     * Total by construction. A committing lease deliberately has no TTL — its
+     * answer must stay recoverable by a lost acknowledgement — so an operation
+     * that threw without settling would leave the lease committing forever:
+     * every retry would `join` an operation that had already died, and every new
+     * preparation would be refused as `busy` until the panel reloaded. So the
+     * whole operation is wrapped, and a thrown failure becomes a refusal that is
+     * recorded like any other.
+     *
+     * `unavailable` rather than `conflict` for a thrown failure, because the two
+     * say different things to the renderer: a conflict means the document moved
+     * and the user may retry, while a failure of unknown outcome means this replay
+     * cannot be trusted to have left the document where the history thinks it is.
+     */
+    function run_history_replay_commit(
+        request: CommitHistoryReplayRequest,
+        payload: ReplayLeasePayload,
+    ): Promise<HistoryReplayCommitted | HistoryReplayCommitRefused> {
+        const operation = commit_history_replay(request, payload)
+            .catch((error: unknown): HistoryReplayCommitRefused => {
+                console.warn('History replay commit failed', error);
+                return Object.freeze({
+                    requestId: request.requestId,
+                    replayId: request.replayId,
+                    leaseId: request.leaseId,
+                    mutationId: request.mutationId,
+                    reason: 'unavailable' as const,
+                });
+            })
+            .then((result) => {
+                replay_leases.settle(request.leaseId, result, Date.now());
+                return result;
+            })
+            .finally(() => {
+                if (active_replay_commit === operation) active_replay_commit = undefined;
+            });
+        active_replay_commit = operation;
+        return operation;
     }
 
     /**
