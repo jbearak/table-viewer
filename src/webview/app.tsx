@@ -115,6 +115,7 @@ import {
 } from './history-cell-state-model';
 import type { HistoryEntry } from './history-stack-model';
 import type { HistoryReplayCommitted } from '../history-replay-protocol';
+import { pending_signal, type PendingSignal } from './pending-signal';
 import { commit_staged_transaction, type StagedMutation } from './staged-mutation';
 import { column_letter } from './grid-model';
 import {
@@ -1066,7 +1067,10 @@ export function App(): React.JSX.Element {
         // Undo of this discard must wait for the host's cleanup: until it settles,
         // a request for the new session it needs would be refused for a reason
         // about timing rather than about the document.
-        discarding_session_ref.current = csv_edit_session_id;
+        discard_cleanup_ref.current = {
+            session: csv_edit_session_id,
+            ...pending_signal<boolean>(),
+        };
         host_bridge.postMessage({
             type: 'discardEditSession',
             editSessionId: csv_edit_session_id,
@@ -3342,25 +3346,26 @@ export function App(): React.JSX.Element {
     }, [active_sheet_index, request_excel_header]);
 
     /**
-     * Waiters on the host's discard acknowledgement, keyed by session.
+     * The discard whose host-side cleanup has not been acknowledged yet.
      *
      * A discard is undoable, and the host refuses `requestEditSession` until its
-     * cleanup settles — so undoing one waits for the acknowledgement rather than
+     * cleanup settles — so undoing one awaits the acknowledgement rather than
      * asking into that window and being refused for a reason about timing.
+     *
+     * One shared promise per discard, not a list of waiters: the replay
+     * coordinator admits a single outstanding replay, so a collection would model
+     * a concurrency that cannot arise, and every additional awaiter can simply
+     * await the same promise.
      */
-    const discard_cleanup_waiters_ref = useRef(
-        new Map<string, ((cleared: boolean) => void)[]>(),
-    );
-    /** The session the last discard is still cleaning up after, if any. */
-    const discarding_session_ref = useRef<string>();
-    /** Waiters on the next `editSessionResult`, for a replay that needs a session. */
-    const session_grant_waiters_ref = useRef<((granted: boolean) => void)[]>([]);
+    const discard_cleanup_ref = useRef<PendingSignal<boolean> & { readonly session: string }>();
+    /** The same, for the next `editSessionResult` a replay is waiting on. */
+    const session_grant_ref = useRef<PendingSignal<boolean>>();
 
     const settle_session_grant_waiters = useCallback((granted: boolean) => {
-        const waiters = session_grant_waiters_ref.current;
-        if (waiters.length === 0) return;
-        session_grant_waiters_ref.current = [];
-        for (const waiter of waiters) waiter(granted);
+        const pending = session_grant_ref.current;
+        if (pending === undefined) return;
+        session_grant_ref.current = undefined;
+        pending.settle(granted);
     }, []);
 
     /**
@@ -3378,24 +3383,19 @@ export function App(): React.JSX.Element {
      * handler sets edit mode as it does for the Edit button.
      */
     const ensure_replay_session = useCallback(async (): Promise<boolean> => {
-        const discarding = discarding_session_ref.current;
+        const discarding = discard_cleanup_ref.current;
         if (discarding !== undefined) {
-            const cleared = await new Promise<boolean>((resolve) => {
-                const waiters = discard_cleanup_waiters_ref.current;
-                waiters.set(discarding, [...(waiters.get(discarding) ?? []), resolve]);
-            });
             // A clear that failed leaves editing disabled for the whole file, so
             // there is no session to be had and undo must not promise one.
-            if (!cleared) return false;
+            if (!await discarding.settled) return false;
         }
         if (csv_edit_session_id_ref.current !== undefined) return true;
         // A request already in flight — the Edit button pressed a moment ago —
         // is joined rather than duplicated: the host answers one request, and a
         // second would be refused while the first is outstanding.
         const already_requested = pending_edit_request_ref.current !== null;
-        const granted = new Promise<boolean>((resolve) => {
-            session_grant_waiters_ref.current.push(resolve);
-        });
+        const grant = session_grant_ref.current ?? pending_signal<boolean>();
+        session_grant_ref.current = grant;
         if (!already_requested) {
             set_edit_session_pending(true);
             const request_id = [
@@ -3418,7 +3418,7 @@ export function App(): React.JSX.Element {
                 worksheetId: requested_sheet?.worksheetId,
             });
         }
-        return granted;
+        return grant.settled;
     }, []);
     ensure_replay_session_ref.current = ensure_replay_session;
 
@@ -3849,13 +3849,11 @@ export function App(): React.JSX.Element {
                 // than the ones it is about to.
                 settle_session_grant_waiters(msg.granted && !!msg.editSessionId);
             } else if (msg.type === 'discardEditSessionResult') {
-                const waiters = discard_cleanup_waiters_ref.current;
-                const pending = waiters.get(msg.editSessionId);
-                waiters.delete(msg.editSessionId);
-                if (discarding_session_ref.current === msg.editSessionId) {
-                    discarding_session_ref.current = undefined;
+                const pending = discard_cleanup_ref.current;
+                if (pending !== undefined && pending.session === msg.editSessionId) {
+                    discard_cleanup_ref.current = undefined;
+                    pending.settle(msg.cleared);
                 }
-                for (const waiter of pending ?? []) waiter(msg.cleared);
             } else if (msg.type === 'editSessionRevoked') {
                 apply_save_lifecycle(msg.lifecycle);
             } else if (msg.type === 'saveDialogResult') {

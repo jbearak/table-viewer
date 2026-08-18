@@ -223,6 +223,20 @@ describe('beginning a replay', () => {
             expect(posted).toEqual([]);
         });
 
+        it('does not acquire one when there is nothing to replay', async () => {
+            // Acquiring a session puts the window INTO edit mode. Pressing undo on
+            // an empty history must not start editing the file and then refuse, so
+            // an empty or blocked history is answered before anything is asked for.
+            const { coordinator, session, posted } = harness([]);
+            await expect(coordinator.begin('undo')).resolves.toEqual({
+                kind: 'refused',
+                reason: 'nothing-to-replay',
+            });
+            expect(session.calls).toBe(0);
+            expect(posted).toEqual([]);
+            expect(coordinator.is_busy()).toBe(false);
+        });
+
         it('refuses when no session can be had, and sends nothing', async () => {
             // The host may simply refuse, and after a failed discard cleanup
             // editing is disabled for the whole file.

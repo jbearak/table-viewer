@@ -66,9 +66,20 @@ export function* discard_history_source(
                 sourceColumn: coordinates.sourceColumn,
                 before: overlay_state_from_dirty_entry(entry),
                 after: absent_overlay(),
-                // Never read: both dimensions are `membership` here, and a
-                // membership side's content is not compared. See the file's note.
-                persisted: { value: history_value(''), hyperlink: null },
+                // The store's own record of what this overlay was made against,
+                // which is the closest thing to persisted state that exists
+                // without page residency — and for a link-only entry it IS the
+                // cell's unedited text. Never actually compared: both dimensions
+                // are `membership` here, so only absence is asserted (see the
+                // file's note). Passing the entry's own base rather than a
+                // fabricated empty keeps that independent of the delta builder's
+                // internals: were a later refactor to start consulting persisted
+                // content, this would degrade to a stale base rather than to an
+                // invented empty cell.
+                persisted: {
+                    value: history_value(entry.base, entry.baseRuns),
+                    hyperlink: entry.baseLink ?? null,
+                },
             });
             // A present overlay always moves when it is removed, so the builder
             // cannot answer `undefined` — but it is a total function and this

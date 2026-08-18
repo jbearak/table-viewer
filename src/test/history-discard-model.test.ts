@@ -71,13 +71,28 @@ describe('discard_history_source', () => {
     it('makes every transition membership, so no content is written back', () => {
         // The load-bearing property. A `semantic` redo would write the historical
         // persisted text over whatever is on disk now; `membership` removes the
-        // overlay instead. It is also why the fabricated persisted side below is
-        // never compared.
+        // overlay instead. It is also why the persisted side this module supplies
+        // without page residency is never compared.
         const [delta] = deltas([
             worksheet(SHEET, { '0:0': { value: 'a', base: 'A', link: LINK, baseLink: null } }),
         ]);
         expect(delta.value?.mode).toBe('membership');
         expect(delta.hyperlink?.mode).toBe('membership');
+    });
+
+    it('takes the absent side from the entry\'s own base, never an invented empty', () => {
+        // The persisted side cannot be read without page residency, and a
+        // `membership` transition never compares it. Supplying the base the
+        // overlay was made against — rather than `''` — means a later builder
+        // that did start consulting persisted content would see a stale base, not
+        // an empty cell it would then write over the user's data.
+        const [delta] = deltas([
+            worksheet(SHEET, {
+                '0:0': { value: 'a', base: 'A', link: LINK, baseLink: null },
+            }),
+        ]);
+        expect(delta.value?.desired.content).toEqual(history_value('A'));
+        expect(delta.hyperlink?.desired.content).toBeNull();
     });
 
     it('records a link-only entry through its hyperlink dimension alone', () => {

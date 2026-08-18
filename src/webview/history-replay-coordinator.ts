@@ -214,16 +214,29 @@ interface AcquiringReplay {
     readonly settle: (outcome: ReplayOutcome) => void;
 }
 
+/**
+ * The one slot, in whichever phase holds it.
+ *
+ * One variable rather than two, because the two phases are halves of a single
+ * fact — a replay is outstanding — and separate variables would make "both
+ * populated" a representable state that nothing can produce, leaving every
+ * busy check, settle path and reset to spell out the same exclusion by hand.
+ */
+type ActiveReplay = AcquiringReplay | (RunningReplay & { readonly kind: 'running' });
+
 export function create_history_replay_coordinator(
     host: ReplayCoordinatorHost,
 ): HistoryReplayCoordinator {
-    let reservation: AcquiringReplay | undefined;
-    let running: RunningReplay | undefined;
+    let active: ActiveReplay | undefined;
+
+    /** The slot's occupant, but only once it is actually replaying. */
+    const running_replay = (): (RunningReplay & { kind: 'running' }) | undefined =>
+        active?.kind === 'running' ? active : undefined;
 
     const settle = (outcome: ReplayOutcome): void => {
-        const replay = running;
+        const replay = running_replay();
         if (replay === undefined) return;
-        running = undefined;
+        active = undefined;
         replay.settle(outcome);
     };
 
@@ -231,23 +244,39 @@ export function create_history_replay_coordinator(
         settle({ kind: 'refused', reason });
     };
 
-    /** Release the reservation, if it is still the one that took it. */
+    /** Release the reservation, if it is still the one that took the slot. */
     const release = (held: AcquiringReplay, outcome: ReplayOutcome): void => {
-        if (reservation !== held) return;
-        reservation = undefined;
+        if (active !== held) return;
+        active = undefined;
         held.settle(outcome);
     };
 
     return {
-        is_busy: () => running !== undefined || reservation !== undefined,
+        is_busy: () => active !== undefined,
 
         begin: (direction) => new Promise<ReplayOutcome>((resolve) => {
-            if (running !== undefined || reservation !== undefined) {
+            if (active !== undefined) {
                 resolve({ kind: 'refused', reason: 'busy' });
                 return;
             }
+            // Refuse an empty or blocked history BEFORE acquiring anything.
+            // Acquiring a session installs fresh stores and puts the window into
+            // edit mode, so doing it first would mean pressing undo with nothing
+            // to undo silently started editing the file and then refused. The
+            // authoritative read is still the one after the grant — a grant can
+            // move the history — and this one only avoids a round trip that
+            // could not have replayed anything.
+            const before_acquiring = peek_history(host.history(), direction);
+            if (before_acquiring.kind === 'blocked') {
+                resolve({ kind: 'refused', reason: 'blocked' });
+                return;
+            }
+            if (before_acquiring.kind === 'exhausted') {
+                resolve({ kind: 'refused', reason: 'nothing-to-replay' });
+                return;
+            }
             const held: AcquiringReplay = { kind: 'acquiring', direction, settle: resolve };
-            reservation = held;
+            active = held;
             void (async () => {
                 let granted: boolean;
                 try {
@@ -263,7 +292,7 @@ export function create_history_replay_coordinator(
                     release(held, { kind: 'refused', reason: 'unavailable' });
                     return;
                 }
-                if (reservation !== held) return;
+                if (active !== held) return;
                 // Read AFTER the acquisition, never carried across it: a grant
                 // replaces the stores wholesale, so the overlays a request must
                 // describe are the post-install ones, and the epoch may have moved
@@ -286,10 +315,10 @@ export function create_history_replay_coordinator(
                     release(held, { kind: 'refused', reason: 'unavailable' });
                     return;
                 }
-                // The slot passes from the reservation to the replay itself, in one
-                // step, so no window exists in which neither holds it.
-                reservation = undefined;
-                running = {
+                // The one slot changes phase — from acquiring to running — in a
+                // single assignment, so no window exists in which it is free.
+                active = {
+                    kind: 'running',
                     direction,
                     entry: peek.entry,
                     requestId: request.requestId,
@@ -302,7 +331,7 @@ export function create_history_replay_coordinator(
         }),
 
         on_prepared: (prepared) => {
-            const replay = running;
+            const replay = running_replay();
             if (
                 replay === undefined
                 || replay.requestId !== prepared.requestId
@@ -362,7 +391,7 @@ export function create_history_replay_coordinator(
         },
 
         on_prepare_refused: (refusal) => {
-            const replay = running;
+            const replay = running_replay();
             if (
                 replay === undefined
                 || replay.requestId !== refusal.requestId
@@ -372,7 +401,7 @@ export function create_history_replay_coordinator(
         },
 
         on_committed: (committed) => {
-            const replay = running;
+            const replay = running_replay();
             if (
                 replay === undefined
                 || replay.commit === undefined
@@ -392,7 +421,7 @@ export function create_history_replay_coordinator(
         },
 
         on_commit_refused: (refusal) => {
-            const replay = running;
+            const replay = running_replay();
             if (
                 replay === undefined
                 || replay.commit === undefined
@@ -403,8 +432,8 @@ export function create_history_replay_coordinator(
         },
 
         reset: () => {
-            const held = reservation;
-            if (held !== undefined) {
+            const held = active;
+            if (held !== undefined && held.kind === 'acquiring') {
                 // Still waiting on a session for a document that has gone. Its
                 // caller is awaiting an answer, so it is refused rather than left
                 // for the acquisition to resolve into nothing — and the guard
@@ -412,7 +441,7 @@ export function create_history_replay_coordinator(
                 release(held, { kind: 'refused', reason: 'document-changed' });
                 return;
             }
-            const replay = running;
+            const replay = running_replay();
             if (replay === undefined) return;
             // Nothing to abandon, in either phase. Before a commit the replay
             // holds no lease — every pre-commit exit in `on_prepared` abandons
