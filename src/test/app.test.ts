@@ -7615,8 +7615,14 @@ describe('edit mode save exit', () => {
         // Answered, not silently dropped: the save dialog's "discard" answer also
         // lands here, and by then the dialog has closed — so a bare refusal would
         // leave the user in edit mode with no account of why.
+        // Named for the wait it is actually blocked on. A replay-busy discard is a
+        // different wait with no highlight in it, and is asserted where undo is
+        // drivable from the renderer.
         expect(post_message).toHaveBeenCalledWith(
-            expect.objectContaining({ type: 'showWarning' }),
+            expect.objectContaining({
+                type: 'showWarning',
+                message: expect.stringContaining('cell highlight'),
+            }),
         );
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
         expect(JSON.parse(grid_stub().getAttribute('data-undo-labels')!)).toEqual([]);

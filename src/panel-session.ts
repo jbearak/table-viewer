@@ -429,13 +429,12 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
      * contains the earlier commit, so delivering what is held is both sufficient
      * and the only thing that cannot be rejected as stale.
      *
-     * Answers whether a delivery was emitted; `false` means there is no live
-     * adoption or receiver to deliver to.
+     * Answers whether a delivery was actually emitted; `false` means there was
+     * nothing to deliver to — no live adoption, no receiver yet, a receiver still
+     * behind the ready gate, or an adoption already marked stale.
      */
     deliver_current_material(): boolean {
-        if (this._lifecycle === 'disposed' || !this.current) return false;
-        this.deliver_material_refresh();
-        return true;
+        return this.deliver_material_refresh();
     }
 
     /** Re-sample only configuration/capabilities from the current adoption.
@@ -607,18 +606,23 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
         if (adoption) this.on_adoption_released?.(adoption);
     }
 
-    private deliver_material_refresh(): void {
+    /** Answers whether a delivery was actually created. Every early return is a
+     *  reason nothing can be delivered — no adoption, no receiver yet, a receiver
+     *  still behind the ready gate, or an adoption already marked stale — so a
+     *  caller that needs to know cannot read success from mere material existing. */
+    private deliver_material_refresh(): boolean {
         if (
             !this.current
             || this._lifecycle === 'disposed'
             || this.receiver_epoch === 0
             || this.ready_gate_epoch === this.receiver_epoch
             || this.stale_adoption_epoch === this.current.epoch
-        ) return;
+        ) return false;
         this.invalidate_transport();
         this.supersede_desired();
         this.acknowledged = undefined;
         this.create_desired('refresh', 'other');
+        return true;
     }
 
     private create_desired(

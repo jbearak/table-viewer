@@ -1264,6 +1264,19 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
         expect(posted).toHaveLength(2);
     });
 
+    it('reports no delivery when there is no receiver to deliver to', async () => {
+        // Adopted but never `ready()`, so `receiver_epoch` is still 0. A caller that
+        // reads success from material merely existing would believe the paint it
+        // asked for had gone out.
+        const { session, posted } = make_session();
+        session.replace_adoption(adoption());
+        await settle();
+        expect(posted).toHaveLength(0);
+        expect(session.deliver_current_material()).toBe(false);
+        await settle();
+        expect(posted).toHaveLength(0);
+    });
+
     it('isolates the immutable snapshot from later input mutation', async () => {
         const source = adoption();
         const mutable_state = source.stateSnapshot.state as PerFileState;

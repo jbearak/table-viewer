@@ -1052,10 +1052,21 @@ export function App(): React.JSX.Element {
         // runs, so a bare `return` would leave the user in edit mode with their
         // edits intact and no account of why. The button caller is harmless either
         // way — it is visibly still there to press again.
-        if (!edit_gestures_admitted()) {
+        //
+        // Named per reservation, because the two are separate waits and telling the
+        // user the wrong one is worse than telling them nothing: a replay-busy
+        // discard has no highlight anywhere in it.
+        if (pending_highlight_request_ref.current !== null) {
             host_bridge.postMessage({
                 type: 'showWarning',
                 message: 'A cell highlight is still being applied. Try discarding again in a moment.',
+            });
+            return;
+        }
+        if (!edit_gestures_admitted()) {
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: 'An undo is still being applied. Try discarding again in a moment.',
             });
             return;
         }
