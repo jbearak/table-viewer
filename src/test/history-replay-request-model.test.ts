@@ -1,0 +1,348 @@
+import { describe, expect, it } from 'vitest';
+import type { CellHighlightColor, WorksheetTarget } from '../types';
+import {
+    absent_overlay,
+    build_cell_history_delta,
+    history_value,
+    value_only_overlay,
+    type CellOverlayState,
+} from '../webview/history-cell-state-model';
+import {
+    peek_history,
+    type HistoryAction,
+    type HistoryChange,
+    type HistoryEntry,
+} from '../webview/history-stack-model';
+import { create_history_store } from '../webview/history-store';
+import { plan_history_replay, type ReplayPlan } from '../webview/history-replay-model';
+import { read_state_from_prepared_replay } from '../webview/history-replay-wire-model';
+import {
+    build_commit_request,
+    build_prepare_request,
+    commit_refusal_reason,
+    prepare_refusal_reason,
+    type ReplayRequestSources,
+} from '../webview/history-replay-request-model';
+import type { HistoryReplayPrepared, PrepareHistoryReplayRequest } from '../history-replay-protocol';
+
+const SHEET: WorksheetTarget = { sheetIndex: 0, sheetName: 'Data', worksheetId: 'rId1' };
+const OTHER: WorksheetTarget = { sheetIndex: 1, sheetName: 'Notes', worksheetId: 'rId2' };
+
+/** A cell going from unedited to typed, so undo removes the overlay. */
+function cell_change(
+    row: number,
+    column: number,
+    text: string,
+    worksheet: WorksheetTarget = SHEET,
+): HistoryChange {
+    const delta = build_cell_history_delta({
+        worksheet,
+        sourceRow: row,
+        sourceColumn: column,
+        before: absent_overlay(),
+        after: value_only_overlay(history_value(text), history_value('base')),
+        persistedValue: history_value('base'),
+        persistedHyperlink: null,
+    });
+    if (delta === undefined) throw new Error('fixture built a delta that moved nothing');
+    return { kind: 'cell', delta };
+}
+
+function highlight_change(
+    row: number,
+    column: number,
+    before: CellHighlightColor | null,
+    after: CellHighlightColor | null,
+): HistoryChange {
+    return {
+        kind: 'highlight',
+        delta: { worksheet: SHEET, sourceRow: row, sourceColumn: column, before, after },
+    };
+}
+
+function action(changes: readonly HistoryChange[]): HistoryAction {
+    return { label: 'Edit', changes };
+}
+
+/**
+ * An entry holding one action.
+ *
+ * Built through the store rather than by hand: `HistoryEntry` carries the epoch
+ * and measured costs the stack maintains, and a literal standing in for it would
+ * be a fixture asserting against a shape the store does not produce.
+ */
+function entry(changes: readonly HistoryChange[]): HistoryEntry {
+    const store = create_history_store();
+    const record = store.stage_record({ label: 'Edit', changes });
+    record.commit();
+    record.notify();
+    const peek = peek_history(store.snapshot(), 'undo');
+    if (peek.kind !== 'available') throw new Error('fixture recorded nothing to undo');
+    return peek.entry;
+}
+
+/**
+ * Sources over an overlay map: every cell the action touched currently holds its
+ * after-state, so an undo has something consistent to walk back.
+ */
+function sources(
+    changes: readonly HistoryChange[],
+    invisible: ReadonlySet<string> = new Set(),
+): ReplayRequestSources {
+    const overlays = new Map<string, CellOverlayState>();
+    for (const change of changes) {
+        if (change.kind !== 'cell') continue;
+        overlays.set(
+            `${change.delta.sourceRow}:${change.delta.sourceColumn}`,
+            change.delta.afterOverlay,
+        );
+    }
+    let counter = 0;
+    return {
+        read_overlay: (_worksheet, row, column) => {
+            const key = `${row}:${column}`;
+            return invisible.has(key) ? undefined : overlays.get(key) ?? absent_overlay();
+        },
+        next_id: (prefix) => `${prefix}-${++counter}`,
+    };
+}
+
+function prepare(
+    changes: readonly HistoryChange[],
+    direction: 'undo' | 'redo' = 'undo',
+    invisible?: ReadonlySet<string>,
+): PrepareHistoryReplayRequest | undefined {
+    return build_prepare_request(entry(changes), direction, sources(changes, invisible));
+}
+
+/** The prepared response a compliant host would send. */
+function prepared_for(request: PrepareHistoryReplayRequest): HistoryReplayPrepared {
+    return {
+        requestId: request.requestId,
+        replayId: request.replayId,
+        leaseId: 'lease-1',
+        focusSheetIndex: request.focus.worksheet.sheetIndex,
+        focus: request.focus,
+        cells: request.cells.map((cell) => ({
+            ordinal: cell.ordinal,
+            worksheet: cell.worksheet,
+            resolvedSheetIndex: cell.worksheet.sheetIndex,
+            sourceRow: cell.sourceRow,
+            sourceColumn: cell.sourceColumn,
+            overlay: cell.overlay,
+            persisted: { text: 'base' },
+            persistedHyperlink: null,
+        })),
+    };
+}
+
+function plan_for(
+    changes: readonly HistoryChange[],
+    prepared: HistoryReplayPrepared,
+    direction: 'undo' | 'redo' = 'undo',
+): ReplayPlan {
+    const result = plan_history_replay(
+        action(changes),
+        direction,
+        read_state_from_prepared_replay(prepared),
+    );
+    if (result.kind !== 'plan') throw new Error(`fixture plan refused: ${result.reason}`);
+    return result;
+}
+
+describe('build_prepare_request', () => {
+    it('assigns dense cell ordinals in replay order', () => {
+        const changes = [cell_change(0, 0, 'a'), cell_change(5, 2, 'b'), cell_change(9, 1, 'c')];
+        const request = prepare(changes);
+        expect(request?.cells.map((cell) => cell.ordinal)).toEqual([0, 1, 2]);
+    });
+
+    it('assigns one ordinal per address, not per change', () => {
+        // A paste overlapping its own source touches a cell twice, and both
+        // deltas compare-and-swap against the one cell.
+        const request = prepare([cell_change(0, 0, 'a'), cell_change(0, 0, 'b')]);
+        expect(request?.cells).toHaveLength(1);
+        expect(request?.cells[0]?.ordinal).toBe(0);
+    });
+
+    it('sends the cell current overlay, not the side the action recorded', () => {
+        const changes = [cell_change(3, 4, 'typed')];
+        const request = prepare(changes);
+        // The recorded before-side is absent; the cell currently holds the after.
+        expect(request?.cells[0]?.overlay.kind).toBe('present');
+    });
+
+    it('refuses when a cell overlay cannot be read', () => {
+        expect(prepare([cell_change(0, 0, 'a')], 'undo', new Set(['0:0']))).toBeUndefined();
+    });
+
+    it('refuses an action with no cells to replay', () => {
+        expect(prepare([highlight_change(0, 0, null, 'yellow')])).toBeUndefined();
+    });
+
+    describe('highlight expectations', () => {
+        it('expects the after side and desires the before side, undoing', () => {
+            const request = prepare([
+                cell_change(0, 0, 'a'),
+                highlight_change(1, 1, null, 'yellow'),
+            ]);
+            expect(request?.highlights[0]?.expected).toBe('yellow');
+            expect(request?.highlights[0]?.desired).toBe(null);
+        });
+
+        it('expects the before side and desires the after side, redoing', () => {
+            const request = prepare([
+                cell_change(0, 0, 'a'),
+                highlight_change(1, 1, null, 'yellow'),
+            ], 'redo');
+            expect(request?.highlights[0]?.expected).toBe(null);
+            expect(request?.highlights[0]?.desired).toBe('yellow');
+        });
+
+        it('numbers highlights densely and independently of cells', () => {
+            const request = prepare([
+                cell_change(0, 0, 'a'),
+                highlight_change(1, 1, null, 'yellow'),
+                highlight_change(2, 2, 'green', null),
+            ]);
+            expect(request?.highlights.map((entry) => entry.ordinal)).toEqual([0, 1]);
+        });
+    });
+
+    describe('the focus region', () => {
+        it('covers every touched cell on the first worksheet', () => {
+            const request = prepare([cell_change(2, 3, 'a'), cell_change(7, 1, 'b')]);
+            expect(request?.focus).toMatchObject({
+                sourceRowStart: 2,
+                sourceRowEnd: 7,
+                sourceColumnStart: 1,
+                sourceColumnEnd: 3,
+            });
+        });
+
+        it('ignores cells on other worksheets, which no rectangle could cover', () => {
+            // Undo walks the gesture backwards, so the FIRST change in replay
+            // order is the action's last — here the one on OTHER, which is
+            // therefore the sheet the focus settles on.
+            const request = prepare([
+                cell_change(2, 2, 'a'),
+                cell_change(90, 90, 'b', OTHER),
+            ]);
+            expect(request?.focus.worksheet.sheetIndex).toBe(OTHER.sheetIndex);
+            expect(request?.focus).toMatchObject({ sourceRowStart: 90, sourceRowEnd: 90 });
+        });
+
+        it('follows the first replayed change even when it is a highlight', () => {
+            const request = prepare([
+                cell_change(9, 9, 'a'),
+                highlight_change(4, 4, null, 'yellow'),
+            ]);
+            expect(request?.focus).toMatchObject({ sourceRowStart: 4, sourceRowEnd: 9 });
+        });
+    });
+});
+
+describe('build_commit_request', () => {
+    it('covers exactly the prepared cell set', () => {
+        const changes = [cell_change(0, 0, 'a'), cell_change(1, 1, 'b')];
+        const request = prepare(changes)!;
+        const prepared = prepared_for(request);
+        const commit = build_commit_request(prepared, plan_for(changes, prepared), 'm-1', 0);
+        expect(commit?.cells.map((cell) => cell.ordinal)).toEqual([0, 1]);
+    });
+
+    it('names writes by the ordinal preparation assigned, never its own index', () => {
+        const changes = [cell_change(0, 0, 'a'), cell_change(1, 1, 'b')];
+        const request = prepare(changes)!;
+        const prepared = prepared_for(request);
+        const commit = build_commit_request(prepared, plan_for(changes, prepared), 'm-1', 0);
+        // Every ordinal is one the preparation published.
+        const published = new Set(prepared.cells.map((cell) => cell.ordinal));
+        expect(commit?.cells.every((cell) => published.has(cell.ordinal))).toBe(true);
+    });
+
+    it('one highlight write per prepared highlight, by ordinal', () => {
+        const changes = [
+            cell_change(0, 0, 'a'),
+            highlight_change(1, 1, null, 'yellow'),
+            highlight_change(2, 2, 'green', null),
+        ];
+        const request = prepare(changes)!;
+        const prepared = prepared_for(request);
+        const commit = build_commit_request(prepared, plan_for(changes, prepared), 'm-1', 2);
+        expect(commit?.highlights.map((entry) => entry.ordinal)).toEqual([0, 1]);
+    });
+
+    it('refuses when the plan highlight count disagrees with the prepared one', () => {
+        // A mismatch would mean committing a highlight the host verified nothing
+        // about, so it is refused rather than trimmed to fit.
+        const changes = [cell_change(0, 0, 'a'), highlight_change(1, 1, null, 'yellow')];
+        const request = prepare(changes)!;
+        const prepared = prepared_for(request);
+        expect(build_commit_request(prepared, plan_for(changes, prepared), 'm-1', 2))
+            .toBeUndefined();
+    });
+
+    it('refuses a planned write the preparation has no ordinal for', () => {
+        const changes = [cell_change(0, 0, 'a')];
+        const request = prepare(changes)!;
+        const prepared = prepared_for(request);
+        const plan = plan_for(changes, prepared);
+        // A preparation covering a different cell than the plan writes.
+        const foreign: HistoryReplayPrepared = {
+            ...prepared,
+            cells: prepared.cells.map((cell) => ({ ...cell, sourceRow: cell.sourceRow + 40 })),
+        };
+        expect(build_commit_request(foreign, plan, 'm-1', 0)).toBeUndefined();
+    });
+
+    it('carries the lease correlation through unchanged', () => {
+        const changes = [cell_change(0, 0, 'a')];
+        const request = prepare(changes)!;
+        const prepared = prepared_for(request);
+        const commit = build_commit_request(prepared, plan_for(changes, prepared), 'm-1', 0);
+        expect(commit).toMatchObject({
+            requestId: prepared.requestId,
+            replayId: prepared.replayId,
+            leaseId: prepared.leaseId,
+            mutationId: 'm-1',
+        });
+    });
+
+    it('gives a prepared cell the plan leaves alone a no-op entry', () => {
+        // Two cells prepared, but a plan that writes only one: the untouched cell
+        // still gets a write, carrying what its own overlay projects to, so the
+        // proposal covers the prepared set without proposing a change.
+        const changes = [cell_change(0, 0, 'a'), cell_change(1, 1, 'b')];
+        const request = prepare(changes)!;
+        const prepared = prepared_for(request);
+        const full = plan_for(changes, prepared);
+        const partial: ReplayPlan = { ...full, writes: full.writes.slice(0, 1) };
+        const commit = build_commit_request(prepared, partial, 'm-1', 0);
+        expect(commit?.cells).toHaveLength(2);
+        // Ordinal 1 is the second cell in REPLAY order, which for an undo is the
+        // action's first — the 'a' cell. It keeps its current overlay's value
+        // rather than being reverted by omission.
+        expect(commit?.cells[1]?.entry).toMatchObject({ value: 'a', base: 'base' });
+    });
+});
+
+describe('refusal vocabularies', () => {
+    it('maps every prepare refusal the host can send', () => {
+        expect(prepare_refusal_reason('busy')).toBe('busy');
+        expect(prepare_refusal_reason('conflict')).toBe('conflict');
+        expect(prepare_refusal_reason('malformed')).toBe('malformed');
+        expect(prepare_refusal_reason('unavailable')).toBe('unavailable');
+        expect(prepare_refusal_reason('edit-session-unavailable')).toBe('unavailable');
+        expect(prepare_refusal_reason('document-changed')).toBe('document-changed');
+    });
+
+    it('maps every commit refusal, reading an expired lease as a moved document', () => {
+        expect(commit_refusal_reason('conflict')).toBe('conflict');
+        expect(commit_refusal_reason('malformed')).toBe('malformed');
+        expect(commit_refusal_reason('proposal-mismatch')).toBe('malformed');
+        expect(commit_refusal_reason('unavailable')).toBe('unavailable');
+        expect(commit_refusal_reason('expired')).toBe('document-changed');
+        expect(commit_refusal_reason('document-changed')).toBe('document-changed');
+    });
+});

@@ -391,6 +391,13 @@ export interface GridShellProps {
      */
     history_store?: HistoryStore;
     /**
+     * Whether a new edit gesture may start. Absent means always.
+     *
+     * Carries the replay reservation down: while an undo is in flight, a keystroke
+     * would be planned against a state the replay is about to move.
+     */
+    gestures_admitted?: () => boolean;
+    /**
      * Source-keyed keys the host refused the last save over. Unioned into the
      * conflict tint so a `baseMismatch` cell is visibly marked even though the
      * webview's own residency-gated conflict detection cannot flag it. A
@@ -474,6 +481,7 @@ export function GridShell({
     initial_edits,
     edit_session,
     history_store,
+    gestures_admitted,
     host_rejected_keys,
     on_editing_change,
     editing_ref,
@@ -794,6 +802,7 @@ export function GridShell({
     } = use_editing(get_cell_raw, generation, edit_session_id, store, {
         syntax: edit_syntax,
         capture: history_capture,
+        gestures_admitted,
         // Same identity discipline as get_cell_raw: rebinds with `version` so
         // freshly-loaded pages refresh markdown edit text and bases.
         get_cell: useCallback(

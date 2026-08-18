@@ -1249,3 +1249,61 @@ describe('use_editing — hyperlink capture', () => {
         expect(stack[0].action.changes).toHaveLength(2);
     });
 });
+
+describe('the replay reservation', () => {
+    let admitted = true;
+    let session_store: EditSessionStore | null = null;
+
+    function GateHarness({ rows }: { rows: (CellData | null)[][] }) {
+        const get_cell_raw = React.useMemo(() => make_get_cell_raw(rows), [rows]);
+        hook_result = use_editing(get_cell_raw, 0, 'session-1', session_store!, {
+            gestures_admitted: () => admitted,
+        });
+        return null;
+    }
+
+    async function render_gate() {
+        admitted = true;
+        session_store = create_edit_session_store({ session_id: 'session-1' });
+        container = document.createElement('div');
+        document.body.appendChild(container);
+        root = createRoot(container);
+        await act(async () => {
+            root!.render(React.createElement(GateHarness, { rows: base_rows }));
+        });
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+    }
+
+    it('admits a gesture when nothing is replaying', async () => {
+        await render_gate();
+        await act(async () => { hook_result!.commit_edits([
+            { source_row: 0, source_col: 0, value: 'typed' },
+        ]); });
+        expect(session_store!.get('0:0')?.value).toBe('typed');
+    });
+
+    it('drops a gesture that lands while a replay is in flight', async () => {
+        await render_gate();
+        admitted = false;
+        await act(async () => { hook_result!.commit_edits([
+            { source_row: 0, source_col: 0, value: 'typed' },
+        ]); });
+        // Dropped like a keystroke arriving with no session — not an error, and
+        // not a reason to leave edit mode.
+        expect(session_store!.get('0:0')).toBeUndefined();
+        expect(hook_result!.edit_mode).toBe(true);
+    });
+
+    it('admits again once the replay has settled', async () => {
+        await render_gate();
+        admitted = false;
+        await act(async () => { hook_result!.commit_edits([
+            { source_row: 0, source_col: 0, value: 'lost' },
+        ]); });
+        admitted = true;
+        await act(async () => { hook_result!.commit_edits([
+            { source_row: 0, source_col: 0, value: 'kept' },
+        ]); });
+        expect(session_store!.get('0:0')?.value).toBe('kept');
+    });
+});

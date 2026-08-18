@@ -18,6 +18,19 @@ import {
 } from './cell-content';
 import { is_valid_hyperlink } from './pending-changes';
 import { is_plain_record } from './plain-record';
+// Type-only, and deliberately so: `history-replay-protocol.ts` imports this
+// module's sanitizers, so a value import here would close a runtime cycle. The
+// `import type` is erased, and the protocol module stays the one place that
+// knows how to validate its own payloads.
+import type {
+    AbandonHistoryReplayRequest,
+    CommitHistoryReplayRequest,
+    HistoryReplayCommitRefused,
+    HistoryReplayCommitted,
+    HistoryReplayPrepareRefused,
+    HistoryReplayPrepared,
+    PrepareHistoryReplayRequest,
+} from './history-replay-protocol';
 
 export interface WorkbookData {
     sheets: SheetData[];
@@ -1848,7 +1861,14 @@ export type HostMessage =
      * instead, which is how a saved transform this sheet can no longer support stops
      * being asked for.
      */
-    | { type: 'transformRefused'; sheetIndex: number; requestId: string; intent: TransformIntent; reason: string; terminal: boolean };
+    | { type: 'transformRefused'; sheetIndex: number; requestId: string; intent: TransformIntent; reason: string; terminal: boolean }
+    // Undo/redo replay. The payloads are structural claims, not evidence: every
+    // one is re-parsed from `unknown` at its handler through
+    // `history-replay-protocol.ts`'s sanitizers, exactly as `saveCsv`'s is.
+    | { type: 'historyReplayPrepared'; prepared: HistoryReplayPrepared }
+    | { type: 'historyReplayPrepareRefused'; refusal: HistoryReplayPrepareRefused }
+    | { type: 'historyReplayCommitted'; committed: HistoryReplayCommitted }
+    | { type: 'historyReplayCommitRefused'; refusal: HistoryReplayCommitRefused };
 
 /** Messages from webview to extension host */
 export type WebviewMessage =
@@ -1898,6 +1918,17 @@ export type WebviewMessage =
     | { type: 'setExcelFirstRowHeader'; sheetIndex: number; sheetName: string; enabled: boolean; unhideAll?: boolean; headerRow?: number; requestId: string; generation: number; sourceGeneration: number }
     | { type: 'setTransform'; sheetIndex: number; state: SheetTransformState; requestId: string; generation: number; sourceGeneration: number; intent: TransformIntent }
     | { type: 'hideRows'; sheetIndex: number; displayRows: DisplayRowInterval[]; requestId: string; generation: number; sourceGeneration: number }
+    /** Ask the host to authorize replaying one history action. */
+    | { type: 'prepareHistoryReplay'; request: PrepareHistoryReplayRequest }
+    /** Spend the lease that preparation issued. */
+    | { type: 'commitHistoryReplay'; request: CommitHistoryReplayRequest }
+    /**
+     * Best-effort release of an unspent lease. Correctness must not depend on
+     * this arriving — expiry is the authoritative cleanup — but a planner
+     * refusal knows immediately that the lease is dead, and saying so frees the
+     * host's one-replay slot without a thirty-second wait.
+     */
+    | { type: 'abandonHistoryReplay'; request: AbandonHistoryReplayRequest }
     /**
      * Set one height on every row of a completed resize, named in display space.
      *
