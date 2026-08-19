@@ -264,6 +264,23 @@ So Stage 3's real job is to make the shared reader actually correct:
 Stage 5 may delete the unreadable-attribute guard **only** once the lexer handles
 these cases, with a test per row of the table above.
 
+**Reads are not enough — the mutations need hardening too.** Stage 3 found this;
+my brief had missed it. The writer did not only *read* attributes with
+double-quote-only regexes, it *rewrote* them that way:
+
+```
+/ spans="[^"]*"/          removing a stale row span
+/\bref="[^"]*"/           widening the dimension
+```
+
+Hardening the reads alone would produce a new bug rather than fix one: a
+single-quoted `spans='1:1'` would be read correctly and then silently **fail to
+be removed**, leaving a stale span after an insertion; a single-quoted dimension
+`ref` would be read and never widened. So Stage 3 also adds `remove_attr` and
+`replace_attr_value`, which target the exact unqualified attribute, accept both
+quote forms and whitespace around `=`, and preserve the original quote style.
+This is the "exact-span mutation" prerequisite the architecture review named.
+
 **Scope note: 30 `get_attr` call sites across 4 modules** — `parse-xlsx.ts`,
 `xlsx-hyperlink-write.ts`, `ooxml-relationships.ts`, `xlsx-rich-text.ts`. This is
 not a local change, so the lexer must be a strict improvement: every currently-
