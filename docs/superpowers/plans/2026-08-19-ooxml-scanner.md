@@ -19,10 +19,24 @@ own markup-aware equivalents (`indexOf_live`, `end_tag_after`, `scan_rows`,
 
 `assert_writable_sheet_data` (`xlsx-cell-write.ts:1049-1196`) exists to fail
 closed over exactly that gap: 9 `unsupported()` sites whose only job is to
-refuse shapes where the two scanners would diverge. Git history corroborates —
-roughly a dozen commits titled "Make the writer agree with the reader", "Match
-the reader on merges and dates", "Edit the row element the reader shows, not the
-first one".
+refuse shapes where the two scanners would diverge. They share one local
+`unsupported()` closure emitting a single "cannot edit safely" message, which is
+why 8 separate tests all assert the same regex.
+
+Git history measures the cost. **9 of the 37 commits that have ever touched
+`xlsx-cell-write.ts` are reader/writer agreement fixes** — about a quarter of
+the file's history: "Make the writer agree with the reader about the same file",
+"Agree with the reader on the sheetData close and on namespaces", "Match the
+reader on duplicate rows, comments, and slot entitlement", "Edit the row element
+the reader shows, not the first one", "Read XML the way a parser does in three
+more places", "Refuse three more reader/writer disagreements", and three more.
+That is the recurring tax this issue retires.
+
+The divergence is confined to this one pair. `src/xlsx-hyperlink-write.ts`
+(451 lines) hand-rolls no scanning at all — it already imports the shared
+`ooxml-xml` primitives including the markup-aware ones (`iter_elements_markup`,
+`last_index_of_markup`). So there is no third scanner to reconcile, and Stage 2's
+extraction surface is exactly the writer's private machinery.
 
 I verified four divergence classes by running the code:
 
