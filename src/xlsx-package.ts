@@ -4,10 +4,10 @@ import {
     cells_present,
     element_close,
     formula_count,
-    live_tags_in,
     widen_dimension,
     type XlsxCellEdit,
 } from './xlsx-cell-write';
+import { live_tags_in } from './ooxml-worksheet-scan';
 import { get_style, is_date_format } from './spreadsheet-format';
 import { decode_xml, get_text, iter_elements } from './ooxml-xml';
 import { font_to_style } from './xlsx-rich-text';
