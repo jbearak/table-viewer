@@ -829,6 +829,10 @@ export function App(): React.JSX.Element {
             value.toString(36)).join('-'),
     );
     const pending_excel_header_ref = useRef<string | null>(null);
+    // Toolbar-originated Header Row actions can remount the grid when their
+    // authoritative snapshot advances the generation. Remember which grid owned
+    // keyboard focus so the acknowledgement can restore the newly mounted one.
+    const pending_excel_header_grid_focus_ref = useRef(new Map<string, number>());
     // Mirrors editing_status.save_in_flight for the transform request paths. A ref
     // rather than the state value in their dep arrays: the grid reports editing
     // status on every commit, so depending on it would rebuild these callbacks —
@@ -1470,6 +1474,7 @@ export function App(): React.JSX.Element {
                 if (cross_file_initial && disposition === 'applied') {
                     reset_save_projection();
                     pending_excel_header_ref.current = null;
+                    pending_excel_header_grid_focus_ref.current.clear();
                     pending_excel_header_unhide_ref.current = false;
                     pending_excel_header_promote_ref.current = false;
                     set_pending_excel_header(null);
@@ -1485,6 +1490,7 @@ export function App(): React.JSX.Element {
                         snapshot.capabilities.csvSaveLifecycle,
                     )
                     : undefined;
+                let grid_focus_sheet_after_excel_header: number | undefined;
                 const process_command_result = (
                     result: RetainedSnapshotCommandResult | undefined,
                 ) => {
@@ -1503,6 +1509,9 @@ export function App(): React.JSX.Element {
                     ) return;
                     const restoring_rows = pending_excel_header_unhide_ref.current;
                     const promoting_row = pending_excel_header_promote_ref.current;
+                    grid_focus_sheet_after_excel_header =
+                        pending_excel_header_grid_focus_ref.current.get(result.requestId);
+                    pending_excel_header_grid_focus_ref.current.delete(result.requestId);
                     pending_excel_header_ref.current = null;
                     pending_excel_header_unhide_ref.current = false;
                     pending_excel_header_promote_ref.current = false;
@@ -1954,7 +1963,15 @@ export function App(): React.JSX.Element {
                         }
                     }
                     document_epoch_ref.current += 1;
-                    set_grid_focus_restore(null);
+                    set_grid_focus_restore(
+                        grid_focus_sheet_after_excel_header === next_active_sheet_index
+                            ? {
+                                sheet_index: next_active_sheet_index,
+                                generation: snapshot.generation,
+                                document_epoch: document_epoch_ref.current,
+                            }
+                            : null,
+                    );
                     set_toolbar_focus_restore(null);
                     if (snapshot.presentation === 'initial') {
                         last_preview_visible_row_ref.current = null;
@@ -3649,6 +3666,9 @@ export function App(): React.JSX.Element {
         // without switching to it — which is what lets "all sheets" run as a queue
         // rather than as a tour of the workbook.
         target_sheet_index = active_sheet_index,
+        // The sheet whose grid should regain focus after an authoritative remount.
+        // Undefined for grid- and state-strip-originated header commands.
+        grid_focus_sheet_index?: number,
     ) => {
         const sheet = meta?.sheets[target_sheet_index];
         const header = sheet?.excelFirstRowHeader;
@@ -3676,6 +3696,12 @@ export function App(): React.JSX.Element {
             ++excel_header_request_seq_ref.current
         }`;
         pending_excel_header_ref.current = request_id;
+        if (grid_focus_sheet_index !== undefined) {
+            pending_excel_header_grid_focus_ref.current.set(
+                request_id,
+                grid_focus_sheet_index,
+            );
+        }
         pending_excel_header_unhide_ref.current = unhide_all;
         pending_excel_header_promote_ref.current = header_row !== undefined;
         set_pending_excel_header(request_id);
@@ -3709,7 +3735,13 @@ export function App(): React.JSX.Element {
     const handle_toggle_excel_header = useCallback(() => {
         const header = meta?.sheets[active_sheet_index]?.excelFirstRowHeader;
         if (!header) return;
-        request_excel_header(!(header.mode === 'on' || header.active));
+        request_excel_header(
+            !(header.mode === 'on' || header.active),
+            false,
+            undefined,
+            active_sheet_index,
+            active_sheet_index,
+        );
     }, [active_sheet_index, meta, request_excel_header]);
 
     /**
@@ -3722,6 +3754,7 @@ export function App(): React.JSX.Element {
     const [excel_header_queue, set_excel_header_queue] = useState<{
         enabled: boolean;
         sheets: readonly number[];
+        grid_focus_sheet_index: number;
     } | null>(null);
 
     useEffect(() => {
@@ -3733,6 +3766,7 @@ export function App(): React.JSX.Element {
             false,
             undefined,
             next_sheet,
+            excel_header_queue.grid_focus_sheet_index,
         );
         if (result !== 'wait') {
             set_excel_header_queue({ ...excel_header_queue, sheets: rest });
@@ -3753,7 +3787,13 @@ export function App(): React.JSX.Element {
                 return (header.mode === 'on' || header.active) !== enabled;
             })
             .map(({ index }) => index);
-        if (sheets.length > 0) set_excel_header_queue({ enabled, sheets });
+        if (sheets.length > 0) {
+            set_excel_header_queue({
+                enabled,
+                sheets,
+                grid_focus_sheet_index: active_sheet_index,
+            });
+        }
     }, [active_sheet_index, header_waits_for_transform, meta]);
 
     const handle_promote_row_to_header = useCallback((display_row: number) => {

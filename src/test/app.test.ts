@@ -1733,23 +1733,66 @@ describe('Excel first-row header toggle', () => {
         return meta;
     }
 
-    it('queues one host request per sheet for the all-sheets action', async () => {
+    it('queues all-sheet requests and restores focus after each remount', async () => {
         // The host takes one of these at a time, so "all sheets" drains as a queue.
         // Sheets already in the target state never enter it — S2 is already on.
+        vi.spyOn(document, 'hasFocus').mockReturnValue(true);
         const { post_message } = await render_app();
         await dispatch_host_message(
             initial_snapshot_message(excel_meta_multi([false, true, false])),
         );
+        grid_shell_mock.focus_grid.mockClear();
 
         await open_scope_menu('Header row scope');
         await click_menu_item('Use first row as header on all 3 sheets');
 
         const header_requests = () => post_message.mock.calls
-            .map((call) => call[0] as { type: string; sheetIndex?: number })
-            .filter((message) => message.type === 'setExcelFirstRowHeader');
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message): message is Extract<
+                WebviewMessage,
+                { type: 'setExcelFirstRowHeader' }
+            > => message.type === 'setExcelFirstRowHeader');
 
         // One in flight, and only one: the second must wait for the first to land.
         expect(header_requests().map((request) => request.sheetIndex)).toEqual([0]);
+        await vi.waitUntil(() => grid_shell_mock.focus_grid.mock.calls.length > 0);
+
+        const first = header_requests()[0];
+        await dispatch_host_message(refresh_snapshot_message(
+            excel_meta_multi([true, true, false]),
+            {
+                reason: 'excelHeader',
+                commandResult: {
+                    type: 'excelFirstRowHeader',
+                    requestId: first.requestId,
+                    outcome: 'applied',
+                },
+                generation: 2,
+                sourceGeneration: 2,
+            },
+        ));
+        await vi.waitUntil(() => (
+            header_requests().length === 2
+            && grid_shell_mock.focus_grid.mock.calls.length > 1
+        ));
+        expect(header_requests().map((request) => request.sheetIndex)).toEqual([0, 2]);
+
+        const second = header_requests()[1];
+        await dispatch_host_message(refresh_snapshot_message(
+            excel_meta_multi([true, true, true]),
+            {
+                reason: 'excelHeader',
+                commandResult: {
+                    type: 'excelFirstRowHeader',
+                    requestId: second.requestId,
+                    outcome: 'applied',
+                },
+                generation: 3,
+                sourceGeneration: 3,
+            },
+        ));
+        await vi.waitUntil(() => grid_shell_mock.focus_grid.mock.calls.length > 2);
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledTimes(3);
     });
 
     it('drops the queue rather than draining it into a different workbook', async () => {
@@ -1875,7 +1918,8 @@ describe('Excel first-row header toggle', () => {
             );
     });
 
-    it('requests an authoritative toggle and waits for the result snapshot', async () => {
+    it('restores grid focus after an authoritative toggle remounts it', async () => {
+        vi.spyOn(document, 'hasFocus').mockReturnValue(true);
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
             rowHeightProjection: [{ 0: 44 }],
@@ -1884,6 +1928,7 @@ describe('Excel first-row header toggle', () => {
         }));
         expect(grid_stub().getAttribute('data-row-heights')).toBe('{"0":44}');
         post_message.mockClear();
+        grid_shell_mock.focus_grid.mockClear();
         const old_mount = grid_stub().getAttribute('data-mount-id');
 
         const header_button = get_button('Header Row');
@@ -1891,6 +1936,7 @@ describe('Excel first-row header toggle', () => {
             header_button.focus();
             header_button.click();
         });
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
 
         const request = post_message.mock.calls
             .map((call) => call[0] as WebviewMessage)
@@ -1951,6 +1997,8 @@ describe('Excel first-row header toggle', () => {
         // simply names no display row with a custom height.
         expect(grid_stub().getAttribute('data-row-heights')).toBe('{}');
         expect(grid_stub().getAttribute('data-mount-id')).not.toBe(old_mount);
+        await vi.waitUntil(() => grid_shell_mock.focus_grid.mock.calls.length > 1);
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledTimes(2);
     });
 
     it('blocks every header-row command path during Edit mode', async () => {
