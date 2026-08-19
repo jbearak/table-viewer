@@ -14,6 +14,7 @@ import {
     iso_to_serial,
     widen_dimension,
 } from '../xlsx-cell-write';
+import { OoxmlRefusalError, type OoxmlRefusalCode } from '../ooxml-refusal';
 
 const FORMATTED = 'src/test/fixtures/formatted.xlsx';
 const EMPTY = 'src/test/fixtures/empty-sheet.xlsx';
@@ -27,6 +28,24 @@ function part(bytes: Uint8Array, path: string): Buffer | null {
 }
 
 const OPTS = { datemode: 0 as const, is_date_style: () => false };
+
+function expect_refusal(
+    action: () => unknown,
+    code: OoxmlRefusalCode,
+    coordinate?: string,
+): OoxmlRefusalError {
+    let caught: unknown;
+    try {
+        action();
+    } catch (error) {
+        caught = error;
+    }
+    expect(caught).toBeInstanceOf(OoxmlRefusalError);
+    const refusal = caught as OoxmlRefusalError;
+    expect(refusal.code).toBe(code);
+    if (coordinate !== undefined) expect(refusal.coordinate).toBe(coordinate);
+    return refusal;
+}
 
 /** `formatted.xlsx` with one substitution made in each of the named parts. */
 function patched_parts(edits: Array<[part: string, from: string | RegExp, to: string]>): Uint8Array {
@@ -394,21 +413,19 @@ describe('apply_cell_edits', () => {
         expect(absent).toContain('<c r="A1"><v>3</v></c>');
     });
 
-    it('refuses a commented-out cell that names a live one', () => {
-        // A commented-out cell is text to a parser, and this writer is right about
-        // that — but `parse_xlsx` scans raw substrings, so to *the reader* a
-        // `<c r="A1">` inside a comment is a cell, and a later one wins over the
-        // live cell before it. Splicing the live cell therefore produced a save that
-        // reported success while the grid went on showing `stale`. Neither side can
-        // act on the other's reading, so the shape is refused.
-        expect(() => apply_cell_edits(
-            doc(
-                '<row r="1"><c r="A1"><v>1</v></c></row>'
-                + '<!-- <row r="1"><c r="A1"><v>stale</v></c></row> -->',
-            ),
+    it('edits a live cell while preserving a commented-out duplicate as text', () => {
+        // Reader and writer now share the same comment-aware scanner, so the quoted
+        // cell is text to both. The live cell is replaced in place and no second
+        // live coordinate is synthesized.
+        const quoted = '<!-- <row r="1"><c r="A1"><v>stale</v></c></row> -->';
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A1"><v>1</v></c></row>' + quoted),
             [{ row: 0, col: 0, value: '2' }],
             OPTS,
-        )).toThrow(/cannot\s+edit\s+safely/i);
+        );
+        expect(out).toContain('<row r="1"><c r="A1"><v>2</v></c></row>');
+        expect(out).toContain(quoted);
+        expect(out.replace(quoted, '').match(/<c r="A1"/g)).toHaveLength(1);
     });
 
     it('edits the real row, not a commented-out one the reader also ignores', () => {
@@ -675,17 +692,6 @@ describe('apply_cell_edits', () => {
         expect(out).toContain('<v>2</v>');
     });
 
-    it('still refuses a default namespace override', () => {
-        // The other half of the same guard: this one really does rebind the row and
-        // every unprefixed child, so a spliced `<c>` would land in a foreign
-        // namespace and the save would report success having written nothing.
-        expect(() => apply_cell_edits(
-            doc('<row r="1" xmlns="urn:other"><c r="A1"><v>1</v></c></row>'),
-            [{ row: 0, col: 0, value: '2' }],
-            OPTS,
-        )).toThrow(/different XML namespace/);
-    });
-
     it('does not count formula-shaped text in comments or CDATA', () => {
         // The count only exists to answer "did an edit drop a formula". Counting
         // quoted text made an edit *near* a comment look like a formula appearing
@@ -751,8 +757,8 @@ describe('apply_cell_edits', () => {
         // as markup put the edit *inside the PI* and left the live A1 untouched:
         // the save reports success and the cell on screen never changes.
         //
-        // No `r` in the quoted text: one that carries a reference is refused, because
-        // the reader's raw scan reads it as a real cell that beats the live one.
+        // Cell-shaped PI text, with or without `r`, is ignored by the shared scanner
+        // and preserved verbatim; the live cell remains the only edit target.
         const out = apply_cell_edits(
             doc(
                 '<row r="1"><c r="A1"><v>1</v></c></row>'
@@ -765,35 +771,35 @@ describe('apply_cell_edits', () => {
         expect(out).toContain('<?note <row r="1"><c><v>quoted</v></c></row> ?>');
     });
 
-    it('refuses a cell reference quoted inside CDATA or a processing instruction', () => {
-        // The reader draws no distinction between text a parser discards and markup:
-        // it scans raw substrings, so a `<c r="A1">` in any of the three is a cell to
-        // it, and a later one beats the live cell before it. The writer edited the
-        // live cell and the grid went on showing the ghost after a successful save.
-        for (const inner of [
-            '<row r="1"><c r="A1" t="inlineStr"><is><t>old</t></is></c>'
-            + '<![CDATA[<c r="A1" t="inlineStr"><is><t>ghost</t></is></c>]]></row>',
-            '<row r="1"><c r="A1" t="inlineStr"><is><t>old</t></is></c>'
-            + '<?vendor <c r="A1" t="inlineStr"><is><t>ghost</t></is></c>?></row>',
+    it('edits a live cell while preserving cell-shaped CDATA and PI text', () => {
+        for (const quoted of [
+            '<![CDATA[<c r="A1" t="inlineStr"><is><t>ghost</t></is></c>]]>',
+            '<?vendor <c r="A1" t="inlineStr"><is><t>ghost</t></is></c>?>',
         ]) {
-            expect(() => apply_cell_edits(doc(inner), [{ row: 0, col: 0, value: 'new' }], OPTS))
-                .toThrow(/cannot\s+edit\s+safely/i);
+            const out = apply_cell_edits(
+                doc('<row r="1"><c r="A1"><v>1</v></c>' + quoted + '</row>'),
+                [{ row: 0, col: 0, value: 'new' }],
+                OPTS,
+            );
+            expect(out).toContain(quoted);
+            expect(out).toContain('<c r="A1" t="inlineStr"><is><t xml:space="preserve">new</t></is></c>');
+            expect(out.replace(quoted, '').match(/<c r="A1"/g)).toHaveLength(1);
         }
     });
 
-    it('refuses a cell whose reference disagrees with the row holding it', () => {
-        // `<row r="1"><c r="A2"/></row>` is legal, and the two sides read it
-        // oppositely: the reader keys cells off `<c r>` alone and shows A2, while the
-        // writer filed it under its container. Editing what the user sees as A2 found
-        // no such cell, synthesized a new row, and left two `<c r="A2">` behind —
-        // duplicate coordinates whose displayed value depends on which one wins.
-        expect(() => apply_cell_edits(
+    it('uses the cell reference when it disagrees with the row attribute', () => {
+        // `<c r>` is the sole coordinate authority for both reader and writer. The
+        // existing A2 is replaced in its original owner instead of synthesizing a
+        // second row or a duplicate coordinate.
+        const out = apply_cell_edits(
             doc('<row r="1"><c r="A2"><v>7</v></c></row>'),
             [{ row: 1, col: 0, value: '9' }],
             OPTS,
-        )).toThrow(/cannot\s+edit\s+safely/i);
-        // An unnumbered row has nothing to disagree with — the reader infers its
-        // number from the first cell, exactly as the writer does.
+        );
+        expect(out).toContain('<row r="1"><c r="A2"><v>9</v></c></row>');
+        expect(out.match(/<c r="A2"/g)).toHaveLength(1);
+        expect(out).not.toContain('<row r="2">');
+
         expect(apply_cell_edits(
             doc('<row><c r="A2"><v>7</v></c></row>'),
             [{ row: 1, col: 0, value: '9' }],
@@ -801,75 +807,451 @@ describe('apply_cell_edits', () => {
         )).toContain('<c r="A2"><v>9</v></c>');
     });
 
-    it('refuses a worksheet whose markup it cannot read the way a parser would', () => {
-        // Each of these scans as something other than what it is, and the failure
-        // is silent: the prefixed formula is overwritten unseen (and calcChain is
-        // left stale, since `formula_count` sees no loss), while the other two
-        // append a *second* cell carrying a reference that already exists.
-        const cases = [
-            '<row r="1"><c r="A1"><x:f t="array" ref="A1:B2">SUM(1)</x:f><v>1</v></c></row>',
-            "<row r='1'><c r='A1'><v>1</v></c></row>",
-            '<row r="1"><c><v>1</v></c></row>',
-            // Not just `r`: an unreadable `s` silently drops the cell's formatting,
-            // an unreadable `t="b"` turns a boolean into a string, and an unreadable
-            // `t`/`ref` on `<f>` hides an array formula the writer then overwrites.
-            `<row r="1"><c r="A1" s='3'><v>1</v></c></row>`,
-            `<row r="1"><c r="A1" t='b'><v>1</v></c></row>`,
-            '<row r="1"><c r="A1"><f t = "array" ref = "A1:B2">SUM(1)</f><v>1</v></c></row>',
-            "<row r=\"1\"><c r=\"A1\"><f t='shared' si='0'>SUM(1)</f><v>1</v></c></row>",
-            // Parses as `A1`, so the scanner misses the cell and appends a duplicate.
-            '<row r="1"><c r="A&#49;"><v>1</v></c></row>',
-            // A default-namespace override rebinds the row and every unprefixed
-            // child, so a `<c>` spliced in is not a SpreadsheetML cell at all — the
-            // save would report success having written nothing Excel can see.
-            '<row xmlns="urn:not-spreadsheet" r="1"><c r="B1"><v>1</v></c></row>',
-            // Any whitespace separates a tag name from its attributes, and a
-            // pretty-printer that writes one attribute per line uses a newline.
-            // Looking for a space alone found no attributes at all, so the
-            // subtraction examined an empty string and this unreadable `s` passed
-            // unexamined — the edit then dropped the cell's formatting.
-            '<row r="1"><c\nr="A1"\ns=\'7\'><v>1</v></c></row>',
-            '<row r="1"><c\tr="A1"\ts=\'7\'><v>1</v></c></row>',
-        ];
-        for (const inner of cases) {
-            expect(() => apply_cell_edits(
-                doc(inner),
+    it('orders an inserted cell across every logical row in its owner', () => {
+        // Deleting the row/c disagreement guard makes this mixed owner editable.
+        // A2 must be positioned against B1 as well as C2, not inserted between
+        // them from the edited logical row's partial coordinate map.
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="B1"/><c r="C2"/></row>'),
+            [{ row: 1, col: 0, value: '9' }],
+            OPTS,
+        );
+        expect(out.indexOf('<c r="A2"')).toBeLessThan(out.indexOf('<c r="B1"'));
+        expect(out.indexOf('<c r="B1"')).toBeLessThan(out.indexOf('<c r="C2"'));
+    });
+
+    it('refuses a namespace-prefixed formula element with a stable code', () => {
+        for (const prefix of ['x', 'π']) {
+            expect_refusal(
+                () => apply_cell_edits(
+                    doc(`<row r="1"><c r="A1"><${prefix}:f t="array" ref="A1:B2">`
+                        + `SUM(1)</${prefix}:f><v>1</v></c></row>`),
+                    [{ row: 0, col: 0, value: '2' }],
+                    OPTS,
+                ),
+                'namespace-prefixed-worksheet-element',
+            );
+        }
+    });
+
+    it('edits single-quoted row and cell references in place', () => {
+        const out = apply_cell_edits(
+            doc("<row r='1'><c r='A1'><v>1</v></c></row>"),
+            [{ row: 0, col: 0, value: '2' }],
+            OPTS,
+        );
+        expect(out).toContain('<c r="A1"><v>2</v></c>');
+        expect(out.match(/<c r="A1"/g)).toHaveLength(1);
+    });
+
+    it('refuses a cell with no reference with a stable code', () => {
+        expect_refusal(
+            () => apply_cell_edits(
+                doc('<row r="1"><c><v>1</v></c></row>'),
                 [{ row: 0, col: 0, value: '2' }],
                 OPTS,
-            )).toThrow(/cannot\s+edit\s+safely/i);
+            ),
+            'missing-cell-reference',
+        );
+    });
+
+    it('preserves a single-quoted style index', () => {
+        const out = apply_cell_edits(
+            doc("<row r=\"1\"><c r=\"A1\" s='3'><v>1</v></c></row>"),
+            [{ row: 0, col: 0, value: '2' }],
+            OPTS,
+        );
+        expect(out).toContain('<c r="A1" s="3"><v>2</v></c>');
+    });
+
+    it('preserves a single-quoted boolean type', () => {
+        const out = apply_cell_edits(
+            doc("<row r=\"1\"><c r=\"A1\" t='b'><v>1</v></c></row>"),
+            [{ row: 0, col: 0, value: 'FALSE' }],
+            OPTS,
+        );
+        expect(out).toContain('<c r="A1" t="b"><v>0</v></c>');
+    });
+
+    it('edits an entity-spelled reference in place without a duplicate', () => {
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="A&#49;"><v>1</v></c></row>'),
+            [{ row: 0, col: 0, value: '2' }],
+            OPTS,
+        );
+        expect(out).toContain('<c r="A1"><v>2</v></c>');
+        expect(out.match(/<c r="A1"/g)).toHaveLength(1);
+        expect(out).not.toContain('A&#49;');
+    });
+
+    it('refuses a foreign default namespace with a stable code', () => {
+        expect_refusal(
+            () => apply_cell_edits(
+                doc('<row xmlns="urn:not-spreadsheet" r="1"><c r="B1"><v>1</v></c></row>'),
+                [{ row: 0, col: 0, value: '2' }],
+                OPTS,
+            ),
+            'foreign-worksheet-namespace',
+        );
+    });
+
+    it('preserves single-quoted styles separated by XML whitespace', () => {
+        for (const separator of ['\n', '\t']) {
+            const out = apply_cell_edits(
+                doc(`<row r="1"><c${separator}r="A1"${separator}s='7'><v>1</v></c></row>`),
+                [{ row: 0, col: 0, value: '2' }],
+                OPTS,
+            );
+            expect(out, JSON.stringify(separator)).toContain('<c r="A1" s="7"><v>2</v></c>');
         }
     });
 
     it('treats a prefixed r attribute as a missing cell reference', () => {
-        expect(() => apply_cell_edits(
-            doc('<row r="1"><c vendor:r="A1"><v>1</v></c></row>'),
-            [{ row: 0, col: 0, value: '2' }],
-            OPTS,
-        )).toThrow(/cannot\s+edit\s+safely/i);
+        expect_refusal(
+            () => apply_cell_edits(
+                doc('<row r="1"><c vendor:r="A1"><v>1</v></c></row>'),
+                [{ row: 0, col: 0, value: '2' }],
+                OPTS,
+            ),
+            'missing-cell-reference',
+        );
     });
 
-    it('refuses markup-compatibility alternate content', () => {
+    it('refuses every present but invalid cell reference with one code', () => {
+        for (const reference of ['a1', 'A0', 'A01', 'XFE1', 'A1048577', '1A', 'A']) {
+            expect_refusal(
+                () => apply_cell_edits(
+                    doc(`<row r="1"><c r="${reference}"><v>1</v></c></row>`),
+                    [{ row: 0, col: 0, value: '2' }],
+                    OPTS,
+                ),
+                'invalid-cell-reference',
+                reference,
+            );
+        }
+    });
+
+    it('accepts the last valid format row and column', () => {
+        const last_column = apply_cell_edits(
+            doc('<row r="1"><c r="XFD1"><v>1</v></c></row>'),
+            [{ row: 0, col: 16_383, value: '2' }],
+            OPTS,
+        );
+        expect(last_column).toContain('<c r="XFD1"><v>2</v></c>');
+        expect(last_column.match(/<c r="XFD1"/g)).toHaveLength(1);
+
+        const last_row = apply_cell_edits(
+            doc('<row r="1048576"><c r="A1048576"><v>1</v></c></row>'),
+            [{ row: 1_048_575, col: 0, value: '2' }],
+            OPTS,
+        );
+        expect(last_row).toContain('<c r="A1048576"><v>2</v></c>');
+        expect(last_row.match(/<c r="A1048576"/g)).toHaveLength(1);
+    });
+
+    it('keeps grouped-formula refusals for hostile attribute spellings', () => {
+        const cases = [
+            {
+                kind: 'array formula',
+                formula: '<f t = "array" ref = "A1:B2">SUM(1)</f>',
+            },
+            {
+                kind: 'array formula',
+                formula: "<f t='array' ref='A1:B2'>SUM(1)</f>",
+            },
+            {
+                kind: 'array formula',
+                formula: '<f t="arr&#97;y" ref="A&#49;:B2">SUM(1)</f>',
+            },
+            {
+                kind: 'shared formula',
+                formula: '<f t="shared" ref="A1:B1" si="0">SUM(1)</f>',
+            },
+            {
+                kind: 'shared formula',
+                formula: "<f t='shared' ref='A1:B1' si='0'>SUM(1)</f>",
+            },
+            {
+                kind: 'shared formula',
+                formula: '<f t = "shared" ref = "A1:B1" si = "0">SUM(1)</f>',
+            },
+        ];
+        for (const { kind, formula } of cases) {
+            const inner = `<row r="1"><c r="A1">${formula}<v>1</v></c></row>`;
+            expect(() => apply_cell_edits(
+                doc(inner),
+                [{ row: 0, col: 1, value: '2' }],
+                OPTS,
+            ), formula).toThrow(new RegExp(`B1.*${kind}`));
+        }
+    });
+
+    it('refuses foreign effective namespaces on worksheet, sheetData, and cell', () => {
+        const cell = '<row r="1"><c r="A1"><v>1</v></c></row>';
+        for (const xml of [
+            `<worksheet xmlns="urn:other"><sheetData>${cell}</sheetData></worksheet>`,
+            `<worksheet><sheetData xmlns="urn:other">${cell}</sheetData></worksheet>`,
+            `<worksheet><sheetData><row r="1"><c xmlns="urn:other" r="A1"><v>1</v></c></row></sheetData></worksheet>`,
+            '<worksheet><sheetData><wrapper xmlns="urn:other">'
+                + `${cell}</wrapper></sheetData></worksheet>`,
+        ]) {
+            expect_refusal(
+                () => apply_cell_edits(xml, [{ row: 0, col: 0, value: '2' }], OPTS),
+                'foreign-worksheet-namespace',
+            );
+        }
+    });
+
+    it('refuses a foreign namespace on an empty self-closing row', () => {
+        expect_refusal(
+            () => apply_cell_edits(
+                '<worksheet><sheetData><row xmlns="urn:other" r="1"/></sheetData></worksheet>',
+                [{ row: 0, col: 0, value: '2' }],
+                OPTS,
+            ),
+            'foreign-worksheet-namespace',
+        );
+    });
+
+    it('allows either SpreadsheetML dialect at the root and redundant declarations', () => {
+        for (const ns of [
+            'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
+            'http://purl.oclc.org/ooxml/spreadsheetml/main',
+        ]) {
+            const xml = `<worksheet xmlns="${ns}"><sheetData xmlns="${ns}">`
+                + `<row xmlns="${ns}" r="1"><c xmlns="${ns}" r="A1"><v>1</v></c></row>`
+                + '</sheetData></worksheet>';
+            expect(apply_cell_edits(xml, [{ row: 0, col: 0, value: '2' }], OPTS), ns)
+                .toContain('<c r="A1"><v>2</v></c>');
+        }
+    });
+
+    it('refuses a cross-dialect descendant under a Transitional root', () => {
+        const transitional = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+        const strict = 'http://purl.oclc.org/ooxml/spreadsheetml/main';
+        expect_refusal(
+            () => apply_cell_edits(
+                `<worksheet xmlns="${transitional}"><sheetData>`
+                + `<row xmlns="${strict}" r="1"><c r="A1"><v>1</v></c></row>`
+                + '</sheetData></worksheet>',
+                [{ row: 0, col: 0, value: '2' }],
+                OPTS,
+            ),
+            'foreign-worksheet-namespace',
+        );
+    });
+
+    it('classifies a structurally eligible prefixed SpreadsheetML sheetData', () => {
+        const ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+        for (const xml of [
+            `<worksheet><x:sheetData xmlns:x="${ns}"/></worksheet>`,
+            `<worksheet xmlns:x="${ns}"><x:sheetData/></worksheet>`,
+        ]) {
+            expect_refusal(
+                () => apply_cell_edits(
+                    xml,
+                    [{ row: 0, col: 0, value: '2' }],
+                    OPTS,
+                ),
+                'namespace-prefixed-worksheet-element',
+            );
+        }
+    });
+
+    it('leaves a foreign prefixed sheetData as the plain structural error', () => {
+        let caught: unknown;
+        try {
+            apply_cell_edits(
+                '<worksheet><v:sheetData xmlns:v="urn:vendor"/></worksheet>',
+                [{ row: 0, col: 0, value: '2' }],
+                OPTS,
+            );
+        } catch (error) {
+            caught = error;
+        }
+        expect(caught).toBeInstanceOf(Error);
+        expect(caught).not.toBeInstanceOf(OoxmlRefusalError);
+        expect((caught as Error).message).toMatch(/no <sheetData>/);
+    });
+
+    it('ignores similarly named elements and AlternateContent in disjoint extensions', () => {
+        const extensions = '<extLst><ext xmlns:v="urn:vendor">'
+            + '<v:worksheet/>'
+            + '<v:sheetData/>'
+            + '<v:sheetData-cache/>'
+            + '<v:worksheet.meta/>'
+            + '<v:AlternateContent/>'
+            + '</ext><ext xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">'
+            + '<mc:AlternateContent/>'
+            + '</ext></extLst>';
+        const xml = '<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row>'
+            + `</sheetData>${extensions}</worksheet>`;
+        expect(apply_cell_edits(xml, [{ row: 0, col: 0, value: '2' }], OPTS))
+            .toContain('<c r="A1"><v>2</v></c>');
+    });
+
+    it('never selects a nested vendor sheetData as the worksheet body', () => {
+        const nested = '<extLst><ext xmlns="urn:vendor"><sheetData marker="vendor"/></ext></extLst>';
+        let caught: unknown;
+        try {
+            apply_cell_edits(
+                `<worksheet>${nested}</worksheet>`,
+                [{ row: 0, col: 0, value: '2' }],
+                OPTS,
+            );
+        } catch (error) {
+            caught = error;
+        }
+        expect(caught).toBeInstanceOf(Error);
+        expect(caught).not.toBeInstanceOf(OoxmlRefusalError);
+        expect((caught as Error).message).toMatch(/no <sheetData>/);
+
+        const xml = `<worksheet>${nested}<sheetData>`
+            + '<row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>';
+        const out = apply_cell_edits(xml, [{ row: 0, col: 0, value: '3' }], OPTS);
+        expect(out).toContain('<sheetData marker="vendor"/>');
+        expect(out).toContain('<sheetData><row r="1"><c r="A1"><v>3</v></c></row></sheetData>');
+    });
+
+    it('uses document order when no unprefixed sheetData is present', () => {
+        expect_refusal(
+            () => apply_cell_edits(
+                '<worksheet xmlns="urn:other"><x:sheetData/></worksheet>',
+                [{ row: 0, col: 0, value: '2' }],
+                OPTS,
+            ),
+            'foreign-worksheet-namespace',
+        );
+        expect_refusal(
+            () => apply_cell_edits(
+                '<x:worksheet/><worksheet xmlns="urn:other"/>',
+                [{ row: 0, col: 0, value: '2' }],
+                OPTS,
+            ),
+            'namespace-prefixed-worksheet-element',
+        );
+    });
+
+    it('chooses the first offending construct in document order', () => {
+        const early_invalid = '<row r="1"><c r="A0"><v>1</v></c></row>';
+        const late_prefixed = '<row r="2"><c r="A2"><x:f>1</x:f><v>1</v></c></row>';
+        expect_refusal(
+            () => apply_cell_edits(doc(early_invalid + late_prefixed), [{ row: 0, col: 0, value: '2' }], OPTS),
+            'invalid-cell-reference',
+            'A0',
+        );
+
+        const late_alternate = '<mc:AlternateContent '
+            + 'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">'
+            + '<mc:Choice><row r="2"><c r="A2"/></row></mc:Choice></mc:AlternateContent>';
+        expect_refusal(
+            () => apply_cell_edits(doc(early_invalid + late_alternate), [{ row: 0, col: 0, value: '2' }], OPTS),
+            'invalid-cell-reference',
+            'A0',
+        );
+
+        expect_refusal(
+            () => apply_cell_edits(
+                '<worksheet xmlns="urn:other"><sheetData><row r="1"><c/></row></sheetData></worksheet>',
+                [{ row: 0, col: 0, value: '2' }],
+                OPTS,
+            ),
+            'foreign-worksheet-namespace',
+        );
+
+        expect_refusal(
+            () => apply_cell_edits(
+                doc('<row r="1"><c xmlns="urn:other" r="A0"><v>1</v></c></row>'),
+                [{ row: 0, col: 0, value: '2' }],
+                OPTS,
+            ),
+            'foreign-worksheet-namespace',
+        );
+
+        expect_refusal(
+            () => apply_cell_edits(doc(late_prefixed + early_invalid), [{ row: 0, col: 0, value: '2' }], OPTS),
+            'namespace-prefixed-worksheet-element',
+        );
+    });
+
+    it('refuses exact markup-compatibility AlternateContent inside sheetData', () => {
         // Both branches spell row 1 / A1, and which one a reader believes depends
-        // on whether it understands `Requires`. The scans are flat coordinate maps,
-        // so the last branch won: the edit landed in `mc:Fallback` alone, every
-        // application honouring the `mc:Choice` kept showing the old value, and the
-        // save reported success.
-        const inner = '<mc:AlternateContent'
-            + ' xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">'
-            + '<mc:Choice Requires="x14">'
-            + '<row r="1"><c r="A1" t="inlineStr"><is><t>choice</t></is></c></row></mc:Choice>'
-            + '<mc:Fallback>'
-            + '<row r="1"><c r="A1" t="inlineStr"><is><t>fallback</t></is></c></row></mc:Fallback>'
-            + '</mc:AlternateContent>';
-        expect(() => apply_cell_edits(doc(inner), [{ row: 0, col: 0, value: 'edited' }], OPTS))
-            .toThrow(/cannot\s+edit\s+safely/i);
-        // The prefix is a convention, not a rule; an unprefixed default-namespace
-        // spelling is the same element and the same hazard.
-        const bare = '<AlternateContent><Choice Requires="x14">'
-            + '<row r="1"><c r="A1"><v>1</v></c></row></Choice>'
-            + '<Fallback><row r="1"><c r="A1"><v>2</v></c></row></Fallback></AlternateContent>';
-        expect(() => apply_cell_edits(doc(bare), [{ row: 0, col: 0, value: '3' }], OPTS))
-            .toThrow(/cannot\s+edit\s+safely/i);
+        // on whether it understands `Requires`. Any legal prefix may bind the MC
+        // namespace; the expanded name, not the spelling `mc:`, identifies it.
+        const inner = '<z:AlternateContent'
+            + ' xmlns:z="http://schemas.openxmlformats.org/markup-compatibility/2006">'
+            + '<z:Choice Requires="x14">'
+            + '<row r="1"><c r="A1" t="inlineStr"><is><t>choice</t></is></c></row></z:Choice>'
+            + '<z:Fallback>'
+            + '<row r="1"><c r="A1" t="inlineStr"><is><t>fallback</t></is></c></row></z:Fallback>'
+            + '</z:AlternateContent>';
+        expect_refusal(
+            () => apply_cell_edits(doc(inner), [{ row: 0, col: 0, value: 'edited' }], OPTS),
+            'markup-compatibility-alternate-content',
+        );
+
+        const default_bound = '<AlternateContent '
+            + 'xmlns="http://schemas.openxmlformats.org/markup-compatibility/2006">'
+            + '<Choice/></AlternateContent>';
+        expect_refusal(
+            () => apply_cell_edits(doc(default_bound), [{ row: 0, col: 0, value: '3' }], OPTS),
+            'markup-compatibility-alternate-content',
+        );
+    });
+
+    it('resolves inherited and rebound AlternateContent prefixes by scope', () => {
+        const mc = 'http://schemas.openxmlformats.org/markup-compatibility/2006';
+        const inherited = '<holder xmlns:z="' + mc + '"><z:AlternateContent/></holder>';
+        expect_refusal(
+            () => apply_cell_edits(doc(inherited), [{ row: 0, col: 0, value: '3' }], OPTS),
+            'markup-compatibility-alternate-content',
+        );
+
+        const rebound = '<holder xmlns:z="' + mc + '"><inner xmlns:z="urn:vendor">'
+            + '<z:AlternateContent/></inner></holder>';
+        expect(apply_cell_edits(
+            doc('<row r="1"><c r="A1"><v>1</v></c></row>' + rebound),
+            [{ row: 0, col: 0, value: '3' }],
+            OPTS,
+        )).toContain('<c r="A1"><v>3</v></c>');
+    });
+
+    it('does not treat bare or wrongly bound AlternateContent as markup compatibility', () => {
+        for (const inner of [
+            '<AlternateContent/>',
+            '<mc:AlternateContent xmlns:mc="urn:vendor"/>',
+        ]) {
+            expect(
+                apply_cell_edits(
+                    doc('<row r="1"><c r="A1"><v>1</v></c></row>' + inner),
+                    [{ row: 0, col: 0, value: '3' }],
+                    OPTS,
+                ),
+                inner,
+            ).toContain('<c r="A1"><v>3</v></c>');
+        }
+    });
+
+    it('refuses exact markup-compatibility content that wraps sheetData', () => {
+        const mc = 'http://schemas.openxmlformats.org/markup-compatibility/2006';
+        const spreadsheet = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+        const wrapped = `<worksheet xmlns="${spreadsheet}"><mc:AlternateContent xmlns:mc="${mc}">`
+            + '<mc:Choice><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></mc:Choice>'
+            + '<mc:Fallback><sheetData><row r="1"><c r="A1"><v>2</v></c></row></sheetData></mc:Fallback>'
+            + '</mc:AlternateContent></worksheet>';
+        expect_refusal(
+            () => apply_cell_edits(wrapped, [{ row: 0, col: 0, value: '3' }], OPTS),
+            'markup-compatibility-alternate-content',
+        );
+
+        const only_prefixed = `<worksheet xmlns="${spreadsheet}">`
+            + `<mc:AlternateContent xmlns:mc="${mc}">`
+            + `<mc:Choice><x:sheetData xmlns:x="${spreadsheet}"/></mc:Choice>`
+            + '</mc:AlternateContent></worksheet>';
+        expect_refusal(
+            () => apply_cell_edits(only_prefixed, [{ row: 0, col: 0, value: '3' }], OPTS),
+            'markup-compatibility-alternate-content',
+        );
     });
 
     it('does not refuse alternate content quoted inside a comment', () => {
@@ -880,13 +1262,23 @@ describe('apply_cell_edits', () => {
     });
 
     it('does not refuse ordinary attributes it never reads', () => {
-        // The guard is a subtraction — anything left after canonical `name="value"`
-        // pairs are removed is unreadable — so it has to leave attributes the writer
-        // does not consume alone, entities and all.
+        // The shared attribute lexer reads only exact requested names, so unrelated
+        // vendor attributes and their entities remain untouched.
         const inner = '<row r="1" spans="1:1" customFormat="1">'
             + '<c r="A1" s="3" t="n"><v>1</v></c></row>';
         expect(apply_cell_edits(doc(inner), [{ row: 0, col: 0, value: '2' }], OPTS))
             .toContain('<c r="A1" s="3"><v>2</v></c>');
+    });
+
+    it('does not mistake namespace-shaped attribute text for a declaration', () => {
+        const quoted = 'note="documentation says xmlns=urn:example"';
+        const out = apply_cell_edits(
+            doc(`<row r="1" ${quoted}><c r="A1"><v>1</v></c></row>`),
+            [{ row: 0, col: 0, value: '2' }],
+            OPTS,
+        );
+        expect(out).toContain(`<row r="1" ${quoted}>`);
+        expect(out).toContain('<c r="A1"><v>2</v></c>');
     });
 
     it('does not refuse over markup quoted inside a comment', () => {
@@ -1131,61 +1523,33 @@ describe('apply_cell_edits', () => {
         }
     });
 
-    it('refuses a sheetData that does not end where the reader stops', () => {
-        // The reader closes the element at the first literal `</sheetData>` from
-        // `indexOf` — comment-blind, and that exact spelling only. A comment holding
-        // one ends the element early for the reader, which then never sees the rows
-        // after it; a real close written `</sheetData >` is no close at all, so the
-        // sheet reads as empty. Either way the writer edited rows happily and the
-        // save changed nothing the user could see.
+    it('shares comment-aware and whitespace-tolerant sheetData boundaries', () => {
         for (const body of [
             '<sheetData><!-- </sheetData> --><row r="1"><c r="A1"><v>1</v></c></row></sheetData>',
             '<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData >',
         ]) {
-            expect(() => apply_cell_edits(
+            const out = apply_cell_edits(
                 `<worksheet>${body}</worksheet>`,
                 [{ row: 0, col: 0, value: '9' }],
                 OPTS,
-            ), body).toThrow(/does not end where a parser/);
+            );
+            expect(out, body).toContain('<c r="A1"><v>9</v></c>');
+            expect(out.match(/<c r="A1"/g), body).toHaveLength(1);
         }
     });
 
-    it('allows a redundant declaration of the SpreadsheetML namespace', () => {
-        // Only a declaration that *changes* the binding moves an element out of the
-        // worksheet's namespace. Redeclaring the namespace it is already in is
-        // redundant but legal, and refusing on it rejected a cell the reader
-        // displays perfectly well — with a message that was untrue.
-        const ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+    it('edits the live sheetData after a commented-out one', () => {
+        const quoted = '<!-- <sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData> -->';
         const out = apply_cell_edits(
-            doc(`<row xmlns="${ns}" r="1"><c r="A1"><v>1</v></c></row>`),
-            [{ row: 0, col: 0, value: '9' }],
-            OPTS,
-        );
-        expect(out).toContain('<v>9</v>');
-        // A genuinely different one still refuses.
-        expect(() => apply_cell_edits(
-            doc('<row xmlns="urn:other" r="1"><c r="A1"><v>1</v></c></row>'),
-            [{ row: 0, col: 0, value: '9' }],
-            OPTS,
-        )).toThrow(/different XML namespace/);
-    });
-
-    it('refuses a worksheet whose first sheetData is commented out', () => {
-        // The writer skips comments; the reader does not. `parse_xlsx` scans raw
-        // text, so it finds the *commented* `<sheetData>` first and shows the values
-        // inside it. An edit therefore rewrote the live element the user was not
-        // looking at: the save reported success and the visible value never moved.
-        // Writing into the comment instead is not an option either — it is text
-        // every conforming parser discards. So this refuses, as with the other
-        // divergences the reader and writer cannot be reconciled on.
-        expect(() => apply_cell_edits(
-            '<worksheet>'
-            + '<!-- <sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData> -->'
+            '<worksheet>' + quoted
             + '<sheetData><row r="1"><c r="A1"><v>2</v></c></row></sheetData>'
             + '</worksheet>',
             [{ row: 0, col: 0, value: '9' }],
             OPTS,
-        )).toThrow(/commented-out <sheetData>/);
+        );
+        expect(out).toContain(quoted);
+        expect(out).toContain('<sheetData><row r="1"><c r="A1"><v>9</v></c></row></sheetData>');
+        expect(out.replace(quoted, '').match(/<c r="A1"/g)).toHaveLength(1);
     });
 });
 

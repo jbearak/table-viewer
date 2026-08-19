@@ -569,16 +569,16 @@ master carrying `ref`.
   vacuous as a *document*-level rule — the two cannot coexist on one cell — it
   only means something as an intra-tag tie-break.
 
-  **Implementation is cheaper than it sounds:** each existing detector records its
-  earliest candidate instead of throwing, then the minimum key throws. The three
-  whole-range scans need not be folded into the tag walk — prefix and
-  `AlternateContent` already carry `m.index`, and `ignorable_ranges` yields in
-  ascending order. Two real prerequisites, both needed for
-  `invalid-cell-reference` anyway: the scanner must expose the cell's start offset
-  to its callback, and it must stop suppressing unparseable references — today it
-  invokes the callback only when row and column both resolve, so a malformed `r`
-  never reaches a consumer. That wants a tagged `valid(row, col) | missing |
-  invalid` result carrying the offset.
+  **Implementation:** each detector records its earliest candidate instead of
+  throwing, then the minimum key throws. Two scanner prerequisites, both needed
+  for `invalid-cell-reference`: expose the cell's start offset to its callback and
+  stop suppressing unparseable references, using a tagged `valid(row, col) |
+  missing | invalid` result carrying the offset. Namespace-sensitive identity and
+  structural selection use one writer-only SAX-style token walk with an O(depth)
+  namespace stack. That precision is required for arbitrary inherited prefix
+  bindings and for distinguishing worksheet structure from opaque extension
+  payloads; it is not a DOM, does not enter the reader hot path, and keeps UTF-16
+  string offsets until Stage 6.
 
   **Corpus cases to pin** (not just one multi-fault case): early invalid cell vs
   late prefixed element; early invalid cell vs late `AlternateContent`; ancestor
@@ -614,8 +614,25 @@ master carrying `ref`.
   `foreign-worksheet-namespace` into a corpus a Rust port must match, and pinning
   it as-is would enshrine the gap. Stage 5 therefore evaluates the effective
   default namespace over the structural path (`worksheet` → `sheetData` → `row` →
-  `c`), keeping today's allowance for a redundant re-declaration of
-  SpreadsheetML. Prefixed `sheetData` joins the prefixed-element refusal too.
+  `c`). Either the Transitional or ISO Strict SpreadsheetML URI is valid at the
+  worksheet root because both already edited before this stage; descendants must
+  equal the inherited parent dialect exactly, so a cross-dialect redeclaration is
+  refused while a redundant same-dialect declaration remains accepted.
+- **Fourth live bug, found while making identity structural:** the old literal
+  `find_first_element(xml, 'sheetData')` selected an unprefixed vendor
+  `sheetData` nested under `extLst/ext` when no worksheet body existed. The writer
+  then synthesized rows and cells into that opaque payload and reported success.
+  Stage 5 makes the authoritative `sheetData` an unprefixed direct child of the
+  worksheet document element. A direct prefixed child gets
+  `namespace-prefixed-worksheet-element` only when its QName resolves to an
+  accepted SpreadsheetML URI; a nested or foreign lookalike falls through to the
+  existing plain no-`sheetData` `Error`.
+- `AlternateContent` is the exact expanded name
+  `{http://schemas.openxmlformats.org/markup-compatibility/2006}AlternateContent`,
+  not a local-name or `mc:` spelling test. It refuses only when contained by the
+  authoritative `sheetData`, or, on the no-body path, when a direct worksheet-child
+  MC wrapper contains a SpreadsheetML `sheetData` candidate. Disjoint MC or vendor
+  extension payloads are copied through and do not affect the edit.
 - **Second latent bug found while verifying the first, and in scope here.**
   Row `0` is accepted: `r="A0"` yields row index `-1`, which no guard catches.
   Re-confirmed against the shared scanner after Stage 4 (see the re-measured
@@ -760,6 +777,11 @@ overruled an architect, the reason is stated.
 | One code or many for bad references? | **One** (`invalid-cell-reference`) for all present-but-invalid `r`; `missing-cell-reference` stays separate as a genuinely different document shape. |
 | Can namespace-prefixed cells / `AlternateContent` become *supported*? | **No.** One architect suggested they could; I disagree and am keeping them refusals. These are shapes where the correct edit is genuinely undetermined, not merely unimplemented. |
 | Do format extent limits belong here or to #241? | **Here** for reference *validity* (`XFD`, 1,048,576). #241 owns product display caps in `spreadsheet-safety.ts`. Different layers. |
+| Which SpreadsheetML namespace dialects are writable? | **Both Transitional** (`http://schemas.openxmlformats.org/spreadsheetml/2006/main`) **and ISO Strict** (`http://purl.oclc.org/ooxml/spreadsheetml/main`) at the worksheet root. Strict-root worksheets already edited before Stage 5, so rejecting them would be a regression. Every descendant must exactly match its inherited parent dialect; same-dialect redundant declarations are accepted and cross-dialect redeclarations refuse. Stage 7 must pin all four matrix rows: Strict root edits, Transitional root edits, cross-dialect descendant refuses, genuinely foreign root refuses. |
+| What identifies relevant `AlternateContent`? | The exact expanded name `{http://schemas.openxmlformats.org/markup-compatibility/2006}AlternateContent` **and** structural containment. It refuses when inside authoritative `sheetData`; with no body, a direct worksheet-child MC wrapper refuses only if its subtree contains a SpreadsheetML `sheetData` candidate. Bare names, wrongly bound prefixes, vendor names, and disjoint extension payloads do not receive the code. Stage 7 must pin these distinctions. |
+| What is authoritative `sheetData`? | The first complete, unprefixed direct child of the worksheet document element. A direct prefixed child explains the absence only when its QName resolves to a supported SpreadsheetML URI. Nested or foreign lookalikes never receive writes and leave the existing plain no-`sheetData` error. This closes the fourth confirmed silent-corruption bug. |
+| How is namespace identity resolved in Stage 5? | A writer-only streaming element walk applies each opening tag's declarations before resolving its QName and retains only an O(depth) namespace stack. It keeps Stage 5's UTF-16 indices and does not enter the reader hot path; byte offsets and byte-native restructuring remain Stage 6. |
+| What namespace scoping remains deferred? | The legacy prefixed `row`/`c`/`f`/`is`/`v` identity checks and the `<f>` namespace surface are still scoped to descendants in the selected `sheetData` range rather than a full SpreadsheetML content model. Record this for follow-up; do not broaden Stage 5 into reader restructuring or implement the Stage 7 corpus here. |
 | Byte scanner: does the writer follow? | **Yes**, and the package worksheet boundary and the worksheet half of the hyperlink writer with it. Otherwise `Span` stays a lie and the composed save path still decodes. |
 | Stage 6 gate | **32 MiB** median live-RSS reduction vs a **Stage 5** baseline, not 40 MiB vs Stage 1's. |
 
