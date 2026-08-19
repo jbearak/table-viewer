@@ -63,6 +63,42 @@ A save emits both cells into one row:
 <c r="a1"><v>5</v></c><c r="A1" t="inlineStr">…</c>
 ```
 
+#### Re-measured after Stage 4, against the shared scanner
+
+Stage 4 routed the reader through `scan_rows`, so both sides now resolve
+coordinates in one place — `row_index_from_cell_reference` /
+`column_index_from_cell_reference` in `ooxml-worksheet-scan.ts`, which are
+charCode-range checked (`0x41`–`0x5a`) rather than regex-matched. That changes
+what Stage 5 inherits, so I re-probed the shared path directly:
+
+```
+A1        -> ["0:0"]          canonical control
+A0        -> ["-1:0"]         row 0 accepted, yields a negative row index
+a1        -> []               lowercase now dropped by BOTH sides
+XFE1      -> ["0:16384"]      one past the format's last column (XFD/16383)
+A1048577  -> ["1048576:0"]    one past the format's last row
+1A        -> []               rejected
+A         -> []               rejected
+```
+
+Two corrections to the table above:
+
+- **The `a1` divergence is closed.** Both sides now drop it, because the shared
+  scanner rejects the reference outright instead of the writer computing a
+  column from it. `letter_to_index`'s `charCodeAt(i) - 64` still yields 32 for
+  `'a'`, but it is no longer reachable from a cell reference — its 6 remaining
+  callers (`xlsx-cell-write.ts:532`, `:538`, `:647`, `:648`, `:1375`, `:1377`)
+  all pass `CELL_RANGE_RE`-matched `[A-Z]+` from a `ref=` range. Stage 5 should
+  confirm that and *not* spend a fix on it. It is still worth a conformance case
+  in Stage 7 so the Rust port cannot reintroduce it.
+- **`A0` survives, and is the one real remaining bug** — a `-1` row index from a
+  reference the format does not permit. No guard catches it. Stage 5 owns it.
+
+`XFE1` and `A1048577` confirm there is no format-limit validation anywhere on
+this path: both resolve to plausible-looking indices one past the format's
+maximum. That is the `invalid-cell-reference` gap Stage 5 fills, and the
+boundary values the validator should pin.
+
 ### Two stale doc comments, both load-bearing for a reader of this code
 
 - `xlsx-cell-write.ts:413` — `Span` is documented as "`[start, end)` byte
@@ -481,14 +517,26 @@ master carrying `ref`.
   `c`), keeping today's allowance for a redundant re-declaration of
   SpreadsheetML. Prefixed `sheetData` joins the prefixed-element refusal too.
 - **Second latent bug found while verifying the first, and in scope here.**
-  `parse_cell_ref` accepts row `0`: `r="A0"` yields `row: -1`, a negative index
-  no guard catches (see the trace above). It shares the coordinate-validation
-  path with the lowercase case, so Stage 5 fixes both under
-  `invalid_cell_reference` — validating the coordinate once, in the one place
-  both sides now read it.
-- **Fixes the live lowercase bug:** reader keeps rejecting `r="a1"`, writer
-  refuses with `invalid_cell_reference`. Never silently normalize to `A1` —
-  inserting a coordinate we did not read is how the duplicate got emitted.
+  Row `0` is accepted: `r="A0"` yields row index `-1`, which no guard catches.
+  Re-confirmed against the shared scanner after Stage 4 (see the re-measured
+  probe above), so it is still live. Stage 5 rejects it with
+  `invalid-cell-reference`, validating the coordinate once in the one place both
+  sides now read it.
+- **The lowercase bug closed itself in Stage 4 — do not re-fix it.** Routing the
+  reader through `scan_rows` means `r="a1"` is now dropped by both sides, because
+  the shared scanner rejects the reference rather than the writer deriving a
+  column from it. `letter_to_index`'s `- 64` still mishandles lowercase but is no
+  longer reachable from a cell reference; all 6 callers pass `[A-Z]+` captured by
+  `CELL_RANGE_RE`. Stage 5 should verify that claim rather than trust it, and
+  spend its coordinate-validation work on `A0` and the format limits instead.
+- **Never silently normalize a malformed reference** to its canonical spelling.
+  Inserting a coordinate we did not read is how the original duplicate got
+  emitted; refuse instead.
+- **Format-limit validation is absent on this path, confirmed by probe:** `XFE1`
+  resolves to column 16384 and `A1048577` to row 1048576, each one past the
+  format's maximum, with nothing rejecting either. These are the boundary values
+  `invalid-cell-reference` pins (last valid: `XFD` / 16383, row 1048576 /
+  index 1048575). Distinct from #241's product caps — see the decisions table.
 - Criterion (d) lands here.
 
 ### Stage 6 — Byte offsets
