@@ -25,13 +25,14 @@ async function render_editor(
     on_finished = vi.fn(),
     on_navigation = vi.fn(),
     initial_value?: string,
+    grid_value: GridCell = value(text),
 ) {
     container = document.createElement('div');
     document.body.appendChild(container);
     root = createRoot(container);
     await act(async () => {
         const props = {
-            value: value(text),
+            value: grid_value,
             onChange: on_change,
             onFinishedEditing: on_finished,
             onCommitNavigation: on_navigation,
@@ -55,6 +56,26 @@ describe('CsvCellEditor', () => {
         await render_editor('a', vi.fn(), vi.fn(), vi.fn(), 'a');
 
         const input = container!.querySelector('input')!;
+        expect(input.selectionStart).toBe(1);
+        expect(input.selectionEnd).toBe(1);
+    });
+
+    it('uses the type-to-edit seed instead of stale rich Markdown', async () => {
+        const rich: GridCell = {
+            kind: GridCellKind.Custom,
+            data: {
+                kind: 'rich-text',
+                lines: [[{ text: 'old' }]],
+                font_size_px: 13,
+                edit_value: '**old**',
+            },
+            copyData: 'old',
+            allowOverlay: true,
+        };
+        await render_editor('unused', vi.fn(), vi.fn(), vi.fn(), 'z', rich);
+
+        const input = container!.querySelector('input')!;
+        expect(input.value).toBe('z');
         expect(input.selectionStart).toBe(1);
         expect(input.selectionEnd).toBe(1);
     });

@@ -1,6 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import { GridCellKind } from '../webview/glide-data-grid';
-import { build_grid_cell, font_style } from '../webview/cell-renderer';
+import {
+    build_grid_cell,
+    font_style,
+    rich_cell_display_data,
+} from '../webview/cell-renderer';
 import type { RenderedCell } from '../data-source/interface';
 
 const rc = (raw: string, bold = false, italic = false): RenderedCell => ({
@@ -296,11 +300,61 @@ describe('build_grid_cell — rich cells', () => {
         expect((c as { data: string }).data).toBe('ab');
     });
 
-    it('falls back to Text when the cell is editable or dirty', () => {
-        expect(rich(0, true, { editable: true }).kind).toBe(GridCellKind.Text);
-        expect(rich(0, true, { dirty_value: 'X' }).kind).toBe(GridCellKind.Text);
-        const dirty = rich(0, true, { dirty_value: 'X' });
-        expect((dirty as { displayData: string }).displayData).toBe('X');
+    it('keeps rich rendering while editable and paints dirty Markdown runs', () => {
+        const editable = rich(0, true, { editable: true, edit_value: 'a **b**' });
+        expect(editable.kind).toBe(GridCellKind.Custom);
+        expect((editable as { allowOverlay: boolean }).allowOverlay).toBe(true);
+
+        const dirty = rich(0, true, {
+            editable: true,
+            dirty_value: 'X',
+            edit_value: '*X*',
+            dirty_rich: { runs: [{ text: 'X', style: { italic: true } }] },
+        }) as unknown as { kind: unknown; data: { lines: unknown[]; edit_value?: string } };
+        expect(dirty.kind).toBe(GridCellKind.Custom);
+        expect(dirty.data.lines).toEqual([[{ text: 'X', style: { italic: true } }]]);
+        expect(dirty.data.edit_value).toBe('*X*');
+
+        const formatting_off = rich(0, false, {
+            editable: true,
+            dirty_value: 'X',
+            edit_value: '*X*',
+            dirty_rich: { runs: [{ text: 'X', style: { italic: true } }] },
+        });
+        expect(formatting_off.kind).toBe(GridCellKind.Text);
+    });
+
+    it('promotes a blank cell to rich rendering after a Markdown edit', () => {
+        const blank_row: (RenderedCell | null)[] = [null];
+        const dirty = build_grid_cell(0, blank_row, true, {
+            editable: true,
+            dirty_value: 'new',
+            edit_value: '**new**',
+            dirty_rich: { runs: [{ text: 'new', style: { bold: true } }] },
+        }) as unknown as { kind: unknown; data: { lines: unknown[] } };
+
+        expect(dirty.kind).toBe(GridCellKind.Custom);
+        expect(dirty.data.lines).toEqual([[{ text: 'new', style: { bold: true } }]]);
+    });
+
+    it('does not reuse persisted runs after clearing a rich cell', () => {
+        const cleared = rich(0, true, {
+            editable: true,
+            dirty_value: '',
+            edit_value: '',
+        }) as unknown as { kind: unknown; data: { lines: unknown[] } };
+
+        expect(cleared.kind).toBe(GridCellKind.Custom);
+        expect(cleared.data.lines).toEqual([[]]);
+    });
+
+    it('exposes dirty Markdown runs to tooltip overflow measurement', () => {
+        const data = rich_cell_display_data(rc('plain'), true, 13, {
+            dirty_value: 'wide',
+            dirty_rich: { runs: [{ text: 'wide', style: { bold: true } }] },
+        });
+
+        expect(data?.lines).toEqual([[{ text: 'wide', style: { bold: true } }]]);
     });
 
     it('keeps the highlight tint on a rich cell', () => {
