@@ -6,7 +6,7 @@ import { hide_columns_menu_item } from './column-context-menu';
 
 export interface CellContextMenuModelProps {
     dirty: boolean;
-    is_multi_cell: boolean;
+    has_distinct_copy_selection: boolean;
     preview_mode: boolean;
     can_hide_rows: boolean;
     selected_row_count: number;
@@ -35,6 +35,33 @@ export interface CellContextMenuModelProps {
     on_select_all: () => void;
 }
 
+interface CellSelectionRect {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+}
+
+interface MergedCellBounds {
+    startRow: number;
+    startCol: number;
+    endRow: number;
+    endCol: number;
+}
+
+/** Whether copying the selection differs from copying its active cell. */
+export function has_distinct_copy_selection(
+    range: CellSelectionRect | undefined,
+    active_merge: MergedCellBounds | null,
+): boolean {
+    if (!range || range.width * range.height <= 1) return false;
+    if (!active_merge) return true;
+    return range.x !== active_merge.startCol
+        || range.y !== active_merge.startRow
+        || range.width !== active_merge.endCol - active_merge.startCol + 1
+        || range.height !== active_merge.endRow - active_merge.startRow + 1;
+}
+
 export function cell_context_menu_items(props: CellContextMenuModelProps): MenuItem[] {
     const items: MenuItem[] = [];
     const { on_open_link, on_copy_link } = props;
@@ -55,7 +82,7 @@ export function cell_context_menu_items(props: CellContextMenuModelProps): MenuI
         items.push({ label: 'Discard edit', on_click: () => props.on_discard_edit() });
     }
     items.push({ label: 'Copy cell', on_click: () => props.on_copy_cell() });
-    if (props.is_multi_cell) {
+    if (props.has_distinct_copy_selection) {
         items.push({ label: 'Copy selection', on_click: () => props.on_copy_selection() });
     }
     if (!props.preview_mode) {
