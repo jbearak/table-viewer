@@ -189,12 +189,42 @@ uncosted scope in the issue as written.
 - Pure refactor, no behavior change — this is the stage that makes the rest
   reviewable.
 
-### Stage 3 — Share attribute reads (prerequisite for Stage 5)
+### Stage 3 — Share **and harden** attribute reads (prerequisite for Stage 5)
 
-- Writer's 14 private attribute regexes → shared `get_attr`.
+Routing the writer's regexes through today's `get_attr` is **not sufficient**,
+and this is the most important thing the architecture review caught. I verified
+it against `get_attr` as written (`ooxml-xml.ts:35`):
+
+```
+A1     <c r="A1">                                    ok
+A1     <c r='A1'>                                    ok
+null   <c r = "A1">                                  MISSED (whitespace around =)
+Z99    <c note="text containing r='Z99'" r="A1">     WRONG CELL
+Z99    <c note='has r="Z99" inside' r="A1">          WRONG CELL
+```
+
+`get_attr` uses `\br=(?:"…"|'…')` with no notion of being inside another
+attribute's value, so an attribute-shaped substring in an earlier value wins.
+That does not merely hide a cell — it returns **a different cell's coordinate**.
+
+What holds the line today is the very guard Stage 5 deletes. The
+unreadable-attribute check (`xlsx-cell-write.ts:1155`) is written as a
+**subtraction that fails closed**: it removes every canonical `name="value"` pair
+and refuses if any non-whitespace remains. `r = "A1"` leaves `r =`; single-quoted
+values are never stripped. Both refuse.
+
+So Stage 3's real job is to make the shared reader actually correct:
+
+- Replace `get_attr`'s regex with a small **opening-tag attribute lexer** that
+  tracks quote state, accepts both quote forms, allows XML whitespace around `=`,
+  and matches whole attribute names only.
+- Then move the writer's 14 private attribute regexes onto it.
 - Fix both stale doc comments (`Span` "byte offsets", `get_attr`
   "double-quoted").
 - Still no guard deletion, still no reader change.
+
+Stage 5 may delete the unreadable-attribute guard **only** once the lexer handles
+these cases, with a test per row of the table above.
 
 ### Stage 4 — Reader adopts the markup-aware scan
 
@@ -215,11 +245,57 @@ uncosted scope in the issue as written.
 Today every refusal is a plain `new Error(string)` — there is no structured
 taxonomy, which is a blocker for a language-neutral corpus (criterion (f)).
 
-- One `OoxmlRefusalError` with a stable `code`, optional `coordinate`, and
-  today's human message preserved verbatim. Tests assert `code`, never prose.
+- One `OoxmlRefusalError` in its own leaf module `src/ooxml-refusal.ts`, with a
+  stable `code`, optional `coordinate`, and today's human message preserved
+  verbatim. Tests assert `code`, never prose. The class does not live in
+  `ooxml-xml.ts` or in the shared scanner: the reader must be able to *skip* an
+  invalid coordinate that the writer *refuses*, so a shared mechanism module must
+  not import writer policy. Precedent: `src/sqlite-file-state-errors.ts`.
+- **Codes are kebab-case**, e.g. `invalid-cell-reference`,
+  `missing-cell-reference`, `foreign-worksheet-namespace`. One architect
+  recommended snake_case; I measured the repo instead — string-union members run
+  **63 kebab-case to 4 snake_case**, and the nearest precedent
+  (`SqliteFileStateErrorCategory`) is kebab (`'foreign-key'`,
+  `'malformed-state'`). Kebab serializes to JSON identically, so the corpus loses
+  nothing.
+- `invalid-cell-reference` covers every present-but-invalid `r` — lowercase
+  `a1`, row-zero `A0`, non-canonical `A01`, and out-of-format `XFE1` /
+  `A1048577`. One code, because reader behavior, writer behavior, and user
+  remedy are identical; a port must agree on the refusal, not on which branch of
+  the validator tripped. `missing-cell-reference` stays separate: it is a
+  different document shape, and Excel may infer position from document order.
+- Format limits (`XFD` / 16,384 columns, 1,048,576 rows) belong to *this*
+  validator — they define whether a reference is well-formed. They are distinct
+  from the product display caps in `src/spreadsheet-safety.ts`
+  (`MAX_SHEET_ROWS` 1,000,000, `MAX_SHEET_COLUMNS` 256), which sibling #241 may
+  change. #153 does not touch those.
 - **Delete 4 guards** now dead because both sides share one scanner: cells
   inside comments/CDATA/PI, row-`r` disagreement, unreadable attributes, entity
-  references. Plus **both `<sheetData>` hard errors**.
+  references. Plus **both `<sheetData>` divergence errors** (commented-out first
+  `<sheetData>`; close-tag disagreement) and the then-dead
+  `raw_first_sheet_data`. The structural error for a document with *no* live
+  `<sheetData>` stays — that is not a divergence guard.
+- Each deletion is gated on a falsifiable condition, not an assertion. The
+  existing refusal tests become **successful-edit** tests, and that is the
+  falsifier: each must show the live cell replaced, the quoted/commented text
+  byte-identical, and **no duplicate coordinate** inserted. Where a shape must
+  still fail for a *different* reason (single-quoted grouped-formula attributes
+  reaching the array-formula refusal), that is asserted separately.
+- The mixed test at `xlsx-cell-write.test.ts:804-840` must be **split**: it
+  currently folds five distinct guards into one `/cannot edit safely/i`
+  assertion, so after Stage 5 its cases no longer share an outcome. Keeping it
+  whole would hide precisely the sequencing defect the taxonomy exists to expose.
+- Migration is smaller than the raw test count suggests: **25 `toThrow` sites,
+  all in `xlsx-cell-write.test.ts`** (`xlsx-edit-session.test.ts` has none). Only
+  the taxonomy assertions get rewritten; grouped-formula, merged-cell, and
+  invalid-package errors stay plain `Error`s in this stage. "Assert code, not
+  prose" applies to `OoxmlRefusalError`, not to unrelated categories that have no
+  code yet.
+- Refusal **precedence** is defined explicitly rather than left to map ordering,
+  since the corpus pins observable codes: prefixed element → `AlternateContent` →
+  structural tags in document order → within a cell, missing before invalid
+  reference → foreign namespace by effective structural context. One deliberately
+  multi-fault case pins it.
 - **Keep 4:** namespace-prefixed cell elements, `AlternateContent`, **missing
   `r`**, foreign default namespace.
   - Missing `r` must stay, and I nearly got this wrong: the guard is *not*
@@ -230,6 +306,26 @@ taxonomy, which is a blocker for a language-neutral corpus (criterion (f)).
   - Namespace-prefixed cells and `AlternateContent` stay refusals. They are not
     reachable-with-more-work; they are shapes where the correct edit is
     genuinely undetermined.
+- **Third live bug, found by the architecture review and confirmed by running
+  it: the foreign-namespace guard is scoped too narrowly.** The detector loops
+  only over `row`, `c`, and `f` tags (`xlsx-cell-write.ts:1107`), so a foreign
+  *default* namespace declared higher up rebinds every unprefixed child and is
+  never examined:
+
+  ```
+  sheetData xmlns="urn:other"  -> ACCEPTED   (edit written into a foreign namespace)
+  worksheet  xmlns="urn:other" -> ACCEPTED   (same)
+  row        xmlns="urn:other" -> REFUSED    (control: the guard does work)
+  ```
+
+  The save reports success and no SpreadsheetML cell is written — exactly the
+  failure the guard's own comment describes, reachable one element higher. This
+  must be fixed *before* the code is pinned: Stage 7 freezes
+  `foreign-worksheet-namespace` into a corpus a Rust port must match, and pinning
+  it as-is would enshrine the gap. Stage 5 therefore evaluates the effective
+  default namespace over the structural path (`worksheet` → `sheetData` → `row` →
+  `c`), keeping today's allowance for a redundant re-declaration of
+  SpreadsheetML. Prefixed `sheetData` joins the prefixed-element refusal too.
 - **Second latent bug found while verifying the first, and in scope here.**
   `parse_cell_ref` accepts row `0`: `r="A0"` yields `row: -1`, a negative index
   no guard catches (see the trace above). It shares the coordinate-validation
@@ -247,13 +343,69 @@ Justified by the 40.4 MiB above, and now provable because Stage 1 exists.
 
 - Scanner operates on `Uint8Array`; `Span` becomes what its comment always
   claimed — true UTF-8 byte offsets.
-- Decode only the ~29.3% actually consumed. Numeric `<v>` parses from bytes
-  with no string allocation.
-- Exact-span replacement demonstrated on real bytes, unrelated package content
-  byte-identical (criterion (c)) — already how the writer splices, so this is
-  preserved, not invented.
-- Gate: **≥40 MiB live-RSS reduction** on the fixture, parse time within noise
-  of baseline (speed is not the claim), all tests green.
+- **The writer and the worksheet side of the package layer go byte-native too.**
+  This is a scope correction from the architecture review, and it is forced:
+  `apply_splices` (`xlsx-cell-write.ts:1534`) applies offsets with
+  `String.slice`, so an offset cannot be both a byte offset and a valid string
+  index. Leave `apply_cell_edits` taking a string and `Span` is simply a
+  different lie. So `apply_cell_edits`, `cells_present`, `formula_count`,
+  `widen_dimension`, and worksheet-part read/write in `xlsx-package.ts` all take
+  and return bytes. `write_part_bytes` must still set `entry.size`, or readers
+  truncate.
+- **The worksheet half of `xlsx-hyperlink-write.ts` comes along.** Cell edits and
+  link edits compose over the same `sheet_xml` in a single save
+  (`xlsx-package.ts:381-456`), so leaving it string-based would reintroduce the
+  whole-part decode on exactly the composed path. Its `.rels` half stays
+  string-based — separate part, normally small.
+- **A one-allocation byte splicer** (`apply_utf8_splices`) replacing the current
+  repeated-realloc loop, preserving today's tie-order rules. Today's version
+  rebuilds the entire part per splice, which I measured on 57 MiB:
+
+  | Splices | Time |
+  |---|---|
+  | 1 | 3 ms |
+  | 10 | 32 ms |
+  | 50 | **203 ms** |
+
+  Linear in edit count, so a 50-cell paste pays 203 ms of pure copying. Computing
+  the output length first and copying each untouched range once removes that.
+- Decode only the small fraction actually consumed. Numeric `<v>` parses from
+  bytes with no string allocation — but **not by reimplementing `Number()`**.
+  Today's reader uses `Number(v_text)`, which accepts spellings a naive decimal
+  parser would not: `Number('0x10')` is 16, `Number('Infinity')` is `Infinity`,
+  `Number(' 5 ')` is 5. So: a no-allocation fast path for ordinary finite decimal
+  syntax, and a per-value fallback that decodes *that one* `<v>` and calls
+  `Number()` for anything else. A diagnostic counter asserts the fixture takes
+  zero fallbacks. Absolute "never allocate for any numeric spelling" would mean
+  writing a correctly-rounded decimal→binary converter — real scope, not worth
+  it here.
+- Note the phrasing: the scanner *inspects* every byte structurally; 29.3% is
+  what the reader *consumes*, and the share actually **decoded** is much smaller
+  than that, since `r`/`t`/`s` and numeric `<v>` never become strings.
+- Exact-span replacement demonstrated on real bytes (criterion (c)) — already how
+  the writer splices, so this is preserved, not invented. State the guarantee
+  precisely, because the whole ZIP legitimately differs after `CFB` reserializes
+  and recompresses: untouched ranges of the edited worksheet part are
+  byte-identical, unmodified package entries have byte-identical content, and the
+  edited part differs only at planned spans. That triple is what tests assert.
+- Gate: **≥32 MiB median live-RSS reduction** measured against a **Stage 5**
+  parent baseline (not Stage 1's `main` baseline, which no longer isolates Stage 6
+  once Stage 4 has changed the reader), in fresh alternating child processes,
+  sampling post-GC `process.memoryUsage().rss`. Parse time no worse than 10%
+  median regression. All tests green.
+  I lowered this from 40 MiB on the architect's reasoning, and it is sound:
+  demanding 40 of a theoretical 40.4 MiB requires recovering 99% of the
+  avoidable region, so allocator page retention or GC timing could fail a correct
+  implementation. 32 MiB is ~80% of the avoidable region and still far too large
+  for noise or a token optimization to clear.
+- Stage failure is defined, not judged: median reduction under 32 MiB; noise too
+  wide to establish a 30 MiB lower bound; a retained worksheet-sized string
+  (visible as a ~57 MiB live jump); any ordinary reader path still decoding the
+  whole part; the fixture taking numeric fallbacks; or any unrelated byte
+  changing.
+- Note `maxRSS` is **peak**, not live, and must not decide this gate on its own —
+  `CFB.read`'s inflation peak can dominate it even after the steady-state string
+  is gone. Live RSS is the post-GC sample.
 
 ### Stage 7 — Package boundary and conformance corpus
 
@@ -280,6 +432,11 @@ Justified by the 40.4 MiB above, and now provable because Stage 1 exists.
   **No callbacks in case context data** (today's `XlsxWriteOptions` passes
   `is_date_style`, `cell_font_style`, `run_font_base` as functions — those
   cannot cross a language boundary and must not leak into the corpus format).
+- The corpus must **not** encode the current refusal set as correct-by-definition.
+  Two of the shapes it would pin are defective today — the narrow
+  foreign-namespace check and the missing coordinate validation — so the corpus is
+  authored *after* Stage 5 fixes them, and it records the intended contract, not
+  the historical behavior.
 - ~40 curated cases to start, migrating incrementally. The 136 existing
   `xlsx-cell-write.test.ts` names already map almost 1:1 onto the hostile shapes
   a corpus needs (CDATA, PIs, duplicate coordinates, whitespace end tags,
@@ -287,6 +444,22 @@ Justified by the 40.4 MiB above, and now provable because Stage 1 exists.
 - Public TypeScript boundary declared **in-tree** (criterion (e)); physical
   extraction to a separate package happens under #240. dta-parser itself was
   built flat and split later — same trajectory, deliberately.
+
+## Decisions settled by architecture review
+
+Recorded so stage agents inherit rulings rather than re-deriving them. Where I
+overruled an architect, the reason is stated.
+
+| Question | Ruling |
+|---|---|
+| Retain a frozen copy of the string scanner for benchmarking? | **No.** Git and Stage 1's committed baselines are the frozen oracle. A second scanner in-tree recreates the exact divergence this issue retires. Temporary overlap is allowed only *within* unmerged Stage 6 commits, for differential tests, deleted before review. |
+| Refusal code casing | **kebab-case.** One architect said snake_case; the repo says otherwise — 63 kebab vs 4 snake in string unions, and `SqliteFileStateErrorCategory` is kebab. |
+| Where does `OoxmlRefusalError` live? | Its own leaf module `src/ooxml-refusal.ts`. Not in the shared scanner: the reader *skips* what the writer *refuses*, so shared mechanism must not import writer policy. |
+| One code or many for bad references? | **One** (`invalid-cell-reference`) for all present-but-invalid `r`; `missing-cell-reference` stays separate as a genuinely different document shape. |
+| Can namespace-prefixed cells / `AlternateContent` become *supported*? | **No.** One architect suggested they could; I disagree and am keeping them refusals. These are shapes where the correct edit is genuinely undetermined, not merely unimplemented. |
+| Do format extent limits belong here or to #241? | **Here** for reference *validity* (`XFD`, 1,048,576). #241 owns product display caps in `spreadsheet-safety.ts`. Different layers. |
+| Byte scanner: does the writer follow? | **Yes**, and the package worksheet boundary and the worksheet half of the hyperlink writer with it. Otherwise `Span` stays a lie and the composed save path still decodes. |
+| Stage 6 gate | **32 MiB** median live-RSS reduction vs a **Stage 5** baseline, not 40 MiB vs Stage 1's. |
 
 ## Delegation and branch strategy
 
