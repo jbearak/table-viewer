@@ -2215,6 +2215,8 @@ describe('GridShell column projection', () => {
         }));
         expect(menu_button_labels()).not.toContain('Clear highlight');
         expect(menu_button_labels()).not.toContain('Clear highlights');
+        expect(menu_button_labels()).toContain('Copy cell');
+        expect(menu_button_labels()).not.toContain('Copy selection');
 
         await act(async () => root!.render(React.createElement(GridShell, {
             ...initial,
@@ -2277,6 +2279,80 @@ describe('GridShell column projection', () => {
             displayRows: [{ start: 0, end: 0 }],
             sourceColumns: [0, 2],
         }, { type: 'clear' });
+    });
+
+    it('copies a preserved multi-cell range through the contextual copy action', async () => {
+        const write_text = vi.fn(async () => {});
+        Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: { writeText: write_text },
+        });
+        await render_grid(props());
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change({
+            columns: compact([]), rows: compact([]),
+            current: {
+                cell: [0, 0],
+                range: { x: 0, y: 0, width: 2, height: 1 },
+                rangeStack: [],
+            },
+        }));
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([1, 0], {
+            preventDefault: vi.fn(),
+            bounds: { x: 100, y: 36, width: 100, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        expect(menu_button_labels()).toContain('Copy selection');
+        expect(menu_button_labels()).not.toContain('Copy cell');
+        await act(async () => Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent === 'Copy selection')!.click());
+        expect(write_text).toHaveBeenCalledWith('source-a\tsource-c');
+    });
+
+    it.each([
+        {
+            name: 'row',
+            selection: { columns: compact([]), rows: compact([0]) },
+            cell: [1, 0] as [number, number],
+            copied: 'source-a\tsource-c',
+        },
+        {
+            name: 'column',
+            selection: { columns: compact([1]), rows: compact([]) },
+            cell: [1, 0] as [number, number],
+            copied: 'C name\nsource-c',
+        },
+    ])('copies a preserved $name selection through Copy selection', async ({
+        selection,
+        cell,
+        copied,
+    }) => {
+        const write_text = vi.fn(async () => {});
+        Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: { writeText: write_text },
+        });
+        await render_grid(props());
+        const on_selection_change = grid_mock.props!.onGridSelectionChange as
+            (selection: unknown) => void;
+        await act(async () => on_selection_change(selection));
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu(cell, {
+            preventDefault: vi.fn(),
+            bounds: { x: 100, y: 36, width: 100, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        expect(menu_button_labels()).toContain('Copy selection');
+        expect(menu_button_labels()).not.toContain('Copy cell');
+        await act(async () => Array.from(document.querySelectorAll('button'))
+            .find((button) => button.textContent === 'Copy selection')!.click());
+        expect(write_text).toHaveBeenCalledWith(copied);
     });
 
     it('redirects the corner marker toggle to a full-grid select-all and back', async () => {
