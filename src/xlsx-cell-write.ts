@@ -758,14 +758,6 @@ function canonical_edits(edits: readonly XlsxCellEdit[]): readonly XlsxCellEdit[
     return by_cell.size === edits.length ? edits : [...by_cell.values()];
 }
 
-/** Does an opening tag contain a default-namespace declaration the lexer could not read? */
-function has_unreadable_default_namespace(tag: string): boolean {
-    // A raw regex mistakes `note="text xmlns=example"` for a declaration. Remove
-    // quoted values first so only attribute syntax can fail closed here.
-    const outside_values = tag.replace(/"[^"]*"|'[^']*'/g, '');
-    return /(?:^|\s)xmlns\s*=/.test(outside_values);
-}
-
 interface RefusalCandidate {
     readonly start: number;
     readonly rank: number;
@@ -792,12 +784,15 @@ interface NamespaceBinding {
 interface NamespaceDeclarations {
     readonly default_namespace?: string;
     readonly bindings: readonly NamespaceBinding[];
+    /** A default declaration was present but not a quoted value we can resolve. */
+    readonly unreadable_default_namespace: boolean;
 }
 
 /** Namespace declarations on one opening tag, decoded and in lexical order. */
 function namespace_declarations(tag: string): NamespaceDeclarations {
     const bindings: NamespaceBinding[] = [];
     let default_namespace: string | undefined;
+    let unreadable_default_namespace = false;
     let i = 1;
 
     // Skip the element QName.
@@ -818,12 +813,16 @@ function namespace_declarations(tag: string): NamespaceDeclarations {
         while (i < tag.length && /[\s]/.test(tag[i])) i++;
         const quote = tag[i];
         if (quote !== '"' && quote !== "'") {
+            if (name === 'xmlns') unreadable_default_namespace = true;
             while (i < tag.length && !/[\s>]/.test(tag[i])) i++;
             continue;
         }
         const value_start = ++i;
         const value_end = tag.indexOf(quote, value_start);
-        if (value_end === -1) break;
+        if (value_end === -1) {
+            if (name === 'xmlns') unreadable_default_namespace = true;
+            break;
+        }
         const value = decode_xml(tag.slice(value_start, value_end));
         if (name === 'xmlns') default_namespace = value;
         else if (name.startsWith('xmlns:') && name.length > 'xmlns:'.length) {
@@ -831,7 +830,11 @@ function namespace_declarations(tag: string): NamespaceDeclarations {
         }
         i = value_end + 1;
     }
-    return { default_namespace, bindings };
+    return {
+        default_namespace,
+        bindings,
+        unreadable_default_namespace: default_namespace === undefined && unreadable_default_namespace,
+    };
 }
 
 interface NamespaceFrame {
@@ -1008,8 +1011,7 @@ function scan_worksheet_structure(xml: string): WorksheetStructure {
                 }
                 if (
                     !is_spreadsheetml_namespace(namespace)
-                    || (declarations.default_namespace === undefined
-                        && has_unreadable_default_namespace(open_tag))
+                    || declarations.unreadable_default_namespace
                 ) {
                     consider('both', start, 1, 'foreign-worksheet-namespace');
                 }
@@ -1020,8 +1022,7 @@ function scan_worksheet_structure(xml: string): WorksheetStructure {
             saw_sheet_data = true;
             if (
                 namespace !== worksheet_namespace
-                || (declarations.default_namespace === undefined
-                    && has_unreadable_default_namespace(open_tag))
+                || declarations.unreadable_default_namespace
             ) {
                 consider('sheet-data', start, 1, 'foreign-worksheet-namespace');
             }
@@ -1069,8 +1070,7 @@ function scan_worksheet_structure(xml: string): WorksheetStructure {
             && (local_name === 'row' || local_name === 'c' || local_name === 'f')
             && (
                 namespace !== worksheet_namespace
-                || (declarations.default_namespace === undefined
-                    && has_unreadable_default_namespace(open_tag))
+                || declarations.unreadable_default_namespace
             )
         ) {
             consider('sheet-data', start, 1, 'foreign-worksheet-namespace');

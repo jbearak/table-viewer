@@ -164,14 +164,8 @@ function scan_cell_elements(
 
 /** Optional consumers of the row scan; absent callbacks allocate no cell spans. */
 export interface ScanRowsOptions {
-    /** Every complete row, including empty and self-closing rows. */
-    readonly on_row?: (row: Span) => void;
     /** Every complete cell, including missing and invalid references. */
-    readonly on_reference?: (
-        reference: ScannedCellReference,
-        open_tag: string,
-        owner: Span,
-    ) => void;
+    readonly on_reference?: (reference: ScannedCellReference) => void;
     readonly on_coordinate?: (row: number, col: number, owner: Span) => void;
     readonly capture_cell?: (row: number, col: number) => boolean;
     readonly on_cell?: (
@@ -324,16 +318,14 @@ export function scan_rows(
         const row_index = r !== null && ROW_NUMBER_RE.test(r) ? Number(r) - 1 : null;
         if (is_self_closing(xml, start, tag_end)) {
             // Nothing inside to infer a row number from, and nothing to edit either.
-            if (row_index !== null || options?.on_row) {
-                const span = {
+            if (row_index !== null) {
+                add(row_index, {
                     start,
                     end: tag_end + 1,
                     inner_start: tag_end + 1,
                     inner_end: tag_end + 1,
                     open_tag,
-                };
-                options?.on_row?.(span);
-                if (row_index !== null) add(row_index, span);
+                });
             }
             pos = tag_end + 1;
             continue;
@@ -347,7 +339,6 @@ export function scan_rows(
         // from the writer's row map, and editing it synthesizes a duplicate A2.
         // Plural because one row element may contain cells naming several rows.
         const span = { start, end: after_close, inner_start: tag_end + 1, inner_end: close, open_tag };
-        options?.on_row?.(span);
         if (row_index !== null) add(row_index, span);
         let cell_rows: Set<number> | undefined;
         scan_cell_elements(
@@ -356,12 +347,14 @@ export function scan_rows(
             close,
             ignorable,
             (reference, cell_end, inner_start, inner_end, cell_open_tag) => {
-                options?.on_reference?.(reference, cell_open_tag, span);
+                options?.on_reference?.(reference);
                 if (reference.kind !== 'valid') return;
                 const { row, col } = reference;
                 options?.on_coordinate?.(row, col, span);
-                cell_rows ??= new Set();
-                cell_rows.add(row);
+                if (row !== row_index) {
+                    cell_rows ??= new Set();
+                    cell_rows.add(row);
+                }
                 if (options?.on_cell && (options.capture_cell?.(row, col) ?? true)) {
                     options.on_cell(row, col, {
                         start: reference.start,
@@ -374,9 +367,7 @@ export function scan_rows(
             },
         );
         if (cell_rows) {
-            for (const index of cell_rows) {
-                if (index !== row_index) add(index, span);
-            }
+            for (const index of cell_rows) add(index, span);
         }
         pos = after_close;
     }
@@ -408,7 +399,7 @@ export function scan_cells(xml: string, from: number, to: number, row?: number):
                 open_tag,
             };
             const existing = out.get(reference.col);
-            if (row !== undefined || existing === undefined || span.start < existing.start) {
+            if (row !== undefined || existing === undefined) {
                 out.set(reference.col, span);
             }
         },
