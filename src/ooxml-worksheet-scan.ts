@@ -1,0 +1,278 @@
+import {
+    find_tag_end,
+    ignorable_end,
+    ignorable_ranges,
+    is_tag_boundary,
+    is_self_closing,
+} from './ooxml-xml';
+
+/** A located element in the worksheet XML: [start, end) UTF-16 string indices of the whole element. */
+export interface Span {
+    readonly start: number;
+    readonly end: number;
+    /** Offset just past the opening tag's `>`; equals `end` for self-closing elements. */
+    readonly inner_start: number;
+    readonly open_tag: string;
+    /**
+     * Where the element's content ends, i.e. the start of its end tag. Equals
+     * `end` for a self-closing element.
+     *
+     * Carried rather than derived: an end tag may legally be written `</row\n>`, so
+     * `end - '</row>'.length` is not where it starts. Computing it that way put an
+     * insertion *inside* the end tag and emitted malformed XML.
+     */
+    readonly inner_end: number;
+}
+
+/**
+ * Every row number an unnumbered `<row>` implies, taken from its `<c r="…">`s.
+ *
+ * Usually one. But `r` is optional on both `<row>` and — for the row number —
+ * nothing forces an unnumbered row's cells to agree: a generator may put `A1` and
+ * `B2` in one `<row>`, and the reader, which keys cells purely off `<c r="…">`,
+ * shows them on the two rows they name. Taking only the *first* reference made
+ * the writer call that whole row row 1, so an edit to `B2` found no row 2, took
+ * the synthesize-a-row path, and appended a second `B2`. Two cells with the same
+ * coordinate, and which one a reader believes is its own business.
+ *
+ * So the span is claimed by every row its cells actually name, and
+ * {@link scan_cells} then matches on the full coordinate rather than the column
+ * alone. Empty for a row with no referenced cell — there is nothing to edit in
+ * it, so leaving it unmapped costs nothing.
+ */
+function row_indexes_from_cells(
+    xml: string,
+    from: number,
+    to: number,
+    ranges: ReadonlyArray<[number, number]>,
+): number[] {
+    // A Set, not an array with `includes`: this runs once per `<c>` in the row, and
+    // an unnumbered row whose cells name many distinct rows made the scan quadratic
+    // in the number of cells. A worksheet may hold a million rows, so a generator
+    // that emits one unnumbered row per cell could stall the save before it applies
+    // a single edit. Insertion order is preserved either way.
+    const found = new Set<number>();
+    let pos = from;
+    while (pos < to) {
+        // A commented-out `<c r="A1"/>` ahead of the row's real cells named the
+        // wrong row, so the edit missed the span it was aiming at and synthesized
+        // a duplicate row for a coordinate already present.
+        const at = indexOf_live(xml, '<c', pos, ranges);
+        if (at === -1 || at >= to) break;
+        if (!is_tag_boundary(xml[at + 2])) { pos = at + 2; continue; }
+        const tag_end = find_tag_end(xml, at);
+        if (tag_end === -1 || tag_end >= to) break;
+        const ref = /\br="[A-Z]+(\d+)"/.exec(xml.slice(at, tag_end + 1));
+        if (ref) found.add(Number(ref[1]) - 1);
+        pos = tag_end + 1;
+    }
+    return [...found];
+}
+
+/**
+ * Every real `<name …>` opening tag in a whole document, quote- and comment-aware.
+ *
+ * The package layer's `matchAll(/<sheet\b[^>]*>/g)` had the same defect as the
+ * writer's scans: a legal raw `>` inside a sheet name truncated the tag, the
+ * `name="` test then failed, and that worksheet dropped out of the numbering —
+ * so an edit aimed at sheet 0 was written into sheet 1. Silent, and valid on disk.
+ */
+export function* live_tags_in(xml: string, name: string): Generator<[number, string]> {
+    yield* live_tags(xml, name, 0, xml.length, ignorable_ranges(xml, 0, xml.length));
+}
+
+/**
+ * Every real `<name …>` opening tag in `[from, to)`, as [offset, whole tag].
+ *
+ * The one way to scan tags here. `matchAll(/<f\b[^>]*>/g)` gets both halves of
+ * this wrong: `[^>]*` stops at the first `>`, and a `>` inside a quoted attribute
+ * value is legal XML — `x:note="1 > 0"` need not be escaped — so the "tag" it
+ * yields is a fragment, which made the safety guard refuse a perfectly editable
+ * worksheet and made a sheet named `Welcome > Intro` shift the workbook's
+ * worksheet numbering, writing an edit into the wrong sheet. And a bare regex has
+ * no idea what a comment is, so a commented-out element read as live.
+ * `find_tag_end` is the reader's own quote-aware scan; `ignorable_ranges` is what
+ * makes "live" mean live.
+ */
+export function* live_tags(
+    xml: string,
+    name: string,
+    from: number,
+    to: number,
+    ranges: ReadonlyArray<[number, number]>,
+): Generator<[number, string]> {
+    let pos = from;
+    while (pos < to) {
+        const at = indexOf_live(xml, `<${name}`, pos, ranges);
+        if (at === -1 || at >= to) return;
+        if (!is_tag_boundary(xml[at + name.length + 1])) { pos = at + 1; continue; }
+        const tag_end = find_tag_end(xml, at);
+        if (tag_end === -1) return;
+        yield [at, xml.slice(at, tag_end + 1)];
+        pos = tag_end + 1;
+    }
+}
+
+/**
+ * The first `needle` at or after `from` that is real markup rather than quoted text.
+ *
+ * Every raw `indexOf` in these scanners needs this, not just the ones that find
+ * opening tags. Skipping a commented-out `<row>` but then closing the *live* row
+ * at a `</row>` inside a comment is the same bug wearing the other shoe: the span
+ * ends early, and the edit splices into the comment (silent no-op) or across it
+ * (malformed XML, which is worse than either).
+ */
+export function indexOf_live(
+    xml: string,
+    needle: string,
+    from: number,
+    ranges: ReadonlyArray<[number, number]>,
+): number {
+    let pos = from;
+    while (true) {
+        const at = xml.indexOf(needle, pos);
+        if (at === -1) return -1;
+        const skip_to = ignorable_end(ranges, at);
+        if (skip_to === undefined) return at;
+        pos = skip_to;
+    }
+}
+
+/**
+ * The span of the first live `</name>` end tag at or after `from`, as
+ * `[start, end)`, or null if there is none.
+ *
+ * Not an `indexOf('</c>')`: XML permits whitespace between the name and the `>`,
+ * so `</c\n>` is an ordinary end tag that a pretty-printer may well write.
+ * Missing it made the element look unterminated, the cell took the
+ * synthesize-a-new-one path, and the row came out with *two* `<c r="A1">` — a
+ * file whose displayed value depends on which one the reader keeps.
+ *
+ * The name boundary is checked rather than assumed, because `</c` is also a
+ * prefix of `</calcChain`; a prefix match resumes the search instead of ending
+ * the element in the wrong place.
+ */
+export function end_tag_after(
+    xml: string,
+    name: string,
+    from: number,
+    ranges: ReadonlyArray<[number, number]>,
+): [number, number] | null {
+    let pos = from;
+    while (true) {
+        const at = indexOf_live(xml, `</${name}`, pos, ranges);
+        if (at === -1) return null;
+        const after = at + name.length + 2;
+        if (xml[after] === '>') return [at, after + 1];
+        const gt = xml.indexOf('>', after);
+        if (gt !== -1 && after < gt && !/\S/.test(xml.slice(after, gt))) return [at, gt + 1];
+        pos = at + 1;
+    }
+}
+
+/**
+ * Locate the `<row>` elements in `sheetData`, keyed by row index, **in document
+ * order and plural**.
+ *
+ * A row index can name more than one element — SpreadsheetML does not forbid two
+ * `<row r="1">`, and unnumbered rows can be attributed to a row by their cells.
+ * Keeping only one of them made the writer disagree with the reader, which never
+ * resolves a whole row at all: `parse_xlsx` keys every `<c r=…>` into a map as it
+ * scans, so precedence is settled independently *per coordinate*. With a styled
+ * `A1` in the first element and a `D1` in the second, the reader shows the first
+ * element's `A1`, while a writer that had picked one span saw no `A1` in it and
+ * inserted a fresh, unstyled one — the visible number kept its value but lost its
+ * currency format, and the sheet gained a duplicate coordinate.
+ */
+export function scan_rows(xml: string, from: number, to: number): Map<number, Span[]> {
+    const out = new Map<number, Span[]>();
+    const add = (index: number, span: Span): void => {
+        const list = out.get(index);
+        if (list) list.push(span);
+        else out.set(index, [span]);
+    };
+    const ignorable = ignorable_ranges(xml, from, to);
+    let pos = from;
+    while (pos < to) {
+        const start = xml.indexOf('<row', pos);
+        if (start === -1 || start >= to) break;
+        const skip_to = ignorable_end(ignorable, start);
+        if (skip_to !== undefined) { pos = skip_to; continue; }
+        if (!is_tag_boundary(xml[start + 4])) { pos = start + 1; continue; }
+        const tag_end = find_tag_end(xml, start);
+        if (tag_end === -1) break;
+        const open_tag = xml.slice(start, tag_end + 1);
+        const r = /\br="(\d+)"/.exec(open_tag);
+        if (is_self_closing(xml, start, tag_end)) {
+            // Nothing inside to infer a row number from, and nothing to edit either.
+            if (r) add(Number(r[1]) - 1, { start, end: tag_end + 1, inner_start: tag_end + 1, inner_end: tag_end + 1, open_tag });
+            pos = tag_end + 1;
+            continue;
+        }
+        const end_tag = end_tag_after(xml, 'row', tag_end, ignorable);
+        if (end_tag === null) break;
+        const [close, after_close] = end_tag;
+        // `r` is optional in SpreadsheetML, and the reader never needed it: it keys
+        // cells off `<c r="A1">`. Skipping an unnumbered row here made the writer
+        // disagree, and an edit to a cell the user can plainly see took the
+        // synthesize-the-row path — appending a *second* row with a second copy of
+        // that cell. Duplicate coordinates, and a reader may pick either value.
+        // Recover the numbers from the cell references inside instead — plural,
+        // because nothing forces an unnumbered row's cells to name a single row;
+        // see `row_indexes_from_cells`.
+        const span = { start, end: after_close, inner_start: tag_end + 1, inner_end: close, open_tag };
+        if (r) {
+            add(Number(r[1]) - 1, span);
+        } else {
+            for (const index of row_indexes_from_cells(xml, tag_end + 1, close, ignorable)) {
+                add(index, span);
+            }
+        }
+        pos = after_close;
+    }
+    return out;
+}
+
+/**
+ * Locate every `<c>` element inside one row's inner range, keyed by column index.
+ *
+ * `row` is the row the caller is editing, and cells naming a *different* row are
+ * skipped. That matters only for an unnumbered `<row>` whose cells disagree about
+ * which row they are on — see `row_indexes_from_cells` — where one span is shared
+ * by several rows and keying on the column alone would return a neighbour's cell.
+ * For an ordinary row every cell names it, so nothing is filtered.
+ */
+export function scan_cells(xml: string, from: number, to: number, row: number): Map<number, Span> {
+    const out = new Map<number, Span>();
+    const ignorable = ignorable_ranges(xml, from, to);
+    let pos = from;
+    while (pos < to) {
+        const start = xml.indexOf('<c', pos);
+        if (start === -1 || start >= to) break;
+        const skip_to = ignorable_end(ignorable, start);
+        if (skip_to !== undefined) { pos = skip_to; continue; }
+        if (!is_tag_boundary(xml[start + 2])) { pos = start + 1; continue; }
+        const tag_end = find_tag_end(xml, start);
+        if (tag_end === -1 || tag_end >= to) break;
+        const open_tag = xml.slice(start, tag_end + 1);
+        const r = /\br="([A-Z]+)(\d+)"/.exec(open_tag);
+        const col = r && Number(r[2]) - 1 === row ? letter_to_index(r[1]) : null;
+        if (is_self_closing(xml, start, tag_end)) {
+            if (col !== null) out.set(col, { start, end: tag_end + 1, inner_start: tag_end + 1, inner_end: tag_end + 1, open_tag });
+            pos = tag_end + 1;
+            continue;
+        }
+        const end_tag = end_tag_after(xml, 'c', tag_end, ignorable);
+        if (end_tag === null) break;
+        const [close, after_close] = end_tag;
+        if (col !== null) out.set(col, { start, end: after_close, inner_start: tag_end + 1, inner_end: close, open_tag });
+        pos = after_close;
+    }
+    return out;
+}
+
+export function letter_to_index(letters: string): number {
+    let index = 0;
+    for (let i = 0; i < letters.length; i++) index = index * 26 + (letters.charCodeAt(i) - 64);
+    return index - 1;
+}
