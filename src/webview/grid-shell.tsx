@@ -3770,6 +3770,8 @@ export function GridShell({
     if (context_menu?.kind === 'cell') {
         const { row, display_col, source_col } = context_menu;
         const range = grid_selection.current?.range;
+        const has_explicit_column_selection = grid_selection.columns.length > 0;
+        const has_explicit_row_selection = grid_selection.rows.length > 0;
         const selected_rows = selected_display_row_intervals(grid_selection, row_count);
         // Columns the selection spans; hide targets all of them (falls back to
         // the clicked column when the selection maps to nothing usable).
@@ -3821,10 +3823,12 @@ export function GridShell({
                 : {}),
             dirty: menu_source_row !== undefined
                 && dirty_cells.has(`${menu_source_row}:${source_col}`),
-            has_distinct_copy_selection: has_distinct_copy_selection(
-                range,
-                merge_index.is_anchor(row, display_col),
-            ),
+            has_distinct_copy_selection: has_explicit_column_selection
+                || has_explicit_row_selection
+                || has_distinct_copy_selection(
+                    range,
+                    merge_index.is_anchor(row, display_col),
+                ),
             preview_mode,
             // Hiding rows is offered in edit mode: it is a transform like any
             // other, and the host admits it from the panel holding the session.
@@ -3850,7 +3854,17 @@ export function GridShell({
                 height: 1,
             }),
             on_copy_selection: () => {
-                if (range) copy_rect(range);
+                if (has_explicit_column_selection) {
+                    copy_source_selection({
+                        y: 0,
+                        height: row_count,
+                        source_columns: selected_column_sources,
+                    }, true);
+                } else if (has_explicit_row_selection) {
+                    if (selected_rows) copy_display_rows(selected_rows);
+                } else if (range) {
+                    copy_rect(range);
+                }
             },
             on_highlight: (color) => mutate_highlight_selection({ type: 'set', color }),
             on_clear_highlight: () => mutate_highlight_selection({ type: 'clear' }),

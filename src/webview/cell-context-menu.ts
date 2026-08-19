@@ -71,22 +71,11 @@ export function cell_context_menu_items(props: CellContextMenuModelProps): MenuI
     if (on_copy_link) {
         items.push({ label: 'Copy link', on_click: () => on_copy_link() });
     }
-    if (props.on_edit_hyperlink) {
-        const on_edit_hyperlink = props.on_edit_hyperlink;
-        items.push({
-            label: props.has_hyperlink ? 'Edit hyperlink…' : 'Hyperlink…',
-            on_click: () => on_edit_hyperlink(),
-        });
-    }
     if (props.dirty) {
         items.push({ label: 'Discard edit', on_click: () => props.on_discard_edit() });
     }
-    items.push({ label: 'Copy cell', on_click: () => props.on_copy_cell() });
-    if (props.has_distinct_copy_selection) {
-        items.push({ label: 'Copy selection', on_click: () => props.on_copy_selection() });
-    }
     if (!props.preview_mode) {
-        items.push({ kind: 'separator' });
+        if (items.length > 0) items.push({ kind: 'separator' });
         for (const color of CELL_HIGHLIGHT_COLORS) {
             items.push({
                 label: `Highlight ${color}`,
@@ -102,6 +91,11 @@ export function cell_context_menu_items(props: CellContextMenuModelProps): MenuI
             });
         }
     }
+    if (items.length > 0) items.push({ kind: 'separator' });
+    items.push(props.has_distinct_copy_selection
+        ? { label: 'Copy selection', on_click: () => props.on_copy_selection() }
+        : { label: 'Copy cell', on_click: () => props.on_copy_cell() });
+
     const hide_items: MenuItem[] = [];
     if (props.can_hide_rows) {
         hide_items.push(hide_rows_menu_item(props.selected_row_count, props.on_hide_rows));
@@ -111,7 +105,6 @@ export function cell_context_menu_items(props: CellContextMenuModelProps): MenuI
     );
     items.push(
         { kind: 'separator' },
-        { kind: 'submenu', label: 'Hide', items: hide_items },
         {
             kind: 'submenu',
             label: 'Select',
@@ -121,6 +114,17 @@ export function cell_context_menu_items(props: CellContextMenuModelProps): MenuI
                 { label: 'Select all', on_click: () => props.on_select_all() },
             ],
         },
+        { kind: 'submenu', label: 'Hide', items: hide_items },
     );
+    if (props.on_edit_hyperlink) {
+        const on_edit_hyperlink = props.on_edit_hyperlink;
+        items.push(
+            { kind: 'separator' },
+            {
+                label: props.has_hyperlink ? 'Edit hyperlink…' : 'Hyperlink…',
+                on_click: () => on_edit_hyperlink(),
+            },
+        );
+    }
     return items;
 }
