@@ -94,6 +94,27 @@ consumes:
 **16.7 MiB = 29.3% of the part.** The other **40.4 MiB is markup that gets
 decoded into a JS string and never read.**
 
+**The committed fixture is the weak case.** `sheet4.xml` is all-ASCII numeric,
+so V8 stores it as a one-byte string. Non-ASCII cell text forces a two-byte
+string and roughly doubles the penalty. Measured in isolated processes via
+`maxRSS`:
+
+| Content | Part size | Decode cost | Ratio |
+|---|---|---|---|
+| ASCII | 22.1 MiB | +18.5 MiB | 0.84× |
+| accented | 27.5 MiB | +48.1 MiB | **1.75×** |
+
+So the 40.4 MiB figure understates the win on any workbook with non-Latin or
+accented text. Stage 1 therefore baselines a synthetic non-ASCII worksheet
+alongside the real fixture (criterion (a) says worksheets, plural).
+
+**A measurement trap, recorded because it cost me a wrong conclusion once
+already.** Do not compute the decode cost as summed `heapUsed + external` deltas
+in a single process: the source `Buffer` is re-accounted and the deltas cancel to
+a bogus +0.0 MiB. Trust `maxRSS` from a fresh child process per phase, and the
+`external` delta *alone* after two forced GCs. The harness reports the two fields
+separately, never pre-summed.
+
 Speed is a genuine non-goal here: byte scan 41 ms vs string scan 43 ms —
 equivalent. Byte offsets buy **memory and correctness**. (Separately, and not
 addressed by this plan: `ignorable_ranges` runs over the whole part ~7×/save at
