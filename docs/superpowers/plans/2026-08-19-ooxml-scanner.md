@@ -359,10 +359,29 @@ taxonomy, which is a blocker for a language-neutral corpus (criterion (f)).
   byte-identical, and **no duplicate coordinate** inserted. Where a shape must
   still fail for a *different* reason (single-quoted grouped-formula attributes
   reaching the array-formula refusal), that is asserted separately.
-- The mixed test at `xlsx-cell-write.test.ts:804-840` must be **split**: it
-  currently folds five distinct guards into one `/cannot edit safely/i`
-  assertion, so after Stage 5 its cases no longer share an outcome. Keeping it
-  whole would hide precisely the sequencing defect the taxonomy exists to expose.
+- The mixed test at `xlsx-cell-write.test.ts:804-840` must be **split**. It folds
+  **11 cases** into one `/cannot edit safely/i` assertion, and after Stage 3 they
+  no longer share an outcome. Keeping it whole would hide precisely the sequencing
+  defect the taxonomy exists to expose. Classified:
+
+  | Case | After Stage 5 |
+  |---|---|
+  | `<x:f t="array" ref="A1:B2">` | refuse `namespace-prefixed-worksheet-element` |
+  | `<c>` with no `r` | refuse `missing-cell-reference` |
+  | `<row xmlns="urn:not-spreadsheet">` | refuse `foreign-worksheet-namespace` |
+  | `<row r='1'><c r='A1'>` (single-quoted) | **now edits successfully** |
+  | `<c r="A1" s='3'>` | **now edits, style 3 preserved** |
+  | `<c r="A1" t='b'>` | **now edits, boolean preserved** |
+  | `<c r="A&#49;">` | **now edits in place, no duplicate** |
+  | `<c\nr="A1"\ns='7'>` | **now edits, style 7 preserved** |
+  | `<c\tr="A1"\ts='7'>` | **now edits, style 7 preserved** |
+  | `<f t = "array" ref = "A1:B2">` | **must still refuse** — array-formula guard |
+  | `<f t='shared' si='0'>` | **must still refuse** — shared-formula guard |
+
+  The last two are the load-bearing rows: they must keep failing, but for a
+  *different* reason than before, reached through the grouped-formula path rather
+  than the attribute guard. If either silently starts passing, Stage 3's migration
+  is incomplete and a save can corrupt a formula group.
 - Migration is smaller than the raw test count suggests: **25 `toThrow` sites,
   all in `xlsx-cell-write.test.ts`** (`xlsx-edit-session.test.ts` has none). Only
   the taxonomy assertions get rewritten; grouped-formula, merged-cell, and
