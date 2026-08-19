@@ -1,11 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
-import { cell_context_menu_items } from '../webview/cell-context-menu';
+import {
+    cell_context_menu_items,
+    has_distinct_copy_selection,
+} from '../webview/cell-context-menu';
 import type { MenuItem } from '../webview/context-menu';
 
 function base() {
     return {
         dirty: false,
-        is_multi_cell: false,
+        has_distinct_copy_selection: false,
         preview_mode: false,
         can_hide_rows: true,
         selected_row_count: 1,
@@ -45,7 +48,7 @@ describe('cell context menu model', () => {
         const items = cell_context_menu_items({
             ...base(),
             dirty: true,
-            is_multi_cell: true,
+            has_distinct_copy_selection: true,
             can_clear_highlight: true,
             highlight_cell_count: 1,
             selected_row_count: 3,
@@ -93,6 +96,30 @@ describe('cell context menu model', () => {
         expect(props.on_hide_rows).toHaveBeenCalledOnce();
         expect(props.on_hide_columns).toHaveBeenCalledOnce();
         expect(props.on_select_all).toHaveBeenCalledOnce();
+    });
+});
+
+describe('copy selection visibility', () => {
+    const merged_cell = { startRow: 2, startCol: 3, endRow: 3, endCol: 5 };
+
+    it('omits Copy selection when the expanded range is one merged cell', () => {
+        const distinct = has_distinct_copy_selection(
+            { x: 3, y: 2, width: 3, height: 2 },
+            merged_cell,
+        );
+        const items = cell_context_menu_items({
+            ...base(),
+            has_distinct_copy_selection: distinct,
+        });
+        expect(items.some((item) => item.kind === undefined
+            && item.label === 'Copy selection')).toBe(false);
+    });
+
+    it('retains Copy selection when a range extends beyond the active merged cell', () => {
+        expect(has_distinct_copy_selection(
+            { x: 3, y: 2, width: 4, height: 2 },
+            merged_cell,
+        )).toBe(true);
     });
 });
 

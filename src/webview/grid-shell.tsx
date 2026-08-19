@@ -54,7 +54,10 @@ import {
     MAX_COLUMN_WIDTH_PX,
 } from './grid-model';
 import { ContextMenu } from './context-menu';
-import { cell_context_menu_items } from './cell-context-menu';
+import {
+    cell_context_menu_items,
+    has_distinct_copy_selection,
+} from './cell-context-menu';
 import { ColumnContextMenu, MultiColumnContextMenu } from './column-context-menu';
 import {
     grid_selection_contains_column,
@@ -3818,7 +3821,10 @@ export function GridShell({
                 : {}),
             dirty: menu_source_row !== undefined
                 && dirty_cells.has(`${menu_source_row}:${source_col}`),
-            is_multi_cell: !!range && range.width * range.height > 1,
+            has_distinct_copy_selection: has_distinct_copy_selection(
+                range,
+                merge_index.is_anchor(row, display_col),
+            ),
             preview_mode,
             // Hiding rows is offered in edit mode: it is a transform like any
             // other, and the host admits it from the panel holding the session.
