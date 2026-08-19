@@ -264,6 +264,34 @@ So Stage 3's real job is to make the shared reader actually correct:
 Stage 5 may delete the unreadable-attribute guard **only** once the lexer handles
 these cases, with a test per row of the table above.
 
+**Scope note: 30 `get_attr` call sites across 4 modules** — `parse-xlsx.ts`,
+`xlsx-hyperlink-write.ts`, `ooxml-relationships.ts`, `xlsx-rich-text.ts`. This is
+not a local change, so the lexer must be a strict improvement: every currently-
+working call must return exactly what it returns today.
+
+**Two traps, found by prototyping the lexer and diffing it against today's
+behavior.** I hit both in a first sketch:
+
+| Tag | Today | Naive lexer | Verdict |
+|---|---|---|---|
+| `<c r = "A1">` | `null` | `A1` | fix |
+| `<c note="…r='Z99'…" r="A1">` | `Z99` | `A1` | fix |
+| `<c\nr="A1"\ns="7">` | `A1` | **`null`** | **REGRESSION** |
+| `<c vendor:r="A1">` | `A1` | `null` | fix (see below) |
+
+- **Do not split the tag name on a space.** A sketch using `tag.indexOf(' ')`
+  breaks newline-separated attributes, which is how a pretty-printer spells an
+  ordinary cell. This is not hypothetical: it is tested at
+  `xlsx-cell-write.test.ts:831`, and the writer's comment at
+  `xlsx-cell-write.ts:1144` records it as a bug already fixed once. Split on any
+  XML whitespace.
+- **A prefixed attribute is not the unqualified one.** `vendor:r` must not satisfy
+  a query for `r` — today's `\b` boundary lets it through. Returning `null` is
+  correct, and Stage 5 then classifies such a cell as `missing-cell-reference`.
+
+Both directions need tests: the fixes, and the two behaviors that must *not*
+change.
+
 ### Stage 4 — Reader adopts the markup-aware scan
 
 - `parse_worksheet_core`'s `<sheetData>`/`<row>`/`<c>` path moves onto the
