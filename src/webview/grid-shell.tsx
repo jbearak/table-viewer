@@ -3958,9 +3958,6 @@ export function GridShell({
                 onColumnResize={handle_column_resize}
                 onItemHovered={on_item_hovered}
                 onCellsEdited={on_cells_edited}
-                // Both gated on `editable_cells`, so a read-only or
-                // save-in-flight sheet offers neither.
-                //
                 // `onPaste` as a bare `true` rather than a callback: the
                 // callback exists to VET a paste before Glide splits it, and
                 // there is nothing to vet here that the per-cell path does not
@@ -3971,10 +3968,10 @@ export function GridShell({
                 // the entire clipboard into the single focused cell, tabs and
                 // newlines and all.
                 onPaste={editable_cells}
-                // The pointer affordance only. Fill's keyboard hotkeys need no
-                // prop and have always been live; this adds the drag handle, and
-                // both arrive through `onCellsEdited` as one `"fill"` batch.
-                fillHandle={editable_cells}
+                // Do not expose Glide's drag-to-fill affordance. It is easy to
+                // trigger accidentally and duplicates values rather than helping
+                // with Table Viewer's viewing and lightweight editing workflow.
+                fillHandle={false}
                 onCellClicked={on_cell_clicked}
                 customRenderers={custom_renderers}
                 onCellContextMenu={on_cell_context_menu}

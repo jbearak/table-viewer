@@ -3510,13 +3510,13 @@ describe('GridShell history capture', () => {
         );
     }
 
-    it('offers paste and the fill handle only while cells are editable', async () => {
+    it('offers paste only while cells are editable and never offers the fill handle', async () => {
         const history = create_history_store();
         await render_grid(capture_props(history));
         // A bare `true`, not a vetting callback: every refusal paste needs is
         // already made per cell (see the prop's comment in grid-shell).
         expect(grid_mock.props!.onPaste).toBe(true);
-        expect(grid_mock.props!.fillHandle).toBe(true);
+        expect(grid_mock.props!.fillHandle).toBe(false);
 
         await render_grid(capture_props(history, { edit_mode: false }));
         expect(grid_mock.props!.onPaste).toBe(false);
