@@ -47,9 +47,17 @@ I verified four divergence classes by running the code:
 | `r="A&#49;"` (entity) | `A1` (decoded) | invisible | refused |
 | **`r="a1"` (lowercase)** | **rejected — no cell** | **accepted** | **silent duplicate coordinate on save** |
 
-The last one is a **live bug**, not a refusal. `parse_cell_ref` requires
-`/^([A-Z]+)(\d+)$/` so the reader drops the cell; `letter_to_index` accepts
-lowercase and computes a wrong index. A save emits both cells into one row:
+The last one is a **live bug**, not a refusal. `parse_cell_ref`
+(`parse-xlsx.ts:262`) requires `/^([A-Z]+)(\d+)$/` so the reader drops the cell;
+`letter_to_index` (`xlsx-cell-write.ts:734`) does `charCodeAt(i) - 64`, which for
+`'a'` (97) yields **column 32**, not 0. Verified by running both:
+
+```
+a1   reader=REJECTED       writer_col=32
+A0   reader=row -1 col 0   writer_col=0
+```
+
+A save emits both cells into one row:
 
 ```xml
 <c r="a1"><v>5</v></c><c r="A1" t="inlineStr">…</c>
@@ -205,6 +213,12 @@ taxonomy, which is a blocker for a language-neutral corpus (criterion (f)).
   - Namespace-prefixed cells and `AlternateContent` stay refusals. They are not
     reachable-with-more-work; they are shapes where the correct edit is
     genuinely undetermined.
+- **Second latent bug found while verifying the first, and in scope here.**
+  `parse_cell_ref` accepts row `0`: `r="A0"` yields `row: -1`, a negative index
+  no guard catches (see the trace above). It shares the coordinate-validation
+  path with the lowercase case, so Stage 5 fixes both under
+  `invalid_cell_reference` — validating the coordinate once, in the one place
+  both sides now read it.
 - **Fixes the live lowercase bug:** reader keeps rejecting `r="a1"`, writer
   refuses with `invalid_cell_reference`. Never silently normalize to `A1` —
   inserting a coordinate we did not read is how the duplicate got emitted.
