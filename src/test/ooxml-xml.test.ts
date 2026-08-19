@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { get_attr, remove_attr } from '../ooxml-xml';
+import { find_first_element, scan_rows } from '../ooxml-worksheet-scan';
 
 describe('get_attr', () => {
     it('reads a double-quoted attribute', () => {
@@ -39,5 +40,22 @@ describe('remove_attr', () => {
     it('removes the exact attribute in either quote form', () => {
         expect(remove_attr('<row vendor:spans="9:9" spans = \'1:1\' r="1">', 'spans'))
             .toBe('<row vendor:spans="9:9" r="1">');
+    });
+});
+
+
+describe('worksheet element bounds', () => {
+    it('does not scan a row that closes beyond sheetData', () => {
+        const xml = '<worksheet><sheetData><row r="1"></sheetData>'
+            + '<c r="A1"><v>outside</v></c></row></worksheet>';
+        const sheet_data = find_first_element(xml, 'sheetData')!;
+        const coordinates: string[] = [];
+
+        const rows = scan_rows(xml, sheet_data.inner_start, sheet_data.inner_end, {
+            on_coordinate: (row, col) => coordinates.push(`${row}:${col}`),
+        });
+
+        expect(rows.size).toBe(0);
+        expect(coordinates).toEqual([]);
     });
 });

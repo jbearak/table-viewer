@@ -39,6 +39,11 @@ import {
     iter_elements,
     iter_elements_markup,
 } from './ooxml-xml';
+import {
+    element_content,
+    find_first_element,
+    scan_rows,
+} from './ooxml-worksheet-scan';
 
 // --- ZIP / Entry Access ---
 
@@ -352,22 +357,23 @@ function parse_worksheet_core(
     let max_row = 0;
     let max_col = 0;
 
-    const sheet_data = get_text(xml, 'sheetData');
+    const sheet_data = find_first_element(xml, 'sheetData');
     if (sheet_data) {
-        iter_elements(sheet_data, 'row', (_row_open, row_inner) => {
-            iter_elements(row_inner, 'c', (c_open, c_inner) => {
-                const ref = get_attr(c_open, 'r');
-                if (!ref) return;
-                const cell_ref = parse_cell_ref(ref);
-                if (!cell_ref) return;
-                const { row, col } = cell_ref;
+        scan_rows(xml, sheet_data.inner_start, sheet_data.inner_end, {
+            on_cell: (row, col, cell_span) => {
+                const c_open = cell_span.open_tag;
                 if (row + 1 > max_row) max_row = row + 1;
                 if (col + 1 > max_col) max_col = col + 1;
 
                 const t = get_attr(c_open, 't');
                 const s = get_attr(c_open, 's');
                 const xf_index = s ? parseInt(s, 10) : 0;
-                const v_text = get_text(c_inner, 'v');
+                const v_text = element_content(
+                    xml,
+                    'v',
+                    cell_span.inner_start,
+                    cell_span.inner_end,
+                );
                 const style = get_style(xf_index, xfs, fonts);
 
                 let raw: string | number | boolean | null = null;
@@ -401,7 +407,12 @@ function parse_worksheet_core(
                     // Note the legacy plain path returned null for an <is> with
                     // no <t>; parse_xlsx_string_item returns '' there, and an
                     // empty string densifies identically to a blank cell.
-                    const is_elem = get_text(c_inner, 'is');
+                    const is_elem = element_content(
+                        xml,
+                        'is',
+                        cell_span.inner_start,
+                        cell_span.inner_end,
+                    );
                     if (is_elem) {
                         const parsed = parse_xlsx_string_item(is_elem);
                         if (typeof parsed === 'string') {
@@ -452,7 +463,7 @@ function parse_worksheet_core(
                         `Spreadsheet has too many cells to open safely (max ${MAX_WORKBOOK_CELLS.toLocaleString()})`
                     );
                 }
-            });
+            },
         });
     }
 

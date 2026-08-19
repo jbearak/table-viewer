@@ -4,18 +4,18 @@ import {
     ignorable_end,
     ignorable_ranges,
     is_tag_boundary,
-    is_self_closing,
     remove_attr,
     replace_attr_value,
     strip_illegal_xml_chars,
 } from './ooxml-xml';
 import {
     end_tag_after,
+    find_first_element,
     indexOf_live,
     letter_to_index,
     live_tags,
-    scan_cells,
     scan_rows,
+    type ScanRowsOptions,
     type Span,
 } from './ooxml-worksheet-scan';
 import { text_styles_equal, type CellTextStyle, type RichTextRun } from './cell-content';
@@ -501,7 +501,6 @@ interface GroupedRange {
 }
 
 const ROW_NUMBER_RE = /^\d+$/;
-const CELL_REFERENCE_RE = /^([A-Z]+)(\d+)$/;
 const CELL_RANGE_RE = /^([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?$/;
 
 /**
@@ -789,7 +788,12 @@ function canonical_edits(edits: readonly XlsxCellEdit[]): readonly XlsxCellEdit[
  * Scoped to `<sheetData>`, since that is all the writer touches, and to the parts
  * of it a splice depends on.
  */
-function assert_writable_sheet_data(xml: string, from: number, to: number): void {
+function assert_writable_sheet_data(
+    xml: string,
+    from: number,
+    to: number,
+    scan_options?: ScanRowsOptions,
+): Map<number, Span[]> {
     // Offsets kept absolute so the ignorable ranges line up; comments and CDATA are
     // text, and refusing a worksheet over markup quoted inside one would be a
     // false positive on a file that edits perfectly well.
@@ -846,14 +850,6 @@ function assert_writable_sheet_data(xml: string, from: number, to: number): void
             unsupported('cells written inside text a parser discards');
         }
     }
-    const tags: Array<[number, string]> = [];
-    for (const name of ['row', 'c', 'f'] as const) {
-        // Whole tags, quote-aware. Matching `[^>]*` cut every tag at the first `>`,
-        // and a `>` inside a quoted attribute value is legal and needs no escaping —
-        // so the fragment left over had an unbalanced quote in it, failed the
-        // subtraction below, and refused a worksheet that edits perfectly well.
-        for (const found of live_tags(xml, name, from, to, ignorable)) tags.push(found);
-    }
     // A cell whose reference names a different row than the `<row r=…>` holding it.
     // Legal XML, and the two sides read it oppositely: the reader keys cells off
     // `<c r>` alone and puts `<row r="1"><c r="A2"/></row>` in row 2, while this
@@ -861,29 +857,23 @@ function assert_writable_sheet_data(xml: string, from: number, to: number): void
     // therefore found no such cell, took the synthesize-a-new-row path, and left the
     // sheet with two `<c r="A2">` — duplicate coordinates whose displayed value
     // depends on which one a reader keeps.
-    //
-    // Sorted, because `tags` is filled a name at a time: every `<row>` first, then
-    // every `<c>`, so document order has to be restored before "the row containing
-    // this cell" means anything.
-    tags.sort((a, b) => a[0] - b[0]);
-    let containing_row: number | undefined;
-    for (const [at, tag] of tags) {
-        if (!live(at)) continue;
-        if (tag.startsWith('<row')) {
-            const r = get_attr(tag, 'r');
-            // Absent `r` is legal and the reader infers it from the first cell, so
-            // there is nothing to disagree with — see `row_index_from_first_cell`.
-            containing_row = r !== null && ROW_NUMBER_RE.test(r) ? Number(r) : undefined;
-            continue;
-        }
-        if (!tag.startsWith('<c') || containing_row === undefined) continue;
-        const ref = get_attr(tag, 'r')?.match(CELL_REFERENCE_RE);
-        if (ref && Number(ref[2]) !== containing_row) {
-            unsupported('cells whose reference disagrees with the row holding them');
-        }
-    }
-    for (const [at, tag] of tags) {
-        if (!live(at)) continue;
+    // The shared scan supplies each cell's containing row directly, so this no
+    // longer needs to rebuild containment by collecting and sorting opening tags.
+    const rows = scan_rows(xml, from, to, {
+        ...scan_options,
+        on_coordinate: (row, col, owner) => {
+            const containing_row = get_attr(owner.open_tag, 'r');
+            if (
+                containing_row !== null
+                && ROW_NUMBER_RE.test(containing_row)
+                && row + 1 !== Number(containing_row)
+            ) {
+                unsupported('cells whose reference disagrees with the row holding them');
+            }
+            scan_options?.on_coordinate?.(row, col, owner);
+        },
+    });
+    const assert_supported_tag = (tag: string): void => {
         // Any whitespace separates a tag name from its attributes, not a space
         // alone: `<c\nr="A1"\ns='7'>` is how a pretty-printer that writes one
         // attribute per line spells an ordinary cell. Looking only for a space
@@ -935,7 +925,29 @@ function assert_writable_sheet_data(xml: string, from: number, to: number): void
         if (declared === null && /\sxmlns=/.test(attrs)) {
             unsupported('worksheet elements in a different XML namespace');
         }
+    };
+
+    // Whole tags, quote-aware and in document order. Matching `[^>]*` cut every
+    // tag at the first `>` inside an attribute value; collecting one tag name at
+    // a time needed a million-entry array and a sort merely to restore this order.
+    let pos = from;
+    while (pos < to) {
+        const at = xml.indexOf('<', pos);
+        if (at === -1 || at >= to) break;
+        const skip_to = ignorable_end(ignorable, at);
+        if (skip_to !== undefined) { pos = skip_to; continue; }
+        const is_guarded_tag = (
+            (xml.startsWith('<row', at) && is_tag_boundary(xml[at + 4]))
+            || (xml.startsWith('<c', at) && is_tag_boundary(xml[at + 2]))
+            || (xml.startsWith('<f', at) && is_tag_boundary(xml[at + 2]))
+        );
+        if (!is_guarded_tag) { pos = at + 1; continue; }
+        const tag_end = find_tag_end(xml, at);
+        if (tag_end === -1 || tag_end >= to) break;
+        assert_supported_tag(xml.slice(at, tag_end + 1));
+        pos = tag_end + 1;
     }
+    return rows;
 }
 
 /**
@@ -950,8 +962,8 @@ function assert_writable_sheet_data(xml: string, from: number, to: number): void
  * a formula cell with no cached `<v>`, reads as BLANK today, and treating
  * either as display-backed would let a save invent text the user never saw.
  *
- * Resolved exactly as an edit would resolve it — same `scan_rows`/`scan_cells`
- * — so the answer describes the cell the writer would actually splice.
+ * Resolved by the same `scan_rows` cell callback an edit uses, so the answer
+ * describes the cell the writer would actually splice.
  *
  * Batched because the caller has a set of coordinates and the scan is
  * sheet-wide: asking one coordinate at a time re-walked the whole worksheet per
@@ -971,20 +983,11 @@ export function cells_present(
     if (by_row.size === 0) return found;
     const sd_open = find_sheet_data_open(xml);
     if (!sd_open) return found;
-    const rows = scan_rows(xml, sd_open.inner_start, sd_open.inner_end);
-    for (const [row, cols] of by_row) {
-        const spans = rows.get(row);
-        if (!spans) continue;
-        // One `scan_cells` per row element, not per requested column: several
-        // coordinates commonly share a row, and the scan covers the whole span.
-        const cells = new Map<number, Span>();
-        for (const span of spans) {
-            for (const [col, cell] of scan_cells(xml, span.inner_start, span.end, row)) {
-                cells.set(col, cell);
-            }
-        }
-        for (const col of cols) if (cells.has(col)) found.add(`${row}:${col}`);
-    }
+    scan_rows(xml, sd_open.inner_start, sd_open.inner_end, {
+        on_coordinate: (row, col) => {
+            if (by_row.get(row)?.includes(col)) found.add(`${row}:${col}`);
+        },
+    });
     return found;
 }
 
@@ -1066,17 +1069,32 @@ export function apply_cell_edits(
         return apply_cell_edits(expanded, edits, options);
     }
 
-    assert_writable_sheet_data(xml, inner_start, inner_end);
-
-    const rows = scan_rows(xml, inner_start, inner_end);
-
-    // Group edits by row so each row is scanned for cells at most once.
+    // Group edits by row before scanning, so cell spans are retained only for
+    // coordinates this save can touch. The scan still sees every `<c r>` once to
+    // validate its owner and to capture edited coordinates without a second pass.
     const by_row = new Map<number, XlsxCellEdit[]>();
     for (const e of edits) {
         const list = by_row.get(e.row);
         if (list) list.push(e);
         else by_row.set(e.row, [e]);
     }
+    const cells_by_row = new Map<number, Map<number, Span>>();
+    const owners_by_row = new Map<number, Map<number, Span>>();
+    const rows = assert_writable_sheet_data(xml, inner_start, inner_end, {
+        capture_cell: (row) => by_row.has(row),
+        on_cell: (row, col, cell, owner) => {
+            let cells = cells_by_row.get(row);
+            let owners = owners_by_row.get(row);
+            if (!cells || !owners) {
+                cells = new Map();
+                owners = new Map();
+                cells_by_row.set(row, cells);
+                owners_by_row.set(row, owners);
+            }
+            cells.set(col, cell);
+            owners.set(col, owner);
+        },
+    });
 
     const splices: Splice[] = [];
     const new_rows: Array<{ row: number; text: string }> = [];
@@ -1121,14 +1139,8 @@ export function apply_cell_edits(
         // scans and never decides anything at row granularity. `owner` remembers
         // which element a surviving cell came from, because an insert may only be
         // positioned against cells inside the element it is being spliced into.
-        const cells = new Map<number, Span>();
-        const owner = new Map<number, Span>();
-        for (const span of row_spans) {
-            for (const [col, cell] of scan_cells(xml, span.inner_start, span.end, row)) {
-                cells.set(col, cell);
-                owner.set(col, span);
-            }
-        }
+        const cells = cells_by_row.get(row) ?? new Map<number, Span>();
+        const owner = owners_by_row.get(row) ?? new Map<number, Span>();
         // New coordinates go into the element the reader treats as authoritative
         // for anything it already holds: the last one.
         const row_span = row_spans[row_spans.length - 1];
@@ -1313,34 +1325,15 @@ function find_sheet_data_open(xml: string): {
 } | null {
     // A commented-out `<sheetData>` ahead of the live one took every edit into the
     // comment: the worksheet on disk never changed and the save reported success.
-    const ignorable = ignorable_ranges(xml, 0, xml.length);
-    let pos = 0;
-    while (true) {
-        const start = indexOf_live(xml, '<sheetData', pos, ignorable);
-        if (start === -1) return null;
-        if (!is_tag_boundary(xml[start + 10])) { pos = start + 1; continue; }
-        const tag_end = find_tag_end(xml, start);
-        if (tag_end === -1) return null;
-        if (is_self_closing(xml, start, tag_end)) {
-            return {
-                inner_start: tag_end + 1,
-                inner_end: tag_end + 1,
-                self_closing: true,
-                element_start: start,
-                element_end: tag_end + 1,
-            };
-        }
-        const end_tag = end_tag_after(xml, 'sheetData', tag_end, ignorable);
-        if (end_tag === null) return null;
-        const [close, after_close] = end_tag;
-        return {
-            inner_start: tag_end + 1,
-            inner_end: close,
-            self_closing: false,
-            element_start: start,
-            element_end: after_close,
-        };
-    }
+    const element = find_first_element(xml, 'sheetData');
+    if (element === null) return null;
+    return {
+        inner_start: element.inner_start,
+        inner_end: element.inner_end,
+        self_closing: element.inner_start === element.end,
+        element_start: element.start,
+        element_end: element.end,
+    };
 }
 
 /**

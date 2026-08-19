@@ -68,49 +68,115 @@ export interface Span {
 }
 
 /**
- * Every row number an unnumbered `<row>` implies, taken from its `<c r="…">`s.
+ * The first live `<name>` element in `[from, to)`, including its exact spans.
  *
- * Usually one. But `r` is optional on both `<row>` and — for the row number —
- * nothing forces an unnumbered row's cells to agree: a generator may put `A1` and
- * `B2` in one `<row>`, and the reader, which keys cells purely off `<c r="…">`,
- * shows them on the two rows they name. Taking only the *first* reference made
- * the writer call that whole row row 1, so an edit to `B2` found no row 2, took
- * the synthesize-a-row path, and appended a second `B2`. Two cells with the same
- * coordinate, and which one a reader believes is its own business.
- *
- * So the span is claimed by every row its cells actually name, and
- * {@link scan_cells} then matches on the full coordinate rather than the column
- * alone. Empty for a row with no referenced cell — there is nothing to edit in
- * it, so leaving it unmapped costs nothing.
+ * This is the shared element boundary rule for worksheet reads and writes. In
+ * particular, closing tags may contain XML whitespace before `>`, and apparent
+ * tags inside comments, CDATA sections, or processing instructions are text.
  */
-function row_indexes_from_cells(
+export function find_first_element(
+    xml: string,
+    name: string,
+    from = 0,
+    to = xml.length,
+): Span | null {
+    const ranges = ignorable_ranges(xml, from, to);
+    for (const [start, open_tag] of live_tags(xml, name, from, to, ranges)) {
+        const tag_end = start + open_tag.length - 1;
+        if (tag_end >= to) return null;
+        if (is_self_closing(xml, start, tag_end)) {
+            return {
+                start,
+                end: tag_end + 1,
+                inner_start: tag_end + 1,
+                inner_end: tag_end + 1,
+                open_tag,
+            };
+        }
+        const end_tag = end_tag_after(xml, name, tag_end + 1, ranges);
+        if (end_tag === null || end_tag[1] > to) return null;
+        return {
+            start,
+            end: end_tag[1],
+            inner_start: tag_end + 1,
+            inner_end: end_tag[0],
+            open_tag,
+        };
+    }
+    return null;
+}
+
+/** The verbatim content of {@link find_first_element}, or null when absent. */
+export function element_content(
+    xml: string,
+    name: string,
+    from = 0,
+    to = xml.length,
+): string | null {
+    const element = find_first_element(xml, name, from, to);
+    return element === null ? null : xml.slice(element.inner_start, element.inner_end);
+}
+
+type ScannedCoordinateCallback = (
+    row: number,
+    col: number,
+    start: number,
+    end: number,
+    inner_start: number,
+    inner_end: number,
+    open_tag: string,
+) => void;
+
+/** Every complete, live, referenced `<c>` in one row, in document order. */
+function scan_cell_coordinates(
     xml: string,
     from: number,
     to: number,
     ranges: ReadonlyArray<[number, number]>,
-): number[] {
-    // A Set, not an array with `includes`: this runs once per `<c>` in the row, and
-    // an unnumbered row whose cells name many distinct rows made the scan quadratic
-    // in the number of cells. A worksheet may hold a million rows, so a generator
-    // that emits one unnumbered row per cell could stall the save before it applies
-    // a single edit. Insertion order is preserved either way.
-    const found = new Set<number>();
+    callback: ScannedCoordinateCallback,
+): void {
     let pos = from;
     while (pos < to) {
-        // A commented-out `<c r="A1"/>` ahead of the row's real cells named the
-        // wrong row, so the edit missed the span it was aiming at and synthesized
-        // a duplicate row for a coordinate already present.
-        const at = indexOf_live(xml, '<c', pos, ranges);
-        if (at === -1 || at >= to) break;
-        if (!is_tag_boundary(xml[at + 2])) { pos = at + 2; continue; }
-        const tag_end = find_tag_end(xml, at);
-        if (tag_end === -1 || tag_end >= to) break;
-        const ref = get_attr(xml.slice(at, tag_end + 1), 'r');
+        const start = xml.indexOf('<c', pos);
+        if (start === -1 || start >= to) return;
+        const skip_to = ignorable_end(ranges, start);
+        if (skip_to !== undefined) { pos = skip_to; continue; }
+        if (!is_tag_boundary(xml[start + 2])) { pos = start + 1; continue; }
+        const tag_end = find_tag_end(xml, start);
+        if (tag_end === -1 || tag_end >= to) return;
+        const open_tag = xml.slice(start, tag_end + 1);
+        const ref = get_attr(open_tag, 'r');
         const row = ref === null ? null : row_index_from_cell_reference(ref);
-        if (row !== null) found.add(row);
-        pos = tag_end + 1;
+        const col = row === null || ref === null
+            ? null
+            : column_index_from_cell_reference(ref, row);
+        let end: number;
+        let inner_end: number;
+        if (is_self_closing(xml, start, tag_end)) {
+            end = tag_end + 1;
+            inner_end = end;
+        } else {
+            const end_tag = end_tag_after(xml, 'c', tag_end + 1, ranges);
+            if (end_tag === null || end_tag[1] > to) return;
+            [inner_end, end] = end_tag;
+        }
+        pos = end;
+        if (row !== null && col !== null) {
+            callback(row, col, start, end, tag_end + 1, inner_end, open_tag);
+        }
     }
-    return [...found];
+}
+
+/** Optional consumers of the row scan; absent callbacks allocate no cell spans. */
+export interface ScanRowsOptions {
+    readonly on_coordinate?: (row: number, col: number, owner: Span) => void;
+    readonly capture_cell?: (row: number, col: number) => boolean;
+    readonly on_cell?: (
+        row: number,
+        col: number,
+        cell: Span,
+        owner: Span,
+    ) => void;
 }
 
 /**
@@ -228,7 +294,12 @@ export function end_tag_after(
  * inserted a fresh, unstyled one — the visible number kept its value but lost its
  * currency format, and the sheet gained a duplicate coordinate.
  */
-export function scan_rows(xml: string, from: number, to: number): Map<number, Span[]> {
+export function scan_rows(
+    xml: string,
+    from: number,
+    to: number,
+    options?: ScanRowsOptions,
+): Map<number, Span[]> {
     const out = new Map<number, Span[]>();
     const add = (index: number, span: Span): void => {
         const list = out.get(index);
@@ -244,7 +315,7 @@ export function scan_rows(xml: string, from: number, to: number): Map<number, Sp
         if (skip_to !== undefined) { pos = skip_to; continue; }
         if (!is_tag_boundary(xml[start + 4])) { pos = start + 1; continue; }
         const tag_end = find_tag_end(xml, start);
-        if (tag_end === -1) break;
+        if (tag_end === -1 || tag_end >= to) break;
         const open_tag = xml.slice(start, tag_end + 1);
         const r = get_attr(open_tag, 'r');
         const row_index = r !== null && ROW_NUMBER_RE.test(r) ? Number(r) - 1 : null;
@@ -255,7 +326,7 @@ export function scan_rows(xml: string, from: number, to: number): Map<number, Sp
             continue;
         }
         const end_tag = end_tag_after(xml, 'row', tag_end, ignorable);
-        if (end_tag === null) break;
+        if (end_tag === null || end_tag[1] > to) break;
         const [close, after_close] = end_tag;
         // `r` is optional in SpreadsheetML, and the reader never needed it: it keys
         // cells off `<c r="A1">`. Skipping an unnumbered row here made the writer
@@ -263,15 +334,36 @@ export function scan_rows(xml: string, from: number, to: number): Map<number, Sp
         // synthesize-the-row path — appending a *second* row with a second copy of
         // that cell. Duplicate coordinates, and a reader may pick either value.
         // Recover the numbers from the cell references inside instead — plural,
-        // because nothing forces an unnumbered row's cells to name a single row;
-        // see `row_indexes_from_cells`.
+        // because nothing forces an unnumbered row's cells to name a single row.
+        // Coordinate callbacks always use `<c r>` directly; the row map retains its
+        // Stage 3 policy of trusting a written `<row r>` and inferring only when absent.
         const span = { start, end: after_close, inner_start: tag_end + 1, inner_end: close, open_tag };
-        if (row_index !== null) {
-            add(row_index, span);
-        } else {
-            for (const index of row_indexes_from_cells(xml, tag_end + 1, close, ignorable)) {
-                add(index, span);
-            }
+        if (row_index !== null) add(row_index, span);
+        let cell_rows: Set<number> | undefined;
+        scan_cell_coordinates(
+            xml,
+            tag_end + 1,
+            close,
+            ignorable,
+            (row, col, cell_start, cell_end, inner_start, inner_end, cell_open_tag) => {
+                options?.on_coordinate?.(row, col, span);
+                if (row_index === null) {
+                    cell_rows ??= new Set();
+                    cell_rows.add(row);
+                }
+                if (options?.on_cell && (options.capture_cell?.(row, col) ?? true)) {
+                    options.on_cell(row, col, {
+                        start: cell_start,
+                        end: cell_end,
+                        inner_start,
+                        inner_end,
+                        open_tag: cell_open_tag,
+                    }, span);
+                }
+            },
+        );
+        if (row_index === null && cell_rows) {
+            for (const index of cell_rows) add(index, span);
         }
         pos = after_close;
     }
@@ -282,37 +374,24 @@ export function scan_rows(xml: string, from: number, to: number): Map<number, Sp
  * Locate every `<c>` element inside one row's inner range, keyed by column index.
  *
  * `row` is the row the caller is editing, and cells naming a *different* row are
- * skipped. That matters only for an unnumbered `<row>` whose cells disagree about
- * which row they are on — see `row_indexes_from_cells` — where one span is shared
- * by several rows and keying on the column alone would return a neighbour's cell.
- * For an ordinary row every cell names it, so nothing is filtered.
+ * skipped. For an unnumbered row whose cells name several rows, `scan_rows` maps
+ * the shared span under each row through its `cell_rows` set; matching only the
+ * column here could otherwise return a neighbour's cell. For an ordinary row
+ * every cell names it, so nothing is filtered.
  */
 export function scan_cells(xml: string, from: number, to: number, row: number): Map<number, Span> {
     const out = new Map<number, Span>();
-    const ignorable = ignorable_ranges(xml, from, to);
-    let pos = from;
-    while (pos < to) {
-        const start = xml.indexOf('<c', pos);
-        if (start === -1 || start >= to) break;
-        const skip_to = ignorable_end(ignorable, start);
-        if (skip_to !== undefined) { pos = skip_to; continue; }
-        if (!is_tag_boundary(xml[start + 2])) { pos = start + 1; continue; }
-        const tag_end = find_tag_end(xml, start);
-        if (tag_end === -1 || tag_end >= to) break;
-        const open_tag = xml.slice(start, tag_end + 1);
-        const ref = get_attr(open_tag, 'r');
-        const col = ref === null ? null : column_index_from_cell_reference(ref, row);
-        if (is_self_closing(xml, start, tag_end)) {
-            if (col !== null) out.set(col, { start, end: tag_end + 1, inner_start: tag_end + 1, inner_end: tag_end + 1, open_tag });
-            pos = tag_end + 1;
-            continue;
-        }
-        const end_tag = end_tag_after(xml, 'c', tag_end, ignorable);
-        if (end_tag === null) break;
-        const [close, after_close] = end_tag;
-        if (col !== null) out.set(col, { start, end: after_close, inner_start: tag_end + 1, inner_end: close, open_tag });
-        pos = after_close;
-    }
+    scan_cell_coordinates(
+        xml,
+        from,
+        to,
+        ignorable_ranges(xml, from, to),
+        (cell_row, col, start, end, inner_start, inner_end, open_tag) => {
+            if (cell_row === row) {
+                out.set(col, { start, end, inner_start, inner_end, open_tag });
+            }
+        },
+    );
     return out;
 }
 
