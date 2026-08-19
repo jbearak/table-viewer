@@ -8,45 +8,48 @@ import {
 } from './ooxml-xml';
 
 const ROW_NUMBER_RE = /^\d+$/;
+const MAX_WORKSHEET_ROWS = 1_048_576;
+const MAX_WORKSHEET_COLUMNS = 16_384;
 
-/** The zero-based row in a canonical cell reference, without allocating captures. */
-function row_index_from_cell_reference(ref: string): number | null {
-    let i = 0;
-    while (i < ref.length) {
-        const code = ref.charCodeAt(i);
-        if (code < 0x41 || code > 0x5a) break;
-        i++;
-    }
-    if (i === 0 || i === ref.length) return null;
+/** How one cell opening tag spells (or omits) its coordinate. */
+export type ScannedCellReference =
+    | { readonly kind: 'valid'; readonly row: number; readonly col: number; readonly start: number }
+    | { readonly kind: 'missing'; readonly start: number }
+    | { readonly kind: 'invalid'; readonly reference: string; readonly start: number };
 
-    let row = 0;
-    for (; i < ref.length; i++) {
-        const code = ref.charCodeAt(i) - 0x30;
-        if (code < 0 || code > 9) return null;
-        row = row * 10 + code;
-    }
-    return row - 1;
-}
+/**
+ * Resolve one decoded `r` value without normalizing malformed spellings.
+ *
+ * SpreadsheetML coordinates are canonical uppercase letters followed by a
+ * one-based row with no leading zeroes. The format itself ends at XFD1048576;
+ * these are format limits, distinct from Table Viewer's smaller product caps.
+ */
+function resolve_cell_reference(ref: string | null, start: number): ScannedCellReference {
+    if (ref === null) return { kind: 'missing', start };
 
-/** The zero-based column when `ref` names `row`, without allocating captures. */
-function column_index_from_cell_reference(ref: string, row: number): number | null {
     let i = 0;
     let column = 0;
     while (i < ref.length) {
         const code = ref.charCodeAt(i);
         if (code < 0x41 || code > 0x5a) break;
         column = column * 26 + code - 0x40;
+        if (column > MAX_WORKSHEET_COLUMNS) {
+            return { kind: 'invalid', reference: ref, start };
+        }
         i++;
     }
-    if (i === 0 || i === ref.length) return null;
-
-    let found_row = 0;
-    for (; i < ref.length; i++) {
-        const code = ref.charCodeAt(i) - 0x30;
-        if (code < 0 || code > 9) return null;
-        found_row = found_row * 10 + code;
+    if (i === 0 || i === ref.length || ref.charCodeAt(i) === 0x30) {
+        return { kind: 'invalid', reference: ref, start };
     }
-    return found_row - 1 === row ? column - 1 : null;
+
+    let row = 0;
+    for (; i < ref.length; i++) {
+        const digit = ref.charCodeAt(i) - 0x30;
+        if (digit < 0 || digit > 9) return { kind: 'invalid', reference: ref, start };
+        row = row * 10 + digit;
+        if (row > MAX_WORKSHEET_ROWS) return { kind: 'invalid', reference: ref, start };
+    }
+    return { kind: 'valid', row: row - 1, col: column - 1, start };
 }
 
 /** A located element in the worksheet XML: [start, end) UTF-16 string indices of the whole element. */
@@ -117,23 +120,21 @@ export function element_content(
     return element === null ? null : xml.slice(element.inner_start, element.inner_end);
 }
 
-type ScannedCoordinateCallback = (
-    row: number,
-    col: number,
-    start: number,
+type ScannedCellCallback = (
+    reference: ScannedCellReference,
     end: number,
     inner_start: number,
     inner_end: number,
     open_tag: string,
 ) => void;
 
-/** Every complete, live, referenced `<c>` in one row, in document order. */
-function scan_cell_coordinates(
+/** Every complete, live `<c>` in one row, in document order. */
+function scan_cell_elements(
     xml: string,
     from: number,
     to: number,
     ranges: ReadonlyArray<[number, number]>,
-    callback: ScannedCoordinateCallback,
+    callback: ScannedCellCallback,
 ): void {
     let pos = from;
     while (pos < to) {
@@ -145,11 +146,7 @@ function scan_cell_coordinates(
         const tag_end = find_tag_end(xml, start);
         if (tag_end === -1 || tag_end >= to) return;
         const open_tag = xml.slice(start, tag_end + 1);
-        const ref = get_attr(open_tag, 'r');
-        const row = ref === null ? null : row_index_from_cell_reference(ref);
-        const col = row === null || ref === null
-            ? null
-            : column_index_from_cell_reference(ref, row);
+        const reference = resolve_cell_reference(get_attr(open_tag, 'r'), start);
         let end: number;
         let inner_end: number;
         if (is_self_closing(xml, start, tag_end)) {
@@ -161,14 +158,20 @@ function scan_cell_coordinates(
             [inner_end, end] = end_tag;
         }
         pos = end;
-        if (row !== null && col !== null) {
-            callback(row, col, start, end, tag_end + 1, inner_end, open_tag);
-        }
+        callback(reference, end, tag_end + 1, inner_end, open_tag);
     }
 }
 
 /** Optional consumers of the row scan; absent callbacks allocate no cell spans. */
 export interface ScanRowsOptions {
+    /** Every complete row, including empty and self-closing rows. */
+    readonly on_row?: (row: Span) => void;
+    /** Every complete cell, including missing and invalid references. */
+    readonly on_reference?: (
+        reference: ScannedCellReference,
+        open_tag: string,
+        owner: Span,
+    ) => void;
     readonly on_coordinate?: (row: number, col: number, owner: Span) => void;
     readonly capture_cell?: (row: number, col: number) => boolean;
     readonly on_cell?: (
@@ -321,39 +324,47 @@ export function scan_rows(
         const row_index = r !== null && ROW_NUMBER_RE.test(r) ? Number(r) - 1 : null;
         if (is_self_closing(xml, start, tag_end)) {
             // Nothing inside to infer a row number from, and nothing to edit either.
-            if (row_index !== null) add(row_index, { start, end: tag_end + 1, inner_start: tag_end + 1, inner_end: tag_end + 1, open_tag });
+            if (row_index !== null || options?.on_row) {
+                const span = {
+                    start,
+                    end: tag_end + 1,
+                    inner_start: tag_end + 1,
+                    inner_end: tag_end + 1,
+                    open_tag,
+                };
+                options?.on_row?.(span);
+                if (row_index !== null) add(row_index, span);
+            }
             pos = tag_end + 1;
             continue;
         }
         const end_tag = end_tag_after(xml, 'row', tag_end, ignorable);
         if (end_tag === null || end_tag[1] > to) break;
         const [close, after_close] = end_tag;
-        // `r` is optional in SpreadsheetML, and the reader never needed it: it keys
-        // cells off `<c r="A1">`. Skipping an unnumbered row here made the writer
-        // disagree, and an edit to a cell the user can plainly see took the
-        // synthesize-the-row path — appending a *second* row with a second copy of
-        // that cell. Duplicate coordinates, and a reader may pick either value.
-        // Recover the numbers from the cell references inside instead — plural,
-        // because nothing forces an unnumbered row's cells to name a single row.
-        // Coordinate callbacks always use `<c r>` directly; the row map retains its
-        // Stage 3 policy of trusting a written `<row r>` and inferring only when absent.
+        // `<c r>` is the sole coordinate authority. Claim this span for every row
+        // its cells name as well as for a written `<row r>`: otherwise a legal
+        // `<row r="1"><c r="A2"/></row>` is visible at A2 to the reader but absent
+        // from the writer's row map, and editing it synthesizes a duplicate A2.
+        // Plural because one row element may contain cells naming several rows.
         const span = { start, end: after_close, inner_start: tag_end + 1, inner_end: close, open_tag };
+        options?.on_row?.(span);
         if (row_index !== null) add(row_index, span);
         let cell_rows: Set<number> | undefined;
-        scan_cell_coordinates(
+        scan_cell_elements(
             xml,
             tag_end + 1,
             close,
             ignorable,
-            (row, col, cell_start, cell_end, inner_start, inner_end, cell_open_tag) => {
+            (reference, cell_end, inner_start, inner_end, cell_open_tag) => {
+                options?.on_reference?.(reference, cell_open_tag, span);
+                if (reference.kind !== 'valid') return;
+                const { row, col } = reference;
                 options?.on_coordinate?.(row, col, span);
-                if (row_index === null) {
-                    cell_rows ??= new Set();
-                    cell_rows.add(row);
-                }
+                cell_rows ??= new Set();
+                cell_rows.add(row);
                 if (options?.on_cell && (options.capture_cell?.(row, col) ?? true)) {
                     options.on_cell(row, col, {
-                        start: cell_start,
+                        start: reference.start,
                         end: cell_end,
                         inner_start,
                         inner_end,
@@ -362,8 +373,10 @@ export function scan_rows(
                 }
             },
         );
-        if (row_index === null && cell_rows) {
-            for (const index of cell_rows) add(index, span);
+        if (cell_rows) {
+            for (const index of cell_rows) {
+                if (index !== row_index) add(index, span);
+            }
         }
         pos = after_close;
     }
@@ -374,21 +387,27 @@ export function scan_rows(
  * Locate every `<c>` element inside one row's inner range, keyed by column index.
  *
  * `row` is the row the caller is editing, and cells naming a *different* row are
- * skipped. For an unnumbered row whose cells name several rows, `scan_rows` maps
- * the shared span under each row through its `cell_rows` set; matching only the
- * column here could otherwise return a neighbour's cell. For an ordinary row
- * every cell names it, so nothing is filtered.
+ * skipped. One row element may contain cells naming several rows, whether or not
+ * its own `r` attribute is present or agrees; `scan_rows` maps that shared span
+ * under every referenced row. Matching only the column here could otherwise
+ * return a neighbouring row's cell from the same owner.
  */
 export function scan_cells(xml: string, from: number, to: number, row: number): Map<number, Span> {
     const out = new Map<number, Span>();
-    scan_cell_coordinates(
+    scan_cell_elements(
         xml,
         from,
         to,
         ignorable_ranges(xml, from, to),
-        (cell_row, col, start, end, inner_start, inner_end, open_tag) => {
-            if (cell_row === row) {
-                out.set(col, { start, end, inner_start, inner_end, open_tag });
+        (reference, end, inner_start, inner_end, open_tag) => {
+            if (reference.kind === 'valid' && reference.row === row) {
+                out.set(reference.col, {
+                    start: reference.start,
+                    end,
+                    inner_start,
+                    inner_end,
+                    open_tag,
+                });
             }
         },
     );

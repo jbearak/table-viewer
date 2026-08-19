@@ -18,6 +18,7 @@ import {
     type ScanRowsOptions,
     type Span,
 } from './ooxml-worksheet-scan';
+import { OoxmlRefusalError, type OoxmlRefusalCode } from './ooxml-refusal';
 import { text_styles_equal, type CellTextStyle, type RichTextRun } from './cell-content';
 
 /**
@@ -208,8 +209,13 @@ const NUMBER_RE = /^[+-]?((0|[1-9]\d*)(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/;
  */
 const MAX_EXACT_DIGITS = 15;
 
-/** The namespace a worksheet's own elements are already in. */
+/** The two standardized default namespaces for SpreadsheetML worksheet elements. */
 const SPREADSHEETML_NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+const STRICT_SPREADSHEETML_NS = 'http://purl.oclc.org/ooxml/spreadsheetml/main';
+
+function is_spreadsheetml_namespace(namespace: string): boolean {
+    return namespace === SPREADSHEETML_NS || namespace === STRICT_SPREADSHEETML_NS;
+}
 
 /**
  * How many significant digits a numeric literal spells out.
@@ -500,7 +506,6 @@ interface GroupedRange {
     readonly end_col: number;
 }
 
-const ROW_NUMBER_RE = /^\d+$/;
 const CELL_RANGE_RE = /^([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?$/;
 
 /**
@@ -750,202 +755,204 @@ function canonical_edits(edits: readonly XlsxCellEdit[]): readonly XlsxCellEdit[
     return by_cell.size === edits.length ? edits : [...by_cell.values()];
 }
 
+/** Does an opening tag contain a default-namespace declaration the lexer could not read? */
+function has_unreadable_default_namespace(tag: string): boolean {
+    // A raw regex mistakes `note="text xmlns=example"` for a declaration. Remove
+    // quoted values first so only attribute syntax can fail closed here.
+    const outside_values = tag.replace(/"[^"]*"|'[^']*'/g, '');
+    return /(?:^|\s)xmlns\s*=/.test(outside_values);
+}
+
+type RefusalConsider = (
+    start: number,
+    rank: number,
+    code: OoxmlRefusalCode,
+    coordinate?: string,
+) => void;
+
+/** The first live opening construct in the XML part, after declarations and comments. */
+function first_live_markup_start(
+    xml: string,
+    ignorable: ReadonlyArray<[number, number]>,
+): number {
+    let pos = 0;
+    while (true) {
+        const at = xml.indexOf('<', pos);
+        if (at === -1) return -1;
+        const skip_to = ignorable_end(ignorable, at);
+        if (skip_to !== undefined) { pos = skip_to; continue; }
+        return at;
+    }
+}
+
+/** Record unsupported element identities, shared by normal and missing-sheetData paths. */
+function collect_element_identity_refusals(
+    xml: string,
+    ignorable: ReadonlyArray<[number, number]>,
+    sheet_data: Span | null,
+    consider: RefusalConsider,
+): void {
+    const live = (at: number): boolean => ignorable_end(ignorable, at) === undefined;
+    const root_start = first_live_markup_start(xml, ignorable);
+    const from = sheet_data?.inner_start ?? -1;
+    const to = sheet_data?.inner_end ?? -1;
+
+    // Exact XML-name boundaries matter: `vendor:sheetData-cache` is an unrelated
+    // extension element, not a prefixed spelling of SpreadsheetML `sheetData`.
+    for (const m of xml.matchAll(
+        /<[A-Za-z_][\w.-]*:(worksheet|sheetData|row|c|f|is|v)(?=[ \t\n\r\/>])/g,
+    )) {
+        if (!live(m.index)) continue;
+        const local_name = m[1];
+        const relevant = local_name === 'worksheet'
+            ? m.index === root_start
+            : local_name === 'sheetData'
+                ? sheet_data === null
+                : m.index >= from && m.index < to;
+        if (relevant) consider(m.index, 0, 'namespace-prefixed-worksheet-element');
+    }
+
+    // AlternateContent can wrap sheetData itself, so its opening construct belongs
+    // to the whole worksheet part rather than only the selected sheetData body.
+    for (const m of xml.matchAll(
+        /<(?:[A-Za-z_][\w.-]*:)?AlternateContent(?=[ \t\n\r\/>])/g,
+    )) {
+        if (live(m.index)) consider(m.index, 0, 'markup-compatibility-alternate-content');
+    }
+}
+
 /**
- * Refuse a worksheet this writer cannot read the way an XML parser would.
+ * Refuse worksheet constructs whose correct edit is genuinely undetermined.
  *
- * The scanners here match literal spellings — `<row`, `<c`, `<f`, `r="A1"` — which
- * is exact for how Excel and every mainstream generator write a worksheet, and
- * wrong for spellings that are equally valid XML. Three of them corrupt silently
- * rather than failing loudly, which is why this refuses instead of trying harder:
- *
- *  - A namespace prefix (`<x:row>`, `<x:c>`, `<x:f>`), or a default-namespace
- *    override (`<row xmlns="urn:other">`). Both bind the element to a URI, so they
- *    are the same elements to a parser and invisible to these scanners. A mixed
- *    document is the dangerous case: unprefixed rows and cells scan normally but a
- *    prefixed `<x:f>` is not seen, so the edit overwrites an array formula and
- *    `formula_count` reports no loss, leaving `calcChain.xml` attached and stale.
- *    An override is worse still — a `<c>` spliced into an overridden row inherits
- *    the foreign namespace, so the save succeeds and writes no worksheet cell.
- *  - An attribute spelled any way but `name="value"` — single-quoted (`r='A1'`),
- *    space-padded (`r = "A1"`), or carrying an entity reference (`r="A&#49;"`).
- *    Every attribute the writer consumes is matched literally, so each spelling
- *    has its own silent failure: an unrecognized `r` *appends a second cell with
- *    the same reference*, an unrecognized `s` drops the cell's formatting, an
- *    unrecognized `t="b"` turns a boolean into a string, and an unrecognized
- *    `t`/`ref` on `<f>` hides an array formula the writer would then overwrite.
- *    Checked across every attribute of `<row>`, `<c>` and `<f>` rather than just
- *    the consumed ones: the consumed set is a moving target, and a worksheet
- *    that spells one attribute unusually will spell its neighbours that way too.
- *  - A cell with no `r` at all, whose column is implied by document order. Same
- *    duplicate-coordinate outcome, and the reader ignores such cells too, so the
- *    user is editing a cell they cannot see.
- *
- * Handling any of these properly means a namespace-aware tokenizer that preserves
- * byte offsets — real work, and unnecessary for the files this feature is for. A
- * refusal costs the user a save they could not safely have had anyway; the
- * alternative costs them a workbook that looks fine and is not.
- *
- * Scoped to `<sheetData>`, since that is all the writer touches, and to the parts
- * of it a splice depends on.
+ * Candidates are compared in strict document order. The opening construct is the
+ * anchor; a rank breaks ties only within one opening tag: unsupported element
+ * identity, foreign effective namespace, missing reference, invalid reference.
+ * UTF-16 string indices preserve the same ordering as the byte offsets Stage 6
+ * will carry, without taking that stage's representation change here.
  */
 function assert_writable_sheet_data(
     xml: string,
-    from: number,
-    to: number,
-    scan_options?: ScanRowsOptions,
+    sheet_data: Span,
+    scan_options?: Pick<ScanRowsOptions, 'capture_cell' | 'on_cell'>,
 ): Map<number, Span[]> {
-    // Offsets kept absolute so the ignorable ranges line up; comments and CDATA are
-    // text, and refusing a worksheet over markup quoted inside one would be a
-    // false positive on a file that edits perfectly well.
-    const ignorable = ignorable_ranges(xml, from, to);
-    const live = (at: number): boolean => ignorable_end(ignorable, at) === undefined;
-    const unsupported = (what: string): never => {
-        throw new Error(
-            `Cannot edit this worksheet: it uses ${what}, which Table Viewer cannot `
-            + 'edit safely. Re-saving the file in Excel will normally fix it.',
-        );
-    };
-    for (const m of xml.matchAll(/<[A-Za-z_][\w.-]*:(?:row|c|f|is|v)\b/g)) {
-        if (m.index >= from && m.index < to && live(m.index)) {
-            unsupported('namespace-prefixed cell elements');
-        }
+    interface RefusalCandidate {
+        readonly start: number;
+        readonly rank: number;
+        readonly code: OoxmlRefusalCode;
+        readonly coordinate?: string;
     }
-    // Markup-compatibility branches. `<mc:AlternateContent>` holds several
-    // alternative spellings of the same content, of which a consumer picks *one*
-    // by whether it understands the `Requires` namespaces — so the same `<row
-    // r="1">` legitimately appears more than once with different values, and
-    // which one is real depends on the reader.
-    //
-    // The row and cell scans are flat maps keyed by coordinate, so the last
-    // branch simply overwrote the earlier ones: an edit landed in `mc:Fallback`
-    // alone and every application that understands the `mc:Choice` went on
-    // showing the old value, after a save that reported success. There is no
-    // position this writer can splice that is correct for all readers, so it
-    // declines instead. Any prefix, since `mc` is a convention and not a rule.
-    for (const m of xml.matchAll(/<(?:[A-Za-z_][\w.-]*:)?AlternateContent\b/g)) {
-        if (m.index >= from && m.index < to && live(m.index)) {
-            unsupported('markup-compatibility alternate content');
-        }
-    }
-    // A cell carrying an `r` written inside anything a parser treats as text —
-    // a comment, a CDATA section, a processing instruction. Being right about XML
-    // is not enough here: `parse_xlsx` scans raw text with `indexOf`, so such a
-    // `<c r="A1">` is a cell *to the reader*, and a later one wins over the live
-    // cell before it. The writer correctly edits the live cell, the reader
-    // correctly-for-itself keeps the quoted value, and the save reports success
-    // having changed nothing the user can see.
-    //
-    // Refused rather than followed: splicing there would mean writing into text
-    // every conforming parser discards, and teaching the reader to skip these is a
-    // reader change this branch does not make. Text with no `r` in it is invisible
-    // to both sides and stays allowed — that is the ordinary annotated worksheet,
-    // and refusing it would be a false positive.
-    //
-    // All three kinds, not comments alone: the reader draws no distinction between
-    // them, so neither can this. Checking only comments left CDATA and PIs masking
-    // a successful write exactly as comments had.
-    for (const [start, end] of ignorable) {
-        if (start < from || start >= to) continue;
-        if (/<c\s[^>]*\br=/.test(xml.slice(start, end))) {
-            unsupported('cells written inside text a parser discards');
-        }
-    }
-    // A cell whose reference names a different row than the `<row r=…>` holding it.
-    // Legal XML, and the two sides read it oppositely: the reader keys cells off
-    // `<c r>` alone and puts `<row r="1"><c r="A2"/></row>` in row 2, while this
-    // writer files the cell under its container. Editing what the user sees as A2
-    // therefore found no such cell, took the synthesize-a-new-row path, and left the
-    // sheet with two `<c r="A2">` — duplicate coordinates whose displayed value
-    // depends on which one a reader keeps.
-    // The shared scan supplies each cell's containing row directly, so this no
-    // longer needs to rebuild containment by collecting and sorting opening tags.
-    const rows = scan_rows(xml, from, to, {
-        ...scan_options,
-        on_coordinate: (row, col, owner) => {
-            const containing_row = get_attr(owner.open_tag, 'r');
-            if (
-                containing_row !== null
-                && ROW_NUMBER_RE.test(containing_row)
-                && row + 1 !== Number(containing_row)
-            ) {
-                unsupported('cells whose reference disagrees with the row holding them');
-            }
-            scan_options?.on_coordinate?.(row, col, owner);
-        },
-    });
-    const assert_supported_tag = (tag: string): void => {
-        // Any whitespace separates a tag name from its attributes, not a space
-        // alone: `<c\nr="A1"\ns='7'>` is how a pretty-printer that writes one
-        // attribute per line spells an ordinary cell. Looking only for a space
-        // found none, so the subtraction below examined an empty string, the
-        // unreadable single-quoted style passed the guard unexamined, and the edit
-        // silently dropped the cell's formatting.
-        const first_space = /\s/.exec(tag)?.index;
-        const attrs = tag.slice(first_space ?? tag.length - 1, -1);
-        // Whatever remains once every canonical `name="value"` pair is removed has
-        // to be nothing but the tag's own whitespace and its self-closing slash.
-        // Written as a subtraction so an attribute spelled some way not thought of
-        // here still fails closed rather than passing unexamined.
-        const rest = attrs.replace(/\s[A-Za-z_:][\w.:-]*="[^"]*"/g, '');
-        if (/\S/.test(rest.replace(/\/$/, ''))) {
-            unsupported('attributes this writer cannot read the way a parser would');
-        }
-        // Entities are only a hazard in the values this writer reads back: `r="A&#49;"`
-        // is `A1` to a parser and unmatchable here, so the cell is missed and the edit
-        // appends a duplicate. Elsewhere in the tag an `&amp;` is ordinary and legal.
-        if (/\s(?:r|s|t|ref)="[^"]*&/.test(attrs)) {
-            unsupported('cell references written with XML entities');
-        }
-        if (tag.startsWith('<c') && get_attr(tag, 'r') === null) {
-            unsupported('cells whose position is implied rather than written');
-        }
-        // A prefix is not the only way to move an element out of SpreadsheetML: a
-        // default-namespace override (`<row xmlns="urn:other">`) rebinds the row and
-        // every unprefixed child. A `<c>` spliced in there inherits the foreign
-        // namespace, so the save reports success and no worksheet cell is written.
-        //
-        // Only the *default* declaration, because only it rebinds anything.
-        // `xmlns:vendor="…"` introduces a prefix for elements that opt into it and
-        // leaves the unprefixed `<c>` exactly where it was — refusing on that
-        // rejected an ordinary worksheet, and the prefixed elements themselves are
-        // already caught above.
-        //
-        // And only a declaration that actually *changes* the binding. Redeclaring
-        // the SpreadsheetML namespace the worksheet is already in is redundant but
-        // legal, and a generator may well emit it; refusing on it rejected a cell
-        // the reader displays perfectly well, with a message that was simply untrue
-        // — the namespace had not changed. A `<c>` spliced under such a row lands in
-        // exactly the namespace it would have had anyway.
-        const declared = get_attr(tag, 'xmlns');
-        if (declared !== null && declared !== SPREADSHEETML_NS) {
-            unsupported('worksheet elements in a different XML namespace');
-        }
-        // Any malformed declaration the shared attribute lexer cannot read still
-        // fails closed rather than being assumed harmless.
-        if (declared === null && /\sxmlns=/.test(attrs)) {
-            unsupported('worksheet elements in a different XML namespace');
+
+    let first: RefusalCandidate | undefined;
+    const consider = (
+        start: number,
+        rank: number,
+        code: OoxmlRefusalCode,
+        coordinate?: string,
+    ): void => {
+        if (
+            first === undefined
+            || start < first.start
+            || (start === first.start && rank < first.rank)
+        ) {
+            first = { start, rank, code, coordinate };
         }
     };
 
-    // Whole tags, quote-aware and in document order. Matching `[^>]*` cut every
-    // tag at the first `>` inside an attribute value; collecting one tag name at
-    // a time needed a million-entry array and a sort merely to restore this order.
-    let pos = from;
-    while (pos < to) {
-        const at = xml.indexOf('<', pos);
-        if (at === -1 || at >= to) break;
-        const skip_to = ignorable_end(ignorable, at);
-        if (skip_to !== undefined) { pos = skip_to; continue; }
-        const is_guarded_tag = (
-            (xml.startsWith('<row', at) && is_tag_boundary(xml[at + 4]))
-            || (xml.startsWith('<c', at) && is_tag_boundary(xml[at + 2]))
-            || (xml.startsWith('<f', at) && is_tag_boundary(xml[at + 2]))
-        );
-        if (!is_guarded_tag) { pos = at + 1; continue; }
-        const tag_end = find_tag_end(xml, at);
-        if (tag_end === -1 || tag_end >= to) break;
-        assert_supported_tag(xml.slice(at, tag_end + 1));
-        pos = tag_end + 1;
+    // Offsets stay absolute so the ignorable ranges line up. Comments, CDATA and
+    // processing instructions are text to both shared scanners and cannot establish
+    // a refusal.
+    const ignorable = ignorable_ranges(xml, 0, xml.length);
+    const from = sheet_data.inner_start;
+    const to = sheet_data.inner_end;
+
+    // A prefix makes an element invisible to the literal-name scanner. In a mixed
+    // document an unseen `<x:f>` can be overwritten while formula_count observes no
+    // loss, leaving calcChain attached and stale. A prefixed worksheet or sheetData
+    // is the same ambiguity at a structural level.
+    //
+    // AlternateContent holds alternative spellings of the same content, selected by
+    // the namespaces a consumer understands. Editing one branch alone can report
+    // success while another consumer keeps displaying the unchanged branch. It may
+    // wrap sheetData itself, so both identities are collected over the whole part.
+    collect_element_identity_refusals(xml, ignorable, sheet_data, consider);
+    // A default-namespace override rebinds the element and every unprefixed
+    // descendant. A `<c>` spliced under a foreign worksheet, sheetData or row then
+    // inherits that namespace, so the save reports success but writes no worksheet
+    // cell. Evaluate the effective binding along worksheet → sheetData → row → c.
+    //
+    // Only the default declaration matters: `xmlns:vendor="…"` leaves unprefixed
+    // cells in SpreadsheetML. Redundantly redeclaring SpreadsheetML is legal and
+    // remains allowed. An unreadable default declaration fails closed.
+    const effective_namespace = (
+        parent: string,
+        tag: string,
+        start: number,
+    ): string => {
+        const declared = get_attr(tag, 'xmlns');
+        if (declared !== null) {
+            if (!is_spreadsheetml_namespace(declared)) {
+                consider(start, 1, 'foreign-worksheet-namespace');
+            }
+            return declared;
+        }
+        if (has_unreadable_default_namespace(tag)) {
+            consider(start, 1, 'foreign-worksheet-namespace');
+        }
+        return parent;
+    };
+
+    const worksheet = find_first_element(xml, 'worksheet');
+    const worksheet_namespace = worksheet === null
+        ? SPREADSHEETML_NS
+        : effective_namespace(SPREADSHEETML_NS, worksheet.open_tag, worksheet.start);
+    const sheet_data_namespace = effective_namespace(
+        worksheet_namespace,
+        sheet_data.open_tag,
+        sheet_data.start,
+    );
+
+    // `scan_rows` invokes on_row immediately before that owner's cells, so one
+    // carried binding covers the current row without a second sheet-sized map.
+    let current_row_namespace = sheet_data_namespace;
+    // `<f xmlns="urn:other">` was part of the existing refusal surface. It is not
+    // on the structural path, so only its explicit declaration can establish a new
+    // candidate; an inherited foreign binding is already anchored above.
+    for (const [start, tag] of live_tags(xml, 'f', from, to, ignorable)) {
+        effective_namespace(SPREADSHEETML_NS, tag, start);
+    }
+
+    const rows = scan_rows(xml, from, to, {
+        ...scan_options,
+        on_row: (row) => {
+            current_row_namespace = effective_namespace(
+                sheet_data_namespace,
+                row.open_tag,
+                row.start,
+            );
+        },
+        on_reference: (reference, open_tag) => {
+            // Called for its `consider` side effect: a declaration on `<c>` can be
+            // foreign even though the resolved namespace is not needed afterwards.
+            effective_namespace(current_row_namespace, open_tag, reference.start);
+            if (reference.kind === 'missing') {
+                // Excel infers this cell's position from document order. Our
+                // coordinate-only contract has no equivalent position, so inserting
+                // an explicit cell can create a semantic duplicate Excel already saw.
+                consider(reference.start, 2, 'missing-cell-reference');
+            } else if (reference.kind === 'invalid') {
+                // Never normalize a malformed reference into a coordinate we did not
+                // read; that is how the original duplicate-cell corruption was made.
+                consider(
+                    reference.start,
+                    3,
+                    'invalid-cell-reference',
+                    reference.reference,
+                );
+            }
+        },
+    });
+    if (first !== undefined) {
+        throw new OoxmlRefusalError(first.code, first.coordinate);
     }
     return rows;
 }
@@ -981,9 +988,9 @@ export function cells_present(
         else by_row.set(row, [col]);
     }
     if (by_row.size === 0) return found;
-    const sd_open = find_sheet_data_open(xml);
-    if (!sd_open) return found;
-    scan_rows(xml, sd_open.inner_start, sd_open.inner_end, {
+    const sheet_data = find_first_element(xml, 'sheetData');
+    if (!sheet_data) return found;
+    scan_rows(xml, sheet_data.inner_start, sheet_data.inner_end, {
         on_coordinate: (row, col) => {
             if (by_row.get(row)?.includes(col)) found.add(`${row}:${col}`);
         },
@@ -1009,50 +1016,41 @@ export function apply_cell_edits(
     if (edits.length === 0) return xml;
     edits = canonical_edits(edits);
 
-    const sd_open = find_sheet_data_open(xml);
-    if (!sd_open) throw new Error('Worksheet XML has no <sheetData> element');
-    const { inner_start, inner_end, self_closing, element_start, element_end } = sd_open;
-
-    // The reader takes the *first* `<sheetData` in the raw text — `get_text` uses
-    // `indexOf` and knows nothing about comments — while this scan skips quoted
-    // ones to find the live element. Usually the same element; when a commented-out
-    // `<sheetData>` sits ahead of the live one, not. Then every cell the user sees
-    // comes from inside the comment, the edit correctly rewrites the live element,
-    // and the value on screen never changes after a save that reported success.
-    //
-    // Refused rather than resolved, exactly as for cells quoted inside text: there
-    // is no position to splice that is right for both sides, since writing into the
-    // comment means writing into text every conforming parser discards.
-    if (raw_first_sheet_data(xml) !== element_start) {
-        throw new Error(
-            'Cannot edit this worksheet: it has a commented-out <sheetData> before the '
-            + 'live one, which Table Viewer cannot edit safely. Re-saving the file in '
-            + 'Excel will normally fix it.',
-        );
+    const sheet_data = find_first_element(xml, 'sheetData');
+    if (!sheet_data) {
+        // Structured constructs can explain why the literal-name scanner found no
+        // sheetData. Compare them in document order before the generic structural
+        // error; AlternateContent may itself wrap the unavailable sheetData.
+        const ignorable = ignorable_ranges(xml, 0, xml.length);
+        let first: { start: number; rank: number; code: OoxmlRefusalCode } | undefined;
+        const consider = (start: number, rank: number, code: OoxmlRefusalCode): void => {
+            if (
+                first === undefined
+                || start < first.start
+                || (start === first.start && rank < first.rank)
+            ) first = { start, rank, code };
+        };
+        collect_element_identity_refusals(xml, ignorable, null, consider);
+        const worksheet = find_first_element(xml, 'worksheet');
+        if (worksheet !== null) {
+            const declared = get_attr(worksheet.open_tag, 'xmlns');
+            if (
+                (declared !== null && !is_spreadsheetml_namespace(declared))
+                || (declared === null && has_unreadable_default_namespace(worksheet.open_tag))
+            ) {
+                consider(worksheet.start, 1, 'foreign-worksheet-namespace');
+            }
+        }
+        if (first !== undefined) throw new OoxmlRefusalError(first.code);
+        throw new Error('Worksheet XML has no <sheetData> element');
     }
-
-    // And the same for the *end* of the element. The reader closes `<sheetData>` at
-    // the first literal `</sheetData>` from `indexOf` — comment-blind, and matching
-    // that exact spelling only. This scan skips quoted text and tolerates the legal
-    // `</sheetData >`, so the two disagree twice over:
-    //
-    //   - a comment containing `</sheetData>` ends the element early for the reader,
-    //     which then sees none of the rows after it, while the writer edits them
-    //     happily;
-    //   - a real close written `</sheetData >` is no close at all to the reader, so
-    //     `get_text` returns null and the sheet reads as empty.
-    //
-    // Either way the save reports success and changes nothing the user can see —
-    // the same divergence the guard above refuses, at the other end of the element.
-    // `self_closing` is exempt: the reader returns an empty string for it and the
-    // expansion below gives both sides the same element.
-    if (!self_closing && xml.indexOf('</sheetData>', inner_start) !== inner_end) {
-        throw new Error(
-            'Cannot edit this worksheet: its <sheetData> does not end where a parser '
-            + 'reading it would stop, so Table Viewer cannot edit it safely. '
-            + 'Re-saving the file in Excel will normally fix it.',
-        );
-    }
+    const {
+        inner_start,
+        inner_end,
+        start: element_start,
+        end: element_end,
+    } = sheet_data;
+    const self_closing = sheet_data.inner_start === sheet_data.end;
 
     // An empty `<sheetData/>` has nowhere to splice into, so expand it to a pair
     // first and re-derive the offsets from the expanded document.
@@ -1080,7 +1078,7 @@ export function apply_cell_edits(
     }
     const cells_by_row = new Map<number, Map<number, Span>>();
     const owners_by_row = new Map<number, Map<number, Span>>();
-    const rows = assert_writable_sheet_data(xml, inner_start, inner_end, {
+    const rows = assert_writable_sheet_data(xml, sheet_data, {
         capture_cell: (row) => by_row.has(row),
         on_cell: (row, col, cell, owner) => {
             let cells = cells_by_row.get(row);
@@ -1296,44 +1294,6 @@ function apply_splices(xml: string, splices: Splice[]): string {
         out = out.slice(0, s.start) + s.text + out.slice(s.end);
     }
     return out;
-}
-
-/**
- * Where the *reader* believes `<sheetData>` starts: the first raw occurrence.
- *
- * Deliberately comment-blind, because `parse_xlsx`'s `get_text` is — it scans with
- * `indexOf` and applies the same tag-boundary test and nothing else. This exists
- * only to be compared against the live element {@link find_sheet_data_open} finds,
- * so it has to reproduce that scan rather than improve on it.
- */
-function raw_first_sheet_data(xml: string): number {
-    let pos = 0;
-    while (true) {
-        const start = xml.indexOf('<sheetData', pos);
-        if (start === -1) return -1;
-        if (is_tag_boundary(xml[start + 10])) return start;
-        pos = start + 1;
-    }
-}
-
-function find_sheet_data_open(xml: string): {
-    inner_start: number;
-    inner_end: number;
-    self_closing: boolean;
-    element_start: number;
-    element_end: number;
-} | null {
-    // A commented-out `<sheetData>` ahead of the live one took every edit into the
-    // comment: the worksheet on disk never changed and the save reported success.
-    const element = find_first_element(xml, 'sheetData');
-    if (element === null) return null;
-    return {
-        inner_start: element.inner_start,
-        inner_end: element.inner_end,
-        self_closing: element.inner_start === element.end,
-        element_start: element.start,
-        element_end: element.end,
-    };
 }
 
 /**

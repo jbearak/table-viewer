@@ -58,4 +58,30 @@ describe('worksheet element bounds', () => {
         expect(rows.size).toBe(0);
         expect(coordinates).toEqual([]);
     });
+
+    it('reports valid, missing, and invalid cell references with start offsets', () => {
+        const xml = '<worksheet><sheetData><row r="1">'
+            + '<c/><c r="A0"/><c r="XFD1048576"/>'
+            + '</row></sheetData></worksheet>';
+        const sheet_data = find_first_element(xml, 'sheetData')!;
+        const references: unknown[] = [];
+        const coordinates: string[] = [];
+
+        scan_rows(xml, sheet_data.inner_start, sheet_data.inner_end, {
+            on_reference: (reference) => references.push(reference),
+            on_coordinate: (row, col) => coordinates.push(`${row}:${col}`),
+        });
+
+        expect(references).toEqual([
+            { kind: 'missing', start: xml.indexOf('<c/>') },
+            { kind: 'invalid', reference: 'A0', start: xml.indexOf('<c r="A0"') },
+            {
+                kind: 'valid',
+                row: 1_048_575,
+                col: 16_383,
+                start: xml.indexOf('<c r="XFD1048576"'),
+            },
+        ]);
+        expect(coordinates).toEqual(['1048575:16383']);
+    });
 });
