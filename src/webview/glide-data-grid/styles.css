@@ -118,7 +118,7 @@
 }
 
 /* internal/data-grid-overlay-editor/data-grid-overlay-editor-style.tsx
-   (left/top/min-width/min-height/max-height and the --overlay-top /
+   (left/top/min-width/max-width/min-height/max-height and the --overlay-top /
    --gdg-overlay-pad custom properties are inline at the call site) */
 .gdg-overlay-editor {
     position: absolute;
