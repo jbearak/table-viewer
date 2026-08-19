@@ -97,16 +97,19 @@ describe('HighlightControl', () => {
             .every((button) => (button as HTMLButtonElement).disabled)).toBe(true);
     });
 
-    it('applies, clears selection, clears all, and restores trigger focus on Escape', async () => {
+    it('returns action focus to the owner and restores trigger focus on Escape', async () => {
         const on_apply = vi.fn();
         const on_clear = vi.fn();
         const on_clear_all = vi.fn();
-        await render({ on_apply, on_clear, on_clear_all });
+        const grid = document.createElement('button');
+        document.body.appendChild(grid);
+        const on_action_complete = vi.fn(() => grid.focus());
+        await render({ on_apply, on_clear, on_clear_all, on_action_complete });
         const trigger = container.querySelector<HTMLButtonElement>('.highlight-trigger')!;
         await click(trigger);
         await click(Array.from(container.querySelectorAll('.highlight-actions button'))[0]);
         expect(on_apply).toHaveBeenCalledOnce();
-        expect(document.activeElement).toBe(trigger);
+        expect(document.activeElement).toBe(grid);
 
         await click(trigger);
         await click(Array.from(container.querySelectorAll('.highlight-actions button'))[1]);
@@ -115,6 +118,8 @@ describe('HighlightControl', () => {
         await click(trigger);
         await click(Array.from(container.querySelectorAll('.highlight-actions button'))[2]);
         expect(on_clear_all).toHaveBeenCalledOnce();
+        expect(on_action_complete).toHaveBeenCalledTimes(3);
+        expect(document.activeElement).toBe(grid);
 
         await click(trigger);
         await act(async () => document.dispatchEvent(new KeyboardEvent('keydown', {
@@ -122,6 +127,7 @@ describe('HighlightControl', () => {
         })));
         expect(container.querySelector('.highlight-popover')).toBeNull();
         expect(document.activeElement).toBe(trigger);
+        grid.remove();
     });
 
     it('closes on outside pointer without forcing trigger focus', async () => {

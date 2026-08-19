@@ -14,6 +14,8 @@ export interface HighlightControlProps {
     disabled?: boolean;
     status?: string;
     high_contrast?: boolean;
+    /** Return keyboard control to the grid after a mutation is committed. */
+    on_action_complete?: () => void;
 }
 
 const VIEWPORT_MARGIN_PX = 8;
@@ -30,6 +32,7 @@ export function HighlightControl({
     disabled = false,
     status = '',
     high_contrast: high_contrast_prop,
+    on_action_complete,
 }: HighlightControlProps): React.JSX.Element {
     const { highContrast: detected_high_contrast } = use_vscode_theme();
     const high_contrast = high_contrast_prop ?? detected_high_contrast;
@@ -188,21 +191,33 @@ export function HighlightControl({
                         <button
                             type="button"
                             disabled={actions_disabled}
-                            onClick={() => { on_apply(); close(true); }}
+                            onClick={() => {
+                                on_apply();
+                                close(on_action_complete === undefined);
+                                on_action_complete?.();
+                            }}
                         >
                             {pending ? 'Applying…' : 'Apply to selection'}
                         </button>
                         <button
                             type="button"
                             disabled={actions_disabled}
-                            onClick={() => { on_clear(); close(true); }}
+                            onClick={() => {
+                                on_clear();
+                                close(on_action_complete === undefined);
+                                on_action_complete?.();
+                            }}
                         >
                             Clear selection highlights
                         </button>
                         <button
                             type="button"
                             disabled={clear_all_disabled}
-                            onClick={() => { on_clear_all(); close(true); }}
+                            onClick={() => {
+                                on_clear_all();
+                                close(on_action_complete === undefined);
+                                on_action_complete?.();
+                            }}
                         >
                             Clear all highlights
                         </button>

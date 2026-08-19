@@ -34,6 +34,7 @@ const grid_shell_mock = vi.hoisted(() => ({
     flush_live_edit: vi.fn(),
     stop_edit_admission: vi.fn(),
     focus_grid: vi.fn(),
+    has_grid_focus: vi.fn(() => true),
     select_all: vi.fn(),
     copy_sheet: vi.fn(async () => {}),
     copy_selection: vi.fn(),
@@ -127,6 +128,7 @@ vi.mock('../webview/grid-shell', () => ({
             if (!props.grid_focus_ref) return;
             const handle = {
                 generation: props.generation,
+                has_focus: () => grid_shell_mock.has_grid_focus(),
                 focus: () => {
                     grid_shell_mock.focus_grid();
                     return true;
@@ -913,6 +915,8 @@ function cleanup() {
     grid_shell_mock.flush_live_edit.mockReset();
     grid_shell_mock.stop_edit_admission.mockReset();
     grid_shell_mock.focus_grid.mockReset();
+    grid_shell_mock.has_grid_focus.mockReset();
+    grid_shell_mock.has_grid_focus.mockReturnValue(true);
     grid_shell_mock.select_all.mockReset();
     grid_shell_mock.copy_sheet.mockReset();
     grid_shell_mock.copy_selection.mockReset();
@@ -1596,8 +1600,10 @@ describe('formatting toggle', () => {
         // Defaults on.
         expect(grid_stub().getAttribute('data-show-formatting')).toBe('true');
 
+        grid_shell_mock.focus_grid.mockClear();
         await click_button('Formatting');
         expect(grid_stub().getAttribute('data-show-formatting')).toBe('false');
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
     });
 
     it('keeps formatting per sheet, not per workbook', async () => {
@@ -1731,23 +1737,67 @@ describe('Excel first-row header toggle', () => {
         return meta;
     }
 
-    it('queues one host request per sheet for the all-sheets action', async () => {
+    it('queues all-sheet requests and restores focus after each remount', async () => {
         // The host takes one of these at a time, so "all sheets" drains as a queue.
         // Sheets already in the target state never enter it — S2 is already on.
+        vi.spyOn(document, 'hasFocus').mockReturnValue(true);
         const { post_message } = await render_app();
         await dispatch_host_message(
             initial_snapshot_message(excel_meta_multi([false, true, false])),
         );
+        grid_shell_mock.focus_grid.mockClear();
 
         await open_scope_menu('Header row scope');
         await click_menu_item('Use first row as header on all 3 sheets');
 
         const header_requests = () => post_message.mock.calls
-            .map((call) => call[0] as { type: string; sheetIndex?: number })
-            .filter((message) => message.type === 'setExcelFirstRowHeader');
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message): message is Extract<
+                WebviewMessage,
+                { type: 'setExcelFirstRowHeader' }
+            > => message.type === 'setExcelFirstRowHeader');
 
         // One in flight, and only one: the second must wait for the first to land.
         expect(header_requests().map((request) => request.sheetIndex)).toEqual([0]);
+        await vi.waitUntil(() => grid_shell_mock.focus_grid.mock.calls.length > 0);
+
+        const first = header_requests()[0];
+        await dispatch_host_message(refresh_snapshot_message(
+            excel_meta_multi([true, true, false]),
+            {
+                reason: 'excelHeader',
+                commandResult: {
+                    type: 'excelFirstRowHeader',
+                    requestId: first.requestId,
+                    outcome: 'applied',
+                },
+                generation: 2,
+                sourceGeneration: 2,
+            },
+        ));
+        // The queue posts its next request in the acknowledgement commit. Deliver
+        // it immediately, before the first remount's focus-retry timer can run.
+        // Back-to-back remounts must carry the same intent rather than treating the
+        // temporary body focus as a newer user interaction.
+        expect(header_requests()).toHaveLength(2);
+        expect(header_requests().map((request) => request.sheetIndex)).toEqual([0, 2]);
+
+        const second = header_requests()[1];
+        await dispatch_host_message(refresh_snapshot_message(
+            excel_meta_multi([true, true, true]),
+            {
+                reason: 'excelHeader',
+                commandResult: {
+                    type: 'excelFirstRowHeader',
+                    requestId: second.requestId,
+                    outcome: 'applied',
+                },
+                generation: 3,
+                sourceGeneration: 3,
+            },
+        ));
+        await vi.waitUntil(() => grid_shell_mock.focus_grid.mock.calls.length > 1);
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledTimes(2);
     });
 
     it('drops the queue rather than draining it into a different workbook', async () => {
@@ -1873,7 +1923,8 @@ describe('Excel first-row header toggle', () => {
             );
     });
 
-    it('requests an authoritative toggle and waits for the result snapshot', async () => {
+    it('restores grid focus after an authoritative toggle remounts it', async () => {
+        vi.spyOn(document, 'hasFocus').mockReturnValue(true);
         const { post_message } = await render_app();
         await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
             rowHeightProjection: [{ 0: 44 }],
@@ -1882,6 +1933,7 @@ describe('Excel first-row header toggle', () => {
         }));
         expect(grid_stub().getAttribute('data-row-heights')).toBe('{"0":44}');
         post_message.mockClear();
+        grid_shell_mock.focus_grid.mockClear();
         const old_mount = grid_stub().getAttribute('data-mount-id');
 
         const header_button = get_button('Header Row');
@@ -1889,6 +1941,7 @@ describe('Excel first-row header toggle', () => {
             header_button.focus();
             header_button.click();
         });
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
 
         const request = post_message.mock.calls
             .map((call) => call[0] as WebviewMessage)
@@ -1937,9 +1990,18 @@ describe('Excel first-row header toggle', () => {
             generation: 5,
             sourceGeneration: 8,
         }));
+        // The matching result removed its pending request and armed focus for the
+        // replacement grid. Before that retry runs, a same-generation delivery
+        // must rebase the armed token even though no request-map entry remains.
+        grid_shell_mock.has_grid_focus.mockReturnValue(false);
+        act(() => header_button.blur());
+        expect(document.activeElement).toBe(document.body);
+        await dispatch_host_message(refresh_snapshot_message(excel_meta(false, 'off'), {
+            generation: 5,
+            sourceGeneration: 8,
+        }));
         expect(get_button('Header Row').getAttribute('aria-pressed')).toBe('false');
         expect(get_button('Header Row').disabled).toBe(false);
-        expect(document.activeElement).toBe(get_button('Header Row'));
         expect(document.querySelector('[role="status"]')?.textContent)
             .toBe('Column names updated.');
         expect(grid_stub().getAttribute('data-row-count')).toBe('3');
@@ -1949,6 +2011,168 @@ describe('Excel first-row header toggle', () => {
         // simply names no display row with a custom height.
         expect(grid_stub().getAttribute('data-row-heights')).toBe('{}');
         expect(grid_stub().getAttribute('data-mount-id')).not.toBe(old_mount);
+        await vi.waitUntil(() => grid_shell_mock.focus_grid.mock.calls.length > 1);
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not steal newer focus when a header acknowledgement remounts the grid', async () => {
+        vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
+            generation: 4,
+            sourceGeneration: 7,
+        }));
+        post_message.mockClear();
+        grid_shell_mock.focus_grid.mockClear();
+
+        await click_button('Header Row');
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
+        const request = post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .find((message): message is Extract<
+                WebviewMessage,
+                { type: 'setExcelFirstRowHeader' }
+            > => message.type === 'setExcelFirstRowHeader')!;
+
+        // A newer interaction owns focus before the host answers. The header
+        // update changes the Columns reset key and closes its dialog, so that
+        // control must restore its own trigger rather than letting the old grid
+        // intent steal focus (or leaving focus on body).
+        await click_button('Columns');
+        expect(document.activeElement)
+            .toBe(document.querySelector('.column-visibility-search'));
+        grid_shell_mock.has_grid_focus.mockReturnValue(false);
+
+        await dispatch_host_message(refresh_snapshot_message(excel_meta(false, 'off'), {
+            reason: 'excelHeader',
+            commandResult: {
+                type: 'excelFirstRowHeader',
+                requestId: request.requestId,
+                outcome: 'applied',
+            },
+            generation: 5,
+            sourceGeneration: 8,
+        }));
+        await vi.waitUntil(() => grid_shell_mock.has_grid_focus.mock.calls.length > 0);
+
+        expect(document.querySelector('.column-visibility-popover')).toBeNull();
+        expect(document.activeElement).toBe(columns_trigger());
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
+    });
+
+    it('does not steal focus moved after a remount while its restore is queued', async () => {
+        vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
+            generation: 4,
+            sourceGeneration: 7,
+        }));
+        post_message.mockClear();
+        grid_shell_mock.focus_grid.mockClear();
+
+        await click_button('Header Row');
+        const request = post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .find((message): message is Extract<
+                WebviewMessage,
+                { type: 'setExcelFirstRowHeader' }
+            > => message.type === 'setExcelFirstRowHeader')!;
+        await dispatch_host_message(refresh_snapshot_message(excel_meta(false, 'off'), {
+            reason: 'excelHeader',
+            commandResult: {
+                type: 'excelFirstRowHeader',
+                requestId: request.requestId,
+                outcome: 'applied',
+            },
+            generation: 5,
+            sourceGeneration: 8,
+        }));
+
+        // The new grid has mounted but its delayed focus retry has not yet run.
+        // A dialog opened in that window supersedes the pending intent.
+        grid_shell_mock.has_grid_focus.mockReturnValue(false);
+        await click_button('Highlight');
+        const focused_swatch = document.activeElement;
+        expect(focused_swatch?.getAttribute('role')).toBe('radio');
+        const focus_checks_before_retry = grid_shell_mock.has_grid_focus.mock.calls.length;
+        await vi.waitUntil(() => (
+            grid_shell_mock.has_grid_focus.mock.calls.length > focus_checks_before_retry
+        ));
+
+        expect(document.activeElement).toBe(focused_swatch);
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
+    });
+
+    it('preserves pending header focus across a newer snapshot before a stale result', async () => {
+        vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
+            generation: 4,
+            sourceGeneration: 7,
+        }));
+        post_message.mockClear();
+        grid_shell_mock.focus_grid.mockClear();
+
+        await click_button('Header Row');
+        const request = post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .find((message): message is Extract<
+                WebviewMessage,
+                { type: 'setExcelFirstRowHeader' }
+            > => message.type === 'setExcelFirstRowHeader')!;
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
+
+        // A newer same-file delivery wins and remounts the grid while the header
+        // result is still outstanding. The pending action must carry focus through
+        // that remount even though this delivery contains no command result.
+        await dispatch_host_message(refresh_snapshot_message(excel_meta(true), {
+            generation: 5,
+            sourceGeneration: 8,
+            identity: {
+                deliveryId: 10,
+                authority: { fileId: 'file:test', revision: 10 },
+                stateRevision: 10,
+                sourceBasis: { physicalRevision: 10, projectionRevision: 0 },
+            },
+        }));
+        // A capability/state-only delivery at the replacement grid's same
+        // generation can land before its delayed focus retry. It advances the
+        // document epoch but must rebase, not clear, the carried intent.
+        await dispatch_host_message(refresh_snapshot_message(excel_meta(true), {
+            generation: 5,
+            sourceGeneration: 8,
+            identity: {
+                deliveryId: 11,
+                authority: { fileId: 'file:test', revision: 11 },
+                stateRevision: 11,
+                sourceBasis: { physicalRevision: 10, projectionRevision: 0 },
+            },
+        }));
+        await vi.waitUntil(() => grid_shell_mock.focus_grid.mock.calls.length > 1);
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledTimes(2);
+
+        // Retained command results are processed even on a stale delivery. It
+        // settles the request without applying (or remounting from) this snapshot.
+        await dispatch_host_message(refresh_snapshot_message(excel_meta(false, 'off'), {
+            reason: 'excelHeader',
+            commandResult: {
+                type: 'excelFirstRowHeader',
+                requestId: request.requestId,
+                outcome: 'applied',
+            },
+            generation: 4,
+            sourceGeneration: 7,
+            identity: {
+                deliveryId: 9,
+                authority: { fileId: 'file:test', revision: 9 },
+                stateRevision: 9,
+                sourceBasis: { physicalRevision: 9, projectionRevision: 0 },
+            },
+        }));
+
+        expect(document.querySelector('[role="status"]')?.textContent)
+            .toBe('Column names updated.');
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledTimes(2);
     });
 
     it('blocks every header-row command path during Edit mode', async () => {

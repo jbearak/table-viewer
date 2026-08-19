@@ -305,6 +305,8 @@ export interface HighlightSelectionHandle {
 export interface GridFocusHandle {
     /** Generation owned by the GridShell instance exposing this handle. */
     generation: number;
+    /** Whether this mounted grid currently owns DOM focus. */
+    has_focus(): boolean;
     /** Focus the mounted Glide grid; false while no DataEditor is available. */
     focus(): boolean;
 }
@@ -620,6 +622,10 @@ export function GridShell({
         if (!grid_focus_ref) return;
         const handle: GridFocusHandle = {
             generation,
+            has_focus: () => {
+                const active = document.activeElement;
+                return !!active && !!grid_root_ref.current?.contains(active);
+            },
             focus: focus_grid,
         };
         grid_focus_ref.current = handle;

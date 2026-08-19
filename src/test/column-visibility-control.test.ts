@@ -252,8 +252,10 @@ describe('ColumnVisibilityControl', () => {
 
         act(() => trigger().click());
         set_input_value(search(), 'Revenue');
+        expect(document.activeElement).toBe(search());
         rendered.rerender({ reset_key: 'sheet-2' });
         expect(document.querySelector('[role="dialog"]')).toBeNull();
+        expect(document.activeElement).toBe(trigger());
         act(() => trigger().click());
         expect(search().value).toBe('');
     });

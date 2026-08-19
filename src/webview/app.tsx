@@ -179,6 +179,21 @@ type FilterHistogramState = FilterHistogramStatus;
 const GRID_FOCUS_RESTORE_MAX_ATTEMPTS = 8;
 const GRID_FOCUS_RESTORE_RETRY_MS = 16;
 
+/** Whether a live control currently owns focus (as opposed to a remount leaving it on body). */
+function has_surviving_focus_target(): boolean {
+    const active = document.activeElement;
+    return active instanceof HTMLElement
+        && active !== document.body
+        && active !== document.documentElement
+        && active.isConnected;
+}
+
+interface GridFocusRestoreState {
+    sheet_index: number;
+    generation: number;
+    document_epoch: number;
+}
+
 /**
  * No sheet has a resize in flight — the initial value, and the one a new document resets
  * to. A shared frozen constant so that "nothing pending" is always the *same* array, and
@@ -729,11 +744,18 @@ export function App(): React.JSX.Element {
     }>({ key: '', value: { status: 'loading' } });
     const [pending_preview_scroll, set_pending_preview_scroll] =
         useState<PendingPreviewScroll | null>(null);
-    const [grid_focus_restore, set_grid_focus_restore] = useState<{
-        sheet_index: number;
-        generation: number;
-        document_epoch: number;
-    } | null>(null);
+    const [grid_focus_restore, set_grid_focus_restore_state] =
+        useState<GridFocusRestoreState | null>(null);
+    const grid_focus_restore_ref = useRef<GridFocusRestoreState | null>(null);
+    const set_grid_focus_restore = useCallback((
+        next: React.SetStateAction<GridFocusRestoreState | null>,
+    ) => {
+        const resolved = typeof next === 'function'
+            ? next(grid_focus_restore_ref.current)
+            : next;
+        grid_focus_restore_ref.current = resolved;
+        set_grid_focus_restore_state(resolved);
+    }, []);
     const [toolbar_focus_restore, set_toolbar_focus_restore] = useState<{
         sheet_index: number;
         document_epoch: number;
@@ -829,6 +851,10 @@ export function App(): React.JSX.Element {
             value.toString(36)).join('-'),
     );
     const pending_excel_header_ref = useRef<string | null>(null);
+    // Toolbar-originated Header Row actions can remount the grid when their
+    // authoritative snapshot advances the generation. Remember which grid owned
+    // keyboard focus so the acknowledgement can restore the newly mounted one.
+    const pending_excel_header_grid_focus_ref = useRef(new Map<string, number>());
     // Mirrors editing_status.save_in_flight for the transform request paths. A ref
     // rather than the state value in their dep arrays: the grid reports editing
     // status on every commit, so depending on it would rebuild these callbacks —
@@ -1470,6 +1496,7 @@ export function App(): React.JSX.Element {
                 if (cross_file_initial && disposition === 'applied') {
                     reset_save_projection();
                     pending_excel_header_ref.current = null;
+                    pending_excel_header_grid_focus_ref.current.clear();
                     pending_excel_header_unhide_ref.current = false;
                     pending_excel_header_promote_ref.current = false;
                     set_pending_excel_header(null);
@@ -1485,6 +1512,7 @@ export function App(): React.JSX.Element {
                         snapshot.capabilities.csvSaveLifecycle,
                     )
                     : undefined;
+                let grid_focus_sheet_after_excel_header: number | undefined;
                 const process_command_result = (
                     result: RetainedSnapshotCommandResult | undefined,
                 ) => {
@@ -1503,6 +1531,9 @@ export function App(): React.JSX.Element {
                     ) return;
                     const restoring_rows = pending_excel_header_unhide_ref.current;
                     const promoting_row = pending_excel_header_promote_ref.current;
+                    grid_focus_sheet_after_excel_header =
+                        pending_excel_header_grid_focus_ref.current.get(result.requestId);
+                    pending_excel_header_grid_focus_ref.current.delete(result.requestId);
                     pending_excel_header_ref.current = null;
                     pending_excel_header_unhide_ref.current = false;
                     pending_excel_header_promote_ref.current = false;
@@ -1551,7 +1582,18 @@ export function App(): React.JSX.Element {
                 // Retained results are independently idempotent: a duplicate or
                 // stale snapshot can still finish its matching command without
                 // rehydrating or regressing the UI.
+                const pending_grid_focus_sheet_before_result =
+                    pending_excel_header_grid_focus_ref.current.values().next().value;
+                const grid_focus_intent_survived =
+                    grid_focus_ref.current?.has_focus() === true
+                    || !has_surviving_focus_target();
                 process_command_result(snapshot.commandResult);
+                const grid_focus_sheet_for_snapshot =
+                    grid_focus_sheet_after_excel_header
+                    ?? pending_grid_focus_sheet_before_result
+                    ?? (cross_file_initial
+                        ? undefined
+                        : grid_focus_restore_ref.current?.sheet_index);
 
                 if (disposition === 'applied') {
                     // Every applied snapshot is lifecycle-relevant, including the
@@ -1954,7 +1996,16 @@ export function App(): React.JSX.Element {
                         }
                     }
                     document_epoch_ref.current += 1;
-                    set_grid_focus_restore(null);
+                    set_grid_focus_restore(
+                        grid_focus_intent_survived
+                            && grid_focus_sheet_for_snapshot === next_active_sheet_index
+                            ? {
+                                sheet_index: next_active_sheet_index,
+                                generation: snapshot.generation,
+                                document_epoch: document_epoch_ref.current,
+                            }
+                            : null,
+                    );
                     set_toolbar_focus_restore(null);
                     if (snapshot.presentation === 'initial') {
                         last_preview_visible_row_ref.current = null;
@@ -2925,6 +2976,18 @@ export function App(): React.JSX.Element {
                 return;
             }
             const handle = grid_focus_ref.current;
+            // The token may have been armed while no replacement grid existed.
+            // A newer connected focus target means the user moved on during that
+            // window; do not steal focus from it when the retry finally runs.
+            if (
+                has_surviving_focus_target()
+                && handle?.has_focus() !== true
+            ) {
+                set_grid_focus_restore((current) => (
+                    current === grid_focus_restore ? null : current
+                ));
+                return;
+            }
             if (
                 handle?.generation === grid_focus_restore.generation
                 && handle.focus()
@@ -2968,12 +3031,7 @@ export function App(): React.JSX.Element {
         // turn before deciding that acknowledgement removed the initiating control;
         // this preserves that chip while still catching Remove/Clear/Cancel teardown.
         const timer = window.setTimeout(() => {
-            const active = document.activeElement;
-            const focus_survived = active instanceof HTMLElement
-                && active !== document.body
-                && active !== document.documentElement
-                && active.isConnected;
-            if (!focus_survived && document.hasFocus()) {
+            if (!has_surviving_focus_target() && document.hasFocus()) {
                 toolbar_focus_ref.current?.focus();
             }
             set_toolbar_focus_restore((current) => (
@@ -3649,6 +3707,9 @@ export function App(): React.JSX.Element {
         // without switching to it — which is what lets "all sheets" run as a queue
         // rather than as a tour of the workbook.
         target_sheet_index = active_sheet_index,
+        // The sheet whose grid should regain focus after an authoritative remount.
+        // Undefined for grid- and state-strip-originated header commands.
+        grid_focus_sheet_index?: number,
     ) => {
         const sheet = meta?.sheets[target_sheet_index];
         const header = sheet?.excelFirstRowHeader;
@@ -3676,6 +3737,12 @@ export function App(): React.JSX.Element {
             ++excel_header_request_seq_ref.current
         }`;
         pending_excel_header_ref.current = request_id;
+        if (grid_focus_sheet_index !== undefined) {
+            pending_excel_header_grid_focus_ref.current.set(
+                request_id,
+                grid_focus_sheet_index,
+            );
+        }
         pending_excel_header_unhide_ref.current = unhide_all;
         pending_excel_header_promote_ref.current = header_row !== undefined;
         set_pending_excel_header(request_id);
@@ -3709,7 +3776,13 @@ export function App(): React.JSX.Element {
     const handle_toggle_excel_header = useCallback(() => {
         const header = meta?.sheets[active_sheet_index]?.excelFirstRowHeader;
         if (!header) return;
-        request_excel_header(!(header.mode === 'on' || header.active));
+        request_excel_header(
+            !(header.mode === 'on' || header.active),
+            false,
+            undefined,
+            active_sheet_index,
+            active_sheet_index,
+        );
     }, [active_sheet_index, meta, request_excel_header]);
 
     /**
@@ -3722,6 +3795,7 @@ export function App(): React.JSX.Element {
     const [excel_header_queue, set_excel_header_queue] = useState<{
         enabled: boolean;
         sheets: readonly number[];
+        grid_focus_sheet_index: number;
     } | null>(null);
 
     useEffect(() => {
@@ -3733,6 +3807,7 @@ export function App(): React.JSX.Element {
             false,
             undefined,
             next_sheet,
+            excel_header_queue.grid_focus_sheet_index,
         );
         if (result !== 'wait') {
             set_excel_header_queue({ ...excel_header_queue, sheets: rest });
@@ -3753,7 +3828,13 @@ export function App(): React.JSX.Element {
                 return (header.mode === 'on' || header.active) !== enabled;
             })
             .map(({ index }) => index);
-        if (sheets.length > 0) set_excel_header_queue({ enabled, sheets });
+        if (sheets.length > 0) {
+            set_excel_header_queue({
+                enabled,
+                sheets,
+                grid_focus_sheet_index: active_sheet_index,
+            });
+        }
     }, [active_sheet_index, header_waits_for_transform, meta]);
 
     const handle_promote_row_to_header = useCallback((display_row: number) => {
@@ -4950,6 +5031,9 @@ export function App(): React.JSX.Element {
     const focus_columns_trigger = useCallback(() => {
         toolbar_focus_ref.current?.focus_columns();
     }, []);
+    const focus_grid_after_toolbar_action = useCallback(() => {
+        grid_focus_ref.current?.focus();
+    }, []);
 
     // Host-rejected keys the store still holds. Resolving an edit (discarding it, or
     // the whole map going away) must dismiss the rejection: the host was refusing a
@@ -5513,6 +5597,7 @@ export function App(): React.JSX.Element {
         <div className={`viewer ${effective_vertical_tabs ? 'vertical-tabs' : ''}`}>
             <Toolbar
                 ref={toolbar_focus_ref}
+                on_action_complete={focus_grid_after_toolbar_action}
                 show_formatting={show_formatting}
                 on_toggle_formatting={handle_toggle_formatting}
                 show_formatting_button={meta.hasFormatting}
