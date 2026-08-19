@@ -1,10 +1,53 @@
 import {
     find_tag_end,
+    get_attr,
     ignorable_end,
     ignorable_ranges,
     is_tag_boundary,
     is_self_closing,
 } from './ooxml-xml';
+
+const ROW_NUMBER_RE = /^\d+$/;
+
+/** The zero-based row in a canonical cell reference, without allocating captures. */
+function row_index_from_cell_reference(ref: string): number | null {
+    let i = 0;
+    while (i < ref.length) {
+        const code = ref.charCodeAt(i);
+        if (code < 0x41 || code > 0x5a) break;
+        i++;
+    }
+    if (i === 0 || i === ref.length) return null;
+
+    let row = 0;
+    for (; i < ref.length; i++) {
+        const code = ref.charCodeAt(i) - 0x30;
+        if (code < 0 || code > 9) return null;
+        row = row * 10 + code;
+    }
+    return row - 1;
+}
+
+/** The zero-based column when `ref` names `row`, without allocating captures. */
+function column_index_from_cell_reference(ref: string, row: number): number | null {
+    let i = 0;
+    let column = 0;
+    while (i < ref.length) {
+        const code = ref.charCodeAt(i);
+        if (code < 0x41 || code > 0x5a) break;
+        column = column * 26 + code - 0x40;
+        i++;
+    }
+    if (i === 0 || i === ref.length) return null;
+
+    let found_row = 0;
+    for (; i < ref.length; i++) {
+        const code = ref.charCodeAt(i) - 0x30;
+        if (code < 0 || code > 9) return null;
+        found_row = found_row * 10 + code;
+    }
+    return found_row - 1 === row ? column - 1 : null;
+}
 
 /** A located element in the worksheet XML: [start, end) UTF-16 string indices of the whole element. */
 export interface Span {
@@ -62,8 +105,9 @@ function row_indexes_from_cells(
         if (!is_tag_boundary(xml[at + 2])) { pos = at + 2; continue; }
         const tag_end = find_tag_end(xml, at);
         if (tag_end === -1 || tag_end >= to) break;
-        const ref = /\br="[A-Z]+(\d+)"/.exec(xml.slice(at, tag_end + 1));
-        if (ref) found.add(Number(ref[1]) - 1);
+        const ref = get_attr(xml.slice(at, tag_end + 1), 'r');
+        const row = ref === null ? null : row_index_from_cell_reference(ref);
+        if (row !== null) found.add(row);
         pos = tag_end + 1;
     }
     return [...found];
@@ -202,10 +246,11 @@ export function scan_rows(xml: string, from: number, to: number): Map<number, Sp
         const tag_end = find_tag_end(xml, start);
         if (tag_end === -1) break;
         const open_tag = xml.slice(start, tag_end + 1);
-        const r = /\br="(\d+)"/.exec(open_tag);
+        const r = get_attr(open_tag, 'r');
+        const row_index = r !== null && ROW_NUMBER_RE.test(r) ? Number(r) - 1 : null;
         if (is_self_closing(xml, start, tag_end)) {
             // Nothing inside to infer a row number from, and nothing to edit either.
-            if (r) add(Number(r[1]) - 1, { start, end: tag_end + 1, inner_start: tag_end + 1, inner_end: tag_end + 1, open_tag });
+            if (row_index !== null) add(row_index, { start, end: tag_end + 1, inner_start: tag_end + 1, inner_end: tag_end + 1, open_tag });
             pos = tag_end + 1;
             continue;
         }
@@ -221,8 +266,8 @@ export function scan_rows(xml: string, from: number, to: number): Map<number, Sp
         // because nothing forces an unnumbered row's cells to name a single row;
         // see `row_indexes_from_cells`.
         const span = { start, end: after_close, inner_start: tag_end + 1, inner_end: close, open_tag };
-        if (r) {
-            add(Number(r[1]) - 1, span);
+        if (row_index !== null) {
+            add(row_index, span);
         } else {
             for (const index of row_indexes_from_cells(xml, tag_end + 1, close, ignorable)) {
                 add(index, span);
@@ -255,8 +300,8 @@ export function scan_cells(xml: string, from: number, to: number, row: number): 
         const tag_end = find_tag_end(xml, start);
         if (tag_end === -1 || tag_end >= to) break;
         const open_tag = xml.slice(start, tag_end + 1);
-        const r = /\br="([A-Z]+)(\d+)"/.exec(open_tag);
-        const col = r && Number(r[2]) - 1 === row ? letter_to_index(r[1]) : null;
+        const ref = get_attr(open_tag, 'r');
+        const col = ref === null ? null : column_index_from_cell_reference(ref, row);
         if (is_self_closing(xml, start, tag_end)) {
             if (col !== null) out.set(col, { start, end: tag_end + 1, inner_start: tag_end + 1, inner_end: tag_end + 1, open_tag });
             pos = tag_end + 1;

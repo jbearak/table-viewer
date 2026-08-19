@@ -6,7 +6,7 @@
  * there is exactly one implementation of each scan.
  *
  * These scanners are deliberately lightweight rather than standards-complete:
- * not namespace-aware, and `get_attr` reads only double-quoted values.
+ * not namespace-aware, and `get_attr` lexes only an element's opening tag.
  */
 
 /** Expand the five predefined XML entities and numeric character references.
@@ -32,16 +32,106 @@ export function decode_xml(s: string): string {
         .replace(/&amp;/g, '&');
 }
 
+function is_xml_whitespace(code: number): boolean {
+    return code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0d;
+}
+
+/** The start of an exact attribute's quoted value, or -1 when it is absent. */
+function attr_value_start(tag: string, attr: string): number {
+    if (tag.charCodeAt(0) !== 0x3c) return -1; // `<`
+
+    let i = tag.charCodeAt(1) === 0x2f ? 2 : 1; // `/`
+    // Skip the element name. Any XML whitespace may introduce attributes; a
+    // pretty-printer commonly puts the first one on the next line.
+    while (i < tag.length) {
+        const code = tag.charCodeAt(i);
+        if (is_xml_whitespace(code) || code === 0x2f || code === 0x3e) break; // `/`, `>`
+        i++;
+    }
+
+    while (i < tag.length) {
+        while (i < tag.length && is_xml_whitespace(tag.charCodeAt(i))) i++;
+        if (i === tag.length) return -1;
+        const code = tag.charCodeAt(i);
+        if (code === 0x2f || code === 0x3e) return -1;
+
+        const name_start = i;
+        while (i < tag.length) {
+            const name_code = tag.charCodeAt(i);
+            if (
+                is_xml_whitespace(name_code)
+                || name_code === 0x3d || name_code === 0x2f || name_code === 0x3e
+            ) break; // `=`, `/`, `>`
+            i++;
+        }
+        const name_end = i;
+
+        while (i < tag.length && is_xml_whitespace(tag.charCodeAt(i))) i++;
+        if (tag.charCodeAt(i) !== 0x3d) { // `=`
+            // Malformed XML. Advance past this token so a later, well-formed
+            // attribute cannot make the lexer stall.
+            if (i === name_start) i++;
+            continue;
+        }
+        i++;
+        while (i < tag.length && is_xml_whitespace(tag.charCodeAt(i))) i++;
+
+        const quote = tag[i];
+        if (quote !== '"' && quote !== "'") {
+            // XML attribute values must be quoted. Skip the malformed token and
+            // resume at the next XML whitespace rather than reading through it.
+            while (i < tag.length && !is_xml_whitespace(tag.charCodeAt(i))) i++;
+            continue;
+        }
+        const value_start = i + 1;
+        if (
+            name_end - name_start === attr.length
+            && tag.startsWith(attr, name_start)
+        ) return value_start;
+        const value_end = tag.indexOf(quote, value_start);
+        if (value_end === -1) return -1;
+        i = value_end + 1;
+    }
+    return -1;
+}
+
+/** Read one exact attribute name from an opening tag.
+ *
+ * This is a lexer rather than a regular expression so attribute-shaped text
+ * inside a quoted value cannot be mistaken for markup. XML permits either
+ * quote form and XML whitespace around `=`, all of which are accepted here.
+ */
 export function get_attr(tag: string, attr: string): string | null {
-    // Both quote forms: XML 1.0 §3.1 allows either, and a writer that emits
-    // single quotes produces a perfectly legal part. Reading only one form
-    // made such an attribute invisible — benign in a reader that then skips
-    // the element, but silently destructive in a writer that rebuilds a
-    // section from what it could see.
-    const re = new RegExp(`\\b${attr}=(?:"([^"]*)"|'([^']*)')`, '');
-    const m = tag.match(re);
-    if (!m) return null;
-    return decode_xml(m[1] ?? m[2] ?? '');
+    const start = attr_value_start(tag, attr);
+    if (start === -1) return null;
+    const end = tag.indexOf(tag[start - 1], start);
+    return end === -1 ? null : decode_xml(tag.slice(start, end));
+}
+
+/** Replace one exact attribute's raw value while preserving its quote and spacing. */
+export function replace_attr_value(tag: string, attr: string, value: string): string {
+    const start = attr_value_start(tag, attr);
+    if (start === -1) return tag;
+    const end = tag.indexOf(tag[start - 1], start);
+    return end === -1 ? tag : tag.slice(0, start) + value + tag.slice(end);
+}
+
+/** Remove one exact attribute and the XML whitespace that introduces it. */
+export function remove_attr(tag: string, attr: string): string {
+    const value_start = attr_value_start(tag, attr);
+    if (value_start === -1) return tag;
+    const value_end = tag.indexOf(tag[value_start - 1], value_start);
+    if (value_end === -1) return tag;
+
+    let before_name = value_start - 2;
+    while (before_name >= 0 && is_xml_whitespace(tag.charCodeAt(before_name))) before_name--;
+    if (tag.charCodeAt(before_name) !== 0x3d) return tag; // `=`
+    before_name--;
+    while (before_name >= 0 && is_xml_whitespace(tag.charCodeAt(before_name))) before_name--;
+
+    let start = before_name - attr.length + 1;
+    while (start > 0 && is_xml_whitespace(tag.charCodeAt(start - 1))) start--;
+    return tag.slice(0, start) + tag.slice(value_end + 1);
 }
 
 /** Find the index of '>' that closes an opening tag, skipping '>' inside quoted attribute values. Returns -1 if not found. */
