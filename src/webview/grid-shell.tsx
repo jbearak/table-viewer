@@ -1217,7 +1217,12 @@ export function GridShell({
             rows: CompactSelection.empty(),
             current: { cell, range, rangeStack: [] },
         });
-        grid_ref.current?.scrollTo(cell[0], cell[1]);
+        // A replay should lead the eye to the start of an oversized cell. Glide's
+        // default nearest-edge reveal can otherwise show its right edge and leave
+        // the value offscreen; fitting cells retain ordinary nearest-edge behavior.
+        grid_ref.current?.scrollTo(cell[0], cell[1], 'both', 0, 0, {
+            hAlign: 'start-if-oversized',
+        });
         focus_grid();
 
         clear_history_flash();

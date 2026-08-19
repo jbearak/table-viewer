@@ -669,7 +669,7 @@ type ScrollToFn = (
     paddingX?: number,
     paddingY?: number,
     options?: {
-        hAlign?: "start" | "center" | "end";
+        hAlign?: "start" | "center" | "end" | "start-if-oversized";
         vAlign?: "start" | "center" | "end";
     }
 ) => void;
@@ -1628,6 +1628,10 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
 
                         const minx = targetRect.width + paddingX * 2;
                         switch (options?.hAlign) {
+                            case "start-if-oversized":
+                                if (minx <= sRight - sLeft) break;
+                                sRight = sLeft + minx;
+                                break;
                             case "start":
                                 sRight = sLeft + minx;
                                 break;

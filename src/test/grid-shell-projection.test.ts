@@ -3680,7 +3680,14 @@ describe('the cursor and flash an undo leaves behind', () => {
             };
             expect(selection.current?.cell).toEqual([1, 4]);
             expect(selection.current?.range).toEqual({ x: 1, y: 4, width: 2, height: 2 });
-            expect(grid_mock.scroll_to).toHaveBeenCalledWith(1, 4);
+            expect(grid_mock.scroll_to).toHaveBeenCalledWith(
+                1,
+                4,
+                'both',
+                0,
+                0,
+                { hAlign: 'start-if-oversized' },
+            );
             expect(on_applied).toHaveBeenCalledWith(1, expect.objectContaining({ kind: 'applied' }));
 
             // Every cell of the region, and only those: the flash outranks whatever
