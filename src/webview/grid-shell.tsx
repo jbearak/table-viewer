@@ -911,12 +911,14 @@ export function GridShell({
         && !highlight_in_flight
         && !close_barrier_active;
     // Edit callbacks can outlive the render that supplied them. Read admission
-    // through a render-current ref so a queued overlay finish cannot commit just
-    // because its callback closed over the previous editable state.
+    // through refs updated only by the committed tree: mutating them during render
+    // would let an abandoned concurrent render change the mounted callbacks' view.
     const editable_cells_ref = useRef(editable_cells);
-    editable_cells_ref.current = editable_cells;
     const edit_session_id_ref = useRef(edit_session_id);
-    edit_session_id_ref.current = edit_session_id;
+    useLayoutEffect(() => {
+        editable_cells_ref.current = editable_cells;
+        edit_session_id_ref.current = edit_session_id;
+    }, [editable_cells, edit_session_id]);
 
     useEffect(() => {
         if (
