@@ -97,6 +97,20 @@ describe('toolbar toggle colors', () => {
         expect(hover_rule).toMatch(/opacity:\s*0\.45/);
     });
 
+    it('removes the active fill from disabled split toggles', () => {
+        const disabled_rule = /\.toolbar-split\.active\.disabled\s*\{([^}]*)\}/
+            .exec(get_webview_css())?.[1];
+        expect(disabled_rule).toBeDefined();
+        expect(disabled_rule).toMatch(/background:\s*transparent/);
+        expect(disabled_rule).toMatch(/--vscode-panel-border/);
+
+        const caret_rule = /\.toolbar-split\.active\.disabled \.toolbar-split-caret\s*\{([^}]*)\}/
+            .exec(get_webview_css())?.[1];
+        expect(caret_rule).toBeDefined();
+        expect(caret_rule).toMatch(/--vscode-disabledForeground/);
+        expect(caret_rule).toMatch(/opacity:\s*0\.45/);
+    });
+
     it('paints the scope divider as a 1px rule despite its spacing', () => {
         // The rule carries breathing room on top of the action row's gap so it reads
         // as a boundary rather than one more crowded item. That room is padding, so
@@ -414,6 +428,10 @@ describe('Toolbar', () => {
             excel_header_status: 'Updating column names…',
             excel_header_disabled: true,
             excel_header_disabled_reason: 'Updating column names…',
+            excel_header_scope_menu: {
+                aria_label: 'Header row scope',
+                items: [],
+            },
             on_toggle_excel_header,
         });
 
@@ -423,6 +441,7 @@ describe('Toolbar', () => {
         expect(button.disabled).toBe(false);
         expect(button.getAttribute('aria-disabled')).toBe('true');
         expect(button.getAttribute('aria-pressed')).toBe('true');
+        expect(button.closest('.toolbar-split')?.classList.contains('disabled')).toBe(true);
         act(() => button.click());
         expect(on_toggle_excel_header).not.toHaveBeenCalled();
         expect(document.querySelector('[role="status"]')?.textContent)

@@ -446,7 +446,7 @@ function ToolbarButton({
             <span
                 ref={split_ref}
                 className={scope_menu
-                    ? `toolbar-split ${active ? 'active' : ''}`.trim()
+                    ? `toolbar-split ${active ? 'active' : ''} ${disabled ? 'disabled' : ''}`.trim()
                     : undefined}
             >
                 <button
