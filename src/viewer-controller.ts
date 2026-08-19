@@ -5,7 +5,6 @@ import { CsvDataSource } from './data-source/csv-source';
 import { ExcelHeaderDataSource } from './data-source/excel-header-source';
 import type {
     DataSource,
-    RenderedCell,
     SheetMeta,
     WorkbookMeta,
 } from './data-source/interface';
@@ -36,11 +35,13 @@ import {
     FileSizeLimitExceededError,
     MAX_CSV_ROWS,
 } from './spreadsheet-safety';
-import { serialize_csv } from './serialize-csv';
+import { prepare_csv_serializer } from './serialize-csv';
 import { write_xlsx_workbook_cell_edits } from './xlsx-package';
 import type { XlsxCellEdit } from './xlsx-cell-write';
 import { validate_dirty_bases } from './csv-base-validation';
 import { cell_edit_base } from './cell-edit-model';
+import { get_raw_cell_text } from './cell-display';
+import { cell_key, parse_cell_key } from './cell-key';
 import type { CellHyperlink, RichText } from './cell-content';
 import type { XlsxHyperlinkEdit } from './xlsx-hyperlink-write';
 import type {
@@ -515,6 +516,21 @@ function excel_hidden_rows_for_source(
     });
 }
 
+function group_cell_keys_by_source_row(
+    keys: Iterable<string>,
+): Map<number, number[]> {
+    const columns_by_source_row = new Map<number, number[]>();
+    for (const key of keys) {
+        const coordinates = parse_cell_key(key);
+        if (!coordinates) continue;
+        const { sourceRow: source_row, sourceColumn: column } = coordinates;
+        const columns = columns_by_source_row.get(source_row);
+        if (columns) columns.push(column);
+        else columns_by_source_row.set(source_row, [column]);
+    }
+    return columns_by_source_row;
+}
+
 /**
  * Read the current value of each wanted `row:col`, keyed by *source* row.
  *
@@ -551,14 +567,7 @@ function harvest_source_bases(
     // Group by SOURCE row first, so each distinct row is projected once. A wide
     // edit or replay names many columns of one row, and projecting per key would
     // re-walk the source's row mapping once per column for no new information.
-    const cols_by_source_row = new Map<number, number[]>();
-    for (const key of wanted_bases) {
-        const [source_row, col] = key.split(':').map(Number);
-        if (!Number.isInteger(source_row) || !Number.isInteger(col)) continue;
-        const cols = cols_by_source_row.get(source_row);
-        if (cols) cols.push(col);
-        else cols_by_source_row.set(source_row, [col]);
-    }
+    const cols_by_source_row = group_cell_keys_by_source_row(wanted_bases);
     const by_projected_row = new Map<number, { source_row: number; cols: number[] }>();
     for (const [source_row, cols] of cols_by_source_row) {
         const projected = projected_row_for_source(src, sheet_index, source_row);
@@ -582,7 +591,7 @@ function harvest_source_bases(
                 const cell_key = `${entry.source_row}:${col}`;
                 observed_bases.set(
                     cell_key,
-                    cell === null ? '' : String(cell.raw ?? ''),
+                    get_raw_cell_text(cell?.raw ?? null),
                 );
                 if (cell !== null) {
                     const rich = cell_edit_base(cell).rich;
@@ -779,73 +788,125 @@ export function build_csv_source(
     });
 }
 
+type CsvTextEncoder = Pick<TextEncoder, 'encode'>;
+
+function concatenate_csv_chunks(chunks: readonly Uint8Array[]): Uint8Array {
+    if (chunks.length === 0) return new Uint8Array();
+    if (chunks.length === 1) return chunks[0];
+    const concatenated = Buffer.concat(chunks);
+    return new Uint8Array(
+        concatenated.buffer,
+        concatenated.byteOffset,
+        concatenated.byteLength,
+    );
+}
+
+function fixed_csv_bytes_producer(bytes: Uint8Array): SavePlan['produce'] {
+    return () => bytes;
+}
+
 /**
- * Harvest conflict bases and re-serialize the whole file, in one traversal.
+ * Harvest conflict bases and prepare the complete output bytes in one traversal.
  *
  * The walk visits every row (a million is a real case), so the base harvest
- * rides along with the serialization rather than making a second pass.
+ * rides along with serialization rather than making a second pass. Each source
+ * window is serialized and encoded before the next is read; only encoded chunks
+ * survive the loop, and they are copied once into the final write buffer.
  */
-export function plan_csv_save(input: SavePlanInput): SavePlan {
+export function plan_csv_save(
+    input: SavePlanInput,
+    encoder: CsvTextEncoder = new TextEncoder(),
+): SavePlan {
     if (input.worksheets.length !== 1 || input.worksheets[0].sheet_index !== 0) {
         throw new Error('CSV saves require exactly one worksheet payload.');
     }
     const { source: src } = input;
     const { edits, wanted_bases } = input.worksheets[0];
-    const observed_bases = new Map<string, string>();
-    const wanted_columns = new Map<number, number[]>();
-    for (const key of wanted_bases) {
-        const [source_row, col] = key.split(':').map(Number);
-        const columns = wanted_columns.get(source_row);
-        if (columns) columns.push(col);
-        else wanted_columns.set(source_row, [col]);
-    }
-    const wants_bases = wanted_columns.size > 0;
+    const sheet = src.meta().sheets[0];
+    if (!sheet) throw new Error('CSV source has no worksheet.');
 
-    const row_count = src.meta().sheets[0].rowCount;
-    function* row_windows(): Generator<(RenderedCell | null)[]> {
-        let absolute_row = 0;
-        for (let start = 0; start < row_count; start += SAVE_WINDOW) {
-            const { rows } = src.read_rows(0, start, SAVE_WINDOW);
-            for (const row of rows) {
-                // `wants_bases` short-circuits the per-row Map probe. The walk
-                // visits every row of the file but the map is empty whenever
-                // there is nothing to harvest, so without this a save with no
-                // dirty edits pays a million lookups for no possible hit.
-                const columns = wants_bases
-                    ? wanted_columns.get(absolute_row)
-                    : undefined;
+    // A renderer can only edit columns exposed by the source snapshot. Reject a
+    // forged in-range row with an enormous column before it can widen a record
+    // into billions of fields. Rows beyond the snapshot are left for the normal
+    // removed-row validation so the user still receives that specific outcome.
+    const assert_valid_key = (key: string) => {
+        const coordinates = parse_cell_key(key);
+        if (!coordinates) throw new Error('CSV save contains an invalid cell key.');
+        if (
+            coordinates.sourceRow < sheet.sourceRowCount
+            && coordinates.sourceColumn >= sheet.columnCount
+        ) {
+            throw new RangeError('CSV save contains a column outside the worksheet.');
+        }
+    };
+    for (const key in edits) {
+        if (Object.prototype.hasOwnProperty.call(edits, key)) assert_valid_key(key);
+    }
+    for (const key of wanted_bases) assert_valid_key(key);
+
+    const observed_bases = new Map<string, string>();
+    const wanted_columns = group_cell_keys_by_source_row(wanted_bases);
+    const wants_bases = wanted_columns.size > 0;
+    const serializer = prepare_csv_serializer({
+        delimiter: get_delimiter(input.file_path),
+        edits,
+        originalColumnCounts: src.originalColumnCounts,
+        lineEnding: src.lineEnding,
+        headerLine: src.headerLine,
+    });
+    const chunks: Uint8Array[] = [];
+    let pending_prefix = serializer.headerPrefix;
+
+    const row_count = sheet.rowCount;
+    let start = 0;
+    while (start < row_count) {
+        const window = src.read_rows(0, start, SAVE_WINDOW);
+        if (
+            window.startRow !== start
+            || window.rows.length === 0
+            || window.rows.length > SAVE_WINDOW
+            || start + window.rows.length > row_count
+        ) {
+            throw new Error('CSV source returned an invalid row window.');
+        }
+
+        function* rows_with_observed_bases() {
+            for (let offset = 0; offset < window.rows.length; offset += 1) {
+                const absolute_row = start + offset;
+                const row = window.rows[offset];
+                const columns = wanted_columns.get(absolute_row);
                 if (columns) {
-                    for (const col of columns) {
-                        // A column past this row's field count is left
-                        // unrecorded, so the reader reports `undefined` and
-                        // validate_dirty_bases coalesces it to '' — matching the
-                        // webview's get_cell_raw, where a loaded blank cell is ''.
-                        const cell = row[col];
+                    for (const column of columns) {
+                        // A column past this row's field count is left unrecorded,
+                        // so validate_dirty_bases coalesces it to ''.
+                        const cell = row[column];
                         if (cell === undefined) continue;
                         observed_bases.set(
-                            `${absolute_row}:${col}`,
-                            cell === null ? '' : String(cell.raw ?? ''),
+                            cell_key(absolute_row, column),
+                            get_raw_cell_text(cell?.raw ?? null),
                         );
                     }
                 }
-                absolute_row++;
                 yield row;
             }
         }
+        const rows = wants_bases ? rows_with_observed_bases() : window.rows;
+        const text = pending_prefix + serializer.serialize_rows(rows, start);
+        pending_prefix = '';
+        if (text.length > 0) chunks.push(encoder.encode(text));
+        start += window.rows.length;
     }
-    // Serialized eagerly, not inside `produce`: the harvest is a side effect of
-    // this walk, and the caller reads `observed_bases` to decide whether the
-    // save may proceed at all.
-    const content = serialize_csv(
-        row_windows(),
-        get_delimiter(input.file_path),
-        edits,
-        src.originalColumnCounts,
-        src.lineEnding,
-        src.headerLine,
-    );
-    const bytes = new TextEncoder().encode(content);
-    return { observed_bases: [observed_bases], produce: () => bytes };
+    if (pending_prefix.length > 0) chunks.push(encoder.encode(pending_prefix));
+
+    // Eager rather than inside `produce`: the caller reads `observed_bases`
+    // immediately and allocation failures remain planning failures. Build the
+    // producer in a separate scope so it retains only the final bytes, never the
+    // chunk array or source windows used to assemble them.
+    const bytes = concatenate_csv_chunks(chunks);
+    return {
+        observed_bases: [observed_bases],
+        produce: fixed_csv_bytes_producer(bytes),
+    };
 }
 
 export function csv_source_builder(config?: ConfigPort): ViewerProfile['build_source'] {

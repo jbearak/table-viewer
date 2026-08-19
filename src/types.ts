@@ -1744,7 +1744,13 @@ export function sanitized_wire_save_maps(
 ): Pick<CsvSaveWorksheetOperation, 'edits' | 'dirtyEdits'> | undefined {
     const edits = sanitized_wire_string_record(edits_value);
     const dirty_edits = sanitized_wire_dirty_map(dirty_edits_value);
-    if (!edits || !dirty_edits || !save_maps_agree(edits, dirty_edits)) {
+    if (
+        !edits
+        || !dirty_edits
+        || Object.keys(edits).some((key) => !is_canonical_cell_key(key))
+        || Object.keys(dirty_edits).some((key) => !is_canonical_cell_key(key))
+        || !save_maps_agree(edits, dirty_edits)
+    ) {
         return undefined;
     }
     return Object.freeze({ edits, dirtyEdits: dirty_edits });

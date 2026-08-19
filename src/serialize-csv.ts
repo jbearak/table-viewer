@@ -1,15 +1,106 @@
+import { parse_cell_key } from './cell-key';
+import { get_raw_cell_text } from './cell-display';
 import type { CellData } from './types';
 
+export interface CsvSerializationOptions {
+    readonly delimiter: ',' | '\t';
+    readonly edits?: Readonly<Record<string, string>>;
+    readonly originalColumnCounts?: readonly number[];
+    readonly lineEnding?: '\r\n' | '\r' | '\n';
+    readonly headerLine?: string;
+}
+
+export interface PreparedCsvSerializer {
+    /** Complete promoted-header contribution, including its row terminator. */
+    readonly headerPrefix: string;
+    /** Serialize data rows using their absolute, header-excluded source offset. */
+    serialize_rows(
+        rows: Iterable<readonly (CellData | null)[]>,
+        start_row: number,
+    ): string;
+}
+
 /**
- * Serialize rows to CSV/TSV text.
+ * Prepare the row-local CSV/TSV rules shared by whole-document and windowed
+ * serialization. Edit metadata is indexed once for the complete save; callers
+ * can then serialize independent source windows without resetting absolute row
+ * identity or rescanning every edit for every window.
+ */
+export function prepare_csv_serializer(
+    options: CsvSerializationOptions,
+): PreparedCsvSerializer {
+    const {
+        delimiter,
+        edits,
+        originalColumnCounts: original_column_counts,
+        lineEnding: line_ending = '\n',
+        headerLine: header_line,
+    } = options;
+
+    // Retain only one numeric maximum per edited row. The edit record already
+    // owns every value; duplicating it into one nested Map per row makes a
+    // million-row paste consume hundreds of megabytes before serialization.
+    let max_edit_column_by_row: Map<number, number> | undefined;
+    if (edits) {
+        for (const key in edits) {
+            if (!Object.prototype.hasOwnProperty.call(edits, key)) continue;
+            const coordinates = parse_cell_key(key);
+            if (!coordinates) continue;
+            const { sourceRow: row, sourceColumn: column } = coordinates;
+            const current = max_edit_column_by_row?.get(row);
+            if (current === undefined || column > current) {
+                (max_edit_column_by_row ??= new Map()).set(row, column);
+            }
+        }
+    }
+
+    const serialize_row = (r: number, row: readonly (CellData | null)[]): string => {
+        const fields: string[] = [];
+        let col_count = original_column_counts?.[r] ?? row.length;
+        const max_edit_column = max_edit_column_by_row?.get(r);
+        if (max_edit_column !== undefined && max_edit_column >= col_count) {
+            col_count = max_edit_column + 1;
+        }
+        for (let c = 0; c < col_count; c++) {
+            const key = `${r}:${c}`;
+            const value = edits && Object.prototype.hasOwnProperty.call(edits, key)
+                ? edits[key]
+                : get_raw_cell_text(row[c]?.raw ?? null);
+            fields.push(quote_field(value, delimiter));
+        }
+        return fields.join(delimiter);
+    };
+
+    return Object.freeze({
+        // `undefined` means no header was consumed; '' is a real blank header
+        // whose complete contribution is one line terminator.
+        headerPrefix: header_line === undefined
+            ? ''
+            : header_line + line_ending,
+        serialize_rows(
+            rows: Iterable<readonly (CellData | null)[]>,
+            start_row: number,
+        ): string {
+            const lines: string[] = [];
+            let absolute_row = start_row;
+            for (const row of rows) {
+                lines.push(serialize_row(absolute_row, row));
+                absolute_row += 1;
+            }
+            // Every emitted record owns its terminator. Independently serialized
+            // contiguous windows therefore concatenate without a boundary separator.
+            return lines.length === 0 ? '' : lines.join(line_ending) + line_ending;
+        },
+    });
+}
+
+/**
+ * Serialize rows to one CSV/TSV string.
  *
- * `rows` is an `Iterable` of rows rather than a materialized 2-D array so the
- * CSV save path can stream windows from the data source (one window's cell
- * objects become GC-eligible after it is serialized) without ever holding the
- * whole sheet in memory. Arrays are themselves iterable, so callers that pass a
- * full `(CellData | null)[][]` keep working unchanged. The absolute row index is
- * tracked manually as we iterate, since `edits` and `original_column_counts` are
- * both keyed/indexed by absolute row number.
+ * This remains the small-input compatibility API and the byte-parity oracle for
+ * tests. The production save path uses {@link prepare_csv_serializer} directly,
+ * serializing and encoding one source window at a time so it never retains this
+ * document-sized string.
  *
  * An edit keyed past the last source row is **dropped**, not appended. Under
  * source-keyed edit identity a stale edit at row 90,000 in a file that shrank to
@@ -31,55 +122,14 @@ export function serialize_csv(
     line_ending: '\r\n' | '\r' | '\n' = '\n',
     header_line?: string,
 ): string {
-    const lines: string[] = [];
-
-    // Precompute per-row max edited column so the inner loop is O(1). Column
-    // growth *is* a supported feature (an edit beyond a row's original field
-    // count widens that row); row growth is not — see the header comment.
-    let max_edit_col: Map<number, number> | undefined;
-    if (edits) {
-        max_edit_col = new Map();
-        for (const key of Object.keys(edits)) {
-            const [er, ec] = key.split(':').map(Number);
-            const cur = max_edit_col.get(er);
-            if (cur === undefined || ec > cur) max_edit_col.set(er, ec);
-        }
-    }
-
-    const serialize_row = (r: number, row: (CellData | null)[]): string => {
-        const fields: string[] = [];
-        let col_count = original_column_counts?.[r] ?? row.length;
-        // Extend if any edit targets a column beyond original count
-        const max_ec = max_edit_col?.get(r);
-        if (max_ec !== undefined && max_ec >= col_count) {
-            col_count = max_ec + 1;
-        }
-        for (let c = 0; c < col_count; c++) {
-            const key = `${r}:${c}`;
-            let value: string;
-            if (edits && key in edits) {
-                value = edits[key];
-            } else {
-                const cell = row[c];
-                value = cell !== null && cell !== undefined ? String(cell.raw ?? '') : '';
-            }
-            fields.push(quote_field(value, delimiter));
-        }
-        return fields.join(delimiter);
-    };
-
-    let r = 0;
-    for (const row of rows) {
-        lines.push(serialize_row(r, row));
-        r++;
-    }
-
-    // A logically empty sheet serializes to empty output, not a lone terminator.
-    const body = lines.length === 0 ? '' : lines.join(line_ending) + line_ending;
-    // When the source consumed row 0 as the column header, the grid's data rows
-    // exclude it; re-prepend it verbatim so the saved file keeps its header. A
-    // header-only file (empty body) still re-emits the lone header line.
-    return header_line === undefined ? body : header_line + line_ending + body;
+    const serializer = prepare_csv_serializer({
+        delimiter,
+        edits,
+        originalColumnCounts: original_column_counts,
+        lineEnding: line_ending,
+        headerLine: header_line,
+    });
+    return serializer.headerPrefix + serializer.serialize_rows(rows, 0);
 }
 
 function quote_field(value: string, delimiter: string): string {

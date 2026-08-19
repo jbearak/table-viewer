@@ -98,6 +98,8 @@ describe('validate_dirty_bases', () => {
         ['a negative row', '-1:0'],
         ['a negative column', '0:-1'],
         ['a fractional row', '1.5:0'],
+        ['a leading-zero alias', '01:0'],
+        ['an unsafe integer', '9007199254740993:0'],
     ])('rejects %s as a removed row', (_label, key) => {
         const outcome = validate_dirty_bases(
             edits({ [key]: { value: 'X', base: 'a' } }),

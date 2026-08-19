@@ -194,8 +194,9 @@ describe('CSV reload races', () => {
         expect(warning).toHaveBeenCalledTimes(2);
     });
 
-    it('saves a file admitted through Open Anyway', async () => {
+    it('saves output above the threshold after the file is admitted through Open Anyway', async () => {
         const bytes = enc.encode('h\na\n');
+        const saved = 'x'.repeat(1024 * 1024);
         const writes: Uint8Array[] = [];
         vscode_mock.__setConfigurationValue('tableViewer.maxFileSizeMiB', 1);
         vscode_mock.__setStatImplementation(async () => ({
@@ -212,10 +213,13 @@ describe('CSV reload races', () => {
 
         await panel.__receive({ type: 'ready' });
         await panel.__receive({ type: 'requestEditSession' });
-        await panel.__receive({ type: 'saveCsv', edits: { '0:0': 'saved' } });
+        await panel.__receive({ type: 'saveCsv', edits: { '0:0': saved } });
 
         expect(writes).toHaveLength(1);
-        expect(new TextDecoder().decode(writes[0])).toBe('h\nsaved\n');
+        expect(writes[0].byteLength).toBe(saved.length + 3);
+        expect(writes[0].subarray(0, 2)).toEqual(enc.encode('h\n'));
+        expect(writes[0].at(-1)).toBe(0x0a);
+        expect(writes[0].subarray(2, -1).every(byte => byte === 0x78)).toBe(true);
         expect(panel.__messages).toContainEqual(expect.objectContaining({
             type: 'saveResult',
             success: true,
