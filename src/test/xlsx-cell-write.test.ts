@@ -840,6 +840,14 @@ describe('apply_cell_edits', () => {
         }
     });
 
+    it('treats a prefixed r attribute as a missing cell reference', () => {
+        expect(() => apply_cell_edits(
+            doc('<row r="1"><c vendor:r="A1"><v>1</v></c></row>'),
+            [{ row: 0, col: 0, value: '2' }],
+            OPTS,
+        )).toThrow(/cannot\s+edit\s+safely/i);
+    });
+
     it('refuses markup-compatibility alternate content', () => {
         // Both branches spell row 1 / A1, and which one a reader believes depends
         // on whether it understands `Requires`. The scans are flat coordinate maps,
@@ -1185,6 +1193,15 @@ describe('widen_dimension', () => {
     it('widens to cover newly written cells', () => {
         const out = widen_dimension('<x><dimension ref="A1:B2"/></x>', 5, 4, 5, 4);
         expect(out).toContain('ref="A1:E6"');
+    });
+
+    it('replaces the exact ref while preserving its quote and spacing', () => {
+        const out = widen_dimension(
+            '<x><dimension vendor:ref="Z99" ref = \'C3:D4\'/></x>',
+            0, 0, 5, 4,
+        );
+        expect(out).toContain('vendor:ref="Z99"');
+        expect(out).toContain("ref = 'A1:E6'");
     });
 
     it('never shrinks an existing extent', () => {

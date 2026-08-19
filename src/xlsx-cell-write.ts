@@ -1,9 +1,12 @@
 import {
     find_tag_end,
+    get_attr,
     ignorable_end,
     ignorable_ranges,
     is_tag_boundary,
     is_self_closing,
+    remove_attr,
+    replace_attr_value,
     strip_illegal_xml_chars,
 } from './ooxml-xml';
 import {
@@ -484,7 +487,7 @@ export function element_content(xml: string, name: string): string | null {
  */
 type GroupedFormulaKind = 'shared' | 'array' | 'dataTable';
 
-function is_grouped_formula_kind(value: string | undefined): value is GroupedFormulaKind {
+function is_grouped_formula_kind(value: string | null): value is GroupedFormulaKind {
     return value === 'shared' || value === 'array' || value === 'dataTable';
 }
 
@@ -496,6 +499,10 @@ interface GroupedRange {
     readonly end_row: number;
     readonly end_col: number;
 }
+
+const ROW_NUMBER_RE = /^\d+$/;
+const CELL_REFERENCE_RE = /^([A-Z]+)(\d+)$/;
+const CELL_RANGE_RE = /^([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?$/;
 
 /**
  * The `ref` range of every shared/array formula on the sheet.
@@ -518,10 +525,9 @@ function grouped_formula_ranges(xml: string): GroupedRange[] {
     // and treating it as a live range refuses an edit to a cell that is not in one.
     const ignorable = ignorable_ranges(xml, 0, xml.length);
     for (const [, tag] of live_tags(xml, 'f', 0, xml.length, ignorable)) {
-        const type = /\bt="([^"]*)"/.exec(tag);
-        const kind = type?.[1];
+        const kind = get_attr(tag, 't');
         if (!is_grouped_formula_kind(kind)) continue;
-        const ref = /\bref="([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?"/.exec(tag);
+        const ref = get_attr(tag, 'ref')?.match(CELL_RANGE_RE);
         if (!ref) continue;
         const start_col = letter_to_index(ref[1]);
         const start_row = Number(ref[2]) - 1;
@@ -582,8 +588,8 @@ function grouped_formula_kind(cell_inner: string): GroupedFormulaKind | null {
     // ordinary cell refused a literal edit that was never part of a group.
     const ignorable = ignorable_ranges(cell_inner, 0, cell_inner.length);
     for (const [, tag] of live_tags(cell_inner, 'f', 0, cell_inner.length, ignorable)) {
-        const type = /\bt="([^"]*)"/.exec(tag);
-        return is_grouped_formula_kind(type?.[1]) ? type![1] as GroupedFormulaKind : null;
+        const kind = get_attr(tag, 't');
+        return is_grouped_formula_kind(kind) ? kind : null;
     }
     return null;
 }
@@ -633,9 +639,9 @@ function merged_follower_ranges(xml: string): GroupedRange[] {
         if (!is_tag_boundary(inner[at + '<mergeCell'.length])) { pos = at + 1; continue; }
         const cell_end = find_tag_end(inner, at);
         if (cell_end === -1) break;
-        const m = /\bref="([A-Z]+)(\d+):([A-Z]+)(\d+)"/.exec(inner.slice(at, cell_end + 1));
+        const m = get_attr(inner.slice(at, cell_end + 1), 'ref')?.match(CELL_RANGE_RE);
         pos = cell_end + 1;
-        if (!m) continue;
+        if (!m || m[3] === undefined || m[4] === undefined) continue;
         const start_row = Number(m[2]) - 1;
         const end_row = Number(m[4]) - 1;
         const start_col = letter_to_index(m[1]);
@@ -692,9 +698,9 @@ function cell_reference(row: number, col: number): string {
  * side that renders the result is.
  */
 function existing_style(open_tag: string): number | null {
-    const m = /\bs="\s*([+-]?\d+)/.exec(open_tag);
-    if (!m) return null;
-    const parsed = Number(m[1]);
+    const value = get_attr(open_tag, 's');
+    if (value === null) return null;
+    const parsed = parseInt(value, 10);
     // `parseInt` yields a negative for `s="-1"`; no such style exists, and the
     // reader's own `get_style` falls back for an out-of-range index.
     return parsed >= 0 ? parsed : null;
@@ -864,14 +870,14 @@ function assert_writable_sheet_data(xml: string, from: number, to: number): void
     for (const [at, tag] of tags) {
         if (!live(at)) continue;
         if (tag.startsWith('<row')) {
-            const r = /\br="(\d+)"/.exec(tag);
+            const r = get_attr(tag, 'r');
             // Absent `r` is legal and the reader infers it from the first cell, so
             // there is nothing to disagree with — see `row_index_from_first_cell`.
-            containing_row = r ? Number(r[1]) : undefined;
+            containing_row = r !== null && ROW_NUMBER_RE.test(r) ? Number(r) : undefined;
             continue;
         }
         if (!tag.startsWith('<c') || containing_row === undefined) continue;
-        const ref = /\br="([A-Z]+)(\d+)"/.exec(tag);
+        const ref = get_attr(tag, 'r')?.match(CELL_REFERENCE_RE);
         if (ref && Number(ref[2]) !== containing_row) {
             unsupported('cells whose reference disagrees with the row holding them');
         }
@@ -900,7 +906,7 @@ function assert_writable_sheet_data(xml: string, from: number, to: number): void
         if (/\s(?:r|s|t|ref)="[^"]*&/.test(attrs)) {
             unsupported('cell references written with XML entities');
         }
-        if (tag.startsWith('<c') && !/\br="/.test(tag)) {
+        if (tag.startsWith('<c') && get_attr(tag, 'r') === null) {
             unsupported('cells whose position is implied rather than written');
         }
         // A prefix is not the only way to move an element out of SpreadsheetML: a
@@ -920,13 +926,13 @@ function assert_writable_sheet_data(xml: string, from: number, to: number): void
         // the reader displays perfectly well, with a message that was simply untrue
         // — the namespace had not changed. A `<c>` spliced under such a row lands in
         // exactly the namespace it would have had anyway.
-        const declared = /\sxmlns="([^"]*)"/.exec(attrs);
-        if (declared && declared[1] !== SPREADSHEETML_NS) {
+        const declared = get_attr(tag, 'xmlns');
+        if (declared !== null && declared !== SPREADSHEETML_NS) {
             unsupported('worksheet elements in a different XML namespace');
         }
-        // A single-quoted or entity-bearing spelling is not read here, so it fails
-        // closed rather than being assumed harmless.
-        if (!declared && /\sxmlns=/.test(attrs)) {
+        // Any malformed declaration the shared attribute lexer cannot read still
+        // fails closed rather than being assumed harmless.
+        if (declared === null && /\sxmlns=/.test(attrs)) {
             unsupported('worksheet elements in a different XML namespace');
         }
     }
@@ -1152,6 +1158,7 @@ export function apply_cell_edits(
                 );
                 if (grouped) throw grouped_formula_error(e.row, e.col, grouped);
                 const xf = existing_style(cell_span.open_tag);
+                const existing_type = get_attr(cell_span.open_tag, 't');
                 splices.push({
                     start: cell_span.start,
                     end: cell_span.end,
@@ -1161,8 +1168,8 @@ export function apply_cell_edits(
                         e,
                         xf,
                         options,
-                        /\bt="b"/.test(cell_span.open_tag),
-                        /\bt="d"/.test(cell_span.open_tag),
+                        existing_type === 'b',
+                        existing_type === 'd',
                     ),
                 });
             } else {
@@ -1186,22 +1193,19 @@ export function apply_cell_edits(
         // Dropped rather than recomputed — the correct value depends on cells this
         // splice does not enumerate, and absent is a legal spelling that means
         // "work it out", while wrong is not.
-        const drop_spans = inserts.length > 0 && / spans="[^"]*"/.test(row_span.open_tag);
+        const drop_spans = inserts.length > 0 && get_attr(row_span.open_tag, 'spans') !== null;
         if (inserts.length > 0 && row_span.inner_start === row_span.end) {
             // `<row r="5" ht="20"/>` — a valid empty row, which is what a row given
             // a height or a format but no cells looks like. There is no `</row>` to
             // insert before, so the element is replaced by a paired one keeping its
             // attributes; computing an offset from `'</row>'.length` here would
             // splice into the middle of the opening tag and emit malformed XML.
-            const attributes = row_span.open_tag.slice(
-                '<row'.length,
-                row_span.open_tag.length - '/>'.length,
-            );
+            const open_tag = drop_spans ? remove_attr(row_span.open_tag, 'spans') : row_span.open_tag;
+            const attributes = open_tag.slice('<row'.length, open_tag.length - '/>'.length);
             splices.push({
                 start: row_span.start,
                 end: row_span.end,
-                text: `<row${drop_spans ? attributes.replace(/ spans="[^"]*"/, '') : attributes}>`
-                    + `${inserts.map((i) => i.text).join('')}</row>`,
+                text: `<row${attributes}>${inserts.map((i) => i.text).join('')}</row>`,
             });
             continue;
         }
@@ -1211,7 +1215,7 @@ export function apply_cell_edits(
             splices.push({
                 start: row_span.start,
                 end: row_span.inner_start,
-                text: row_span.open_tag.replace(/ spans="[^"]*"/, ''),
+                text: remove_attr(row_span.open_tag, 'spans'),
             });
         }
         for (const ins of inserts) {
@@ -1366,7 +1370,7 @@ export function widen_dimension(
     if (found.done) return xml;
     const [start, open_tag] = found.value;
     const tag_end = start + open_tag.length - 1;
-    const m = /\bref="([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?"/.exec(open_tag);
+    const m = get_attr(open_tag, 'ref')?.match(CELL_RANGE_RE);
     if (!m) return xml;
     const cur_start_col = letter_to_index(m[1]);
     const cur_start_row = Number(m[2]) - 1;
@@ -1385,6 +1389,6 @@ export function widen_dimension(
         && end_col === cur_end_col && end_row === cur_end_row
     ) return xml;
     const ref = `${col_index_to_letter(start_col)}${start_row + 1}:${col_index_to_letter(end_col)}${end_row + 1}`;
-    const replaced = open_tag.replace(/\bref="[^"]*"/, `ref="${ref}"`);
+    const replaced = replace_attr_value(open_tag, 'ref', ref);
     return xml.slice(0, start) + replaced + xml.slice(tag_end + 1);
 }
