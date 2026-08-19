@@ -181,6 +181,39 @@ The write path alone adds 334.5 MiB above the read peak. Stage 6's target is the
 headline must not be read as fixing saves; the remaining write-path and CFB costs
 belong to #240.
 
+#### Stage 4 already took a third of it, which was not the plan
+
+Sharing one scan between guard-checking and edit-resolution let the writer drop
+an entire second pass over `<sheetData>` — it had been building a tag array of
+every `<row>`, `<c>` and `<f>` (a million entries on this fixture) and sorting it
+merely to restore document order. Measured on the Stage 1 fixture, three runs:
+
+| Metric | Stage 1 baseline | After Stage 4 | Change |
+|---|---|---|---|
+| `real-full-save` peak RSS | 582.5 MiB | **389.2 MiB** | **−33.2%** |
+| `real-full-save` live heap delta | 57.6 MiB | 0.5 MiB | −99.2% |
+| `real-coordinate-scan` | 554 ms | 519 ms | −6.4% |
+| `real-full-save` time | 2396 ms | ~2700 ms | +12% (gate allows +15%) |
+
+Reproducible to ±0.15 MiB across runs, and confirmed against a same-machine
+re-measurement of pre-Stage-4 `issue153` (579.2 MiB) so it is not drift in the
+baseline file. Two consequences:
+
+- **Stage 3's hot-path regression is repaid.** Coordinate scan went 554 → 584 ms
+  when the attribute lexer landed; it is now 519 ms, better than before either
+  change. The lexer's cost was real but is dominated by removing a whole pass.
+- **Stage 6's gate needs restating, not just rebasing.** It was "≥32 MiB median
+  live-RSS reduction vs a Stage 5 baseline". The 57.2 MiB decode is still there
+  (`live_external_delta_mib` is unchanged at 57.168 — untouched by Stage 4, since
+  it is the decoded string itself), so the target survives; but the *save-peak*
+  headroom Stage 6 was going to claim has partly been taken already. Stage 6
+  should measure against Stage 5 and justify itself on the external delta, which
+  is the number byte offsets actually address.
+
+Worth noting the peak-RSS win came from deleting a redundant traversal, not from
+byte offsets — a reminder that on this path allocation count has been mattering
+more than representation.
+
 Speed is a genuine non-goal here: byte scan 41 ms vs string scan 43 ms —
 equivalent, and the baseline confirms it from the other direction — decode is
 3.4 ms against a 554 ms coordinate scan. Byte offsets buy **memory and
@@ -481,11 +514,78 @@ master carrying `ref`.
   invalid-package errors stay plain `Error`s in this stage. "Assert code, not
   prose" applies to `OoxmlRefusalError`, not to unrelated categories that have no
   code yet.
-- Refusal **precedence** is defined explicitly rather than left to map ordering,
-  since the corpus pins observable codes: prefixed element → `AlternateContent` →
-  structural tags in document order → within a cell, missing before invalid
-  reference → foreign namespace by effective structural context. One deliberately
-  multi-fault case pins it.
+- Refusal **precedence: strict document order — first offending construct wins.**
+  Settled by architecture review, which overturned the category-priority rule this
+  plan previously carried (prefixed element → `AlternateContent` → structural tags
+  → …). That rule was a category-priority scheme wearing document order's clothes,
+  and it would have frozen the current multi-pass implementation into the corpus:
+  a Rust port with a clean streaming tokenizer would have had to emulate the order
+  in which today's TypeScript functions happen to be written.
+
+  The normative rule:
+
+  > Scan the part start to end. Anchor each refusal to the start byte of the
+  > smallest construct that establishes it. The smallest anchor wins. Across
+  > different constructs, the code kind never outweighs byte position.
+
+  Comparison key `(owner_start_byte, intra_construct_rank)`, where the rank breaks
+  ties *within one opening tag only*: unsupported element identity → foreign
+  effective namespace → missing reference → invalid reference. This is not a
+  severity tier across the document; a late prefixed `<x:f>` must lose to an early
+  invalid cell.
+
+  Anchors are the **opening construct**, not the precise bad byte — a missing
+  attribute and a relational contradiction have no unique offending byte, and an
+  `xmlns` applies to the whole element regardless of where in the tag it sits.
+
+  Rejected: **collecting all faults as a set.** It looks like it sidesteps
+  precedence but replaces one ordering rule with a much larger and less obvious
+  contract — whether duplicates collapse, whether one bad cell and fifty produce
+  the same result, whether faults inside `AlternateContent` count, whether a
+  foreign-namespace cell also reports its missing `r`. Those suppression rules are
+  harder for a port to match exactly than a single precedence rule, and a bare set
+  is not even useful to a user: `{invalid-cell-reference}` says neither how many
+  nor where. An *ordered diagnostic list with offsets* would beat one code for a
+  user, but that is a repair/lint surface, not a save refusal — don't let the
+  corpus pin it unless Table Viewer actually ships one.
+
+  **Two premises I had wrong**, both corrected by the review:
+  - Refusal prose is *already* observable, not indistinguishable. The messages
+    share a template but the `what` differs per site, and tests already assert on
+    specific phrases — `/different XML namespace/` (`xlsx-cell-write.test.ts:686`,
+    `:1170`), `/does not end where a parser/` (`:1149`), `/commented-out
+    <sheetData>/` (`:1188`). So order is technically observable today; it is just
+    undocumented and unintentional, which is not a reason to keep it.
+  - Today's precedence is not "whole-range checks, then document order". The
+    row-disagreement guard runs a *complete* pass and can throw from anywhere in
+    the sheet before the per-tag walk begins, so a late row mismatch currently
+    beats an early missing `r`. Another artifact, not a design.
+
+  **Define precedence over the post-deletion refusal set only.** Guards Stage 5
+  deletes must not receive corpus codes — pinning temporary compatibility
+  machinery into a taxonomy the same stage removes is exactly backwards. The
+  lasting surface is five codes: prefixed element, `AlternateContent`, foreign
+  namespace, missing reference, invalid reference. Note "missing before invalid" is
+  vacuous as a *document*-level rule — the two cannot coexist on one cell — it
+  only means something as an intra-tag tie-break.
+
+  **Implementation is cheaper than it sounds:** each existing detector records its
+  earliest candidate instead of throwing, then the minimum key throws. The three
+  whole-range scans need not be folded into the tag walk — prefix and
+  `AlternateContent` already carry `m.index`, and `ignorable_ranges` yields in
+  ascending order. Two real prerequisites, both needed for
+  `invalid-cell-reference` anyway: the scanner must expose the cell's start offset
+  to its callback, and it must stop suppressing unparseable references — today it
+  invokes the callback only when row and column both resolve, so a malformed `r`
+  never reaches a consumer. That wants a tagged `valid(row, col) | missing |
+  invalid` result carrying the offset.
+
+  **Corpus cases to pin** (not just one multi-fault case): early invalid cell vs
+  late prefixed element; early invalid cell vs late `AlternateContent`; ancestor
+  foreign namespace vs descendant missing `r`; one construct carrying both a
+  foreign namespace and a bad `r`; and at least one pair in *reversed* physical
+  order, proving document position changes the primary code. Pin codes only, not
+  offsets.
 - **Keep 4:** namespace-prefixed cell elements, `AlternateContent`, **missing
   `r`**, foreign default namespace.
   - Missing `r` must stay, and I nearly got this wrong: the guard is *not*
