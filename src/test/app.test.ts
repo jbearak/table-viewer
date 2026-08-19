@@ -2025,12 +2025,13 @@ describe('Excel first-row header toggle', () => {
                 { type: 'setExcelFirstRowHeader' }
             > => message.type === 'setExcelFirstRowHeader')!;
 
-        // A newer interaction owns focus before the host answers. The Highlight
-        // dialog survives the grid remount, so the acknowledgement must not leave
-        // it open while moving keyboard control somewhere else.
-        await click_button('Highlight');
-        const focused_swatch = document.activeElement;
-        expect(focused_swatch?.getAttribute('role')).toBe('radio');
+        // A newer interaction owns focus before the host answers. The header
+        // update changes the Columns reset key and closes its dialog, so that
+        // control must restore its own trigger rather than letting the old grid
+        // intent steal focus (or leaving focus on body).
+        await click_button('Columns');
+        expect(document.activeElement)
+            .toBe(document.querySelector('.column-visibility-search'));
         grid_shell_mock.has_grid_focus.mockReturnValue(false);
 
         await dispatch_host_message(refresh_snapshot_message(excel_meta(false, 'off'), {
@@ -2045,8 +2046,8 @@ describe('Excel first-row header toggle', () => {
         }));
         await vi.waitUntil(() => grid_shell_mock.has_grid_focus.mock.calls.length > 0);
 
-        expect(document.querySelector('.highlight-popover')).not.toBeNull();
-        expect(document.activeElement).toBe(focused_swatch);
+        expect(document.querySelector('.column-visibility-popover')).toBeNull();
+        expect(document.activeElement).toBe(columns_trigger());
         expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
     });
 
@@ -2122,6 +2123,19 @@ describe('Excel first-row header toggle', () => {
                 deliveryId: 10,
                 authority: { fileId: 'file:test', revision: 10 },
                 stateRevision: 10,
+                sourceBasis: { physicalRevision: 10, projectionRevision: 0 },
+            },
+        }));
+        // A capability/state-only delivery at the replacement grid's same
+        // generation can land before its delayed focus retry. It advances the
+        // document epoch but must rebase, not clear, the carried intent.
+        await dispatch_host_message(refresh_snapshot_message(excel_meta(true), {
+            generation: 5,
+            sourceGeneration: 8,
+            identity: {
+                deliveryId: 11,
+                authority: { fileId: 'file:test', revision: 11 },
+                stateRevision: 11,
                 sourceBasis: { physicalRevision: 10, projectionRevision: 0 },
             },
         }));

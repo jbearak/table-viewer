@@ -75,8 +75,11 @@ export const ColumnVisibilityControl = forwardRef<
     }, []);
 
     useEffect(() => {
+        const restore_trigger_focus =
+            boundary_ref.current?.contains(document.activeElement) === true;
         set_open(false);
         set_filter('');
+        if (restore_trigger_focus) trigger_ref.current?.focus({ preventScroll: true });
     }, [reset_key]);
 
     useEffect(() => {

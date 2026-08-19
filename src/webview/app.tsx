@@ -1981,8 +1981,7 @@ export function App(): React.JSX.Element {
                     }
                     document_epoch_ref.current += 1;
                     set_grid_focus_restore(
-                        remounts_the_grid
-                            && grid_focus_intent_survived
+                        grid_focus_intent_survived
                             && grid_focus_sheet_for_snapshot === next_active_sheet_index
                             ? {
                                 sheet_index: next_active_sheet_index,
