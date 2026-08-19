@@ -4457,6 +4457,48 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         expect(Element.prototype.scrollTo).toBeCalledWith(0, 15_101);
     });
 
+    test("Imperative scrollTo can prefer the start of an oversized cell", async () => {
+        vi.useFakeTimers();
+        const ref = React.createRef<DataEditorRef>();
+        render(
+            <EventedDataEditor
+                ref={ref}
+                {...basicProps}
+                columns={[
+                    { title: "A", width: 150 },
+                    { title: "B", width: 1200 },
+                ]}
+            />,
+            { wrapper: Context }
+        );
+        prep(false);
+
+        act(() => {
+            ref.current?.scrollTo(1, 0, "both", 0, 0, {
+                hAlign: "start-if-oversized",
+            });
+        });
+
+        expect(Element.prototype.scrollTo).toBeCalledWith(150, 0);
+    });
+
+    test("Imperative oversized-start preference leaves a fitting visible cell in place", async () => {
+        vi.useFakeTimers();
+        const ref = React.createRef<DataEditorRef>();
+        render(<EventedDataEditor ref={ref} {...basicProps} />, {
+            wrapper: Context,
+        });
+        prep(false);
+
+        act(() => {
+            ref.current?.scrollTo(1, 0, "both", 0, 0, {
+                hAlign: "start-if-oversized",
+            });
+        });
+
+        expect(Element.prototype.scrollTo).not.toHaveBeenCalled();
+    });
+
     test("Imperative scrollTo pixel", async () => {
         vi.useFakeTimers();
         const ref = React.createRef<DataEditorRef>();
