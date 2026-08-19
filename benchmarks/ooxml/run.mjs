@@ -186,6 +186,7 @@ async function build_source_bundle() {
             stdin: {
                 contents: [
                     "export { cells_present } from './src/xlsx-cell-write.ts';",
+                    "export { worksheet_scan_input } from './src/ooxml-worksheet-scan.ts';",
                     "export { write_xlsx_cell_edits } from './src/xlsx-package.ts';",
                 ].join('\n'),
                 resolveDir: REPO_ROOT,

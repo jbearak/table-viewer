@@ -11,6 +11,19 @@ const ROW_NUMBER_RE = /^\d+$/;
 const MAX_WORKSHEET_ROWS = 1_048_576;
 const MAX_WORKSHEET_COLUMNS = 16_384;
 
+
+/**
+ * Convert a package worksheet entry into the representation consumed by the
+ * shared scanner. Kept as the production boundary so the benchmark measures
+ * this exact conversion rather than an inline approximation.
+ */
+export function worksheet_scan_input(content: Uint8Array): string {
+    const bytes = Buffer.isBuffer(content)
+        ? content
+        : Buffer.from(content.buffer, content.byteOffset, content.byteLength);
+    return bytes.toString('utf8');
+}
+
 /** How one cell opening tag spells (or omits) its coordinate. */
 export type ScannedCellReference =
     | { readonly kind: 'valid'; readonly row: number; readonly col: number; readonly start: number }

@@ -7,7 +7,7 @@ import {
     widen_dimension,
     type XlsxCellEdit,
 } from './xlsx-cell-write';
-import { live_tags_in } from './ooxml-worksheet-scan';
+import { live_tags_in, worksheet_scan_input } from './ooxml-worksheet-scan';
 import { get_style, is_date_format } from './spreadsheet-format';
 import { decode_xml, get_text, iter_elements } from './ooxml-xml';
 import { font_to_style } from './xlsx-rich-text';
@@ -41,6 +41,11 @@ import {
  * construction — the strongest preservation guarantee available, and the one the
  * `putexcel` requirement actually asks for.
  */
+
+function read_part_bytes(cfb_file: ReturnType<typeof CFB.read>, path: string): Uint8Array | null {
+    const entry = CFB.find(cfb_file, path);
+    return entry?.content ? entry.content as Uint8Array : null;
+}
 
 function read_part_text(cfb_file: ReturnType<typeof CFB.read>, path: string): string | null {
     const entry = CFB.find(cfb_file, path);
@@ -375,8 +380,9 @@ export function write_xlsx_workbook_cell_edits(
         const part = parts[sheetIndex];
         if (!part) throw new Error('Could not locate a worksheet to save');
         const path = `/${part}`;
-        const sheet_xml = read_part_text(cfb_file, path);
-        if (sheet_xml === null) throw new Error('Could not read a worksheet to save');
+        const sheet_content = read_part_bytes(cfb_file, path);
+        if (sheet_content === null) throw new Error('Could not read a worksheet to save');
+        const sheet_xml = worksheet_scan_input(sheet_content);
 
         // A `<hyperlink display="…">` about to be cleared may be the only place
         // the cell's visible text lives — parse-xlsx falls back to `display` for

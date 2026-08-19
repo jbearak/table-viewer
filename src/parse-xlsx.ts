@@ -43,9 +43,15 @@ import {
     element_content,
     find_first_element,
     scan_rows,
+    worksheet_scan_input,
 } from './ooxml-worksheet-scan';
 
 // --- ZIP / Entry Access ---
+
+function get_entry_bytes(cfb_file: ReturnType<typeof CFB.read>, path: string): Uint8Array | null {
+    const entry = CFB.find(cfb_file, path);
+    return entry?.content ? entry.content as Uint8Array : null;
+}
 
 function get_entry_text(cfb_file: ReturnType<typeof CFB.read>, path: string): string | null {
     const entry = CFB.find(cfb_file, path);
@@ -663,8 +669,8 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookDa
         const sheet_path = rels.get(entry.rId);
         if (!sheet_path) continue;
 
-        const ws_xml = get_entry_text(cfb_file, `/${sheet_path}`);
-        if (!ws_xml) {
+        const ws_content = get_entry_bytes(cfb_file, `/${sheet_path}`);
+        if (!ws_content) {
             // Empty or missing sheet
             sheets.push({
                 name: entry.name,
@@ -678,7 +684,7 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookDa
         }
 
         const working = parse_worksheet_core(
-            ws_xml, sst, xfs, fonts, format_map, datemode, budget,
+            worksheet_scan_input(ws_content), sst, xfs, fonts, format_map, datemode, budget,
             worksheet_rels(cfb_file, sheet_path)
         );
         workings.push(working);
@@ -714,8 +720,8 @@ export async function parse_xlsx_streaming(buffer: Uint8Array): Promise<Streamin
         const sheet_path = rels.get(entry.rId);
         if (!sheet_path) continue;
 
-        const ws_xml = get_entry_text(cfb_file, `/${sheet_path}`);
-        if (!ws_xml) {
+        const ws_content = get_entry_bytes(cfb_file, `/${sheet_path}`);
+        if (!ws_content) {
             sheets.push({
                 name: entry.name,
                 worksheetId: entry.worksheetId,
@@ -728,7 +734,7 @@ export async function parse_xlsx_streaming(buffer: Uint8Array): Promise<Streamin
         }
 
         const working = parse_worksheet_core(
-            ws_xml, sst, xfs, fonts, format_map, datemode, budget,
+            worksheet_scan_input(ws_content), sst, xfs, fonts, format_map, datemode, budget,
             worksheet_rels(cfb_file, sheet_path)
         );
         workings.push(working);
