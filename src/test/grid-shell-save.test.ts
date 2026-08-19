@@ -214,6 +214,7 @@ async function render_grid(
         sheet_index: 0,
         generation: 1,
         show_formatting: false,
+        edit_activation_id: 1,
         column_projection,
         column_widths: {},
         on_column_resize: vi.fn(),

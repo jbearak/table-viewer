@@ -260,6 +260,7 @@ function props(overrides: Partial<GridShellProps> = {}): GridShellProps {
         sheet_index: 0,
         generation: 1,
         show_formatting: false,
+        edit_activation_id: 0,
         column_projection: {
             visible_to_source: [0, 2],
             source_to_visible: [0, undefined, 1],
@@ -2535,6 +2536,283 @@ describe('GridShell link-only edits', () => {
         const get_cell_content = grid_mock.props!.getCellContent as
             (cell: [number, number]) => { displayData: string };
         expect(get_cell_content([0, 0]).displayData).toBe('typed');
+    });
+});
+
+describe('GridShell edit-admission lifetime', () => {
+    const editable = (overrides: Partial<GridShellProps> = {}) => props({
+        edit_mode: true,
+        edit_activation_id: 1,
+        csv_editable: true,
+        edit_session_id: 'session-1',
+        ...overrides,
+    });
+    const cell_is_editable = () => {
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => { allowOverlay: boolean };
+        return get_cell_content([0, 0]).allowOverlay;
+    };
+
+    it('keeps an edit admission fenced across an ordinary rerender', async () => {
+        // A failed close/reload remains fenced. The boundary is a real new
+        // activation, not "some render happened after stop_edit_admission".
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const initial = editable({ editing_ref });
+        const GridShell = await render_grid(initial);
+        expect(cell_is_editable()).toBe(true);
+
+        await act(async () => editing_ref.current!.stop_edit_admission());
+        expect(cell_is_editable()).toBe(false);
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, { ...initial }));
+        });
+        expect(cell_is_editable()).toBe(false);
+    });
+
+    it('reopens cell editing for a new edit-mode activation in the same session', async () => {
+        // The desktop host deliberately reuses an already-owned session ID. The
+        // close fence belongs to the activation that raised it, so false→true
+        // must open a new one without requiring a remount or a different ID.
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const initial = editable({ editing_ref });
+        const GridShell = await render_grid(initial);
+        expect(cell_is_editable()).toBe(true);
+
+        await act(async () => editing_ref.current!.stop_edit_admission());
+        expect(cell_is_editable()).toBe(false);
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...initial,
+                edit_mode: false,
+            }));
+        });
+        expect(cell_is_editable()).toBe(false);
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...initial,
+                edit_mode: true,
+                edit_activation_id: 2,
+            }));
+        });
+        expect(cell_is_editable()).toBe(true);
+        const close_overlay = await open_tracking_overlay([0, 0], 'source-a');
+        expect(document.querySelector('.cell-editor-input')).not.toBeNull();
+        await close_overlay();
+    });
+
+    it('does not let an abandoned re-entry render reopen the mounted admission', async () => {
+        // Reproduce the concurrent-render leak directly. The committed tree is
+        // fenced and inactive, then a transition renders the next activation far
+        // enough to execute GridShell before a sibling suspends it. The mounted
+        // imperative handle must still observe activation 1 until React commits 2.
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        const initial = editable({ editing_ref, edit_session: store });
+        vi.resetModules();
+        vi.stubGlobal('acquireVsCodeApi', () => ({
+            postMessage: grid_mock.post_message,
+            getState: vi.fn(),
+            setState: vi.fn(),
+        }));
+        const { GridShell } = await import('../webview/grid-shell');
+        container = document.createElement('div');
+        document.body.appendChild(container);
+        root = createRoot(container);
+        const never = new Promise<void>(() => {});
+        function Suspend(): React.JSX.Element {
+            throw never;
+        }
+        function Harness({
+            active,
+            activation,
+            suspend,
+        }: {
+            active: boolean;
+            activation: number;
+            suspend: boolean;
+        }): React.JSX.Element {
+            return React.createElement(
+                React.Suspense,
+                { fallback: null },
+                React.createElement(GridShell, {
+                    ...initial,
+                    edit_mode: active,
+                    edit_activation_id: activation,
+                }),
+                suspend ? React.createElement(Suspend) : null,
+            );
+        }
+        await act(async () => {
+            root!.render(React.createElement(Harness, {
+                active: true,
+                activation: 1,
+                suspend: false,
+            }));
+        });
+        const close_overlay = await open_tracking_overlay([0, 0], 'typed');
+        await act(async () => editing_ref.current!.stop_edit_admission());
+        await act(async () => {
+            root!.render(React.createElement(Harness, {
+                active: false,
+                activation: 1,
+                suspend: false,
+            }));
+        });
+
+        await act(async () => {
+            React.startTransition(() => {
+                root!.render(React.createElement(Harness, {
+                    active: true,
+                    activation: 2,
+                    suspend: true,
+                }));
+            });
+        });
+        await act(async () => editing_ref.current!.commit_live_edit());
+
+        expect(store.snapshot().size).toBe(0);
+        await close_overlay();
+    });
+
+    it('keeps callback mirrors aligned with the committed tree during abandoned renders', async () => {
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        const initial = editable({ edit_session: store });
+        vi.resetModules();
+        vi.stubGlobal('acquireVsCodeApi', () => ({
+            postMessage: grid_mock.post_message,
+            getState: vi.fn(),
+            setState: vi.fn(),
+        }));
+        const { GridShell } = await import('../webview/grid-shell');
+        container = document.createElement('div');
+        document.body.appendChild(container);
+        root = createRoot(container);
+        const never = new Promise<void>(() => {});
+        function Suspend(): React.JSX.Element {
+            throw never;
+        }
+        function Harness({
+            highlight,
+            session,
+            suspend,
+        }: {
+            highlight: boolean;
+            session: string;
+            suspend: boolean;
+        }): React.JSX.Element {
+            return React.createElement(
+                React.Suspense,
+                { fallback: null },
+                React.createElement(GridShell, {
+                    ...initial,
+                    highlight_in_flight: highlight,
+                    edit_session_id: session,
+                }),
+                suspend ? React.createElement(Suspend) : null,
+            );
+        }
+        const render = async (highlight: boolean, session: string, suspend: boolean) => {
+            await act(async () => {
+                root!.render(React.createElement(Harness, { highlight, session, suspend }));
+            });
+        };
+        await render(false, 'session-1', false);
+
+        // A queued callback belongs to the still-mounted editable tree. A render
+        // that would disable editing must not reject it unless that render commits.
+        const committed_edit = edit_one(grid_mock.props!.onCellsEdited);
+        await act(async () => {
+            React.startTransition(() => {
+                root!.render(React.createElement(Harness, {
+                    highlight: true,
+                    session: 'session-1',
+                    suspend: true,
+                }));
+            });
+        });
+        await act(async () => committed_edit([0, 0], {
+            kind: 'text',
+            data: 'committed admission',
+        }));
+        expect(store.snapshot().get('0:0')?.value).toBe('committed admission');
+
+        // Cancel that transition, open an overlay under session 1, then abandon a
+        // render for session 2. The mounted finish still belongs to session 1.
+        await render(false, 'session-1', false);
+        const close_overlay = await open_tracking_overlay([0, 0], 'session one finish');
+        const committed_overlay_edit = edit_one(grid_mock.props!.onCellsEdited);
+        await act(async () => {
+            React.startTransition(() => {
+                root!.render(React.createElement(Harness, {
+                    highlight: false,
+                    session: 'session-2',
+                    suspend: true,
+                }));
+            });
+        });
+        await act(async () => committed_overlay_edit([0, 0], {
+            kind: 'text',
+            data: 'session one finish',
+        }));
+        expect(store.snapshot().get('0:0')?.value).toBe('session one finish');
+        await close_overlay();
+    });
+
+    it('blocks ordinary overlay folds after the fence but permits one barrier fold', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        await render_grid(editable({ editing_ref, edit_session: store }));
+        const close_overlay = await open_tracking_overlay([0, 0], 'typed');
+        const changed = vi.fn();
+        const unsubscribe = store.subscribe(changed);
+
+        await act(async () => editing_ref.current!.stop_edit_admission());
+        await act(async () => editing_ref.current!.commit_live_edit());
+        await act(async () => editing_ref.current!.flush_live_edit());
+        expect(store.snapshot().size).toBe(0);
+
+        await act(async () => editing_ref.current!.commit_live_edit_at_close_barrier());
+        expect(store.snapshot().get('0:0')).toEqual({
+            value: 'typed',
+            base: 'source-a',
+        });
+        expect(changed).toHaveBeenCalledTimes(1);
+
+        await act(async () => editing_ref.current!.commit_live_edit_at_close_barrier());
+        expect(changed).toHaveBeenCalledTimes(1);
+        unsubscribe();
+        await close_overlay();
+    });
+
+    it('refuses a cell-menu discard after the admission fence', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const store = create_edit_session_store(
+            { session_id: 'session-1' },
+            { '0:0': { value: 'dirty', base: 'source-a' } },
+        );
+        await render_grid(editable({ editing_ref, edit_session: store }));
+        const on_cell_context_menu = grid_mock.props!.onCellContextMenu as
+            (cell: [number, number], event: Record<string, unknown>) => void;
+        await act(async () => on_cell_context_menu([0, 0], {
+            preventDefault: vi.fn(),
+            bounds: { x: 0, y: 0, width: 100, height: 24 },
+            localEventX: 10,
+            localEventY: 10,
+        }));
+        const discard = Array.from(document.querySelectorAll('button'))
+            .find((candidate) => candidate.textContent === 'Discard edit');
+        expect(discard).toBeDefined();
+
+        await act(async () => editing_ref.current!.stop_edit_admission());
+        await act(async () => discard!.click());
+
+        expect(store.snapshot().get('0:0')).toEqual({
+            value: 'dirty',
+            base: 'source-a',
+        });
     });
 });
 

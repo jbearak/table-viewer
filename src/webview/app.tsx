@@ -522,6 +522,21 @@ export function App(): React.JSX.Element {
             () => csv_edit_session_id_ref.current,
         );
     }
+    const [edit_mode, set_edit_mode_state] = useState(false);
+    const edit_mode_ref = useRef(false);
+    // Passed down as the admission lifetime instead of asking GridShell to derive
+    // one during render. React can abandon a child render; only these parent-owned
+    // state updates make a new activation observable to the mounted tree.
+    const [edit_activation_id, set_edit_activation_id] = useState(0);
+    const advance_edit_activation = useCallback(() => {
+        set_edit_activation_id((current) => current + 1);
+    }, []);
+    const set_edit_mode = useCallback((next: boolean) => {
+        const previous = edit_mode_ref.current;
+        edit_mode_ref.current = next;
+        if (next && !previous) advance_edit_activation();
+        set_edit_mode_state(next);
+    }, [advance_edit_activation]);
     /**
      * The workbook's undo history — one, for the whole workbook, because undoing
      * an edit made on another sheet switches to that sheet.
@@ -660,12 +675,6 @@ export function App(): React.JSX.Element {
         }
         csv_edit_session_id_ref.current = next;
         set_csv_edit_session_id_state(next);
-    }, []);
-    const [edit_mode, set_edit_mode_state] = useState(false);
-    const edit_mode_ref = useRef(false);
-    const set_edit_mode = useCallback((next: boolean) => {
-        edit_mode_ref.current = next;
-        set_edit_mode_state(next);
     }, []);
     // One granted session makes every worksheet editable. The active tab chooses
     // only which per-sheet store the mounted grid views; it is not an edit pointer.
@@ -917,7 +926,7 @@ export function App(): React.JSX.Element {
         // App-owned store that survives generation-keyed GridShell remounts.
         const editing = editing_ref.current;
         editing?.stop_edit_admission();
-        editing?.commit_live_edit();
+        editing?.commit_live_edit_at_close_barrier();
         await new Promise<void>((resolve) => queueMicrotask(resolve));
 
         const durability = pending_edit_durability.snapshot(edit_session_id);
@@ -1548,6 +1557,8 @@ export function App(): React.JSX.Element {
                     // Every applied snapshot is lifecycle-relevant, including the
                     // first snapshot for a newly selected file.
                     const applied_save_transition = save_transition!;
+                    const edit_mode_before_snapshot = edit_mode_ref.current;
+                    const edit_session_before_snapshot = csv_edit_session_id_ref.current;
                     last_applied_snapshot_ref.current = snapshot.identity;
                     // Fold the open overlay into the store before this snapshot's
                     // generation bump unmounts the grid that owns it. Ahead of both
@@ -2494,7 +2505,16 @@ export function App(): React.JSX.Element {
                     });
                     set_truncation_message(snapshot.truncationMessage);
                     set_csv_editable(snapshot.capabilities.csvEditable);
-                    set_csv_edit_session_id(snapshot.capabilities.csvEditSessionId);
+                    const next_edit_session = snapshot.capabilities.csvEditSessionId;
+                    if (
+                        edit_mode_before_snapshot
+                        && edit_mode_ref.current
+                        && next_edit_session !== undefined
+                        && next_edit_session !== edit_session_before_snapshot
+                    ) {
+                        advance_edit_activation();
+                    }
+                    set_csv_edit_session_id(next_edit_session);
                     set_csv_editing_supported(
                         snapshot.capabilities.csvEditingSupported,
                     );
@@ -4207,6 +4227,12 @@ export function App(): React.JSX.Element {
                 pending_edit_request_ref.current = null;
                 set_edit_session_pending(false);
                 if (msg.granted && msg.editSessionId) {
+                    if (
+                        edit_mode_ref.current
+                        && csv_edit_session_id_ref.current !== msg.editSessionId
+                    ) {
+                        advance_edit_activation();
+                    }
                     set_csv_edit_session_id(msg.editSessionId);
                     // Taken from the grant rather than from the active tab: the two
                     // can differ if the user switched sheets while the request was
@@ -4353,6 +4379,7 @@ export function App(): React.JSX.Element {
         window.addEventListener('message', handler);
         return () => window.removeEventListener('message', handler);
     }, [
+        advance_edit_activation,
         apply_save_lifecycle,
         discard_edit_session,
         install_edit_session,
@@ -5393,6 +5420,7 @@ export function App(): React.JSX.Element {
             merges={merges_flattened ? [] : current_sheet.merges}
             preview_mode={preview_mode}
             edit_mode={edit_mode_on_active_sheet}
+            edit_activation_id={edit_activation_id}
             highlight_in_flight={highlight_request_pending}
             csv_editable={csv_editable}
             edit_syntax={edit_syntax}
