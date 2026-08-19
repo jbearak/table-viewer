@@ -198,6 +198,7 @@
     "test:desktop-smoke:relaunch": "npm run desktop:prepackage && playwright test --config=desktop/test-smoke/playwright.config.ts desktop/test-smoke/state-relaunch.spec.ts",
     "test:desktop-perf": "npm run desktop:prepackage && playwright test --config=desktop/test-performance/playwright.config.ts",
     "perf:compare": "node benchmarks/grid/compare.mjs",
+    "perf:ooxml": "node benchmarks/ooxml/run.mjs --compare benchmarks/ooxml/baselines/main-string-scanner.json",
     "watch": "tsc -watch -p ./",
     "package": "vsce package --no-dependencies"
   },
