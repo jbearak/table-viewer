@@ -726,6 +726,48 @@ Justified by the 40.4 MiB above, and now provable because Stage 1 exists.
   `CFB.read`'s inflation peak can dominate it even after the steady-state string
   is gone. Live RSS is the post-GC sample.
 
+
+**Result (merged as `94d4a54`; branch `issue153-stage6-byte-offsets`).** Gate met,
+but the headline number needs reading carefully.
+
+| Scenario | Metric | Stage 5 | Stage 6 | Change |
+|---|---|---|---|---|
+| coordinate-scan | time_ms | 554.3 | 498.1 | −10.1% |
+| coordinate-scan | peak_rss_mib | 248.0 | 186.9 | −24.7% |
+| coordinate-scan | live_external_delta_mib | 57.168 | **0** | −100% |
+| full-save | time_ms | 2395.7 | 1884.3 | −21.3% |
+| full-save | peak_rss_mib | 582.5 | 255.9 | −56.1% |
+| full-save | live_heap_used_delta_mib | 57.589 | 0.539 | −99.1% |
+| worksheet-decode | live_external_delta_mib | 57.168 | **0** | −100% |
+
+The 57.2 MiB `live_external_delta_mib` that Stage 4 left untouched — the one this
+stage existed to remove — is now zero, comfortably past the 32 MiB gate.
+
+**Do not cite `real-worksheet-decode.time_ms` (3.401 → 0.008 ms, −99.8%) as a
+speedup.** `worksheet_scan_input` is now the identity function, so that phase
+measures a no-op. The decode was *eliminated*, not accelerated, and the phase has
+no remaining diagnostic value beyond asserting the byte length still matches. The
+load-bearing evidence that the cost was removed rather than *displaced* into the
+scan is coordinate-scan: it got both faster and smaller at the same time, which a
+deferred decode could not do.
+
+**Behavior preservation was verified differentially, not just by tests.** Running
+the same edits through `650fb2d` and the merged code: 35 fixture/editset
+combinations produced **byte-identical** packages (SHA-256 over full output), and
+21 refusal cases produced **identical error messages**. Fixtures covered ASCII,
+non-ASCII (`é☃ü`), numeric, boolean, empty-string, far-off-sheet, and multi-edit
+mixed-row cases. Full suite: 4665 passed / 3 skipped across 206 files.
+
+**`Buffer.allocUnsafe` in `apply_utf8_splices` cannot leak uninitialized memory,
+for a structural reason worth recording** so a future reader doesn't "fix" it into
+`alloc()` and pay the zeroing cost. Overlapping splices make the length
+arithmetic double-count removed widths, so the computed length always comes in
+*short* and `out.set` throws `RangeError` before any unwritten gap can be
+returned. Fuzzing 200k random splice sets (123,108 of which overlapped) produced
+**zero** garbage bytes: 123,108 throws, 802 valid results. Overlap is also
+unreachable from the five production splice producers, which partition by row
+span and cell span. The throw is a backstop, not a live path.
+
 ### Stage 7 — Package boundary and conformance corpus
 
 - Versioned language-neutral `conformance/` — fixtures, golden outputs, refusal
