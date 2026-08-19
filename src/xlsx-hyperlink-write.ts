@@ -23,7 +23,6 @@
 
 import {
     encode_xml_attr,
-    find_element_section,
     find_tag_end,
     get_attr,
     index_of_markup,
@@ -33,9 +32,17 @@ import {
     iter_elements_markup,
     last_index_of_markup,
 } from './ooxml-xml';
+import {
+    find_element_section as find_worksheet_section,
+    find_tag_end as find_worksheet_tag_end,
+    index_of_markup as index_of_worksheet_markup,
+    is_tag_boundary as is_worksheet_tag_boundary,
+    last_index_of_markup as last_index_of_worksheet_markup,
+    utf8_text,
+} from './ooxml-worksheet-scan';
 import { parse_relationships } from './ooxml-relationships';
 import type { CellHyperlink } from './cell-content';
-import { col_index_to_letter } from './xlsx-cell-write';
+import { apply_utf8_splices, col_index_to_letter } from './xlsx-cell-write';
 
 /** One cell's link edit, in canonical source coordinates (0-based). */
 export interface XlsxHyperlinkEdit {
@@ -50,8 +57,8 @@ export interface XlsxHyperlinkEdit {
  *  rels are untouched). Whether a returned part must be ADDED to the package
  *  rather than replaced is not reported here: the caller passed the part in, so
  *  it already knows — a null input with a non-null result is a creation. */
-export interface HyperlinkWriteResult {
-    readonly sheet_xml: string;
+export interface HyperlinkWriteResult<T extends Uint8Array | string = Uint8Array> {
+    readonly sheet_xml: T;
     readonly rels_xml: string | null;
 }
 
@@ -120,46 +127,37 @@ const AFTER_HYPERLINKS = [
     'oleObjects', 'controls', 'webPublishItems', 'tableParts', 'extLst',
 ] as const;
 
-/** The index in `xml` where a new `<hyperlinks>` section belongs. */
-function hyperlink_section_insert_pos(xml: string): number {
+/** The byte offset in `xml` where a new `<hyperlinks>` section belongs. */
+function hyperlink_section_insert_pos(xml: Uint8Array): number {
     for (const tag of AFTER_HYPERLINKS) {
         const open = `<${tag}`;
         let pos = 0;
         while (true) {
-            const start = index_of_markup(xml, open, pos);
+            const start = index_of_worksheet_markup(xml, open, pos);
             if (start === -1) break;
-            if (!is_tag_boundary(xml[start + open.length])) {
+            if (!is_worksheet_tag_boundary(xml[start + open.length])) {
                 pos = start + 1;
                 continue;
             }
             return start;
         }
     }
-    const close_sheet_data = last_index_of_markup(xml, '</sheetData>');
+    const close_sheet_data = last_index_of_worksheet_markup(xml, '</sheetData>');
     if (close_sheet_data !== -1) return close_sheet_data + '</sheetData>'.length;
     // A wholly empty sheet writes <sheetData/>; insert right after it.
-    const empty_sheet_data = index_of_markup(xml, '<sheetData/>');
+    const empty_sheet_data = index_of_worksheet_markup(xml, '<sheetData/>');
     if (empty_sheet_data !== -1) return empty_sheet_data + '<sheetData/>'.length;
     throw new Error('Worksheet has no sheetData element');
 }
 
-/** True when the `<worksheet …>` open tag declares the `r` namespace. */
-function worksheet_declares_r_ns(xml: string): boolean {
-    const start = index_of_markup(xml, '<worksheet');
-    if (start === -1) return false;
-    const tag_end = find_tag_end(xml, start);
-    if (tag_end === -1) return false;
-    return xml.substring(start, tag_end + 1).includes('xmlns:r=');
-}
-
-/** Add `xmlns:r` to the `<worksheet>` open tag. */
-function add_r_ns(xml: string): string {
-    const start = index_of_markup(xml, '<worksheet');
+/** Namespace insertion point, or null when the worksheet already declares it. */
+function r_namespace_insert_pos(xml: Uint8Array): number | null {
+    const start = index_of_worksheet_markup(xml, '<worksheet');
     if (start === -1) throw new Error('Worksheet has no worksheet element');
-    const tag_end = find_tag_end(xml, start);
+    const tag_end = find_worksheet_tag_end(xml, start);
     if (tag_end === -1) throw new Error('Worksheet has no worksheet element');
-    const insert = xml[tag_end - 1] === '/' ? tag_end - 1 : tag_end;
-    return `${xml.slice(0, insert)} xmlns:r="${OFFICE_R_NS}"${xml.slice(insert)}`;
+    if (utf8_text(xml, start, tag_end + 1).includes('xmlns:r=')) return null;
+    return xml[tag_end - 1] === 0x2f ? tag_end - 1 : tag_end;
 }
 
 /** All relationship IDs of a `.rels` document (any type — new IDs must avoid
@@ -270,9 +268,10 @@ export interface ClearedDisplay {
  * value edit in the same save.
  */
 export function cleared_display_texts(
-    sheet_xml: string,
+    source: Uint8Array | string,
     edits: readonly XlsxHyperlinkEdit[],
 ): ClearedDisplay[] {
+    const sheet_xml = typeof source === 'string' ? Buffer.from(source, 'utf8') : source;
     // Same last-wins canonicalization the splice uses, so the two cannot
     // disagree about which edit governs a cell: a clear followed by a set keeps
     // its display on the replacement and needs no promotion.
@@ -282,8 +281,9 @@ export function cleared_display_texts(
     // A set-only batch can never delete a display, so it never pays for the
     // section scan below.
     if (!any_clear) return [];
-    const section = find_element_section(sheet_xml, 'hyperlinks');
+    const section = find_worksheet_section(sheet_xml, 'hyperlinks');
     if (!section) return [];
+    const section_inner = utf8_text(sheet_xml, section.inner_start, section.inner_end);
     const out: ClearedDisplay[] = [];
     // FIRST element per ref wins, because that is the one whose text the reader
     // shows: parse-xlsx synthesizes the cell from the first `<hyperlink>` it
@@ -293,7 +293,7 @@ export function cleared_display_texts(
     // when the first element carried no display at all. Nothing forbids two
     // elements naming one ref, so this is not a hypothetical shape.
     const seen = new Set<string>();
-    for (const link of existing_hyperlinks(section.inner)) {
+    for (const link of existing_hyperlinks(section_inner)) {
         if (seen.has(link.ref)) continue;
         seen.add(link.ref);
         const edit = by_ref.get(link.ref);
@@ -342,10 +342,22 @@ export function apply_hyperlink_edits(
     sheet_xml: string,
     rels_xml: string | null,
     edits: readonly XlsxHyperlinkEdit[],
-): HyperlinkWriteResult {
+): HyperlinkWriteResult<string>;
+export function apply_hyperlink_edits(
+    sheet_xml: Uint8Array,
+    rels_xml: string | null,
+    edits: readonly XlsxHyperlinkEdit[],
+): HyperlinkWriteResult<Uint8Array>;
+export function apply_hyperlink_edits(
+    source: Uint8Array | string,
+    rels_xml: string | null,
+    edits: readonly XlsxHyperlinkEdit[],
+): HyperlinkWriteResult<Uint8Array | string> {
     if (edits.length === 0) {
-        return { sheet_xml, rels_xml: null };
+        return { sheet_xml: source, rels_xml: null };
     }
+    const return_text = typeof source === 'string';
+    const sheet_xml = return_text ? Buffer.from(source, 'utf8') : source;
     // Last edit wins per cell ref.
     const by_ref = canonical_link_edits(edits, () => {
         throw new Error('Invalid hyperlink edit coordinates');
@@ -353,8 +365,10 @@ export function apply_hyperlink_edits(
 
     // Same locator the reader uses, so the two cannot disagree about which
     // `<hyperlinks>` section is the live one.
-    const section = find_element_section(sheet_xml, 'hyperlinks');
-    const current = section ? existing_hyperlinks(section.inner) : [];
+    const section = find_worksheet_section(sheet_xml, 'hyperlinks');
+    const current = section
+        ? existing_hyperlinks(utf8_text(sheet_xml, section.inner_start, section.inner_end))
+        : [];
 
     // Relationship bookkeeping. Only *hyperlink* rels may ever be removed, and
     // only when no surviving element still references them — a drawing rel
@@ -417,25 +431,27 @@ export function apply_hyperlink_edits(
         if (rel && rel.type === HYPERLINK_REL_TYPE) removed_rel_ids.add(r_id);
     }
 
-    // Splice the sheet.
+    // Splice the worksheet once, even when adding both a section and `xmlns:r`.
     const elements = [...kept, ...added];
-    let updated_sheet: string;
+    const sheet_splices: Array<{ start: number; end: number; text: string }> = [];
     if (elements.length === 0) {
-        updated_sheet = section
-            ? sheet_xml.slice(0, section.start) + sheet_xml.slice(section.end)
-            : sheet_xml;
+        if (section) sheet_splices.push({ start: section.start, end: section.end, text: '' });
     } else {
         const section_text = `<hyperlinks>${elements.join('')}</hyperlinks>`;
-        updated_sheet = section
-            ? sheet_xml.slice(0, section.start) + section_text + sheet_xml.slice(section.end)
-            : (() => {
-                const at = hyperlink_section_insert_pos(sheet_xml);
-                return sheet_xml.slice(0, at) + section_text + sheet_xml.slice(at);
-            })();
+        if (section) {
+            sheet_splices.push({ start: section.start, end: section.end, text: section_text });
+        } else {
+            const at = hyperlink_section_insert_pos(sheet_xml);
+            sheet_splices.push({ start: at, end: at, text: section_text });
+        }
     }
-    if (new_rel_elements.length > 0 && !worksheet_declares_r_ns(updated_sheet)) {
-        updated_sheet = add_r_ns(updated_sheet);
+    if (new_rel_elements.length > 0) {
+        const at = r_namespace_insert_pos(sheet_xml);
+        if (at !== null) {
+            sheet_splices.push({ start: at, end: at, text: ` xmlns:r="${OFFICE_R_NS}"` });
+        }
     }
+    const updated_sheet = apply_utf8_splices(sheet_xml, sheet_splices);
 
     // Splice the rels.
     let updated_rels: string | null = null;
@@ -447,5 +463,8 @@ export function apply_hyperlink_edits(
         );
     }
 
-    return { sheet_xml: updated_sheet, rels_xml: updated_rels };
+    return {
+        sheet_xml: return_text ? utf8_text(updated_sheet) : updated_sheet,
+        rels_xml: updated_rels,
+    };
 }

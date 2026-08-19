@@ -7,9 +7,17 @@ import {
     widen_dimension,
     type XlsxCellEdit,
 } from './xlsx-cell-write';
-import { live_tags_in, worksheet_scan_input } from './ooxml-worksheet-scan';
+import { worksheet_scan_input } from './ooxml-worksheet-scan';
 import { get_style, is_date_format } from './spreadsheet-format';
-import { decode_xml, get_text, iter_elements } from './ooxml-xml';
+import {
+    decode_xml,
+    find_tag_end,
+    get_text,
+    ignorable_end,
+    ignorable_ranges,
+    is_tag_boundary,
+    iter_elements,
+} from './ooxml-xml';
 import { font_to_style } from './xlsx-rich-text';
 import type { CellTextStyle } from './cell-content';
 import {
@@ -53,15 +61,24 @@ function read_part_text(cfb_file: ReturnType<typeof CFB.read>, path: string): st
     return Buffer.from(entry.content as Uint8Array).toString('utf8');
 }
 
-function write_part_text(cfb_file: ReturnType<typeof CFB.read>, path: string, text: string): boolean {
+function write_part_bytes(
+    cfb_file: ReturnType<typeof CFB.read>,
+    path: string,
+    bytes: Uint8Array,
+): boolean {
     const entry = CFB.find(cfb_file, path);
     if (!entry) return false;
-    const bytes = Buffer.from(text, 'utf8');
-    entry.content = bytes;
+    entry.content = (Buffer.isBuffer(bytes)
+        ? bytes
+        : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)) as CFB.CFB$Blob;
     // `size` is not derived from `content` on write, so both must be set or the
     // emitted zip declares a stale length and readers truncate the part.
-    entry.size = bytes.length;
+    entry.size = bytes.byteLength;
     return true;
+}
+
+function write_part_text(cfb_file: ReturnType<typeof CFB.read>, path: string, text: string): boolean {
+    return write_part_bytes(cfb_file, path, Buffer.from(text, 'utf8'));
 }
 
 /**
@@ -374,7 +391,10 @@ export function write_xlsx_workbook_cell_edits(
     const { is_date_style, cell_font_style, run_font_base } = read_style_write_context(cfb_file);
     const datemode = read_datemode(cfb_file);
     let removed_formula = false;
-    const replacements: Array<{ path: string; xml: string; created?: boolean }> = [];
+    const replacements: Array<
+        | { path: string; bytes: Uint8Array }
+        | { path: string; text: string; created?: boolean }
+    > = [];
 
     for (const { sheetIndex, edits, link_edits } of active) {
         const part = parts[sheetIndex];
@@ -446,7 +466,7 @@ export function write_xlsx_workbook_cell_edits(
             if (link_result.rels_xml !== null) {
                 replacements.push({
                     path: rels_path,
-                    xml: link_result.rels_xml,
+                    text: link_result.rels_xml,
                     // A sheet that had no `.rels` part gets one created.
                     created: rels_xml === null,
                 });
@@ -459,20 +479,21 @@ export function write_xlsx_workbook_cell_edits(
         if (all_edits.length > 0) {
             removed_formula ||= formula_count(updated) < formula_count(sheet_xml);
         }
-        replacements.push({ path, xml: updated });
+        replacements.push({ path, bytes: updated });
     }
 
-    for (const { path, xml, created } of replacements) {
-        if (created) {
+    for (const replacement of replacements) {
+        if ('text' in replacement && replacement.created) {
             // A sheet that never had relationships has no `.rels` part to
             // replace; adding one needs no [Content_Types] change because the
             // standard `Default Extension="rels"` already types it.
-            CFB.utils.cfb_add(cfb_file, path, Buffer.from(xml, 'utf8'));
+            CFB.utils.cfb_add(cfb_file, replacement.path, Buffer.from(replacement.text, 'utf8'));
             continue;
         }
-        if (!write_part_text(cfb_file, path, xml)) {
-            throw new Error('Could not update a worksheet to save');
-        }
+        const written = 'bytes' in replacement
+            ? write_part_bytes(cfb_file, replacement.path, replacement.bytes)
+            : write_part_text(cfb_file, replacement.path, replacement.text);
+        if (!written) throw new Error('Could not update a worksheet to save');
     }
     if (removed_formula) remove_part(cfb_file, '/xl/calcChain.xml');
 
@@ -554,6 +575,22 @@ function plan_reference_removals(
     return commits;
 }
 
+function* string_live_tags_in(xml: string, name: string): Generator<[number, string]> {
+    const ranges = ignorable_ranges(xml, 0, xml.length);
+    let pos = 0;
+    while (pos < xml.length) {
+        const at = xml.indexOf(`<${name}`, pos);
+        if (at === -1) return;
+        const skip_to = ignorable_end(ranges, at);
+        if (skip_to !== undefined) { pos = skip_to; continue; }
+        if (!is_tag_boundary(xml[at + name.length + 1])) { pos = at + 1; continue; }
+        const tag_end = find_tag_end(xml, at);
+        if (tag_end === -1) return;
+        yield [at, xml.slice(at, tag_end + 1)];
+        pos = tag_end + 1;
+    }
+}
+
 /**
  * Delete every live empty `<name …>` element that `wanted` selects.
  *
@@ -565,7 +602,7 @@ function plan_reference_removals(
  */
 function remove_elements(xml: string, name: string, wanted: (tag: string) => boolean): string {
     const spans: Array<[number, number]> = [];
-    for (const [at, tag] of live_tags_in(xml, name)) {
+    for (const [at, tag] of string_live_tags_in(xml, name)) {
         if (!wanted(tag)) continue;
         const inner_start = at + tag.length;
         if (tag.endsWith('/>')) {

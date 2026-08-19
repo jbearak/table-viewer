@@ -55,6 +55,20 @@ describe('apply_hyperlink_edits', () => {
         expect(out.rels_xml).toBeNull();
     });
 
+    it('uses byte offsets when non-ASCII text precedes the worksheet splice', () => {
+        const source = sheet('<metadata>café 東京</metadata><sheetData/>');
+        const out = apply_hyperlink_edits(Buffer.from(source), null, [
+            { row: 1, col: 1, link: internal('Sheet2!B5') },
+        ]);
+        const expected = source.replace(
+            '<sheetData/>',
+            '<sheetData/><hyperlinks><hyperlink ref="B2" location="Sheet2!B5"/></hyperlinks>',
+        );
+
+        expect(Buffer.from(out.sheet_xml).equals(Buffer.from(expected))).toBe(true);
+        expect(out.rels_xml).toBeNull();
+    });
+
     it('inserts the section before schema-later elements, not after them', () => {
         const xml = sheet('<sheetData/><pageMargins left="0.7"/>');
         const out = apply_hyperlink_edits(xml, null, [
