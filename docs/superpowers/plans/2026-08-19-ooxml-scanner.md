@@ -298,6 +298,18 @@ change.
   shared scanner. **Scoped to those three elements only** — sharedStrings,
   styles, `dimension`, `mergeCells` stay naive in this stage; widening them is
   not needed to close the divergence and would multiply the diff.
+- The exact surface, verified: `parse-xlsx.ts:355` (`get_text(xml,'sheetData')`),
+  `:357` (`iter_elements(…,'row')`), `:358` (`iter_elements(…,'c')`), plus the two
+  nested reads inside the cell loop at `:370` (`get_text(c_inner,'v')`) and `:404`
+  (`get_text(c_inner,'is')`). The other 12 naive callsites in the file are out of
+  scope for this stage.
+- **Why the `<sheetData>` close matters here.** `get_text` (`ooxml-xml.ts:336`)
+  finds its close tag with a plain `indexOf('</sheetData>')` and no depth
+  tracking or whitespace tolerance, while the writer scans for an end tag that may
+  carry internal whitespace. That mismatch is exactly one of the two
+  `<sheetData>` divergence errors Stage 5 deletes — so Stage 4 must adopt the
+  writer's end-tag scan, not merely the element iteration, or the guard cannot
+  come out.
 - The single authoritative coordinate rule lands here, one implementation, both
   sides (criterion (b)): **`<c r="…">` is the sole authority; last-scanned-wins
   per coordinate.** No positional inference, ever.
