@@ -399,6 +399,30 @@ taxonomy, which is a blocker for a language-neutral corpus (criterion (f)).
   *different* reason than before, reached through the grouped-formula path rather
   than the attribute guard. If either silently starts passing, Stage 3's migration
   is incomplete and a save can corrupt a formula group.
+
+**Verified after Stage 3: the formula path does now catch them.** The attribute
+guard fires first and masks which guard is doing the work, so asserting
+`/cannot edit safely/i` proves nothing. I disabled *only* that guard in a scratch
+copy and edited **B1 — a follower, not the master**, since a follower carries no
+`<f>` of its own and is protected solely by the grouped range:
+
+```
+array,  ref = "A1:B2"  (ws around =)   -> refused: part of an array formula
+array,  ref='A1:B2'    (single-quoted) -> refused: part of an array formula
+shared, ref="A1:B1"                    -> refused: part of a shared formula
+shared, ref='A1:B1'    (single-quoted) -> refused: part of a shared formula
+shared, ref = "A1:B1"  (ws around =)   -> refused: part of a shared formula
+```
+
+This is the evidence that Stage 5 may delete the attribute guard. Stage 5 must
+re-run this probe after the deletion, since it is then the real behavior rather
+than a masked one.
+
+One caveat on writing these cases: `<f t="shared" si="0">` with **no `ref`** is
+correctly *accepted* — a shared master's `ref` is what spans its followers, so
+with no range there is nothing to protect and `if (!ref) continue` is right. My
+first probe made that mistake and looked like a corruption bug. Test a realistic
+master carrying `ref`.
 - Migration is smaller than the raw test count suggests: **25 `toThrow` sites,
   all in `xlsx-cell-write.test.ts`** (`xlsx-edit-session.test.ts` has none). Only
   the taxonomy assertions get rewritten; grouped-formula, merged-cell, and
