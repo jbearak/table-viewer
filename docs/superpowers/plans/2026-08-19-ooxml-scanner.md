@@ -133,10 +133,27 @@ addressed by this plan: `ignorable_ranges` runs over the whole part ~7×/save at
 **Guards come out only *after* attribute reads are shared, never before.**
 
 Deleting the single-quote and entity guards requires first moving the writer's
-private attribute regexes onto shared `get_attr`. Otherwise a single-quoted
-`ref='A1:B2'` becomes invisible to `grouped_formula_ranges`, the array-formula
-refusal silently stops firing, and a save corrupts a formula group. That is
-Stage 3 before Stage 5, and it is not negotiable.
+private attribute regexes onto shared `get_attr`. That is Stage 3 before Stage 5,
+and it is not negotiable.
+
+I verified it by running `grouped_formula_ranges`' two actual regexes
+(`xlsx-cell-write.ts:784` and `:786`) against hostile forms. **Three of four slip
+through:**
+
+```
+GUARDED    <f t="array" ref="A1:B2">
+UNGUARDED  <f t='array' ref='A1:B2'>       t= missed, ref missed
+UNGUARDED  <f t="array" ref='A1:B2'>       ref missed
+UNGUARDED  <f t="array" ref="A&#49;:B2">   ref missed
+```
+
+And the failure is silent by construction: the function does `if (!ref)
+continue`, so a `ref` it cannot parse is treated as *not a grouped formula*
+rather than as something to refuse. Today the entity and single-quote guards
+catch all three upstream, before this code runs. Remove those guards while these
+regexes are still private and the array-formula refusal quietly stops firing on
+every one of them — and a save then rewrites a cell inside a live formula group.
+That is the concrete corruption the ordering prevents.
 
 ## Stages
 
