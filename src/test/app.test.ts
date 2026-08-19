@@ -34,6 +34,7 @@ const grid_shell_mock = vi.hoisted(() => ({
     flush_live_edit: vi.fn(),
     stop_edit_admission: vi.fn(),
     focus_grid: vi.fn(),
+    has_grid_focus: vi.fn(() => true),
     select_all: vi.fn(),
     copy_sheet: vi.fn(async () => {}),
     copy_selection: vi.fn(),
@@ -127,6 +128,7 @@ vi.mock('../webview/grid-shell', () => ({
             if (!props.grid_focus_ref) return;
             const handle = {
                 generation: props.generation,
+                has_focus: () => grid_shell_mock.has_grid_focus(),
                 focus: () => {
                     grid_shell_mock.focus_grid();
                     return true;
@@ -913,6 +915,8 @@ function cleanup() {
     grid_shell_mock.flush_live_edit.mockReset();
     grid_shell_mock.stop_edit_admission.mockReset();
     grid_shell_mock.focus_grid.mockReset();
+    grid_shell_mock.has_grid_focus.mockReset();
+    grid_shell_mock.has_grid_focus.mockReturnValue(true);
     grid_shell_mock.select_all.mockReset();
     grid_shell_mock.copy_sheet.mockReset();
     grid_shell_mock.copy_selection.mockReset();
@@ -1998,6 +2002,109 @@ describe('Excel first-row header toggle', () => {
         expect(grid_stub().getAttribute('data-row-heights')).toBe('{}');
         expect(grid_stub().getAttribute('data-mount-id')).not.toBe(old_mount);
         await vi.waitUntil(() => grid_shell_mock.focus_grid.mock.calls.length > 1);
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not steal newer focus when a header acknowledgement remounts the grid', async () => {
+        vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
+            generation: 4,
+            sourceGeneration: 7,
+        }));
+        post_message.mockClear();
+        grid_shell_mock.focus_grid.mockClear();
+
+        await click_button('Header Row');
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
+        const request = post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .find((message): message is Extract<
+                WebviewMessage,
+                { type: 'setExcelFirstRowHeader' }
+            > => message.type === 'setExcelFirstRowHeader')!;
+
+        // A newer interaction owns focus before the host answers. The Highlight
+        // dialog survives the grid remount, so the acknowledgement must not leave
+        // it open while moving keyboard control somewhere else.
+        await click_button('Highlight');
+        const focused_swatch = document.activeElement;
+        expect(focused_swatch?.getAttribute('role')).toBe('radio');
+        grid_shell_mock.has_grid_focus.mockReturnValue(false);
+
+        await dispatch_host_message(refresh_snapshot_message(excel_meta(false, 'off'), {
+            reason: 'excelHeader',
+            commandResult: {
+                type: 'excelFirstRowHeader',
+                requestId: request.requestId,
+                outcome: 'applied',
+            },
+            generation: 5,
+            sourceGeneration: 8,
+        }));
+        await vi.waitUntil(() => grid_shell_mock.has_grid_focus.mock.calls.length > 0);
+
+        expect(document.querySelector('.highlight-popover')).not.toBeNull();
+        expect(document.activeElement).toBe(focused_swatch);
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
+    });
+
+    it('preserves pending header focus across a newer snapshot before a stale result', async () => {
+        vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(excel_meta(true), {
+            generation: 4,
+            sourceGeneration: 7,
+        }));
+        post_message.mockClear();
+        grid_shell_mock.focus_grid.mockClear();
+
+        await click_button('Header Row');
+        const request = post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .find((message): message is Extract<
+                WebviewMessage,
+                { type: 'setExcelFirstRowHeader' }
+            > => message.type === 'setExcelFirstRowHeader')!;
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
+
+        // A newer same-file delivery wins and remounts the grid while the header
+        // result is still outstanding. The pending action must carry focus through
+        // that remount even though this delivery contains no command result.
+        await dispatch_host_message(refresh_snapshot_message(excel_meta(true), {
+            generation: 5,
+            sourceGeneration: 8,
+            identity: {
+                deliveryId: 10,
+                authority: { fileId: 'file:test', revision: 10 },
+                stateRevision: 10,
+                sourceBasis: { physicalRevision: 10, projectionRevision: 0 },
+            },
+        }));
+        await vi.waitUntil(() => grid_shell_mock.focus_grid.mock.calls.length > 1);
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledTimes(2);
+
+        // Retained command results are processed even on a stale delivery. It
+        // settles the request without applying (or remounting from) this snapshot.
+        await dispatch_host_message(refresh_snapshot_message(excel_meta(false, 'off'), {
+            reason: 'excelHeader',
+            commandResult: {
+                type: 'excelFirstRowHeader',
+                requestId: request.requestId,
+                outcome: 'applied',
+            },
+            generation: 4,
+            sourceGeneration: 7,
+            identity: {
+                deliveryId: 9,
+                authority: { fileId: 'file:test', revision: 9 },
+                stateRevision: 9,
+                sourceBasis: { physicalRevision: 9, projectionRevision: 0 },
+            },
+        }));
+
+        expect(document.querySelector('[role="status"]')?.textContent)
+            .toBe('Column names updated.');
         expect(grid_shell_mock.focus_grid).toHaveBeenCalledTimes(2);
     });
 

@@ -1560,7 +1560,14 @@ export function App(): React.JSX.Element {
                 // Retained results are independently idempotent: a duplicate or
                 // stale snapshot can still finish its matching command without
                 // rehydrating or regressing the UI.
+                const pending_grid_focus_sheet_before_result =
+                    pending_excel_header_grid_focus_ref.current.values().next().value;
+                const grid_owned_focus_before_snapshot =
+                    grid_focus_ref.current?.has_focus() === true;
                 process_command_result(snapshot.commandResult);
+                const grid_focus_sheet_for_snapshot =
+                    grid_focus_sheet_after_excel_header
+                    ?? pending_grid_focus_sheet_before_result;
 
                 if (disposition === 'applied') {
                     // Every applied snapshot is lifecycle-relevant, including the
@@ -1964,7 +1971,9 @@ export function App(): React.JSX.Element {
                     }
                     document_epoch_ref.current += 1;
                     set_grid_focus_restore(
-                        grid_focus_sheet_after_excel_header === next_active_sheet_index
+                        remounts_the_grid
+                            && grid_owned_focus_before_snapshot
+                            && grid_focus_sheet_for_snapshot === next_active_sheet_index
                             ? {
                                 sheet_index: next_active_sheet_index,
                                 generation: snapshot.generation,
