@@ -95,7 +95,7 @@ import {
     rich_cell_display_data,
     type CellEditOverlay,
 } from './cell-renderer';
-import { rich_text_cell_renderer } from './rich-text-cell-renderer';
+import { is_rich_text_cell, rich_text_cell_renderer } from './rich-text-cell-renderer';
 import { parse_http_external_url } from '../external-url';
 import type { CellHyperlink } from '../cell-content';
 import { HyperlinkDialog } from './hyperlink-dialog';
@@ -2090,18 +2090,32 @@ export function GridShell({
             const link = cell_hyperlink(display_column, row);
             if (!text && !link) return;
 
-            // A dirty value paints through the Text path even on a rich cell,
-            // so only an undirtied rich cell measures with the rich rule.
             const source_column = source_column_for_display(display_column);
             const source_row = get_source_row(row);
             const dirty = source_row !== undefined && source_column !== undefined
-                && store.get(cell_key(source_row, source_column)) !== undefined;
+                ? store.get(cell_key(source_row, source_column))
+                : undefined;
             const loaded = source_column === undefined
                 ? null
                 : get_row(row)?.[source_column] ?? null;
-            const rich_data = !dirty && loaded
-                ? rich_cell_display_data(loaded, show_formatting, font_size_px)
-                : undefined;
+            // Measure the same effective payload the grid paints. In particular,
+            // a pending Markdown edit may introduce styled runs into a plain or
+            // blank cell, and an empty dirty value must suppress persisted runs.
+            const rich_data = rich_cell_display_data(
+                loaded,
+                show_formatting,
+                font_size_px,
+                dirty
+                    ? {
+                        ...(dirty_entry_value_changed(dirty)
+                            ? { dirty_value: dirty.value }
+                            : {}),
+                        ...(edit_syntax === 'markdown' && dirty.valueRuns
+                            ? { dirty_rich: dirty.valueRuns }
+                            : {}),
+                    }
+                    : undefined,
+            );
             // Hover bounds are client-space geometry. A fractional canvas scale
             // can make a default 24px row arrive as 24.5px, which must not turn
             // every single-line cell into a soft-wrapped cell. Read the same
@@ -2188,6 +2202,7 @@ export function GridShell({
             get_cell_height,
             get_cell_width,
             show_formatting,
+            edit_syntax,
             source_column_for_display,
             store,
         ],
@@ -2381,6 +2396,9 @@ export function GridShell({
                     ...(dirty && dirty_entry_value_changed(dirty)
                         ? { dirty_value: dirty.value }
                         : {}),
+                    ...(edit_syntax === 'markdown' && dirty?.valueRuns
+                        ? { dirty_rich: dirty.valueRuns }
+                        : {}),
                     // The flash outranks every persistent tint for its half
                     // second, so the region an undo changed is legible even where
                     // the cells are also dirty, conflicted, or highlighted — which
@@ -2510,7 +2528,11 @@ export function GridShell({
                     ? captured.source_row
                     : resolve_source_row(row);
                 if (source_row === null) continue;
-                const text = value.kind === GridCellKind.Text ? value.data ?? '' : '';
+                const text = value.kind === GridCellKind.Text
+                    ? value.data ?? ''
+                    : value.kind === GridCellKind.Custom && is_rich_text_cell(value)
+                        ? value.data.edit_value ?? ''
+                        : '';
                 edits.push({ source_row, source_col: source_column, value: text });
 
                 // Auto-grow the row to fit hard line breaks (Shift+Alt+Enter),
@@ -2668,14 +2690,16 @@ export function GridShell({
         store,
     ]);
 
-    // Custom CSV overlay editor (Enter/Tab advance, Shift/Alt+Enter newline, Esc
-    // cancel). Only consulted for editable Text cells.
+    // Custom overlay editor (Enter/Tab advance, Shift/Alt+Enter newline, Esc
+    // cancel). Rich Markdown cells adapt through the same text editor so their
+    // canvas renderer can remain active throughout Edit mode.
     const provide_editor = useCallback<ProvideEditorCallback<GridCell>>(
         (cell) => {
             if (
                 save_in_flight_ref.current
                 || !editable_cells
-                || cell.kind !== GridCellKind.Text
+                || (cell.kind !== GridCellKind.Text
+                    && !(cell.kind === GridCellKind.Custom && is_rich_text_cell(cell)))
             ) return undefined;
             // disablePadding/disableStyling: the editor carries its own
             // .cell-editor-input border + background, so suppress Glide's overlay box.
