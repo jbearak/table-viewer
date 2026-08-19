@@ -281,6 +281,22 @@ be removed**, leaving a stale span after an insertion; a single-quoted dimension
 quote forms and whitespace around `=`, and preserve the original quote style.
 This is the "exact-span mutation" prerequisite the architecture review named.
 
+**Measured cost, accepted deliberately.** The lexer is ~5% slower on the hot
+path, reproducible across two runs (coordinate-scan 554 → 583/585 ms, +5.2%/+5.5%;
+full-save 2396 → 2611/2609 ms, +8.9%/+9.0%). The `perf:ooxml` gate passes, but
+this is signal, not the ±7% timing noise.
+
+The cause is structural, not sloppy code: the lexer walks attributes in document
+order, so reading `t` or `s` traverses the attributes before them, where the old
+regex jumped straight to a match. Notably the old code was *also* wasteful — it
+built a fresh `RegExp` per call (28 ms vs 9 ms cached across 200k calls) — so the
+lexer is not slow so much as honest.
+
+Accepted because the reader calls this ~3.7M times on the fixture and the
+alternative is returning a different cell's coordinate. Stage 6 rewrites this path
+onto bytes and should recover it; if it does not, a per-attribute fast path is the
+fallback.
+
 **Scope note: 30 `get_attr` call sites across 4 modules** — `parse-xlsx.ts`,
 `xlsx-hyperlink-write.ts`, `ooxml-relationships.ts`, `xlsx-rich-text.ts`. This is
 not a local change, so the lexer must be a strict improvement: every currently-
