@@ -1,9 +1,11 @@
 import {
+    decode_xml,
     find_tag_end,
     get_attr,
     ignorable_end,
     ignorable_ranges,
     is_tag_boundary,
+    is_self_closing,
     remove_attr,
     replace_attr_value,
     strip_illegal_xml_chars,
@@ -14,6 +16,7 @@ import {
     indexOf_live,
     letter_to_index,
     live_tags,
+    scan_cells,
     scan_rows,
     type ScanRowsOptions,
     type Span,
@@ -763,62 +766,351 @@ function has_unreadable_default_namespace(tag: string): boolean {
     return /(?:^|\s)xmlns\s*=/.test(outside_values);
 }
 
-type RefusalConsider = (
-    start: number,
-    rank: number,
-    code: OoxmlRefusalCode,
-    coordinate?: string,
-) => void;
-
-/** The first live opening construct in the XML part, after declarations and comments. */
-function first_live_markup_start(
-    xml: string,
-    ignorable: ReadonlyArray<[number, number]>,
-): number {
-    let pos = 0;
-    while (true) {
-        const at = xml.indexOf('<', pos);
-        if (at === -1) return -1;
-        const skip_to = ignorable_end(ignorable, at);
-        if (skip_to !== undefined) { pos = skip_to; continue; }
-        return at;
-    }
+interface RefusalCandidate {
+    readonly start: number;
+    readonly rank: number;
+    readonly code: OoxmlRefusalCode;
+    readonly coordinate?: string;
 }
 
-/** Record unsupported element identities, shared by normal and missing-sheetData paths. */
-function collect_element_identity_refusals(
-    xml: string,
-    ignorable: ReadonlyArray<[number, number]>,
-    sheet_data: Span | null,
-    consider: RefusalConsider,
-): void {
-    const live = (at: number): boolean => ignorable_end(ignorable, at) === undefined;
-    const root_start = first_live_markup_start(xml, ignorable);
-    const from = sheet_data?.inner_start ?? -1;
-    const to = sheet_data?.inner_end ?? -1;
+function earlier_refusal(
+    current: RefusalCandidate | undefined,
+    candidate: RefusalCandidate,
+): RefusalCandidate {
+    return current === undefined
+        || candidate.start < current.start
+        || (candidate.start === current.start && candidate.rank < current.rank)
+        ? candidate
+        : current;
+}
 
-    // Exact XML-name boundaries matter: `vendor:sheetData-cache` is an unrelated
-    // extension element, not a prefixed spelling of SpreadsheetML `sheetData`.
-    for (const m of xml.matchAll(
-        /<[A-Za-z_][\w.-]*:(worksheet|sheetData|row|c|f|is|v)(?=[ \t\n\r\/>])/g,
-    )) {
-        if (!live(m.index)) continue;
-        const local_name = m[1];
-        const relevant = local_name === 'worksheet'
-            ? m.index === root_start
-            : local_name === 'sheetData'
-                ? sheet_data === null
-                : m.index >= from && m.index < to;
-        if (relevant) consider(m.index, 0, 'namespace-prefixed-worksheet-element');
+interface NamespaceBinding {
+    readonly prefix: string;
+    readonly namespace: string;
+}
+
+interface NamespaceDeclarations {
+    readonly default_namespace?: string;
+    readonly bindings: readonly NamespaceBinding[];
+}
+
+/** Namespace declarations on one opening tag, decoded and in lexical order. */
+function namespace_declarations(tag: string): NamespaceDeclarations {
+    const bindings: NamespaceBinding[] = [];
+    let default_namespace: string | undefined;
+    let i = 1;
+
+    // Skip the element QName.
+    while (i < tag.length && !/[\s/>]/.test(tag[i])) i++;
+    while (i < tag.length) {
+        while (i < tag.length && /[\s]/.test(tag[i])) i++;
+        if (i >= tag.length || tag[i] === '/' || tag[i] === '>') break;
+
+        const name_start = i;
+        while (i < tag.length && !/[\s=/>]/.test(tag[i])) i++;
+        const name = tag.slice(name_start, i);
+        while (i < tag.length && /[\s]/.test(tag[i])) i++;
+        if (tag[i] !== '=') {
+            while (i < tag.length && !/[\s>]/.test(tag[i])) i++;
+            continue;
+        }
+        i++;
+        while (i < tag.length && /[\s]/.test(tag[i])) i++;
+        const quote = tag[i];
+        if (quote !== '"' && quote !== "'") {
+            while (i < tag.length && !/[\s>]/.test(tag[i])) i++;
+            continue;
+        }
+        const value_start = ++i;
+        const value_end = tag.indexOf(quote, value_start);
+        if (value_end === -1) break;
+        const value = decode_xml(tag.slice(value_start, value_end));
+        if (name === 'xmlns') default_namespace = value;
+        else if (name.startsWith('xmlns:') && name.length > 'xmlns:'.length) {
+            bindings.push({ prefix: name.slice('xmlns:'.length), namespace: value });
+        }
+        i = value_end + 1;
+    }
+    return { default_namespace, bindings };
+}
+
+interface NamespaceFrame {
+    readonly qname: string;
+    readonly default_namespace: string;
+    readonly bindings: readonly NamespaceBinding[];
+    readonly start: number;
+    readonly worksheet_document: boolean;
+    readonly inside_sheet_data: boolean;
+    readonly missing_sheet_data_alternate: boolean;
+}
+
+function resolve_prefix(
+    stack: readonly NamespaceFrame[],
+    own: readonly NamespaceBinding[],
+    prefix: string,
+): string {
+    for (let i = own.length - 1; i >= 0; i--) {
+        if (own[i].prefix === prefix) return own[i].namespace;
+    }
+    for (let depth = stack.length - 1; depth >= 0; depth--) {
+        const bindings = stack[depth].bindings;
+        for (let i = bindings.length - 1; i >= 0; i--) {
+            if (bindings[i].prefix === prefix) return bindings[i].namespace;
+        }
+    }
+    return prefix === 'xml' ? 'http://www.w3.org/XML/1998/namespace' : '';
+}
+
+const MARKUP_COMPATIBILITY_NS
+    = 'http://schemas.openxmlformats.org/markup-compatibility/2006';
+
+interface WorksheetStructure {
+    readonly sheet_data: Span | null;
+    /** Earliest structural refusal when an authoritative sheetData exists. */
+    readonly refusal?: RefusalCandidate;
+    /** Earliest explanatory refusal when no authoritative sheetData exists. */
+    readonly missing_sheet_data_refusal?: RefusalCandidate;
+}
+
+/** Where one comment, CDATA section, or processing instruction ends. */
+function quoted_markup_end(xml: string, start: number): number | undefined {
+    let close: number;
+    let width: number;
+    if (xml.startsWith('<!--', start)) {
+        close = xml.indexOf('-->', start + 4);
+        width = 3;
+    } else if (xml.startsWith('<![CDATA[', start)) {
+        close = xml.indexOf(']]>', start + 9);
+        width = 3;
+    } else if (xml.startsWith('<?', start)) {
+        close = xml.indexOf('?>', start + 2);
+        width = 2;
+    } else {
+        return undefined;
+    }
+    return close === -1 ? xml.length : close + width;
+}
+
+/** Could any element inside this sheetData alter a refusal decision? */
+function needs_namespace_body_scan(xml: string, from: number, to: number): boolean {
+    const declaration = xml.indexOf('xmlns', from);
+    if (declaration !== -1 && declaration < to) return true;
+    // Exact MC elements either carry/use a namespace declaration or have a
+    // prefixed QName. The same prefixed-QName test covers row/c/f/is/v identity.
+    const prefixed_element = /<[^\s!?/<>][^\s/<>]*:/g;
+    prefixed_element.lastIndex = from;
+    const match = prefixed_element.exec(xml);
+    return match !== null && match.index < to;
+}
+
+/**
+ * Locate the worksheet document element and its direct `sheetData` child while
+ * resolving namespace declarations with an O(depth) SAX-style stack.
+ *
+ * This walk exists only for writer safety decisions. The shared reader remains on
+ * its allocation-light literal scanner, and offsets remain UTF-16 string indices
+ * until Stage 6. Frames are discarded at each end tag; no worksheet-sized element
+ * tree or namespace map is retained. Ordinary worksheets with no namespace
+ * declarations or prefixed elements in `sheetData` take a native-search fast path
+ * and do not pay for a second per-cell token walk.
+ */
+function scan_worksheet_structure(xml: string): WorksheetStructure {
+    const stack: NamespaceFrame[] = [];
+    let pos = 0;
+    let saw_document_element = false;
+    let saw_sheet_data = false;
+    let worksheet_namespace = SPREADSHEETML_NS;
+    let sheet_data: Span | null = null;
+    let refusal: RefusalCandidate | undefined;
+    let missing_sheet_data_refusal: RefusalCandidate | undefined;
+
+    const consider = (
+        target: 'both' | 'sheet-data' | 'missing-sheet-data',
+        start: number,
+        rank: number,
+        code: OoxmlRefusalCode,
+    ): void => {
+        const candidate = { start, rank, code };
+        if (target !== 'missing-sheet-data') refusal = earlier_refusal(refusal, candidate);
+        if (target !== 'sheet-data') {
+            missing_sheet_data_refusal = earlier_refusal(missing_sheet_data_refusal, candidate);
+        }
+    };
+
+    while (pos < xml.length) {
+        const start = xml.indexOf('<', pos);
+        if (start === -1 || (sheet_data !== null && start >= sheet_data.inner_end)) break;
+        const quoted_end = quoted_markup_end(xml, start);
+        if (quoted_end !== undefined) { pos = quoted_end; continue; }
+
+        // Other declarations are not elements and therefore do not establish the
+        // document element or contribute to element depth.
+        if (xml.startsWith('<!', start)) {
+            const end = find_tag_end(xml, start);
+            if (end === -1) break;
+            pos = end + 1;
+            continue;
+        }
+
+        const tag_end = find_tag_end(xml, start);
+        if (tag_end === -1) break;
+        const closing = xml.startsWith('</', start);
+        if (closing) {
+            let name_end = start + 2;
+            while (name_end < tag_end && !/[\s>]/.test(xml[name_end])) name_end++;
+            const closing_qname = xml.slice(start + 2, name_end);
+            const frame = stack[stack.length - 1];
+            // A mismatched close means this is not a complete worksheet structure.
+            // Stop rather than deriving writable spans from malformed nesting.
+            if (frame === undefined || frame.qname !== closing_qname) break;
+            stack.pop();
+            pos = tag_end + 1;
+            continue;
+        }
+
+        const open_tag = xml.slice(start, tag_end + 1);
+        let name_end = 1;
+        while (name_end < open_tag.length && !/[\s/>]/.test(open_tag[name_end])) name_end++;
+        const qname = open_tag.slice(1, name_end);
+        const colon = qname.indexOf(':');
+        const prefix = colon === -1 ? undefined : qname.slice(0, colon);
+        const local_name = colon === -1 ? qname : qname.slice(colon + 1);
+        const declarations = namespace_declarations(open_tag);
+        const parent = stack[stack.length - 1];
+        const worksheet_document = !saw_document_element && local_name === 'worksheet';
+        const implicit_worksheet_namespace = worksheet_document
+            && prefix === undefined
+            && declarations.default_namespace === undefined;
+        const default_namespace = declarations.default_namespace
+            ?? parent?.default_namespace
+            ?? (implicit_worksheet_namespace ? SPREADSHEETML_NS : '');
+        const namespace = prefix === undefined
+            ? default_namespace
+            : resolve_prefix(stack, declarations.bindings, prefix);
+        const direct_worksheet_child = parent?.worksheet_document === true;
+        const authoritative_sheet_data = !saw_sheet_data
+            && direct_worksheet_child
+            && prefix === undefined
+            && local_name === 'sheetData';
+        const inside_sheet_data = authoritative_sheet_data
+            || parent?.inside_sheet_data === true;
+        const exact_alternate_content = local_name === 'AlternateContent'
+            && namespace === MARKUP_COMPATIBILITY_NS;
+        const missing_sheet_data_alternate = direct_worksheet_child
+            && exact_alternate_content;
+
+        if (!saw_document_element) {
+            saw_document_element = true;
+            if (worksheet_document) {
+                worksheet_namespace = namespace;
+                if (prefix !== undefined) {
+                    consider('both', start, 0, 'namespace-prefixed-worksheet-element');
+                }
+                if (
+                    !is_spreadsheetml_namespace(namespace)
+                    || (declarations.default_namespace === undefined
+                        && has_unreadable_default_namespace(open_tag))
+                ) {
+                    consider('both', start, 1, 'foreign-worksheet-namespace');
+                }
+            }
+        }
+
+        if (authoritative_sheet_data) {
+            saw_sheet_data = true;
+            if (
+                namespace !== worksheet_namespace
+                || (declarations.default_namespace === undefined
+                    && has_unreadable_default_namespace(open_tag))
+            ) {
+                consider('sheet-data', start, 1, 'foreign-worksheet-namespace');
+            }
+            // Use the exact boundary scanner shared with the reader. The namespace
+            // walk decides structural eligibility; it must not introduce a second
+            // notion of where the selected body closes.
+            sheet_data = find_first_element(xml, 'sheetData', start);
+            if (sheet_data === null) break;
+            if (
+                sheet_data.inner_start === sheet_data.end
+                || !needs_namespace_body_scan(
+                    xml,
+                    sheet_data.inner_start,
+                    sheet_data.inner_end,
+                )
+            ) {
+                return { sheet_data, refusal, missing_sheet_data_refusal };
+            }
+        } else if (
+            !saw_sheet_data
+            && direct_worksheet_child
+            && prefix !== undefined
+            && local_name === 'sheetData'
+            && is_spreadsheetml_namespace(namespace)
+        ) {
+            // This explains a missing literal worksheet body only when it occupies
+            // the real structural slot and is genuinely SpreadsheetML.
+            consider('missing-sheet-data', start, 0, 'namespace-prefixed-worksheet-element');
+        }
+
+        if (
+            inside_sheet_data
+            && prefix !== undefined
+            && (local_name === 'row'
+                || local_name === 'c'
+                || local_name === 'f'
+                || local_name === 'is'
+                || local_name === 'v')
+        ) {
+            consider('sheet-data', start, 0, 'namespace-prefixed-worksheet-element');
+        }
+        if (
+            inside_sheet_data
+            && prefix === undefined
+            && (local_name === 'row' || local_name === 'c' || local_name === 'f')
+            && (
+                namespace !== worksheet_namespace
+                || (declarations.default_namespace === undefined
+                    && has_unreadable_default_namespace(open_tag))
+            )
+        ) {
+            consider('sheet-data', start, 1, 'foreign-worksheet-namespace');
+        }
+        if (inside_sheet_data && exact_alternate_content) {
+            consider('sheet-data', start, 0, 'markup-compatibility-alternate-content');
+        }
+
+        // With no direct worksheet body, an exact MC wrapper is explanatory only
+        // when it is itself a worksheet child and contains a SpreadsheetML
+        // `sheetData` candidate in one of its alternatives.
+        if (local_name === 'sheetData' && is_spreadsheetml_namespace(namespace)) {
+            for (let depth = stack.length - 1; depth >= 0; depth--) {
+                if (stack[depth].missing_sheet_data_alternate) {
+                    consider(
+                        'missing-sheet-data',
+                        stack[depth].start,
+                        0,
+                        'markup-compatibility-alternate-content',
+                    );
+                    break;
+                }
+            }
+        }
+
+        if (!is_self_closing(xml, start, tag_end)) {
+            stack.push({
+                qname,
+                default_namespace,
+                bindings: declarations.bindings,
+                start,
+                worksheet_document,
+                inside_sheet_data,
+                missing_sheet_data_alternate,
+            });
+        }
+        pos = tag_end + 1;
     }
 
-    // AlternateContent can wrap sheetData itself, so its opening construct belongs
-    // to the whole worksheet part rather than only the selected sheetData body.
-    for (const m of xml.matchAll(
-        /<(?:[A-Za-z_][\w.-]*:)?AlternateContent(?=[ \t\n\r\/>])/g,
-    )) {
-        if (live(m.index)) consider(m.index, 0, 'markup-compatibility-alternate-content');
-    }
+    return { sheet_data, refusal, missing_sheet_data_refusal };
 }
 
 /**
@@ -832,108 +1124,24 @@ function collect_element_identity_refusals(
  */
 function assert_writable_sheet_data(
     xml: string,
-    sheet_data: Span,
+    structure: WorksheetStructure,
     scan_options?: Pick<ScanRowsOptions, 'capture_cell' | 'on_cell'>,
 ): Map<number, Span[]> {
-    interface RefusalCandidate {
-        readonly start: number;
-        readonly rank: number;
-        readonly code: OoxmlRefusalCode;
-        readonly coordinate?: string;
-    }
-
-    let first: RefusalCandidate | undefined;
+    const sheet_data = structure.sheet_data;
+    if (sheet_data === null) throw new Error('Worksheet XML has no <sheetData> element');
+    let first = structure.refusal;
     const consider = (
         start: number,
         rank: number,
         code: OoxmlRefusalCode,
         coordinate?: string,
     ): void => {
-        if (
-            first === undefined
-            || start < first.start
-            || (start === first.start && rank < first.rank)
-        ) {
-            first = { start, rank, code, coordinate };
-        }
+        first = earlier_refusal(first, { start, rank, code, coordinate });
     };
 
-    // Offsets stay absolute so the ignorable ranges line up. Comments, CDATA and
-    // processing instructions are text to both shared scanners and cannot establish
-    // a refusal.
-    const ignorable = ignorable_ranges(xml, 0, xml.length);
-    const from = sheet_data.inner_start;
-    const to = sheet_data.inner_end;
-
-    // A prefix makes an element invisible to the literal-name scanner. In a mixed
-    // document an unseen `<x:f>` can be overwritten while formula_count observes no
-    // loss, leaving calcChain attached and stale. A prefixed worksheet or sheetData
-    // is the same ambiguity at a structural level.
-    //
-    // AlternateContent holds alternative spellings of the same content, selected by
-    // the namespaces a consumer understands. Editing one branch alone can report
-    // success while another consumer keeps displaying the unchanged branch. It may
-    // wrap sheetData itself, so both identities are collected over the whole part.
-    collect_element_identity_refusals(xml, ignorable, sheet_data, consider);
-    // A default-namespace override rebinds the element and every unprefixed
-    // descendant. A `<c>` spliced under a foreign worksheet, sheetData or row then
-    // inherits that namespace, so the save reports success but writes no worksheet
-    // cell. Evaluate the effective binding along worksheet → sheetData → row → c.
-    //
-    // Only the default declaration matters: `xmlns:vendor="…"` leaves unprefixed
-    // cells in SpreadsheetML. Redundantly redeclaring SpreadsheetML is legal and
-    // remains allowed. An unreadable default declaration fails closed.
-    const effective_namespace = (
-        parent: string,
-        tag: string,
-        start: number,
-    ): string => {
-        const declared = get_attr(tag, 'xmlns');
-        if (declared !== null) {
-            if (!is_spreadsheetml_namespace(declared)) {
-                consider(start, 1, 'foreign-worksheet-namespace');
-            }
-            return declared;
-        }
-        if (has_unreadable_default_namespace(tag)) {
-            consider(start, 1, 'foreign-worksheet-namespace');
-        }
-        return parent;
-    };
-
-    const worksheet = find_first_element(xml, 'worksheet');
-    const worksheet_namespace = worksheet === null
-        ? SPREADSHEETML_NS
-        : effective_namespace(SPREADSHEETML_NS, worksheet.open_tag, worksheet.start);
-    const sheet_data_namespace = effective_namespace(
-        worksheet_namespace,
-        sheet_data.open_tag,
-        sheet_data.start,
-    );
-
-    // `scan_rows` invokes on_row immediately before that owner's cells, so one
-    // carried binding covers the current row without a second sheet-sized map.
-    let current_row_namespace = sheet_data_namespace;
-    // `<f xmlns="urn:other">` was part of the existing refusal surface. It is not
-    // on the structural path, so only its explicit declaration can establish a new
-    // candidate; an inherited foreign binding is already anchored above.
-    for (const [start, tag] of live_tags(xml, 'f', from, to, ignorable)) {
-        effective_namespace(SPREADSHEETML_NS, tag, start);
-    }
-
-    const rows = scan_rows(xml, from, to, {
+    const rows = scan_rows(xml, sheet_data.inner_start, sheet_data.inner_end, {
         ...scan_options,
-        on_row: (row) => {
-            current_row_namespace = effective_namespace(
-                sheet_data_namespace,
-                row.open_tag,
-                row.start,
-            );
-        },
-        on_reference: (reference, open_tag) => {
-            // Called for its `consider` side effect: a declaration on `<c>` can be
-            // foreign even though the resolved namespace is not needed afterwards.
-            effective_namespace(current_row_namespace, open_tag, reference.start);
+        on_reference: (reference) => {
             if (reference.kind === 'missing') {
                 // Excel infers this cell's position from document order. Our
                 // coordinate-only contract has no equivalent position, so inserting
@@ -951,9 +1159,7 @@ function assert_writable_sheet_data(
             }
         },
     });
-    if (first !== undefined) {
-        throw new OoxmlRefusalError(first.code, first.coordinate);
-    }
+    if (first !== undefined) throw new OoxmlRefusalError(first.code, first.coordinate);
     return rows;
 }
 
@@ -988,7 +1194,7 @@ export function cells_present(
         else by_row.set(row, [col]);
     }
     if (by_row.size === 0) return found;
-    const sheet_data = find_first_element(xml, 'sheetData');
+    const sheet_data = scan_worksheet_structure(xml).sheet_data;
     if (!sheet_data) return found;
     scan_rows(xml, sheet_data.inner_start, sheet_data.inner_end, {
         on_coordinate: (row, col) => {
@@ -1016,36 +1222,14 @@ export function apply_cell_edits(
     if (edits.length === 0) return xml;
     edits = canonical_edits(edits);
 
-    const sheet_data = find_first_element(xml, 'sheetData');
+    const structure = scan_worksheet_structure(xml);
+    const sheet_data = structure.sheet_data;
     if (!sheet_data) {
-        // Structured constructs can explain why the literal-name scanner found no
-        // sheetData. Compare them in document order before the generic structural
-        // error; AlternateContent may itself wrap the unavailable sheetData.
-        const ignorable = ignorable_ranges(xml, 0, xml.length);
-        let first: { start: number; rank: number; code: OoxmlRefusalCode } | undefined;
-        const consider = (start: number, rank: number, code: OoxmlRefusalCode): void => {
-            if (
-                first === undefined
-                || start < first.start
-                || (start === first.start && rank < first.rank)
-            ) first = { start, rank, code };
-        };
-        collect_element_identity_refusals(xml, ignorable, null, consider);
-        const worksheet = find_first_element(xml, 'worksheet');
-        if (worksheet !== null) {
-            const declared = get_attr(worksheet.open_tag, 'xmlns');
-            if (
-                (declared !== null && !is_spreadsheetml_namespace(declared))
-                || (declared === null && has_unreadable_default_namespace(worksheet.open_tag))
-            ) {
-                consider(worksheet.start, 1, 'foreign-worksheet-namespace');
-            }
-        }
+        const first = structure.missing_sheet_data_refusal;
         if (first !== undefined) throw new OoxmlRefusalError(first.code);
         throw new Error('Worksheet XML has no <sheetData> element');
     }
     const {
-        inner_start,
         inner_end,
         start: element_start,
         end: element_end,
@@ -1077,20 +1261,15 @@ export function apply_cell_edits(
         else by_row.set(e.row, [e]);
     }
     const cells_by_row = new Map<number, Map<number, Span>>();
-    const owners_by_row = new Map<number, Map<number, Span>>();
-    const rows = assert_writable_sheet_data(xml, sheet_data, {
+    const rows = assert_writable_sheet_data(xml, structure, {
         capture_cell: (row) => by_row.has(row),
-        on_cell: (row, col, cell, owner) => {
+        on_cell: (row, col, cell) => {
             let cells = cells_by_row.get(row);
-            let owners = owners_by_row.get(row);
-            if (!cells || !owners) {
+            if (!cells) {
                 cells = new Map();
-                owners = new Map();
                 cells_by_row.set(row, cells);
-                owners_by_row.set(row, owners);
             }
             cells.set(col, cell);
-            owners.set(col, owner);
         },
     });
 
@@ -1120,6 +1299,11 @@ export function apply_cell_edits(
         }
     }
 
+    // A numbered row can legally own cells whose references name other rows. Cache
+    // a bounded rescan only for owner elements that receive inserts, so positioning
+    // sees every existing column in that owner without retaining sheet-wide spans.
+    const ordering_cells_by_owner = new Map<Span, Map<number, Span>>();
+
     for (const [row, row_edits] of by_row) {
         const row_spans = rows.get(row);
         if (!row_spans || row_spans.length === 0) {
@@ -1134,11 +1318,8 @@ export function apply_cell_edits(
 
         // Merged across every element claiming this row, last-wins per column —
         // the reader's rule exactly, since it keys each `<c r=…>` into a map as it
-        // scans and never decides anything at row granularity. `owner` remembers
-        // which element a surviving cell came from, because an insert may only be
-        // positioned against cells inside the element it is being spliced into.
+        // scans and never decides anything at row granularity.
         const cells = cells_by_row.get(row) ?? new Map<number, Span>();
-        const owner = owners_by_row.get(row) ?? new Map<number, Span>();
         // New coordinates go into the element the reader treats as authoritative
         // for anything it already holds: the last one.
         const row_span = row_spans[row_spans.length - 1];
@@ -1228,6 +1409,11 @@ export function apply_cell_edits(
                 text: remove_attr(row_span.open_tag, 'spans'),
             });
         }
+        let ordering_cells = ordering_cells_by_owner.get(row_span);
+        if (!ordering_cells && inserts.length > 0) {
+            ordering_cells = scan_cells(xml, row_span.inner_start, row_span.inner_end);
+            ordering_cells_by_owner.set(row_span, ordering_cells);
+        }
         for (const ins of inserts) {
             // The span's own content end, not `end - '</row>'.length`: an end tag may
             // legally be written `</row\n>`, and the subtraction then landed *inside*
@@ -1235,12 +1421,7 @@ export function apply_cell_edits(
             // malformed XML.
             let at = row_span.inner_end;
             let best: number | undefined;
-            for (const [col, span] of cells) {
-                // Only cells living inside the element being spliced can position an
-                // insert: a higher-column cell in a *different* `<row>` element is
-                // at an offset outside this one, and inserting there would splice
-                // the new `<c>` into somebody else's row.
-                if (owner.get(col) !== row_span) continue;
+            for (const [col, span] of ordering_cells ?? []) {
                 if (col > ins.col && (best === undefined || span.start < best)) best = span.start;
             }
             if (best !== undefined) at = best;

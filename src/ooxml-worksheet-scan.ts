@@ -386,13 +386,12 @@ export function scan_rows(
 /**
  * Locate every `<c>` element inside one row's inner range, keyed by column index.
  *
- * `row` is the row the caller is editing, and cells naming a *different* row are
- * skipped. One row element may contain cells naming several rows, whether or not
- * its own `r` attribute is present or agrees; `scan_rows` maps that shared span
- * under every referenced row. Matching only the column here could otherwise
- * return a neighbouring row's cell from the same owner.
+ * With `row`, cells naming a different row are skipped. Without it, the earliest
+ * cell for each column is returned so a writer can place a new cell in column order
+ * across a mixed-row owner. One row element may contain cells naming several rows,
+ * whether or not its own `r` attribute is present or agrees.
  */
-export function scan_cells(xml: string, from: number, to: number, row: number): Map<number, Span> {
+export function scan_cells(xml: string, from: number, to: number, row?: number): Map<number, Span> {
     const out = new Map<number, Span>();
     scan_cell_elements(
         xml,
@@ -400,14 +399,17 @@ export function scan_cells(xml: string, from: number, to: number, row: number): 
         to,
         ignorable_ranges(xml, from, to),
         (reference, end, inner_start, inner_end, open_tag) => {
-            if (reference.kind === 'valid' && reference.row === row) {
-                out.set(reference.col, {
-                    start: reference.start,
-                    end,
-                    inner_start,
-                    inner_end,
-                    open_tag,
-                });
+            if (reference.kind !== 'valid' || (row !== undefined && reference.row !== row)) return;
+            const span = {
+                start: reference.start,
+                end,
+                inner_start,
+                inner_end,
+                open_tag,
+            };
+            const existing = out.get(reference.col);
+            if (row !== undefined || existing === undefined || span.start < existing.start) {
+                out.set(reference.col, span);
             }
         },
     );

@@ -807,15 +807,31 @@ describe('apply_cell_edits', () => {
         )).toContain('<c r="A2"><v>9</v></c>');
     });
 
-    it('refuses a namespace-prefixed formula element with a stable code', () => {
-        expect_refusal(
-            () => apply_cell_edits(
-                doc('<row r="1"><c r="A1"><x:f t="array" ref="A1:B2">SUM(1)</x:f><v>1</v></c></row>'),
-                [{ row: 0, col: 0, value: '2' }],
-                OPTS,
-            ),
-            'namespace-prefixed-worksheet-element',
+    it('orders an inserted cell across every logical row in its owner', () => {
+        // Deleting the row/c disagreement guard makes this mixed owner editable.
+        // A2 must be positioned against B1 as well as C2, not inserted between
+        // them from the edited logical row's partial coordinate map.
+        const out = apply_cell_edits(
+            doc('<row r="1"><c r="B1"/><c r="C2"/></row>'),
+            [{ row: 1, col: 0, value: '9' }],
+            OPTS,
         );
+        expect(out.indexOf('<c r="A2"')).toBeLessThan(out.indexOf('<c r="B1"'));
+        expect(out.indexOf('<c r="B1"')).toBeLessThan(out.indexOf('<c r="C2"'));
+    });
+
+    it('refuses a namespace-prefixed formula element with a stable code', () => {
+        for (const prefix of ['x', 'π']) {
+            expect_refusal(
+                () => apply_cell_edits(
+                    doc(`<row r="1"><c r="A1"><${prefix}:f t="array" ref="A1:B2">`
+                        + `SUM(1)</${prefix}:f><v>1</v></c></row>`),
+                    [{ row: 0, col: 0, value: '2' }],
+                    OPTS,
+                ),
+                'namespace-prefixed-worksheet-element',
+            );
+        }
     });
 
     it('edits single-quoted row and cell references in place', () => {
@@ -976,6 +992,8 @@ describe('apply_cell_edits', () => {
             `<worksheet xmlns="urn:other"><sheetData>${cell}</sheetData></worksheet>`,
             `<worksheet><sheetData xmlns="urn:other">${cell}</sheetData></worksheet>`,
             `<worksheet><sheetData><row r="1"><c xmlns="urn:other" r="A1"><v>1</v></c></row></sheetData></worksheet>`,
+            '<worksheet><sheetData><wrapper xmlns="urn:other">'
+                + `${cell}</wrapper></sheetData></worksheet>`,
         ]) {
             expect_refusal(
                 () => apply_cell_edits(xml, [{ row: 0, col: 0, value: '2' }], OPTS),
@@ -995,7 +1013,7 @@ describe('apply_cell_edits', () => {
         );
     });
 
-    it('allows both SpreadsheetML namespaces and redundant structural declarations', () => {
+    it('allows either SpreadsheetML dialect at the root and redundant declarations', () => {
         for (const ns of [
             'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
             'http://purl.oclc.org/ooxml/spreadsheetml/main',
@@ -1008,28 +1026,91 @@ describe('apply_cell_edits', () => {
         }
     });
 
-    it('classifies a prefixed sheetData as a prefixed worksheet element', () => {
+    it('refuses a cross-dialect descendant under a Transitional root', () => {
+        const transitional = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+        const strict = 'http://purl.oclc.org/ooxml/spreadsheetml/main';
         expect_refusal(
             () => apply_cell_edits(
-                '<worksheet><x:sheetData xmlns:x="urn:other"/></worksheet>',
+                `<worksheet xmlns="${transitional}"><sheetData>`
+                + `<row xmlns="${strict}" r="1"><c r="A1"><v>1</v></c></row>`
+                + '</sheetData></worksheet>',
                 [{ row: 0, col: 0, value: '2' }],
                 OPTS,
             ),
-            'namespace-prefixed-worksheet-element',
+            'foreign-worksheet-namespace',
         );
     });
 
-    it('ignores similarly named prefixed elements in extension payloads', () => {
+    it('classifies a structurally eligible prefixed SpreadsheetML sheetData', () => {
+        const ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+        for (const xml of [
+            `<worksheet><x:sheetData xmlns:x="${ns}"/></worksheet>`,
+            `<worksheet xmlns:x="${ns}"><x:sheetData/></worksheet>`,
+        ]) {
+            expect_refusal(
+                () => apply_cell_edits(
+                    xml,
+                    [{ row: 0, col: 0, value: '2' }],
+                    OPTS,
+                ),
+                'namespace-prefixed-worksheet-element',
+            );
+        }
+    });
+
+    it('leaves a foreign prefixed sheetData as the plain structural error', () => {
+        let caught: unknown;
+        try {
+            apply_cell_edits(
+                '<worksheet><v:sheetData xmlns:v="urn:vendor"/></worksheet>',
+                [{ row: 0, col: 0, value: '2' }],
+                OPTS,
+            );
+        } catch (error) {
+            caught = error;
+        }
+        expect(caught).toBeInstanceOf(Error);
+        expect(caught).not.toBeInstanceOf(OoxmlRefusalError);
+        expect((caught as Error).message).toMatch(/no <sheetData>/);
+    });
+
+    it('ignores similarly named elements and AlternateContent in disjoint extensions', () => {
         const extensions = '<extLst><ext xmlns:v="urn:vendor">'
             + '<v:worksheet/>'
             + '<v:sheetData/>'
             + '<v:sheetData-cache/>'
             + '<v:worksheet.meta/>'
+            + '<v:AlternateContent/>'
+            + '</ext><ext xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">'
+            + '<mc:AlternateContent/>'
             + '</ext></extLst>';
         const xml = '<worksheet><sheetData><row r="1"><c r="A1"><v>1</v></c></row>'
             + `</sheetData>${extensions}</worksheet>`;
         expect(apply_cell_edits(xml, [{ row: 0, col: 0, value: '2' }], OPTS))
             .toContain('<c r="A1"><v>2</v></c>');
+    });
+
+    it('never selects a nested vendor sheetData as the worksheet body', () => {
+        const nested = '<extLst><ext xmlns="urn:vendor"><sheetData marker="vendor"/></ext></extLst>';
+        let caught: unknown;
+        try {
+            apply_cell_edits(
+                `<worksheet>${nested}</worksheet>`,
+                [{ row: 0, col: 0, value: '2' }],
+                OPTS,
+            );
+        } catch (error) {
+            caught = error;
+        }
+        expect(caught).toBeInstanceOf(Error);
+        expect(caught).not.toBeInstanceOf(OoxmlRefusalError);
+        expect((caught as Error).message).toMatch(/no <sheetData>/);
+
+        const xml = `<worksheet>${nested}<sheetData>`
+            + '<row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>';
+        const out = apply_cell_edits(xml, [{ row: 0, col: 0, value: '3' }], OPTS);
+        expect(out).toContain('<sheetData marker="vendor"/>');
+        expect(out).toContain('<sheetData><row r="1"><c r="A1"><v>3</v></c></row></sheetData>');
     });
 
     it('uses document order when no unprefixed sheetData is present', () => {
@@ -1060,8 +1141,9 @@ describe('apply_cell_edits', () => {
             'A0',
         );
 
-        const late_alternate = '<AlternateContent><Choice><row r="2"><c r="A2"/></row>'
-            + '</Choice></AlternateContent>';
+        const late_alternate = '<mc:AlternateContent '
+            + 'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">'
+            + '<mc:Choice><row r="2"><c r="A2"/></row></mc:Choice></mc:AlternateContent>';
         expect_refusal(
             () => apply_cell_edits(doc(early_invalid + late_alternate), [{ row: 0, col: 0, value: '2' }], OPTS),
             'invalid-cell-reference',
@@ -1092,36 +1174,68 @@ describe('apply_cell_edits', () => {
         );
     });
 
-    it('refuses markup-compatibility alternate content', () => {
+    it('refuses exact markup-compatibility AlternateContent inside sheetData', () => {
         // Both branches spell row 1 / A1, and which one a reader believes depends
-        // on whether it understands `Requires`. The scans are flat coordinate maps,
-        // so the last branch won: the edit landed in `mc:Fallback` alone, every
-        // application honouring the `mc:Choice` kept showing the old value, and the
-        // save reported success.
-        const inner = '<mc:AlternateContent'
-            + ' xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">'
-            + '<mc:Choice Requires="x14">'
-            + '<row r="1"><c r="A1" t="inlineStr"><is><t>choice</t></is></c></row></mc:Choice>'
-            + '<mc:Fallback>'
-            + '<row r="1"><c r="A1" t="inlineStr"><is><t>fallback</t></is></c></row></mc:Fallback>'
-            + '</mc:AlternateContent>';
+        // on whether it understands `Requires`. Any legal prefix may bind the MC
+        // namespace; the expanded name, not the spelling `mc:`, identifies it.
+        const inner = '<z:AlternateContent'
+            + ' xmlns:z="http://schemas.openxmlformats.org/markup-compatibility/2006">'
+            + '<z:Choice Requires="x14">'
+            + '<row r="1"><c r="A1" t="inlineStr"><is><t>choice</t></is></c></row></z:Choice>'
+            + '<z:Fallback>'
+            + '<row r="1"><c r="A1" t="inlineStr"><is><t>fallback</t></is></c></row></z:Fallback>'
+            + '</z:AlternateContent>';
         expect_refusal(
             () => apply_cell_edits(doc(inner), [{ row: 0, col: 0, value: 'edited' }], OPTS),
             'markup-compatibility-alternate-content',
         );
-        // The prefix is a convention, not a rule; an unprefixed default-namespace
-        // spelling is the same element and the same hazard.
-        const bare = '<AlternateContent><Choice Requires="x14">'
-            + '<row r="1"><c r="A1"><v>1</v></c></row></Choice>'
-            + '<Fallback><row r="1"><c r="A1"><v>2</v></c></row></Fallback></AlternateContent>';
+
+        const default_bound = '<AlternateContent '
+            + 'xmlns="http://schemas.openxmlformats.org/markup-compatibility/2006">'
+            + '<Choice/></AlternateContent>';
         expect_refusal(
-            () => apply_cell_edits(doc(bare), [{ row: 0, col: 0, value: '3' }], OPTS),
+            () => apply_cell_edits(doc(default_bound), [{ row: 0, col: 0, value: '3' }], OPTS),
             'markup-compatibility-alternate-content',
         );
     });
 
-    it('refuses alternate content that wraps sheetData itself', () => {
-        const wrapped = '<worksheet><mc:AlternateContent xmlns:mc="urn:mc">'
+    it('resolves inherited and rebound AlternateContent prefixes by scope', () => {
+        const mc = 'http://schemas.openxmlformats.org/markup-compatibility/2006';
+        const inherited = '<holder xmlns:z="' + mc + '"><z:AlternateContent/></holder>';
+        expect_refusal(
+            () => apply_cell_edits(doc(inherited), [{ row: 0, col: 0, value: '3' }], OPTS),
+            'markup-compatibility-alternate-content',
+        );
+
+        const rebound = '<holder xmlns:z="' + mc + '"><inner xmlns:z="urn:vendor">'
+            + '<z:AlternateContent/></inner></holder>';
+        expect(apply_cell_edits(
+            doc('<row r="1"><c r="A1"><v>1</v></c></row>' + rebound),
+            [{ row: 0, col: 0, value: '3' }],
+            OPTS,
+        )).toContain('<c r="A1"><v>3</v></c>');
+    });
+
+    it('does not treat bare or wrongly bound AlternateContent as markup compatibility', () => {
+        for (const inner of [
+            '<AlternateContent/>',
+            '<mc:AlternateContent xmlns:mc="urn:vendor"/>',
+        ]) {
+            expect(
+                apply_cell_edits(
+                    doc('<row r="1"><c r="A1"><v>1</v></c></row>' + inner),
+                    [{ row: 0, col: 0, value: '3' }],
+                    OPTS,
+                ),
+                inner,
+            ).toContain('<c r="A1"><v>3</v></c>');
+        }
+    });
+
+    it('refuses exact markup-compatibility content that wraps sheetData', () => {
+        const mc = 'http://schemas.openxmlformats.org/markup-compatibility/2006';
+        const spreadsheet = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+        const wrapped = `<worksheet xmlns="${spreadsheet}"><mc:AlternateContent xmlns:mc="${mc}">`
             + '<mc:Choice><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></mc:Choice>'
             + '<mc:Fallback><sheetData><row r="1"><c r="A1"><v>2</v></c></row></sheetData></mc:Fallback>'
             + '</mc:AlternateContent></worksheet>';
@@ -1130,8 +1244,9 @@ describe('apply_cell_edits', () => {
             'markup-compatibility-alternate-content',
         );
 
-        const only_prefixed = '<worksheet><mc:AlternateContent xmlns:mc="urn:mc">'
-            + '<mc:Choice><x:sheetData xmlns:x="urn:x"/></mc:Choice>'
+        const only_prefixed = `<worksheet xmlns="${spreadsheet}">`
+            + `<mc:AlternateContent xmlns:mc="${mc}">`
+            + `<mc:Choice><x:sheetData xmlns:x="${spreadsheet}"/></mc:Choice>`
             + '</mc:AlternateContent></worksheet>';
         expect_refusal(
             () => apply_cell_edits(only_prefixed, [{ row: 0, col: 0, value: '3' }], OPTS),
