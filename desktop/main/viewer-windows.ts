@@ -515,6 +515,7 @@ export class ViewerWindowManager {
         let has_admitted_document = false;
         let loading_epoch_active = false;
         let failed_navigation_attempts: FailureSignature[] = [];
+        let provisional_acknowledgement_receipts: PendingEditAcknowledgementReceipt[] = [];
         const active_document_token = (): string | undefined => {
             if (
                 document_admission.kind === 'idle'
@@ -540,6 +541,7 @@ export class ViewerWindowManager {
         const invalidate_document_admission = () => {
             document_admission = { kind: 'unavailable' };
             failed_navigation_attempts = [];
+            provisional_acknowledgement_receipts = [];
             loading_epoch_active = false;
         };
         const report_renderer_generation_change = () => {
@@ -571,8 +573,25 @@ export class ViewerWindowManager {
             for (const listener of [...renderer_loss_listeners]) listener(error, retryable);
         };
         const finalize_document_replacement = () => {
+            provisional_acknowledgement_receipts = [];
             forget_history_menu();
             report_renderer_generation_change();
+        };
+        const deliver_acknowledgement_receipt = (
+            receipt: PendingEditAcknowledgementReceipt,
+        ) => {
+            for (const listener of [...acknowledgement_receipt_listeners]) listener(receipt);
+        };
+        const restore_provisional_predecessor = () => {
+            if (document_admission.kind !== 'provisional') return;
+            document_admission = document_admission.predecessor;
+            if (active_document_token() === undefined) {
+                provisional_acknowledgement_receipts = [];
+                return;
+            }
+            for (const receipt of provisional_acknowledgement_receipts.splice(0)) {
+                deliver_acknowledgement_receipt(receipt);
+            }
         };
         const on_main_frame_navigation_started = (
             details: Electron.Event<Electron.WebContentsDidStartNavigationEventParams>,
@@ -600,6 +619,7 @@ export class ViewerWindowManager {
                 predecessor: document_admission,
                 attempts: [attempt],
             };
+            provisional_acknowledgement_receipts = [];
         };
         const on_main_frame_navigated = (
             _event: Electron.Event,
@@ -704,7 +724,7 @@ export class ViewerWindowManager {
                     };
                     return;
                 }
-                document_admission = document_admission.predecessor;
+                restore_provisional_predecessor();
                 return;
             }
             if (error_code === ERR_ABORTED) {
@@ -723,9 +743,7 @@ export class ViewerWindowManager {
         };
         const on_loading_started = () => begin_loading_epoch();
         const on_loading_stopped = () => {
-            if (document_admission.kind === 'provisional') {
-                document_admission = document_admission.predecessor;
-            }
+            restore_provisional_predecessor();
             loading_epoch_active = false;
         };
         const on_render_process_gone = (
@@ -751,9 +769,17 @@ export class ViewerWindowManager {
             if (
                 event.sender !== web_contents
                 || event.senderFrame !== web_contents.mainFrame
-                || active_document_token() === undefined
             ) return;
-            for (const listener of [...acknowledgement_receipt_listeners]) listener(receipt);
+            // A provisional navigation temporarily makes the current document
+            // inadmissible, but does not replace it unless the navigation commits.
+            // The preload emits each delivery receipt once, so retain receipts
+            // from that interval and admit them if the navigation rolls back.
+            if (document_admission.kind === 'provisional') {
+                provisional_acknowledgement_receipts.push(receipt);
+                return;
+            }
+            if (active_document_token() === undefined) return;
+            deliver_acknowledgement_receipt(receipt);
         };
         const document_token_watcher = (event: Electron.IpcMainEvent) => {
             if (event.sender !== web_contents || event.senderFrame !== web_contents.mainFrame) return;
