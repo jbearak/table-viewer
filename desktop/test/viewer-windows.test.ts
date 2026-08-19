@@ -1259,7 +1259,7 @@ describe('viewer window close protocol', () => {
         expect(window.destroyed).toBe(false);
     });
 
-    it('suspends acknowledgement receipts during provisional navigation', async () => {
+    it('defers acknowledgement receipts until a provisional navigation rolls back', async () => {
         const first_drain = deferred();
         const second_drain = deferred();
         controller_mock.controller.drain
@@ -1297,7 +1297,9 @@ describe('viewer window close protocol', () => {
         window.webContents.emit(
             'did-fail-load', {}, -2, 'ERR_FAILED', 'https://provisional.example/', true,
         );
-        acknowledge_last_delivery(window);
+        // The renderer sends this delivery receipt once. A failed provisional
+        // navigation restores the same document, so the receipt observed while
+        // it was provisional must become admissible without being sent again.
         await vi.waitFor(() => expect(controller_mock.controller.drain).toHaveBeenCalledTimes(2));
         second_drain.resolve();
         await vi.waitFor(() => expect(window.webContents.reload).toHaveBeenCalledOnce());
