@@ -179,6 +179,15 @@ type FilterHistogramState = FilterHistogramStatus;
 const GRID_FOCUS_RESTORE_MAX_ATTEMPTS = 8;
 const GRID_FOCUS_RESTORE_RETRY_MS = 16;
 
+/** Whether a live control currently owns focus (as opposed to a remount leaving it on body). */
+function has_surviving_focus_target(): boolean {
+    const active = document.activeElement;
+    return active instanceof HTMLElement
+        && active !== document.body
+        && active !== document.documentElement
+        && active.isConnected;
+}
+
 /**
  * No sheet has a resize in flight — the initial value, and the one a new document resets
  * to. A shared frozen constant so that "nothing pending" is always the *same* array, and
@@ -1562,8 +1571,9 @@ export function App(): React.JSX.Element {
                 // rehydrating or regressing the UI.
                 const pending_grid_focus_sheet_before_result =
                     pending_excel_header_grid_focus_ref.current.values().next().value;
-                const grid_owned_focus_before_snapshot =
-                    grid_focus_ref.current?.has_focus() === true;
+                const grid_focus_intent_survived =
+                    grid_focus_ref.current?.has_focus() === true
+                    || !has_surviving_focus_target();
                 process_command_result(snapshot.commandResult);
                 const grid_focus_sheet_for_snapshot =
                     grid_focus_sheet_after_excel_header
@@ -1972,7 +1982,7 @@ export function App(): React.JSX.Element {
                     document_epoch_ref.current += 1;
                     set_grid_focus_restore(
                         remounts_the_grid
-                            && grid_owned_focus_before_snapshot
+                            && grid_focus_intent_survived
                             && grid_focus_sheet_for_snapshot === next_active_sheet_index
                             ? {
                                 sheet_index: next_active_sheet_index,
@@ -2951,6 +2961,18 @@ export function App(): React.JSX.Element {
                 return;
             }
             const handle = grid_focus_ref.current;
+            // The token may have been armed while no replacement grid existed.
+            // A newer connected focus target means the user moved on during that
+            // window; do not steal focus from it when the retry finally runs.
+            if (
+                has_surviving_focus_target()
+                && handle?.has_focus() !== true
+            ) {
+                set_grid_focus_restore((current) => (
+                    current === grid_focus_restore ? null : current
+                ));
+                return;
+            }
             if (
                 handle?.generation === grid_focus_restore.generation
                 && handle.focus()
@@ -2994,12 +3016,7 @@ export function App(): React.JSX.Element {
         // turn before deciding that acknowledgement removed the initiating control;
         // this preserves that chip while still catching Remove/Clear/Cancel teardown.
         const timer = window.setTimeout(() => {
-            const active = document.activeElement;
-            const focus_survived = active instanceof HTMLElement
-                && active !== document.body
-                && active !== document.documentElement
-                && active.isConnected;
-            if (!focus_survived && document.hasFocus()) {
+            if (!has_surviving_focus_target() && document.hasFocus()) {
                 toolbar_focus_ref.current?.focus();
             }
             set_toolbar_focus_restore((current) => (
