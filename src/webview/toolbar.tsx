@@ -169,6 +169,7 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                 onClick={props.on_toggle_excel_header}
                 disabled={props.excel_header_disabled}
                 focusable_when_disabled
+                disabled_split_palette
                 menu_key="excel-header"
                 scope_menu={props.excel_header_scope_menu}
             />
@@ -254,6 +255,7 @@ function ToolbarButton({
     extra_class,
     disabled = false,
     focusable_when_disabled = false,
+    disabled_split_palette = false,
     menu_key,
     scope_menu,
 }: {
@@ -264,6 +266,7 @@ function ToolbarButton({
     extra_class?: string;
     disabled?: boolean;
     focusable_when_disabled?: boolean;
+    disabled_split_palette?: boolean;
     menu_key?: string;
     scope_menu?: ToolbarScopeMenu;
 }): React.JSX.Element {
@@ -446,7 +449,7 @@ function ToolbarButton({
             <span
                 ref={split_ref}
                 className={scope_menu
-                    ? `toolbar-split ${active ? 'active' : ''} ${disabled ? 'disabled' : ''}`.trim()
+                    ? `toolbar-split ${active ? 'active' : ''} ${disabled ? 'disabled' : ''} ${disabled && disabled_split_palette ? 'disabled-palette' : ''}`.trim()
                     : undefined}
             >
                 <button

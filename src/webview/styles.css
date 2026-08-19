@@ -156,11 +156,10 @@ body {
     background: var(--vscode-button-background, #0e639c);
 }
 
-/* The active fill belongs to the split wrapper, not its label button. Mirror the
-   toggle's disabled palette here so a disabled Header Row control does not keep a
-   saturated active background behind grey text. The caret remains fully interactive
-   because its all-sheets menu can still contain available actions. */
-.toolbar-split.active.disabled {
+/* The active fill belongs to the split wrapper, not its label button. Header Row
+   opts the whole split control into this palette so its background and caret match
+   the disabled label while the caret keeps its independent menu behavior. */
+.toolbar-split.active.disabled-palette {
     border-color: var(--vscode-panel-border, #444);
     background: transparent;
 }
@@ -182,7 +181,7 @@ body {
     opacity: 0.45;
 }
 
-.toolbar-split.active.disabled .toolbar-split-gap {
+.toolbar-split.active.disabled-palette .toolbar-split-gap {
     background: var(--vscode-panel-border, #444);
     opacity: 1;
 }
@@ -202,7 +201,7 @@ body {
     color: var(--vscode-button-foreground, #fff);
 }
 
-.toolbar-split.active.disabled .toolbar-split-caret {
+.toolbar-split.disabled-palette .toolbar-split-caret {
     color: var(--vscode-disabledForeground, rgba(204, 204, 204, 0.5));
     opacity: 0.45;
 }
@@ -218,8 +217,8 @@ body {
     background: var(--vscode-button-hoverBackground, #1177bb);
 }
 
-.toolbar-split.active.disabled .toolbar-split-caret:hover,
-.toolbar-split.active.disabled .toolbar-split-caret.open {
+.toolbar-split.active.disabled-palette .toolbar-split-caret:hover,
+.toolbar-split.active.disabled-palette .toolbar-split-caret.open {
     background: var(--vscode-list-hoverBackground, #2a2d2e);
 }
 
