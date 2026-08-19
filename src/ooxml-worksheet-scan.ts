@@ -40,7 +40,8 @@ export function index_of_bytes(
     from = 0,
     to = xml.length,
 ): number {
-    const bytes = bytes_view(xml).subarray(0, to);
+    const source = bytes_view(xml);
+    const bytes = to < source.length ? source.subarray(0, to) : source;
     if (needle.length === 1) return bytes.indexOf(needle.charCodeAt(0), from);
     let encoded = ASCII_NEEDLES.get(needle);
     if (encoded === undefined) {

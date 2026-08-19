@@ -47,7 +47,6 @@ import {
     index_of_bytes,
     is_self_closing,
     is_tag_boundary,
-    opening_tag_text,
     scan_rows,
     utf8_text,
     worksheet_scan_input,

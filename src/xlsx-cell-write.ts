@@ -1,19 +1,15 @@
 import {
     decode_xml,
-    find_tag_end as find_string_tag_end,
     get_attr,
     ignorable_ranges as string_ignorable_ranges,
-    is_self_closing as is_string_self_closing,
     remove_attr,
     replace_attr_value,
     strip_illegal_xml_chars,
 } from './ooxml-xml';
 import {
-    end_tag_after,
     find_first_element,
     find_tag_end,
     get_tag_attr,
-    ignorable_end,
     ignorable_ranges,
     index_of_bytes,
     indexOf_live,
