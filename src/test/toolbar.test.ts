@@ -29,6 +29,7 @@ function render_toolbar(props?: Partial<React.ComponentProps<typeof Toolbar>>) {
     root = createRoot(container);
 
     const merged_props: React.ComponentProps<typeof Toolbar> = {
+        on_action_complete: vi.fn(),
         show_formatting: true,
         on_toggle_formatting,
         show_formatting_button: true,
@@ -222,6 +223,21 @@ describe('Toolbar', () => {
         });
         act(() => toolbar.dispatchEvent(event));
         expect(event.defaultPrevented).toBe(true);
+    });
+
+    it('reports completed toolbar actions to the grid owner', () => {
+        const on_action_complete = vi.fn();
+        render_toolbar({
+            on_action_complete,
+            show_edit_button: true,
+            show_excel_header_button: true,
+        });
+
+        for (const label of ['Edit', 'Formatting', 'Header Row', 'Auto-fit Columns']) {
+            act(() => get_button(label).click());
+        }
+
+        expect(on_action_complete).toHaveBeenCalledTimes(4);
     });
 
     it('orders actions workbook scope first, then worksheet scope', () => {
@@ -829,15 +845,18 @@ describe('Toolbar scope menus', () => {
         expect(restore?.disabled).toBe(true);
     });
 
-    it('runs the chosen action and closes', () => {
+    it('runs the chosen scope action, closes, and reports completion', async () => {
         const menu = scope_menu();
-        render_toolbar({ auto_fit_scope_menu: menu });
+        const on_action_complete = vi.fn();
+        render_toolbar({ auto_fit_scope_menu: menu, on_action_complete });
         open_caret();
 
         const first = document.querySelector<HTMLButtonElement>('[role="menuitem"]');
         act(() => first!.click());
         expect(menu.items[0].on_click).toHaveBeenCalledOnce();
         expect(document.querySelector('[role="menu"]')).toBeNull();
+        await vi.waitUntil(() => on_action_complete.mock.calls.length > 0);
+        expect(on_action_complete).toHaveBeenCalledOnce();
     });
 
     it('leaves the button itself meaning this sheet', () => {

@@ -1596,8 +1596,10 @@ describe('formatting toggle', () => {
         // Defaults on.
         expect(grid_stub().getAttribute('data-show-formatting')).toBe('true');
 
+        grid_shell_mock.focus_grid.mockClear();
         await click_button('Formatting');
         expect(grid_stub().getAttribute('data-show-formatting')).toBe('false');
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
     });
 
     it('keeps formatting per sheet, not per workbook', async () => {

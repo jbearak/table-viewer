@@ -4950,6 +4950,9 @@ export function App(): React.JSX.Element {
     const focus_columns_trigger = useCallback(() => {
         toolbar_focus_ref.current?.focus_columns();
     }, []);
+    const focus_grid_after_toolbar_action = useCallback(() => {
+        grid_focus_ref.current?.focus();
+    }, []);
 
     // Host-rejected keys the store still holds. Resolving an edit (discarding it, or
     // the whole map going away) must dismiss the rejection: the host was refusing a
@@ -5513,6 +5516,7 @@ export function App(): React.JSX.Element {
         <div className={`viewer ${effective_vertical_tabs ? 'vertical-tabs' : ''}`}>
             <Toolbar
                 ref={toolbar_focus_ref}
+                on_action_complete={focus_grid_after_toolbar_action}
                 show_formatting={show_formatting}
                 on_toggle_formatting={handle_toggle_formatting}
                 show_formatting_button={meta.hasFormatting}

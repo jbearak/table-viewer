@@ -61,6 +61,8 @@ const ScopeMenuContext = React.createContext<{
 } | null>(null);
 
 export interface ToolbarProps {
+    /** Called after an action so the owning view can return focus to the grid. */
+    on_action_complete: () => void;
     show_formatting: boolean;
     on_toggle_formatting: () => void;
     show_formatting_button: boolean;
@@ -124,6 +126,7 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                     ? 'Exit edit mode.'
                     : 'Enter edit mode to modify cell values.'}
                 onClick={props.on_toggle_edit_mode}
+                on_action_complete={props.on_action_complete}
                 extra_class={props.is_dirty ? 'has-unsaved' : undefined}
                 disabled={props.edit_disabled}
             />
@@ -137,6 +140,7 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                     ? 'Show raw cell values on this sheet.'
                     : 'Show formatted cell values on this sheet.'}
                 onClick={props.on_toggle_formatting}
+                on_action_complete={props.on_action_complete}
                 menu_key="formatting"
                 scope_menu={props.formatting_scope_menu}
             />
@@ -167,6 +171,7 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                         : 'Show the header row as data on this sheet.'
                     : 'Use the first non-hidden row as column names on this sheet.'}
                 onClick={props.on_toggle_excel_header}
+                on_action_complete={props.on_action_complete}
                 disabled={props.excel_header_disabled}
                 focusable_when_disabled
                 disabled_split_palette
@@ -189,6 +194,7 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                 ? 'Restore original column widths on this sheet.'
                 : 'Auto-fit all columns to their content on this sheet.'}
             onClick={props.on_toggle_auto_fit}
+            on_action_complete={props.on_action_complete}
             disabled={props.auto_fit_disabled}
             menu_key="auto-fit"
             scope_menu={props.auto_fit_scope_menu}
@@ -209,7 +215,10 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
             </span>
             {props.highlight && (
                 <div className="toolbar-lead">
-                    <HighlightControl {...props.highlight} />
+                    <HighlightControl
+                        {...props.highlight}
+                        on_action_complete={props.on_action_complete}
+                    />
                 </div>
             )}
             {/*
@@ -252,6 +261,7 @@ function ToolbarButton({
     active,
     tooltip_text,
     onClick,
+    on_action_complete,
     extra_class,
     disabled = false,
     focusable_when_disabled = false,
@@ -263,6 +273,7 @@ function ToolbarButton({
     active: boolean;
     tooltip_text: string;
     onClick: () => void;
+    on_action_complete: () => void;
     extra_class?: string;
     disabled?: boolean;
     focusable_when_disabled?: boolean;
@@ -276,12 +287,10 @@ function ToolbarButton({
     /*
      * Set when a menu item was activated with the pointer.
      *
-     * `ContextMenu` restores focus to the chevron after an activation, which is right
-     * for the keyboard — Enter on an item should land you back on the control you
-     * opened. But for a mouse click that restored focus is invisible to the user and
-     * would raise the tooltip over a control they have finished with. Cleared as soon
-     * as the pointer or the keyboard comes back, so the tooltip is only skipped for
-     * the interaction that just ended.
+     * Completing an action now returns focus to the grid. Suppression still matters
+     * while the menu closes and that focus handoff is queued: without it, a pointer
+     * activation can briefly raise the tooltip over a control the user has finished
+     * with. Cleared as soon as the pointer or keyboard comes back.
      */
     const [tooltip_suppressed, set_tooltip_suppressed] = useState(false);
     const scope_context = React.useContext(ScopeMenuContext);
@@ -299,6 +308,10 @@ function ToolbarButton({
      * not matter.
      */
     const pressed_own_caret_ref = useRef(false);
+    // ContextMenu uses the same delayed restore hook for Escape and activation.
+    // Remember which one happened so Escape returns to the caret while a completed
+    // command returns to the grid.
+    const menu_action_activated_ref = useRef(false);
     const tooltip_id = useId();
     const button_ref = useRef<HTMLButtonElement>(null);
     const caret_ref = useRef<HTMLButtonElement>(null);
@@ -377,6 +390,7 @@ function ToolbarButton({
             // activation synthesised as a click. The same idiom the button below uses
             // to decide whether to blur itself.
             if (event.detail > 0) set_tooltip_suppressed(true);
+            menu_action_activated_ref.current = true;
             item.on_click();
         },
     }));
@@ -463,6 +477,7 @@ function ToolbarButton({
                         set_is_hovered(false);
                         if (event.detail > 0) button_ref.current?.blur();
                         onClick();
+                        on_action_complete();
                     }}
                     aria-describedby={!native_disabled && show_tooltip ? tooltip_id : undefined}
                     aria-pressed={active}
@@ -537,7 +552,14 @@ function ToolbarButton({
                     items={menu_items}
                     aria_label={scope_menu!.aria_label}
                     on_dismiss={close_menu}
-                    restore_focus={() => caret_ref.current?.focus()}
+                    restore_focus={() => {
+                        if (menu_action_activated_ref.current) {
+                            menu_action_activated_ref.current = false;
+                            on_action_complete();
+                        } else {
+                            caret_ref.current?.focus();
+                        }
+                    }}
                 />
             )}
         </>
