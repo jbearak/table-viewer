@@ -102,19 +102,26 @@ consumes:
 **16.7 MiB = 29.3% of the part.** The other **40.4 MiB is markup that gets
 decoded into a JS string and never read.**
 
-**The committed fixture is the weak case.** `sheet4.xml` is all-ASCII numeric,
-so V8 stores it as a one-byte string. Non-ASCII cell text forces a two-byte
-string and roughly doubles the penalty. Measured in isolated processes via
-`maxRSS`:
+**Correction: there is no non-ASCII penalty.** I predicted decode would cost
+~1.75× the part on accented text and that the win would be larger for
+international workbooks. Stage 1's harness measured 0.982, and re-testing
+confirms the harness is right and I was wrong:
 
 | Content | Part size | Decode cost | Ratio |
 |---|---|---|---|
-| ASCII | 22.1 MiB | +18.5 MiB | 0.84× |
-| accented | 27.5 MiB | +48.1 MiB | **1.75×** |
+| ASCII (real fixture) | 57.2 MiB | 57.2 MiB | 1.00 |
+| Latin-1 (`café`) | 26.3 MiB | 25.8 MiB | 0.98 |
+| CJK (`数値`) | 9.3 MiB | ~9.5 MiB | ~1.0 |
 
-So the 40.4 MiB figure understates the win on any workbook with non-Latin or
-accented text. Stage 1 therefore baselines a synthetic non-ASCII worksheet
-alongside the real fixture (criterion (a) says worksheets, plural).
+V8 uses a one-byte string representation whenever *every* character is Latin-1,
+and `é` (U+00E9) is Latin-1 — so accented text never widens. Even genuine CJK
+measured ~1.0×. My earlier synthetic test had compared two differently-sized
+parts and I misattributed the difference to widening.
+
+The decode cost is therefore ~1.0× the part regardless of content. Simpler than
+claimed, and it still fully justifies Stage 6 — it just is not larger for
+international workbooks. Stage 1 baselines a synthetic non-ASCII worksheet anyway
+(criterion (a) says worksheets, plural), which is how the error was caught.
 
 **A measurement trap, recorded because it cost me a wrong conclusion once
 already.** Do not compute the decode cost as summed `heapUsed + external` deltas
@@ -123,8 +130,25 @@ a bogus +0.0 MiB. Trust `maxRSS` from a fresh child process per phase, and the
 `external` delta *alone* after two forced GCs. The harness reports the two fields
 separately, never pre-summed.
 
+**Stage 6 removes a minority share of a save, and this plan should say so.**
+Stage 1's committed baseline, one single-cell edit on the 57.2 MiB fixture:
+
+| Phase | Peak RSS | vs part | Time |
+|---|---|---|---|
+| `cfb-read` | 125.5 MiB | 2.2× | 194 ms |
+| worksheet decode | 183.0 MiB | — | 3.4 ms |
+| coordinate scan | 248.0 MiB | 4.3× | 554 ms |
+| **full save** | **582.5 MiB** | **10.2×** | **2396 ms** |
+
+The write path alone adds 334.5 MiB above the read peak. Stage 6's target is the
+57.2 MiB decode — real, but a minority share of a 582 MiB save. The 57 MiB
+headline must not be read as fixing saves; the remaining write-path and CFB costs
+belong to #240.
+
 Speed is a genuine non-goal here: byte scan 41 ms vs string scan 43 ms —
-equivalent. Byte offsets buy **memory and correctness**. (Separately, and not
+equivalent, and the baseline confirms it from the other direction — decode is
+3.4 ms against a 554 ms coordinate scan. Byte offsets buy **memory and
+correctness**. (Separately, and not
 addressed by this plan: `ignorable_ranges` runs over the whole part ~7×/save at
 74 ms ≈ 500 ms, and `formula_count` twice at 36 ms.)
 
