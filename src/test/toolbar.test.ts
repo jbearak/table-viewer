@@ -97,6 +97,20 @@ describe('toolbar toggle colors', () => {
         expect(hover_rule).toMatch(/opacity:\s*0\.45/);
     });
 
+    it('removes the active fill from disabled split toggles', () => {
+        const disabled_rule = /\.toolbar-split\.active\.disabled-palette\s*\{([^}]*)\}/
+            .exec(get_webview_css())?.[1];
+        expect(disabled_rule).toBeDefined();
+        expect(disabled_rule).toMatch(/background:\s*transparent/);
+        expect(disabled_rule).toMatch(/--vscode-panel-border/);
+
+        const caret_rule = /\.toolbar-split\.disabled-palette \.toolbar-split-caret\s*\{([^}]*)\}/
+            .exec(get_webview_css())?.[1];
+        expect(caret_rule).toBeDefined();
+        expect(caret_rule).toMatch(/--vscode-disabledForeground/);
+        expect(caret_rule).toMatch(/opacity:\s*0\.45/);
+    });
+
     it('paints the scope divider as a 1px rule despite its spacing', () => {
         // The rule carries breathing room on top of the action row's gap so it reads
         // as a boundary rather than one more crowded item. That room is padding, so
@@ -414,6 +428,10 @@ describe('Toolbar', () => {
             excel_header_status: 'Updating column names…',
             excel_header_disabled: true,
             excel_header_disabled_reason: 'Updating column names…',
+            excel_header_scope_menu: {
+                aria_label: 'Header row scope',
+                items: [],
+            },
             on_toggle_excel_header,
         });
 
@@ -423,6 +441,8 @@ describe('Toolbar', () => {
         expect(button.disabled).toBe(false);
         expect(button.getAttribute('aria-disabled')).toBe('true');
         expect(button.getAttribute('aria-pressed')).toBe('true');
+        expect(button.closest('.toolbar-split')?.classList.contains('disabled')).toBe(true);
+        expect(button.closest('.toolbar-split')?.classList.contains('disabled-palette')).toBe(true);
         act(() => button.click());
         expect(on_toggle_excel_header).not.toHaveBeenCalled();
         expect(document.querySelector('[role="status"]')?.textContent)
@@ -436,16 +456,37 @@ describe('Toolbar', () => {
             excel_header_automatic: false,
             excel_header_disabled: true,
             excel_header_disabled_reason: 'Clear sorting and filters first.',
+            excel_header_scope_menu: {
+                aria_label: 'Header row scope',
+                items: [],
+            },
         });
 
         const button = get_button('Header Row');
         expect(button.disabled).toBe(false);
         expect(button.getAttribute('aria-disabled')).toBe('true');
+        expect(button.closest('.toolbar-split')?.classList.contains('disabled')).toBe(true);
+        expect(button.closest('.toolbar-split')?.classList.contains('disabled-palette')).toBe(true);
         const wrapper = button.closest<HTMLElement>('.toolbar-item')!;
         expect(wrapper.getAttribute('role')).toBeNull();
         expect(wrapper.getAttribute('tabindex')).toBeNull();
         act(() => button.focus());
         expect(get_tooltip()?.textContent).toBe('Clear sorting and filters first.');
+    });
+
+    it('does not apply the Header Row disabled palette to Auto-fit scope controls', () => {
+        render_toolbar({
+            auto_fit_active: true,
+            auto_fit_disabled: true,
+            auto_fit_scope_menu: {
+                aria_label: 'Auto-fit scope',
+                items: [{ label: 'Restore all', on_click: vi.fn() }],
+            },
+        });
+
+        const split = get_button('Auto-fit Columns').closest('.toolbar-split');
+        expect(split?.classList.contains('disabled')).toBe(true);
+        expect(split?.classList.contains('disabled-palette')).toBe(false);
     });
 
     it('renders the Columns trigger with dialog semantics and a hidden-count badge', () => {
