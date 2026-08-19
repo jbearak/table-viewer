@@ -37,6 +37,9 @@ export interface RichCellData {
     /** Right-to-left cell text (Glide's whole-string heuristic): segments lay
      *  out from the right edge, like the built-in Text cell's RTL path. */
     readonly rtl?: true;
+    /** Markdown spelling used by the external editor while this rich cell is
+     * editable. Absent on ordinary read-only rich cells. */
+    readonly edit_value?: string;
 }
 
 /**

@@ -176,5 +176,10 @@ export const rich_text_cell_renderer: CustomRenderer<RichTextGridCell> = {
         ctx.font = entry_font;
         return width + 2 * theme.cellHorizontalPadding;
     },
-    onPaste: () => undefined,
+    onDelete: cell => cell.data.edit_value === ''
+        ? undefined
+        : { ...cell, data: { ...cell.data, edit_value: '' } },
+    onPaste: (value, data) => value === data.edit_value
+        ? undefined
+        : { ...data, edit_value: value },
 };

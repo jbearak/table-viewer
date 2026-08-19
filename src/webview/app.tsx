@@ -1,3 +1,4 @@
+import { cell_key } from '../cell-key';
 import React, {
     useState,
     useEffect,
@@ -23,6 +24,7 @@ import {
     type CellHighlightMutation,
     type CellHighlightSelection,
     type CellHighlightState,
+    type HighlightCellDelta,
     dirty_entries_equal,
     type CsvDirtyEntry,
     type CsvSaveLifecycle,
@@ -31,6 +33,7 @@ import {
     type DisplayRowInterval,
     type PerFileState,
     type SheetPendingEditCells,
+    type HistoryMenuProjection,
     type HostMessage,
     type SheetTransformState,
     type FilterEntry,
@@ -96,6 +99,40 @@ import {
     create_edit_session_registry,
     type EditSessionRegistry,
 } from './edit-session-registry';
+import type { DirtyEntry, StoreWrite } from './edit-session-store';
+import {
+    create_history_store,
+    type HistoryStore,
+    type StagedHistoryRecord,
+} from './history-store';
+import { discard_history_source } from './history-discard-model';
+import {
+    create_history_replay_coordinator,
+    type AcceptedReplay,
+    type HistoryReplayCoordinator,
+} from './history-replay-coordinator';
+import { history_refusal_warning, replayed_verb } from './history-command-model';
+import {
+    history_menu_projection,
+    history_menu_projections_equal,
+} from './history-menu-projection';
+import {
+    history_focus_request,
+    type HistoryFocusOutcome,
+    type PendingHistoryFocus,
+} from './history-focus-model';
+import { replayed_store_entry } from './history-replay-request-model';
+import {
+    absent_overlay,
+    overlay_state_from_dirty_entry,
+    type HistoryDirection,
+} from './history-cell-state-model';
+import type { HistoryEntry } from './history-stack-model';
+import type { HistoryReplayCommitted } from '../history-replay-protocol';
+import { pending_signal, type PendingSignal } from './pending-signal';
+import { run_discard_transaction } from './discard-transaction-model';
+import { highlight_history_source } from './highlight-capture-model';
+import { commit_staged_transaction, type StagedMutation } from './staged-mutation';
 import { column_letter } from './grid-model';
 import {
     clamp_row_height,
@@ -123,6 +160,8 @@ import {
 import { apply_font_family, apply_font_size } from './vscode-theme';
 import {
     edit_command_target,
+    history_hotkey_command,
+    run_native_text_history,
     text_field_selection,
     type EditCommand,
 } from './edit-command';
@@ -498,6 +537,133 @@ export function App(): React.JSX.Element {
         if (next && !previous) advance_edit_activation();
         set_edit_mode_state(next);
     }, [advance_edit_activation]);
+    /**
+     * The workbook's undo history — one, for the whole workbook, because undoing
+     * an edit made on another sheet switches to that sheet.
+     *
+     * A ref rather than state: capture reads the current stack synchronously
+     * mid-gesture, with no re-render between reading it and recording into it,
+     * and a wide paste must not rebuild App's callbacks while it is being
+     * assembled. The object also has to survive a GridShell remount, which is
+     * keyed by generation and by sheet.
+     */
+    const history_store_ref = useRef<HistoryStore | null>(null);
+    if (history_store_ref.current === null) {
+        history_store_ref.current = create_history_store();
+    }
+
+    /**
+     * Record a highlight gesture this window made, once the host has applied it.
+     *
+     * A plain record with nothing staged alongside it: unlike a cell edit, the
+     * mutation has ALREADY happened on the host and in durable state by the time
+     * this window sees it, so there is nothing left to hold back. A refusal
+     * therefore cannot un-apply the gesture — it installs the barrier that makes a
+     * later undo explain itself, which is the same trade the discard makes.
+     */
+    const record_highlight_gesture = useCallback((
+        deltas: readonly HighlightCellDelta[],
+        label: string,
+    ) => {
+        if (deltas.length === 0) return;
+        const record = history_store_ref.current!.stage_record({
+            label,
+            changes: highlight_history_source(deltas, meta_ref.current?.sheets ?? []),
+        });
+        commit_staged_transaction([record]);
+    }, []);
+
+    /**
+     * The one outstanding replay, if any.
+     *
+     * A ref rather than state, for the same reason as the history store: a replay
+     * starts inside an event handler and the reservation has to be visible to the
+     * next keypress immediately, not after a render.
+     */
+    const replay_coordinator_ref = useRef<HistoryReplayCoordinator | null>(null);
+    /**
+     * Acquire an edit session for a replay that has none.
+     *
+     * Reached through a ref because the coordinator is built during the first
+     * render, before the callback this delegates to exists — and it must not be
+     * rebuilt when that callback's dependencies move, since it holds the
+     * reservation the next keypress is refused against.
+     */
+    const ensure_replay_session_ref = useRef<(() => Promise<boolean>) | null>(null);
+    // Declared before the block below rather than after it: the block closes over
+    // this ref, and while `next_id` is only ever called later, a `const` read from
+    // its own TDZ is a throw waiting for someone to move a call.
+    const replay_id_counter_ref = useRef(0);
+    if (replay_coordinator_ref.current === null) {
+        replay_coordinator_ref.current = create_history_replay_coordinator({
+            history: () => history_store_ref.current!.snapshot(),
+            ensure_session: () => ensure_replay_session_ref.current?.() ?? Promise.resolve(false),
+            read_overlay: (worksheet, source_row, source_column) => {
+                // Resolved through the live workbook rather than the target's own
+                // index, because history is workbook-wide: an action recorded
+                // before a reorder names its sheet by identity, and the index it
+                // carries may now be another sheet entirely.
+                const sheets = meta_ref.current?.sheets;
+                if (sheets === undefined) return undefined;
+                const sheet_index = worksheet_target_index(sheets, worksheet);
+                if (sheet_index === undefined) return undefined;
+                const store = edit_session_registry_ref.current!.for_sheet(sheet_index);
+                const entry = store.get(cell_key(source_row, source_column));
+                // Absent is a fact about a cell we CAN see. The registry answers
+                // for every sheet in the workbook, so there is no third state
+                // here — an unopened sheet's store is simply empty.
+                return entry === undefined
+                    ? absent_overlay()
+                    : overlay_state_from_dirty_entry(entry);
+            },
+            post: (message) => { host_bridge.postMessage(message); },
+            next_id: (prefix) => `${prefix}-${++replay_id_counter_ref.current}`,
+        });
+    }
+
+    /**
+     * Land a committed replay: the stores and the history move as ONE transaction.
+     *
+     * The history is a participant, not a consequence. If the edit stores moved
+     * and the history did not, the next undo would replay a gesture the document
+     * has already walked back; if the history moved and the stores did not, undo
+     * would have silently skipped one. Both are states no further undo or redo
+     * could describe, so the three passes decide together — and nothing between
+     * validating and committing may await or set React state.
+     */
+    const apply_committed_replay = useCallback((
+        committed: HistoryReplayCommitted,
+        entry: HistoryEntry,
+        direction: HistoryDirection,
+    ): boolean => {
+        const session_id = csv_edit_session_id_ref.current;
+        const registry = edit_session_registry_ref.current!;
+        // Grouped per store, because a store owns exactly one worksheet and a
+        // workbook-wide gesture spans several. The host's accepted writes carry
+        // the resolved sheet index, so this never re-resolves a target.
+        const by_sheet = new Map<number, StoreWrite[]>();
+        for (const write of committed.cells) {
+            const writes = by_sheet.get(write.resolvedSheetIndex) ?? [];
+            writes.push({ key: write.key, entry: replayed_store_entry(write.entry) });
+            by_sheet.set(write.resolvedSheetIndex, writes);
+        }
+        const staged: StagedMutation[] = [];
+        for (const [sheet_index, writes] of by_sheet) {
+            const staging = registry.for_sheet(sheet_index).stage_writes(session_id, writes);
+            // A store whose session moved on refuses to stage. Abandoning the
+            // whole transaction is right: a replay is one gesture, and applying
+            // the sheets that would still take it leaves half an undo.
+            if (staging === undefined) return false;
+            staged.push(staging);
+        }
+        const move = history_store_ref.current!.stage_move(direction, entry);
+        staged.push(move);
+        // Highlights need no participant here: they are the host's own durable
+        // state, and the renderer learns their new value from the
+        // `cellHighlightsChanged` the commit's write already produces.
+        return commit_staged_transaction(staged);
+    }, []);
+
     const set_csv_edit_session_id = useCallback((next: string | undefined) => {
         const previous = csv_edit_session_id_ref.current;
         if (next && next !== previous) {
@@ -732,7 +898,17 @@ export function App(): React.JSX.Element {
         Array.from(crypto.getRandomValues(new Uint32Array(2)), (value) =>
             value.toString(36)).join('-'),
     );
-    const pending_highlight_request_ref = useRef<string | null>(null);
+    /**
+     * The highlight request awaiting the host, with the name to record it under.
+     *
+     * One ref and not two: the label is only ever read when a reply matching this
+     * id arrives, so carrying it here makes "which gesture" and "what it was
+     * called" impossible to get out of step.
+     */
+    const pending_highlight_request_ref = useRef<{
+        readonly requestId: string;
+        readonly label: string;
+    } | null>(null);
     const last_highlight_state_revision_ref = useRef(0);
 
     const { persist_immediate } = use_state_sync(
@@ -889,15 +1065,76 @@ export function App(): React.JSX.Element {
 
     const discard_edit_session = useCallback(() => {
         if (!csv_edit_session_id) return;
+        // A discard is a recorded gesture, so it answers to the same reservation
+        // every other one does — and it does NOT reach `run_edit_gesture`, which is
+        // where the rest of them are gated. Recorded across a highlight round trip
+        // it would land ahead of the highlight the user made first, so the first
+        // undo would repaint cells instead of restoring the discarded edits.
+        //
+        // Refused rather than deferred: the window is one host round trip, and a
+        // discard queued behind a reply would fire after the user had moved on.
+        //
+        // Answered rather than silently dropped, because one caller is the save
+        // dialog's "discard" choice: the dialog has already closed by the time this
+        // runs, so a bare `return` would leave the user in edit mode with their
+        // edits intact and no account of why. The button caller is harmless either
+        // way — it is visibly still there to press again.
+        //
+        // Named per reservation, because the two are separate waits and telling the
+        // user the wrong one is worse than telling them nothing: a replay-busy
+        // discard has no highlight anywhere in it.
+        if (pending_highlight_request_ref.current !== null) {
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: 'A cell highlight is still being applied. Try discarding again in a moment.',
+            });
+            return;
+        }
+        if (!edit_gestures_admitted()) {
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: 'An undo is still being applied. Try discarding again in a moment.',
+            });
+            return;
+        }
+        // Fold any open cell editor FIRST, so its text is part of what the discard
+        // throws away and therefore part of what undoing it restores. Left open, it
+        // would be dropped by the exit below with nothing in history describing it.
+        editing_ref.current?.commit_live_edit();
+        // Emptying the stores and recording what was emptied are ONE transaction;
+        // the invariant and its outcomes live in the model.
+        const outcome = run_discard_transaction({
+            registry: edit_session_registry_ref.current!,
+            history: history_store_ref.current!,
+            sessionId: csv_edit_session_id,
+            sheets: meta_ref.current?.sheets ?? [],
+        });
+        // Nothing was emptied and nothing recorded, so the user presses it again —
+        // which is why the fence comes AFTER this and not before. Fenced first,
+        // this return would leave the session alive but its admission stopped and
+        // its publication silenced: the user stays in edit mode with their edits,
+        // unable to type, and nothing else lowers the fence for a session that is
+        // never leaving.
+        if (outcome.kind === 'abandoned') return;
+        // Past the point of no return, and before the terminal message reaches the
+        // host, which is the ordering the fence exists for.
         fence_edit_session_exit(csv_edit_session_id);
+        if (outcome.kind === 'unrecordable') {
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: 'These edits were too large to keep in the undo history, so discarding them cannot be undone.',
+            });
+        }
         set_edit_mode(false);
         // Every edit is being thrown away, including the rejected ones.
         clear_save_verdict();
-        // Every sheet's, not just the mounted grid's: the session covers the
-        // whole workbook and the host clears every live durable slot, so a
-        // store left full here would repaint edits the user just discarded
-        // the next time its sheet is opened.
-        edit_session_registry_ref.current!.clear_all(csv_edit_session_id);
+        // Undo of this discard must wait for the host's cleanup: until it settles,
+        // a request for the new session it needs would be refused for a reason
+        // about timing rather than about the document.
+        discard_cleanup_ref.current = {
+            session: csv_edit_session_id,
+            ...pending_signal<boolean>(),
+        };
         host_bridge.postMessage({
             type: 'discardEditSession',
             editSessionId: csv_edit_session_id,
@@ -1083,6 +1320,12 @@ export function App(): React.JSX.Element {
                 || incoming.operation.editSessionId === current_session_id
             ) {
                 hydrate_and_install(incoming.operation, 'tombstone');
+                // A Save/Discard dialog still on screen names a session that no
+                // longer exists, so no answer to it can ever match — and the ref
+                // is what makes `handle_sheet_select` decline. Left set, tab
+                // switching stays blocked for the life of the window, and any
+                // switch deferred behind it never runs.
+                pending_save_dialog_ref.current = null;
                 set_csv_edit_session_id(undefined);
                 set_edit_session_pending(false);
                 set_edit_mode(false);
@@ -1132,8 +1375,9 @@ export function App(): React.JSX.Element {
                     || msg.physicalRevision !== identity.sourceBasis.physicalRevision
                     || msg.sourceGeneration !== source_generation_ref.current
                 ) return;
+                const pending_highlight = pending_highlight_request_ref.current;
                 const matching_request = !!msg.requestId
-                    && pending_highlight_request_ref.current === msg.requestId;
+                    && pending_highlight?.requestId === msg.requestId;
                 if (matching_request) {
                     pending_highlight_request_ref.current = null;
                     set_highlight_request_pending(false);
@@ -1152,6 +1396,18 @@ export function App(): React.JSX.Element {
                     return;
                 }
                 last_highlight_state_revision_ref.current = msg.stateRevision;
+                // Only this window's OWN gesture enters its history. The same
+                // message arrives for another window's highlight, an external
+                // reload, and a post-save rebase; recording those would let undo
+                // repaint cells this user never touched.
+                if (
+                    matching_request
+                    && !msg.error
+                    && msg.deltas !== undefined
+                    && pending_highlight !== null
+                ) {
+                    record_highlight_gesture(msg.deltas, pending_highlight.label);
+                }
                 state_ref.current = {
                     ...state_ref.current,
                     cellHighlights: msg.state,
@@ -1356,6 +1612,12 @@ export function App(): React.JSX.Element {
                     } else if (remounts_the_grid) {
                         editing_ref.current?.commit_live_edit();
                     }
+                    // The basis a pending highlight request was sent against, read
+                    // BEFORE this snapshot overwrites either — see the abandonment
+                    // check below.
+                    const pending_basis_physical_revision = snapshot_identity_ref
+                        .current?.sourceBasis.physicalRevision;
+                    const pending_basis_source_generation = source_generation_ref.current;
                     snapshot_identity_ref.current = snapshot.identity;
                     const previous_sheets_by_name = new Map(
                         previous_sheets.map((sheet) => [sheet.name, sheet]),
@@ -1521,6 +1783,29 @@ export function App(): React.JSX.Element {
                     let locally_retained_sheet_indices: ReadonlySet<number> = new Set();
                     if (snapshot.presentation === 'initial') {
                         edit_session_registry_ref.current!.replace_document();
+                        // A different file is under the history now. Any
+                        // surviving action would be the previous workbook's
+                        // edits, waiting to be replayed through whatever
+                        // worksheet identity happened to match here.
+                        history_store_ref.current!.clear();
+                        // And any replay still in flight was planned against the
+                        // document that just left. Its caller is awaiting an
+                        // answer, so it is settled rather than dropped — a promise
+                        // that never resolved would hold the reservation, and the
+                        // user's undo, for the life of the window.
+                        replay_coordinator_ref.current?.reset();
+                        // The outgoing document's discard cleanup, if one was
+                        // still unacknowledged. Settled as failed rather than
+                        // dropped: an awaiter would otherwise hold for an
+                        // acknowledgement that belongs to a file which has left.
+                        // Unreachable today — the cleared history refuses a replay
+                        // before it asks for a session — but that is another
+                        // mechanism's doing, not this one's.
+                        const discarding = discard_cleanup_ref.current;
+                        if (discarding !== undefined) {
+                            discard_cleanup_ref.current = undefined;
+                            discarding.settle(false);
+                        }
                     } else {
                         const edit_session_id = csv_edit_session_id_ref.current;
                         const reconciliation = edit_session_registry_ref.current!
@@ -1712,13 +1997,37 @@ export function App(): React.JSX.Element {
                     generation_ref.current = snapshot.generation;
                     source_generation_ref.current = snapshot.sourceGeneration;
                     if (snapshot.presentation === 'initial') {
-                        pending_highlight_request_ref.current = null;
-                        set_highlight_request_pending(false);
                         set_highlight_status('');
                         set_highlight_selection_available(false);
                         set_edit_session_pending(false);
                         pending_edit_request_ref.current = null;
                         pending_save_dialog_ref.current = null;
+                        // The document is being replaced, which clears history with
+                        // it: a switch a replay asked for describes a workbook that
+                        // is no longer loaded.
+                        deferred_history_sheet_ref.current = null;
+                    }
+                    // A highlight request names the basis it was sent against, and
+                    // its reply is filtered on that basis matching the live one — so
+                    // once this snapshot moves either, no reply can ever resolve the
+                    // request. Abandoning it is the only outcome left, and it must
+                    // not be limited to the 'initial' case: an external file change
+                    // arrives as a REFRESH with a new physical revision, and a
+                    // request stranded there would hold both the highlight panel and
+                    // — since the same reservation orders cell gestures against the
+                    // history — every subsequent cell edit, for the life of the
+                    // window.
+                    if (
+                        pending_highlight_request_ref.current !== null
+                        && (
+                            snapshot.presentation === 'initial'
+                            || snapshot.identity.sourceBasis.physicalRevision
+                                !== pending_basis_physical_revision
+                            || snapshot.sourceGeneration !== pending_basis_source_generation
+                        )
+                    ) {
+                        pending_highlight_request_ref.current = null;
+                        set_highlight_request_pending(false);
                     }
                     set_source_epoch((n) => n + 1);
                     // What the rows *are* changes with a new source, a new view
@@ -2807,6 +3116,38 @@ export function App(): React.JSX.Element {
         restore_blocker_epoch,
     ]);
 
+    /**
+     * Whether a cell gesture may enter the history right now.
+     *
+     * Two reservations, one predicate, because both are about the same thing —
+     * an edit must not be RECORDED while another gesture is mid-flight for the
+     * same history:
+     *
+     *   - A replay in flight owns the history's next move.
+     *   - A highlight round trip is recorded only when the host's deltas come
+     *     back, so an edit committed inside that window would enter the history
+     *     BEFORE the highlight the user made first, and undo would revert the
+     *     highlight instead of the typing.
+     *
+     * Here rather than in the grid because this is where every recorded gesture
+     * converges: `run_edit_gesture` gates the overlay editor, paste, Glide's
+     * fill hotkeys AND the hyperlink dialog, which reaches the store through
+     * `commit_hyperlinks` and no grid-side editability flag.
+     * GridShell's `highlight_in_flight` prop is the affordance, not the barrier —
+     * it stops a cell opening at all, so nothing the user types is silently
+     * swallowed.
+     *
+     * Stable across renders because a gesture starts and ends inside event
+     * handlers: making this depend on rendered state would rebuild the editing
+     * callbacks mid-gesture, and a wide paste is assembled across many of them.
+     * Both reservations therefore live in refs.
+     */
+    const edit_gestures_admitted = useCallback(
+        () => !(replay_coordinator_ref.current?.is_busy() ?? false)
+            && pending_highlight_request_ref.current === null,
+        [],
+    );
+
     const handle_sheet_select = useCallback(
         (sheet_index: number) => {
             // A Save/Discard/Cancel dialog is a question about *one* worksheet, and
@@ -2872,6 +3213,298 @@ export function App(): React.JSX.Element {
         }
     }, [active_sheet_index, handle_sheet_select]);
 
+    /**
+     * Where the last undo or redo landed, held until a GridShell consumes it.
+     *
+     * Held rather than applied directly, because a workbook-wide history can
+     * replay onto a sheet the user is not looking at: the switch below remounts
+     * the grid, and the request has to outlive that to reach the grid that can
+     * honour it.
+     */
+    const [history_focus, set_history_focus] = useState<PendingHistoryFocus | null>(null);
+    /** The last projection posted, so an unchanged one is not posted again. */
+    const history_menu_state_ref = useRef<HistoryMenuProjection | undefined>(undefined);
+    const history_focus_sequence_ref = useRef(0);
+    /**
+     * The live request, mirrored so a callback can read it without depending on
+     * it. `handle_history_focus_applied` is handed to the grid and must not be
+     * rebuilt every time a replay installs a new request.
+     */
+    const history_focus_ref = useRef<PendingHistoryFocus | null>(null);
+
+    /**
+     * A sheet a committed replay wants shown, still waiting for its turn.
+     *
+     * A ref rather than state because the thing that unblocks it — the save
+     * dialog closing — is itself a ref, so no render is guaranteed to follow and
+     * an effect would not re-run. The drain is therefore explicit, from the
+     * handler that answers the dialog.
+     */
+    const deferred_history_sheet_ref = useRef<number | null>(null);
+
+    /**
+     * Show the sheet a replay landed on, if we are allowed to right now.
+     *
+     * Idempotent and safe to call from either side: it clears the request only
+     * once the switch has actually been made.
+     */
+    const switch_to_history_sheet = useCallback(() => {
+        const sheet_index = deferred_history_sheet_ref.current;
+        if (sheet_index === null) return;
+        if (pending_save_dialog_ref.current) return;
+        deferred_history_sheet_ref.current = null;
+        handle_sheet_select(sheet_index);
+    }, [handle_sheet_select]);
+
+    // Retried on every render, because the drain in the save-dialog handler covers
+    // the ordinary case but not every way that dialog can go away: the host can
+    // revoke the session underneath it, and editing can become unavailable. Those
+    // paths all change state, so a render follows, and this is a ref read and a
+    // return whenever there is nothing waiting.
+    useEffect(() => {
+        switch_to_history_sheet();
+    });
+
+    const handle_history_focus_applied = useCallback((
+        sequence: number,
+        outcome: HistoryFocusOutcome,
+    ) => {
+        // Only the request that was answered: a newer replay may already have
+        // replaced it, and clearing unconditionally would drop that one unapplied.
+        // Matched against the ref rather than inside the updater, because the
+        // answer decides whether to warn as well as what to clear, and a state
+        // updater that also posted a message would post it twice under
+        // StrictMode's double invocation.
+        const answered = history_focus_ref.current;
+        if (answered === null || answered.sequence !== sequence) return;
+        history_focus_ref.current = null;
+        set_history_focus((current) => (current?.sequence === sequence ? null : current));
+        if (outcome.kind === 'rows-hidden' || outcome.kind === 'columns-hidden') {
+            // Said out loud, because the replay DID land: the durable state
+            // changed and the cursor did not move, and silence would read as
+            // nothing having happened. The filters are deliberately left alone —
+            // they are not part of history, and clearing one to expose the row
+            // would make undo mutate view state the user never asked about.
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: `The change was ${replayed_verb(answered.direction)}, but the affected cells are hidden by the current view.`,
+            });
+        }
+    }, []);
+
+    /**
+     * Land an accepted replay, then send the cursor after it.
+     *
+     * The focus is installed only if the local transaction COMMITTED. A focus
+     * request for writes that never landed would move the cursor to a region and
+     * flash it to advertise a change the renderer does not hold.
+     */
+    const handle_committed_history_replay = useCallback((accepted: AcceptedReplay) => {
+        const applied = apply_committed_replay(
+            accepted.committed,
+            accepted.entry,
+            accepted.direction,
+        );
+        if (!applied) {
+            // The host committed and the renderer could not follow, which no
+            // further undo can describe: the two are now telling different stories
+            // about the document.
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: `The change was ${replayed_verb(accepted.direction)} in the file, but this view could not be updated. Reopen the file to resynchronize.`,
+            });
+            return;
+        }
+        const display_focus = accepted.committed.displayFocus;
+        if (display_focus !== null) {
+            const request = history_focus_request(
+                history_focus_sequence_ref.current += 1,
+                accepted.direction,
+                accepted.committed.focusSheetIndex,
+                display_focus,
+                accepted.committed.focus.sourceColumnStart,
+                accepted.committed.focus.sourceColumnEnd,
+            );
+            history_focus_ref.current = request;
+            set_history_focus(request);
+        } else {
+            // Every touched row is filtered out of the view. The replay succeeded;
+            // there is simply nowhere truthful for the cursor to go.
+            host_bridge.postMessage({
+                type: 'showWarning',
+                message: `The change was ${replayed_verb(accepted.direction)}, but the affected cells are hidden by the current view.`,
+            });
+        }
+        // The cursor follows what changed, which for a workbook-wide history can be
+        // a sheet the user is not looking at.
+        //
+        // Order relative to the focus install above does not matter — both are
+        // state updates React batches into the one render, so no grid ever observes
+        // a switched sheet without the request. What DOES matter is that the
+        // request is state and not a call: the grid for that sheet has yet to
+        // mount, and it finds the request waiting when it does.
+        if (accepted.committed.focusSheetIndex !== active_sheet_index) {
+            // Remembered, not fired and forgotten: `handle_sheet_select` declines
+            // while a Save/Discard dialog is open — answering that dialog against
+            // the wrong worksheet is the worse bug — and nothing else would retry.
+            // Without this the focus request outlives the replay forever, because
+            // the mounted grid correctly refuses a request for another sheet, so
+            // the cursor never moves and the flash never fires.
+            deferred_history_sheet_ref.current = accepted.committed.focusSheetIndex;
+            switch_to_history_sheet();
+        }
+    }, [
+        active_sheet_index,
+        apply_committed_replay,
+        switch_to_history_sheet,
+    ]);
+
+    /**
+     * Keep the desktop's native Edit menu in step with the history.
+     *
+     * Posted rather than derived, because the menu is in another process and
+     * cannot read the stack. Diffed against the last post, because rebuilding an
+     * application menu is not free and the three inputs move for reasons that
+     * usually change nothing: a keystroke that dirties a cell moves neither
+     * label, and a focus change between two grid elements is not a change of
+     * text-editing state.
+     *
+     * Harmless in the VS Code webview, which has no native menu — the host
+     * ignores a message type it does not handle — and cheap enough not to be
+     * worth a platform test that the renderer cannot make reliably anyway.
+     */
+    const publish_history_menu_state = useCallback(() => {
+        const store = history_store_ref.current;
+        if (store === null) return;
+        const projection = history_menu_projection(
+            store.snapshot(),
+            edit_command_target(document.activeElement) === 'text',
+        );
+        // The helper already answers false for a ref that has never been posted,
+        // which is what makes the first publish happen.
+        if (history_menu_projections_equal(history_menu_state_ref.current, projection)) return;
+        history_menu_state_ref.current = projection;
+        host_bridge.postMessage({ type: 'historyMenuStateChanged', state: projection });
+    }, []);
+
+    /**
+     * Both things the projection is built from, watched where each moves.
+     *
+     * The stack has a subscription — and a landed replay moves it, so that is also
+     * what keeps the labels fresh across an undo. Text-editing focus has
+     * capture-phase focus events, because focusin/focusout do not bubble from every
+     * element the CSV editor uses.
+     *
+     * The initial publish is the effect body, not a separate call: a window whose
+     * history is empty still has to say so, or the menu would keep the enabled
+     * items it was built with before any viewer reported.
+     */
+    useEffect(() => {
+        publish_history_menu_state();
+        const unsubscribe = history_store_ref.current!.subscribe(publish_history_menu_state);
+        const on_focus_change = () => publish_history_menu_state();
+        window.addEventListener('focusin', on_focus_change, true);
+        window.addEventListener('focusout', on_focus_change, true);
+        return () => {
+            unsubscribe();
+            window.removeEventListener('focusin', on_focus_change, true);
+            window.removeEventListener('focusout', on_focus_change, true);
+        };
+    }, [publish_history_menu_state]);
+
+    /**
+     * Undo or redo, from a keystroke or the desktop Edit menu.
+     *
+     * The one entry point into the coordinator. Everything that LANDS a replay is
+     * in the committed handler above, driven by the host's answer — this only
+     * starts one and reports why it did not happen.
+     *
+     * It never releases the edit session and never leaves edit mode: undo may put
+     * the user back into editing to restore an overlay, but it is not a way out of
+     * it.
+     */
+    const run_history_command = useCallback(async (direction: HistoryDirection) => {
+        const coordinator = replay_coordinator_ref.current;
+        if (coordinator === null) return;
+        // Read BEFORE the replay: a `blocked` refusal is about the barrier that was
+        // in the way, and the stack may move under the await.
+        const barrier_label = history_store_ref.current?.snapshot().barrier?.label;
+        const outcome = await coordinator.begin(direction);
+        if (outcome.kind !== 'refused') return;
+        const warning = history_refusal_warning(outcome.reason, direction, barrier_label);
+        if (warning !== null) host_bridge.postMessage({ type: 'showWarning', message: warning });
+    }, []);
+
+    /**
+     * Undo and redo from the keyboard, for the VS Code webview.
+     *
+     * Capture phase, because Glide consumes key events on the way up and would
+     * eat these before a bubbling listener saw them.
+     *
+     * A text target is left entirely alone — not prevented, not stopped, not
+     * acted on — so the browser's own text undo runs inside an open cell editor.
+     * That is decision 4, and here it costs nothing but an early return; on the
+     * desktop the same rule has to be enforced in `run_edit_command`, because the
+     * OS eats the accelerator before this listener could ever run.
+     *
+     * Key repeat is not filtered. Holding the chord down to walk back a run of
+     * edits is how the feature is used, and the coordinator's own busy refusal is
+     * already the throttle — a silent one, by design.
+     */
+    useEffect(() => {
+        const handler = (event: KeyboardEvent) => {
+            const command = history_hotkey_command(event);
+            if (command === undefined) return;
+            const target = event.target instanceof Element ? event.target : document.activeElement;
+            if (edit_command_target(target) === 'text') return;
+            event.preventDefault();
+            event.stopPropagation();
+            void run_history_command(command);
+        };
+        window.addEventListener('keydown', handler, true);
+        return () => window.removeEventListener('keydown', handler, true);
+    }, [run_history_command]);
+
+    /**
+     * Route the host's replay answers to the coordinator, and land a committed one.
+     *
+     * Its own effect rather than a branch in an existing handler: those handlers'
+     * dependency arrays already run to dozens of entries, and a replay needs none
+     * of what they close over.
+     */
+    useEffect(() => {
+        const handler = (event: MessageEvent) => {
+            const msg = event.data as HostMessage;
+            const coordinator = replay_coordinator_ref.current;
+            if (coordinator === null) return;
+            switch (msg.type) {
+                case 'historyReplayPrepared':
+                    coordinator.on_prepared(msg.prepared);
+                    return;
+                case 'historyReplayPrepareRefused':
+                    coordinator.on_prepare_refused(msg.refusal);
+                    return;
+                case 'historyReplayCommitted': {
+                    // Apply only what the coordinator ACCEPTED, and only the entry
+                    // it accepted for: a stale correlation returns undefined here
+                    // rather than letting this handler decide on its own.
+                    const accepted = coordinator.on_committed(msg.committed);
+                    if (accepted === undefined) return;
+                    handle_committed_history_replay(accepted);
+                    return;
+                }
+                case 'historyReplayCommitRefused':
+                    coordinator.on_commit_refused(msg.refusal);
+                    return;
+                default:
+                    return;
+            }
+        };
+        window.addEventListener('message', handler);
+        return () => window.removeEventListener('message', handler);
+    }, [handle_committed_history_replay]);
+
+
     // Release a deferred sheet action once the active sheet and the mounted grid
     // handle both match the target. Re-checked after any keyed grid remount.
     useEffect(() => {
@@ -2900,6 +3533,14 @@ export function App(): React.JSX.Element {
     const run_edit_command = useCallback((command: EditCommand) => {
         const active = document.activeElement;
         if (edit_command_target(active) === 'text') {
+            // Decision 4, and the whole reason undo comes through here: inside an
+            // open cell editor Cmd/Ctrl+Z is the browser's text undo, not the
+            // workbook's. The OS consumed the accelerator before the page saw it,
+            // so this focus check is the only place that distinction can be made.
+            if (command === 'undo' || command === 'redo') {
+                run_native_text_history(command);
+                return;
+            }
             const field = active as HTMLInputElement | HTMLTextAreaElement;
             if (command === 'selectAll') {
                 field.select?.();
@@ -2915,10 +3556,14 @@ export function App(): React.JSX.Element {
             }
             return;
         }
+        if (command === 'undo' || command === 'redo') {
+            void run_history_command(command);
+            return;
+        }
         const handle = grid_actions_ref.current;
         if (command === 'selectAll') handle?.select_all();
         else handle?.copy_selection();
-    }, []);
+    }, [run_history_command]);
 
     /**
      * The only writer, so the live array and the persisted copy cannot drift.
@@ -3114,6 +3759,88 @@ export function App(): React.JSX.Element {
     const handle_promote_row_to_header = useCallback((display_row: number) => {
         request_excel_header(true, false, display_row);
     }, [active_sheet_index, request_excel_header]);
+
+    /**
+     * The discard whose host-side cleanup has not been acknowledged yet.
+     *
+     * A discard is undoable, and the host refuses `requestEditSession` until its
+     * cleanup settles — so undoing one awaits the acknowledgement rather than
+     * asking into that window and being refused for a reason about timing.
+     *
+     * One shared promise per discard, not a list of waiters: the replay
+     * coordinator admits a single outstanding replay, so a collection would model
+     * a concurrency that cannot arise, and every additional awaiter can simply
+     * await the same promise.
+     */
+    const discard_cleanup_ref = useRef<PendingSignal<boolean> & { readonly session: string }>();
+    /** The same, for the next `editSessionResult` a replay is waiting on. */
+    const session_grant_ref = useRef<PendingSignal<boolean>>();
+
+    const settle_session_grant_waiters = useCallback((granted: boolean) => {
+        const pending = session_grant_ref.current;
+        if (pending === undefined) return;
+        session_grant_ref.current = undefined;
+        pending.settle(granted);
+    }, []);
+
+    /**
+     * Hold an edit session, acquiring one if there is none, for a replay.
+     *
+     * Three waits, and the order is the point. A discard's host-side cleanup has
+     * to settle first, because a request sent into that window is refused for a
+     * reason about timing rather than about the document. Then a session is
+     * requested if one is not already held. Only then does the replay build its
+     * prepare request, because the grant crosses a hydration boundary that
+     * replaces the stores wholesale.
+     *
+     * Re-entering edit mode is deliberate and one-directional: undo may put the
+     * user back into editing, and must never take them out of it — the grant
+     * handler sets edit mode as it does for the Edit button.
+     */
+    const ensure_replay_session = useCallback(async (): Promise<boolean> => {
+        const discarding = discard_cleanup_ref.current;
+        if (discarding !== undefined) {
+            // A clear that failed leaves editing disabled for the whole file, so
+            // there is no session to be had and undo must not promise one.
+            if (!await discarding.settled) return false;
+        }
+        if (csv_edit_session_id_ref.current !== undefined) return true;
+        // A request already in flight — the Edit button pressed a moment ago —
+        // is joined rather than duplicated: the host answers one request, and a
+        // second would be refused while the first is outstanding.
+        const already_requested = pending_edit_request_ref.current !== null;
+        const grant = session_grant_ref.current ?? pending_signal<boolean>();
+        session_grant_ref.current = grant;
+        if (!already_requested) {
+            set_edit_session_pending(true);
+            const request_id = [
+                'edit',
+                edit_request_prefix_ref.current,
+                ++edit_request_seq_ref.current,
+            ].join(':');
+            pending_edit_request_ref.current = request_id;
+            // The sheet the discarded session was last editing, which is the
+            // pointer the restored one should resume on. Not the active tab: the
+            // grant's only use for the field is to set the initial pointer, and
+            // the replay's own focus decides where the cursor lands.
+            const sheet_index = edit_session_sheet_index_ref.current;
+            const requested_sheet = meta_ref.current?.sheets[sheet_index];
+            host_bridge.postMessage({
+                type: 'requestEditSession',
+                requestId: request_id,
+                sheetIndex: sheet_index,
+                sheetName: requested_sheet?.name,
+                worksheetId: requested_sheet?.worksheetId,
+            });
+        }
+        return grant.settled;
+    }, []);
+    // In an effect, not the render body: a render-phase write is a side effect,
+    // and StrictMode's double render makes that a rule with teeth. A layout effect
+    // is early enough — nothing calls this before the user asks for a replay.
+    useLayoutEffect(() => {
+        ensure_replay_session_ref.current = ensure_replay_session;
+    }, [ensure_replay_session]);
 
     const handle_toggle_edit_mode = useCallback(() => {
         const entering = !edit_mode;
@@ -3543,6 +4270,16 @@ export function App(): React.JSX.Element {
                     set_csv_edit_session_id(undefined);
                     set_edit_mode(false);
                 }
+                // After the install and the edit-mode transition, so a replay
+                // resuming here reads the stores the grant just replaced rather
+                // than the ones it is about to.
+                settle_session_grant_waiters(msg.granted && !!msg.editSessionId);
+            } else if (msg.type === 'discardEditSessionResult') {
+                const pending = discard_cleanup_ref.current;
+                if (pending !== undefined && pending.session === msg.editSessionId) {
+                    discard_cleanup_ref.current = undefined;
+                    pending.settle(msg.cleared);
+                }
             } else if (msg.type === 'editSessionRevoked') {
                 apply_save_lifecycle(msg.lifecycle);
             } else if (msg.type === 'saveDialogResult') {
@@ -3553,6 +4290,12 @@ export function App(): React.JSX.Element {
                     || pending_dialog.editSessionId !== msg.editSessionId
                 ) return;
                 pending_save_dialog_ref.current = null;
+                // A cross-sheet replay that arrived while this dialog was open is
+                // still waiting to be shown. Drained before the choice is acted
+                // on, so the switch happens whatever the answer was — including
+                // 'cancel', which otherwise returns control with the cursor
+                // stranded on the wrong sheet.
+                switch_to_history_sheet();
                 if (msg.choice === 'save') {
                     if (request_save_or_remain_dirty()) {
                         pending_exit_ref.current = true;
@@ -3560,7 +4303,6 @@ export function App(): React.JSX.Element {
                         leave_edit_mode();
                     }
                 } else if (msg.choice === 'discard') {
-                    editing_ref.current?.clear_dirty();
                     discard_edit_session();
                 }
                 // 'cancel' → stay in edit mode, keep edits.
@@ -3642,10 +4384,12 @@ export function App(): React.JSX.Element {
         discard_edit_session,
         install_edit_session,
         handle_sheet_select,
+        switch_to_history_sheet,
         leave_edit_mode,
         persist_immediate,
         request_save_or_remain_dirty,
         run_edit_command,
+        settle_session_grant_waiters,
     ]);
 
     // If editing becomes unavailable (e.g. a reload disables CSV editing), leave
@@ -3701,12 +4445,24 @@ export function App(): React.JSX.Element {
             || preview_mode_ref.current
             || pending_highlight_request_ref.current
         ) return;
+        // Highlight admission makes every cell read-only until the host replies.
+        // Glide does not reliably close an overlay it already mounted when
+        // provideEditor changes, so fold and terminate it before reserving the
+        // history slot. Doing this after setting the pending ref would make the
+        // gesture gate reject the user's already-typed text.
+        editing_ref.current?.commit_live_edit();
         const request_id = [
             'highlight',
             highlight_request_prefix_ref.current,
             ++highlight_request_seq_ref.current,
         ].join(':');
-        pending_highlight_request_ref.current = request_id;
+        // The gesture's own name goes with the request: the diff that comes back
+        // says which cells moved but not what the user asked for, and "Undo Clear
+        // highlight" reads as the action they took.
+        pending_highlight_request_ref.current = {
+            requestId: request_id,
+            label: mutation.type === 'clear' ? 'Clear highlight' : 'Highlight cells',
+        };
         set_highlight_request_pending(true);
         set_highlight_status('Updating cell highlights…');
         host_bridge.postMessage({
@@ -3729,12 +4485,16 @@ export function App(): React.JSX.Element {
             || preview_mode_ref.current
             || pending_highlight_request_ref.current
         ) return;
+        editing_ref.current?.commit_live_edit();
         const request_id = [
             'highlight',
             highlight_request_prefix_ref.current,
             ++highlight_request_seq_ref.current,
         ].join(':');
-        pending_highlight_request_ref.current = request_id;
+        pending_highlight_request_ref.current = {
+            requestId: request_id,
+            label: 'Clear all highlights',
+        };
         set_highlight_request_pending(true);
         set_highlight_status('Updating cell highlights…');
         host_bridge.postMessage({
@@ -4641,6 +5401,12 @@ export function App(): React.JSX.Element {
             row_count={effective_row_count}
             show_formatting={show_formatting}
             column_projection={current_column_projection}
+            // Read from the ref during render, which is sound because every writer
+            // of it also moves `generation` — the state this component re-renders
+            // on and the grid is keyed by — in the same message handler.
+            mapping_generation={mapping_generations_ref.current[active_sheet_index] ?? 1}
+            history_focus={history_focus}
+            on_history_focus_applied={handle_history_focus_applied}
             column_widths={column_widths[active_sheet_index] ?? {}}
             on_column_resize={handle_column_resize}
             // The host's display-keyed projection for this sheet — never `{}` under a
@@ -4655,6 +5421,7 @@ export function App(): React.JSX.Element {
             preview_mode={preview_mode}
             edit_mode={edit_mode_on_active_sheet}
             edit_activation_id={edit_activation_id}
+            highlight_in_flight={highlight_request_pending}
             csv_editable={csv_editable}
             edit_syntax={edit_syntax}
             edit_session_id={csv_edit_session_id}
@@ -4666,6 +5433,8 @@ export function App(): React.JSX.Element {
             edit_session={edit_session_registry_ref.current!.for_sheet(
                 active_sheet_index,
             )}
+            history_store={history_store_ref.current!}
+            gestures_admitted={edit_gestures_admitted}
             host_rejected_keys={live_rejected_keys}
             on_editing_change={handle_editing_change}
             editing_ref={editing_ref}
@@ -4946,10 +5715,7 @@ export function App(): React.JSX.Element {
                             Discard Conflicted
                         </button>
                         <button
-                            onClick={() => {
-                                editing_ref.current?.clear_dirty();
-                                discard_edit_session();
-                            }}
+                            onClick={() => { discard_edit_session(); }}
                         >
                             Discard All
                         </button>

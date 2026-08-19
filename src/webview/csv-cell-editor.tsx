@@ -6,6 +6,7 @@ import {
     type EditorCommitNavigation,
 } from './csv-cell-editor-model';
 import { count_lines, has_line_break } from './line-breaks';
+import type { RichCellData } from './rich-text-layout';
 
 /** Glide movement delta: `[deltaCol, deltaRow]`, each clamped to -1/0/+1. */
 type Movement = readonly [-1 | 0 | 1, -1 | 0 | 1];
@@ -23,10 +24,20 @@ export interface CsvCellEditorProps {
 }
 
 function cell_text(cell: GridCell): string {
-    return cell.kind === GridCellKind.Text ? cell.data ?? '' : '';
+    if (cell.kind === GridCellKind.Text) return cell.data ?? '';
+    if (cell.kind === GridCellKind.Custom) {
+        return (cell.data as Partial<RichCellData>).edit_value ?? '';
+    }
+    return '';
 }
 
 function with_text(cell: GridCell, text: string): GridCell {
+    if (cell.kind === GridCellKind.Custom) {
+        return {
+            ...cell,
+            data: { ...(cell.data as RichCellData), edit_value: text },
+        } as GridCell;
+    }
     return { ...cell, data: text, displayData: text } as GridCell;
 }
 
@@ -46,7 +57,11 @@ export function CsvCellEditor({
     onCommitNavigation,
     initialValue,
 }: CsvCellEditorProps): React.JSX.Element {
-    const initial = cell_text(value);
+    // Glide rewrites built-in Text cells with the type-to-edit seed before it
+    // opens the overlay, but Custom cells are passed through unchanged. Rich
+    // Markdown cells use Custom so the canvas can keep painting their runs;
+    // prefer the explicit seed for both kinds to give them identical behavior.
+    const initial = initialValue ?? cell_text(value);
     const [text, set_text] = useState(initial);
     const [is_multiline, set_is_multiline] = useState(has_line_break(initial));
     const input_ref = useRef<HTMLInputElement | HTMLTextAreaElement | null>(null);
@@ -67,9 +82,10 @@ export function CsvCellEditor({
                 // Mouse/Enter activation starts with the existing cell selected.
                 el.select();
             } else {
-                // Type-to-edit has already placed the initiating text in `value`.
-                // Leave it intact so the next character appends instead of
-                // replacing it through the browser's selected-text behavior.
+                // The initiating text is `initial` (for built-in Text Glide has
+                // also placed it in `value`; for rich Custom it has not). Leave
+                // it intact so the next character appends instead of replacing
+                // it through the browser's selected-text behavior.
                 el.setSelectionRange(el.value.length, el.value.length);
             }
             mounted_ref.current = true;

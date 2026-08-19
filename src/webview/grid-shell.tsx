@@ -1,3 +1,4 @@
+import { cell_key } from '../cell-key';
 import React, {
     useCallback,
     useEffect,
@@ -12,9 +13,10 @@ import {
     DataEditor,
     GridCellKind,
     type CellClickedEventArgs,
+    type CellEditSource,
     type DataEditorRef,
     type DrawHeaderCallback,
-    type EditableGridCell,
+    type EditListItem,
     type GridCell,
     type GridColumn,
     type HeaderClickedEventArgs,
@@ -52,7 +54,10 @@ import {
     MAX_COLUMN_WIDTH_PX,
 } from './grid-model';
 import { ContextMenu } from './context-menu';
-import { cell_context_menu_items } from './cell-context-menu';
+import {
+    cell_context_menu_items,
+    has_distinct_copy_selection,
+} from './cell-context-menu';
 import { ColumnContextMenu, MultiColumnContextMenu } from './column-context-menu';
 import {
     grid_selection_contains_column,
@@ -90,7 +95,7 @@ import {
     rich_cell_display_data,
     type CellEditOverlay,
 } from './cell-renderer';
-import { rich_text_cell_renderer } from './rich-text-cell-renderer';
+import { is_rich_text_cell, rich_text_cell_renderer } from './rich-text-cell-renderer';
 import { parse_http_external_url } from '../external-url';
 import type { CellHyperlink } from '../cell-content';
 import { HyperlinkDialog } from './hyperlink-dialog';
@@ -105,7 +110,13 @@ import {
 } from './cell-overflow-model';
 import { browserIsOSX } from './glide-data-grid/common/browser-detect.js';
 import { count_lines, has_line_break } from './line-breaks';
-import { use_editing, type DirtyEntry } from './use-editing';
+import {
+    use_editing,
+    type CellValueEdit,
+    type DirtyEntry,
+    type HistoryCaptureOptions,
+} from './use-editing';
+import type { HistoryStore } from './history-store';
 import { cell_edit_text, dirty_value_edit_text, type EditSyntax } from '../cell-edit-model';
 import {
     create_edit_session_store,
@@ -151,7 +162,17 @@ import {
     highlight_selection_from_grid,
     selected_display_row_intervals,
 } from './highlight-selection-model';
-import { highlight_rgba } from './highlight-theme';
+import { highlight_rgba, history_flash_rgba } from './highlight-theme';
+import {
+    HISTORY_FLASH_DURATION_MS,
+    begin_history_flash,
+    history_flash_covers,
+    history_flash_damage,
+    resolve_history_focus,
+    type HistoryFlash,
+    type HistoryFocusOutcome,
+    type PendingHistoryFocus,
+} from './history-focus-model';
 import {
     clamp_row_height,
     default_row_height_for_font,
@@ -189,6 +210,22 @@ const PREVIEW_RESTORE_SETTLE_MS = 32;
  * compute an edit_value here.
  */
 const markdown_edit_text_cache = new WeakMap<object, string>();
+
+/**
+ * What the undo menu will say this gesture was.
+ *
+ * Named from the gesture Glide reports rather than from what the cells ended up
+ * containing: a paste of empty strings is still a paste to the user, and "Undo
+ * Clear cells" for it would name an operation they did not perform.
+ */
+function edit_history_label(source: CellEditSource, count: number): string {
+    switch (source) {
+        case 'paste': return 'Paste';
+        case 'fill': return 'Fill';
+        case 'delete': return count === 1 ? 'Clear cell' : 'Clear cells';
+        default: return count === 1 ? 'Edit cell' : 'Edit cells';
+    }
+}
 
 function cached_markdown_edit_text(
     source: object,
@@ -351,6 +388,23 @@ export interface GridShellProps {
     /** Parent-owned identity of the committed edit-mode activation. */
     edit_activation_id: number;
     csv_editable?: boolean;
+    /**
+     * Whether a highlight gesture is awaiting the host's acknowledgement.
+     *
+     * Cells stop OFFERING an editor for that window, on the same reasoning as
+     * `save_in_flight`: a highlight round-trips through durable state, and it is
+     * recorded only when the host's deltas come back, so an edit recorded while
+     * one is outstanding would enter the history BEFORE the highlight the user
+     * made first — undo would then revert the highlight when the user expected
+     * their typing back. The window is one host round trip, and the highlight
+     * panel is already disabled across it.
+     *
+     * The affordance only. The barrier that actually keeps such an edit out of
+     * the history is App's `gestures_admitted`, which every recorded gesture
+     * passes through — including the hyperlink dialog, which reaches the store
+     * without consulting any editability flag here.
+     */
+    highlight_in_flight?: boolean;
     /** How this sheet's cells are edited ('markdown' for xlsx). Default 'plain'. */
     edit_syntax?: EditSyntax;
     edit_session_id?: string;
@@ -366,6 +420,20 @@ export interface GridShellProps {
      * mount-scoped store seeded from `initial_edits`.
      */
     edit_session?: EditSessionStore;
+    /**
+     * The workbook's undo history. Hoisted like `edit_session`, and for a
+     * stronger reason: history spans every sheet, so it cannot live in a shell
+     * that is mounted per sheet and keyed by generation. A consumer without one
+     * (the shell's own tests) edits exactly as before, unrecorded.
+     */
+    history_store?: HistoryStore;
+    /**
+     * Whether a new edit gesture may start. Absent means always.
+     *
+     * Carries the replay reservation down: while an undo is in flight, a keystroke
+     * would be planned against a state the replay is about to move.
+     */
+    gestures_admitted?: () => boolean;
     /**
      * Source-keyed keys the host refused the last save over. Unioned into the
      * conflict tint so a `baseMismatch` cell is visibly marked even though the
@@ -387,6 +455,23 @@ export interface GridShellProps {
     grid_focus_ref?: MutableRefObject<GridFocusHandle | null>;
     /** App-owned bridge for sheet-tab actions (select all / copy sheet). */
     grid_actions_ref?: MutableRefObject<GridActionsHandle | null>;
+    /**
+     * Where an undo or redo landed, retained by App across the sheet switch and
+     * the generation-keyed remount a cross-sheet replay causes.
+     *
+     * Declarative rather than a method on `grid_actions_ref`: that handle carries
+     * repeatable user actions, while this is a one-shot state transition with a
+     * correlation that has to survive a remount to be delivered at all.
+     */
+    history_focus?: PendingHistoryFocus | null;
+    /** Clears the App-owned request, reporting what the grid was able to do. */
+    on_history_focus_applied?: (sequence: number, outcome: HistoryFocusOutcome) => void;
+    /**
+     * This sheet's mapping generation, for checking a host-resolved focus against
+     * the view actually installed. A projection resolved against a mapping that
+     * has since moved names rows that are no longer the ones the replay touched.
+     */
+    mapping_generation?: number;
     /** Latest preview scroll request, retained by App across GridShell remounts. */
     pending_preview_scroll?: PendingPreviewScroll | null;
     /** Clears the App-owned request only after Glide accepts the scroll. */
@@ -443,6 +528,7 @@ export function GridShell({
     edit_mode = false,
     edit_activation_id,
     csv_editable = false,
+    highlight_in_flight = false,
     edit_syntax = 'plain',
     edit_session_id,
     save_operation,
@@ -450,6 +536,8 @@ export function GridShell({
     on_save_request = () => undefined,
     initial_edits,
     edit_session,
+    history_store,
+    gestures_admitted,
     host_rejected_keys,
     on_editing_change,
     editing_ref,
@@ -457,6 +545,9 @@ export function GridShell({
     on_auto_fit_sample_change,
     grid_focus_ref,
     grid_actions_ref,
+    history_focus = null,
+    on_history_focus_applied = () => {},
+    mapping_generation = 1,
     pending_preview_scroll = null,
     on_preview_scroll_applied = () => {},
     on_preview_visible_row_change = () => {},
@@ -750,17 +841,36 @@ export function GridShell({
         [version],
     );
 
+    // Full identity, all three fields, on every recorded change: a workbook-wide
+    // undo has to find its way back to the sheet an edit was made on, and a bare
+    // index cannot survive a reorder between the edit and the undo.
+    const history_capture = useMemo((): HistoryCaptureOptions | undefined => (
+        history_store === undefined ? undefined : {
+            worksheet: {
+                sheetIndex: sheet_index,
+                ...(sheet_meta.name === undefined ? {} : { sheetName: sheet_meta.name }),
+                ...(sheet_meta.worksheetId === undefined
+                    ? {}
+                    : { worksheetId: sheet_meta.worksheetId }),
+            },
+            history: history_store,
+        }
+    ), [history_store, sheet_index, sheet_meta.name, sheet_meta.worksheetId]);
+
     const {
         dirty_cells,
         conflicted_keys: derived_conflicted_keys,
         commit_edit,
+        commit_edits,
         clear_dirty,
         replace_dirty,
         clear_dirty_keys,
         discard_conflicted,
-        commit_hyperlink,
+        commit_hyperlinks,
     } = use_editing(get_cell_raw, generation, edit_session_id, store, {
         syntax: edit_syntax,
+        capture: history_capture,
+        gestures_admitted,
         // Same identity discipline as get_cell_raw: rebinds with `version` so
         // freshly-loaded pages refresh markdown edit text and bases.
         get_cell: useCallback(
@@ -798,7 +908,15 @@ export function GridShell({
     const editable_cells = edit_mode
         && csv_editable
         && !save_in_flight
+        && !highlight_in_flight
         && !close_barrier_active;
+    // Edit callbacks can outlive the render that supplied them. Read admission
+    // through a render-current ref so a queued overlay finish cannot commit just
+    // because its callback closed over the previous editable state.
+    const editable_cells_ref = useRef(editable_cells);
+    editable_cells_ref.current = editable_cells;
+    const edit_session_id_ref = useRef(edit_session_id);
+    edit_session_id_ref.current = edit_session_id;
 
     useEffect(() => {
         if (
@@ -1049,6 +1167,111 @@ export function GridShell({
         write_grid_selection(selection);
         grid_ref.current?.scrollTo(cell[0], cell[1]);
     }, [merges, write_grid_selection]);
+    // The flash lives in a ref, not state: `get_cell_content` reads it during
+    // paint, and a re-render is neither needed nor wanted — the visible cells are
+    // damaged explicitly, twice, on entry and at the deadline.
+    const history_flash_ref = useRef<HistoryFlash | null>(null);
+    const history_flash_timer_ref = useRef<number | null>(null);
+    const applied_history_sequence_ref = useRef<number | null>(null);
+
+    /**
+     * Repaint the cells a flash covers, whatever `history_flash_ref` now holds.
+     *
+     * Both callers pass the same flash and want the same cells; what differs is
+     * only when they run relative to installing or clearing it. Bounded by the
+     * viewport, which is what keeps a select-all-sized replay from enumerating a
+     * million cells — `history_flash_damage` intersects with the visible rect.
+     */
+    const repaint_history_flash = useCallback((flash: HistoryFlash) => {
+        const cells = history_flash_damage(flash, visible_ref.current)
+            .map(({ cell }) => ({ cell: cell as Item }));
+        if (cells.length > 0) grid_ref.current?.updateCells(cells);
+    }, []);
+
+    const clear_history_flash = useCallback(() => {
+        if (history_flash_timer_ref.current !== null) {
+            window.clearTimeout(history_flash_timer_ref.current);
+            history_flash_timer_ref.current = null;
+        }
+        const flash = history_flash_ref.current;
+        history_flash_ref.current = null;
+        if (flash === null) return;
+        // Repainted AFTER clearing, so it reads the cleared state and the cells
+        // come back with whatever persistent tint they actually have — conflict,
+        // dirty, or a cell highlight.
+        repaint_history_flash(flash);
+    }, [repaint_history_flash]);
+
+    useEffect(() => clear_history_flash, [clear_history_flash]);
+
+    /**
+     * Move the cursor to what an undo or redo changed, and flash it.
+     *
+     * A layout effect so the selection is written before the browser paints: a
+     * cross-sheet replay arrives with this grid freshly mounted, and a visible
+     * frame at the old cursor before it jumps reads as a glitch.
+     */
+    useLayoutEffect(() => {
+        if (history_focus === null) return;
+        if (applied_history_sequence_ref.current === history_focus.sequence) return;
+        // Before resolving, not after: a request for another sheet is not this
+        // grid's to answer OR to refuse — App is mid-switch and the grid that can
+        // honour it has yet to mount — so there is nothing to resolve.
+        if (history_focus.sheetIndex !== sheet_index) return;
+        const outcome = resolve_history_focus(history_focus, {
+            rowCount: row_count,
+            mappingGeneration: mapping_generation,
+            columnProjection: column_projection,
+        });
+        applied_history_sequence_ref.current = history_focus.sequence;
+        if (outcome.kind !== 'applied') {
+            on_history_focus_applied(history_focus.sequence, outcome);
+            return;
+        }
+        // Merge snapping, for the reason `select_active_display_cell` documents:
+        // controlled writes bypass the grid's own canonicalization, so a region
+        // overlapping a merge would render as a partial block.
+        const { cell, range } = expand_glide_selection(outcome.cell, outcome.range, merges);
+        write_grid_selection({
+            columns: CompactSelection.empty(),
+            rows: CompactSelection.empty(),
+            current: { cell, range, rangeStack: [] },
+        });
+        // A replay should lead the eye to the start of an oversized cell. Glide's
+        // default nearest-edge reveal can otherwise show its right edge and leave
+        // the value offscreen; fitting cells retain ordinary nearest-edge behavior.
+        grid_ref.current?.scrollTo(cell[0], cell[1], 'both', 0, 0, {
+            hAlign: 'start-if-oversized',
+        });
+        focus_grid();
+
+        clear_history_flash();
+        const flash = begin_history_flash(range, Date.now());
+        history_flash_ref.current = flash;
+        repaint_history_flash(flash);
+        // No same-flash guard in the callback: a newer replay reaches
+        // `clear_history_flash` above before installing its own flash, and that
+        // cancels this timer — so if this ever runs, the flash it was armed for is
+        // still the installed one.
+        history_flash_timer_ref.current = window.setTimeout(
+            clear_history_flash,
+            HISTORY_FLASH_DURATION_MS,
+        );
+        on_history_focus_applied(history_focus.sequence, outcome);
+    }, [
+        clear_history_flash,
+        column_projection,
+        display_column_count,
+        focus_grid,
+        history_focus,
+        mapping_generation,
+        merges,
+        on_history_focus_applied,
+        row_count,
+        sheet_index,
+        write_grid_selection,
+    ]);
+
     const select_active_display_cell_ref = useRef(select_active_display_cell);
     const focus_grid_ref = useRef(focus_grid);
     const row_count_ref = useRef(row_count);
@@ -1068,12 +1291,18 @@ export function GridShell({
         merge_index,
     ]);
     const previous_projection_ref = useRef(column_projection);
-    useEffect(() => {
+    useLayoutEffect(() => {
         if (column_projections_equal(previous_projection_ref.current, column_projection)) {
             previous_projection_ref.current = column_projection;
             return;
         }
         previous_projection_ref.current = column_projection;
+        // A controlled selection reset and a new provideEditor callback do not
+        // reliably close an overlay Glide already mounted. App folds its live
+        // value before changing a projection; explicitly terminate the old
+        // display-coordinate lifetime before display columns acquire new
+        // meanings.
+        grid_ref.current?.dismissOverlay();
         const focused_source = focused_source_column_ref.current;
         focused_source_column_ref.current = focused_source !== undefined
             && visible_source_columns.includes(focused_source)
@@ -1236,8 +1465,15 @@ export function GridShell({
     const open_overlay_row_ref = useRef<{
         display_cell: Item;
         source_row: number;
+        source_column: number;
+        edit_session_id: string | undefined;
         pin: symbol;
     } | null>(null);
+    // Remains raised while an overlay lifetime is revoked, then clears when
+    // editing reopens or a newly mounted tracking editor captures admission.
+    // This closes the small window in which an already-queued finish can arrive
+    // after the old editor was unmounted.
+    const overlay_admission_revoked_ref = useRef(false);
     const pending_editor_navigation_ref = useRef<Item | null>(null);
     useEffect(() => {
         pending_editor_navigation_ref.current = null;
@@ -1251,6 +1487,8 @@ export function GridShell({
     unpin_rows_ref.current = unpin_rows;
     const get_source_row_ref = useRef(get_source_row);
     get_source_row_ref.current = get_source_row;
+    const source_column_for_display_ref = useRef(source_column_for_display);
+    source_column_for_display_ref.current = source_column_for_display;
 
     const release_open_overlay_row = useCallback(() => {
         const captured = open_overlay_row_ref.current;
@@ -1268,25 +1506,27 @@ export function GridShell({
         if (!loc) return;
         const display_row = loc[1];
         const source_row = get_source_row_ref.current(display_row);
+        const source_column = source_column_for_display_ref.current(loc[0]);
         // Unresolved identity: nothing to remember and nothing worth pinning. The
         // overlay-open gate means this is unreachable for a real editor mount, and
         // leaving the ref null keeps the commit guards' early return intact.
-        if (source_row === undefined) return;
+        if (source_row === undefined || source_column === undefined) return;
+        overlay_admission_revoked_ref.current = false;
         open_overlay_row_ref.current = {
             display_cell: [loc[0], display_row],
             source_row,
+            source_column,
+            edit_session_id: edit_session_id_ref.current,
             pin: pin_rows_ref.current(display_row, display_row),
         };
     }, [release_open_overlay_row]);
 
     /**
-     * Canonical source row for a commit arriving from the open overlay. Live
-     * residency first — that is the truth for every path that did not come through
-     * an overlay (Glide's paste path, most importantly, which never opens one).
-     * Only when the row is no longer resident does the identity captured at
-     * overlay-open time stand in, and only for the row it was captured for: a
-     * mismatched display row means this commit is not that overlay's, so the
-     * caller's early return still applies.
+     * Canonical source row for a current gesture. Live residency is the truth for
+     * paste/fill/delete, which do not belong to an open overlay. If the row has
+     * just been evicted, the overlay capture remains a safe fallback for its own
+     * display row. Exact overlay edits choose the full captured identity at their
+     * call sites so a newly resident row cannot steal a late finish.
      */
     const commit_source_row = useCallback((row: number): number | undefined => {
         const resident = get_source_row(row);
@@ -1302,11 +1542,34 @@ export function GridShell({
     // only if Glide re-renders the overlay. Releasing here too makes the lifecycle
     // independent of that: an unreleased pin would hold a page resident for the
     // rest of the session.
-    useEffect(() => {
-        if (editable_cells) return;
+    useLayoutEffect(() => {
+        if (editable_cells) {
+            // The revoked overlay was synchronously dismissed below. Reopening
+            // admission permits the next ordinary edit callback; a real overlay
+            // mount will replace the capture before it can finish in any case.
+            overlay_admission_revoked_ref.current = false;
+            return;
+        }
         pending_editor_navigation_ref.current = null;
+        overlay_admission_revoked_ref.current = true;
+        // `provideEditor` controls whether a *new* overlay may open; Glide does
+        // not consistently apply that change to one it already owns. The caller
+        // initiating an ordinary transition folds the live text first. This
+        // imperative dismissal is the final lifecycle boundary for revocation
+        // and other transitions where accepting a late edit would be unsafe.
+        grid_ref.current?.dismissOverlay();
         release_open_overlay_row();
     }, [editable_cells, release_open_overlay_row]);
+
+    const previous_overlay_session_ref = useRef(edit_session_id);
+    useLayoutEffect(() => {
+        if (previous_overlay_session_ref.current === edit_session_id) return;
+        previous_overlay_session_ref.current = edit_session_id;
+        pending_editor_navigation_ref.current = null;
+        overlay_admission_revoked_ref.current = true;
+        grid_ref.current?.dismissOverlay();
+        release_open_overlay_row();
+    }, [edit_session_id, release_open_overlay_row]);
 
     // Unmount (a generation/sheet remount, or the webview closing). The loader's
     // own unmount clears its pins as well, so this is the belt to that braces —
@@ -1322,7 +1585,13 @@ export function GridShell({
         const loc = grid_selection_ref.current.current?.cell;
         if (!loc) return null;
         const [display_column, row] = loc;
-        const source_column = source_column_for_display(display_column);
+        const captured = open_overlay_row_ref.current;
+        const captured_matches = captured !== null
+            && captured.display_cell[0] === display_column
+            && captured.display_cell[1] === row;
+        const source_column = captured_matches
+            ? captured.source_column
+            : source_column_for_display(display_column);
         if (source_column === undefined) return null;
         // The `key` is a durable edit key, so it must be fully source-keyed: the
         // save collectors (collect_save_payload) merge it
@@ -1330,14 +1599,16 @@ export function GridShell({
         // would poison them. Falls back to the identity captured when this overlay
         // opened, so an editor whose page left mid-edit still reaches the save
         // rather than being silently dropped (see commit_source_row).
-        const source_row = commit_source_row(row);
+        const source_row = captured_matches
+            ? captured.source_row
+            : commit_source_row(row);
         if (source_row === undefined) return null;
         // `original` is what the editor *opened with*, so cleanliness is a
         // comparison in the editor's own space. On a markdown sheet that is
         // the cell's markup (mirroring get_cell_content's `edit_value`), not
         // the plain raw text — comparing "**x**" against "x" would mark an
         // untouched bold cell as uncommitted the moment its editor opened.
-        const key = `${source_row}:${source_column}`;
+        const key = cell_key(source_row, source_column);
         let original: string;
         const dirty = store.get(key);
         if (dirty) {
@@ -1384,6 +1655,7 @@ export function GridShell({
             || operation.editSessionId !== edit_session_id
             || operation.saveRequestId.length === 0
         ) return false;
+        grid_ref.current?.dismissOverlay();
         const worksheet = worksheet_payload(operation);
         save_operation_ref.current = operation;
         saved_edits_ref.current = worksheet ? { ...worksheet.edits } : {};
@@ -1409,7 +1681,7 @@ export function GridShell({
      * larger by hand is left alone.
      *
      * Shared by *every* path that commits a cell value, which is the point of it being a
-     * function rather than a branch inside `on_cell_edited`. There are two such paths and
+     * function rather than a branch inside `on_cells_edited`. There are two such paths and
      * only one of them is Glide's: App also folds an open multiline editor through
      * `commit_live_edit` when something is about to remount or re-project the grid — a
      * transform completing, a column-visibility change. That fold used to reach
@@ -1420,7 +1692,7 @@ export function GridShell({
      *
      * Takes a *display* row deliberately, and resolves no source row even where the caller
      * has one to hand: `on_row_resize` speaks display intervals and the host owns the one
-     * display→source mapper. The auto-grow comment in `on_cell_edited` has the full
+     * display→source mapper. The auto-grow comment in `on_cells_edited` has the full
      * version of that argument.
      */
     const auto_grow_row_for_text = useCallback((
@@ -1497,33 +1769,38 @@ export function GridShell({
     ]);
 
     const commit_live_edit_unfenced = useCallback((): void => {
-        if (save_in_flight_ref.current) return;
+        if (save_in_flight_ref.current) {
+            grid_ref.current?.dismissOverlay();
+            return;
+        }
         const live = read_live_edit();
-        if (!live) return;
-        // Source-keyed already: `live.key` comes from read_live_edit and
-        // commit_edit's first parameter is a source row. No conversion here.
-        const [source_row, source_column] = live.key.split(':').map(Number);
-        if (!Number.isInteger(source_row) || !Number.isInteger(source_column)) return;
-        commit_edit(source_row, source_column, live.value);
-        // The display row for the same cell, read from the same selection `read_live_edit`
-        // derived `live.key` from and in the same synchronous block — so the two name one
-        // cell in the two spaces, with no mapping and no chance of drift.
-        //
-        // Whether the resize this posts is honoured depends on why the fold happened, and
-        // that is the honest state of it rather than a gap. A fold for a column-visibility
-        // change, or for a transform installing on *another* sheet, leaves this sheet's
-        // mapping alone, so the host accepts it (`mapping_generation`, in
-        // `viewer-controller`) and the height lands. A fold for a transform installing on
-        // *this* sheet is refused, and must be: the display row here belongs to the
-        // arrangement being left, and the reason resizes are never replayed is that
-        // replaying one resizes whatever rows have moved into those positions. The text is
-        // committed either way. No repaint, unlike `on_cell_edited`: every caller of this
-        // is about to remount or re-project the grid, which repaints everything.
-        const active_cell = grid_selection_ref.current.current?.cell;
-        if (active_cell !== undefined) {
-            auto_grow_row_for_text(active_cell[1], live.value, active_cell[0]);
+        if (live) {
+            // Source-keyed already: `live.key` comes from read_live_edit and
+            // commit_edit's first parameter is a source row. No conversion here.
+            const [source_row, source_column] = live.key.split(':').map(Number);
+            if (Number.isInteger(source_row) && Number.isInteger(source_column)) {
+                commit_edit(source_row, source_column, live.value);
+                // The display row for the same cell, read from the same selection
+                // `read_live_edit` derived `live.key` from and in the same
+                // synchronous block — so the two name one cell in the two spaces,
+                // with no mapping and no chance of drift.
+                //
+                // Whether the resize this posts is honoured depends on why the
+                // fold happened, and that is the honest state of it rather than a
+                // gap. No repaint, unlike `on_cells_edited`: every caller is about
+                // to remount, re-project, or make the grid read-only.
+                const active_cell = grid_selection_ref.current.current?.cell;
+                if (active_cell !== undefined) {
+                    auto_grow_row_for_text(active_cell[1], live.value, active_cell[0]);
+                }
+            }
         }
         set_live_uncommitted(false);
+        // Folding and terminating are one lifecycle operation. Merely changing
+        // provideEditor or the controlled selection can leave Glide's portalled
+        // overlay mounted, which is how a cell from the newly selected sheet
+        // appeared as a dialog after a highlight transition.
+        grid_ref.current?.dismissOverlay();
     }, [
         auto_grow_row_for_text,
         commit_edit,
@@ -1759,7 +2036,7 @@ export function GridShell({
             const source_row = get_source_row(row);
             const dirty = source_row === undefined
                 ? undefined
-                : store.get(`${source_row}:${source_column}`);
+                : store.get(cell_key(source_row, source_column));
             if (dirty) return dirty.value;
 
             // Merged blocks need no special case: the grid's hover hit-test
@@ -1808,7 +2085,7 @@ export function GridShell({
             const source_row = get_source_row(row);
             if (source_row !== undefined) {
                 // `link: null` is a pending *clear* — a real answer, not a miss.
-                const pending = store.get(`${source_row}:${source_column}`)?.link;
+                const pending = store.get(cell_key(source_row, source_column))?.link;
                 if (pending !== undefined) return pending ?? undefined;
             }
             return get_row(row)?.[source_column]?.hyperlink;
@@ -1855,18 +2132,32 @@ export function GridShell({
             const link = cell_hyperlink(display_column, row);
             if (!text && !link) return;
 
-            // A dirty value paints through the Text path even on a rich cell,
-            // so only an undirtied rich cell measures with the rich rule.
             const source_column = source_column_for_display(display_column);
             const source_row = get_source_row(row);
             const dirty = source_row !== undefined && source_column !== undefined
-                && store.get(`${source_row}:${source_column}`) !== undefined;
+                ? store.get(cell_key(source_row, source_column))
+                : undefined;
             const loaded = source_column === undefined
                 ? null
                 : get_row(row)?.[source_column] ?? null;
-            const rich_data = !dirty && loaded
-                ? rich_cell_display_data(loaded, show_formatting, font_size_px)
-                : undefined;
+            // Measure the same effective payload the grid paints. In particular,
+            // a pending Markdown edit may introduce styled runs into a plain or
+            // blank cell, and an empty dirty value must suppress persisted runs.
+            const rich_data = rich_cell_display_data(
+                loaded,
+                show_formatting,
+                font_size_px,
+                dirty
+                    ? {
+                        ...(dirty_entry_value_changed(dirty)
+                            ? { dirty_value: dirty.value }
+                            : {}),
+                        ...(edit_syntax === 'markdown' && dirty.valueRuns
+                            ? { dirty_rich: dirty.valueRuns }
+                            : {}),
+                    }
+                    : undefined,
+            );
             // Hover bounds are client-space geometry. A fractional canvas scale
             // can make a default 24px row arrive as 24.5px, which must not turn
             // every single-line cell into a soft-wrapped cell. Read the same
@@ -1953,6 +2244,7 @@ export function GridShell({
             get_cell_height,
             get_cell_width,
             show_formatting,
+            edit_syntax,
             source_column_for_display,
             store,
         ],
@@ -2037,7 +2329,7 @@ export function GridShell({
         source_row: number,
         source_column: number,
     ): string | undefined => {
-        const color = cell_highlights?.cells[`${source_row}:${source_column}`];
+        const color = cell_highlights?.cells[cell_key(source_row, source_column)];
         return color ? highlight_rgba(color, high_contrast) : undefined;
     }, [cell_highlights, high_contrast]);
 
@@ -2080,7 +2372,7 @@ export function GridShell({
             const source_row = get_source_row(row);
             const key = source_row === undefined
                 ? undefined
-                : `${source_row}:${source_column}`;
+                : cell_key(source_row, source_column);
             const dirty = key === undefined ? undefined : store.get(key);
             const highlight_bg = source_row === undefined
                 ? undefined
@@ -2116,8 +2408,18 @@ export function GridShell({
                     }
                 }
             }
+            // Read at paint time against the deadline, so no re-render is needed
+            // to end it: the timer damages these cells and this returns false.
+            const flash_bg = history_flash_covers(
+                history_flash_ref.current,
+                display_column,
+                row,
+                Date.now(),
+            )
+                ? history_flash_rgba(high_contrast)
+                : undefined;
             let overlay: CellEditOverlay | undefined;
-            if (editable_cells || dirty || highlight_bg) {
+            if (editable_cells || dirty || highlight_bg || flash_bg) {
                 overlay = {
                     editable,
                     ...(edit_value !== undefined ? { edit_value } : {}),
@@ -2136,11 +2438,19 @@ export function GridShell({
                     ...(dirty && dirty_entry_value_changed(dirty)
                         ? { dirty_value: dirty.value }
                         : {}),
-                    bg: dirty
+                    ...(edit_syntax === 'markdown' && dirty?.valueRuns
+                        ? { dirty_rich: dirty.valueRuns }
+                        : {}),
+                    // The flash outranks every persistent tint for its half
+                    // second, so the region an undo changed is legible even where
+                    // the cells are also dirty, conflicted, or highlighted — which
+                    // after an undo of a cell edit they usually are. All of those
+                    // come back when it expires; nothing about them is lost.
+                    bg: flash_bg ?? (dirty
                         ? key !== undefined && conflicted_keys_ref.current.has(key)
                             ? conflict_bg
                             : dirty_bg
-                        : highlight_bg,
+                        : highlight_bg),
                 };
             }
             return build_grid_cell(
@@ -2176,65 +2486,152 @@ export function GridShell({
             // damages the cells already painted with the old ones).
             dirty_bg,
             conflict_bg,
+            high_contrast,
         ],
     );
 
-    // Glide opens its own overlay editor; it reports the committed value here
-    // with the cell location, which we fold into the dirty map.
-    const on_cell_edited = useCallback(
-        (cell: Item, new_value: EditableGridCell) => {
-            if (edit_admission_is_fenced() || save_in_flight_ref.current) return;
-            const [display_column, row] = cell;
-            const source_column = source_column_for_display(display_column);
-            if (source_column === undefined) return;
-            // Resolve source identity here as well as at overlay-open time.
-            // get_cell_content's `editable` gate covers the overlay and Glide's
-            // activation/delete paths, but Glide's paste path never consults
-            // `allowOverlay` (see the `readonly` flag in cell-renderer.ts), so this
-            // is the second of the two guards keeping an unresolvable row from
-            // landing an edit under the wrong key.
-            //
-            // Live residency first, then the identity this overlay opened with:
-            // Glide passes `overlay.cell` (the coordinates the editor opened on) to
-            // onFinishEditing, so the captured entry names exactly this commit's row
-            // and the guard keeps refusing only the genuinely unresolvable case.
-            const source_row = commit_source_row(row);
-            if (source_row === undefined) return;
-            const text =
-                new_value.kind === GridCellKind.Text ? new_value.data ?? '' : '';
-            commit_edit(source_row, source_column, text);
-            // Auto-grow the row to fit hard line breaks (Shift+Alt+Enter),
-            // mirroring the old renderer. Only ever grows a row, never shrinks a
-            // user-sized one; repaints the whole row at the new height.
-            // The measurement and the resize live in `auto_grow_row_for_text` because
-            // this is not the only path that commits a value — see there.
-            //
-            // No longer gated on a `transformed` prop — which no longer exists, having had
-            // no readers left once this was its last one. It used to be, because a height was
-            // persisted under the display row it was measured at, which under a
-            // permutation named some other source row — durable corruption, so the
-            // whole affordance was suppressed rather than risked. Now the height goes
-            // up as a display interval and the host maps it through the permutation it
-            // installed, so a permuted view is no different from an unpermuted one; and
-            // `row_heights` is itself display-keyed, so the comparison below is a
-            // like-for-like read at this row. This site *could* resolve `source_row` (it
-            // did so just above, to key the edit) and deliberately does not: one
-            // display→source mapper, host-side, is the invariant the design rests on.
-            if (auto_grow_row_for_text(row, text, display_column)) {
-                const cells: { cell: Item }[] = [];
-                for (let display_column = 0; display_column < display_column_count; display_column++) {
-                    cells.push({ cell: [display_column, row] });
+    /**
+     * Every mutation Glide performs, as the batch it performed it in.
+     *
+     * Glide already assembles a paste, a fill, a multi-cell delete and a single
+     * overlay commit each as one array, and `source` names which. Taking the
+     * batch rather than `onCellEdited` per item is what makes a paste one
+     * undoable gesture instead of a thousand, and one store publication instead
+     * of a thousand.
+     */
+    const on_cells_edited = useCallback(
+        (items: readonly EditListItem[], source: CellEditSource): boolean => {
+            // The admission gates are the batch's, applied once: past the close
+            // barrier `post_pending_edits` refuses to publish, so an edit
+            // committed after it would sit in the store and never reach the host.
+            if (
+                !editable_cells_ref.current
+                || edit_admission_is_fenced()
+                || save_in_flight_ref.current
+            ) return true;
+            if (source === 'edit' && overlay_admission_revoked_ref.current) return true;
+            const open_overlay = open_overlay_row_ref.current;
+            if (
+                source === 'edit'
+                && open_overlay !== null
+                && open_overlay.edit_session_id !== edit_session_id_ref.current
+            ) return true;
+            // The replay reservation belongs here too, and BEFORE the auto-grow
+            // below: `run_edit_gesture` drops a gesture that is not admitted, so a
+            // row grown on the way past would persist a durable height for text
+            // that never reached the store. `editable_cells` does not cover this —
+            // it excludes a save and a highlight in flight, not a replay.
+            if (gestures_admitted !== undefined && !gestures_admitted()) return true;
+
+            const edits: CellValueEdit[] = [];
+            const damaged: { cell: Item }[] = [];
+            const grown_rows = new Set<number>();
+            // Rectangular gestures repeat each display row across every column
+            // they cover, and resolving one costs a page-map lookup and a
+            // temporary location object; a 10x100 paste would pay for ten rows a
+            // thousand times. `null` is cached too — an unresolvable row is
+            // unresolvable for the whole batch.
+            const source_rows = new Map<number, number | null>();
+            const resolve_source_row = (row: number): number | null => {
+                const cached = source_rows.get(row);
+                if (cached !== undefined) return cached;
+                const resolved = commit_source_row(row) ?? null;
+                source_rows.set(row, resolved);
+                return resolved;
+            };
+            for (const { location, value } of items) {
+                const [display_column, row] = location;
+                // A late finish from an overlay belongs to the source column it
+                // opened on, even if a projection has since assigned its display
+                // slot to another column. Paste/fill/delete are current gestures,
+                // so they continue to resolve through the live projection.
+                const captured = open_overlay;
+                const captured_matches = source === 'edit'
+                    && captured !== null
+                    && captured.display_cell[0] === display_column
+                    && captured.display_cell[1] === row;
+                const source_column = captured_matches
+                    ? captured.source_column
+                    : source_column_for_display(display_column);
+                if (source_column === undefined) continue;
+                // Resolve source identity here as well as at overlay-open time.
+                // get_cell_content's `editable` gate covers the overlay and
+                // Glide's activation/delete paths, but Glide's paste path never
+                // consults `allowOverlay` (see the `readonly` flag in
+                // cell-renderer.ts), so this is the second of the two guards
+                // keeping an unresolvable row from landing an edit under the
+                // wrong key.
+                //
+                // Glide passes `overlay.cell` (the coordinates the editor opened
+                // on) to onFinishEditing, so an exact late overlay finish uses the
+                // captured row as well as the captured column. Other gestures use
+                // current residency, with the capture only as an eviction fallback.
+                const source_row = captured_matches
+                    ? captured.source_row
+                    : resolve_source_row(row);
+                if (source_row === null) continue;
+                const text = value.kind === GridCellKind.Text
+                    ? value.data ?? ''
+                    : value.kind === GridCellKind.Custom && is_rich_text_cell(value)
+                        ? value.data.edit_value ?? ''
+                        : '';
+                edits.push({ source_row, source_col: source_column, value: text });
+
+                // Auto-grow the row to fit hard line breaks (Shift+Alt+Enter),
+                // mirroring the old renderer. Only ever grows a row, never
+                // shrinks a user-sized one; repaints the whole row at the new
+                // height. The measurement and the resize live in
+                // `auto_grow_row_for_text` because this is not the only path that
+                // commits a value — see there.
+                //
+                // No longer gated on a `transformed` prop — which no longer
+                // exists, having had no readers left once this was its last one.
+                // It used to be, because a height was persisted under the display
+                // row it was measured at, which under a permutation named some
+                // other source row — durable corruption, so the whole affordance
+                // was suppressed rather than risked. Now the height goes up as a
+                // display interval and the host maps it through the permutation
+                // it installed, so a permuted view is no different from an
+                // unpermuted one; and `row_heights` is itself display-keyed, so
+                // the comparison below is a like-for-like read at this row. This
+                // site *could* resolve `source_row` (it did so just above, to key
+                // the edit) and deliberately does not: one display→source mapper,
+                // host-side, is the invariant the design rests on.
+                if (auto_grow_row_for_text(row, text, display_column)) {
+                    grown_rows.add(row);
+                    continue;
                 }
-                grid_ref.current?.updateCells(cells);
-                return;
+                damaged.push({ cell: [display_column, row] });
             }
-            grid_ref.current?.updateCells([{ cell: [display_column, row] }]);
+
+            commit_edits(edits, edit_history_label(source, edits.length));
+
+            // A grown row repaints whole: its other columns are laid out at the
+            // new height too. Its own cells' individual entries drop out first —
+            // a row is repainted once, not once plus once per cell in it.
+            if (grown_rows.size > 0) {
+                const cell_damage = damaged.filter(({ cell }) => !grown_rows.has(cell[1]));
+                damaged.length = 0;
+                damaged.push(...cell_damage);
+                for (const row of grown_rows) {
+                    for (let column = 0; column < display_column_count; column++) {
+                        damaged.push({ cell: [column, row] });
+                    }
+                }
+            }
+            if (damaged.length > 0) grid_ref.current?.updateCells(damaged);
+            // Claim the batch, so Glide does not also replay it one cell at a
+            // time through `onCellEdited`.
+            return true;
         },
         [
             auto_grow_row_for_text,
-            commit_edit,
+            commit_edits,
             display_column_count,
             edit_admission_is_fenced,
+            editable_cells_ref,
+            edit_session_id_ref,
+            gestures_admitted,
             source_column_for_display,
             commit_source_row,
             save_in_flight_ref,
@@ -2260,7 +2657,7 @@ export function GridShell({
                 capture_open_overlay_row();
                 refresh_live_uncommitted();
                 return () => {
-                    // Ordering matters: on_cell_edited already ran by the time Glide
+                    // Ordering matters: on_cells_edited already ran by the time Glide
                     // tears the editor down (onFinishEditing commits, then clears the
                     // overlay), so releasing here cannot strip the capture out from
                     // under the commit that needs it.
@@ -2337,14 +2734,16 @@ export function GridShell({
         store,
     ]);
 
-    // Custom CSV overlay editor (Enter/Tab advance, Shift/Alt+Enter newline, Esc
-    // cancel). Only consulted for editable Text cells.
+    // Custom overlay editor (Enter/Tab advance, Shift/Alt+Enter newline, Esc
+    // cancel). Rich Markdown cells adapt through the same text editor so their
+    // canvas renderer can remain active throughout Edit mode.
     const provide_editor = useCallback<ProvideEditorCallback<GridCell>>(
         (cell) => {
             if (
                 save_in_flight_ref.current
                 || !editable_cells
-                || cell.kind !== GridCellKind.Text
+                || (cell.kind !== GridCellKind.Text
+                    && !(cell.kind === GridCellKind.Custom && is_rich_text_cell(cell)))
             ) return undefined;
             // disablePadding/disableStyling: the editor carries its own
             // .cell-editor-input border + background, so suppress Glide's overlay box.
@@ -2681,7 +3080,7 @@ export function GridShell({
             if (source_row === undefined) return undefined;
             let displayed_row: (RenderedCell | null)[] | undefined;
             for (const source_column of selection.source_columns) {
-                const key = `${source_row}:${source_column}`;
+                const key = cell_key(source_row, source_column);
                 const displayed_value = live?.key === key
                     ? live.value
                     : dirty.get(key)?.value;
@@ -2827,7 +3226,7 @@ export function GridShell({
             // some other row's edit.
             const source_row = get_source_row(row);
             if (source_row === undefined) return;
-            clear_dirty_keys(new Set([`${source_row}:${source_column}`]));
+            clear_dirty_keys(new Set([cell_key(source_row, source_column)]));
             grid_ref.current?.updateCells([{ cell: [display_column, row] }]);
         },
         [clear_dirty_keys, edit_admission_is_fenced, get_source_row, save_in_flight_ref],
@@ -2877,7 +3276,11 @@ export function GridShell({
                 || edit_admission_is_fenced()
                 || save_in_flight_ref.current
             ) return;
-            commit_hyperlink(target.source_row, target.source_col, next);
+            commit_hyperlinks([{
+                source_row: target.source_row,
+                source_col: target.source_col,
+                value: next,
+            }]);
             // Damage explicitly: a link change on an already-dirty cell leaves
             // the dirty key set unchanged, so the tint effect below sees no
             // transition and would never repaint the new link presentation.
@@ -2894,7 +3297,7 @@ export function GridShell({
             if (cells.length > 0) grid_ref.current?.updateCells(cells);
         },
         [
-            commit_hyperlink,
+            commit_hyperlinks,
             display_column_for_source,
             edit_admission_is_fenced,
             get_source_row,
@@ -3436,6 +3839,8 @@ export function GridShell({
     if (context_menu?.kind === 'cell') {
         const { row, display_col, source_col } = context_menu;
         const range = grid_selection.current?.range;
+        const has_explicit_column_selection = grid_selection.columns.length > 0;
+        const has_explicit_row_selection = grid_selection.rows.length > 0;
         const selected_rows = selected_display_row_intervals(grid_selection, row_count);
         // Columns the selection spans; hide targets all of them (falls back to
         // the clicked column when the selection maps to nothing usable).
@@ -3487,7 +3892,12 @@ export function GridShell({
                 : {}),
             dirty: menu_source_row !== undefined
                 && dirty_cells.has(`${menu_source_row}:${source_col}`),
-            is_multi_cell: !!range && range.width * range.height > 1,
+            has_distinct_copy_selection: has_explicit_column_selection
+                || has_explicit_row_selection
+                || has_distinct_copy_selection(
+                    range,
+                    merge_index.is_anchor(row, display_col),
+                ),
             preview_mode,
             // Hiding rows is offered in edit mode: it is a transform like any
             // other, and the host admits it from the panel holding the session.
@@ -3513,7 +3923,17 @@ export function GridShell({
                 height: 1,
             }),
             on_copy_selection: () => {
-                if (range) copy_rect(range);
+                if (has_explicit_column_selection) {
+                    copy_source_selection({
+                        y: 0,
+                        height: row_count,
+                        source_columns: selected_column_sources,
+                    }, true);
+                } else if (has_explicit_row_selection) {
+                    if (selected_rows) copy_display_rows(selected_rows);
+                } else if (range) {
+                    copy_rect(range);
+                }
             },
             on_highlight: (color) => mutate_highlight_selection({ type: 'set', color }),
             on_clear_highlight: () => mutate_highlight_selection({ type: 'clear' }),
@@ -3577,7 +3997,24 @@ export function GridShell({
                 onVisibleRegionChanged={on_visible_region_changed}
                 onColumnResize={handle_column_resize}
                 onItemHovered={on_item_hovered}
-                onCellEdited={on_cell_edited}
+                onCellsEdited={on_cells_edited}
+                // Both gated on `editable_cells`, so a read-only or
+                // save-in-flight sheet offers neither.
+                //
+                // `onPaste` as a bare `true` rather than a callback: the
+                // callback exists to VET a paste before Glide splits it, and
+                // there is nothing to vet here that the per-cell path does not
+                // already refuse — `readonly` closes a cell the projection
+                // cannot resolve (see cell-renderer's `refused`), the fork skips
+                // covered merge cells, and `on_cells_edited` drops any row whose
+                // source identity does not resolve. Left undefined, Glide pastes
+                // the entire clipboard into the single focused cell, tabs and
+                // newlines and all.
+                onPaste={editable_cells}
+                // The pointer affordance only. Fill's keyboard hotkeys need no
+                // prop and have always been live; this adds the drag handle, and
+                // both arrive through `onCellsEdited` as one `"fill"` batch.
+                fillHandle={editable_cells}
                 onCellClicked={on_cell_clicked}
                 customRenderers={custom_renderers}
                 onCellContextMenu={on_cell_context_menu}

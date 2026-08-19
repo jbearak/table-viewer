@@ -179,6 +179,41 @@ describe('ContextMenu keyboard behavior', () => {
         expect(trigger.getAttribute('aria-expanded')).toBe('false');
     });
 
+    it('moves focus away from the initially highlighted item on hover', () => {
+        render_menu([
+            { label: 'First', on_click: vi.fn() },
+            { label: 'Second', on_click: vi.fn() },
+        ]);
+        const buttons = document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]');
+        expect(document.activeElement).toBe(buttons[0]);
+
+        act(() => buttons[1].dispatchEvent(new MouseEvent('mouseover', { bubbles: true })));
+
+        expect(document.activeElement).toBe(buttons[1]);
+        expect(Array.from(buttons, (button) => button.tabIndex)).toEqual([-1, 0]);
+    });
+
+    it('closes an open submenu when hovering a disabled sibling without focusing it', () => {
+        render_menu([
+            {
+                kind: 'submenu',
+                label: 'Select',
+                items: [{ label: 'Select row', on_click: vi.fn() }],
+            },
+            { label: 'Unavailable', disabled: true, on_click: vi.fn() },
+        ]);
+        const trigger = document.querySelector<HTMLButtonElement>('button[aria-haspopup="menu"]')!;
+        const disabled = Array.from(document.querySelectorAll<HTMLButtonElement>('button'))
+            .find((button) => button.textContent === 'Unavailable')!;
+        act(() => trigger.dispatchEvent(new MouseEvent('mouseover', { bubbles: true })));
+        expect(trigger.getAttribute('aria-expanded')).toBe('true');
+
+        act(() => disabled.dispatchEvent(new MouseEvent('pointerover', { bubbles: true })));
+
+        expect(trigger.getAttribute('aria-expanded')).toBe('false');
+        expect(document.activeElement).toBe(trigger);
+    });
+
     it('activates a submenu leaf and dismisses/restores exactly once', () => {
         vi.useFakeTimers();
         const on_click = vi.fn();

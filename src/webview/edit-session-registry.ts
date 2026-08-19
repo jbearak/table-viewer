@@ -46,8 +46,10 @@ import {
 } from '../types';
 import {
     create_edit_session_store,
+    type DirtyEntry,
     type EditSessionStore,
 } from './edit-session-store';
+import type { StagedMutation } from './staged-mutation';
 import { collect_save_payload } from './csv-save-model';
 
 export interface EditSessionSaveWorksheet {
@@ -66,6 +68,23 @@ export type EditSessionSavePreflight =
         reason: 'unresolvedBases' | 'parkedEdits';
         targets: readonly WorksheetTarget[];
     };
+
+/**
+ * A discard held back from every store's subscribers, with the overlays it will
+ * remove.
+ *
+ * `worksheets` is in the shape `discard_history_source` consumes, and it is a
+ * snapshot: the maps are the stores' own copy-on-write snapshots, taken in the
+ * same call that staged the emptying, so the recorded action and the staged
+ * state describe the same instant.
+ */
+export interface StagedDiscard {
+    readonly mutations: readonly StagedMutation[];
+    readonly worksheets: readonly {
+        readonly target: WorksheetTarget;
+        readonly entries: ReadonlyMap<string, DirtyEntry>;
+    }[];
+}
 
 export interface EditSessionRegistry {
     /**
@@ -127,6 +146,29 @@ export interface EditSessionRegistry {
      */
     clear_all(session_id: string | undefined): void;
     /**
+     * Stage the same emptying, and hand back what is about to be thrown away.
+     *
+     * The snapshot and the staging are one call because they must describe ONE
+     * state. Reading every map and then staging separately would leave a window
+     * in which a keystroke landed: the recorded action would be missing that
+     * cell, so undoing the discard would restore everything except the user's
+     * last edit — and the store's own `valid()` cannot catch it, because the
+     * staging would have been taken against the state that already included it.
+     *
+     * `undefined` when any store refuses to stage, which is a session that has
+     * moved on. Nothing is staged in that case: a discard is one gesture, and
+     * emptying the sheets that would still take it leaves half a session.
+     *
+     * Parked stores are included. Their edits are just as gone after a discard,
+     * and a parked store holding entries is what blocks a save — so a discard
+     * that skipped them would leave the block in place with nothing visible
+     * causing it.
+     */
+    stage_discard(
+        session_id: string | undefined,
+        sheets: readonly WorksheetIdentityInput[],
+    ): StagedDiscard | undefined;
+    /**
      * Every store the registry holds, with the sheet index each sits at. The
      * close-flush boundary walks these: the session is workbook-scoped, so any
      * sheet's store may hold unpublished edits, not just the pointer sheet's.
@@ -134,7 +176,15 @@ export interface EditSessionRegistry {
     entries(): IterableIterator<[number, EditSessionStore]>;
 }
 
-function target_for_sheet(
+/**
+ * A sheet index plus its identity, as the whole target a history change records.
+ *
+ * Exported because highlight capture needs exactly this and building it by
+ * spreading a `WorksheetIdentity` is a trap: the identity's field is `name`,
+ * the target's is `sheetName`, so a spread yields a target that resolves by
+ * index alone — and an index silently names a different worksheet after a move.
+ */
+export function target_for_sheet(
     sheetIndex: number,
     sheet: WorksheetIdentityInput,
 ): WorksheetTarget {
@@ -294,6 +344,43 @@ export function create_edit_session_registry(
         replace_document: () => {
             stores.clear();
             parked.clear();
+        },
+        stage_discard: (session_id, sheets) => {
+            const mutations: StagedMutation[] = [];
+            const worksheets: {
+                target: WorksheetTarget;
+                entries: ReadonlyMap<string, DirtyEntry>;
+            }[] = [];
+            // Snapshot and stage in one step per store, so no window exists
+            // between reading a map and fixing the state that map came from. A
+            // `target` of undefined is a store whose sheet is gone from the
+            // workbook: it still has to be emptied — a discard empties everything
+            // — but its cells have no identity to be named by in history, so it
+            // is staged without being captured.
+            const stage = (
+                store: EditSessionStore,
+                target: WorksheetTarget | undefined,
+            ): boolean => {
+                const entries = store.snapshot();
+                const staged = store.stage_clear(session_id);
+                if (staged === undefined) return false;
+                mutations.push(staged);
+                if (target !== undefined && entries.size > 0) {
+                    worksheets.push({ target, entries });
+                }
+                return true;
+            };
+            for (const [sheet_index, store] of stores) {
+                const sheet = sheets[sheet_index];
+                if (!stage(
+                    store,
+                    sheet === undefined ? undefined : target_for_sheet(sheet_index, sheet),
+                )) return undefined;
+            }
+            for (const { target, store } of parked.values()) {
+                if (!stage(store, target)) return undefined;
+            }
+            return { mutations, worksheets };
         },
         clear_all: (session_id) => {
             for (const store of stores.values()) store.clear(session_id);

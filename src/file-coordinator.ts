@@ -8,6 +8,7 @@ import {
     count_cell_highlights,
     sanitize_cell_highlight_state,
 } from './cell-highlights';
+import { highlight_state_deltas } from './highlight-delta';
 import {
     canonical_file_key,
     type FileRefreshWatcher,
@@ -31,7 +32,11 @@ import type {
     FileStateLease,
     FileStateSnapshot,
 } from './state';
-import type { PerFileState } from './types';
+import type {
+    CellHighlightState,
+    HighlightCellDelta,
+    PerFileState,
+} from './types';
 import {
     reconcile_finalization,
     type FinalizationReconciliation,
@@ -142,6 +147,15 @@ export interface CellHighlightCommitReceipt {
     readonly authority: FileAuthoritySnapshot;
     readonly stateSnapshot: Readonly<FileStateSnapshot>;
     readonly affectedCells: number;
+    /**
+     * The cells this gesture moved, taken across the compare-and-set.
+     *
+     * Computed here because this is the only place both sides are in hand. A
+     * subscriber sees only the committed state, and the state it replaced may
+     * already have included another window's change — so a delta derived from the
+     * published state could attribute that change to this gesture.
+     */
+    readonly deltas: readonly HighlightCellDelta[];
 }
 
 export interface CellHighlightAuthorityCommandBase {
@@ -273,6 +287,10 @@ interface FileCoordinatorEntry {
     pendingRefreshFlushes: number;
     readonly warnedKeys: Set<string>;
 }
+
+/** Shared, because a no-op gesture is the common case and every one of them
+ *  would otherwise allocate and freeze its own empty array. */
+const NO_HIGHLIGHT_DELTAS: readonly HighlightCellDelta[] = Object.freeze([]);
 
 const entries = new Map<string, FileCoordinatorEntry>();
 
@@ -815,6 +833,11 @@ export function acquire_file_coordinator(
                 let changed: boolean;
                 let affected_cells: number;
                 let scope: CellHighlightCommitReceipt['scope'];
+                // The state this attempt is diffed against, kept because a
+                // compare-and-set conflict re-reads and loops: the delta must
+                // describe the transition that actually committed, not the one an
+                // earlier attempt planned.
+                let previous_highlights: CellHighlightState | undefined;
                 if ('selection' in command) {
                     const current = normalize_host_state(
                         state_snapshot.state,
@@ -829,6 +852,7 @@ export function acquire_file_coordinator(
                     });
                     if (plan.type === 'rejected') return plan;
                     next = { ...current, cellHighlights: plan.state };
+                    previous_highlights = current.cellHighlights;
                     changed = JSON.stringify(current.cellHighlights)
                         !== JSON.stringify(plan.state);
                     affected_cells = plan.affectedCells;
@@ -839,6 +863,7 @@ export function acquire_file_coordinator(
                         sanitize_cell_highlight_state(current.cellHighlights),
                     );
                     next = { ...current, cellHighlights: undefined };
+                    previous_highlights = sanitize_cell_highlight_state(current.cellHighlights);
                     changed = current.cellHighlights !== undefined;
                     scope = { type: 'all' };
                 }
@@ -875,6 +900,14 @@ export function acquire_file_coordinator(
                     authority: snapshot(entry),
                     stateSnapshot: deep_clone_and_freeze(committed),
                     affectedCells: affected_cells,
+                    // Empty when nothing changed, which is what a no-op gesture
+                    // should record in a history: nothing.
+                    deltas: changed
+                        ? Object.freeze([...highlight_state_deltas(
+                            previous_highlights,
+                            next.cellHighlights,
+                        )])
+                        : NO_HIGHLIGHT_DELTAS,
                 });
                 for (const subscriber of [...entry.cellHighlightSubscribers]) {
                     try {

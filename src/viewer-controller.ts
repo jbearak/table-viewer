@@ -130,6 +130,7 @@ import { sanitize_column_visibility_state } from './webview/column-projection';
 // this boundary.
 import { clamp_row_height } from './webview/row-heights';
 import {
+    apply_cell_highlight_patch,
     cell_highlight_states_equal,
     rebase_cell_highlight_digest,
     reconcile_physical_cell_highlights,
@@ -138,6 +139,31 @@ import {
     apply_layout_state_patch,
     derive_layout_state_patch,
 } from './layout-state-patch';
+import {
+    sanitized_abandon_history_replay_request,
+    sanitized_commit_history_replay_request,
+    replay_request_requires_edit_session,
+    sanitized_prepare_history_replay_request,
+    type CommitHistoryReplayRequest,
+    type HistoryReplayCommitRefused,
+    type HistoryReplayCommitted,
+    type HistoryReplayFocus,
+    type HistoryReplayHighlightInput,
+    type HistoryReplayPrepareRefused,
+    type HistoryReplayPreparedCell,
+    type PrepareHistoryReplayRequest,
+} from './history-replay-protocol';
+import { resolve_replay_display_focus } from './history-replay-focus-model';
+import { create_history_replay_lease_registry } from './history-replay-lease-model';
+import {
+    pending_edits_with_replay_writes,
+    prepared_content_unchanged,
+    replay_cell_key,
+    replay_cell_matches,
+    replay_highlight_matches,
+    replay_highlight_patches,
+    type ReplayCellWrite,
+} from './history-replay-durable-model';
 import {
     complete_normalized_per_file_state,
     normalize_workbook_snapshot_state,
@@ -522,15 +548,26 @@ function harvest_source_bases(
     // records an entry, `null` for linkless, and only an unobserved cell reads
     // as undefined.
     const observed_links = new Map<string, CellHyperlink | null>();
-    const by_projected_row = new Map<number, { source_row: number; cols: number[] }>();
+    // Group by SOURCE row first, so each distinct row is projected once. A wide
+    // edit or replay names many columns of one row, and projecting per key would
+    // re-walk the source's row mapping once per column for no new information.
+    const cols_by_source_row = new Map<number, number[]>();
     for (const key of wanted_bases) {
         const [source_row, col] = key.split(':').map(Number);
         if (!Number.isInteger(source_row) || !Number.isInteger(col)) continue;
+        const cols = cols_by_source_row.get(source_row);
+        if (cols) cols.push(col);
+        else cols_by_source_row.set(source_row, [col]);
+    }
+    const by_projected_row = new Map<number, { source_row: number; cols: number[] }>();
+    for (const [source_row, cols] of cols_by_source_row) {
         const projected = projected_row_for_source(src, sheet_index, source_row);
         if (projected === undefined) continue;
         const entry = by_projected_row.get(projected);
-        if (entry) entry.cols.push(col);
-        else by_projected_row.set(projected, { source_row, cols: [col] });
+        // Two source rows projecting to one row is not expected, but merging
+        // rather than overwriting keeps every requested column observable.
+        if (entry) entry.cols.push(...cols);
+        else by_projected_row.set(projected, { source_row, cols });
     }
     const projected_rows = [...by_projected_row.keys()].sort((a, b) => a - b);
     for (let start = 0; start < projected_rows.length; start += SAVE_WINDOW) {
@@ -556,6 +593,64 @@ function harvest_source_bases(
         });
     }
     return { texts: observed_bases, rich: observed_rich, links: observed_links };
+}
+
+/**
+ * One replay cell's content as read from a verified source.
+ *
+ * `undefined` for a cell the source cannot answer for — a source row outside the
+ * worksheet, or one no longer in the projection. Distinguished from an empty
+ * cell, because substituting `''` for an unanswerable cell would fabricate the
+ * missing side of an undo transition: undo would write emptiness over content it
+ * never saw.
+ */
+export interface MaterializedReplayCell {
+    readonly text: string;
+    readonly rich?: RichText;
+    readonly hyperlink: CellHyperlink | null;
+}
+
+/**
+ * Read the persisted content behind a set of replay cells.
+ *
+ * `harvest_source_bases` per sheet, deliberately: the projection step, the row
+ * grouping, the `SAVE_WINDOW` batching and the rich/hyperlink derivation are
+ * exactly what a save's base validation needs, and a replay that read cells even
+ * slightly differently would refuse bases the save path accepts, or accept ones
+ * it refuses. One reader means the two cannot disagree.
+ *
+ * Renderer page residency has nothing to do with this. The host reads the source
+ * directly, so a replay reaches a background sheet and rows the webview never
+ * loaded — which is what makes a workbook-wide history possible at all.
+ */
+function materialize_replay_cells(
+    src: DataSource,
+    requested: readonly { readonly sheet_index: number; readonly source_row: number; readonly source_column: number }[],
+): Map<string, MaterializedReplayCell> {
+    const wanted_by_sheet = new Map<number, Set<string>>();
+    for (const cell of requested) {
+        const wanted = wanted_by_sheet.get(cell.sheet_index);
+        const key = `${cell.source_row}:${cell.source_column}`;
+        if (wanted === undefined) wanted_by_sheet.set(cell.sheet_index, new Set([key]));
+        else wanted.add(key);
+    }
+    const observed = new Map<string, MaterializedReplayCell>();
+    for (const [sheet_index, wanted] of wanted_by_sheet) {
+        const { texts, rich, links } = harvest_source_bases(src, sheet_index, wanted);
+        for (const key of wanted) {
+            // `links` records every OBSERVED cell, `null` included, so its
+            // membership — not the text's emptiness — is what separates a blank
+            // cell from one the projection never showed us.
+            if (!links.has(key)) continue;
+            const rich_runs = rich.get(key);
+            observed.set(`${sheet_index}:${key}`, {
+                text: texts.get(key) ?? '',
+                ...(rich_runs ? { rich: rich_runs } : {}),
+                hyperlink: links.get(key) ?? null,
+            });
+        }
+    }
+    return observed;
 }
 
 /**
@@ -839,6 +934,39 @@ export function attach_viewer(
     let load_seq = 0;
     let latest_refresh_event: FileRefreshEvent | undefined;
     let disposed = false;
+    /**
+     * What a replay lease retains, so a commit mutates only what preparation
+     * verified.
+     *
+     * Everything a commit needs is here, and a commit message contributes NO
+     * coordinates of its own: it names cells by the ordinal preparation assigned,
+     * so a stale or hostile renderer cannot reach a cell the host never checked.
+     * The captured host identities are what make the lease self-invalidating —
+     * see the currency predicate built alongside each one.
+     */
+    interface ReplayLeasePayload {
+        readonly cells: readonly HistoryReplayPreparedCell[];
+        readonly highlights: readonly HistoryReplayHighlightInput[];
+        /** Each prepared highlight's resolved sheet, by ordinal. */
+        readonly highlightSheetIndices: ReadonlyMap<number, number>;
+        readonly focus: HistoryReplayFocus;
+        readonly focusSheetIndex: number;
+        readonly sourceGeneration: number;
+        /** Whether the host state the lease was bound to is still in place. */
+        readonly isCurrent: () => boolean;
+    }
+    const replay_leases = create_history_replay_lease_registry<
+        ReplayLeasePayload,
+        HistoryReplayCommitted | HistoryReplayCommitRefused
+    >();
+    let replay_preparation_in_flight = false;
+    /**
+     * The commit operation a taken lease is running, so a retransmission can join
+     * the one mutation instead of waiting on an answer that may never come.
+     */
+    let active_replay_commit:
+        | Promise<HistoryReplayCommitted | HistoryReplayCommitRefused>
+        | undefined;
     let active_save_operation: CsvSaveHostOperation | undefined;
     let active_save_drain: Promise<void> = Promise.resolve();
     let disposal_edit_release_drain: Promise<void> = Promise.resolve();
@@ -3777,6 +3905,14 @@ export function attach_viewer(
                     core = installed;
                     source = next;
                     source_authority = committed.receipt.resultingBasis;
+                    // An unspent replay lease is bound to the source and core
+                    // being replaced here, so it can no longer be spent. Its own
+                    // currency predicate would refuse the commit anyway; dropping
+                    // it now is what stops it from holding the one-at-a-time slot
+                    // and reporting `busy` to every replay until its TTL runs out.
+                    // A COMMITTING lease is deliberately left alone — its answer
+                    // must stay recoverable by a lost acknowledgement.
+                    replay_leases.invalidate();
                     sync_active_transform_panel();
                     session.replace_adoption(adoption, () => {
                         confirm_transfer();
@@ -4027,8 +4163,12 @@ export function attach_viewer(
                 ...(receipt.scope.type === 'selection'
                     ? { sheetIndex: receipt.scope.sheetIndex }
                     : {}),
+                // The request id AND the gesture's deltas travel together, and
+                // only to the receiver that asked: a delta is the authority for
+                // entering something in THAT window's undo history, and another
+                // window's gesture must never enter it.
                 ...(receipt.originToken === cell_highlight_subscriber_token
-                    ? { requestId: receipt.requestId }
+                    ? { requestId: receipt.requestId, deltas: receipt.deltas }
                     : {}),
                 stateRevision: receipt.stateSnapshot.revision,
                 physicalRevision: receipt.authority.physicalRevision,
@@ -5278,6 +5418,13 @@ export function attach_viewer(
                 core?.begin_receiver_epoch(begun.receiverEpoch);
                 active_edit_session_request = undefined;
                 cancel_edit_claim(active_edit_claim);
+                // A reloaded renderer has no history — it is session-scoped and
+                // died with the old one — so there is nothing left that could
+                // spend a lease or read a retained answer. Cleared rather than
+                // invalidated: retaining terminal records for a webview that no
+                // longer remembers asking would only hold memory.
+                replay_leases.clear();
+                replay_preparation_in_flight = false;
                 active_save_dialog_request = undefined;
                 pending_edit_sequence_session_id = undefined;
                 highest_pending_edit_sequence = 0;
@@ -6500,6 +6647,19 @@ export function attach_viewer(
                     const operation = begin_edit_cleanup(msg.editSessionId);
                     if (!operation) return;
                     notify_edit_state();
+                    // Acknowledged either way, because a discard is undoable and
+                    // undoing one has to acquire a NEW session: until cleanup
+                    // settles the host refuses `requestEditSession`, so an undo in
+                    // that window would fail for a reason about timing rather than
+                    // about the document. The renderer waits for this rather than
+                    // racing it.
+                    const acknowledge = (cleared: boolean): void => {
+                        void post_to_receiver({
+                            type: 'discardEditSessionResult',
+                            editSessionId: msg.editSessionId,
+                            cleared,
+                        });
+                    };
                     try {
                         // The discard ends the workbook-scoped session, so every
                         // live sheet's slot goes at once — the one dialog the user
@@ -6507,8 +6667,12 @@ export function attach_viewer(
                         const snapshot = await clear_pending_edits({ type: 'workbook' });
                         finish_edit_cleanup(operation, true, snapshot);
                         if (!disposed) update_session_state_material(snapshot, false);
+                        acknowledge(true);
                     } catch (error) {
                         finish_edit_cleanup(operation, false);
+                        // A failed clear leaves the host `uncertain` and editing
+                        // disabled for the file, so undo has nothing to re-enter.
+                        acknowledge(false);
                         log_sanitized_failure('Failed to clear discarded CSV edits', error);
                         show_owner_warning(
                             'Table Viewer could not clear the discarded edit state. Editing remains disabled for this file.');
@@ -6838,6 +7002,164 @@ export function attach_viewer(
                 await write;
                 return;
             }
+            case 'prepareHistoryReplay': {
+                const request = sanitized_prepare_history_replay_request(msg.request);
+                const receiver_epoch = session.current_receiver_epoch;
+                if (request === undefined) {
+                    // A malformed request may still carry a usable correlation,
+                    // and answering it is what keeps the renderer from hanging on
+                    // a replay that will never be prepared. Without one there is
+                    // nothing to answer to, and inventing an id would refuse a
+                    // replay nobody is waiting on while leaving the real one hung.
+                    const raw = msg.request;
+                    if (
+                        !is_plain_record(raw)
+                        || typeof raw.requestId !== 'string'
+                        || typeof raw.replayId !== 'string'
+                    ) return;
+                    void post_to_receiver({
+                        type: 'historyReplayPrepareRefused',
+                        refusal: {
+                            requestId: raw.requestId,
+                            replayId: raw.replayId,
+                            reason: 'malformed',
+                        },
+                    }, receiver_epoch);
+                    return;
+                }
+                const refuse = (
+                    reason: HistoryReplayPrepareRefused['reason'],
+                ): void => {
+                    void post_to_receiver({
+                        type: 'historyReplayPrepareRefused',
+                        refusal: {
+                            requestId: request.requestId,
+                            replayId: request.replayId,
+                            reason,
+                        },
+                    }, receiver_epoch);
+                };
+                // One preparation at a time, and none while a lease is already
+                // live: two replays interleaving would each plan against a
+                // document the other is moving. The renderer serializes too, so
+                // reaching this is a stale request rather than a race worth
+                // queueing.
+                if (replay_preparation_in_flight || replay_leases.current(Date.now()) !== undefined) {
+                    refuse('busy');
+                    return;
+                }
+                // A replay carrying cell writes mutates session-owned pending-edit
+                // state; one carrying only highlights mutates durable workbook
+                // state, which the ordinary highlight commands change with no
+                // session and outside edit mode. So the session requirement follows
+                // the cells — read through the shared derivation, so this gate and
+                // the lease binding below cannot disagree about what it admitted.
+                const requires_edit_session = replay_request_requires_edit_session(request);
+                if (profile.previewMode === true) {
+                    refuse('unavailable');
+                    return;
+                }
+                if (requires_edit_session && !profile.editing) {
+                    refuse('unavailable');
+                    return;
+                }
+                if (
+                    requires_edit_session
+                    && (!owns_edit_session() || edit_cleanup_blocked())
+                ) {
+                    refuse('edit-session-unavailable');
+                    return;
+                }
+                replay_preparation_in_flight = true;
+                try {
+                    await prepare_history_replay(request, receiver_epoch, refuse);
+                } finally {
+                    replay_preparation_in_flight = false;
+                }
+                return;
+            }
+            case 'commitHistoryReplay': {
+                const request = sanitized_commit_history_replay_request(msg.request);
+                const receiver_epoch = session.current_receiver_epoch;
+                if (request === undefined) {
+                    const raw = msg.request;
+                    if (
+                        !is_plain_record(raw)
+                        || typeof raw.requestId !== 'string'
+                        || typeof raw.replayId !== 'string'
+                        || typeof raw.leaseId !== 'string'
+                        || typeof raw.mutationId !== 'string'
+                    ) return;
+                    void post_to_receiver({
+                        type: 'historyReplayCommitRefused',
+                        refusal: {
+                            requestId: raw.requestId,
+                            replayId: raw.replayId,
+                            leaseId: raw.leaseId,
+                            mutationId: raw.mutationId,
+                            reason: 'malformed',
+                        },
+                    }, receiver_epoch);
+                    return;
+                }
+                // Synchronous and before any await: the decision is what makes
+                // taking the lease exactly-once, so nothing may interleave
+                // between reading it and transitioning it.
+                const decision = replay_leases.decide_commit(request, Date.now());
+                if (decision.kind === 'refuse') {
+                    void post_to_receiver({
+                        type: 'historyReplayCommitRefused',
+                        refusal: {
+                            requestId: request.requestId,
+                            replayId: request.replayId,
+                            leaseId: request.leaseId,
+                            mutationId: request.mutationId,
+                            reason: decision.reason,
+                        },
+                    }, receiver_epoch);
+                    return;
+                }
+                if (decision.kind === 'replay') {
+                    // A lost acknowledgement. The document was already mutated
+                    // once; re-post the answer and touch nothing.
+                    void post_to_receiver(
+                        history_replay_result_message(decision.settled.result),
+                        receiver_epoch,
+                    );
+                    return;
+                }
+                if (decision.kind === 'join') {
+                    // The commit is already running. Await the SAME operation
+                    // rather than returning silently: the mutation must not run
+                    // twice, but the renderer that retried is waiting for an
+                    // answer, and a `join` that answered nothing would leave it
+                    // waiting forever if the original post was the one that got
+                    // lost. Awaiting the shared promise gives both callers the one
+                    // outcome the single mutation produced.
+                    const running = active_replay_commit;
+                    if (running === undefined) return;
+                    void post_to_receiver(
+                        history_replay_result_message(await running),
+                        receiver_epoch,
+                    );
+                    return;
+                }
+                const operation = run_history_replay_commit(request, decision.lease.payload);
+                void post_to_receiver(
+                    history_replay_result_message(await operation),
+                    receiver_epoch,
+                );
+                return;
+            }
+            case 'abandonHistoryReplay': {
+                const request = sanitized_abandon_history_replay_request(msg.request);
+                if (request === undefined) return;
+                // Silent by design, and silent about a lease already committing:
+                // abandonment races a commit the renderer has already sent, and
+                // losing that race must not cancel the mutation.
+                replay_leases.abandon(request.leaseId);
+                return;
+            }
             case 'pendingEditsFlush': {
                 const waiter = pending_edit_flush_waiters.get(msg.requestId);
                 if (!waiter || !Number.isSafeInteger(msg.highestProducedSequence)) return;
@@ -6900,6 +7222,718 @@ export function attach_viewer(
         edit_admission_closed = true;
         active_edit_session_request = undefined;
         cancel_edit_claim(active_edit_claim);
+    }
+
+    /**
+     * Verify a replay against the acknowledged document, then issue its lease.
+     *
+     * Three independent classes of check, in the order that makes each one cheap
+     * to reach. None subsumes another; see the protocol module's header.
+     *
+     *   1. AGREEMENT — the host and renderer must be describing one document, so
+     *      the coordinates in the request mean what the renderer meant by them.
+     *   2. COMPARE-AND-SWAP — every requested overlay must equal durable pending
+     *      -edit state and every highlight its expected colour. This is what
+     *      makes a replay refuse rather than overwrite an edit it never saw.
+     *   3. PHYSICAL CURRENCY — the acknowledged source must still be an accurate
+     *      parse of the bytes on disk, since the watcher may not yet have seen an
+     *      external write. Done last because it costs a read of the whole file.
+     *
+     * Deliberately does NOT build or adopt a source. An adoption bumps the source
+     * generation and the document epoch, so a replay that forced one would
+     * invalidate its own lease; and it would buy nothing, because the host reads
+     * any row of the current source directly. The save path is the precedent.
+     *
+     * Deliberately does NOT run `establish_pending_edit_flush_boundary` either.
+     * That protocol stops edit admission and republishes every store — it is a
+     * close/reload mechanism, and running it per undo keypress would both cost a
+     * round trip and reject the whole pending-edit protocol on its timeout.
+     * Draining `pending_edit_writes` is what soundness actually needs: it
+     * establishes that every edit the host has ADMITTED is durable, and an
+     * unpublished local overlay that disagrees with durable state is caught by
+     * the compare-and-swap as a conflict rather than guessed at.
+     */
+    async function prepare_history_replay(
+        request: PrepareHistoryReplayRequest,
+        receiver_epoch: number,
+        refuse: (reason: HistoryReplayPrepareRefused['reason']) => void,
+    ): Promise<void> {
+        // Every edit the host has already admitted becomes durable before
+        // anything is compared against durable state. A message still in the
+        // renderer's own queue is not covered, and does not need to be: it will
+        // disagree with what is read here and refuse as a conflict.
+        await pending_edit_writes.catch(() => {});
+
+        const adoption = session.current_adoption();
+        const src = source;
+        const replay_core = core;
+        const observation = source_observation;
+        const expected_digest = session.acknowledged_physical_digest();
+        const expected_authority = source_authority.authorityRevision;
+        const expected_physical_revision = source_authority.physicalRevision;
+        // Bound only for a replay that writes pending edits. A highlight-only
+        // lease must be independent of the edit session in BOTH directions: it
+        // cannot require one, and it must not be invalidated by one starting or
+        // ending underneath it — highlights are not session state. The same
+        // derivation the admission gate used, so the lease cannot bind under
+        // assumptions the gate did not apply.
+        const requires_edit_session = replay_request_requires_edit_session(request);
+        const edit_session = requires_edit_session ? active_edit_session_id : undefined;
+        const bound_source_generation = replay_core?.source_generation;
+
+        /**
+         * Whether everything the lease is bound to is still in place.
+         *
+         * Rechecked after every await here and again at commit. Binds
+         * `source_generation` and not `core.generation`: a transform advances the
+         * view without moving the source rows a replay addresses, so pinning the
+         * view generation would refuse replays that are perfectly sound.
+         */
+        const replay_is_current = (): boolean => !disposed
+            && session.current_receiver_epoch === receiver_epoch
+            && src !== undefined
+            && replay_core !== undefined
+            && core === replay_core
+            && source === src
+            && session.current_adoption() === adoption
+            && adoption?.resources.source === src
+            && adoption.resources.core === replay_core
+            && replay_core.source_generation === bound_source_generation
+            && source_observation === observation
+            && session.acknowledged_current()
+            && source_authority.authorityRevision === expected_authority
+            && source_authority.physicalRevision === expected_physical_revision
+            && file_coordinator.state_write_is_current(expected_authority)
+            // Every term above is unconditional — the document, source, adoption,
+            // authority and digest identities bind every lease. Only the session
+            // terms are conditional, and a highlight-only lease is still
+            // self-invalidating without them.
+            && (
+                !requires_edit_session
+                || (
+                    owns_edit_session()
+                    && !edit_cleanup_blocked()
+                    && active_edit_session_id === edit_session
+                )
+            );
+
+        if (
+            src === undefined
+            || replay_core === undefined
+            || observation === undefined
+            || expected_digest === undefined
+            || !!src.truncationMessage
+            || !replay_is_current()
+        ) {
+            refuse('document-changed');
+            return;
+        }
+
+        // 1. AGREEMENT. Resolve every worksheet the request names against the
+        // acknowledged workbook, by the same identity hierarchy durable state is
+        // reconciled by, so a renamed or reordered sheet resolves or refuses
+        // rather than silently addressing its new occupant.
+        const sheets = src.meta().sheets;
+        const lookup = worksheet_target_lookup(sheets);
+        const resolved_cells: { readonly input: typeof request.cells[number]; readonly sheetIndex: number }[] = [];
+        for (const cell of request.cells) {
+            const sheet_index = lookup(cell.worksheet);
+            const sheet = sheet_index === undefined ? undefined : sheets[sheet_index];
+            if (
+                sheet_index === undefined
+                || sheet === undefined
+                || cell.sourceRow >= sheet.sourceRowCount
+                || cell.sourceColumn >= sheet.columnCount
+            ) {
+                refuse('unavailable');
+                return;
+            }
+            resolved_cells.push({ input: cell, sheetIndex: sheet_index });
+        }
+        const highlight_sheet_indices = new Map<number, number>();
+        for (const highlight of request.highlights) {
+            const sheet_index = lookup(highlight.worksheet);
+            const sheet = sheet_index === undefined ? undefined : sheets[sheet_index];
+            if (
+                sheet_index === undefined
+                || sheet === undefined
+                || highlight.sourceRow >= sheet.sourceRowCount
+                || highlight.sourceColumn >= sheet.columnCount
+            ) {
+                refuse('unavailable');
+                return;
+            }
+            highlight_sheet_indices.set(highlight.ordinal, sheet_index);
+        }
+        const focus_sheet_index = lookup(request.focus.worksheet);
+        if (focus_sheet_index === undefined) {
+            refuse('unavailable');
+            return;
+        }
+
+        // Materialize the content each cell's overlay sits on top of, batched by
+        // row rather than one read per cell: a workbook-wide gesture can name
+        // thousands, and an undo keypress must not walk the source once each.
+        const materialized = materialize_replay_cells(
+            src,
+            resolved_cells.map(({ input, sheetIndex }) => ({
+                sheet_index: sheetIndex,
+                source_row: input.sourceRow,
+                source_column: input.sourceColumn,
+            })),
+        );
+        if (!replay_is_current()) {
+            refuse('document-changed');
+            return;
+        }
+        const prepared_cells: HistoryReplayPreparedCell[] = [];
+        for (const { input, sheetIndex } of resolved_cells) {
+            const content = materialized.get(
+                `${sheetIndex}:${input.sourceRow}:${input.sourceColumn}`,
+            );
+            // A cell the source cannot answer for is refused, never defaulted to
+            // empty: an undo would otherwise write emptiness over content it
+            // never saw.
+            if (content === undefined) {
+                refuse('unavailable');
+                return;
+            }
+            prepared_cells.push(Object.freeze({
+                ordinal: input.ordinal,
+                worksheet: input.worksheet,
+                resolvedSheetIndex: sheetIndex,
+                sourceRow: input.sourceRow,
+                sourceColumn: input.sourceColumn,
+                overlay: input.overlay,
+                persisted: content.rich === undefined
+                    ? { text: content.text }
+                    : { text: content.text, runs: content.rich },
+                persistedHyperlink: content.hyperlink,
+            }));
+        }
+
+        // 2. COMPARE-AND-SWAP against durable state.
+        const state = await read_file_state(false);
+        if (!replay_is_current()) {
+            refuse('document-changed');
+            return;
+        }
+        const current = normalize_host_state(state.state, sheets);
+        if (!replay_overlays_match_durable(current, prepared_cells, sheets)) {
+            refuse('conflict');
+            return;
+        }
+        if (!replay_highlights_match_durable(
+            current,
+            request.highlights,
+            highlight_sheet_indices,
+            sheets,
+        )) {
+            refuse('conflict');
+            return;
+        }
+
+        // 3. PHYSICAL CURRENCY. Last because it reads the whole file, and a
+        // conflict found above would have made the read wasted work.
+        const physical = await replay_physical_source_is_current(
+            observation,
+            expected_digest,
+            expected_authority,
+        );
+        if (!replay_is_current()) {
+            refuse('document-changed');
+            return;
+        }
+        if (!physical) {
+            refuse('document-changed');
+            return;
+        }
+
+        const now = Date.now();
+        const lease = replay_leases.issue(
+            {
+                leaseId: `${request.requestId}:${now}`,
+                requestId: request.requestId,
+                replayId: request.replayId,
+            },
+            {
+                cells: Object.freeze(prepared_cells),
+                highlights: request.highlights,
+                highlightSheetIndices: highlight_sheet_indices,
+                focus: request.focus,
+                focusSheetIndex: focus_sheet_index,
+                sourceGeneration: replay_core.source_generation,
+                isCurrent: replay_is_current,
+            },
+            now,
+        );
+        if (lease === undefined) {
+            refuse('busy');
+            return;
+        }
+        // Awaited, unlike most posts here: the lease is already live, and a
+        // renderer that never learned its id can neither spend nor abandon it —
+        // it would hold the one-at-a-time slot and refuse every replay as `busy`
+        // until its TTL ran out. Abandoning on a failed delivery is what keeps the
+        // slot's occupancy tied to a renderer that actually knows about it.
+        const delivered = await post_to_receiver({
+            type: 'historyReplayPrepared',
+            prepared: {
+                requestId: request.requestId,
+                replayId: request.replayId,
+                leaseId: lease.leaseId,
+                focusSheetIndex: focus_sheet_index,
+                focus: request.focus,
+                cells: Object.freeze(prepared_cells),
+            },
+        }, receiver_epoch);
+        // Conditional on this exact lease, so a newer one issued in the meantime
+        // is never the thing dropped.
+        if (!delivered && replay_leases.current(Date.now())?.leaseId === lease.leaseId) {
+            replay_leases.abandon(lease.leaseId);
+        }
+    }
+
+    /** The answer for a settled replay, whichever way it went. */
+    function history_replay_result_message(
+        result: HistoryReplayCommitted | HistoryReplayCommitRefused,
+    ): HostMessage {
+        return 'reason' in result
+            ? { type: 'historyReplayCommitRefused', refusal: result }
+            : { type: 'historyReplayCommitted', committed: result };
+    }
+
+    /**
+     * Run a taken commit to a terminal answer, exactly once, and settle its lease.
+     *
+     * Total by construction. A committing lease deliberately has no TTL — its
+     * answer must stay recoverable by a lost acknowledgement — so an operation
+     * that threw without settling would leave the lease committing forever:
+     * every retry would `join` an operation that had already died, and every new
+     * preparation would be refused as `busy` until the panel reloaded. So the
+     * whole operation is wrapped, and a thrown failure becomes a refusal that is
+     * recorded like any other.
+     *
+     * `unavailable` rather than `conflict` for a thrown failure, because the two
+     * say different things to the renderer: a conflict means the document moved
+     * and the user may retry, while a failure of unknown outcome means this replay
+     * cannot be trusted to have left the document where the history thinks it is.
+     */
+    function run_history_replay_commit(
+        request: CommitHistoryReplayRequest,
+        payload: ReplayLeasePayload,
+    ): Promise<HistoryReplayCommitted | HistoryReplayCommitRefused> {
+        const operation = commit_history_replay(request, payload)
+            .catch((error: unknown): HistoryReplayCommitRefused => {
+                console.warn('History replay commit failed', error);
+                return Object.freeze({
+                    requestId: request.requestId,
+                    replayId: request.replayId,
+                    leaseId: request.leaseId,
+                    mutationId: request.mutationId,
+                    reason: 'unavailable' as const,
+                });
+            })
+            .then((result) => {
+                replay_leases.settle(request.leaseId, result, Date.now());
+                return result;
+            })
+            .finally(() => {
+                if (active_replay_commit === operation) active_replay_commit = undefined;
+            });
+        active_replay_commit = operation;
+        return operation;
+    }
+
+    /**
+     * Apply a leased replay: re-verify, then move pending edits and highlights in
+     * ONE compare-and-swap.
+     *
+     * One update, not two, because a replay is one undo. Two writes would let a
+     * reader observe the cells moved and the highlights not, and — worse — would
+     * leave the document in that split state permanently if the second failed,
+     * with no history entry able to describe it.
+     *
+     * Everything mutated is named by ordinal against the retained preparation.
+     * The request contributes no coordinates, no worksheets and no colours: the
+     * cell writes carry entries the renderer computed, and even those are only
+     * applied at addresses preparation resolved and verified.
+     */
+    async function commit_history_replay(
+        request: CommitHistoryReplayRequest,
+        payload: ReplayLeasePayload,
+    ): Promise<HistoryReplayCommitted | HistoryReplayCommitRefused> {
+        const refused = (
+            reason: HistoryReplayCommitRefused['reason'],
+        ): HistoryReplayCommitRefused => Object.freeze({
+            requestId: request.requestId,
+            replayId: request.replayId,
+            leaseId: request.leaseId,
+            mutationId: request.mutationId,
+            reason,
+        });
+
+        // Every write must name a cell preparation verified, and every prepared
+        // cell must be written: a partial proposal is a different gesture from
+        // the one the lease authorizes, and applying it would leave half an undo.
+        const by_ordinal = new Map(payload.cells.map((cell) => [cell.ordinal, cell]));
+        if (request.cells.length !== payload.cells.length) return refused('proposal-mismatch');
+        const writes: (ReplayCellWrite & { readonly ordinal: number; readonly key: string })[] = [];
+        for (const write of request.cells) {
+            const prepared = by_ordinal.get(write.ordinal);
+            if (prepared === undefined) return refused('proposal-mismatch');
+            writes.push({
+                ordinal: write.ordinal,
+                sheetIndex: prepared.resolvedSheetIndex,
+                sourceRow: prepared.sourceRow,
+                sourceColumn: prepared.sourceColumn,
+                key: replay_cell_key(prepared.sourceRow, prepared.sourceColumn),
+                entry: write.entry,
+            });
+        }
+        const highlight_ordinals = new Set(request.highlights.map((write) => write.ordinal));
+        if (highlight_ordinals.size !== payload.highlights.length) {
+            return refused('proposal-mismatch');
+        }
+        const highlights = payload.highlights.filter(
+            (highlight) => highlight_ordinals.has(highlight.ordinal),
+        );
+        if (highlights.length !== payload.highlights.length) {
+            return refused('proposal-mismatch');
+        }
+
+        await pending_edit_writes.catch(() => {});
+        if (!payload.isCurrent()) return refused('document-changed');
+        const src = source;
+        const replay_core = core;
+        const observation = source_observation;
+        const expected_digest = session.acknowledged_physical_digest();
+        const expected_authority = source_authority.authorityRevision;
+        const physical_digest = source_authority.physicalDigest;
+        if (
+            src === undefined
+            || replay_core === undefined
+            || observation === undefined
+            || expected_digest === undefined
+            || physical_digest === undefined
+        ) return refused('document-changed');
+
+        // The file again, because preparation's check is old by now: a replay
+        // waits on a user keypress and a round trip.
+        //
+        // What this re-verification does NOT close, and cannot — the same
+        // filesystem TOCTOU the save path documents at its pre-write stat:
+        //  - A write landing between this check and the compare-and-swap below
+        //    is not detected here. The gap is the filesystem's own plus the
+        //    event-loop turns that resume these continuations. Only an advisory
+        //    lock or an OS-level compare-and-swap would close it, and
+        //    `FileSystemPort` exposes no handle to build either on.
+        //  - A same-size write within the same coarse mtime tick is invisible to
+        //    any {size, mtime} comparison; it is caught only by the digest, and
+        //    only if it lands before the read.
+        //
+        // What bounds the consequence is that this is not a write path. The
+        // replay mutates only durable pending-edit and highlight state, and it
+        // does so under a compare-and-swap whose expectations were recorded at
+        // preparation. A file that changed inside the residual window costs the
+        // replay a refusal — the user retries after the reload lands — never a
+        // mutation against bytes nobody read, and never a partial application.
+        if (!await replay_physical_source_is_current(
+            observation,
+            expected_digest,
+            expected_authority,
+        )) return refused('document-changed');
+        if (!payload.isCurrent()) return refused('document-changed');
+
+        const sheets = src.meta().sheets;
+        // The content the lease was issued against, re-read. The digest proves
+        // the FILE has not moved; this proves the host's READING of it has not,
+        // which is a different thing once a projection or header promotion can
+        // change how a source row is reached.
+        const materialized = materialize_replay_cells(
+            src,
+            payload.cells.map((cell) => ({
+                sheet_index: cell.resolvedSheetIndex,
+                source_row: cell.sourceRow,
+                source_column: cell.sourceColumn,
+            })),
+        );
+        const current_content = payload.cells.map((cell) => {
+            const content = materialized.get(
+                `${cell.resolvedSheetIndex}:${cell.sourceRow}:${cell.sourceColumn}`,
+            );
+            return content === undefined
+                ? undefined
+                : {
+                    persisted: content.rich === undefined
+                        ? { text: content.text }
+                        : { text: content.text, runs: content.rich },
+                    persistedHyperlink: content.hyperlink,
+                };
+        });
+        if (current_content.some((entry) => entry === undefined)) {
+            return refused('document-changed');
+        }
+        if (!prepared_content_unchanged(
+            payload.cells,
+            current_content.filter((entry): entry is NonNullable<typeof entry> => entry !== undefined),
+        )) return refused('document-changed');
+
+        const highlight_patches = replay_highlight_patches(highlights.map((highlight) => ({
+            sheetIndex: payload.highlightSheetIndices.get(highlight.ordinal) ?? -1,
+            sourceRow: highlight.sourceRow,
+            sourceColumn: highlight.sourceColumn,
+            expected: highlight.expected,
+            desired: highlight.desired,
+        })));
+        if (highlight_patches.some((patch) => patch.sheetIndex < 0)) {
+            return refused('proposal-mismatch');
+        }
+
+        // The compare-and-swap. `conflict` is reported by the updater rather than
+        // thrown, because a conflict is an ordinary outcome — someone typed while
+        // the replay was in flight — and must leave history exactly where it is.
+        let conflicted = false;
+        let unavailable = false;
+        const replay_committed = await update_file_state((current, updater_sheets) => {
+            conflicted = false;
+            unavailable = false;
+            if (!payload.isCurrent()) {
+                unavailable = true;
+                return current;
+            }
+            // Re-verified INSIDE the updater, which is what makes the check
+            // atomic with the write: `update_file_state` retries against a fresh
+            // snapshot when an unrelated writer wins, and a comparison made
+            // before the loop would then be authorizing a write against state
+            // that has moved.
+            const identities = updater_sheets.map(worksheet_identity);
+            if (
+                !replay_overlays_match_durable(current, payload.cells, identities)
+                || !replay_highlights_match_durable(
+                    current,
+                    highlights,
+                    payload.highlightSheetIndices,
+                    identities,
+                )
+            ) {
+                conflicted = true;
+                return current;
+            }
+            let next = current;
+            const by_sheet = new Map<number, (typeof writes)[number][]>();
+            for (const write of writes) {
+                const sheet_writes = by_sheet.get(write.sheetIndex);
+                if (sheet_writes === undefined) by_sheet.set(write.sheetIndex, [write]);
+                else sheet_writes.push(write);
+            }
+            for (const [sheet_index, sheet_writes] of by_sheet) {
+                const sheet = identities[sheet_index];
+                const cells = pending_edits_for_sheet(
+                    next.pendingEdits,
+                    sheet_index,
+                    sheet?.name,
+                    sheet?.worksheetId,
+                );
+                const updated = pending_edits_with_replay_writes(cells, sheet_writes);
+                if (updated === cells) continue;
+                next = {
+                    ...next,
+                    pendingEdits: with_pending_edits_for_sheet(
+                        next.pendingEdits,
+                        sheet_index,
+                        updated,
+                        sheet?.name,
+                        sheet?.worksheetId,
+                    ),
+                };
+            }
+            for (const patch of highlight_patches) {
+                try {
+                    const highlights_next = apply_cell_highlight_patch(
+                        next.cellHighlights,
+                        patch,
+                        { sheets: updater_sheets } as WorkbookMeta,
+                        physical_digest,
+                    );
+                    if (cell_highlight_states_equal(next.cellHighlights, highlights_next)) continue;
+                    next = { ...next, cellHighlights: highlights_next };
+                } catch {
+                    // Out of range, or over the per-file cap. Either way the
+                    // replay cannot be applied as recorded, and applying the rest
+                    // would leave half an undo.
+                    unavailable = true;
+                    return current;
+                }
+            }
+            return next;
+        }, undefined, payload.isCurrent, {
+            expectedAuthorityRevision: expected_authority,
+            expectedPhysicalRevision: source_authority.physicalRevision,
+        });
+
+        if (unavailable) return refused('unavailable');
+        if (conflicted) return refused('conflict');
+        if (!payload.isCurrent()) return refused('document-changed');
+        // Highlights the replay wrote have to be PUBLISHED, not merely committed.
+        // `update_file_state` refreshes the session's state material without
+        // delivering it, which is right for pending edits — the renderer holds
+        // those in its own stores and applies the accepted writes itself — but a
+        // highlight lives only in durable state, so without this the cells would
+        // change on disk and never repaint.
+        //
+        // AFTER the currency check above, and never folded into the commit as a
+        // `deliver` flag: delivering supersedes the acknowledged snapshot, so
+        // `acknowledged_current()` — a term of `replay_is_current` — goes false
+        // the moment it happens. Delivering first would make this replay's own
+        // publication refuse it as `document-changed` with the highlight already
+        // durably written, leaving the renderer's history unmoved and every retry
+        // conflicting against the state the replay had in fact applied.
+        //
+        // Deliberately not the `cellHighlightsChanged` shape the highlight
+        // COMMANDS publish: that message carries a request id and the gesture's
+        // deltas, which are what enter a window's undo history. A replay is the
+        // history moving, so re-entering it would record undo as a new gesture.
+        if (highlight_patches.length > 0 && replay_committed !== undefined && !disposed) {
+            // The material already held, not `replay_committed` re-installed. An
+            // unrelated writer committing behind this replay installs a LATER
+            // revision, and `update_state_snapshot` refuses an older one — so
+            // re-installing to force the delivery would silently deliver nothing
+            // and leave the replayed highlight painted stale indefinitely. That
+            // newer material already contains this commit.
+            session.deliver_current_material();
+        }
+        // The updater's own result is used ONLY for that delivery. An unchanged
+        // updater reports `undefined` — for a replay that means the document
+        // already held everything the replay would write, a byte-identical redo of
+        // a gesture that changed nothing durable, which is a success and not a
+        // refusal, and needs no repaint. The answer below is assembled from the
+        // retained preparation either way.
+        return Object.freeze({
+            requestId: request.requestId,
+            replayId: request.replayId,
+            leaseId: request.leaseId,
+            mutationId: request.mutationId,
+            sourceGeneration: payload.sourceGeneration,
+            cells: Object.freeze(writes.map((write) => Object.freeze({
+                ordinal: write.ordinal,
+                resolvedSheetIndex: write.sheetIndex,
+                key: write.key,
+                entry: write.entry,
+            }))),
+            focusSheetIndex: payload.focusSheetIndex,
+            focus: payload.focus,
+            // Resolved HERE and not at preparation: a replay waits on a keypress
+            // and a round trip, and a transform queued in that window would make a
+            // preparation-time answer name rows the user is no longer looking at.
+            // Serialized commands mean anything queued after this point publishes
+            // after the commit, and the generation stamp is what lets the renderer
+            // decline a projection that was overtaken anyway.
+            displayFocus: resolve_replay_display_focus(
+                payload,
+                (sheet_index, source_row) => replay_core.display_row_for_source(
+                    sheet_index,
+                    source_row,
+                ),
+                replay_core.mapping_generation(payload.focusSheetIndex),
+            ),
+        });
+    }
+
+    /** Whether every prepared cell still holds the overlay the request reported. */
+    function replay_overlays_match_durable(
+        current: PerFileState,
+        cells: readonly HistoryReplayPreparedCell[],
+        sheets: readonly WorksheetIdentity[],
+    ): boolean {
+        // One map read per sheet rather than per cell: `pending_edits_for_sheet`
+        // walks the slot to answer, and a wide gesture would walk it thousands of
+        // times.
+        const by_sheet = new Map<number, SheetPendingEditCells | undefined>();
+        for (const cell of cells) {
+            const index = cell.resolvedSheetIndex;
+            if (!by_sheet.has(index)) {
+                const sheet = sheets[index];
+                by_sheet.set(index, pending_edits_for_sheet(
+                    current.pendingEdits,
+                    index,
+                    sheet?.name,
+                    sheet?.worksheetId,
+                ));
+            }
+            if (!replay_cell_matches(by_sheet.get(index), {
+                sheetIndex: index,
+                sourceRow: cell.sourceRow,
+                sourceColumn: cell.sourceColumn,
+                overlay: cell.overlay,
+                persisted: cell.persisted,
+            })) return false;
+        }
+        return true;
+    }
+
+    /** Whether every prepared highlight still holds its expected colour. */
+    function replay_highlights_match_durable(
+        current: PerFileState,
+        highlights: readonly HistoryReplayHighlightInput[],
+        sheet_indices: ReadonlyMap<number, number>,
+        sheets: readonly WorksheetIdentity[],
+    ): boolean {
+        const digest = source_authority.physicalDigest;
+        if (digest === undefined) return false;
+        const renderable = normalize_workbook_snapshot_state(
+            current,
+            { sheets } as WorkbookMeta,
+            digest,
+        ).cellHighlights;
+        for (const highlight of highlights) {
+            const index = sheet_indices.get(highlight.ordinal);
+            if (index === undefined) return false;
+            if (!replay_highlight_matches(
+                renderable?.sheets[index]?.cells,
+                {
+                    sheetIndex: index,
+                    sourceRow: highlight.sourceRow,
+                    sourceColumn: highlight.sourceColumn,
+                    expected: highlight.expected,
+                    desired: highlight.desired,
+                },
+            )) return false;
+        }
+        return true;
+    }
+
+    /**
+     * Whether the file still holds the bytes this session parsed.
+     *
+     * The save path's sequence, for the same reason: stat, read, re-stat, compare
+     * the digest and the authority. The two stats bracket the read so a write
+     * landing mid-read is caught rather than digested.
+     *
+     * The residual race is accepted and is the same one the save path documents.
+     * The commit repeats this check and spells out exactly what the repetition
+     * does and does not close; see the comment above its call.
+     */
+    async function replay_physical_source_is_current(
+        observation: Readonly<PhysicalSourceObservation>,
+        expected_digest: string,
+        expected_authority: number,
+    ): Promise<boolean> {
+        try {
+            const before = await host.fs.stat(uri);
+            if (`${before.mtime}:${before.size}` !== observation.fingerprint) return false;
+            const raw = await host.fs.read_file(uri);
+            const after = await host.fs.stat(uri);
+            return before.mtime === after.mtime
+                && before.size === after.size
+                && content_digest(raw) === expected_digest
+                && source_authority.authorityRevision === expected_authority
+                && expected_authority === file_coordinator.authority().authorityRevision;
+        } catch {
+            // An unreadable file is not a current one. Refusing is right either
+            // way: a replay that cannot verify its basis must not mutate.
+            return false;
+        }
     }
 
     async function establish_pending_edit_flush_boundary(
@@ -7027,6 +8061,10 @@ export function attach_viewer(
                 }
             };
             cleanup(() => cancel_edit_claim(active_edit_claim));
+            // Nothing can be spent or answered after disposal, and `disposed` is
+            // already part of every lease's currency predicate. Cleared so the
+            // registry's retained answers do not outlive the panel.
+            cleanup(() => replay_leases.clear());
             disposal_edit_release_drain = pending_edit_writes
                 .catch(() => {})
                 .then(async () => { await release_edit_session(); });

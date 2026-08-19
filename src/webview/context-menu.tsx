@@ -119,6 +119,16 @@ function MenuLevel({
         }
     };
 
+    const hover_item = (index: number) => {
+        if (!enabled_indexes.includes(index)) {
+            set_open_submenu_index(null);
+            return;
+        }
+        focus_index(index);
+        if (items[index]?.kind === 'submenu') open_submenu(index, false);
+        else set_open_submenu_index(null);
+    };
+
     const on_key_down = (event: React.KeyboardEvent<HTMLDivElement>) => {
         const item = items[active_index];
         if (event.key === 'Escape') {
@@ -192,8 +202,8 @@ function MenuLevel({
                                 disabled={item.disabled}
                                 tabIndex={!item.disabled && active_index === index ? 0 : -1}
                                 onFocus={() => set_active_index(index)}
-                                onPointerEnter={() => open_submenu(index, false)}
-                                onMouseEnter={() => open_submenu(index, false)}
+                                onPointerEnter={() => hover_item(index)}
+                                onMouseEnter={() => hover_item(index)}
                                 onClick={() => open_submenu(index, true)}
                             >
                                 <span className="context-menu-label">{item.label}</span>
@@ -233,8 +243,8 @@ function MenuLevel({
                         disabled={item.disabled}
                         tabIndex={!item.disabled && active_index === index ? 0 : -1}
                         onFocus={() => set_active_index(index)}
-                        onPointerEnter={() => set_open_submenu_index(null)}
-                        onMouseEnter={() => set_open_submenu_index(null)}
+                        onPointerEnter={() => hover_item(index)}
+                        onMouseEnter={() => hover_item(index)}
                         onClick={(event) => {
                             if (item.disabled) return;
                             item.on_click(event);

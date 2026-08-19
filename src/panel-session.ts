@@ -418,6 +418,25 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
         return true;
     }
 
+    /**
+     * Deliver the material already installed, without replacing it.
+     *
+     * For a caller that changed durable state and needs the renderer to see it,
+     * but whose own committed snapshot may no longer be the newest: an unrelated
+     * writer committing behind it installs a LATER revision, and
+     * {@link update_state_snapshot} refuses an older one — so re-installing to
+     * force a delivery would silently deliver nothing. The newer material already
+     * contains the earlier commit, so delivering what is held is both sufficient
+     * and the only thing that cannot be rejected as stale.
+     *
+     * Answers whether a delivery was actually emitted; `false` means there was
+     * nothing to deliver to — no live adoption, no receiver yet, a receiver still
+     * behind the ready gate, or an adoption already marked stale.
+     */
+    deliver_current_material(): boolean {
+        return this.deliver_material_refresh();
+    }
+
     /** Re-sample only configuration/capabilities from the current adoption.
      * Source/core/authority identity and generations remain unchanged, while every
      * already-issued snapshot stays immutable. */
@@ -587,18 +606,23 @@ export class PanelSession<Handle = ReturnType<typeof setTimeout>> {
         if (adoption) this.on_adoption_released?.(adoption);
     }
 
-    private deliver_material_refresh(): void {
+    /** Answers whether a delivery was actually created. Every early return is a
+     *  reason nothing can be delivered — no adoption, no receiver yet, a receiver
+     *  still behind the ready gate, or an adoption already marked stale — so a
+     *  caller that needs to know cannot read success from mere material existing. */
+    private deliver_material_refresh(): boolean {
         if (
             !this.current
             || this._lifecycle === 'disposed'
             || this.receiver_epoch === 0
             || this.ready_gate_epoch === this.receiver_epoch
             || this.stale_adoption_epoch === this.current.epoch
-        ) return;
+        ) return false;
         this.invalidate_transport();
         this.supersede_desired();
         this.acknowledged = undefined;
         this.create_desired('refresh', 'other');
+        return true;
     }
 
     private create_desired(
