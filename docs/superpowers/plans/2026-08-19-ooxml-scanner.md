@@ -730,18 +730,36 @@ Justified by the 40.4 MiB above, and now provable because Stage 1 exists.
 **Result (merged as `94d4a54`; branch `issue153-stage6-byte-offsets`).** Gate met,
 but the headline number needs reading carefully.
 
-| Scenario | Metric | Stage 5 | Stage 6 | Change |
-|---|---|---|---|---|
-| coordinate-scan | time_ms | 554.3 | 498.1 | −10.1% |
-| coordinate-scan | peak_rss_mib | 248.0 | 186.9 | −24.7% |
-| coordinate-scan | live_external_delta_mib | 57.168 | **0** | −100% |
-| full-save | time_ms | 2395.7 | 1884.3 | −21.3% |
-| full-save | peak_rss_mib | 582.5 | 255.9 | −56.1% |
-| full-save | live_heap_used_delta_mib | 57.589 | 0.539 | −99.1% |
-| worksheet-decode | live_external_delta_mib | 57.168 | **0** | −100% |
+**Correction to my own first draft of this table.** I initially compared against
+`benchmarks/ooxml/baselines/main-string-scanner.json`, labelling that column
+"Stage 5". It is not — it is the **Stage 1** baseline, captured before any stage
+landed. Stage 6 captured a fresh same-machine Stage 5 parent sample, which is the
+only comparison that isolates this stage (exactly the reason the Stage 6 gate was
+specified against a Stage 5 parent rather than Stage 1). Both columns below, since
+the cumulative figure is the one worth quoting in the PR and the isolated one is
+the one that judges the stage.
 
-The 57.2 MiB `live_external_delta_mib` that Stage 4 left untouched — the one this
-stage existed to remove — is now zero, comfortably past the 32 MiB gate.
+| Scenario | Metric | Stage 1 | Stage 5 | Stage 6 | vs Stage 5 |
+|---|---|---|---|---|---|
+| coordinate-scan | time_ms | 554.3 | 541.0 | 465.5 | **−14.0%** |
+| coordinate-scan | peak_rss_mib | 248.0 | 248.0 | 171.5 | **−30.8%** |
+| coordinate-scan | live_external_delta_mib | 57.168 | 57.168 | **0** | **−100%** |
+| worksheet-decode | live_external_delta_mib | 57.168 | 57.168 | **0** | **−100%** |
+| full-save | time_ms | 2395.7 | 1762.5 | 1842.9 | **+4.6%** |
+| full-save | peak_rss_mib | 582.5 | 373.4 | 255.5 | **−31.6%** |
+
+The gate — ≥32 MiB median `live_external_delta_mib` reduction against a Stage 5
+parent — is met with **57.168 MiB**, the entire avoidable region rather than the
+~80% the gate asked for. That figure is unaffected by the baseline mix-up, since
+Stage 5 did not move it.
+
+**But full-save time got 4.6% *worse* against Stage 5, not 21% better.** The
+−21.3% I first wrote is the cumulative Stage 1→6 improvement, and attributing it
+to Stage 6 would have overstated this stage by crediting it with Stage 5's work.
+The honest reading: Stage 6 trades a small amount of save time for a 31.6% peak-RSS
+drop and elimination of the decoded copy. That is the trade the stage was
+authorized to make, and +4.6% is inside the harness's ±15% tolerance — but it is a
+regression on that metric and should be described as one, not buried.
 
 **Do not cite `real-worksheet-decode.time_ms` (3.401 → 0.008 ms, −99.8%) as a
 speedup.** `worksheet_scan_input` is now the identity function, so that phase
@@ -750,6 +768,13 @@ no remaining diagnostic value beyond asserting the byte length still matches. Th
 load-bearing evidence that the cost was removed rather than *displaced* into the
 scan is coordinate-scan: it got both faster and smaller at the same time, which a
 deferred decode could not do.
+
+**Baseline-labelling hazard, recorded so the next stage does not repeat it.** The
+only committed baseline is labelled `main-string-scanner`, which reads like "the
+baseline" but pins Stage 1. Any stage gated against its *parent* must capture a
+fresh same-machine sample; comparing to the committed file silently measures the
+cumulative effect of every prior stage and flatters the current one. I made this
+error writing up Stage 6 and the stage agent's own numbers caught it.
 
 **Behavior preservation was verified differentially, not just by tests.** Running
 the same edits through `650fb2d` and the merged code: 35 fixture/editset
