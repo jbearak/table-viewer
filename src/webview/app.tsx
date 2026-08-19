@@ -188,6 +188,12 @@ function has_surviving_focus_target(): boolean {
         && active.isConnected;
 }
 
+interface GridFocusRestoreState {
+    sheet_index: number;
+    generation: number;
+    document_epoch: number;
+}
+
 /**
  * No sheet has a resize in flight — the initial value, and the one a new document resets
  * to. A shared frozen constant so that "nothing pending" is always the *same* array, and
@@ -738,11 +744,18 @@ export function App(): React.JSX.Element {
     }>({ key: '', value: { status: 'loading' } });
     const [pending_preview_scroll, set_pending_preview_scroll] =
         useState<PendingPreviewScroll | null>(null);
-    const [grid_focus_restore, set_grid_focus_restore] = useState<{
-        sheet_index: number;
-        generation: number;
-        document_epoch: number;
-    } | null>(null);
+    const [grid_focus_restore, set_grid_focus_restore_state] =
+        useState<GridFocusRestoreState | null>(null);
+    const grid_focus_restore_ref = useRef<GridFocusRestoreState | null>(null);
+    const set_grid_focus_restore = useCallback((
+        next: React.SetStateAction<GridFocusRestoreState | null>,
+    ) => {
+        const resolved = typeof next === 'function'
+            ? next(grid_focus_restore_ref.current)
+            : next;
+        grid_focus_restore_ref.current = resolved;
+        set_grid_focus_restore_state(resolved);
+    }, []);
     const [toolbar_focus_restore, set_toolbar_focus_restore] = useState<{
         sheet_index: number;
         document_epoch: number;
@@ -1577,7 +1590,10 @@ export function App(): React.JSX.Element {
                 process_command_result(snapshot.commandResult);
                 const grid_focus_sheet_for_snapshot =
                     grid_focus_sheet_after_excel_header
-                    ?? pending_grid_focus_sheet_before_result;
+                    ?? pending_grid_focus_sheet_before_result
+                    ?? (cross_file_initial
+                        ? undefined
+                        : grid_focus_restore_ref.current?.sheet_index);
 
                 if (disposition === 'applied') {
                     // Every applied snapshot is lifecycle-relevant, including the

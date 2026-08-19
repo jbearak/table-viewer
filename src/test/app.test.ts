@@ -1990,9 +1990,18 @@ describe('Excel first-row header toggle', () => {
             generation: 5,
             sourceGeneration: 8,
         }));
+        // The matching result removed its pending request and armed focus for the
+        // replacement grid. Before that retry runs, a same-generation delivery
+        // must rebase the armed token even though no request-map entry remains.
+        grid_shell_mock.has_grid_focus.mockReturnValue(false);
+        act(() => header_button.blur());
+        expect(document.activeElement).toBe(document.body);
+        await dispatch_host_message(refresh_snapshot_message(excel_meta(false, 'off'), {
+            generation: 5,
+            sourceGeneration: 8,
+        }));
         expect(get_button('Header Row').getAttribute('aria-pressed')).toBe('false');
         expect(get_button('Header Row').disabled).toBe(false);
-        expect(document.activeElement).toBe(get_button('Header Row'));
         expect(document.querySelector('[role="status"]')?.textContent)
             .toBe('Column names updated.');
         expect(grid_stub().getAttribute('data-row-count')).toBe('3');
