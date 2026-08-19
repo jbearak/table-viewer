@@ -206,10 +206,23 @@ Justified by the 40.4 MiB above, and now provable because Stage 1 exists.
 ### Stage 7 — Package boundary and conformance corpus
 
 - Versioned language-neutral `conformance/` — fixtures, golden outputs, refusal
-  codes, version pins — modeled on `@jbearak/dta-parser`, a sibling checkout at
-  `/Users/jmb/repos/Extensions/dta-parser` that is published, has two real
-  consumers, and has **already made this exact TS→Rust→R split** with a
-  `conformance/cases.json`. Criterion (f).
+  codes, version pins. Criterion (f).
+- **Correction to an earlier premise.** I had cited the sibling checkout
+  `/Users/jmb/repos/Extensions/dta-parser` as precedent for a TS→Rust→R split
+  pinned by a `conformance/cases.json`. I read it: that is not what it does.
+  There is **no Rust in it at all** and no conformance corpus. Its R package
+  (`r-package/dtaparser/`) **embeds the compiled TypeScript** in
+  `inst/js/dta-parser.js` behind an `adapter.js` bridge, and its parity tests
+  assert against **`haven`** — an external reference implementation — rather than
+  against shared golden files.
+  Two things follow. First, this repo has **no in-house precedent** for the
+  corpus format, so Stage 7 is designing it rather than copying it, and should be
+  costed accordingly. Second, dta-parser is still a useful precedent for the
+  thing it actually demonstrates: shipping one implementation to a second
+  language via an embedded-JS bridge, and pinning correctness to an independent
+  reference implementation. For OOXML the analogue of `haven` is **Excel's own
+  round-trip output** — worth considering as a corpus input for #240's port,
+  since goldens we author ourselves can only prove self-consistency.
 - Corpus asserts **observable outputs and refusal codes only — never internal
   spans**, so the Rust port can pin it without inheriting our data structures.
   **No callbacks in case context data** (today's `XlsxWriteOptions` passes
