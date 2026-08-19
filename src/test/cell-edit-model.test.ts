@@ -14,6 +14,7 @@ import {
     sanitized_dirty_entry,
     sanitized_wire_dirty_entry,
     sanitized_wire_save_maps,
+    sanitized_wire_string_record,
     type PerFileState,
 } from '../types';
 
@@ -172,25 +173,27 @@ describe('sanitized_wire_dirty_entry', () => {
 });
 
 describe('sanitized_wire_save_maps', () => {
-    it('preserves an own __proto__ key in null-prototype maps', () => {
-        const edits = Object.create(null) as Record<string, unknown>;
-        const dirty = Object.create(null) as Record<string, unknown>;
-        edits['__proto__'] = 'saved';
-        dirty['__proto__'] = { value: 'saved', base: 'base' };
+    it('preserves an own __proto__ key in the generic null-prototype record', () => {
+        const input = Object.create(null) as Record<string, unknown>;
+        input['__proto__'] = 'saved';
 
-        const maps = sanitized_wire_save_maps(edits, dirty);
+        const record = sanitized_wire_string_record(input);
 
-        expect(maps).toBeDefined();
-        expect(Object.getPrototypeOf(maps!.edits)).toBeNull();
-        expect(Object.getPrototypeOf(maps!.dirtyEdits)).toBeNull();
-        expect(Object.prototype.hasOwnProperty.call(maps!.edits, '__proto__'))
-            .toBe(true);
-        expect(maps!.edits['__proto__']).toBe('saved');
-        expect(maps!.dirtyEdits.__proto__).toEqual({
-            value: 'saved',
-            base: 'base',
-        });
+        expect(record).toBeDefined();
+        expect(Object.getPrototypeOf(record)).toBeNull();
+        expect(Object.prototype.hasOwnProperty.call(record, '__proto__')).toBe(true);
+        expect(record!['__proto__']).toBe('saved');
     });
+
+    it.each(['__proto__', '01:0', '0:9007199254740993'])(
+        'rejects the noncanonical cell key %s',
+        (key) => {
+            expect(sanitized_wire_save_maps(
+                { [key]: 'saved' },
+                { [key]: { value: 'saved', base: 'base' } },
+            )).toBeUndefined();
+        },
+    );
 });
 
 describe('durable pendingEdits with runs', () => {

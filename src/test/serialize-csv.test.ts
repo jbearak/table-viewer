@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { serialize_csv } from '../serialize-csv';
+import { prepare_csv_serializer, serialize_csv } from '../serialize-csv';
 import type { CellData } from '../types';
 
 function cell(raw: string): CellData {
@@ -159,6 +159,65 @@ describe('serialize_csv', () => {
             const edits: Record<string, string> = { '3:1': 'EDITED' };
             const windowed = serialize_csv(chunked(rows, 2), ',', edits);
             expect(windowed).toBe('a,b\nc,d\ne,f\ng,EDITED\n');
+        });
+    });
+
+    describe('prepared window serializer', () => {
+        it('uses absolute row offsets across independent calls', () => {
+            const edits = {
+                '0:0': 'FIRST',
+                '10000:0': 'LAST',
+                '10000:2': 'EXTENDED',
+            };
+            const serializer = prepare_csv_serializer({
+                delimiter: ',',
+                edits,
+                lineEnding: '\r\n',
+                headerLine: 'Header',
+            });
+
+            const first = serializer.serialize_rows([[cell('a')]], 0);
+            const last = serializer.serialize_rows([[cell('z')]], 10_000);
+
+            expect(serializer.headerPrefix + first + last)
+                .toBe('Header\r\nFIRST\r\nLAST,,EXTENDED\r\n');
+        });
+
+        it('keeps no header distinct from a blank physical header', () => {
+            expect(prepare_csv_serializer({ delimiter: ',' }).headerPrefix).toBe('');
+            expect(prepare_csv_serializer({
+                delimiter: ',',
+                lineEnding: '\r',
+                headerLine: '',
+            }).headerPrefix).toBe('\r');
+        });
+
+        it('concatenates prepared windows to the compatibility output', () => {
+            const rows: (CellData | null)[][] = [
+                [cell('café'), cell('plain')],
+                [cell('say "hello"'), cell('line 1\nline 2')],
+                [cell('😀')],
+            ];
+            const edits = { '2:2': 'tail, value' };
+            const originalColumnCounts = [2, 2, 1];
+            const serializer = prepare_csv_serializer({
+                delimiter: ',',
+                edits,
+                originalColumnCounts,
+                headerLine: 'Name,Value',
+            });
+            const prepared = serializer.headerPrefix
+                + serializer.serialize_rows(rows.slice(0, 2), 0)
+                + serializer.serialize_rows(rows.slice(2), 2);
+
+            expect(prepared).toBe(serialize_csv(
+                rows,
+                ',',
+                edits,
+                originalColumnCounts,
+                '\n',
+                'Name,Value',
+            ));
         });
     });
 

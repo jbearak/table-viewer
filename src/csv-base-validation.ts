@@ -38,6 +38,7 @@ import {
     type CellHyperlink,
     type RichText,
 } from './cell-content';
+import { parse_cell_key } from './cell-key';
 import type { CsvDirtyMap } from './types';
 
 export type BaseValidationOutcome =
@@ -87,26 +88,19 @@ export function validate_dirty_bases(
     const conflicted_keys: string[] = [];
 
     for (const [key, entry] of Object.entries(dirty_edits)) {
-        const [source_row, col] = key.split(':').map(Number);
-        // Fail closed on a key that is not a pair of non-negative integers. Without
-        // this the arithmetic silently absorbs the garbage rather than rejecting it:
-        // `''`, `'a:b'` and `'4'` all yield NaN, `NaN >= source_row_count` is
-        // **false** so the removed-row branch below misses them, and then
-        // `read_raw(NaN, col) ?? ''` compares '' against the entry's base — so any
-        // malformed key whose base happens to be '' would pass validation outright
-        // and be handed to the serializer. Grouped with `removedRows` because that
-        // is the outcome whose message ("edited rows no longer exist") is the
-        // closest true statement about a key that names no row at all, and because
-        // it takes precedence, so one such key cannot be masked by a mismatch.
-        if (
-            !Number.isInteger(source_row)
-            || !Number.isInteger(col)
-            || source_row < 0
-            || col < 0
-        ) {
+        // Fail closed through the shared canonical parser. Numeric coercion would
+        // otherwise accept aliases such as `01:0`; the serializer addresses the
+        // same cell as `1:0`, so accepting both spellings can validate one key and
+        // silently drop the edit stored under the other. Grouped with `removedRows`
+        // because that outcome's message is the closest true statement about a key
+        // that names no canonical source row, and because it takes precedence over
+        // mismatches so malformed keys cannot be masked.
+        const coordinates = parse_cell_key(key);
+        if (!coordinates) {
             removed_keys.push(key);
             continue;
         }
+        const { sourceRow: source_row, sourceColumn: col } = coordinates;
         if (source_row >= source_row_count) {
             removed_keys.push(key);
             continue;
