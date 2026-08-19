@@ -205,9 +205,23 @@ uncosted scope in the issue as written.
 
 ### Stage 2 — Extract the shared worksheet scanner
 
-- New `src/ooxml-worksheet-scan.ts`. Move the writer's markup-aware machinery
-  (`indexOf_live`, `end_tag_after`, `scan_rows`, `scan_cells`,
-  `row_indexes_from_cells`) out of `xlsx-cell-write.ts`.
+- New `src/ooxml-worksheet-scan.ts`. Move the writer's markup-aware machinery out
+  of `xlsx-cell-write.ts` (line numbers verified):
+
+  | Function | Line | Note |
+  |---|---|---|
+  | `row_indexes_from_cells` | 447 | |
+  | `live_tags_in` | 498 | **exported**; `xlsx-package.ts:562` consumes it |
+  | `live_tags` | 557 | private; explicit range + precomputed ignorables |
+  | `indexOf_live` | 585 | |
+  | `end_tag_after` | 615 | |
+  | `scan_rows` | 647 | `Map<number, Span[]>` — plural, emulates reader precedence |
+  | `scan_cells` | 705 | |
+
+- **Both tag generators must survive.** Private `live_tags` (range-scoped, hot
+  path) and exported `live_tags_in` (whole-document convenience, external
+  consumer in `xlsx-package.ts`) look redundant but are not interchangeable.
+  Collapsing them is a behavior change, and Stage 2 is a pure refactor.
 - Writer consumes it. **Reader untouched. All 9 guards stay in place.**
 - All 136 + 58 tests green, byte-identical save output.
 - Pure refactor, no behavior change — this is the stage that makes the rest
@@ -495,6 +509,14 @@ main
       ├── … one per stage
       └── issue153-s7-conformance → PR to main
 ```
+
+**Each stage agent works in its own git worktree** (`isolation: "worktree"`), and
+the supervising session makes no commits, checkouts, or writes in a tree an agent
+holds. This is a correction, not a preference: Stage 1 ran in the shared checkout,
+and the supervisor's `git add -A` swept the agent's in-progress harness into a
+commit labelled as documentation-only, forcing a history rewrite. One writer per
+checkout. The supervisor reads state with `git log`/`git show`/`git diff` only,
+and uses path-scoped `git add`, never `-A`.
 
 One level-2 subagent per stage. Each owns its stage branch end to end and,
 before merging, dispatches its own level-3 reviewers:
