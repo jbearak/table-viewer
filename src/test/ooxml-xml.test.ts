@@ -46,8 +46,9 @@ describe('remove_attr', () => {
 
 describe('worksheet element bounds', () => {
     it('does not scan a row that closes beyond sheetData', () => {
-        const xml = '<worksheet><sheetData><row r="1"></sheetData>'
+        const source = '<worksheet><sheetData><row r="1"></sheetData>'
             + '<c r="A1"><v>outside</v></c></row></worksheet>';
+        const xml = Buffer.from(source, 'utf8');
         const sheet_data = find_first_element(xml, 'sheetData')!;
         const coordinates: string[] = [];
 
@@ -60,9 +61,10 @@ describe('worksheet element bounds', () => {
     });
 
     it('reports valid, missing, and invalid cell references with start offsets', () => {
-        const xml = '<worksheet><sheetData><row r="1">'
+        const source = '<worksheet><sheetData><row r="1">'
             + '<c/><c r="A0"/><c r="XFD1048576"/>'
             + '</row></sheetData></worksheet>';
+        const xml = Buffer.from(source, 'utf8');
         const sheet_data = find_first_element(xml, 'sheetData')!;
         const references: unknown[] = [];
         const coordinates: string[] = [];
@@ -83,5 +85,21 @@ describe('worksheet element bounds', () => {
             },
         ]);
         expect(coordinates).toEqual(['1048575:16383']);
+    });
+
+    it('reports true UTF-8 byte offsets after non-ASCII text', () => {
+        const source = '<worksheet><note>café</note><sheetData>'
+            + '<row r="1"><c r="A1"><v>1</v></c></row>'
+            + '</sheetData></worksheet>';
+        const xml = Buffer.from(source, 'utf8');
+        const sheet_data = find_first_element(xml, 'sheetData')!;
+        let cell_start = -1;
+
+        scan_rows(xml, sheet_data.inner_start, sheet_data.inner_end, {
+            on_reference: (reference) => { cell_start = reference.start; },
+        });
+
+        expect(cell_start).toBe(xml.indexOf('<c r="A1"'));
+        expect(cell_start).toBeGreaterThan(source.indexOf('<c r="A1"'));
     });
 });

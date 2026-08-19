@@ -79,6 +79,10 @@ function verify_saved_output(output, profile) {
     }
 }
 
+function worksheet_input_byte_length(input) {
+    return typeof input === 'string' ? Buffer.byteLength(input, 'utf8') : input.byteLength;
+}
+
 function* first_column_coordinates(row_count) {
     // One requested coordinate per fixture row makes cells_present walk every
     // row and every cell while retaining only a compact, checkable result.
@@ -108,7 +112,7 @@ async function measure_phase() {
         cfb_file = CFB.read(raw, { type: 'buffer' });
         content = worksheet_content(cfb_file, profile);
     }
-    if (phase === 'coordinate-scan' || phase === 'full-save') {
+    if (phase === 'worksheet-decode' || phase === 'coordinate-scan' || phase === 'full-save') {
         if (!bundle_path) shape_error(`${phase} requires a source bundle`);
         source = await import(pathToFileURL(bundle_path).href);
     }
@@ -132,16 +136,16 @@ async function measure_phase() {
         }
         case 'worksheet-decode': {
             const started = performance.now();
-            const xml = content.toString('utf8');
+            const xml = source.worksheet_scan_input(content);
             elapsed_ms = performance.now() - started;
-            if (Buffer.byteLength(xml, 'utf8') !== profile.worksheet_bytes) {
-                shape_error('decoded worksheet byte length changed');
+            if (worksheet_input_byte_length(xml) !== profile.worksheet_bytes) {
+                shape_error('worksheet scan input byte length changed');
             }
             result = xml;
             break;
         }
         case 'coordinate-scan': {
-            const xml = content.toString('utf8');
+            const xml = source.worksheet_scan_input(content);
             const started = performance.now();
             const found = source.cells_present(
                 xml,

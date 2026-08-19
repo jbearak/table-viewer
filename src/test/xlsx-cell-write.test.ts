@@ -8,6 +8,7 @@ import {
 import { parse_xlsx, worksheet_part_paths } from '../parse-xlsx';
 import {
     apply_cell_edits,
+    apply_utf8_splices,
     classify_value,
     col_index_to_letter,
     formula_count,
@@ -1061,6 +1062,16 @@ describe('apply_cell_edits', () => {
         );
     });
 
+    it('keeps the first authoritative sheetData when a prefixed one follows it', () => {
+        const ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+        const xml = `<worksheet xmlns:x="${ns}"><sheetData>`
+            + '<row r="1"><c r="A1"><v>1</v></c></row>'
+            + '</sheetData><x:sheetData/></worksheet>';
+
+        expect(apply_cell_edits(xml, [{ row: 0, col: 0, value: '2' }], OPTS))
+            .toContain('<c r="A1"><v>2</v></c>');
+    });
+
     it('classifies a structurally eligible prefixed SpreadsheetML sheetData', () => {
         const ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
         for (const xml of [
@@ -1422,6 +1433,28 @@ describe('apply_cell_edits', () => {
         const out = apply_cell_edits(original, [{ row: 0, col: 0, value: '9' }], OPTS);
         expect(out).toContain('<c r="B1" t="s"><v>5</v></c>');
         expect(out).toContain('<pageMargins/>');
+    });
+
+    it('splices byte offsets without shifting non-ASCII surroundings', () => {
+        const original = doc('<note>café</note><row r="1"><c r="A1"><v>1</v></c>'
+            + '<c r="B1" t="inlineStr"><is><t>東京</t></is></c></row>');
+        const bytes = Buffer.from(original, 'utf8');
+        const out = apply_cell_edits(bytes, [{ row: 0, col: 0, value: '9' }], OPTS);
+        const expected = original.replace('<c r="A1"><v>1</v></c>', '<c r="A1"><v>9</v></c>');
+
+        expect(Buffer.from(out).equals(Buffer.from(expected, 'utf8'))).toBe(true);
+    });
+
+    it('keeps same-byte-offset splice ordering in one allocation', () => {
+        const xml = Buffer.from('caféC', 'utf8');
+        const at = xml.indexOf('C');
+        const out = apply_utf8_splices(xml, [
+            { start: at, end: at + 1, text: 'R' },
+            { start: at, end: at, text: 'A' },
+            { start: at, end: at, text: 'B' },
+        ]);
+
+        expect(Buffer.from(out).toString('utf8')).toBe('caféABR');
     });
 
     it('applies several edits across rows in one pass', () => {

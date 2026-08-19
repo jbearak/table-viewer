@@ -1,23 +1,27 @@
 import {
     decode_xml,
-    find_tag_end,
     get_attr,
-    ignorable_end,
-    ignorable_ranges,
-    is_tag_boundary,
-    is_self_closing,
+    ignorable_ranges as string_ignorable_ranges,
     remove_attr,
     replace_attr_value,
     strip_illegal_xml_chars,
 } from './ooxml-xml';
 import {
-    end_tag_after,
     find_first_element,
+    find_tag_end,
+    get_tag_attr,
+    ignorable_ranges,
+    index_of_bytes,
     indexOf_live,
+    is_self_closing,
+    is_tag_boundary,
     letter_to_index,
     live_tags,
+    opening_tag_text,
     scan_cells,
     scan_rows,
+    starts_with_bytes,
+    utf8_text,
     type ScanRowsOptions,
     type Span,
 } from './ooxml-worksheet-scan';
@@ -448,13 +452,51 @@ function build_cell_xml(
  * comment is an empty element with a note attached, and removing it takes the note
  * with it. CDATA is left in place: that genuinely is character data.
  */
+function string_index_of_live(
+    xml: string,
+    needle: string,
+    from: number,
+    ranges: ReadonlyArray<[number, number]>,
+): number {
+    let pos = from;
+    while (true) {
+        const at = xml.indexOf(needle, pos);
+        if (at === -1) return -1;
+        let skip_to: number | undefined;
+        for (const [start, end] of ranges) {
+            if (at < start) break;
+            if (at < end) { skip_to = end; break; }
+        }
+        if (skip_to === undefined) return at;
+        pos = skip_to;
+    }
+}
+
+function string_end_tag_after(
+    xml: string,
+    name: string,
+    from: number,
+    ranges: ReadonlyArray<[number, number]>,
+): [number, number] | null {
+    let pos = from;
+    while (true) {
+        const at = string_index_of_live(xml, `</${name}`, pos, ranges);
+        if (at === -1) return null;
+        const after = at + name.length + 2;
+        if (xml[after] === '>') return [at, after + 1];
+        const gt = xml.indexOf('>', after);
+        if (gt !== -1 && after < gt && !/\S/.test(xml.slice(after, gt))) return [at, gt + 1];
+        pos = at + 1;
+    }
+}
+
 export function element_close(
     xml: string,
     name: string,
     inner_start: number,
 ): { inner: string; end: number } | null {
-    const ranges = ignorable_ranges(xml, 0, xml.length);
-    const end_tag = end_tag_after(xml, name, inner_start, ranges);
+    const ranges = string_ignorable_ranges(xml, 0, xml.length);
+    const end_tag = string_end_tag_after(xml, name, inner_start, ranges);
     if (end_tag === null) return null;
     let inner = xml.slice(inner_start, end_tag[0]);
     for (const [start, end] of ranges) {
@@ -465,25 +507,6 @@ export function element_close(
         inner = inner.slice(0, from) + ' '.repeat(to - from) + inner.slice(to);
     }
     return { inner, end: end_tag[1] };
-}
-
-/**
- * The inner text of the first live `<name>…</name>` element, or null.
- *
- * The same hazard one level up: `<numFmts[^>]*>([\s\S]*?)</numFmts>` cut the
- * opening tag at the first `>`, so an attribute value legally containing one
- * swallowed the element's content and every entry inside went unread. An empty
- * element has no content and answers null.
- */
-export function element_content(xml: string, name: string): string | null {
-    const ranges = ignorable_ranges(xml, 0, xml.length);
-    for (const [at, tag] of live_tags(xml, name, 0, xml.length, ranges)) {
-        if (tag.endsWith('/>')) return null;
-        const inner_start = at + tag.length;
-        const end_tag = end_tag_after(xml, name, inner_start, ranges);
-        return end_tag === null ? null : xml.slice(inner_start, end_tag[0]);
-    }
-    return null;
 }
 
 /**
@@ -526,15 +549,15 @@ const CELL_RANGE_RE = /^([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?$/;
  * whole-sheet range (`A1:XFD1048576`) is legal and not rare. Materializing that
  * is billions of entries for a workbook we may not even be editing near.
  */
-function grouped_formula_ranges(xml: string): GroupedRange[] {
+function grouped_formula_ranges(xml: Uint8Array): GroupedRange[] {
     const ranges: GroupedRange[] = [];
     // Same reason `scan_rows` skips these: a commented-out array formula is text,
     // and treating it as a live range refuses an edit to a cell that is not in one.
     const ignorable = ignorable_ranges(xml, 0, xml.length);
-    for (const [, tag] of live_tags(xml, 'f', 0, xml.length, ignorable)) {
-        const kind = get_attr(tag, 't');
+    for (const tag of live_tags(xml, 'f', 0, xml.length, ignorable)) {
+        const kind = get_tag_attr(xml, tag.start, tag.end, 't');
         if (!is_grouped_formula_kind(kind)) continue;
-        const ref = get_attr(tag, 'ref')?.match(CELL_RANGE_RE);
+        const ref = get_tag_attr(xml, tag.start, tag.end, 'ref')?.match(CELL_RANGE_RE);
         if (!ref) continue;
         const start_col = letter_to_index(ref[1]);
         const start_row = Number(ref[2]) - 1;
@@ -590,12 +613,16 @@ function grouped_range_kind(
  * Both a shared master (`t="shared"` with an `si`) and a shared *follower* (an
  * empty `<f t="shared" si="..."/>`) count: replacing either breaks the group.
  */
-function grouped_formula_kind(cell_inner: string): GroupedFormulaKind | null {
+function grouped_formula_kind(
+    xml: Uint8Array,
+    from: number,
+    to: number,
+): GroupedFormulaKind | null {
     // Only the cell's *live* `<f>`: an array formula quoted in a comment inside an
     // ordinary cell refused a literal edit that was never part of a group.
-    const ignorable = ignorable_ranges(cell_inner, 0, cell_inner.length);
-    for (const [, tag] of live_tags(cell_inner, 'f', 0, cell_inner.length, ignorable)) {
-        const kind = get_attr(tag, 't');
+    const ignorable = ignorable_ranges(xml, from, to);
+    for (const tag of live_tags(xml, 'f', from, to, ignorable)) {
+        const kind = get_tag_attr(xml, tag.start, tag.end, 't');
         return is_grouped_formula_kind(kind) ? kind : null;
     }
     return null;
@@ -618,7 +645,7 @@ function grouped_formula_kind(cell_inner: string): GroupedFormulaKind | null {
  * reader's own parsing, comment-blindness and all, so both sides agree on which
  * coordinates are covered.
  */
-function merged_follower_ranges(xml: string): GroupedRange[] {
+function merged_follower_ranges(xml: Uint8Array): GroupedRange[] {
     // Located exactly as `get_text` does it: the first raw `<mergeCells`, closed at
     // the first *literal* `</mergeCells>`. Not `[^>]*` for the opening tag — a legal
     // `<mergeCell note="x > y" ref="A1:C1"/>` cut the match short, so a merge the
@@ -626,27 +653,30 @@ function merged_follower_ranges(xml: string): GroupedRange[] {
     // through. And not `</mergeCells\s*>` for the close — the reader does not accept
     // that spelling, so it saw no merges at all while the writer refused a cell the
     // grid was displaying normally.
-    const open = /<mergeCells[\s>]/.exec(xml);
-    if (!open) return [];
-    const tag_end = find_tag_end(xml, open.index);
+    let open = index_of_bytes(xml, '<mergeCells');
+    while (open !== -1 && xml[open + '<mergeCells'.length] !== 0x3e
+        && !is_tag_boundary(xml[open + '<mergeCells'.length])) {
+        open = index_of_bytes(xml, '<mergeCells', open + 1);
+    }
+    if (open === -1) return [];
+    const tag_end = find_tag_end(xml, open);
     if (tag_end === -1) return [];
-    const close = xml.indexOf('</mergeCells>', tag_end);
+    const close = index_of_bytes(xml, '</mergeCells>', tag_end);
     if (close === -1) return [];
-    const inner = xml.slice(tag_end + 1, close);
     const ranges: GroupedRange[] = [];
     // Walked tag by tag with the same quote-aware `find_tag_end` the reader uses,
     // rather than matched with one regex: `[^>]*` ends the tag at a `>` inside an
     // attribute value, and the reader does not. Comments are deliberately *not*
     // skipped here — `iter_elements` does not skip them either, so a commented-out
     // `<mergeCell>` hides cells for the reader and must for the writer too.
-    let pos = 0;
-    while (pos < inner.length) {
-        const at = inner.indexOf('<mergeCell', pos);
-        if (at === -1) break;
-        if (!is_tag_boundary(inner[at + '<mergeCell'.length])) { pos = at + 1; continue; }
-        const cell_end = find_tag_end(inner, at);
-        if (cell_end === -1) break;
-        const m = get_attr(inner.slice(at, cell_end + 1), 'ref')?.match(CELL_RANGE_RE);
+    let pos = tag_end + 1;
+    while (pos < close) {
+        const at = index_of_bytes(xml, '<mergeCell', pos);
+        if (at === -1 || at >= close) break;
+        if (!is_tag_boundary(xml[at + '<mergeCell'.length])) { pos = at + 1; continue; }
+        const cell_end = find_tag_end(xml, at);
+        if (cell_end === -1 || cell_end >= close) break;
+        const m = get_tag_attr(xml, at, cell_end + 1, 'ref')?.match(CELL_RANGE_RE);
         pos = cell_end + 1;
         if (!m || m[3] === undefined || m[4] === undefined) continue;
         const start_row = Number(m[2]) - 1;
@@ -727,7 +757,8 @@ function existing_style(open_tag: string): number | null {
  * can move it in or out of the counted range, which read as a dropped formula and
  * deleted `xl/calcChain.xml` from a workbook that never lost one.
  */
-export function formula_count(xml: string): number {
+export function formula_count(source: Uint8Array | string): number {
+    const xml = typeof source === 'string' ? Buffer.from(source, 'utf8') : source;
     const ignorable = ignorable_ranges(xml, 0, xml.length);
     let count = 0;
     let pos = 0;
@@ -758,14 +789,6 @@ function canonical_edits(edits: readonly XlsxCellEdit[]): readonly XlsxCellEdit[
     return by_cell.size === edits.length ? edits : [...by_cell.values()];
 }
 
-/** Does an opening tag contain a default-namespace declaration the lexer could not read? */
-function has_unreadable_default_namespace(tag: string): boolean {
-    // A raw regex mistakes `note="text xmlns=example"` for a declaration. Remove
-    // quoted values first so only attribute syntax can fail closed here.
-    const outside_values = tag.replace(/"[^"]*"|'[^']*'/g, '');
-    return /(?:^|\s)xmlns\s*=/.test(outside_values);
-}
-
 interface RefusalCandidate {
     readonly start: number;
     readonly rank: number;
@@ -792,12 +815,15 @@ interface NamespaceBinding {
 interface NamespaceDeclarations {
     readonly default_namespace?: string;
     readonly bindings: readonly NamespaceBinding[];
+    /** A default declaration was present but not a quoted value we can resolve. */
+    readonly unreadable_default_namespace: boolean;
 }
 
 /** Namespace declarations on one opening tag, decoded and in lexical order. */
 function namespace_declarations(tag: string): NamespaceDeclarations {
     const bindings: NamespaceBinding[] = [];
     let default_namespace: string | undefined;
+    let unreadable_default_namespace = false;
     let i = 1;
 
     // Skip the element QName.
@@ -818,12 +844,16 @@ function namespace_declarations(tag: string): NamespaceDeclarations {
         while (i < tag.length && /[\s]/.test(tag[i])) i++;
         const quote = tag[i];
         if (quote !== '"' && quote !== "'") {
+            if (name === 'xmlns') unreadable_default_namespace = true;
             while (i < tag.length && !/[\s>]/.test(tag[i])) i++;
             continue;
         }
         const value_start = ++i;
         const value_end = tag.indexOf(quote, value_start);
-        if (value_end === -1) break;
+        if (value_end === -1) {
+            if (name === 'xmlns') unreadable_default_namespace = true;
+            break;
+        }
         const value = decode_xml(tag.slice(value_start, value_end));
         if (name === 'xmlns') default_namespace = value;
         else if (name.startsWith('xmlns:') && name.length > 'xmlns:'.length) {
@@ -831,7 +861,11 @@ function namespace_declarations(tag: string): NamespaceDeclarations {
         }
         i = value_end + 1;
     }
-    return { default_namespace, bindings };
+    return {
+        default_namespace,
+        bindings,
+        unreadable_default_namespace: default_namespace === undefined && unreadable_default_namespace,
+    };
 }
 
 interface NamespaceFrame {
@@ -873,17 +907,17 @@ interface WorksheetStructure {
 }
 
 /** Where one comment, CDATA section, or processing instruction ends. */
-function quoted_markup_end(xml: string, start: number): number | undefined {
+function quoted_markup_end(xml: Uint8Array, start: number): number | undefined {
     let close: number;
     let width: number;
-    if (xml.startsWith('<!--', start)) {
-        close = xml.indexOf('-->', start + 4);
+    if (starts_with_bytes(xml, '<!--', start)) {
+        close = index_of_bytes(xml, '-->', start + 4);
         width = 3;
-    } else if (xml.startsWith('<![CDATA[', start)) {
-        close = xml.indexOf(']]>', start + 9);
+    } else if (starts_with_bytes(xml, '<![CDATA[', start)) {
+        close = index_of_bytes(xml, ']]>', start + 9);
         width = 3;
-    } else if (xml.startsWith('<?', start)) {
-        close = xml.indexOf('?>', start + 2);
+    } else if (starts_with_bytes(xml, '<?', start)) {
+        close = index_of_bytes(xml, '?>', start + 2);
         width = 2;
     } else {
         return undefined;
@@ -892,29 +926,40 @@ function quoted_markup_end(xml: string, start: number): number | undefined {
 }
 
 /** Could any element inside this sheetData alter a refusal decision? */
-function needs_namespace_body_scan(xml: string, from: number, to: number): boolean {
-    const declaration = xml.indexOf('xmlns', from);
+function needs_namespace_body_scan(xml: Uint8Array, from: number, to: number): boolean {
+    const declaration = index_of_bytes(xml, 'xmlns', from);
     if (declaration !== -1 && declaration < to) return true;
     // Exact MC elements either carry/use a namespace declaration or have a
-    // prefixed QName. The same prefixed-QName test covers row/c/f/is/v identity.
-    const prefixed_element = /<[^\s!?/<>][^\s/<>]*:/g;
-    prefixed_element.lastIndex = from;
-    const match = prefixed_element.exec(xml);
-    return match !== null && match.index < to;
+    // prefixed QName. Search the much rarer colon and prove it belongs to the
+    // opening QName, rather than walking every `<row>` and `<c>` in JavaScript.
+    let colon = index_of_bytes(xml, ':', from);
+    while (colon !== -1 && colon < to) {
+        let start = colon - 1;
+        while (start >= from) {
+            const code = xml[start];
+            if (code === 0x3c || code === 0x3e || is_tag_boundary(code) || code === 0x3d) break;
+            start--;
+        }
+        if (xml[start] === 0x3c) {
+            const first = xml[start + 1];
+            if (first !== 0x21 && first !== 0x3f && first !== 0x2f) return true;
+        }
+        colon = index_of_bytes(xml, ':', colon + 1);
+    }
+    return false;
 }
 
 /**
  * Locate the worksheet document element and its direct `sheetData` child while
  * resolving namespace declarations with an O(depth) SAX-style stack.
  *
- * This walk exists only for writer safety decisions. The shared reader remains on
- * its allocation-light literal scanner, and offsets remain UTF-16 string indices
- * until Stage 6. Frames are discarded at each end tag; no worksheet-sized element
- * tree or namespace map is retained. Ordinary worksheets with no namespace
- * declarations or prefixed elements in `sheetData` take a native-search fast path
- * and do not pay for a second per-cell token walk.
+ * This walk exists only for writer safety decisions. Frames are discarded at
+ * each end tag; no worksheet-sized element tree or namespace map is retained.
+ * Ordinary worksheets with no namespace declarations or prefixed elements in
+ * `sheetData` take a native-search fast path and do not pay for a second per-cell
+ * token walk. Every retained position is a UTF-8 byte offset.
  */
-function scan_worksheet_structure(xml: string): WorksheetStructure {
+function scan_worksheet_structure(xml: Uint8Array): WorksheetStructure {
     const stack: NamespaceFrame[] = [];
     let pos = 0;
     let saw_document_element = false;
@@ -938,14 +983,14 @@ function scan_worksheet_structure(xml: string): WorksheetStructure {
     };
 
     while (pos < xml.length) {
-        const start = xml.indexOf('<', pos);
+        const start = index_of_bytes(xml, '<', pos);
         if (start === -1 || (sheet_data !== null && start >= sheet_data.inner_end)) break;
         const quoted_end = quoted_markup_end(xml, start);
         if (quoted_end !== undefined) { pos = quoted_end; continue; }
 
         // Other declarations are not elements and therefore do not establish the
         // document element or contribute to element depth.
-        if (xml.startsWith('<!', start)) {
+        if (starts_with_bytes(xml, '<!', start)) {
             const end = find_tag_end(xml, start);
             if (end === -1) break;
             pos = end + 1;
@@ -954,11 +999,11 @@ function scan_worksheet_structure(xml: string): WorksheetStructure {
 
         const tag_end = find_tag_end(xml, start);
         if (tag_end === -1) break;
-        const closing = xml.startsWith('</', start);
+        const closing = starts_with_bytes(xml, '</', start);
         if (closing) {
             let name_end = start + 2;
-            while (name_end < tag_end && !/[\s>]/.test(xml[name_end])) name_end++;
-            const closing_qname = xml.slice(start + 2, name_end);
+            while (name_end < tag_end && !is_tag_boundary(xml[name_end])) name_end++;
+            const closing_qname = utf8_text(xml, start + 2, name_end);
             const frame = stack[stack.length - 1];
             // A mismatched close means this is not a complete worksheet structure.
             // Stop rather than deriving writable spans from malformed nesting.
@@ -968,7 +1013,7 @@ function scan_worksheet_structure(xml: string): WorksheetStructure {
             continue;
         }
 
-        const open_tag = xml.slice(start, tag_end + 1);
+        const open_tag = utf8_text(xml, start, tag_end + 1);
         let name_end = 1;
         while (name_end < open_tag.length && !/[\s/>]/.test(open_tag[name_end])) name_end++;
         const qname = open_tag.slice(1, name_end);
@@ -1008,8 +1053,7 @@ function scan_worksheet_structure(xml: string): WorksheetStructure {
                 }
                 if (
                     !is_spreadsheetml_namespace(namespace)
-                    || (declarations.default_namespace === undefined
-                        && has_unreadable_default_namespace(open_tag))
+                    || declarations.unreadable_default_namespace
                 ) {
                     consider('both', start, 1, 'foreign-worksheet-namespace');
                 }
@@ -1020,8 +1064,7 @@ function scan_worksheet_structure(xml: string): WorksheetStructure {
             saw_sheet_data = true;
             if (
                 namespace !== worksheet_namespace
-                || (declarations.default_namespace === undefined
-                    && has_unreadable_default_namespace(open_tag))
+                || declarations.unreadable_default_namespace
             ) {
                 consider('sheet-data', start, 1, 'foreign-worksheet-namespace');
             }
@@ -1069,8 +1112,7 @@ function scan_worksheet_structure(xml: string): WorksheetStructure {
             && (local_name === 'row' || local_name === 'c' || local_name === 'f')
             && (
                 namespace !== worksheet_namespace
-                || (declarations.default_namespace === undefined
-                    && has_unreadable_default_namespace(open_tag))
+                || declarations.unreadable_default_namespace
             )
         ) {
             consider('sheet-data', start, 1, 'foreign-worksheet-namespace');
@@ -1119,11 +1161,10 @@ function scan_worksheet_structure(xml: string): WorksheetStructure {
  * Candidates are compared in strict document order. The opening construct is the
  * anchor; a rank breaks ties only within one opening tag: unsupported element
  * identity, foreign effective namespace, missing reference, invalid reference.
- * UTF-16 string indices preserve the same ordering as the byte offsets Stage 6
- * will carry, without taking that stage's representation change here.
+ * UTF-8 byte offsets make that ordering independent of JavaScript string width.
  */
 function assert_writable_sheet_data(
-    xml: string,
+    xml: Uint8Array,
     structure: WorksheetStructure,
     scan_options?: Pick<ScanRowsOptions, 'capture_cell' | 'on_cell'>,
 ): Map<number, Span[]> {
@@ -1183,9 +1224,10 @@ function assert_writable_sheet_data(
  * question, which is quadratic in a save that clears many links at once.
  */
 export function cells_present(
-    xml: string,
+    source: Uint8Array | string,
     coordinates: Iterable<{ readonly row: number; readonly col: number }>,
 ): Set<string> {
+    const xml = typeof source === 'string' ? Buffer.from(source, 'utf8') : source;
     const found = new Set<string>();
     const by_row = new Map<number, number[]>();
     for (const { row, col } of coordinates) {
@@ -1218,10 +1260,29 @@ export function apply_cell_edits(
     xml: string,
     edits: readonly XlsxCellEdit[],
     options: XlsxWriteOptions,
-): string {
-    if (edits.length === 0) return xml;
-    edits = canonical_edits(edits);
+): string;
+export function apply_cell_edits(
+    xml: Uint8Array,
+    edits: readonly XlsxCellEdit[],
+    options: XlsxWriteOptions,
+): Uint8Array;
+export function apply_cell_edits(
+    source: Uint8Array | string,
+    edits: readonly XlsxCellEdit[],
+    options: XlsxWriteOptions,
+): Uint8Array | string {
+    if (edits.length === 0) return source;
+    const return_text = typeof source === 'string';
+    const xml = return_text ? Buffer.from(source, 'utf8') : source;
+    const updated = apply_cell_edits_bytes(xml, canonical_edits(edits), options);
+    return return_text ? utf8_text(updated) : updated;
+}
 
+function apply_cell_edits_bytes(
+    xml: Uint8Array,
+    edits: readonly XlsxCellEdit[],
+    options: XlsxWriteOptions,
+): Uint8Array {
     const structure = scan_worksheet_structure(xml);
     const sheet_data = structure.sheet_data;
     if (!sheet_data) {
@@ -1245,10 +1306,13 @@ export function apply_cell_edits(
     // a bare tag dropped every one of them. This module's whole contract is that
     // it changes the cells it was asked to change and nothing else.
     if (self_closing) {
-        const open_tag = xml.slice(element_start, element_end)
-            .replace(/\/\s*>$/, '>');
-        const expanded = xml.slice(0, element_start) + open_tag + '</sheetData>' + xml.slice(element_end);
-        return apply_cell_edits(expanded, edits, options);
+        const open_tag = utf8_text(xml, element_start, element_end).replace(/\/\s*>$/, '>');
+        const expanded = apply_utf8_splices(xml, [{
+            start: element_start,
+            end: element_end,
+            text: `${open_tag}</sheetData>`,
+        }]);
+        return apply_cell_edits_bytes(expanded, edits, options);
     }
 
     // Group edits by row before scanning, so cell spans are retained only for
@@ -1345,11 +1409,14 @@ export function apply_cell_edits(
                 // names. This catches the one it cannot see: a shared *follower*,
                 // whose `<f t="shared" si="…"/>` carries no `ref` of its own.
                 const grouped = grouped_formula_kind(
-                    xml.slice(cell_span.inner_start, cell_span.end),
+                    xml,
+                    cell_span.inner_start,
+                    cell_span.inner_end,
                 );
                 if (grouped) throw grouped_formula_error(e.row, e.col, grouped);
-                const xf = existing_style(cell_span.open_tag);
-                const existing_type = get_attr(cell_span.open_tag, 't');
+                const cell_open_tag = opening_tag_text(xml, cell_span);
+                const xf = existing_style(cell_open_tag);
+                const existing_type = get_attr(cell_open_tag, 't');
                 splices.push({
                     start: cell_span.start,
                     end: cell_span.end,
@@ -1385,7 +1452,7 @@ export function apply_cell_edits(
         // not. Insert each before the first existing cell of a higher column,
         // falling back to the row's end.
         // Sorted, because several inserts landing in the same gap share a splice
-        // offset and `apply_splices` then keeps them in the order they arrived —
+        // offset and `apply_utf8_splices` then keeps them in the order they arrived —
         // which is the caller's edit order, not the column order the schema wants.
         inserts.sort((a, b) => (a.col - b.col) || (a.row - b.row));
         // `spans` caches the row's occupied column range. It is an optimization hint
@@ -1395,14 +1462,15 @@ export function apply_cell_edits(
         // Dropped rather than recomputed — the correct value depends on cells this
         // splice does not enumerate, and absent is a legal spelling that means
         // "work it out", while wrong is not.
-        const drop_spans = get_attr(row_span.open_tag, 'spans') !== null;
+        const row_open_tag = opening_tag_text(xml, row_span);
+        const drop_spans = get_attr(row_open_tag, 'spans') !== null;
         if (row_span.inner_start === row_span.end) {
             // `<row r="5" ht="20"/>` — a valid empty row, which is what a row given
             // a height or a format but no cells looks like. There is no `</row>` to
             // insert before, so the element is replaced by a paired one keeping its
             // attributes; computing an offset from `'</row>'.length` here would
             // splice into the middle of the opening tag and emit malformed XML.
-            const open_tag = drop_spans ? remove_attr(row_span.open_tag, 'spans') : row_span.open_tag;
+            const open_tag = drop_spans ? remove_attr(row_open_tag, 'spans') : row_open_tag;
             const attributes = open_tag.slice('<row'.length, open_tag.length - '/>'.length);
             splices.push({
                 start: row_span.start,
@@ -1417,7 +1485,7 @@ export function apply_cell_edits(
             splices.push({
                 start: row_span.start,
                 end: row_span.inner_start,
-                text: remove_attr(row_span.open_tag, 'spans'),
+                text: remove_attr(row_open_tag, 'spans'),
             });
         }
         const ordering_cells = scan_cells(xml, row_span.inner_start, row_span.inner_end);
@@ -1454,33 +1522,46 @@ export function apply_cell_edits(
         splices.push({ start: at, end: at, text: nr.text });
     }
 
-    return apply_splices(xml, splices);
+    return apply_utf8_splices(xml, splices);
 }
 
 /**
- * Apply splices right-to-left so each splice's offsets stay valid — they were all
- * computed against the original string. Ties (two zero-width inserts at the same
- * offset) keep their relative order, which matters when two new cells insert
- * before the same existing cell.
+ * Apply byte-offset splices with one output allocation. Every offset was computed
+ * against the original worksheet, so unchanged ranges copy through verbatim.
  *
- * A replacement and an insert can share a start offset: inserting a new cell
- * before existing `C1` puts the insert at `C1`'s start, and editing `C1` itself
- * replaces from there. Applying right-to-left, the *replacement* has to go first
- * — otherwise the insert lands at that offset and the replacement, still holding
- * the original `[start, end)`, overwrites the text just inserted. So among ties,
- * nonzero-width splices sort ahead of zero-width ones.
+ * Ties preserve the old right-to-left splicer's result: same-offset inserts keep
+ * source order, and an insert appears before a replacement sharing its start. The
+ * latter is load-bearing when inserting a new cell before an existing `C1` while
+ * also replacing `C1` itself.
  */
-function apply_splices(xml: string, splices: Splice[]): string {
-    const is_insert = (s: Splice) => (s.end > s.start ? 0 : 1);
+export function apply_utf8_splices(xml: Uint8Array, splices: readonly Splice[]): Uint8Array {
+    if (splices.length === 0) return xml;
     const ordered = splices
-        .map((s, i) => ({ s, i }))
-        .sort((a, b) => (b.s.start - a.s.start)
-            || (is_insert(a.s) - is_insert(b.s))
-            || (b.i - a.i));
-    let out = xml;
-    for (const { s } of ordered) {
-        out = out.slice(0, s.start) + s.text + out.slice(s.end);
+        .map((splice, index) => ({
+            splice,
+            index,
+            bytes: Buffer.from(splice.text, 'utf8'),
+        }))
+        .sort((a, b) => (a.splice.start - b.splice.start)
+            || ((a.splice.end === a.splice.start ? 0 : 1)
+                - (b.splice.end === b.splice.start ? 0 : 1))
+            || (a.index - b.index));
+    let length = xml.length;
+    for (const { splice, bytes } of ordered) {
+        length += bytes.length - (splice.end - splice.start);
     }
+    const out = Buffer.allocUnsafe(length);
+    let input_at = 0;
+    let output_at = 0;
+    for (const { splice, bytes } of ordered) {
+        const unchanged = xml.subarray(input_at, splice.start);
+        out.set(unchanged, output_at);
+        output_at += unchanged.length;
+        out.set(bytes, output_at);
+        output_at += bytes.length;
+        input_at = splice.end;
+    }
+    out.set(xml.subarray(input_at), output_at);
     return out;
 }
 
@@ -1498,7 +1579,23 @@ export function widen_dimension(
     min_col: number,
     max_row: number,
     max_col: number,
-): string {
+): string;
+export function widen_dimension(
+    xml: Uint8Array,
+    min_row: number,
+    min_col: number,
+    max_row: number,
+    max_col: number,
+): Uint8Array;
+export function widen_dimension(
+    source: Uint8Array | string,
+    min_row: number,
+    min_col: number,
+    max_row: number,
+    max_col: number,
+): Uint8Array | string {
+    const return_text = typeof source === 'string';
+    const xml = return_text ? Buffer.from(source, 'utf8') : source;
     // The live one: widening a commented-out `<dimension>` left the real extent
     // stale, which is what `<dimension>` is maintained here to prevent.
     const found = live_tags(
@@ -1508,11 +1605,11 @@ export function widen_dimension(
         xml.length,
         ignorable_ranges(xml, 0, xml.length),
     ).next();
-    if (found.done) return xml;
-    const [start, open_tag] = found.value;
-    const tag_end = start + open_tag.length - 1;
+    if (found.done) return source;
+    const { start, end } = found.value;
+    const open_tag = utf8_text(xml, start, end);
     const m = get_attr(open_tag, 'ref')?.match(CELL_RANGE_RE);
-    if (!m) return xml;
+    if (!m) return source;
     const cur_start_col = letter_to_index(m[1]);
     const cur_start_row = Number(m[2]) - 1;
     const cur_end_col = m[3] !== undefined ? letter_to_index(m[3]) : cur_start_col;
@@ -1528,8 +1625,12 @@ export function widen_dimension(
     if (
         start_col === cur_start_col && start_row === cur_start_row
         && end_col === cur_end_col && end_row === cur_end_row
-    ) return xml;
+    ) return source;
     const ref = `${col_index_to_letter(start_col)}${start_row + 1}:${col_index_to_letter(end_col)}${end_row + 1}`;
-    const replaced = replace_attr_value(open_tag, 'ref', ref);
-    return xml.slice(0, start) + replaced + xml.slice(tag_end + 1);
+    const updated = apply_utf8_splices(xml, [{
+        start,
+        end,
+        text: replace_attr_value(open_tag, 'ref', ref),
+    }]);
+    return return_text ? utf8_text(updated) : updated;
 }
