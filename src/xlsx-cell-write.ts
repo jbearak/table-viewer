@@ -1299,10 +1299,11 @@ export function apply_cell_edits(
         }
     }
 
-    // A numbered row can legally own cells whose references name other rows. Cache
-    // a bounded rescan only for owner elements that receive inserts, so positioning
-    // sees every existing column in that owner without retaining sheet-wide spans.
-    const ordering_cells_by_owner = new Map<Span, Map<number, Span>>();
+    // A numbered row can legally own cells whose references name other rows. If
+    // edits address more than one of those logical rows, they still mutate one
+    // physical owner. Collect its inserts once so opening-tag rewrites and cell
+    // insertions cannot overlap at stale offsets.
+    const inserts_by_owner = new Map<Span, Array<{ row: number; col: number; text: string }>>();
 
     for (const [row, row_edits] of by_row) {
         const row_spans = rows.get(row);
@@ -1323,7 +1324,6 @@ export function apply_cell_edits(
         // New coordinates go into the element the reader treats as authoritative
         // for anything it already holds: the last one.
         const row_span = row_spans[row_spans.length - 1];
-        const inserts: Array<{ col: number; text: string }> = [];
 
         for (const e of row_edits) {
             const cell_span = cells.get(e.col);
@@ -1364,10 +1364,21 @@ export function apply_cell_edits(
                     ),
                 });
             } else {
-                inserts.push({ col: e.col, text: build_cell_xml(e.row, e.col, e, null, options) });
+                let inserts = inserts_by_owner.get(row_span);
+                if (!inserts) {
+                    inserts = [];
+                    inserts_by_owner.set(row_span, inserts);
+                }
+                inserts.push({
+                    row: e.row,
+                    col: e.col,
+                    text: build_cell_xml(e.row, e.col, e, null, options),
+                });
             }
         }
+    }
 
+    for (const [row_span, inserts] of inserts_by_owner) {
         // New cells within an existing row must land in ascending column order:
         // Excel tolerates out-of-order `<c>` in many builds but the schema
         // specifies sorted, and some consumers (and Excel's own repair check) do
@@ -1376,7 +1387,7 @@ export function apply_cell_edits(
         // Sorted, because several inserts landing in the same gap share a splice
         // offset and `apply_splices` then keeps them in the order they arrived —
         // which is the caller's edit order, not the column order the schema wants.
-        inserts.sort((a, b) => a.col - b.col);
+        inserts.sort((a, b) => (a.col - b.col) || (a.row - b.row));
         // `spans` caches the row's occupied column range. It is an optimization hint
         // that Excel recomputes, but a *stale* one is a lie about the row: an insert
         // outside the cached range left `spans="1:1"` on a row now reaching C, and
@@ -1384,8 +1395,8 @@ export function apply_cell_edits(
         // Dropped rather than recomputed — the correct value depends on cells this
         // splice does not enumerate, and absent is a legal spelling that means
         // "work it out", while wrong is not.
-        const drop_spans = inserts.length > 0 && get_attr(row_span.open_tag, 'spans') !== null;
-        if (inserts.length > 0 && row_span.inner_start === row_span.end) {
+        const drop_spans = get_attr(row_span.open_tag, 'spans') !== null;
+        if (row_span.inner_start === row_span.end) {
             // `<row r="5" ht="20"/>` — a valid empty row, which is what a row given
             // a height or a format but no cells looks like. There is no `</row>` to
             // insert before, so the element is replaced by a paired one keeping its
@@ -1409,11 +1420,7 @@ export function apply_cell_edits(
                 text: remove_attr(row_span.open_tag, 'spans'),
             });
         }
-        let ordering_cells = ordering_cells_by_owner.get(row_span);
-        if (!ordering_cells && inserts.length > 0) {
-            ordering_cells = scan_cells(xml, row_span.inner_start, row_span.inner_end);
-            ordering_cells_by_owner.set(row_span, ordering_cells);
-        }
+        const ordering_cells = scan_cells(xml, row_span.inner_start, row_span.inner_end);
         for (const ins of inserts) {
             // The span's own content end, not `end - '</row>'.length`: an end tag may
             // legally be written `</row\n>`, and the subtraction then landed *inside*
@@ -1421,7 +1428,7 @@ export function apply_cell_edits(
             // malformed XML.
             let at = row_span.inner_end;
             let best: number | undefined;
-            for (const [col, span] of ordering_cells ?? []) {
+            for (const [col, span] of ordering_cells) {
                 if (col > ins.col && (best === undefined || span.start < best)) best = span.start;
             }
             if (best !== undefined) at = best;

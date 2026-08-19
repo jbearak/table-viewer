@@ -820,6 +820,26 @@ describe('apply_cell_edits', () => {
         expect(out.indexOf('<c r="B1"')).toBeLessThan(out.indexOf('<c r="C2"'));
     });
 
+    it('coalesces inserts for logical rows sharing one physical owner', () => {
+        // B2 arrives first on purpose. Planning each logical row separately left
+        // B2 before A1 and, with `spans`, queued overlapping opening-tag rewrites.
+        for (const spans of ['', ' spans="3:4"']) {
+            const out = apply_cell_edits(
+                doc(`<row r="1"${spans}><c r="C1"/><c r="D2"/></row>`),
+                [
+                    { row: 1, col: 1, value: '2' },
+                    { row: 0, col: 0, value: '1' },
+                ],
+                OPTS,
+            );
+            expect(out).toContain(
+                '<row r="1"><c r="A1"><v>1</v></c><c r="B2"><v>2</v></c>'
+                + '<c r="C1"/><c r="D2"/></row>',
+            );
+            expect(out).not.toContain('spans=');
+        }
+    });
+
     it('refuses a namespace-prefixed formula element with a stable code', () => {
         for (const prefix of ['x', 'π']) {
             expect_refusal(
