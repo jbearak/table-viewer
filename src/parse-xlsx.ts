@@ -1,4 +1,4 @@
-import CFB from 'cfb';
+import { ZipPackage, ZipPackageError } from './zip-package';
 import {
     assert_safe_sheet_count,
     assert_safe_sheet_shape,
@@ -54,15 +54,22 @@ import {
 
 // --- ZIP / Entry Access ---
 
-function get_entry_bytes(cfb_file: ReturnType<typeof CFB.read>, path: string): Uint8Array | null {
-    const entry = CFB.find(cfb_file, path);
-    return entry?.content ? entry.content as Uint8Array : null;
+function get_entry_bytes(zip: ZipPackage, path: string): Uint8Array | null {
+    try {
+        return zip.read(path);
+    } catch (error) {
+        if (error instanceof ZipPackageError) throw new Error('Not a valid .xlsx file');
+        throw error;
+    }
 }
 
-function get_entry_text(cfb_file: ReturnType<typeof CFB.read>, path: string): string | null {
-    const entry = CFB.find(cfb_file, path);
-    if (!entry?.content) return null;
-    return Buffer.from(entry.content).toString('utf8');
+function get_entry_text(zip: ZipPackage, path: string): string | null {
+    try {
+        return zip.read_text(path);
+    } catch (error) {
+        if (error instanceof ZipPackageError) throw new Error('Not a valid .xlsx file');
+        throw error;
+    }
 }
 
 // --- Workbook Parsing ---
@@ -95,9 +102,9 @@ export function resolve_part_path(target: string): string {
     return out.join('/');
 }
 
-function parse_sheet_rels(cfb_file: ReturnType<typeof CFB.read>): Map<string, string> {
+function parse_sheet_rels(zip: ZipPackage): Map<string, string> {
     const map = new Map<string, string>();
-    const xml = get_entry_text(cfb_file, '/xl/_rels/workbook.xml.rels');
+    const xml = get_entry_text(zip, '/xl/_rels/workbook.xml.rels');
     if (!xml) return map;
 
     for (const [id, rel] of parse_relationships(xml)) {
@@ -124,10 +131,10 @@ function parse_sheet_rels(cfb_file: ReturnType<typeof CFB.read>): Map<string, st
  * have it hold for the next difference nobody thought of.
  */
 export function worksheet_part_paths_from_package(
-    cfb_file: ReturnType<typeof CFB.read>,
+    zip: ZipPackage,
 ): string[] {
-    const rels = parse_sheet_rels(cfb_file);
-    const workbook_xml = get_entry_text(cfb_file, '/xl/workbook.xml');
+    const rels = parse_sheet_rels(zip);
+    const workbook_xml = get_entry_text(zip, '/xl/workbook.xml');
     if (!workbook_xml) return [];
     // `parse_xlsx` drops a sheet whose relationship does not resolve *before*
     // numbering the rest, so the filter belongs here too — see its own loop.
@@ -137,7 +144,7 @@ export function worksheet_part_paths_from_package(
 }
 
 export function worksheet_part_paths(buffer: Uint8Array): string[] {
-    return worksheet_part_paths_from_package(CFB.read(buffer, { type: 'buffer' }));
+    return worksheet_part_paths_from_package(ZipPackage.open(buffer));
 }
 
 function parse_shared_strings(xml: string): ParsedXlsxString[] {
@@ -746,7 +753,7 @@ function col_letter_to_index(letters: string): number {
  * both paths (mirrors `open_workbook` on the .xls side).
  */
 interface OpenedXlsxWorkbook {
-    cfb_file: ReturnType<typeof CFB.read>;
+    zip: ZipPackage;
     sheet_entries: WorkbookSheetEntry[];
     rels: Map<string, string>;
     sst: ParsedXlsxString[];
@@ -758,49 +765,49 @@ interface OpenedXlsxWorkbook {
 }
 
 function open_xlsx_workbook(buffer: Uint8Array): OpenedXlsxWorkbook {
-    let cfb_file: ReturnType<typeof CFB.read>;
+    let zip: ZipPackage;
     try {
-        cfb_file = CFB.read(buffer, { type: 'buffer' });
+        zip = ZipPackage.open(buffer);
     } catch {
         throw new Error('Not a valid .xlsx file');
     }
 
     // Parse workbook structure
-    const workbook_xml = get_entry_text(cfb_file, '/xl/workbook.xml');
+    const workbook_xml = get_entry_text(zip, '/xl/workbook.xml');
     if (!workbook_xml) throw new Error('No workbook data found in .xlsx file');
 
     const { sheets: sheet_entries, datemode } = parse_workbook_xml(workbook_xml);
     assert_safe_sheet_count(sheet_entries.length);
 
-    const rels = parse_sheet_rels(cfb_file);
+    const rels = parse_sheet_rels(zip);
 
     // Parse shared strings (may be absent for workbooks with no string cells)
-    const sst_xml = get_entry_text(cfb_file, '/xl/sharedStrings.xml');
+    const sst_xml = get_entry_text(zip, '/xl/sharedStrings.xml');
     const sst = sst_xml ? parse_shared_strings(sst_xml) : [];
 
     // Parse styles
-    const styles_xml = get_entry_text(cfb_file, '/xl/styles.xml');
+    const styles_xml = get_entry_text(zip, '/xl/styles.xml');
     const { fonts, xfs, format_map } = styles_xml
         ? parse_styles(styles_xml)
         : { fonts: [], xfs: [], format_map: new Map<number, string>() };
 
     const budget = create_workbook_budget();
 
-    return { cfb_file, sheet_entries, rels, sst, fonts, xfs, format_map, datemode, budget };
+    return { zip, sheet_entries, rels, sst, fonts, xfs, format_map, datemode, budget };
 }
 
 /** Read and parse one worksheet's own `.rels` part (hyperlink targets live
  *  there). Absent part -> empty map, which is the common case. */
 function worksheet_rels(
-    cfb_file: ReturnType<typeof CFB.read>,
+    zip: ZipPackage,
     sheet_path: string,
 ): Map<string, OoxmlRelationship> {
-    const rels_xml = get_entry_text(cfb_file, `/${rels_path_for_part(sheet_path)}`);
+    const rels_xml = get_entry_text(zip, `/${rels_path_for_part(sheet_path)}`);
     return rels_xml ? parse_relationships(rels_xml) : new Map();
 }
 
 export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookData; warnings: string[] }> {
-    const { cfb_file, sheet_entries, rels, sst, fonts, xfs, format_map, datemode, budget } =
+    const { zip, sheet_entries, rels, sst, fonts, xfs, format_map, datemode, budget } =
         open_xlsx_workbook(buffer);
 
     // Parse each worksheet
@@ -811,7 +818,7 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookDa
         const sheet_path = rels.get(entry.rId);
         if (!sheet_path) continue;
 
-        const ws_content = get_entry_bytes(cfb_file, `/${sheet_path}`);
+        const ws_content = get_entry_bytes(zip, `/${sheet_path}`);
         if (!ws_content) {
             // Empty or missing sheet
             sheets.push({
@@ -827,7 +834,7 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookDa
 
         const working = parse_worksheet_core(
             worksheet_scan_input(ws_content), sst, xfs, fonts, format_map, datemode, budget,
-            worksheet_rels(cfb_file, sheet_path)
+            worksheet_rels(zip, sheet_path)
         );
         workings.push(working);
 
@@ -852,7 +859,7 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookDa
  * directly, eliminating the transient 2x representation peak (Task A7).
  */
 export async function parse_xlsx_streaming(buffer: Uint8Array): Promise<StreamingWorkbook> {
-    const { cfb_file, sheet_entries, rels, sst, fonts, xfs, format_map, datemode, budget } =
+    const { zip, sheet_entries, rels, sst, fonts, xfs, format_map, datemode, budget } =
         open_xlsx_workbook(buffer);
 
     const sheets: StreamingSheet[] = [];
@@ -862,7 +869,7 @@ export async function parse_xlsx_streaming(buffer: Uint8Array): Promise<Streamin
         const sheet_path = rels.get(entry.rId);
         if (!sheet_path) continue;
 
-        const ws_content = get_entry_bytes(cfb_file, `/${sheet_path}`);
+        const ws_content = get_entry_bytes(zip, `/${sheet_path}`);
         if (!ws_content) {
             sheets.push({
                 name: entry.name,
@@ -877,7 +884,7 @@ export async function parse_xlsx_streaming(buffer: Uint8Array): Promise<Streamin
 
         const working = parse_worksheet_core(
             worksheet_scan_input(ws_content), sst, xfs, fonts, format_map, datemode, budget,
-            worksheet_rels(cfb_file, sheet_path)
+            worksheet_rels(zip, sheet_path)
         );
         workings.push(working);
         sheets.push(make_streaming_sheet(entry.name, working, working.merges, entry.worksheetId));

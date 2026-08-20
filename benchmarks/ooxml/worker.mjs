@@ -77,6 +77,59 @@ function verify_saved_output(output, profile) {
         || !xml.slice(cell_start, cell_end).includes('>OOXML benchmark</t>')) {
         shape_error('full save output does not contain the benchmark edit at A1');
     }
+
+    const before_members = raw_zip_members(fs.readFileSync(profile.fixture_path));
+    const after_members = raw_zip_members(output);
+    const before_names = [...before_members.keys()].sort();
+    const after_names = [...after_members.keys()].sort();
+    if (JSON.stringify(after_names) !== JSON.stringify(before_names)) {
+        shape_error('full save changed the ZIP member inventory');
+    }
+    const changed = profile.worksheet_path.replace(/^\//, '');
+    for (const [name, before] of before_members) {
+        if (name === changed) continue;
+        const after = after_members.get(name);
+        if (!after || !after.local_record.equals(before.local_record)) {
+            shape_error(`full save changed untouched local record ${name}`);
+        }
+    }
+}
+
+function raw_zip_members(raw) {
+    let eocd = raw.length - 22;
+    for (; eocd >= Math.max(0, raw.length - 0xffff - 22); eocd--) {
+        if (raw.readUInt32LE(eocd) === 0x06054b50
+            && eocd + 22 + raw.readUInt16LE(eocd + 20) === raw.length) break;
+    }
+    if (eocd < 0) shape_error('saved output has no ZIP end record');
+    const count = raw.readUInt16LE(eocd + 10);
+    const central_offset = raw.readUInt32LE(eocd + 16);
+    const entries = [];
+    let central = central_offset;
+    for (let index = 0; index < count; index++) {
+        if (raw.readUInt32LE(central) !== 0x02014b50) {
+            shape_error('saved output has an invalid central directory');
+        }
+        const name_length = raw.readUInt16LE(central + 28);
+        const extra_length = raw.readUInt16LE(central + 30);
+        const comment_length = raw.readUInt16LE(central + 32);
+        const name = raw.subarray(central + 46, central + 46 + name_length).toString('utf8');
+        entries.push({ name, local_offset: raw.readUInt32LE(central + 42) });
+        central += 46 + name_length + extra_length + comment_length;
+    }
+    const physical = [...entries].sort((left, right) => left.local_offset - right.local_offset);
+    const local_end = new Map();
+    for (let index = 0; index < physical.length; index++) {
+        local_end.set(physical[index], physical[index + 1]?.local_offset ?? central_offset);
+    }
+    const members = new Map();
+    for (const entry of entries) {
+        if (members.has(entry.name)) shape_error(`duplicate ZIP member ${entry.name}`);
+        members.set(entry.name, {
+            local_record: raw.subarray(entry.local_offset, local_end.get(entry)),
+        });
+    }
+    return members;
 }
 
 function worksheet_input_byte_length(input) {

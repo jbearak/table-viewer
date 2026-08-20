@@ -1,4 +1,3 @@
-import CFB from 'cfb';
 import { element_close, type XlsxCellEdit } from './xlsx-cell-write';
 import { worksheet_scan_input } from './ooxml-worksheet-scan';
 import { get_style, is_date_format } from './spreadsheet-format';
@@ -23,52 +22,46 @@ import type { XfEntry, DateMode } from './spreadsheet-format';
 import { rels_path_for_part } from './ooxml-relationships';
 import type { XlsxHyperlinkEdit } from './xlsx-hyperlink-write';
 import { apply_worksheet_edits } from './ooxml-surgery';
+import { ZipPackage, ZipPackageError } from './zip-package';
 
 /**
  * Package-level (.xlsx container) side of `putexcel`-style saving.
  *
- * We reuse the `cfb` dependency already present for reading rather than adding a
- * writer library. That choice was made empirically, not by reputation: round-
- * tripping our fixtures and `docs/examples/garden-cafe-sample.xlsx` through
- * `CFB.read` → `CFB.write` reproduced every part byte-identically, and a mutation
- * test (rewrite one `<c>`, leave everything else) produced a zip that `unzip -t`
- * accepts with `xl/styles.xml` untouched. Every deserialize/re-serialize library
- * we looked at (ExcelJS, xlsx-populate, SheetJS write) instead rebuilds parts it
- * models and drops those it doesn't. Here the parts we never touch are never even
- * parsed, so charts, pivot tables, conditional formatting and macros survive by
- * construction — the strongest preservation guarantee available, and the one the
- * `putexcel` requirement actually asks for.
+ * The ZIP package is indexed lazily. Only the workbook metadata and worksheet
+ * parts needed for an edit are inflated; when the package is emitted, every
+ * unchanged local ZIP record is copied verbatim. Charts, images, pivot tables,
+ * macros, and other opaque parts are therefore neither decompressed nor
+ * recompressed.
  */
 
-function read_part_bytes(cfb_file: ReturnType<typeof CFB.read>, path: string): Uint8Array | null {
-    const entry = CFB.find(cfb_file, path);
-    return entry?.content ? entry.content as Uint8Array : null;
+function read_part_bytes(zip: ZipPackage, path: string): Uint8Array | null {
+    try {
+        return zip.read(path);
+    } catch (error) {
+        if (error instanceof ZipPackageError) throw new Error('Not a valid .xlsx file');
+        throw error;
+    }
 }
 
-function read_part_text(cfb_file: ReturnType<typeof CFB.read>, path: string): string | null {
-    const entry = CFB.find(cfb_file, path);
-    if (!entry?.content) return null;
-    return Buffer.from(entry.content as Uint8Array).toString('utf8');
+function read_part_text(zip: ZipPackage, path: string): string | null {
+    try {
+        return zip.read_text(path);
+    } catch (error) {
+        if (error instanceof ZipPackageError) throw new Error('Not a valid .xlsx file');
+        throw error;
+    }
 }
 
 function write_part_bytes(
-    cfb_file: ReturnType<typeof CFB.read>,
+    zip: ZipPackage,
     path: string,
     bytes: Uint8Array,
 ): boolean {
-    const entry = CFB.find(cfb_file, path);
-    if (!entry) return false;
-    entry.content = (Buffer.isBuffer(bytes)
-        ? bytes
-        : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength)) as CFB.CFB$Blob;
-    // `size` is not derived from `content` on write, so both must be set or the
-    // emitted zip declares a stale length and readers truncate the part.
-    entry.size = bytes.byteLength;
-    return true;
+    return zip.replace(path, bytes);
 }
 
-function write_part_text(cfb_file: ReturnType<typeof CFB.read>, path: string, text: string): boolean {
-    return write_part_bytes(cfb_file, path, Buffer.from(text, 'utf8'));
+function write_part_text(zip: ZipPackage, path: string, text: string): boolean {
+    return write_part_bytes(zip, path, Buffer.from(text, 'utf8'));
 }
 
 /**
@@ -226,8 +219,8 @@ interface StyleWriteContext {
     readonly run_font_base: (xf_index: number) => string;
 }
 
-function read_style_write_context(cfb_file: ReturnType<typeof CFB.read>): StyleWriteContext {
-    const xml = read_part_text(cfb_file, '/xl/styles.xml');
+function read_style_write_context(zip: ZipPackage): StyleWriteContext {
+    const xml = read_part_text(zip, '/xl/styles.xml');
     if (!xml) {
         return {
             is_date_style: () => false,
@@ -332,8 +325,8 @@ function numeric_attr(tag: string, name: string): number | null {
  * used 1904 — and the two are 1462 days apart, so a saved `2024-01-15` read back
  * as `2028-01-16`. Not a rounding error: a date four years off.
  */
-function read_datemode(cfb_file: ReturnType<typeof CFB.read>): DateMode {
-    const wb = read_part_text(cfb_file, '/xl/workbook.xml');
+function read_datemode(zip: ZipPackage): DateMode {
+    const wb = read_part_text(zip, '/xl/workbook.xml');
     if (!wb) return 0;
     return parse_workbook_xml(wb).datemode;
 }
@@ -370,16 +363,16 @@ export function write_xlsx_workbook_cell_edits(
         indices.add(sheetIndex);
     }
 
-    let cfb_file: ReturnType<typeof CFB.read>;
+    let zip: ZipPackage;
     try {
-        cfb_file = CFB.read(raw, { type: 'buffer' });
+        zip = ZipPackage.open(raw);
     } catch {
         throw new Error('Not a valid .xlsx file');
     }
 
-    const parts = worksheet_part_paths_from_package(cfb_file);
-    const { is_date_style, cell_font_style, run_font_base } = read_style_write_context(cfb_file);
-    const datemode = read_datemode(cfb_file);
+    const parts = worksheet_part_paths_from_package(zip);
+    const { is_date_style, cell_font_style, run_font_base } = read_style_write_context(zip);
+    const datemode = read_datemode(zip);
     let removed_formula = false;
     const replacements: Array<
         | { path: string; bytes: Uint8Array }
@@ -390,13 +383,13 @@ export function write_xlsx_workbook_cell_edits(
         const part = parts[sheetIndex];
         if (!part) throw new Error('Could not locate a worksheet to save');
         const path = `/${part}`;
-        const sheet_content = read_part_bytes(cfb_file, path);
+        const sheet_content = read_part_bytes(zip, path);
         if (sheet_content === null) throw new Error('Could not read a worksheet to save');
         const sheet_xml = worksheet_scan_input(sheet_content);
 
         const rels_path = `/${rels_path_for_part(part)}`;
         const rels_xml = link_edits && link_edits.length > 0
-            ? read_part_text(cfb_file, rels_path)
+            ? read_part_text(zip, rels_path)
             : null;
         const result = apply_worksheet_edits({
             worksheet_xml: sheet_xml,
@@ -427,20 +420,19 @@ export function write_xlsx_workbook_cell_edits(
             // A sheet that never had relationships has no `.rels` part to
             // replace; adding one needs no [Content_Types] change because the
             // standard `Default Extension="rels"` already types it.
-            CFB.utils.cfb_add(cfb_file, replacement.path, Buffer.from(replacement.text, 'utf8'));
+            zip.add(replacement.path, Buffer.from(replacement.text, 'utf8'));
             continue;
         }
         const written = 'bytes' in replacement
-            ? write_part_bytes(cfb_file, replacement.path, replacement.bytes)
-            : write_part_text(cfb_file, replacement.path, replacement.text);
+            ? write_part_bytes(zip, replacement.path, replacement.bytes)
+            : write_part_text(zip, replacement.path, replacement.text);
         if (!written) throw new Error('Could not update a worksheet to save');
     }
-    if (removed_formula) remove_part(cfb_file, '/xl/calcChain.xml');
+    if (removed_formula) remove_part(zip, '/xl/calcChain.xml');
 
     // `xl/sharedStrings.xml` is deliberately not touched, including its `count`.
     // Values are written inline, so no shared-string table entry changes.
-    const out = CFB.write(cfb_file, { type: 'buffer', fileType: 'zip', compression: true });
-    return out instanceof Uint8Array ? out : new Uint8Array(out as ArrayBufferLike);
+    return zip.write();
 }
 
 /** Backward-compatible one-worksheet entry point. */
@@ -464,8 +456,8 @@ export function write_xlsx_cell_edits(
  * package, so the reference edits are computed before any is applied and a failure
  * to compute them abandons the removal entirely.
  */
-function remove_part(cfb_file: ReturnType<typeof CFB.read>, part_path: string): void {
-    if (!CFB.find(cfb_file, part_path)) return;
+function remove_part(zip: ZipPackage, part_path: string): void {
+    if (!zip.has(part_path)) return;
     // Planned in full before anything is mutated, then committed in one go.
     //
     // Ordering alone cannot make this safe, because every order leaves *some*
@@ -482,7 +474,7 @@ function remove_part(cfb_file: ReturnType<typeof CFB.read>, part_path: string): 
     // parsing left to fail between them.
     let planned: Array<() => void>;
     try {
-        planned = plan_reference_removals(cfb_file, part_path);
+        planned = plan_reference_removals(zip, part_path);
     } catch {
         // calcChain is a pure recalculation cache. Leaving it in place costs a
         // stale chain Excel rebuilds on the next calculation; failing the save
@@ -491,7 +483,7 @@ function remove_part(cfb_file: ReturnType<typeof CFB.read>, part_path: string): 
         return;
     }
     for (const commit of planned) commit();
-    CFB.utils.cfb_del(cfb_file, part_path);
+    zip.remove(part_path);
 }
 
 /**
@@ -502,16 +494,16 @@ function remove_part(cfb_file: ReturnType<typeof CFB.read>, part_path: string): 
  * reference to remove contributes no thunk.
  */
 function plan_reference_removals(
-    cfb_file: ReturnType<typeof CFB.read>,
+    zip: ZipPackage,
     part_path: string,
 ): Array<() => void> {
     const commits: Array<() => void> = [];
     const plan = (path: string, stripped: string | null): void => {
         if (stripped === null) return;
-        commits.push(() => { write_part_text(cfb_file, path, stripped); });
+        commits.push(() => { write_part_text(zip, path, stripped); });
     };
-    plan('/[Content_Types].xml', content_type_override_removed(cfb_file, part_path));
-    plan('/xl/_rels/workbook.xml.rels', workbook_relationship_removed(cfb_file, part_path));
+    plan('/[Content_Types].xml', content_type_override_removed(zip, part_path));
+    plan('/xl/_rels/workbook.xml.rels', workbook_relationship_removed(zip, part_path));
     return commits;
 }
 
@@ -576,10 +568,10 @@ function remove_elements(xml: string, name: string, wanted: (tag: string) => boo
  * this removal exists to prevent.
  */
 function content_type_override_removed(
-    cfb_file: ReturnType<typeof CFB.read>,
+    zip: ZipPackage,
     part_name: string,
 ): string | null {
-    const xml = read_part_text(cfb_file, '/[Content_Types].xml');
+    const xml = read_part_text(zip, '/[Content_Types].xml');
     if (!xml) return null;
     const stripped = remove_elements(
         xml,
@@ -600,10 +592,10 @@ function content_type_override_removed(
  * `calcChain.xml` (relative to `xl/`) and `/xl/calcChain.xml` in the wild.
  */
 function workbook_relationship_removed(
-    cfb_file: ReturnType<typeof CFB.read>,
+    zip: ZipPackage,
     part_path: string,
 ): string | null {
-    const xml = read_part_text(cfb_file, '/xl/_rels/workbook.xml.rels');
+    const xml = read_part_text(zip, '/xl/_rels/workbook.xml.rels');
     if (!xml) return null;
     const wanted = part_path.replace(/^\//, '');
     // See `content_type_override_removed`: same quote-aware location, and a
