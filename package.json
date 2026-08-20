@@ -85,17 +85,21 @@
         {
           "command": "tableViewer.openWorkbookAtSheet",
           "when": "false"
+        },
+        {
+          "command": "tableViewer.openTableDiff",
+          "when": "false"
         }
       ],
       "scm/resourceState/context": [
         {
           "command": "tableViewer.openTableDiff",
-          "when": "scmProvider == git && resourceExtname =~ /\\.(csv|tsv|xlsx|xls)$/i",
+          "when": "scmProvider == git && scmResourceGroup == workingTree && resourceExtname =~ /\\.(csv|tsv|xlsx|xls)$/i",
           "group": "inline"
         },
         {
           "command": "tableViewer.openTableDiff",
-          "when": "scmProvider == git && resourceExtname =~ /\\.(csv|tsv|xlsx|xls)$/i",
+          "when": "scmProvider == git && scmResourceGroup == workingTree && resourceExtname =~ /\\.(csv|tsv|xlsx|xls)$/i",
           "group": "navigation"
         }
       ],

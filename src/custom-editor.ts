@@ -23,7 +23,7 @@ export class TableViewerEditorProvider
      *  modified file's resource identity. `vscode.openWith` cannot carry
      *  options, so openTableDiff parks the original's URI here and the next
      *  resolve for that resource consumes it. */
-    readonly #pending_compares = new Map<string, vscode.Uri>();
+    readonly #pending_compares = new Map<string, { readonly originalUri: vscode.Uri }>();
     readonly #drains = new Set<Promise<void>>();
     #close_barrier: Promise<void> | undefined;
     #close_barrier_settled = false;
@@ -122,19 +122,33 @@ export class TableViewerEditorProvider
 
     /**
      * Open `uri` as a table compared against `original_uri` (its git original).
-     * Always opens a fresh panel: an existing viewer for the file may hold an
-     * edit session, and compare panels are read-only by construction.
+     * The comparison needs a fresh resolve: an existing viewer for the file may
+     * hold an edit session, and compare panels are read-only by construction.
      */
     async openTableDiff(uri: vscode.Uri, original_uri: vscode.Uri): Promise<void> {
         const resource = create_resource_identity(uri).key;
-        this.#pending_compares.set(resource, original_uri);
+        // A fresh wrapper object per call: overlapping diff opens for the same
+        // resource each park their own intent, and the cleanup below removes
+        // only its own entry rather than a successor's.
+        const intent = { originalUri: original_uri };
+        this.#pending_compares.set(resource, intent);
         try {
-            await vscode.commands.executeCommand('vscode.openWith', uri, TABLE_VIEW_TYPE);
+            await vscode.commands.executeCommand(
+                'vscode.openWith',
+                uri,
+                TABLE_VIEW_TYPE,
+                // A new editor group: reusing an existing table tab for this
+                // file would reveal it without calling resolveCustomEditor, so
+                // the comparison would silently never attach.
+                vscode.ViewColumn.Beside,
+            );
         } finally {
-            // resolveCustomEditor consumed the intent if it ran; clear it if the
-            // open failed (or resolved a recycled panel) so a later plain open
-            // of this file cannot inherit a stale compare.
-            this.#pending_compares.delete(resource);
+            if (this.#pending_compares.get(resource) === intent) {
+                // No resolve consumed the intent — the open failed or revealed
+                // an existing tab. Clear it so a later plain open of this file
+                // cannot inherit a stale compare.
+                this.#pending_compares.delete(resource);
+            }
         }
     }
 
@@ -162,7 +176,9 @@ export class TableViewerEditorProvider
             vscode_viewer_host,
             {
                 requestClose: () => webview_panel.dispose(),
-                ...(compare_original ? { compare: { originalUri: compare_original } } : {}),
+                ...(compare_original
+                    ? { compare: { originalUri: compare_original.originalUri } }
+                    : {}),
             },
         );
         this.#controllers.add(controller);

@@ -207,6 +207,42 @@ describe('VS Code activation', () => {
         });
     });
 
+    it('prefers the git extension API for the original URI when available', async () => {
+        await activate(context());
+        const api_uri = vscode_mock.Uri.file('/repo/data.csv')
+            .with({ scheme: 'git', query: 'from-api' });
+        vscode_mock.__setExtension('vscode.git', {
+            exports: {
+                getAPI: () => ({ toGitUri: (_uri: unknown, ref: string) => {
+                    expect(ref).toBe('~');
+                    return api_uri;
+                } }),
+            },
+        });
+
+        await vscode_mock.commands.executeCommand(
+            'tableViewer.openTableDiff',
+            { resourceUri: vscode_mock.Uri.file('/repo/data.csv') },
+        );
+
+        expect(seams.openDiffArgs?.originalUri).toBe(api_uri);
+    });
+
+    it('refuses a table diff for a file missing from the working tree', async () => {
+        await activate(context());
+        vscode_mock.__setStatImplementation(async () => {
+            throw new Error('ENOENT');
+        });
+        const show_error = vi.spyOn(vscode_mock.window, 'showErrorMessage');
+
+        await expect(vscode_mock.commands.executeCommand(
+            'tableViewer.openTableDiff',
+            { resourceUri: vscode_mock.Uri.file('/repo/gone.csv') },
+        )).rejects.toThrow('no longer exists in the working tree');
+        expect(show_error).toHaveBeenCalledOnce();
+        expect(seams.openDiffArgs).toBeUndefined();
+    });
+
     it('ignores a table diff invocation with no file target', async () => {
         await activate(context());
 

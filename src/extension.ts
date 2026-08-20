@@ -64,12 +64,23 @@ function scm_resource_uri(value: unknown): vscode.Uri | undefined {
 }
 
 /**
- * The git extension's URI for the last committed/staged version of `uri` —
- * the same construction as its `toGitUri` (scheme `git`, JSON query with
- * `{path, ref}`). Ref `~` means "index, falling back to HEAD", which is what
- * the SCM view diffs the working tree against.
+ * The git extension's URI for the last committed/staged version of `uri`.
+ * Ref `~` means "index, falling back to HEAD", which is what the SCM view
+ * diffs the working tree against. Prefer the git extension's own `toGitUri`
+ * (it owns the encoding); fall back to the same construction (scheme `git`,
+ * JSON query with `{path, ref}`) when the API is unavailable.
  */
 function to_git_uri(uri: vscode.Uri): vscode.Uri {
+    try {
+        const git = vscode.extensions.getExtension<{
+            getAPI(version: 1): { toGitUri(target: vscode.Uri, ref: string): vscode.Uri };
+        }>('vscode.git')?.exports;
+        const from_api = git?.getAPI(1).toGitUri(uri, '~');
+        if (from_api) return from_api;
+    } catch {
+        // The git extension may be disabled or not yet activated; the manual
+        // construction below matches its current encoding.
+    }
     return uri.with({
         scheme: 'git',
         query: JSON.stringify({ path: uri.fsPath, ref: '~' }),
@@ -195,7 +206,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             const uri = scm_resource_uri(resource_state)
                 ?? vscode.window.activeTextEditor?.document.uri;
             if (!uri || uri.scheme !== 'file') return;
-            await reporting_errors(() => viewers!.openTableDiff(uri, to_git_uri(uri)));
+            await reporting_errors(async () => {
+                // A deleted resource has no working-tree side to open; the
+                // viewer's primary document must exist. Say so instead of
+                // surfacing the raw stat failure from the open.
+                try {
+                    await vscode.workspace.fs.stat(uri);
+                } catch {
+                    throw new Error(
+                        'The file no longer exists in the working tree, so there is '
+                        + 'nothing to compare. Restore or check out the file to view it.',
+                    );
+                }
+                await viewers!.openTableDiff(uri, to_git_uri(uri));
+            });
         });
         register('tableViewer.manageStoredFileState', () => {
             show_state_inspector_panel({
