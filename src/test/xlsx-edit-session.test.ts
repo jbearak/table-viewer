@@ -328,7 +328,7 @@ describe('xlsx edit sessions', () => {
         expect(after.data.sheets[0].rows[1][0]?.raw).toBe(people_before);
     });
 
-    it('saves the first of two open files after its first auto-grown row height', async () => {
+    it('saves and exits the first of two editing files after an auto-grown row height', async () => {
         // A sparse per-sheet array is persisted with JSON nulls. Editing a long
         // value can auto-grow a row before the save-on-exit request arrives, so
         // this is the user-visible sequence that used to leave the durable height
@@ -368,6 +368,8 @@ describe('xlsx edit sessions', () => {
         const second_session = second_result!.editSessionId!;
         expect(first_session).not.toBe('');
         expect(second_session).not.toBe('');
+        expect(latest_snapshot(first).capabilities.csvEditSessionId).toBe(first_session);
+        expect(latest_snapshot(second).capabilities.csvEditSessionId).toBe(second_session);
         const basis = latest_snapshot(first);
 
         await first.__receive({
@@ -389,7 +391,6 @@ describe('xlsx edit sessions', () => {
             operation: workbook_request(first_session, 'save-a', save_worksheet()),
         });
         await wait_for_observable(() => save_results(first).length > 0);
-        await first.__receive({ type: 'releaseEditSession', editSessionId: first_session });
         await wait_for_observable(
             () => latest_snapshot(first).capabilities.csvEditSessionId === undefined,
         );
