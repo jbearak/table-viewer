@@ -509,6 +509,53 @@ describe('GridShell cell wrapping', () => {
         expect(get_cell_content([1, 0]).data?.allow_wrapping).toBe(true);
     });
 
+    it('keeps a merged source-rich cell wrapping when Formatting is off', async () => {
+        const text = 'A long information note with plain and styled sections';
+        grid_mock.get_row.mockImplementation(() => [
+            null,
+            {
+                raw: text,
+                formatted: text,
+                bold: false,
+                italic: false,
+                richText: {
+                    runs: [
+                        { text: 'A long information note with ' },
+                        { text: 'plain and styled sections', style: { bold: true } },
+                    ],
+                },
+            },
+            null,
+        ] as any);
+        const merge = { startRow: 0, startCol: 1, endRow: 0, endCol: 2 };
+        await render_grid(props({
+            show_formatting: false,
+            auto_fit_active: false,
+            row_heights: { 0: 80 },
+            column_projection: {
+                visible_to_source: [0, 1, 2],
+                source_to_visible: [0, 1, 2],
+                hidden_count: 0,
+            },
+            merges: [merge],
+            sheet_meta: {
+                ...props().sheet_meta,
+                merges: [merge],
+            },
+        }));
+
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => {
+                kind: string;
+                allowWrapping?: boolean;
+                displayData?: string;
+            };
+        const cell = get_cell_content([1, 0]);
+        expect(cell.kind).toBe('text');
+        expect(cell.allowWrapping).toBe(true);
+        expect(cell.displayData).toBe(text);
+    });
+
     it('keeps wrapping enabled when auto-fit caps a column at its maximum', async () => {
         const text = 'A long value whose fitted width is capped';
         grid_mock.get_row.mockImplementation(() => [

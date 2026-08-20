@@ -317,6 +317,20 @@ describe('build_grid_cell — rich cells', () => {
         };
         expect(c.data.allow_wrapping).toBe(true);
         expect(c.data.lines).toHaveLength(3);
+
+        const formatting_off = build_grid_cell(
+            0,
+            [information_note],
+            false,
+        ) as unknown as {
+            kind: unknown;
+            allowWrapping?: boolean;
+            displayData: string;
+        };
+        expect(formatting_off.kind).toBe(GridCellKind.Text);
+        expect(formatting_off.allowWrapping).toBe(true);
+        expect(formatting_off.displayData)
+            .toBe('A long introductory paragraph.\n\nNotes More long prose.');
     });
 
     it('synthesizes a whole-cell styled run for a link/underline-only cell', () => {
@@ -363,8 +377,20 @@ describe('build_grid_cell — rich cells', () => {
             dirty_value: 'X',
             edit_value: '*X*',
             dirty_rich: { runs: [{ text: 'X', style: { italic: true } }] },
-        });
+        }) as unknown as {
+            kind: unknown;
+            data: string;
+            displayData: string;
+            copyData?: string;
+            allowOverlay: boolean;
+            readonly?: boolean;
+        };
         expect(formatting_off.kind).toBe(GridCellKind.Text);
+        expect(formatting_off.data).toBe('*X*');
+        expect(formatting_off.displayData).toBe('X');
+        expect(formatting_off.copyData).toBe('X');
+        expect(formatting_off.allowOverlay).toBe(true);
+        expect(formatting_off.readonly).toBeUndefined();
     });
 
     it('promotes a blank cell to rich rendering after a Markdown edit', () => {

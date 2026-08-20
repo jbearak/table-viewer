@@ -4,6 +4,7 @@ import {
     remapForDnDState,
     type MappedGridColumn,
     drawLastUpdateUnderlay,
+    drawTextCell,
 } from "../internal/data-grid/render/data-grid-lib.js";
 import { GridCellKind, type Rectangle } from "../internal/data-grid/data-grid-types.js";
 import { vi, type Mocked, expect, describe, test, it, beforeEach } from "vitest";
@@ -72,6 +73,43 @@ describe("remapForDnDState", () => {
         for (const [index, column] of sampleColumns.entries()) {
             expect(result[index].sticky).toEqual(column.sticky);
         }
+    });
+});
+
+describe("drawTextCell wrapping", () => {
+    it("soft-wraps a Text cell within the supplied cell bounds", () => {
+        const drawn: string[] = [];
+        const ctx = {
+            font: "",
+            textAlign: "start",
+            direction: "inherit",
+            measureText: (text: string) => ({
+                width: text.length * 10,
+                actualBoundingBoxAscent: 8,
+                actualBoundingBoxDescent: 2,
+            }),
+            fillText: (text: string) => drawn.push(text),
+            save: vi.fn(),
+            beginPath: vi.fn(),
+            rect: vi.fn(),
+            clip: vi.fn(),
+            restore: vi.fn(),
+        } as unknown as CanvasRenderingContext2D;
+        const theme = mergeAndRealizeTheme(getDataEditorTheme());
+
+        drawTextCell(
+            {
+                ctx,
+                rect: { x: 0, y: 0, width: 76, height: 80 },
+                theme,
+            },
+            "alpha beta",
+            undefined,
+            true,
+            false,
+        );
+
+        expect(drawn).toEqual(["alpha", "beta"]);
     });
 });
 

@@ -6,6 +6,8 @@ import { ExcelHeaderDataSource } from '../data-source/excel-header-source';
 import { parse_xlsx } from '../parse-xlsx';
 import type { RenderedCell } from '../data-source/interface';
 import { transformed_window } from '../table-transform';
+import { build_grid_cell } from '../webview/cell-renderer';
+import { GridCellKind } from '../webview/glide-data-grid';
 
 const load = (name: string) => new Uint8Array(readFileSync(join(__dirname, 'fixtures', name)));
 
@@ -86,6 +88,13 @@ describe('XlsxDataSource', () => {
             .toMatch(/\r?\n\r?\nThe data set contains survey-based estimates/);
         expect(row[1]?.formatted).toContain('Oficina Nacional de Estadísticas, Cuba)');
         expect(row.slice(2, 5)).toEqual([null, null, null]);
+
+        const formatting_off = build_grid_cell(1, row, false) as unknown as {
+            kind: unknown;
+            allowWrapping?: boolean;
+        };
+        expect(formatting_off.kind).toBe(GridCellKind.Text);
+        expect(formatting_off.allowWrapping).toBe(true);
     }, 15_000);
     it('preserves bold/italic flags', async () => {
         const ds = await XlsxDataSource.create(load('styled.xlsx'));
