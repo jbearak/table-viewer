@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { deflateRawSync } from 'node:zlib';
 import CFB from 'cfb';
 import { describe, expect, it } from 'vitest';
-import { parse_xlsx } from '../parse-xlsx';
+import { parse_xlsx, worksheet_part_paths } from '../parse-xlsx';
 import { write_xlsx_cell_edits } from '../xlsx-package';
 import { ZipPackage } from '../zip-package';
 
@@ -27,7 +27,9 @@ interface ZipMemberLocation {
 
 function zip_member(bytes: Uint8Array, wanted: string): ZipMemberLocation {
     let eocd = bytes.length - 22;
-    while (eocd >= 0 && u32(bytes, eocd) !== 0x06054b50) eocd -= 1;
+    while (eocd >= 0
+        && !(u32(bytes, eocd) === 0x06054b50
+            && eocd + 22 + u16(bytes, eocd + 20) === bytes.length)) eocd -= 1;
     if (eocd < 0) throw new Error('test ZIP has no EOCD');
     let central = u32(bytes, eocd + 16);
     const entries = u16(bytes, eocd + 10);
@@ -177,6 +179,11 @@ describe('lazy XLSX ZIP packages', () => {
         ])).toThrow('Not a valid .xlsx file');
     });
 
+    it('normalizes invalid packages in the worksheet-path helper', () => {
+        expect(() => worksheet_part_paths(Buffer.from('not a ZIP')))
+            .toThrow('Not a valid .xlsx file');
+    });
+
     it('uses the inflater actual length rather than trusting a declared size', () => {
         const corrupt = Buffer.from(readFileSync('src/test/fixtures/basic.xlsx'));
         const { central, local } = zip_member(corrupt, 'xl/workbook.xml');
@@ -204,6 +211,17 @@ describe('lazy XLSX ZIP packages', () => {
         const zip = ZipPackage.open(readFileSync('src/test/fixtures/basic.xlsx'));
         expect(() => zip.add(`/${'a'.repeat(0x10000)}`, Buffer.from('x')))
             .toThrow('ZIP entry name exceeds classic ZIP limits');
+    });
+
+    it('gives a newly added member a valid DOS epoch date', () => {
+        const zip = ZipPackage.open(readFileSync('src/test/fixtures/basic.xlsx'));
+        zip.add('/xl/new-part.xml', Buffer.from('<new/>'));
+        const saved = zip.write();
+        const { central, local } = zip_member(saved, 'xl/new-part.xml');
+        expect(u16(saved, central + 14)).toBe(0x0021);
+        expect(u16(saved, local + 12)).toBe(0x0021);
+        expect(Buffer.from(ZipPackage.open(saved).read('/xl/new-part.xml')!))
+            .toEqual(Buffer.from('<new/>'));
     });
 
     it.each(['signed', 'unsigned'] as const)(

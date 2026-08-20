@@ -342,6 +342,10 @@ export class ZipPackage {
         return bytes === null ? null : Buffer.from(bytes).toString('utf8');
     }
 
+    /**
+     * Takes ownership of `bytes` without copying. The caller must not mutate it
+     * afterwards; reads of a pending replacement may return the same view.
+     */
     replace(path: string, bytes: Uint8Array): boolean {
         const entry = this.by_name.get(normalized_path(path));
         if (!entry || entry.removed) return false;
@@ -349,6 +353,10 @@ export class ZipPackage {
         return true;
     }
 
+    /**
+     * Takes ownership of `bytes` without copying. The caller must not mutate it
+     * afterwards; reads of a pending addition may return the same view.
+     */
     add(path: string, bytes: Uint8Array): void {
         const name = normalized_path(path);
         const existing = this.by_name.get(name);
@@ -367,6 +375,8 @@ export class ZipPackage {
         put_u16(central_record, 6, 20);
         put_u16(central_record, 8, 0x0800);
         put_u16(central_record, 10, 8);
+        // DOS date 1980-01-01; zero would encode an invalid month and day.
+        put_u16(central_record, 14, 0x0021);
         put_u16(central_record, 28, name_bytes.length);
         central_record.set(name_bytes, 46);
         const entry: ZipEntry = {

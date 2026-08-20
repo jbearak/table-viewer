@@ -96,10 +96,14 @@ function verify_saved_output(output, profile) {
 }
 
 function raw_zip_members(raw) {
-    let eocd = raw.length - 22;
-    for (; eocd >= Math.max(0, raw.length - 0xffff - 22); eocd--) {
-        if (raw.readUInt32LE(eocd) === 0x06054b50
-            && eocd + 22 + raw.readUInt16LE(eocd + 20) === raw.length) break;
+    const lowest = Math.max(0, raw.length - 0xffff - 22);
+    let eocd = -1;
+    for (let at = raw.length - 22; at >= lowest; at--) {
+        if (raw.readUInt32LE(at) === 0x06054b50
+            && at + 22 + raw.readUInt16LE(at + 20) === raw.length) {
+            eocd = at;
+            break;
+        }
     }
     if (eocd < 0) shape_error('saved output has no ZIP end record');
     const count = raw.readUInt16LE(eocd + 10);

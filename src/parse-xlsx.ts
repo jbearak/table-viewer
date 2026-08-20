@@ -144,7 +144,13 @@ export function worksheet_part_paths_from_package(
 }
 
 export function worksheet_part_paths(buffer: Uint8Array): string[] {
-    return worksheet_part_paths_from_package(ZipPackage.open(buffer));
+    let zip: ZipPackage;
+    try {
+        zip = ZipPackage.open(buffer);
+    } catch {
+        throw new Error('Not a valid .xlsx file');
+    }
+    return worksheet_part_paths_from_package(zip);
 }
 
 function parse_shared_strings(xml: string): ParsedXlsxString[] {
