@@ -3,6 +3,7 @@ import { getDataEditorTheme, mergeAndRealizeTheme, type FullTheme } from "../com
 import {
     remapForDnDState,
     type MappedGridColumn,
+    clearTextMetricsCache,
     drawLastUpdateUnderlay,
     drawTextCell,
 } from "../internal/data-grid/render/data-grid-lib.js";
@@ -77,24 +78,28 @@ describe("remapForDnDState", () => {
 });
 
 describe("drawTextCell wrapping", () => {
+    const makeContext = (drawn: string[]) => ({
+        font: "",
+        textAlign: "start",
+        direction: "inherit",
+        measureText: (text: string) => ({
+            width: text.length * 10,
+            actualBoundingBoxAscent: 8,
+            actualBoundingBoxDescent: 2,
+        }),
+        fillText: (text: string) => drawn.push(text),
+        save: vi.fn(),
+        beginPath: vi.fn(),
+        rect: vi.fn(),
+        clip: vi.fn(),
+        restore: vi.fn(),
+    }) as unknown as CanvasRenderingContext2D;
+
+    beforeEach(() => clearTextMetricsCache());
+
     it("soft-wraps a Text cell within the supplied cell bounds", () => {
         const drawn: string[] = [];
-        const ctx = {
-            font: "",
-            textAlign: "start",
-            direction: "inherit",
-            measureText: (text: string) => ({
-                width: text.length * 10,
-                actualBoundingBoxAscent: 8,
-                actualBoundingBoxDescent: 2,
-            }),
-            fillText: (text: string) => drawn.push(text),
-            save: vi.fn(),
-            beginPath: vi.fn(),
-            rect: vi.fn(),
-            clip: vi.fn(),
-            restore: vi.fn(),
-        } as unknown as CanvasRenderingContext2D;
+        const ctx = makeContext(drawn);
         const theme = mergeAndRealizeTheme(getDataEditorTheme());
 
         drawTextCell(
@@ -110,6 +115,48 @@ describe("drawTextCell wrapping", () => {
         );
 
         expect(drawn).toEqual(["alpha", "beta"]);
+    });
+
+    test.each([
+        ["leading", "\nalpha beta", ["", "alpha", "beta"]],
+        ["trailing", "alpha beta\n", ["alpha", "beta", ""]],
+        ["interior", "alpha beta\n\ngamma delta", ["alpha", "beta", "", "gamma", "delta"]],
+        ["consecutive", "alpha beta\n\n\ngamma delta", ["alpha", "beta", "", "", "gamma", "delta"]],
+    ])("preserves %s blank hard lines while wrapping", (_name, text, expected) => {
+        const drawn: string[] = [];
+        const ctx = makeContext(drawn);
+        const theme = mergeAndRealizeTheme(getDataEditorTheme());
+
+        drawTextCell(
+            { ctx, rect: { x: 0, y: 0, width: 76, height: 120 }, theme },
+            text,
+            undefined,
+            true,
+            false,
+        );
+        expect(drawn).toEqual(expected);
+    });
+
+    it("reflows blank-line text when a cell grows and shrinks", () => {
+        const drawn: string[] = [];
+        const ctx = makeContext(drawn);
+        const theme = mergeAndRealizeTheme(getDataEditorTheme());
+        const text = "alpha beta\n\ngamma delta";
+        const drawAtWidth = (width: number) => {
+            drawn.length = 0;
+            drawTextCell(
+                { ctx, rect: { x: 0, y: 0, width, height: 120 }, theme },
+                text,
+                undefined,
+                true,
+                false,
+            );
+            return [...drawn];
+        };
+
+        expect(drawAtWidth(76)).toEqual(["alpha", "beta", "", "gamma", "delta"]);
+        expect(drawAtWidth(140)).toEqual(["alpha beta", "", "gamma delta"]);
+        expect(drawAtWidth(86)).toEqual(["alpha", "beta", "", "gamma", "delta"]);
     });
 });
 

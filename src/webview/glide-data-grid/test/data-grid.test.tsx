@@ -7,6 +7,7 @@ import { AllCellRenderers } from "../cells/index.js";
 import { vi, expect, describe, test, beforeEach, afterEach } from "vitest";
 import ImageWindowLoaderImpl from "../common/image-window-loader.js";
 import { mergeAndRealizeTheme } from "../common/styles.js";
+import { MergedCellResolver } from "../internal/data-grid/merged-cell-resolver.js";
 
 const basicProps: DataGridProps = {
     cellXOffset: 0,
@@ -426,6 +427,61 @@ describe("data-grid", () => {
         expect(spy).not.toBeCalled();
         ref.current?.damage([{ cell: [1, 1] }]);
         expect(spy).toBeCalled();
+    });
+
+    test("column resize repaints a wrapped merge from its visible anchor", () => {
+        const columns = [
+            { title: "A", width: 150 },
+            { title: "B", width: 160 },
+            { title: "C", width: 170 },
+            { title: "D", width: 180 },
+            { title: "E", width: 190 },
+        ];
+        const mergedCells = new MergedCellResolver([
+            { x: 1, y: 7, width: 4, height: 1 },
+        ]);
+        const getCellContent: DataGridProps["getCellContent"] = ([col, row]) => ({
+            kind: GridCellKind.Text,
+            allowOverlay: false,
+            allowWrapping: col === 1 && row === 7,
+            data: col === 1 && row === 7
+                ? "A long information note that soft wraps across the merged columns"
+                : `${col},${row}`,
+            displayData: col === 1 && row === 7
+                ? "A long information note that soft wraps across the merged columns"
+                : `${col},${row}`,
+        });
+        const { rerender } = render(
+            <DataGrid
+                {...basicProps}
+                columns={columns}
+                getCellContent={getCellContent}
+                mergedCells={mergedCells}
+                isResizing={true}
+                resizeColumn={2}
+            />
+        );
+        const ctx = screen.getByTestId<HTMLCanvasElement>(dataGridCanvasId).getContext("2d");
+        expect(ctx).not.toBeNull();
+        const rect = vi.spyOn(ctx!, "rect");
+
+        rerender(
+            <DataGrid
+                {...basicProps}
+                columns={columns.map((column, index) => (
+                    index === 2 ? { ...column, width: 220 } : column
+                ))}
+                getCellContent={getCellContent}
+                mergedCells={mergedCells}
+                isResizing={true}
+                resizeColumn={2}
+            />
+        );
+
+        // Resizing C changes the wrap width of B8:E8. The resize blit must
+        // therefore repaint from B's left edge (150 + the one-pixel border),
+        // not C's old left edge at 310.
+        expect(rect).toHaveBeenCalledWith(151, 0, 849, 1000);
     });
 
     test("Out of bounds damage", () => {
