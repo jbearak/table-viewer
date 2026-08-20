@@ -218,4 +218,28 @@ describe('SheetTabs', () => {
         expect(on_context_menu).toHaveBeenCalledWith(1, 9, 9);
         expect(on_strip_context_menu).not.toHaveBeenCalled();
     });
+
+    it('shows git compare badges on added and deleted sheets only', () => {
+        const on_noop = vi.fn();
+        container = document.createElement('div');
+        document.body.appendChild(container);
+        root = createRoot(container);
+        act(() => root!.render(React.createElement(SheetTabs, {
+            sheets: ['Kept', 'New', 'Gone'],
+            badges: [undefined, 'added', 'deleted'],
+            active_sheet_index: 0,
+            on_select: on_noop,
+            on_context_menu: on_noop,
+            on_strip_context_menu: on_noop,
+            on_toggle_orientation: on_noop,
+            vertical: false,
+        })));
+        const badge_of = (index: number) =>
+            tabs()[index].querySelector('.sheet-tab-badge');
+        expect(badge_of(0)).toBeNull();
+        expect(badge_of(1)?.textContent).toBe('+');
+        expect(badge_of(1)?.getAttribute('aria-label')).toBe('(added sheet)');
+        expect(badge_of(2)?.textContent).toBe('−');
+        expect(badge_of(2)?.getAttribute('aria-label')).toBe('(deleted sheet)');
+    });
 });

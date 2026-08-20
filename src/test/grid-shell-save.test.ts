@@ -122,6 +122,7 @@ vi.mock('../webview/vscode-theme', () => ({
         conflictBg: 'rgba(229, 75, 75, 0.22)',
     }),
     theme_font_size_px: () => 13,
+    tint_from_color: (_c: string, _a: number, fallback: string) => fallback,
 }));
 
 vi.mock('../webview/row-resize-overlay', () => ({

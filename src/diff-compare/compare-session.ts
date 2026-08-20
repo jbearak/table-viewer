@@ -2,6 +2,13 @@
 // modified-side source to its git original so one object owns both lifetimes,
 // pads matched sheets' row counts to max(original, modified) so trailing
 // added/deleted rows render as full grid bands, and answers per-page diffs.
+//
+// Deliberately NOT an ExcelHeaderDataSource, so the controller's
+// `instanceof ExcelHeaderDataSource` mutation paths (first-row-header toggle,
+// committed-state override/hidden-row re-application) refuse in compare mode.
+// Both sides bake the per-file state in at build time and share projection
+// policy; mutating the wrapped modified source afterwards would invalidate
+// the padding and pairings computed here at construction.
 import {
     read_source_rows_indexed,
     type DataSource,
@@ -16,6 +23,7 @@ import {
     pair_sheets,
     type CompareDiffWindow,
     type SheetPairing,
+    type SheetPairStatus,
 } from './compare-source';
 
 export class CompareDataSource implements DataSource {
@@ -23,6 +31,11 @@ export class CompareDataSource implements DataSource {
     /** Per modified sheet, positionally matching `meta.sheets`; empty for
      *  sheets without a header change or without a matched original. */
     readonly changedColumnNames: readonly (readonly { col: number; base: string }[])[];
+    /** Pair status per *grid* sheet, positionally matching `meta().sheets`.
+     *  This is the ordering contract (modified sheets first, then deleted
+     *  originals appended in pairing order) stated as data, so consumers never
+     *  re-derive sheet positions from `pairings`. */
+    readonly sheetStatuses: readonly SheetPairStatus[];
     private readonly matched_by_modified_index: ReadonlyMap<
         number,
         Extract<SheetPairing, { status: 'matched' }>
@@ -62,6 +75,15 @@ export class CompareDataSource implements DataSource {
                     : [];
             }),
             ...this.deleted_pairings.map(() => []),
+        ];
+        const status_by_modified_index = new Map(
+            this.pairings.flatMap((pairing) =>
+                pairing.status !== 'deleted' ? [[pairing.modifiedIndex, pairing.status]] : []),
+        );
+        this.sheetStatuses = [
+            ...modified_meta.sheets.map((_, sheet_index) =>
+                status_by_modified_index.get(sheet_index) ?? 'added'),
+            ...this.deleted_pairings.map(() => 'deleted' as const),
         ];
         this.padded_meta = {
             ...modified_meta,
@@ -145,6 +167,47 @@ export class CompareDataSource implements DataSource {
         return window;
     }
 
+    /**
+     * Original-side rows for a matched sheet's deleted band (padded rows beyond
+     * the modified side's rowCount — positional alignment, so the band row and
+     * the original row share the same index). Undefined when the sheet has no
+     * matched original, whose padded rows can then only render blank.
+     */
+    private read_original_band(
+        sheet_index: number,
+        start_row: number,
+        count: number,
+    ): RowWindow['rows'] | undefined {
+        const pairing = this.matched_by_modified_index.get(sheet_index);
+        if (!pairing) return undefined;
+        const original_sheet = this.original.meta().sheets[pairing.originalIndex];
+        if (!original_sheet) return undefined;
+        const end = Math.min(start_row + count, original_sheet.rowCount);
+        if (end <= start_row) return undefined;
+        return this.original.read_rows(pairing.originalIndex, start_row, end - start_row).rows;
+    }
+
+    /** Indexed variant of {@link read_original_band}: one batched original-side
+     *  read, positionally matching `rows` (out-of-range rows come back empty). */
+    private read_original_band_indexed(
+        sheet_index: number,
+        rows: readonly number[],
+    ): RowWindow['rows'] | undefined {
+        const pairing = this.matched_by_modified_index.get(sheet_index);
+        if (!pairing) return undefined;
+        const original_sheet = this.original.meta().sheets[pairing.originalIndex];
+        if (!original_sheet) return undefined;
+        const in_range = rows.filter((row) => row >= 0 && row < original_sheet.rowCount);
+        const batched = in_range.length > 0
+            ? read_source_rows_indexed(this.original, pairing.originalIndex, in_range).rows
+            : [];
+        let batched_position = 0;
+        return rows.map((row) =>
+            row >= 0 && row < original_sheet.rowCount
+                ? batched[batched_position++] ?? []
+                : []);
+    }
+
     read_rows(sheet_index: number, start_row: number, count: number): RowWindow {
         const deleted_index = this.deleted_original_index(sheet_index);
         if (deleted_index !== undefined) {
@@ -159,8 +222,16 @@ export class CompareDataSource implements DataSource {
         const rows = real_end > start
             ? this.modified.read_rows(sheet_index, start, real_end - start).rows.slice()
             : [];
-        // Pad deleted-band rows (beyond the modified side) with empty rows.
-        for (let row = Math.max(start, real.rowCount); row < end; row++) rows.push([]);
+        // Deleted-band rows (beyond the modified side) carry the *original*
+        // content: the grid, filters, sorting, copy, and auto-fit must all see
+        // the removed text, not blanks under a painted band.
+        const band_start = Math.max(start, real.rowCount);
+        if (end > band_start) {
+            const original_rows = this.read_original_band(sheet_index, band_start, end - band_start);
+            for (let row = band_start; row < end; row++) {
+                rows.push(original_rows?.[row - band_start] ?? []);
+            }
+        }
         return { startRow: start, rows };
     }
 
@@ -170,24 +241,31 @@ export class CompareDataSource implements DataSource {
             return read_source_rows_indexed(this.original, deleted_index, row_indices);
         }
         const real = this.modified.meta().sheets[sheet_index];
-        // One batched read of the in-range indices keeps the underlying source's
-        // indexed batching; padded (deleted-band) positions merge back as empties.
+        // One batched read per side keeps the underlying sources' indexed
+        // batching; padded (deleted-band) positions read the *original* rows so
+        // transforms and copies see the removed text the grid shows.
         const in_range: number[] = [];
+        const band_rows: number[] = [];
         for (let position = 0; position < row_indices.length; position++) {
             const row = row_indices[position];
             if (real && row < real.rowCount) in_range.push(row);
+            else band_rows.push(row);
         }
         const batched = in_range.length > 0
             ? read_source_rows_indexed(this.modified, sheet_index, in_range).rows
             : [];
+        const band = band_rows.length > 0
+            ? this.read_original_band_indexed(sheet_index, band_rows)
+            : undefined;
         const rows: RowWindow['rows'] = [];
         let batched_position = 0;
+        let band_position = 0;
         for (let position = 0; position < row_indices.length; position++) {
             const row = row_indices[position];
             rows.push(
                 real && row < real.rowCount
                     ? batched[batched_position++] ?? []
-                    : [],
+                    : band?.[band_position++] ?? [],
             );
         }
         return { rows };
@@ -263,10 +341,24 @@ export class CompareDataSource implements DataSource {
     }
 
     get truncationMessage(): string | undefined {
-        return this.modified.truncationMessage;
+        // A truncated original silently degrades the diff (rows beyond its cap
+        // read as added), so its message must surface alongside the modified
+        // side's.
+        const original = this.original.truncationMessage;
+        const modified = this.modified.truncationMessage;
+        if (modified !== undefined && original !== undefined) {
+            return `${modified} (git original: ${original})`;
+        }
+        return modified
+            ?? (original !== undefined ? `Git original: ${original}` : undefined);
     }
 
     get warnings(): string[] | undefined {
-        return this.modified.warnings;
+        const original = this.original.warnings?.map(
+            (warning) => `Git original: ${warning}`,
+        );
+        const modified = this.modified.warnings;
+        if (!original?.length) return modified;
+        return [...(modified ?? []), ...original];
     }
 }

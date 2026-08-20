@@ -625,6 +625,84 @@ describe('build_grid_cell — diff overlay (Diff toggle)', () => {
         ]]);
     });
 
+    it('diffs the cell\'s own text when compare supplies diff_base alone', () => {
+        const c = build_grid_cell(
+            0,
+            [rc('7')],
+            true,
+            { diff_base: '3' },
+            undefined,
+            false,
+            false,
+            colors,
+        ) as unknown as { data: { lines: unknown[] }; copyData: string };
+        expect(c.data.lines).toEqual([[
+            { text: '3', style: { strikethrough: true }, diff_color: '#c00' },
+            { text: ' -> ' },
+            { text: '7', diff_color: '#0c0' },
+        ]]);
+        // Copy still takes the modified (displayed) value, not the base.
+        expect(c.copyData).toBe('7');
+    });
+
+    it('compare diffs raw against raw even with Formatting on', () => {
+        // The host computed `base` from raw text; letting the Formatting
+        // toggle swap in the formatted value would fabricate differences.
+        const c = build_grid_cell(
+            0,
+            [{ raw: '3.14159', formatted: '3.14', bold: false, italic: false, rawType: 'number' }],
+            true, // Formatting on
+            { diff_base: '3' },
+            undefined,
+            false,
+            false,
+            colors,
+        ) as unknown as { data: { lines: unknown[] } };
+        expect(c.data.lines).toEqual([[
+            { text: '3', style: { strikethrough: true }, diff_color: '#c00' },
+            { text: ' -> ' },
+            { text: '3.14159', diff_color: '#0c0' },
+        ]]);
+    });
+
+    it('strikes a compare-deleted cell whole and copies its own text', () => {
+        const c = build_grid_cell(
+            0,
+            [rc('gone')],
+            true,
+            { compare_deleted: true },
+            undefined,
+            false,
+            false,
+            colors,
+        ) as unknown as { kind: unknown; data: { lines: unknown[] }; copyData: string };
+        expect(c.kind).toBe(GridCellKind.Custom);
+        expect(c.data.lines).toEqual([[
+            { text: 'gone', style: { strikethrough: true }, diff_color: '#c00' },
+        ]]);
+        // The deleted row's cells ARE the original content; copying a visibly
+        // struck-through value must not yield an empty clipboard.
+        expect(c.copyData).toBe('gone');
+    });
+
+    it('caches a compare diff cell across repaints (same inputs, same object)', () => {
+        const shared = rc('7');
+        const first = build_grid_cell(
+            0, [shared], true, { diff_base: '3' }, undefined, false, false, colors);
+        const second = build_grid_cell(
+            0, [shared], true, { diff_base: '3' }, undefined, false, false, colors);
+        expect(second).toBe(first);
+        // A different base misses the cache rather than reusing stale lines.
+        const changed = build_grid_cell(
+            0, [shared], true, { diff_base: '4' }, undefined, false, false, colors,
+        ) as unknown as { data: { lines: unknown[] } };
+        expect(changed.data.lines).toEqual([[
+            { text: '4', style: { strikethrough: true }, diff_color: '#c00' },
+            { text: ' -> ' },
+            { text: '7', diff_color: '#0c0' },
+        ]]);
+    });
+
     it('never reuses a cached rich cell for a diff overlay', () => {
         const shared = {
             raw: 'ab',

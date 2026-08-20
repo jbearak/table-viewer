@@ -76,8 +76,10 @@ describe('CompareDataSource', () => {
         const window = source.read_rows(0, 0, 10);
         expect(window.rows).toHaveLength(3);
         expect(window.rows[0][0]?.raw).toBe('a');
-        expect(window.rows[1]).toEqual([]);
-        expect(window.rows[2]).toEqual([]);
+        // Deleted-band rows carry the original content, so filters, sorting,
+        // copy, and auto-fit see the removed text the grid shows.
+        expect(window.rows[1][0]?.raw).toBe('b');
+        expect(window.rows[2][0]?.raw).toBe('c');
     });
 
     it('leaves the modified meta untouched when it is already the larger side', () => {
@@ -178,11 +180,33 @@ describe('CompareDataSource', () => {
         expect(source.projected_row_index(0, 1)).toBe(0);
     });
 
+    it('surfaces original-side truncation and warnings beside the modified side', () => {
+        const modified = new FixtureSource([{ name: 'Sheet1', rows: [['a']] }]);
+        const original = new FixtureSource([{ name: 'Sheet1', rows: [['a']] }]);
+        (modified as { truncationMessage?: string }).truncationMessage = 'mod cut';
+        (original as { truncationMessage?: string }).truncationMessage = 'orig cut';
+        (modified as { warnings?: string[] }).warnings = ['mod warn'];
+        (original as { warnings?: string[] }).warnings = ['orig warn'];
+        const source = new CompareDataSource(modified, original);
+        expect(source.truncationMessage).toBe('mod cut (git original: orig cut)');
+        expect(source.warnings).toEqual(['mod warn', 'Git original: orig warn']);
+    });
+
+    it('prefixes an original-only truncation message', () => {
+        const modified = new FixtureSource([{ name: 'Sheet1', rows: [['a']] }]);
+        const original = new FixtureSource([{ name: 'Sheet1', rows: [['a']] }]);
+        (original as { truncationMessage?: string }).truncationMessage = 'orig cut';
+        const source = new CompareDataSource(modified, original);
+        expect(source.truncationMessage).toBe('Git original: orig cut');
+        expect(source.warnings).toBeUndefined();
+    });
+
     it('clamps read windows to the padded row count', () => {
         const source = compare([['a'], ['b']], [['a']]);
         const window = source.read_rows(0, 1, 10);
         expect(window.startRow).toBe(1);
-        expect(window.rows).toEqual([[]]);
+        expect(window.rows).toHaveLength(1);
+        expect(window.rows[0][0]?.raw).toBe('b');
         expect(source.read_rows(0, 5, 10).rows).toEqual([]);
     });
 });

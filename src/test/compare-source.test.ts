@@ -151,15 +151,14 @@ describe('diff_row_window', () => {
         expect(diff.changedCells).toEqual([]);
     });
 
-    it('marks trailing original rows as deleted and ships their base text', () => {
+    it('marks trailing original rows as deleted with no changed cells', () => {
+        // Deleted rows carry the original content as the grid row itself
+        // (CompareDataSource.read_rows), so no bases are shipped for them.
         const original = single([['a'], ['gone', 'too']]);
         const modified = single([['a']]);
         const diff = diff_row_window(original, modified, matched, 0, 10);
         expect(diff.rowStatus).toEqual(['same', 'deleted']);
-        expect(diff.changedCells).toEqual([
-            { row: 1, col: 0, base: 'gone' },
-            { row: 1, col: 1, base: 'too' },
-        ]);
+        expect(diff.changedCells).toEqual([]);
     });
 
     it('treats a removed-mid-file row as positional changes (v1 limitation)', () => {
@@ -169,7 +168,6 @@ describe('diff_row_window', () => {
         expect(diff.rowStatus).toEqual(['same', 'same', 'deleted']);
         expect(diff.changedCells).toEqual([
             { row: 1, col: 0, base: 'b' },
-            { row: 2, col: 0, base: 'c' },
         ]);
     });
 

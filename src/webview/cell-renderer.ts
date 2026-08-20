@@ -70,9 +70,14 @@ export interface CellEditOverlay {
     dirty_rich?: RichText;
     /** themeOverride background tint for dirty / conflicted cells. */
     bg?: string;
-    /** Diff toggle is on and this cell has a value edit: the pre-edit text to
-     * show before/against `dirty_value`. Always accompanied by `dirty_value`. */
+    /** The "before" text to diff against the cell's current text. The Diff
+     * toggle supplies it with `dirty_value` (pre-edit vs edited text); git
+     * compare mode supplies it alone (original vs the cell's own raw text —
+     * raw on both sides, so the Formatting toggle cannot fabricate a diff). */
     diff_base?: string;
+    /** Git compare: this cell belongs to a deleted row, whose content *is* the
+     * original text — struck through whole, with no "after" side to diff. */
+    compare_deleted?: boolean;
     /** Open Glide's edit overlay on this cell. */
     editable?: boolean;
     /**
@@ -177,17 +182,34 @@ export function diff_lines(
     return lines;
 }
 
+/** Visual lines for a compare-deleted cell: the whole text struck through in
+ *  the deletion color, split on hard breaks like every other rich cell. */
+function deleted_lines(text: string, colors: DiffColors): RichTextLine[] {
+    return split_lines(text).map((line) =>
+        line === ''
+            ? []
+            : [{
+                text: line,
+                style: { strikethrough: true as const },
+                diff_color: colors.deleted,
+            }]);
+}
+
 /** Memoized rich cells: build_grid_cell is Glide's per-cell paint callback
  *  (every visible cell, every frame, no caching above it), and splitting runs
- *  into lines allocates. RenderedCells are immutable and shared by reference
- *  from the row store, so the object is the cache key; font size, Formatting,
- *  and the row-height wrapping input are the other inputs that shape the payload.
+ *  into lines allocates — word_diff especially. RenderedCells are immutable and
+ *  shared by reference from the row store, so the object is the cache key; font
+ *  size, Formatting, the row-height wrapping input, and (for git compare cells)
+ *  the diff base and colors are the other inputs that shape the payload.
  *  Entries die with their cells. */
 const rich_cell_cache = new WeakMap<
     RenderedCell,
     {
         show_formatting: boolean;
         soft_wrap: boolean;
+        diff_base: string | undefined;
+        compare_deleted: boolean;
+        diff_colors: DiffColors;
         cell: CustomCell<RichCellData>;
     }
 >();
@@ -201,14 +223,20 @@ function rich_cell(
     link_modifier_held = false,
     diff_colors: DiffColors = DIFF_FALLBACK_COLORS,
 ): CustomCell<RichCellData> {
+    // Dirty edit state churns per keystroke, so it is never cached; the git
+    // compare inputs (diff_base / compare_deleted) are stable per generation
+    // and participate in the cache key instead — a compare page's word diffs
+    // must not be recomputed every frame.
     const can_cache = overlay?.dirty_rich === undefined
-        && overlay?.dirty_value === undefined
-        && overlay?.diff_base === undefined;
+        && overlay?.dirty_value === undefined;
     const cached = can_cache ? rich_cell_cache.get(c) : undefined;
     let cell = cached !== undefined
         && cached.cell.data.font_size_px === font_size_px
         && cached.show_formatting === show_formatting
         && cached.soft_wrap === soft_wrap
+        && cached.diff_base === overlay?.diff_base
+        && cached.compare_deleted === (overlay?.compare_deleted ?? false)
+        && cached.diff_colors === diff_colors
         ? cached.cell
         : undefined;
     if (!cell) {
@@ -217,8 +245,15 @@ function rich_cell(
         // '7/16/2023', not its serial). Hard breaks are sufficient to request the
         // rich multiline path; otherwise GridShell enables wrapping only after the
         // effective row/merge height exceeds one default row.
+        //
+        // Exception: a compare diff cell (diff_base without dirty_value) always
+        // diffs raw against raw — the host computed `base` from raw text, so
+        // letting the Formatting toggle swap in the formatted value would
+        // fabricate differences that are not in the file.
         const display = overlay?.dirty_value
-            ?? (show_formatting ? c.formatted : (c.raw ?? ''));
+            ?? (overlay?.diff_base !== undefined
+                ? (c.raw ?? '')
+                : show_formatting ? c.formatted : (c.raw ?? ''));
         // The wrap heuristic looks at everything the cell will paint: for a
         // diff cell that includes the old text, whose hard breaks must still
         // trigger the multiline path even when the new value has none.
@@ -237,8 +272,12 @@ function rich_cell(
             }
             : undefined;
         // Diff first: while the toggle is on, before/after replaces every other
-        // spelling of a dirty cell's content, including its markdown runs.
-        const lines = overlay?.diff_base !== undefined
+        // spelling of a dirty cell's content, including its markdown runs. A
+        // compare-deleted cell has no "after" side — its own text *is* the
+        // removed original, struck through whole in the deletion color.
+        const lines = overlay?.compare_deleted
+            ? deleted_lines(display, diff_colors)
+            : overlay?.diff_base !== undefined
             ? diff_lines(overlay.diff_base, display, c.rawType, diff_colors)
             : rich_text_lines(
                 show_formatting && overlay?.dirty_rich
@@ -271,6 +310,9 @@ function rich_cell(
         if (can_cache) rich_cell_cache.set(c, {
             show_formatting,
             soft_wrap,
+            diff_base: overlay?.diff_base,
+            compare_deleted: overlay?.compare_deleted ?? false,
+            diff_colors,
             cell,
         });
     }
@@ -321,6 +363,7 @@ export function rich_cell_display_data(
         !(c && renders_rich(c, show_formatting))
         && !(show_formatting && overlay?.dirty_rich !== undefined)
         && overlay?.diff_base === undefined
+        && !overlay?.compare_deleted
     ) return undefined;
     return rich_cell(
         c ?? EMPTY_CELL,
@@ -439,6 +482,7 @@ export function build_grid_cell(
         // Diff mode paints mixed colors and strikethrough, which only the
         // rich renderer can draw — regardless of the Formatting toggle.
         || overlay?.diff_base !== undefined
+        || overlay?.compare_deleted
     ) {
         return rich_cell(
             c ?? EMPTY_CELL,

@@ -116,4 +116,20 @@ describe('compare mode controller', () => {
         await vi.waitFor(() => expect(posted(panel, 'rowData').length).toBeGreaterThan(0));
         expect(posted(panel, 'compareDiff')).toEqual([]);
     });
+
+    it('refuses an edit session request in compare mode', async () => {
+        // The snapshot withdraws the Edit button, but the host must refuse the
+        // protocol too: a stale or buggy renderer could still post
+        // requestEditSession, and only the host gate stands between that and
+        // the working-tree file.
+        const panel = open_compare_table();
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThan(0));
+        await panel.__receive({ type: 'requestEditSession', requestId: 'edit-1', sheetIndex: 0 });
+        await vi.waitFor(() => expect(posted(panel, 'editSessionResult').length).toBeGreaterThan(0));
+        expect(posted(panel, 'editSessionResult')[0]).toMatchObject({
+            requestId: 'edit-1',
+            granted: false,
+        });
+    });
 });
