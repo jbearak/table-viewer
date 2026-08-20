@@ -4,7 +4,12 @@ import {
     rich_text_cell_renderer,
     type RichTextGridCell,
 } from '../webview/rich-text-cell-renderer';
-import { GridCellKind, getDefaultTheme, type FullTheme } from '../webview/glide-data-grid';
+import {
+    clearTextMetricsCache,
+    GridCellKind,
+    getDefaultTheme,
+    type FullTheme,
+} from '../webview/glide-data-grid';
 import type { RichTextLine } from '../webview/rich-text-layout';
 
 /** Stub 2D context: width defaults to 10px/char, so layout is assertable.
@@ -44,10 +49,17 @@ const theme: FullTheme = {
     fontFamily: 'sans',
 };
 
+const width_with_padding = (content_width: number): number =>
+    content_width + 2 * theme.cellHorizontalPadding;
+
+interface CellOptions {
+    readonly hyperlink?: boolean;
+    readonly allow_wrapping?: boolean;
+}
+
 function make_cell(
     lines: RichTextLine[],
-    hyperlink = false,
-    allow_wrapping = false,
+    { hyperlink = false, allow_wrapping = false }: CellOptions = {},
 ): RichTextGridCell {
     return {
         kind: GridCellKind.Custom,
@@ -141,11 +153,11 @@ describe('rich_text_cell_renderer.draw', () => {
     });
 
     it('soft-wraps mixed runs and preserves wrapped fonts and decorations', () => {
-        // 66px cell - 16px padding = 50px: exactly five stub characters.
+        // 50px content width: exactly five stub characters.
         const { calls, rects } = draw(make_cell([[
             { text: 'alpha ' },
             { text: 'beta', style: { bold: true, underline: true } },
-        ]], false, true), { x: 0, y: 0, width: 66, height: 80 });
+        ]], { allow_wrapping: true }), { x: 0, y: 0, width: width_with_padding(50), height: 80 });
 
         expect(calls.map(call => call.text)).toEqual(['alpha', 'beta']);
         expect(calls[1].y).toBeGreaterThan(calls[0].y);
@@ -156,17 +168,8 @@ describe('rich_text_cell_renderer.draw', () => {
         expect(rects[0].w).toBe(40);
     });
 
-    it('invalidates wrapping across web-font loading transitions', () => {
-        let loading_done: (() => void) | undefined;
-        const fonts = {
-            status: 'loaded',
-            addEventListener(type: string, listener: () => void) {
-                if (type === 'loadingdone') loading_done = listener;
-            },
-            removeEventListener(type: string, listener: () => void) {
-                if (type === 'loadingdone' && loading_done === listener) loading_done = undefined;
-            },
-        };
+    it('does not cache wrapping measured while a web font starts loading', () => {
+        const fonts = { status: 'loaded' };
         let character_width = 10;
         let start_loading_on_measure = true;
         const stub = stub_ctx(text => {
@@ -186,8 +189,8 @@ describe('rich_text_cell_renderer.draw', () => {
         });
 
         try {
-            const cell = make_cell([[{ text: 'aaaa bbbb' }]], false, true);
-            const rect = { x: 0, y: 0, width: 66, height: 80 };
+            const cell = make_cell([[{ text: 'aaaa bbbb' }]], { allow_wrapping: true });
+            const rect = { x: 0, y: 0, width: width_with_padding(50), height: 80 };
             draw(cell, rect, stub);
             expect(stub.calls.map(call => call.text)).toEqual(['aaaa', 'bbbb']);
 
@@ -195,17 +198,8 @@ describe('rich_text_cell_renderer.draw', () => {
             stub.calls.length = 0;
             character_width = 5;
             fonts.status = 'loaded';
-            loading_done?.();
             draw(cell, rect, stub);
             expect(stub.calls.map(call => call.text)).toEqual(['aaaa bbbb']);
-
-            // A later load can start and finish wholly between draws. Its event
-            // generation must invalidate the now-cached one-line layout.
-            stub.calls.length = 0;
-            character_width = 8;
-            loading_done?.();
-            draw(cell, rect, stub);
-            expect(stub.calls.map(call => call.text)).toEqual(['aaaa', 'bbbb']);
         } finally {
             if (document_descriptor) {
                 Object.defineProperty(globalThis, 'document', document_descriptor);
@@ -215,19 +209,36 @@ describe('rich_text_cell_renderer.draw', () => {
         }
     });
 
+    it('invalidates cached wrapping with Glide text metrics', () => {
+        let character_width = 5;
+        const stub = stub_ctx(text => text.length * character_width);
+        const cell = make_cell([[{ text: 'aaaa bbbb' }]], { allow_wrapping: true });
+        const rect = { x: 0, y: 0, width: width_with_padding(50), height: 80 };
+
+        draw(cell, rect, stub);
+        expect(stub.calls.map(call => call.text)).toEqual(['aaaa bbbb']);
+
+        stub.calls.length = 0;
+        character_width = 8;
+        clearTextMetricsCache();
+        draw(cell, rect, stub);
+        expect(stub.calls.map(call => call.text)).toEqual(['aaaa', 'bbbb']);
+    });
+
     it('starts each wrapped RTL line at the right padding edge', () => {
         const base = make_cell([[
             { text: 'אבגד ' },
             { text: 'הוזח', style: { bold: true } },
-        ]], false, true);
+        ]], { allow_wrapping: true });
         const rtl_cell: RichTextGridCell = {
             ...base,
             data: { ...base.data, rtl: true },
         };
-        const { calls } = draw(rtl_cell, { x: 0, y: 0, width: 56, height: 80 });
+        const width = width_with_padding(40);
+        const { calls } = draw(rtl_cell, { x: 0, y: 0, width, height: 80 });
         expect(calls).toHaveLength(2);
-        expect(calls[0].x).toBe(56 - 8);
-        expect(calls[1].x).toBe(56 - 8);
+        expect(calls[0].x).toBe(width - theme.cellHorizontalPadding);
+        expect(calls[1].x).toBe(width - theme.cellHorizontalPadding);
         expect(calls[1].y).toBeGreaterThan(calls[0].y);
     });
 
@@ -251,7 +262,7 @@ describe('rich_text_cell_renderer.draw', () => {
     it('underlines every segment of a linked cell in the link color', () => {
         const { calls, rects } = draw(make_cell(
             [[{ text: 'go' }, { text: 'to', style: { bold: true } }]],
-            true,
+            { hyperlink: true },
         ));
         expect(rects).toHaveLength(2);
         expect(rects[0].x).toBe(calls[0].x);
@@ -266,8 +277,9 @@ describe('rich_text_cell_renderer.measure', () => {
             [{ text: 'abc' }, { text: 'de', style: { bold: true } }],
             [{ text: 'xy' }],
         ]);
-        // Widest line: 5 chars * 10 = 50, plus 2 * padding (8) = 66.
-        expect(rich_text_cell_renderer.measure!(ctx, cell, theme)).toBe(66);
+        // Widest line: 5 chars * 10 = 50, plus horizontal padding.
+        expect(rich_text_cell_renderer.measure!(ctx, cell, theme))
+            .toBe(width_with_padding(50));
     });
 
     it('keeps auto-fit measurement at the natural width when wrapping is enabled', () => {
@@ -275,8 +287,9 @@ describe('rich_text_cell_renderer.measure', () => {
         const cell = make_cell([[
             { text: 'abc ' },
             { text: 'de', style: { bold: true } },
-        ]], false, true);
-        expect(rich_text_cell_renderer.measure!(ctx, cell, theme)).toBe(76);
+        ]], { allow_wrapping: true });
+        expect(rich_text_cell_renderer.measure!(ctx, cell, theme))
+            .toBe(width_with_padding(60));
     });
 
     it('leaves the measurement font as it found it', () => {
@@ -295,29 +308,7 @@ describe('rich_text_cell_renderer.draw — code-review regressions', () => {
     it('restores the base font after a cell ending in a styled run', () => {
         const stub = stub_ctx();
         const cell = make_cell([[{ text: 'end bold', style: { bold: true } }]]);
-        rich_text_cell_renderer.draw(
-            {
-                ctx: stub.ctx,
-                theme,
-                rect: { x: 0, y: 0, width: 200, height: 30 },
-                cell,
-                col: 0,
-                row: 0,
-                highlighted: false,
-                hoverAmount: 0,
-                hoverX: undefined,
-                hoverY: undefined,
-                cellFillColor: '#fff',
-                imageLoader: undefined as never,
-                spriteManager: undefined as never,
-                hyperWrapping: false,
-                requestAnimationFrame: () => {},
-                drawState: [undefined, () => {}],
-                frameTime: 0,
-                overrideCursor: undefined,
-            },
-            cell,
-        );
+        draw(cell, undefined, stub);
         // Glide's draw loop tracks the canvas font and skips resetting it
         // between cells, so draw must leave the base font behind.
         expect((stub.ctx as unknown as { font: string }).font).toBe(theme.baseFontFull);
@@ -345,7 +336,7 @@ describe('rich_text_cell_renderer.draw — code-review regressions', () => {
         expect(calls).toHaveLength(2);
         // First segment anchors at the right padding edge; the next continues
         // leftward (each segment is 2 chars * 10px wide).
-        expect(calls[0].x).toBe(200 - 8);
-        expect(calls[1].x).toBe(200 - 8 - 20);
+        expect(calls[0].x).toBe(200 - theme.cellHorizontalPadding);
+        expect(calls[1].x).toBe(200 - theme.cellHorizontalPadding - 20);
     });
 });

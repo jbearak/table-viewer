@@ -86,9 +86,8 @@ function append_fragment(target: WrapFragment[], fragment: WrapFragment): void {
     const last = target[target.length - 1];
     if (last?.source === fragment.source) {
         target[target.length - 1] = {
+            ...last,
             text: last.text + fragment.text,
-            ...(last.style ? { style: last.style } : {}),
-            source: last.source,
         };
         return;
     }
@@ -114,11 +113,11 @@ function wrap_tokens(line: RichTextLine): WrapToken[] {
             while (end < segment.text.length && (segment.text[end] === ' ') === is_space) end++;
             const fragment: WrapFragment = {
                 text: segment.text.slice(start, end),
-                ...(segment.style ? { style: segment.style } : {}),
+                style: segment.style,
                 source,
             };
             const last = tokens[tokens.length - 1];
-            if (last?.is_space === is_space) append_fragment(last.fragments, fragment);
+            if (last?.is_space === is_space) last.fragments.push(fragment);
             else tokens.push({ is_space, fragments: [fragment] });
             start = end;
         }
@@ -126,12 +125,12 @@ function wrap_tokens(line: RichTextLine): WrapToken[] {
     return tokens;
 }
 
-function fragments_width(
-    fragments: readonly WrapFragment[],
+function rich_line_width(
+    line: readonly RichTextSegment[],
     measure: (text: string, style: CellTextStyle | undefined) => number,
 ): number {
     let width = 0;
-    for (const fragment of fragments) width += measure(fragment.text, fragment.style);
+    for (const segment of line) width += measure(segment.text, segment.style);
     return width;
 }
 
@@ -153,8 +152,6 @@ function fitting_grapheme_prefix(
     measure: (text: string, style: CellTextStyle | undefined) => number,
 ): FittingPrefix {
     const remaining = parts.length - start;
-    if (remaining <= 0) return { count: 0, width: 0 };
-
     const width_of = (count: number): number =>
         measure(parts.slice(start, start + count).join(''), style);
     let low = 0;
@@ -195,6 +192,11 @@ function split_overwide_word(
     const lines: WrapFragment[][] = [];
     let current: WrapFragment[] = [];
     let current_width = 0;
+    const emit_current = (): void => {
+        lines.push(current);
+        current = [];
+        current_width = 0;
+    };
 
     for (const fragment of fragments) {
         const parts = graphemes(fragment.text);
@@ -213,31 +215,25 @@ function split_overwide_word(
                 offset += fitting.count;
                 current_width += fitting.width;
                 if (offset < parts.length) {
-                    lines.push(current);
-                    current = [];
-                    current_width = 0;
+                    emit_current();
                 }
                 continue;
             }
 
             if (current.length > 0) {
-                lines.push(current);
-                current = [];
-                current_width = 0;
+                emit_current();
                 continue;
             }
 
             // Even one grapheme can be wider than the cell. Emit it by itself so
             // the layout always advances; paint/overflow retain the true width.
             append_fragment(current, { ...fragment, text: parts[offset] });
-            lines.push(current);
-            current = [];
-            current_width = 0;
+            emit_current();
             offset++;
         }
     }
 
-    if (current.length > 0) lines.push(current);
+    if (current.length > 0) emit_current();
     return lines;
 }
 
@@ -271,7 +267,6 @@ export function wrap_rich_text_lines(
         let pending_spaces: WrapFragment[] | undefined;
 
         const emit_current = (): void => {
-            if (current.length === 0) return;
             wrapped.push(public_line(current));
             current = [];
             current_width = 0;
@@ -283,43 +278,34 @@ export function wrap_rich_text_lines(
                 continue;
             }
 
-            const word_width = fragments_width(token.fragments, measure);
+            const word_width = rich_line_width(token.fragments, measure);
             const spaces_width = pending_spaces
-                ? fragments_width(pending_spaces, measure)
+                ? rich_line_width(pending_spaces, measure)
                 : 0;
+            const wraps_before_word = current.length > 0
+                && current_width + spaces_width + word_width > available_width;
+            if (wraps_before_word) emit_current();
+
             if (
-                current.length > 0
-                && current_width + spaces_width + word_width > available_width
+                pending_spaces
+                && !wraps_before_word
+                && (current.length > 0 || spaces_width + word_width <= available_width)
             ) {
-                emit_current();
-                // Separator whitespace belongs to the wrap boundary, not the
-                // start of the next visual line.
-                pending_spaces = undefined;
-            }
-
-            if (current.length === 0) {
-                // Preserve leading hard-line spaces when the complete first
-                // word still fits; otherwise discard them rather than emit a
-                // visually blank soft line.
-                if (pending_spaces && spaces_width + word_width <= available_width) {
-                    append_fragments(current, pending_spaces);
-                    current_width += spaces_width;
-                }
-                pending_spaces = undefined;
-
-                if (word_width > available_width) {
-                    const pieces = split_overwide_word(token.fragments, available_width, measure);
-                    for (let i = 0; i < pieces.length - 1; i++) {
-                        wrapped.push(public_line(pieces[i]));
-                    }
-                    current = pieces[pieces.length - 1] ?? [];
-                    current_width = fragments_width(current, measure);
-                    continue;
-                }
-            } else if (pending_spaces) {
+                // Preserve leading hard-line spaces only when the complete first
+                // word fits. Separator whitespace at a soft break is discarded.
                 append_fragments(current, pending_spaces);
                 current_width += spaces_width;
-                pending_spaces = undefined;
+            }
+            pending_spaces = undefined;
+
+            if (current.length === 0 && word_width > available_width) {
+                const pieces = split_overwide_word(token.fragments, available_width, measure);
+                for (let i = 0; i < pieces.length - 1; i++) {
+                    wrapped.push(public_line(pieces[i]));
+                }
+                current = pieces[pieces.length - 1] ?? [];
+                current_width = rich_line_width(current, measure);
+                continue;
             }
 
             append_fragments(current, token.fragments);
@@ -330,7 +316,7 @@ export function wrap_rich_text_lines(
         // are source content (and can carry underline/strikethrough styling),
         // but never create a blank continuation line by themselves.
         if (pending_spaces) {
-            const spaces_width = fragments_width(pending_spaces, measure);
+            const spaces_width = rich_line_width(pending_spaces, measure);
             if (current.length === 0 || current_width + spaces_width <= available_width) {
                 append_fragments(current, pending_spaces);
             }
@@ -352,11 +338,7 @@ export function rich_lines_max_width(
 ): number {
     let max = 0;
     for (const line of lines) {
-        let width = 0;
-        for (const segment of line) {
-            width += measure(segment.text, segment.style);
-        }
-        if (width > max) max = width;
+        max = Math.max(max, rich_line_width(line, measure));
     }
     return max;
 }

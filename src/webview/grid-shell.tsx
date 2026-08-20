@@ -2154,6 +2154,7 @@ export function GridShell({
             // logical (merge-aware) geometry used by build_grid_cell instead.
             const cell_height = get_cell_height(row, display_column);
             const cell_width = get_cell_width(row, display_column);
+            const soft_wrap = cell_height > default_row_height;
             // Measure the same effective payload the grid paints. In particular,
             // a pending Markdown edit may introduce styled runs into a plain or
             // blank cell, and an empty dirty value must suppress persisted runs.
@@ -2171,7 +2172,7 @@ export function GridShell({
                             : {}),
                     }
                     : undefined,
-                cell_height > default_row_height,
+                soft_wrap,
             );
 
             let overflows: boolean;
@@ -2197,10 +2198,7 @@ export function GridShell({
                 // Use the same wrapping rule as build_grid_cell. `cell_bounds` is
                 // client-space positioning only; logical height also includes a
                 // vertical merge's rows without inheriting canvas scale noise.
-                const wrapping = cell_allows_wrapping(
-                    text,
-                    cell_height > default_row_height,
-                );
+                const wrapping = cell_allows_wrapping(text, soft_wrap);
                 overflows = text !== '' && text_overflows_cell(
                     text,
                     cell_width,

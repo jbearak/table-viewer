@@ -303,7 +303,7 @@ export function getRowIndexForY(
 
 let metricsSize = 0;
 let metricsCache: Record<string, TextMetrics | undefined> = {};
-const isSSR = typeof window === "undefined";
+let textMetricsGeneration = 0;
 
 /** Fork addition: discard every font-dependent text cache before a redraw that
  * follows web-font loading. Later face/weight cycles need the same invalidation
@@ -312,15 +312,14 @@ export function clearTextMetricsCache(): void {
     metricsSize = 0;
     metricsCache = {};
     clearCache();
+    textMetricsGeneration++;
 }
 
-async function clearCacheOnLoad() {
-    if (isSSR || document?.fonts?.ready === undefined) return;
-    await document.fonts.ready;
-    clearTextMetricsCache();
+/** Changes whenever every shared text-metrics cache is invalidated. Custom
+ * renderers use the same epoch instead of observing FontFaceSet separately. */
+export function getTextMetricsGeneration(): number {
+    return textMetricsGeneration;
 }
-
-void clearCacheOnLoad();
 
 function makeCacheKey(
     s: string,

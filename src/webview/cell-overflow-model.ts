@@ -105,10 +105,7 @@ export function rich_text_overflows_cell(
     lines: readonly RichTextLine[],
     cell_width: number,
     measure: (text: string, style: CellTextStyle | undefined) => number,
-    options: Pick<
-        CellOverflowOptions,
-        'cell_height' | 'line_height' | 'horizontal_padding' | 'wrapping'
-    > = {},
+    options: CellOverflowOptions = {},
 ): boolean {
     const padding = options.horizontal_padding ?? CELL_TOOLTIP_HORIZONTAL_PADDING_PX;
     const available_width = Math.max(0, cell_width - padding * 2);

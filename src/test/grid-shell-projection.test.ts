@@ -485,6 +485,7 @@ describe('GridShell cell wrapping', () => {
         const text = 'A long information-note paragraph with styled labels';
         grid_mock.get_row.mockImplementation(() => [
             null,
+            null,
             {
                 raw: text,
                 formatted: text,
@@ -501,11 +502,6 @@ describe('GridShell cell wrapping', () => {
         await render_grid(props({
             show_formatting: true,
             row_heights: { 0: 80 },
-            column_projection: {
-                visible_to_source: [0, 1, 2],
-                source_to_visible: [0, 1, 2],
-                hidden_count: 0,
-            },
         }));
 
         const get_cell_content = grid_mock.props!.getCellContent as

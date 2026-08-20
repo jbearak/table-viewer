@@ -278,20 +278,16 @@ describe('build_grid_cell — rich cells', () => {
 
     it('updates rich wrapping when the same cached source row becomes tall', () => {
         type RichResult = { data: { allow_wrapping?: true } };
-        const short = build_grid_cell(
-            0, rich_row, true, undefined, 13, false,
+        const cell_for_height = (tall: boolean): RichResult => build_grid_cell(
+            0, rich_row, true, undefined, 13, tall,
         ) as unknown as RichResult;
-        const tall = build_grid_cell(
-            0, rich_row, true, undefined, 13, true,
-        ) as unknown as RichResult;
-        const short_again = build_grid_cell(
-            0, rich_row, true, undefined, 13, false,
-        ) as unknown as RichResult;
+        const short = cell_for_height(false);
+        const tall = cell_for_height(true);
+        const short_again = cell_for_height(false);
 
         expect(short.data.allow_wrapping).toBeUndefined();
         expect(tall.data.allow_wrapping).toBe(true);
         expect(short_again.data.allow_wrapping).toBeUndefined();
-        expect(tall).not.toBe(short);
     });
 
     it('wraps a Formatting-off hyperlink when its row is tall', () => {

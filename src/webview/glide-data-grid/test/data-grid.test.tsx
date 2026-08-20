@@ -341,18 +341,8 @@ describe("data-grid", () => {
     test("Redraws after a later web-font load completes", async () => {
         const fontsDescriptor = Object.getOwnPropertyDescriptor(document, "fonts");
         let ready = Promise.resolve({} as FontFaceSet);
-        const loadingDoneListeners = new Set<() => void>();
-        const fonts = {
-            get ready() {
-                return ready;
-            },
-            addEventListener(type: string, listener: () => void) {
-                if (type === "loadingdone") loadingDoneListeners.add(listener);
-            },
-            removeEventListener(type: string, listener: () => void) {
-                if (type === "loadingdone") loadingDoneListeners.delete(listener);
-            },
-        };
+        const fonts = new EventTarget();
+        Object.defineProperty(fonts, "ready", { get: () => ready });
         Object.defineProperty(document, "fonts", {
             configurable: true,
             value: fonts,
@@ -383,7 +373,7 @@ describe("data-grid", () => {
             measuredWidth = 20;
             ready = Promise.resolve({} as FontFaceSet);
             await act(async () => {
-                for (const listener of loadingDoneListeners) listener();
+                fonts.dispatchEvent(new Event("loadingdone"));
                 await ready;
             });
 

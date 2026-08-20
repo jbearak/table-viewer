@@ -117,14 +117,13 @@ export function needs_rich_renderer(c: RenderedCell): boolean {
  *  (every visible cell, every frame, no caching above it), and splitting runs
  *  into lines allocates. RenderedCells are immutable and shared by reference
  *  from the row store, so the object is the cache key; font size, Formatting,
- *  and the effective wrapping mode are the other inputs that shape the payload.
+ *  and the row-height wrapping input are the other inputs that shape the payload.
  *  Entries die with their cells. */
 const rich_cell_cache = new WeakMap<
     RenderedCell,
     {
-        font_size_px: number;
         show_formatting: boolean;
-        allow_wrapping: boolean;
+        soft_wrap: boolean;
         cell: CustomCell<RichCellData>;
     }
 >();
@@ -136,24 +135,24 @@ function rich_cell(
     font_size_px: number,
     soft_wrap = false,
     link_modifier_held = false,
-): GridCell {
-    // Same displayed-text rule as the Text path: the Formatting toggle switches
-    // between the formatted value and the raw one (a linked date cell must show
-    // '7/16/2023', not its serial). Hard breaks are sufficient to request the
-    // rich multiline path; otherwise GridShell enables wrapping only after the
-    // effective row/merge height exceeds one default row.
-    const display = overlay?.dirty_value
-        ?? (show_formatting ? c.formatted : (c.raw ?? ''));
-    const allow_wrapping = cell_allows_wrapping(display, soft_wrap);
+): CustomCell<RichCellData> {
     const can_cache = overlay?.dirty_rich === undefined && overlay?.dirty_value === undefined;
     const cached = can_cache ? rich_cell_cache.get(c) : undefined;
     let cell = cached !== undefined
-        && cached.font_size_px === font_size_px
+        && cached.cell.data.font_size_px === font_size_px
         && cached.show_formatting === show_formatting
-        && cached.allow_wrapping === allow_wrapping
+        && cached.soft_wrap === soft_wrap
         ? cached.cell
         : undefined;
     if (!cell) {
+        // Same displayed-text rule as the Text path: the Formatting toggle switches
+        // between the formatted value and the raw one (a linked date cell must show
+        // '7/16/2023', not its serial). Hard breaks are sufficient to request the
+        // rich multiline path; otherwise GridShell enables wrapping only after the
+        // effective row/merge height exceeds one default row.
+        const display = overlay?.dirty_value
+            ?? (show_formatting ? c.formatted : (c.raw ?? ''));
+        const allow_wrapping = cell_allows_wrapping(display, soft_wrap);
         // Whole-cell flags become one styled run for link/underline-only
         // cells. With formatting off only the link presentation survives
         // (mirroring the Text path dropping bold/italic): plain runs, and the
@@ -193,9 +192,8 @@ function rich_cell(
             readonly: true,
         };
         if (can_cache) rich_cell_cache.set(c, {
-            font_size_px,
             show_formatting,
-            allow_wrapping,
+            soft_wrap,
             cell,
         });
     }
@@ -245,13 +243,13 @@ export function rich_cell_display_data(
         !(c && renders_rich(c, show_formatting))
         && !(show_formatting && overlay?.dirty_rich !== undefined)
     ) return undefined;
-    return (rich_cell(
+    return rich_cell(
         c ?? EMPTY_CELL,
         show_formatting,
         overlay,
         font_size_px,
         soft_wrap,
-    ) as CustomCell<RichCellData>).data;
+    ).data;
 }
 
 function text_cell(
