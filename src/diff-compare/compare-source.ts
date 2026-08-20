@@ -2,20 +2,24 @@
 // here operates on DataSource/WorkbookMeta values so it is unit-testable with
 // in-memory fixtures and shareable across hosts.
 import type { DataSource, WorkbookMeta } from '../data-source/interface';
+import { get_raw_cell_text } from '../cell-display';
 
 export type SheetPairStatus = 'matched' | 'added' | 'deleted';
 
 /**
  * One entry per sheet of the *modified* workbook (in its sheet order), followed
- * by any original-only sheets. `modifiedIndex`/`originalIndex` are present per
- * the status: matched has both, added only modified, deleted only original.
+ * by any original-only sheets. A discriminated union so a pairing cannot claim
+ * a status without the indexes that status implies.
  */
-export interface SheetPairing {
-    readonly status: SheetPairStatus;
-    readonly name: string;
-    readonly modifiedIndex?: number;
-    readonly originalIndex?: number;
-}
+export type SheetPairing =
+    | {
+        readonly status: 'matched';
+        readonly name: string;
+        readonly modifiedIndex: number;
+        readonly originalIndex: number;
+    }
+    | { readonly status: 'added'; readonly name: string; readonly modifiedIndex: number }
+    | { readonly status: 'deleted'; readonly name: string; readonly originalIndex: number };
 
 /**
  * Pair worksheets positionally-independently: by stable `worksheetId` when both
@@ -89,7 +93,7 @@ export interface CompareDiffWindow {
 }
 
 function raw_text(cell: { raw: string | null } | null | undefined): string {
-    return cell?.raw ?? '';
+    return get_raw_cell_text(cell?.raw ?? null);
 }
 
 /**
@@ -104,11 +108,7 @@ export function diff_row_window(
     start_row: number,
     count: number,
 ): CompareDiffWindow {
-    if (
-        pairing.status !== 'matched'
-        || pairing.originalIndex === undefined
-        || pairing.modifiedIndex === undefined
-    ) {
+    if (pairing.status !== 'matched') {
         throw new Error('diff_row_window requires a matched sheet pairing.');
     }
     const original_sheet = original.meta().sheets[pairing.originalIndex];

@@ -1,7 +1,9 @@
 import { createHash } from 'crypto';
-import { XlsxDataSource } from './data-source/xlsx-source';
-import { XlsDataSource } from './data-source/xls-source';
 import { CsvDataSource } from './data-source/csv-source';
+import {
+    build_source_from_buffer,
+    csv_source_from_buffer,
+} from './data-source/from-buffer';
 import { ExcelHeaderDataSource } from './data-source/excel-header-source';
 import type {
     DataSource,
@@ -741,16 +743,14 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
 
 function excel_profile(file_path: string): ViewerProfile {
     const base: ViewerProfileBase = {
-        async build_source(raw, file_path, state) {
-            const physical = file_path.toLowerCase().endsWith('.xlsx')
-                ? await XlsxDataSource.create(raw)
-                : await XlsDataSource.create(Buffer.from(raw));
-            const physical_sheets = physical.meta().sheets;
-            return new ExcelHeaderDataSource(
-                physical,
-                sanitize_excel_header_overrides(state.excelFirstRowHeaders),
-                excel_hidden_rows_for_source(physical_sheets, state.transforms),
-            );
+        build_source(raw, file_path, state) {
+            return build_source_from_buffer(raw, file_path, {
+                excelHeaderOverrides: sanitize_excel_header_overrides(
+                    state.excelFirstRowHeaders,
+                ),
+                excelHiddenRows: (physical_sheets) =>
+                    excel_hidden_rows_for_source(physical_sheets, state.transforms),
+            });
         },
     };
     // .xls is out of scope for editing: the writer above is an OOXML package
@@ -781,11 +781,7 @@ export function build_csv_source(
     const max_rows = options?.loadAllRows
         ? Number.MAX_SAFE_INTEGER
         : Math.max(0, requested_max_rows);
-    // CSV/TSV files conventionally carry column names in their first row, so the
-    // grid promotes it to the column header rather than showing letters.
-    return CsvDataSource.create(raw, get_delimiter(file_path), max_rows, {
-        firstRowIsHeader: true,
-    });
+    return csv_source_from_buffer(raw, file_path, max_rows);
 }
 
 type CsvTextEncoder = Pick<TextEncoder, 'encode'>;

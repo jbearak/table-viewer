@@ -1,6 +1,6 @@
 // Format-dispatching DataSource factory shared by the normal load path and the
 // git-compare session, so both sides of a compare parse identically.
-import type { DataSource } from './interface';
+import type { DataSource, SheetMeta } from './interface';
 import { CsvDataSource } from './csv-source';
 import { XlsxDataSource } from './xlsx-source';
 import { XlsDataSource } from './xls-source';
@@ -13,8 +13,11 @@ export interface FromBufferOptions {
     readonly csvMaxRows?: number;
     /** Excel first-row-header persisted overrides (auto-detect when absent). */
     readonly excelHeaderOverrides?: Record<string, ExcelHeaderOverride>;
-    /** Rows hidden by transforms, consulted by Excel header planning. */
-    readonly excelHiddenRows?: readonly (readonly number[] | undefined)[];
+    /** Rows hidden by transforms, consulted by Excel header planning. Computed
+     *  from the parsed physical sheets, which only exist inside this factory. */
+    readonly excelHiddenRows?: (
+        physical_sheets: readonly SheetMeta[],
+    ) => readonly (readonly number[] | undefined)[] | undefined;
 }
 
 /**
@@ -22,6 +25,18 @@ export interface FromBufferOptions {
  * same way `profile_for` dispatches profiles: `.csv`/`.tsv` → CSV (first row is
  * the header), `.xlsx` → OOXML, anything else → BIFF `.xls`.
  */
+/** CSV/TSV files conventionally carry column names in their first row, so the
+ *  grid promotes it to the column header rather than showing letters. */
+export function csv_source_from_buffer(
+    raw: Uint8Array,
+    file_path: string,
+    max_rows: number = Number.MAX_SAFE_INTEGER,
+): Promise<CsvDataSource> {
+    return CsvDataSource.create(raw, get_delimiter(file_path), max_rows, {
+        firstRowIsHeader: true,
+    });
+}
+
 export async function build_source_from_buffer(
     raw: Uint8Array,
     file_path: string,
@@ -29,17 +44,14 @@ export async function build_source_from_buffer(
 ): Promise<DataSource> {
     const ext = file_path.toLowerCase();
     if (ext.endsWith('.csv') || ext.endsWith('.tsv')) {
-        const max_rows = options.csvMaxRows ?? Number.MAX_SAFE_INTEGER;
-        return CsvDataSource.create(raw, get_delimiter(file_path), max_rows, {
-            firstRowIsHeader: true,
-        });
+        return csv_source_from_buffer(raw, file_path, options.csvMaxRows);
     }
     const physical = ext.endsWith('.xlsx')
         ? await XlsxDataSource.create(raw)
-        : await XlsDataSource.create(Buffer.from(raw));
+        : await XlsDataSource.create(Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength));
     return new ExcelHeaderDataSource(
         physical,
         options.excelHeaderOverrides,
-        options.excelHiddenRows,
+        options.excelHiddenRows?.(physical.meta().sheets),
     );
 }
