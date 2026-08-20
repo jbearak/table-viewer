@@ -16,6 +16,7 @@ import {
     widen_dimension,
 } from '../xlsx-cell-write';
 import { OoxmlRefusalError, type OoxmlRefusalCode } from '../ooxml-refusal';
+import { ZipPackage } from '../zip-package';
 
 const FORMATTED = 'src/test/fixtures/formatted.xlsx';
 const EMPTY = 'src/test/fixtures/empty-sheet.xlsx';
@@ -2379,15 +2380,17 @@ describe('write_xlsx_cell_edits', () => {
             // would quietly stop doing that the day the two are reordered — leaving
             // a test that passes because nothing was injected at all.
             const REFERENCE_PARTS = ['/[Content_Types].xml', '/xl/_rels/workbook.xml.rels'];
-            const actual_find = CFB.find;
+            const actual_read_text = ZipPackage.prototype.read_text;
             let removing = false;
             let first: string | null = null;
             let injected = false;
-            const spy = vi.spyOn(CFB, 'find').mockImplementation(((
-                file: never,
+            const spy = vi.spyOn(ZipPackage.prototype, 'read_text').mockImplementation(function (
+                this: ZipPackage,
                 path: string,
-            ) => {
-                if (path === '/xl/calcChain.xml') removing = true;
+            ) {
+                // Content types are not needed by the edit itself, so their first
+                // read is the start of the calc-chain removal plan.
+                if (path === '/[Content_Types].xml') removing = true;
                 if (removing && REFERENCE_PARTS.includes(path)) {
                     // Repeat visits to the part already reached are let through, so
                     // the removal gets as far as committing that one edit.
@@ -2397,8 +2400,8 @@ describe('write_xlsx_cell_edits', () => {
                         throw new Error('unreadable part');
                     }
                 }
-                return actual_find.call(CFB, file, path);
-            }) as typeof CFB.find);
+                return actual_read_text.call(this, path);
+            });
 
             // The edit itself still succeeds — a stale calc chain is a cache Excel
             // rebuilds, and failing the save would cost the user the edit instead.
