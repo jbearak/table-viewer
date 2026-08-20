@@ -100,11 +100,30 @@ describe('extension runtime manifest', () => {
             'tableViewer.openAsText',
             'tableViewer.openWorkbookAtSheet',
             'tableViewer.manageStoredFileState',
+            'tableViewer.openTableDiff',
         ]);
         expect(manifest.contributes?.menus?.commandPalette).toContainEqual({
             command: 'tableViewer.openWorkbookAtSheet',
             when: 'false',
         });
+    });
+
+    it('offers the table diff on git SCM resources for every supported format', () => {
+        const entries = (manifest.contributes?.menus as Record<string, unknown[]>)[
+            'scm/resourceState/context'
+        ] as { command: string; when: string; group: string }[];
+        const diff_entries = entries.filter(
+            (entry) => entry.command === 'tableViewer.openTableDiff',
+        );
+        expect(diff_entries.map((entry) => entry.group).sort()).toEqual(
+            ['inline', 'navigation'],
+        );
+        for (const entry of diff_entries) {
+            expect(entry.when).toContain('scmProvider == git');
+            for (const extension of ['csv', 'tsv', 'xlsx', 'xls']) {
+                expect(entry.when).toContain(extension);
+            }
+        }
     });
 
     it('externalizes the host-provided SQLite runtime from the one bundle it builds', () => {

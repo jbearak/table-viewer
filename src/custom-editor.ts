@@ -19,6 +19,11 @@ export class TableViewerEditorProvider
     readonly #panels = new Map<ViewerController, vscode.WebviewPanel>();
     readonly #resources = new Map<ViewerController, string>();
     readonly #workbook_opens = new Map<string, Promise<void>>();
+    /** Compare intents awaiting their resolveCustomEditor, keyed by the
+     *  modified file's resource identity. `vscode.openWith` cannot carry
+     *  options, so openTableDiff parks the original's URI here and the next
+     *  resolve for that resource consumes it. */
+    readonly #pending_compares = new Map<string, vscode.Uri>();
     readonly #drains = new Set<Promise<void>>();
     #close_barrier: Promise<void> | undefined;
     #close_barrier_settled = false;
@@ -115,6 +120,24 @@ export class TableViewerEditorProvider
         return controller.select_sheet(sheet_name);
     }
 
+    /**
+     * Open `uri` as a table compared against `original_uri` (its git original).
+     * Always opens a fresh panel: an existing viewer for the file may hold an
+     * edit session, and compare panels are read-only by construction.
+     */
+    async openTableDiff(uri: vscode.Uri, original_uri: vscode.Uri): Promise<void> {
+        const resource = create_resource_identity(uri).key;
+        this.#pending_compares.set(resource, original_uri);
+        try {
+            await vscode.commands.executeCommand('vscode.openWith', uri, TABLE_VIEW_TYPE);
+        } finally {
+            // resolveCustomEditor consumed the intent if it ran; clear it if the
+            // open failed (or resolved a recycled panel) so a later plain open
+            // of this file cannot inherit a stale compare.
+            this.#pending_compares.delete(resource);
+        }
+    }
+
     async resolveCustomEditor(
         document: TableViewerDocument,
         webview_panel: vscode.WebviewPanel,
@@ -128,17 +151,23 @@ export class TableViewerEditorProvider
         webview_panel.webview.html = build_vscode_webview_html(
             webview_panel.webview, this.extension_uri, generate_nonce());
 
+        const resource = create_resource_identity(document.uri).key;
+        const compare_original = this.#pending_compares.get(resource);
+        if (compare_original) this.#pending_compares.delete(resource);
         const controller = attach_viewer(
             webview_panel,
             document.uri,
             this.state_store,
             profile_for(document.uri.fsPath, vscode_viewer_host.config),
             vscode_viewer_host,
-            { requestClose: () => webview_panel.dispose() },
+            {
+                requestClose: () => webview_panel.dispose(),
+                ...(compare_original ? { compare: { originalUri: compare_original } } : {}),
+            },
         );
         this.#controllers.add(controller);
         this.#panels.set(controller, webview_panel);
-        this.#resources.set(controller, create_resource_identity(document.uri).key);
+        this.#resources.set(controller, resource);
         webview_panel.onDidDispose(() => this.#dispose_controller(controller));
     }
 }
@@ -146,6 +175,7 @@ export class TableViewerEditorProvider
 export interface TableViewerRegistration extends vscode.Disposable {
     drain(): Promise<void>;
     openWorkbookAtSheet(uri: vscode.Uri, sheetName: string): Promise<boolean>;
+    openTableDiff(uri: vscode.Uri, originalUri: vscode.Uri): Promise<void>;
 }
 
 export function register_table_viewer(
@@ -183,6 +213,7 @@ export function register_table_viewer(
         },
         drain: () => provider.drain_viewers(),
         openWorkbookAtSheet: (uri, sheetName) => provider.openWorkbookAtSheet(uri, sheetName),
+        openTableDiff: (uri, originalUri) => provider.openTableDiff(uri, originalUri),
     };
     context.subscriptions.push(registration);
     return registration;
