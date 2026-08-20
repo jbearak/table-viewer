@@ -238,6 +238,26 @@ function cached_markdown_edit_text(
     return text;
 }
 
+/**
+ * The value-edit half of a cell's paint overlay. Shared by the paint callback
+ * and the hover-tooltip measurement so the two cannot disagree on what a dirty
+ * cell displays (same rule as cell-renderer's renders_rich). Only a VALUE edit
+ * replaces the displayed text — a link-only entry's `value` is the unedited
+ * cell's raw text. Diff mode needs a trustworthy "before": a base_pending
+ * entry's base is a placeholder until its page lands, so it shows the new
+ * value alone.
+ */
+function dirty_value_overlay_fields(
+    dirty: DirtyEntry,
+    diff_mode: boolean,
+): { dirty_value: string; diff_base?: string } | undefined {
+    if (!dirty_entry_value_changed(dirty)) return undefined;
+    return {
+        dirty_value: dirty.value,
+        ...(diff_mode && !dirty.base_pending ? { diff_base: dirty.base } : {}),
+    };
+}
+
 import { use_row_loader } from './use-row-loader';
 import { theme_font_size_px, use_vscode_theme } from './vscode-theme';
 import { host_bridge, pending_edit_durability } from './host-bridge';
@@ -390,6 +410,9 @@ export interface GridShellProps {
     // Editing (Phase E). edit_mode is App-controlled (toolbar toggle); editing is
     // only possible when csv_editable.
     edit_mode?: boolean;
+    /** Diff toolbar toggle: dirty cells paint before/after instead of just the
+     *  new value. App-owned so it survives Edit off/on within the session. */
+    diff_mode?: boolean;
     /** Parent-owned identity of the committed edit-mode activation. */
     edit_activation_id: number;
     csv_editable?: boolean;
@@ -532,6 +555,7 @@ export function GridShell({
     merges,
     preview_mode = false,
     edit_mode = false,
+    diff_mode = false,
     edit_activation_id,
     csv_editable = false,
     highlight_in_flight = false,
@@ -587,7 +611,14 @@ export function GridShell({
         highContrast: high_contrast,
         dirtyBg: dirty_bg,
         conflictBg: conflict_bg,
+        diffDeletedFg: diff_deleted_fg,
+        diffAddedFg: diff_added_fg,
     } = use_vscode_theme();
+    // Stable object for build_grid_cell / the paint closure's dep array.
+    const diff_colors = useMemo(
+        () => ({ deleted: diff_deleted_fg, added: diff_added_fg }),
+        [diff_deleted_fg, diff_added_fg],
+    );
     // The configured font size, resolved once from the theme so cell painting,
     // canvas measurement, and default row heights all agree.
     const font_size_px = theme_font_size_px(theme);
@@ -2169,15 +2200,14 @@ export function GridShell({
                 font_size_px,
                 dirty
                     ? {
-                        ...(dirty_entry_value_changed(dirty)
-                            ? { dirty_value: dirty.value }
-                            : {}),
+                        ...dirty_value_overlay_fields(dirty, diff_mode),
                         ...(edit_syntax === 'markdown' && dirty.valueRuns
                             ? { dirty_rich: dirty.valueRuns }
                             : {}),
                     }
                     : undefined,
                 soft_wrap,
+                diff_colors,
             );
 
             let overflows: boolean;
@@ -2258,6 +2288,8 @@ export function GridShell({
             get_cell_width,
             show_formatting,
             edit_syntax,
+            diff_mode,
+            diff_colors,
             source_column_for_display,
             store,
         ],
@@ -2443,14 +2475,7 @@ export function GridShell({
                     // and it does reach this branch, via highlight_bg, which is
                     // plain view state independent of edit mode.
                     refused: editable_cells && source_row === undefined,
-                    // Only a VALUE edit replaces the displayed text. A
-                    // link-only entry's `value` is the unedited cell's raw
-                    // text, and substituting it would swap a formatted
-                    // number/date for its raw form even though the save
-                    // deliberately emits no text edit for that cell.
-                    ...(dirty && dirty_entry_value_changed(dirty)
-                        ? { dirty_value: dirty.value }
-                        : {}),
+                    ...(dirty ? dirty_value_overlay_fields(dirty, diff_mode) : {}),
                     ...(edit_syntax === 'markdown' && dirty?.valueRuns
                         ? { dirty_rich: dirty.valueRuns }
                         : {}),
@@ -2480,6 +2505,7 @@ export function GridShell({
                 auto_fit_active
                     || get_cell_height(row, display_column) > default_row_height,
                 link_modifier_held,
+                diff_colors,
             );
         },
         // version: bumps when a page lands so the closure (and the redraw effect) refresh.
@@ -2503,6 +2529,8 @@ export function GridShell({
             // damages the cells already painted with the old ones).
             dirty_bg,
             conflict_bg,
+            diff_colors,
+            diff_mode,
             high_contrast,
         ],
     );
@@ -3771,6 +3799,10 @@ export function GridShell({
         // happen to be damaged for some other reason.
         dirty_bg,
         conflict_bg,
+        // The Diff toggle (and its theme colors) change what dirty cells
+        // paint, so flipping it must damage the already-painted ones too.
+        diff_mode,
+        diff_colors,
     ]);
 
     // Targeted tint repaint: damage only the cells whose dirty/conflict tint

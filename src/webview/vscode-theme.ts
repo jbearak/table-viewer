@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { Theme } from './glide-data-grid';
+import { DIFF_FALLBACK_COLORS } from './cell-renderer';
 
 /**
  * Builds a Glide `Partial<Theme>` from VS Code's `--vscode-*` CSS variables so
@@ -172,6 +173,31 @@ export function build_edit_tints_from_vars(get: VarGetter): GridEditTints {
     };
 }
 
+export interface GridDiffColors {
+    /** Text color for the "before" side of a Diff-mode cell. */
+    diffDeletedFg: string;
+    /** Text color for the "after" side of a Diff-mode cell. */
+    diffAddedFg: string;
+}
+
+/** Diff mode paints text, not tint, so these are the theme's foregrounds read
+ *  verbatim — no alpha re-emission (same injected-getter shape as the tints,
+ *  for the same jsdom reason). Fallbacks are cell-renderer's own defaults, so
+ *  a themed host and a bare one agree on the no-variable colors. */
+export function build_diff_colors_from_vars(get: VarGetter): GridDiffColors {
+    const v = var_reader(get);
+    return {
+        diffDeletedFg: v(
+            '--vscode-gitDecoration-deletedResourceForeground',
+            DIFF_FALLBACK_COLORS.deleted,
+        ),
+        diffAddedFg: v(
+            '--vscode-gitDecoration-addedResourceForeground',
+            DIFF_FALLBACK_COLORS.added,
+        ),
+    };
+}
+
 export function build_theme_from_vars(
     get: VarGetter,
     high_contrast = false,
@@ -251,7 +277,7 @@ export function is_vscode_high_contrast(body: HTMLElement = document.body): bool
         || body.classList.contains('vscode-high-contrast-light');
 }
 
-export interface VscodeGridTheme extends GridEditTints {
+export interface VscodeGridTheme extends GridEditTints, GridDiffColors {
     theme: Partial<Theme>;
     highContrast: boolean;
 }
@@ -267,6 +293,7 @@ function read_vscode_grid_theme(
     return {
         theme: build_theme_from_vars(get, high_contrast),
         ...build_edit_tints_from_vars(get),
+        ...build_diff_colors_from_vars(get),
         highContrast: high_contrast,
     };
 }

@@ -84,6 +84,8 @@ export interface ToolbarProps {
     auto_fit_disabled_reason?: string;
     auto_fit_scope_menu?: ToolbarScopeMenu;
     edit_mode: boolean;
+    diff_mode: boolean;
+    on_toggle_diff_mode: () => void;
     is_dirty: boolean;
     on_toggle_edit_mode: () => void;
     show_edit_button: boolean;
@@ -115,6 +117,21 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
     // Edit changes how the table behaves rather than how the active worksheet is
     // displayed, so it stands alone to the left of the divider.
     const edit_actions = [
+        // Diff only means anything while edits exist to compare, so it appears
+        // with edit mode and disappears with it — its state (App-owned)
+        // survives the round trip.
+        props.show_edit_button && props.edit_mode && (
+            <ToolbarButton
+                key="diff"
+                label="Diff"
+                active={props.diff_mode}
+                tooltip_text={props.diff_mode
+                    ? 'Show edited cells’ new values only.'
+                    : 'Show before and after for edited cells.'}
+                onClick={props.on_toggle_diff_mode}
+                on_action_complete={props.on_action_complete}
+            />
+        ),
         props.show_edit_button && (
             <ToolbarButton
                 key="edit"

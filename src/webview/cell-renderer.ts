@@ -1,8 +1,14 @@
 import { GridCellKind, direction, type CustomCell, type GridCell } from './glide-data-grid';
 import type { RenderedCell } from '../data-source/interface';
 import { rich_text_from_plain, type CellTextStyle, type RichText } from '../cell-content';
-import { has_line_break, normalize_line_breaks } from './line-breaks';
-import { rich_text_lines, type RichCellData } from './rich-text-layout';
+import { has_line_break, normalize_line_breaks, split_lines } from './line-breaks';
+import {
+    rich_text_lines,
+    type RichCellData,
+    type RichTextLine,
+    type RichTextSegment,
+} from './rich-text-layout';
+import { choose_diff_mode, word_diff } from './word-diff';
 
 /**
  * Cell-content construction for the Glide grid. Pure (no canvas, no Glide
@@ -64,6 +70,9 @@ export interface CellEditOverlay {
     dirty_rich?: RichText;
     /** themeOverride background tint for dirty / conflicted cells. */
     bg?: string;
+    /** Diff toggle is on and this cell has a value edit: the pre-edit text to
+     * show before/against `dirty_value`. Always accompanied by `dirty_value`. */
+    diff_base?: string;
     /** Open Glide's edit overlay on this cell. */
     editable?: boolean;
     /**
@@ -113,6 +122,61 @@ export function needs_rich_renderer(c: RenderedCell): boolean {
         || c.strikethrough === true;
 }
 
+/** Resolved theme colors for Diff mode's before/after text. Literal strings
+ *  (GridShell resolves them from the VS Code theme) so this module stays
+ *  theme-free; the fallbacks keep it independently testable. */
+export interface DiffColors {
+    readonly deleted: string;
+    readonly added: string;
+}
+
+/** The spec colors for deleted/added text when the theme provides none —
+ *  also the defaults below, keeping this module independently testable.
+ *  vscode-theme.ts imports these so the two cannot drift. */
+export const DIFF_FALLBACK_COLORS: DiffColors = { deleted: 'red', added: 'green' };
+
+/** Separator between the before and after halves of an arrow-form diff. */
+const DIFF_ARROW = ' -> ';
+
+/**
+ * Visual lines for a Diff-mode cell. Numbers and short values render as
+ * `old -> new` (old in the deletion color, new in the addition color); longer
+ * text gets an inline word diff with deleted words struck through. Splits on
+ * hard breaks the way rich_text_lines does, so multiline values lay out
+ * exactly like every other rich cell.
+ */
+export function diff_lines(
+    base: string,
+    value: string,
+    raw_type: RenderedCell['rawType'],
+    colors: DiffColors,
+): RichTextLine[] {
+    const parts = choose_diff_mode(base, value, raw_type) === 'arrow'
+        ? [
+            { text: base, kind: 'deleted' as const },
+            { text: DIFF_ARROW, kind: 'unchanged' as const },
+            { text: value, kind: 'added' as const },
+        ]
+        : word_diff(base, value);
+    const lines: RichTextSegment[][] = [[]];
+    for (const part of parts) {
+        const pieces = split_lines(part.text);
+        for (let i = 0; i < pieces.length; i++) {
+            if (i > 0) lines.push([]);
+            if (pieces[i] === '') continue;
+            lines[lines.length - 1].push({
+                text: pieces[i],
+                ...(part.kind === 'deleted'
+                    ? { style: { strikethrough: true as const }, diff_color: colors.deleted }
+                    : part.kind === 'added'
+                        ? { diff_color: colors.added }
+                        : {}),
+            });
+        }
+    }
+    return lines;
+}
+
 /** Memoized rich cells: build_grid_cell is Glide's per-cell paint callback
  *  (every visible cell, every frame, no caching above it), and splitting runs
  *  into lines allocates. RenderedCells are immutable and shared by reference
@@ -135,8 +199,11 @@ function rich_cell(
     font_size_px: number,
     soft_wrap = false,
     link_modifier_held = false,
+    diff_colors: DiffColors = DIFF_FALLBACK_COLORS,
 ): CustomCell<RichCellData> {
-    const can_cache = overlay?.dirty_rich === undefined && overlay?.dirty_value === undefined;
+    const can_cache = overlay?.dirty_rich === undefined
+        && overlay?.dirty_value === undefined
+        && overlay?.diff_base === undefined;
     const cached = can_cache ? rich_cell_cache.get(c) : undefined;
     let cell = cached !== undefined
         && cached.cell.data.font_size_px === font_size_px
@@ -152,7 +219,11 @@ function rich_cell(
         // effective row/merge height exceeds one default row.
         const display = overlay?.dirty_value
             ?? (show_formatting ? c.formatted : (c.raw ?? ''));
-        const allow_wrapping = cell_allows_wrapping(display, soft_wrap);
+        // The wrap heuristic looks at everything the cell will paint: for a
+        // diff cell that includes the old text, whose hard breaks must still
+        // trigger the multiline path even when the new value has none.
+        const allow_wrapping = cell_allows_wrapping(display, soft_wrap)
+            || (overlay?.diff_base !== undefined && has_line_break(overlay.diff_base));
         // Whole-cell flags become one styled run for link/underline-only
         // cells. With formatting off only the link presentation survives
         // (mirroring the Text path dropping bold/italic): plain runs, and the
@@ -165,18 +236,24 @@ function rich_cell(
                 ...(c.strikethrough ? { strikethrough: true as const } : {}),
             }
             : undefined;
-        const runs = show_formatting && overlay?.dirty_rich
-            ? overlay.dirty_rich.runs
-            : overlay?.dirty_value !== undefined
-                ? rich_text_from_plain(display).runs
-            : (show_formatting && c.richText
-                ? c.richText.runs
-                : rich_text_from_plain(display, style).runs);
+        // Diff first: while the toggle is on, before/after replaces every other
+        // spelling of a dirty cell's content, including its markdown runs.
+        const lines = overlay?.diff_base !== undefined
+            ? diff_lines(overlay.diff_base, display, c.rawType, diff_colors)
+            : rich_text_lines(
+                show_formatting && overlay?.dirty_rich
+                    ? overlay.dirty_rich.runs
+                    : overlay?.dirty_value !== undefined
+                        ? rich_text_from_plain(display).runs
+                    : (show_formatting && c.richText
+                        ? c.richText.runs
+                        : rich_text_from_plain(display, style).runs),
+            );
         cell = {
             kind: GridCellKind.Custom,
             data: {
                 kind: 'rich-text',
-                lines: rich_text_lines(runs),
+                lines,
                 ...(c.hyperlink ? { hyperlink: c.hyperlink } : {}),
                 font_size_px,
                 ...(allow_wrapping ? { allow_wrapping: true as const } : {}),
@@ -238,10 +315,12 @@ export function rich_cell_display_data(
     font_size_px: number = DEFAULT_CELL_FONT_SIZE_PX,
     overlay?: CellEditOverlay,
     soft_wrap = false,
+    diff_colors: DiffColors = DIFF_FALLBACK_COLORS,
 ): RichCellData | undefined {
     if (
         !(c && renders_rich(c, show_formatting))
         && !(show_formatting && overlay?.dirty_rich !== undefined)
+        && overlay?.diff_base === undefined
     ) return undefined;
     return rich_cell(
         c ?? EMPTY_CELL,
@@ -249,6 +328,8 @@ export function rich_cell_display_data(
         overlay,
         font_size_px,
         soft_wrap,
+        false,
+        diff_colors,
     ).data;
 }
 
@@ -339,6 +420,7 @@ export function build_grid_cell(
     font_size_px: number = DEFAULT_CELL_FONT_SIZE_PX,
     soft_wrap = false,
     link_modifier_held = false,
+    diff_colors: DiffColors = DIFF_FALLBACK_COLORS,
 ): GridCell {
     const c = cells?.[col];
     if (!c && !overlay) return BLANK;
@@ -354,6 +436,9 @@ export function build_grid_cell(
     if (
         (c && renders_rich(c, show_formatting))
         || (show_formatting && overlay?.dirty_rich !== undefined)
+        // Diff mode paints mixed colors and strikethrough, which only the
+        // rich renderer can draw — regardless of the Formatting toggle.
+        || overlay?.diff_base !== undefined
     ) {
         return rich_cell(
             c ?? EMPTY_CELL,
@@ -362,6 +447,7 @@ export function build_grid_cell(
             font_size_px,
             soft_wrap,
             link_modifier_held,
+            diff_colors,
         );
     }
     return text_cell(c ?? EMPTY_CELL, show_formatting, overlay, font_size_px, soft_wrap);
