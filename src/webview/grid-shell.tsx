@@ -2148,6 +2148,12 @@ export function GridShell({
             const loaded = source_column === undefined
                 ? null
                 : get_row(row)?.[source_column] ?? null;
+            // Hover bounds are client-space geometry. A fractional canvas scale
+            // can make a default 24px row arrive as 24.5px, which must not turn
+            // every single-line cell into a soft-wrapped cell. Read the same
+            // logical (merge-aware) geometry used by build_grid_cell instead.
+            const cell_height = get_cell_height(row, display_column);
+            const cell_width = get_cell_width(row, display_column);
             // Measure the same effective payload the grid paints. In particular,
             // a pending Markdown edit may introduce styled runs into a plain or
             // blank cell, and an empty dirty value must suppress persisted runs.
@@ -2165,19 +2171,13 @@ export function GridShell({
                             : {}),
                     }
                     : undefined,
+                cell_height > default_row_height,
             );
-            // Hover bounds are client-space geometry. A fractional canvas scale
-            // can make a default 24px row arrive as 24.5px, which must not turn
-            // every single-line cell into a soft-wrapped cell. Read the same
-            // logical (merge-aware) height used by build_grid_cell instead, so
-            // painting and tooltip overflow choose the same wrapping mode.
-            const cell_height = get_cell_height(row, display_column);
-            const cell_width = get_cell_width(row, display_column);
 
             let overflows: boolean;
             if (rich_data) {
-                // The rich renderer draws hard breaks only and uses per-run
-                // fonts; the overflow check must match or the tooltip lies.
+                // Rich paint and hover measurement share both the run-aware
+                // layout and the payload's effective wrapping decision.
                 overflows = rich_text_overflows_cell(
                     rich_data.lines,
                     cell_width,
@@ -2189,6 +2189,7 @@ export function GridShell({
                     {
                         cell_height,
                         line_height: line_height_for_font(font_size_px),
+                        wrapping: rich_data.allow_wrapping === true,
                     },
                 );
             } else {

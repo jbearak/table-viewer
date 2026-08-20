@@ -149,7 +149,8 @@ vi.mock('../webview/glide-data-grid', () => {
                 tabIndex: 0,
             });
         }),
-        GridCellKind: { Text: 'text' },
+        GridCellKind: { Text: 'text', Custom: 'custom' },
+        direction: () => 'ltr',
     };
 });
 
@@ -478,6 +479,38 @@ describe('GridShell cell wrapping', () => {
         expect(get_cell_content([0, 0]).allowWrapping).toBe(true);
         // The neighboring ordinary cell is still only one default row high.
         expect(get_cell_content([1, 0]).allowWrapping).toBeUndefined();
+    });
+
+    it('passes a manually enlarged row wrapping decision into a rich cell', async () => {
+        const text = 'A long information-note paragraph with styled labels';
+        grid_mock.get_row.mockImplementation(() => [
+            null,
+            {
+                raw: text,
+                formatted: text,
+                bold: false,
+                italic: false,
+                richText: {
+                    runs: [
+                        { text: 'A long information-note paragraph with ' },
+                        { text: 'styled labels', style: { bold: true } },
+                    ],
+                },
+            },
+        ] as any);
+        await render_grid(props({
+            show_formatting: true,
+            row_heights: { 0: 80 },
+            column_projection: {
+                visible_to_source: [0, 1, 2],
+                source_to_visible: [0, 1, 2],
+                hidden_count: 0,
+            },
+        }));
+
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => { data?: { allow_wrapping?: true } };
+        expect(get_cell_content([1, 0]).data?.allow_wrapping).toBe(true);
     });
 });
 

@@ -276,6 +276,53 @@ describe('build_grid_cell — rich cells', () => {
         ]);
     });
 
+    it('updates rich wrapping when the same cached source row becomes tall', () => {
+        type RichResult = { data: { allow_wrapping?: true } };
+        const short = build_grid_cell(
+            0, rich_row, true, undefined, 13, false,
+        ) as unknown as RichResult;
+        const tall = build_grid_cell(
+            0, rich_row, true, undefined, 13, true,
+        ) as unknown as RichResult;
+        const short_again = build_grid_cell(
+            0, rich_row, true, undefined, 13, false,
+        ) as unknown as RichResult;
+
+        expect(short.data.allow_wrapping).toBeUndefined();
+        expect(tall.data.allow_wrapping).toBe(true);
+        expect(short_again.data.allow_wrapping).toBeUndefined();
+        expect(tall).not.toBe(short);
+    });
+
+    it('wraps a Formatting-off hyperlink when its row is tall', () => {
+        const linked = build_grid_cell(
+            1, rich_row, false, undefined, 13, true,
+        ) as unknown as { data: { allow_wrapping?: true } };
+        expect(linked.data.allow_wrapping).toBe(true);
+    });
+
+    it('requests width wrapping for the Undesa-style rich information note', () => {
+        const display = 'A long introductory paragraph.\r\n\r\nNotes More long prose.';
+        const information_note: RenderedCell = {
+            raw: display,
+            formatted: display,
+            bold: false,
+            italic: false,
+            richText: {
+                runs: [
+                    { text: 'A long introductory paragraph.\r\n\r\n' },
+                    { text: 'Notes', style: { bold: true } },
+                    { text: ' More long prose.' },
+                ],
+            },
+        };
+        const c = build_grid_cell(0, [information_note], true) as unknown as {
+            data: { allow_wrapping?: true; lines: unknown[] };
+        };
+        expect(c.data.allow_wrapping).toBe(true);
+        expect(c.data.lines).toHaveLength(3);
+    });
+
     it('synthesizes a whole-cell styled run for a link/underline-only cell', () => {
         const c = rich(2) as unknown as { data: { lines: unknown[] } };
         expect(c.data.lines).toEqual([

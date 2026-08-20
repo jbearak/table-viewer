@@ -5,10 +5,9 @@
  * theme's link color with an underline, Excel-style.
  *
  * The cell data is pure and canvas-free (built by cell-renderer.ts); all
- * measurement happens here against Glide's cached text metrics so drawing and
- * column auto-fit agree. Rich cells draw hard line breaks only — no soft wrap
- * in v1 (that would need a run-aware re-implementation of Glide's wrap
- * layout).
+ * measurement happens here against Glide's cached text metrics. Drawing can
+ * width-wrap styled runs when the cell has enough vertical space; column
+ * auto-fit deliberately keeps measuring the natural, unwrapped hard lines.
  */
 import {
     GridCellKind,
@@ -20,7 +19,12 @@ import {
 } from './glide-data-grid';
 import type { CellTextStyle } from '../cell-content';
 import { canvas_font } from './fit-column-model';
-import { rich_lines_max_width, type RichCellData } from './rich-text-layout';
+import {
+    rich_lines_max_width,
+    wrap_rich_text_lines,
+    type RichCellData,
+    type RichTextLine,
+} from './rich-text-layout';
 
 export type { RichCellData } from './rich-text-layout';
 
@@ -56,6 +60,96 @@ function variant_of(
     return variants[(style?.bold ? 1 : 0) | (style?.italic ? 2 : 0)];
 }
 
+interface WrappedLayoutCacheEntry {
+    readonly available_width: number;
+    readonly font_family: string;
+    readonly font_size_px: number;
+    readonly font_metrics_generation: number;
+    readonly lines: readonly RichTextLine[];
+}
+
+/** RichCellData is stable through cell-renderer's WeakMap cache. Keep only the
+ * latest width/font layout per payload: column resizing invalidates by width,
+ * while old payloads and their wrapped lines die together. FontFaceSet events
+ * advance a generation so a load that completes entirely between grid draws
+ * still invalidates layouts measured with fallback metrics. */
+const wrapped_layout_cache = new WeakMap<RichCellData, WrappedLayoutCacheEntry>();
+let observed_font_set: FontFaceSet | undefined;
+let font_metrics_generation = 0;
+
+const advance_font_metrics_generation = (): void => {
+    font_metrics_generation++;
+};
+
+function current_font_set(): FontFaceSet | undefined {
+    const fonts = typeof document === 'undefined' ? undefined : document.fonts;
+    if (fonts === observed_font_set) return fonts;
+
+    observed_font_set?.removeEventListener?.(
+        'loadingdone',
+        advance_font_metrics_generation,
+    );
+    observed_font_set = fonts;
+    observed_font_set?.addEventListener?.(
+        'loadingdone',
+        advance_font_metrics_generation,
+    );
+    // A new document/font set has unrelated metrics even when it is already
+    // loaded (also makes SSR-to-browser hydration invalidate safely).
+    font_metrics_generation++;
+    return fonts;
+}
+
+function visual_lines(
+    ctx: CanvasRenderingContext2D,
+    data: RichCellData,
+    available_width: number,
+    font_family: string,
+    variants: readonly [string, string, string, string],
+): readonly RichTextLine[] {
+    if (data.allow_wrapping !== true) return data.lines;
+    const fonts_before = current_font_set();
+    const generation_before = font_metrics_generation;
+    const fonts_loading_before = fonts_before?.status === 'loading';
+    const cached = wrapped_layout_cache.get(data);
+    if (
+        !fonts_loading_before
+        && cached?.available_width === available_width
+        && cached.font_family === font_family
+        && cached.font_size_px === data.font_size_px
+        && cached.font_metrics_generation === generation_before
+    ) return cached.lines;
+
+    const lines = wrap_rich_text_lines(data.lines, available_width, (text, style) => {
+        ctx.font = variant_of(variants, style);
+        // Wrapping probes transient prefixes while finding a grapheme boundary.
+        // The completed layout is cached below, so putting every probe in Glide's
+        // global text-metrics cache would retain large one-use strings.
+        return ctx.measureText(text).width;
+    });
+    const fonts_after = current_font_set();
+    const fonts_loading_after = fonts_after?.status === 'loading';
+    if (
+        fonts_loading_before
+        || fonts_loading_after
+        || font_metrics_generation !== generation_before
+    ) {
+        // `measureText` itself can initiate an unused face/weight load. Never
+        // retain that fallback-derived layout; Glide's font-ready redraw rebuilds
+        // it, while loadingdone advances the generation for between-draw loads.
+        wrapped_layout_cache.delete(data);
+    } else {
+        wrapped_layout_cache.set(data, {
+            available_width,
+            font_family,
+            font_size_px: data.font_size_px,
+            font_metrics_generation: generation_before,
+            lines,
+        });
+    }
+    return lines;
+}
+
 export const rich_text_cell_renderer: CustomRenderer<RichTextGridCell> = {
     kind: GridCellKind.Custom,
     isMatch: is_rich_text_cell,
@@ -70,14 +164,21 @@ export const rich_text_cell_renderer: CustomRenderer<RichTextGridCell> = {
         const data = cell.data;
         const { x, y, width: w, height: h } = rect;
         const linked = data.hyperlink !== undefined;
+        const variants = font_variants(data.font_size_px, theme.fontFamily);
+        const available_width = Math.max(0, w - 2 * theme.cellHorizontalPadding);
+        const lines = visual_lines(ctx, data, available_width, theme.fontFamily, variants);
 
+        // Rich layout measurement selects per-run fonts. Glide's draw loop set
+        // the base font on entry; restore it before deriving the shared line
+        // metrics and before save() captures the canvas state.
+        ctx.font = theme.baseFontFull;
         // Mirrors drawMultiLineText's vertical layout so a rich cell lines up
         // with its plain neighbours: em-box line metric from the base font,
         // theme line height, center the block, clip anything that spills.
         const em_height = getEmHeight(ctx, theme.baseFontFull);
         const line_height = theme.lineHeight * em_height;
         const bias = getMiddleCenterBias(ctx, theme);
-        const actual_height = em_height + line_height * (data.lines.length - 1);
+        const actual_height = em_height + line_height * (lines.length - 1);
 
         // Glide's draw loop already clips each column horizontally, so a local
         // clip is only needed when the line block can spill vertically into
@@ -96,22 +197,22 @@ export const rich_text_cell_renderer: CustomRenderer<RichTextGridCell> = {
         const rtl = data.rtl === true;
         if (rtl) ctx.direction = 'rtl';
 
-        const variants = font_variants(data.font_size_px, theme.fontFamily);
         const left = x + theme.cellHorizontalPadding + 0.5;
         const right = x + w - theme.cellHorizontalPadding;
         const optimal_y = y + h / 2 - actual_height / 2;
         let draw_y = Math.max(y + theme.cellVerticalPadding, optimal_y);
-        // Longest run of glyphs that can possibly fit; the same 4px/char floor
-        // Glide's truncateString uses, applied per segment below.
+        // Disabled-wrap safety cap: the same 4px/char floor Glide's
+        // truncateString uses. Wrapped cells already split over-wide words.
         const max_chars = Math.ceil(w / 4);
         let last_font: string | null = null;
 
-        for (const line of data.lines) {
+        for (const line of lines) {
             const text_y = draw_y + em_height / 2 + bias;
             let pen_x = rtl ? right : left;
             for (const segment of line) {
                 if (rtl ? pen_x <= left : pen_x >= right) break;
-                const truncated = segment.text.length > max_chars;
+                const truncated = data.allow_wrapping !== true
+                    && segment.text.length > max_chars;
                 const text = truncated
                     ? segment.text.slice(0, max_chars)
                     : segment.text;

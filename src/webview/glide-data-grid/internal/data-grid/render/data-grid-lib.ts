@@ -305,12 +305,19 @@ let metricsSize = 0;
 let metricsCache: Record<string, TextMetrics | undefined> = {};
 const isSSR = typeof window === "undefined";
 
-async function clearCacheOnLoad() {
-    if (isSSR || document?.fonts?.ready === undefined) return;
-    await document.fonts.ready;
+/** Fork addition: discard every font-dependent text cache before a redraw that
+ * follows web-font loading. Later face/weight cycles need the same invalidation
+ * as the initial document.fonts.ready cycle. */
+export function clearTextMetricsCache(): void {
     metricsSize = 0;
     metricsCache = {};
     clearCache();
+}
+
+async function clearCacheOnLoad() {
+    if (isSSR || document?.fonts?.ready === undefined) return;
+    await document.fonts.ready;
+    clearTextMetricsCache();
 }
 
 void clearCacheOnLoad();

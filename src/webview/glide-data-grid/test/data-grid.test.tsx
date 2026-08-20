@@ -1,8 +1,8 @@
 import * as React from "react";
-import { render, fireEvent, screen, cleanup } from "@testing-library/react";
+import { act, render, fireEvent, screen, cleanup } from "@testing-library/react";
 import DataGrid, { type DataGridProps, type DataGridRef } from "../internal/data-grid/data-grid.js";
 import { CompactSelection, GridCellKind } from "../internal/data-grid/data-grid-types.js";
-import { getDefaultTheme } from "../index.js";
+import { getDefaultTheme, measureTextCached } from "../index.js";
 import { AllCellRenderers } from "../cells/index.js";
 import { vi, expect, describe, test, beforeEach, afterEach } from "vitest";
 import ImageWindowLoaderImpl from "../common/image-window-loader.js";
@@ -336,6 +336,71 @@ describe("data-grid", () => {
                 location: [2, -2],
             })
         );
+    });
+
+    test("Redraws after a later web-font load completes", async () => {
+        const fontsDescriptor = Object.getOwnPropertyDescriptor(document, "fonts");
+        let ready = Promise.resolve({} as FontFaceSet);
+        const loadingDoneListeners = new Set<() => void>();
+        const fonts = {
+            get ready() {
+                return ready;
+            },
+            addEventListener(type: string, listener: () => void) {
+                if (type === "loadingdone") loadingDoneListeners.add(listener);
+            },
+            removeEventListener(type: string, listener: () => void) {
+                if (type === "loadingdone") loadingDoneListeners.delete(listener);
+            },
+        };
+        Object.defineProperty(document, "fonts", {
+            configurable: true,
+            value: fonts,
+        });
+        const spy = vi.fn(basicProps.getCellContent);
+
+        try {
+            await act(async () => {
+                render(<DataGrid {...basicProps} getCellContent={spy} />);
+                await ready;
+            });
+            spy.mockClear();
+
+            let measuredWidth = 10;
+            const measureContext = {
+                font: "13px FontCycleProbe",
+                measureText: () => ({ width: measuredWidth }) as TextMetrics,
+            } as unknown as CanvasRenderingContext2D;
+            expect(measureTextCached(
+                "font-ready-cache-probe",
+                measureContext,
+                measureContext.font,
+            ).width).toBe(10);
+
+            // A later face/weight gets its own FontFaceSet.ready promise. The
+            // completion event must clear fallback metrics and trigger a grid
+            // draw without user damage.
+            measuredWidth = 20;
+            ready = Promise.resolve({} as FontFaceSet);
+            await act(async () => {
+                for (const listener of loadingDoneListeners) listener();
+                await ready;
+            });
+
+            expect(spy).toHaveBeenCalled();
+            expect(measureTextCached(
+                "font-ready-cache-probe",
+                measureContext,
+                measureContext.font,
+            ).width).toBe(20);
+        } finally {
+            cleanup();
+            if (fontsDescriptor) {
+                Object.defineProperty(document, "fonts", fontsDescriptor);
+            } else {
+                Reflect.deleteProperty(document, "fonts");
+            }
+        }
     });
 
     test("Simple damage", () => {

@@ -225,4 +225,39 @@ describe('rich_text_overflows_cell', () => {
             { cell_height: 3 * CELL_TOOLTIP_LINE_HEIGHT_PX, line_height: CELL_TOOLTIP_LINE_HEIGHT_PX },
         )).toBe(true);
     });
+
+    it('uses wrapped rich lines for the vertical height budget', () => {
+        const cell_width = 4 + 2 * CELL_TOOLTIP_HORIZONTAL_PADDING_PX;
+        const lines = [[{ text: 'aa bb' }]];
+        expect(rich_text_overflows_cell(lines, cell_width, rich_measure, {
+            wrapping: true,
+            cell_height: 2 * CELL_TOOLTIP_LINE_HEIGHT_PX + CELL_TOOLTIP_HORIZONTAL_PADDING_PX,
+            line_height: CELL_TOOLTIP_LINE_HEIGHT_PX,
+        })).toBe(false);
+        expect(rich_text_overflows_cell(lines, cell_width, rich_measure, {
+            wrapping: true,
+            cell_height: CELL_TOOLTIP_LINE_HEIGHT_PX + CELL_TOOLTIP_HORIZONTAL_PADDING_PX,
+            line_height: CELL_TOOLTIP_LINE_HEIGHT_PX,
+        })).toBe(true);
+    });
+
+    it('still reports the natural horizontal overflow when wrapping is disabled', () => {
+        const cell_width = 4 + 2 * CELL_TOOLTIP_HORIZONTAL_PADDING_PX;
+        expect(rich_text_overflows_cell(
+            [[{ text: 'aa bb' }]],
+            cell_width,
+            rich_measure,
+            { wrapping: false, cell_height: 100 },
+        )).toBe(true);
+    });
+
+    it('reports a grapheme that remains wider than the wrapped line', () => {
+        const emoji_measure = (text: string): number => text === '😀' ? 10 : text.length;
+        expect(rich_text_overflows_cell(
+            [[{ text: '😀' }]],
+            5 + 2 * CELL_TOOLTIP_HORIZONTAL_PADDING_PX,
+            emoji_measure,
+            { wrapping: true, cell_height: 100 },
+        )).toBe(true);
+    });
 });
