@@ -1457,6 +1457,24 @@ describe('apply_cell_edits', () => {
         expect(Buffer.from(out).toString('utf8')).toBe('caféABR');
     });
 
+    it('rejects invalid or overlapping splice ranges before allocation', () => {
+        const xml = Buffer.from('abcdef', 'utf8');
+
+        expect(() => apply_utf8_splices(xml, [
+            { start: 1, end: 4, text: 'x' },
+            { start: 3, end: 5, text: 'y' },
+        ])).toThrow(/overlapping UTF-8 splice/i);
+        expect(() => apply_utf8_splices(xml, [
+            { start: 4, end: 3, text: 'x' },
+        ])).toThrow(/invalid UTF-8 splice range/i);
+        expect(() => apply_utf8_splices(xml, [
+            { start: -1, end: 0, text: 'x' },
+        ])).toThrow(/invalid UTF-8 splice range/i);
+        expect(() => apply_utf8_splices(xml, [
+            { start: 0, end: xml.length + 1, text: 'x' },
+        ])).toThrow(/invalid UTF-8 splice range/i);
+    });
+
     it('applies several edits across rows in one pass', () => {
         const out = apply_cell_edits(
             doc('<row r="1"><c r="A1"><v>1</v></c></row><row r="2"><c r="B2"><v>2</v></c></row>'),

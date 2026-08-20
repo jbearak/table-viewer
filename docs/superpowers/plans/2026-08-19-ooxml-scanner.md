@@ -52,7 +52,7 @@ The last one is a **live bug**, not a refusal. `parse_cell_ref`
 `letter_to_index` (`xlsx-cell-write.ts:734`) does `charCodeAt(i) - 64`, which for
 `'a'` (97) yields **column 32**, not 0. Verified by running both:
 
-```
+```text
 a1   reader=REJECTED       writer_col=32
 A0   reader=row -1 col 0   writer_col=0
 ```
@@ -71,7 +71,7 @@ coordinates in one place — `row_index_from_cell_reference` /
 charCode-range checked (`0x41`–`0x5a`) rather than regex-matched. That changes
 what Stage 5 inherits, so I re-probed the shared path directly:
 
-```
+```text
 A1        -> ["0:0"]          canonical control
 A0        -> ["-1:0"]         row 0 accepted, yields a negative row index
 a1        -> []               lowercase now dropped by BOTH sides
@@ -233,7 +233,7 @@ I verified it by running `grouped_formula_ranges`' two actual regexes
 (`xlsx-cell-write.ts:784` and `:786`) against hostile forms. **Three of four slip
 through:**
 
-```
+```text
 GUARDED    <f t="array" ref="A1:B2">
 UNGUARDED  <f t='array' ref='A1:B2'>       t= missed, ref missed
 UNGUARDED  <f t="array" ref='A1:B2'>       ref missed
@@ -302,7 +302,7 @@ Routing the writer's regexes through today's `get_attr` is **not sufficient**,
 and this is the most important thing the architecture review caught. I verified
 it against `get_attr` as written (`ooxml-xml.ts:35`):
 
-```
+```text
 A1     <c r="A1">                                    ok
 A1     <c r='A1'>                                    ok
 null   <c r = "A1">                                  MISSED (whitespace around =)
@@ -337,7 +337,7 @@ these cases, with a test per row of the table above.
 my brief had missed it. The writer did not only *read* attributes with
 double-quote-only regexes, it *rewrote* them that way:
 
-```
+```text
 / spans="[^"]*"/          removing a stale row span
 /\bref="[^"]*"/           widening the dimension
 ```
@@ -491,7 +491,7 @@ guard fires first and masks which guard is doing the work, so asserting
 copy and edited **B1 — a follower, not the master**, since a follower carries no
 `<f>` of its own and is protected solely by the grouped range:
 
-```
+```text
 array,  ref = "A1:B2"  (ws around =)   -> refused: part of an array formula
 array,  ref='A1:B2'    (single-quoted) -> refused: part of an array formula
 shared, ref="A1:B1"                    -> refused: part of a shared formula
@@ -602,7 +602,7 @@ master carrying `ref`.
   *default* namespace declared higher up rebinds every unprefixed child and is
   never examined:
 
-  ```
+  ```text
   sheetData xmlns="urn:other"  -> ACCEPTED   (edit written into a foreign namespace)
   worksheet  xmlns="urn:other" -> ACCEPTED   (same)
   row        xmlns="urn:other" -> REFUSED    (control: the guard does work)
@@ -892,7 +892,7 @@ overruled an architect, the reason is stated.
 
 ## Delegation and branch strategy
 
-```
+```text
 main
  └── issue153                     (integration branch, I own it)
       ├── issue153-s1-bench       → merge --no-ff at stage end

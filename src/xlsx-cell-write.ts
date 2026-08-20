@@ -1547,7 +1547,19 @@ export function apply_utf8_splices(xml: Uint8Array, splices: readonly Splice[]):
                 - (b.splice.end === b.splice.start ? 0 : 1))
             || (a.index - b.index));
     let length = xml.length;
+    let previous_end = 0;
     for (const { splice, bytes } of ordered) {
+        if (!Number.isSafeInteger(splice.start)
+            || !Number.isSafeInteger(splice.end)
+            || splice.start < 0
+            || splice.end < splice.start
+            || splice.end > xml.length) {
+            throw new RangeError(`Invalid UTF-8 splice range [${splice.start}, ${splice.end})`);
+        }
+        if (splice.start < previous_end) {
+            throw new RangeError(`Overlapping UTF-8 splice at byte ${splice.start}`);
+        }
+        previous_end = splice.end;
         length += bytes.length - (splice.end - splice.start);
     }
     const out = Buffer.allocUnsafe(length);
