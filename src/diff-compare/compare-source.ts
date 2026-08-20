@@ -1,10 +1,10 @@
 // Pure compare-session core for git table diffs. No vscode imports: everything
 // here operates on DataSource/WorkbookMeta values so it is unit-testable with
 // in-memory fixtures and shareable across hosts.
-import type { DataSource, WorkbookMeta } from '../data-source/interface';
+import type { DataSource, SheetMeta, WorkbookMeta } from '../data-source/interface';
 import { get_raw_cell_text } from '../cell-display';
 
-export type SheetPairStatus = 'matched' | 'added' | 'deleted';
+export type SheetPairStatus = SheetPairing['status'];
 
 /**
  * One entry per sheet of the *modified* workbook (in its sheet order), followed
@@ -46,11 +46,18 @@ export function pair_sheets(
     };
 
     const pairings: SheetPairing[] = modified.sheets.map((sheet, modified_index) => {
+        // Name fallback only when identity is genuinely unknown: two sheets that
+        // both expose stable worksheetIds that differ are different sheets, and a
+        // shared name must not glue them into a bogus cell diff.
+        const name_candidate = by_name.get(sheet.name);
+        const name_conflicts = sheet.worksheetId !== undefined
+            && name_candidate !== undefined
+            && original.sheets[name_candidate].worksheetId !== undefined;
         const original_index = claim(
             sheet.worksheetId !== undefined
                 ? by_worksheet_id.get(sheet.worksheetId)
                 : undefined,
-        ) ?? claim(by_name.get(sheet.name));
+        ) ?? (name_conflicts ? undefined : claim(name_candidate));
         return original_index === undefined
             ? { status: 'added', name: sheet.name, modifiedIndex: modified_index }
             : {
@@ -68,6 +75,31 @@ export function pair_sheets(
         });
     }
     return pairings;
+}
+
+/**
+ * Compare promoted column headers of a matched sheet pair. Both CSV and Excel
+ * sources can promote the first row into `columnNames`, taking it out of the
+ * grid's row space — so a header-only edit is invisible to `diff_row_window`.
+ * Returns the changed column indexes with the original header text (`''` when
+ * the column had no name or did not exist).
+ */
+export function diff_column_names(
+    original_sheet: Pick<SheetMeta, 'columnNames' | 'columnCount'>,
+    modified_sheet: Pick<SheetMeta, 'columnNames' | 'columnCount'>,
+): { col: number; base: string }[] {
+    const column_count = Math.max(
+        original_sheet.columnCount,
+        modified_sheet.columnCount,
+    );
+    const changed: { col: number; base: string }[] = [];
+    for (let col = 0; col < column_count; col++) {
+        const base = original_sheet.columnNames?.[col] ?? '';
+        if (base !== (modified_sheet.columnNames?.[col] ?? '')) {
+            changed.push({ col, base });
+        }
+    }
+    return changed;
 }
 
 /** A cell whose text differs between the sides; `base` is the original text. */
@@ -100,6 +132,10 @@ function raw_text(cell: { raw: string | null } | null | undefined): string {
  * Positionally compare one page of a matched sheet pair (row N vs row N of the
  * two sides' projected row spaces). Lazy: reads only the requested window from
  * each side, so cost is bounded by the page, never the file.
+ *
+ * Promoted header rows (CSV first row, Excel first-row header) are column
+ * names, not grid rows, so header edits are not reported here — callers use
+ * `diff_column_names` for those.
  */
 export function diff_row_window(
     original: DataSource,
@@ -118,7 +154,7 @@ export function diff_row_window(
     }
     const total_rows = Math.max(original_sheet.rowCount, modified_sheet.rowCount);
     const first = Math.max(0, start_row);
-    const end = Math.min(total_rows, start_row + count);
+    const end = Math.min(total_rows, first + count);
 
     const read_side = (
         source: DataSource,

@@ -20,11 +20,6 @@ export interface FromBufferOptions {
     ) => readonly (readonly number[] | undefined)[] | undefined;
 }
 
-/**
- * Build a DataSource for raw file bytes, dispatched on the path's extension the
- * same way `profile_for` dispatches profiles: `.csv`/`.tsv` → CSV (first row is
- * the header), `.xlsx` → OOXML, anything else → BIFF `.xls`.
- */
 /** CSV/TSV files conventionally carry column names in their first row, so the
  *  grid promotes it to the column header rather than showing letters. */
 export function csv_source_from_buffer(
@@ -37,6 +32,11 @@ export function csv_source_from_buffer(
     });
 }
 
+/**
+ * Build a DataSource for raw file bytes, dispatched on the path's extension the
+ * same way `profile_for` dispatches profiles: `.csv`/`.tsv` → CSV (first row is
+ * the header), `.xlsx` → OOXML, anything else → BIFF `.xls`.
+ */
 export async function build_source_from_buffer(
     raw: Uint8Array,
     file_path: string,
