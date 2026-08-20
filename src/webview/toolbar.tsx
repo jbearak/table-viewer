@@ -112,9 +112,9 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
         },
         focus_columns: () => columns_ref.current?.focus() ?? false,
     }), []);
-    // Actions that change something about the whole workbook. Membership here is
-    // what puts a button left of the divider; see the action row below.
-    const workbook_actions = [
+    // Edit changes how the table behaves rather than how the active worksheet is
+    // displayed, so it stands alone to the left of the divider.
+    const edit_actions = [
         props.show_edit_button && (
             <ToolbarButton
                 key="edit"
@@ -131,6 +131,11 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                 disabled={props.edit_disabled}
             />
         ),
+    ].filter(Boolean);
+
+    // Actions that change how the active worksheet is displayed. Columns and
+    // Auto-fit are unconditional, so this group never empties.
+    const worksheet_actions = [
         props.show_formatting_button && (
             <ToolbarButton
                 key="formatting"
@@ -145,12 +150,6 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                 scope_menu={props.formatting_scope_menu}
             />
         ),
-    ].filter(Boolean);
-
-    // Actions that change something about the active worksheet only. Columns and
-    // Auto-fit are unconditional, so this group never empties — which is why the
-    // divider below only has to ask about the workbook group.
-    const worksheet_actions = [
         props.show_excel_header_button && (
             <ToolbarButton
                 key="excel-header"
@@ -222,18 +221,11 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
                 </div>
             )}
             {/*
-              * Two groups: what an action changes for the whole workbook, then what
-              * it changes for this worksheet alone. The order used to interleave the
-              * two, which read as arbitrary (#154).
+              * Two groups: Edit mode, then controls for how the worksheet is shown.
               *
               * Built as two arrays rather than as one JSX sequence so that group
-              * membership is stated once. The divider follows from whether the
-              * workbook group is empty, so adding an action to a group cannot leave
-              * the rule behind — the failure that condition would hide is a narrow
-              * one, visible only when the new action is the *only* workbook action
-              * on screen. Edit alone on the workbook side is the expected state now
-              * that tab orientation moved to the sheet tabs (#154), and it still
-              * earns the rule: it changes what a keystroke does, not what is shown.
+              * membership is stated once. The divider follows from whether Edit is
+              * present, so it cannot leave a stray leading rule when Edit is hidden.
               *
               * Still flat children of one row: `.toolbar-actions > :first-child`
               * carries the right-alignment, so nesting either group in a wrapper
@@ -241,8 +233,8 @@ export const Toolbar = forwardRef<ToolbarFocusHandle, ToolbarProps>(function Too
               */}
             <ScopeMenuContext.Provider value={scope_menu_context}>
             <div className="toolbar-actions">
-                {workbook_actions}
-                {workbook_actions.length > 0 && (
+                {edit_actions}
+                {edit_actions.length > 0 && (
                     <div
                         className="toolbar-actions-divider"
                         role="separator"

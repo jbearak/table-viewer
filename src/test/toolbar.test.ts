@@ -240,7 +240,7 @@ describe('Toolbar', () => {
         expect(on_action_complete).toHaveBeenCalledTimes(4);
     });
 
-    it('orders actions workbook scope first, then worksheet scope', () => {
+    it('separates Edit from the worksheet display actions', () => {
         const { container } = render_toolbar({
             show_edit_button: true,
             show_excel_header_button: true,
@@ -248,8 +248,8 @@ describe('Toolbar', () => {
 
         expect(get_action_labels(container)).toEqual([
             'Edit',
-            'Formatting',
             '|',
+            'Formatting',
             'Header Row',
             'Columns',
             'Auto-fit Columns',
@@ -264,19 +264,19 @@ describe('Toolbar', () => {
         expect(divider?.getAttribute('aria-orientation')).toBe('vertical');
     });
 
-    it('omits the divider when no workbook-scoped action is shown', () => {
-        // A single-sheet CSV with no formatting: nothing sits left of the rule, so
-        // a rule there would be a stray leading line.
+    it('omits the divider when Edit is not shown', () => {
+        // Formatting is a worksheet display control, so it does not create a group
+        // on the left or leave a stray leading rule when Edit is unavailable.
         const { container } = render_toolbar({
-            show_formatting_button: false,
+            show_formatting_button: true,
         });
 
         expect(container.querySelector('.toolbar-actions-divider')).toBeNull();
         expect(container.querySelector('.toolbar-actions')?.firstElementChild?.textContent)
-            .toBe('Columns');
+            .toBe('Formatting');
     });
 
-    it('keeps the divider when only one workbook-scoped action is shown', () => {
+    it('keeps the divider when Edit is the only action before it', () => {
         // The expected state now that tab orientation moved to the sheet tabs (#154):
         // Edit is usually alone on the workbook side, and the rule still belongs there.
         const { container } = render_toolbar({
@@ -288,11 +288,7 @@ describe('Toolbar', () => {
             .toEqual(['Edit', '|', 'Columns', 'Auto-fit Columns']);
     });
 
-    it('divides the two groups for every combination of optional actions', () => {
-        // The divider follows from whether the workbook group rendered anything, so
-        // it must sit at exactly the group boundary in all four combinations —
-        // including the two where only one workbook action is visible, which a
-        // hand-written condition is most likely to get wrong.
+    it('separates only Edit for every combination of optional actions', () => {
         for (const show_edit_button of [false, true]) {
             for (const show_formatting_button of [false, true]) {
                 const { container } = render_toolbar({
@@ -301,23 +297,21 @@ describe('Toolbar', () => {
                     show_excel_header_button: true,
                 });
                 const labels = get_action_labels(container);
-                const workbook_count = [
-                    show_edit_button,
-                    show_formatting_button,
-                ].filter(Boolean).length;
 
-                if (workbook_count === 0) {
+                if (!show_edit_button) {
                     expect(labels).not.toContain('|');
-                } else {
-                    // One rule, at the boundary: every workbook action before it
-                    // and every worksheet action after it.
-                    expect(labels.filter((label) => label === '|')).toHaveLength(1);
-                    expect(labels.indexOf('|')).toBe(workbook_count);
-                    expect(labels.slice(0, workbook_count)).toEqual([
-                        ...(show_edit_button ? ['Edit'] : []),
+                    expect(labels).toEqual([
                         ...(show_formatting_button ? ['Formatting'] : []),
+                        'Header Row',
+                        'Columns',
+                        'Auto-fit Columns',
                     ]);
-                    expect(labels.slice(workbook_count + 1)).toEqual([
+                } else {
+                    expect(labels.filter((label) => label === '|')).toHaveLength(1);
+                    expect(labels).toEqual([
+                        'Edit',
+                        '|',
+                        ...(show_formatting_button ? ['Formatting'] : []),
                         'Header Row',
                         'Columns',
                         'Auto-fit Columns',
