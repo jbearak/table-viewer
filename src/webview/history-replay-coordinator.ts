@@ -295,9 +295,6 @@ export function create_history_replay_coordinator(
             // Acquiring a session for a highlight-only undo would put the user into
             // edit mode for a gesture that was never a content edit.
             const needs_session = action_requires_edit_session(before_acquiring.entry.action);
-            // The entry's own id, never the object: `moves` rebuilds the object,
-            // so identity would report a spurious mismatch for the very same entry.
-            const decided_for = before_acquiring.entry.id;
             const held: AcquiringReplay = { kind: 'acquiring', direction, settle: resolve };
             active = held;
             void (async () => {
@@ -333,17 +330,13 @@ export function create_history_replay_coordinator(
                     release(held, { kind: 'refused', reason: 'nothing-to-replay' });
                     return;
                 }
-                // A different entry than the session decision was made about, so
-                // that decision no longer describes this replay. Refused rather
-                // than re-decided: re-deciding cannot give back an edit session
-                // already granted for the entry that moved, and a keypress the
-                // user can simply repeat is a better answer than replaying
-                // something they did not aim at. Reachable only through a gesture
-                // recorded from a host reply mid-await.
-                if (peek.entry.id !== decided_for) {
-                    release(held, { kind: 'refused', reason: 'busy' });
-                    return;
-                }
+                // The top entry may have changed while the session request was in
+                // flight. Undo still means the newest entry at the instant it can
+                // run; making the user press it again after we already put them
+                // into edit mode turns session acquisition into a visible no-op.
+                // We only await here when the original entry needed a session, so
+                // the session now held is sufficient for any replacement entry
+                // (and harmless for a highlight-only one).
                 const request = build_prepare_request(peek.entry, direction, host);
                 if (request === undefined) {
                     // A cell the renderer cannot see right now. Refusing beats

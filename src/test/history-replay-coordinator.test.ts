@@ -341,12 +341,11 @@ describe('beginning a replay', () => {
             expect(posted).toHaveLength(1);
         });
 
-        it('refuses when a gesture lands on the stack mid-acquisition', async () => {
+        it('continues with the latest gesture when one lands mid-acquisition', async () => {
             // A highlight already sent to the host is recorded when its deltas come
-            // back, which can be while `ensure_session` is in flight — so the entry
-            // actually on top afterwards is not the one the session decision was
-            // made about. Replaying it would undo a gesture the user did not aim at,
-            // having put them into edit mode for a highlight along the way.
+            // back while `ensure_session` is in flight. The acquired session must
+            // not consume the Undo keypress: once it is available, Undo applies to
+            // the latest gesture just as it would have without the mode transition.
             const { coordinator, session, posted, record } = harness([
                 cell_change(0, 0, 'typed'),
             ]);
@@ -357,9 +356,11 @@ describe('beginning a replay', () => {
             record([highlight_change(9, 9, null, 'yellow')]);
             session.gate?.();
 
-            await expect(pending).resolves.toEqual({ kind: 'refused', reason: 'busy' });
-            expect(posted).toEqual([]);
-            expect(coordinator.is_busy()).toBe(false);
+            for (let index = 0; index < 20; index += 1) await Promise.resolve();
+
+            expect(last_prepare(posted).highlights).toHaveLength(1);
+            expect(coordinator.is_busy()).toBe(true);
+            void pending;
         });
 
         it('abandons an acquisition whose document went away', async () => {
