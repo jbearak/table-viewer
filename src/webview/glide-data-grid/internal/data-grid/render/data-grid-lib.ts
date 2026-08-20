@@ -513,7 +513,31 @@ function drawMultiLineText(
     hyperWrapping?: boolean
 ) {
     const fontStyle = theme.baseFontFull;
-    const split = splitText(ctx, data, fontStyle, w - theme.cellHorizontalPadding * 2, hyperWrapping ?? false);
+    const availableWidth = w - theme.cellHorizontalPadding * 2;
+    // canvas-hypertxt records average glyph width while splitting. Passing an
+    // empty hard line makes it divide 0px by 0 characters, poisoning that font's
+    // shared metric with NaN. The current width is already cached by then, so the
+    // failure appears only after a resize: every paragraph at the new width is
+    // incorrectly accepted as one unwrapped line. Preserve blank visual lines
+    // ourselves and only ask the dependency to measure non-empty hard lines.
+    let split: readonly string[];
+    const hasEmptyHardLine = data.startsWith("\n") || data.endsWith("\n") || data.includes("\n\n");
+    if (hasEmptyHardLine) {
+        const hardLines = data.split("\n");
+        const safeSplit: string[] = [];
+        for (const hardLine of hardLines) {
+            if (hardLine.length === 0) {
+                safeSplit.push("");
+            } else {
+                safeSplit.push(...splitText(ctx, hardLine, fontStyle, availableWidth, hyperWrapping ?? false));
+            }
+        }
+        // Match canvas-hypertxt's whole-value whitespace handling now that each
+        // hard line was sent through it independently.
+        split = safeSplit.map((line, index) => index === 0 ? line.trimEnd() : line.trim());
+    } else {
+        split = splitText(ctx, data, fontStyle, availableWidth, hyperWrapping ?? false);
+    }
 
     const emHeight = getEmHeight(ctx, fontStyle);
     const lineHeight = theme.lineHeight * emHeight;
