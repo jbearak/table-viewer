@@ -831,6 +831,44 @@ span and cell span. The throw is a backstop, not a live path.
   extraction to a separate package happens under #240. dta-parser itself was
   built flat and split later — same trajectory, deliberately.
 
+**Result (merged as `8679cea`; branch `issue153-stage7-conformance`, commit
+`f835113`).** Stage complete.
+
+- **41 cases**: 21 byte-exact outputs, 16 structured refusals, 4
+  no-authoritative-`sheetData` outcomes. Zero duplicate ids; `corpus_version`
+  1.0.0, `format_version` 1, `api_version` 1 all pinned.
+- **Portability constraint verified, not just asserted**: `manifest.json` contains
+  **zero** function-valued entries, so none of `is_date_style`,
+  `cell_font_style`, or `run_font_base` leaked into case context. Edit context is
+  data tables only. This was the constraint that decided whether the corpus is
+  usable by #240 at all.
+- Refusals assert **only the five stable codes** — never spans, offsets, scanner
+  state, or error prose. `OOXML_REFUSAL_CODES` was promoted to a runtime `as const`
+  array with `OoxmlRefusalCode` derived from it, so the manifest's `refusal_codes`
+  is checked against the implementation instead of drifting from it.
+- Public root `src/ooxml-surgery/index.ts` exports `apply_worksheet_edits`,
+  `OoxmlRefusalError`, and the version constants; `xlsx-package.ts` keeps ZIP/CFB
+  orchestration, part routing, and calc-chain handling. Extraction plan in
+  `docs/ooxml-package-boundary.md`. Criterion (e) satisfied in-tree, physical split
+  deferred to #240 as planned.
+- Gates: full `npx vitest run` **4711 passed / 3 skipped across 208 files**;
+  `tsc --noEmit` clean; `perf:ooxml` passed.
+
+**Two review findings I rejected, recorded because the reasoning generalizes.**
+Two independent reviewers proposed replacing the public-API test's literal type
+constructions with `expectTypeOf`. Both diagnosed correctly that
+`expect([runs, link_edit]).toHaveLength(2)` asserts nothing — but the remedy is
+weaker than what it replaces: `expectTypeOf` still passes when a type becomes
+*unconstructable* (an accidental `never` member, a required field a consumer
+cannot supply), whereas a literal fails to compile. Criterion (e) is about an
+external consumer being able to **build** these types, so the compile is the
+assertion. Convergence between reviewers was not evidence here, because neither
+addressed the cost of the substitution.
+The second rejection: deleting `conformance/README.md`'s case catalog as
+"duplication" of `manifest.json`. The manifest holds data; the README holds the
+*rationale* a port implementer reads to learn why a case exists. Not derivable
+from the manifest, so deduplicating would delete the reasons and keep the data.
+
 ## Decisions settled by architecture review
 
 Recorded so stage agents inherit rulings rather than re-deriving them. Where I
