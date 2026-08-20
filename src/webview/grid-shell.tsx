@@ -259,7 +259,6 @@ function dirty_value_overlay_fields(
 }
 
 import { use_row_loader } from './use-row-loader';
-import { use_compare_loader } from './use-compare-loader';
 import { theme_font_size_px, tint_from_color, use_vscode_theme } from './vscode-theme';
 
 /** Alpha of the whole-row band behind added/deleted rows in git compare mode.
@@ -634,9 +633,6 @@ export function GridShell({
         () => ({ deleted: diff_deleted_fg, added: diff_added_fg }),
         [diff_deleted_fg, diff_added_fg],
     );
-    // Git compare: ingests the compareDiff page the host posts beside every
-    // rowData window. Inert (no loader constructed) outside compare mode.
-    const compare = use_compare_loader(sheet_index, generation, git_compare);
     // Band tints for whole added/deleted rows, derived from the same theme
     // foregrounds as the diff text so they track the active theme together.
     const compare_row_bgs = useMemo(
@@ -807,6 +803,8 @@ export function GridShell({
         get_source_row,
         get_cell_raw_for_source,
         get_cell_for_source,
+        get_compare_status,
+        get_compare_base,
         sample_loaded_rows,
         version,
     } = loader;
@@ -2493,12 +2491,12 @@ export function GridShell({
                 : undefined;
             // Git compare paint state: a whole-row band for added/deleted rows,
             // and a per-cell before/after via the same diff_base channel the
-            // Diff toggle uses. A deleted band's cells carry the original text
-            // as base against an empty modified value, so the struck-through
-            // old content is what the band shows.
-            const compare_status = git_compare ? compare.get_status(row) : undefined;
+            // Diff toggle uses. Deleted rows carry the original content as the
+            // row itself (see CompareDataSource.read_rows), struck through by
+            // the `compare_deleted` overlay flag.
+            const compare_status = git_compare ? get_compare_status(row) : undefined;
             const compare_base = git_compare
-                ? compare.get_base(row, source_column)
+                ? get_compare_base(row, source_column)
                 : undefined;
             const compare_bg = compare_status !== undefined
                 ? compare_row_bgs[compare_status]
@@ -2520,6 +2518,9 @@ export function GridShell({
                     // Compare's before-text rides the Diff toggle's channel; no
                     // dirty_value, so the "after" side is the cell's own text.
                     ...(compare_base !== undefined ? { diff_base: compare_base } : {}),
+                    // A deleted row's cells are the original content, struck
+                    // through whole (there is no "after" side to diff against).
+                    ...(compare_status === 'deleted' ? { compare_deleted: true as const } : {}),
                     ...(edit_syntax === 'markdown' && dirty?.valueRuns
                         ? { dirty_rich: dirty.valueRuns }
                         : {}),
@@ -2559,10 +2560,10 @@ export function GridShell({
             show_formatting,
             version,
             git_compare,
-            compare.get_status,
-            compare.get_base,
-            // Bumps when a compareDiff page lands, so freshly-diffed cells repaint.
-            compare.version,
+            // `version` above also bumps when a compareDiff sidecar lands, so
+            // freshly-diffed cells repaint through the same channel as pages.
+            get_compare_status,
+            get_compare_base,
             compare_row_bgs,
             editable_cells,
             edit_syntax,

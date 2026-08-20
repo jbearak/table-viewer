@@ -3594,6 +3594,7 @@ export function attach_viewer(
         return {
             gitCompare: {
                 pairings: adopted.pairings,
+                sheetStatuses: adopted.sheetStatuses,
                 changedColumnNames: adopted.changedColumnNames,
             },
         };

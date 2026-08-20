@@ -121,8 +121,9 @@ export type CompareRowStatus = 'same' | 'added' | 'deleted';
  * Sparse per-page diff. `rowStatus[i]` describes absolute row `startRow + i` of
  * the unified grid (whose row count is `max(original, modified)` row counts):
  * `added` rows exist only in the modified side, `deleted` rows only in the
- * original. `changedCells` carries only differing cells — including, for
- * `deleted` rows, the original cell texts so the band can show what was removed.
+ * original. `changedCells` carries only differing cells of rows present on both
+ * sides; `deleted` rows need none — the grid rows themselves carry the original
+ * content (see CompareDataSource.read_rows), struck through by row status.
  */
 export interface CompareDiffWindow {
     readonly startRow: number;
@@ -178,14 +179,6 @@ export function diff_rows_indexed(
         const in_modified = row < modified_sheet.rowCount;
         if (!in_original || !in_modified) {
             row_status.push(in_modified ? 'added' : 'deleted');
-            if (!in_modified) {
-                // Removed row: ship the original texts so the band shows them.
-                const original_row = original_rows.get(row) ?? [];
-                for (let col = 0; col < column_count; col++) {
-                    const base = raw_text(original_row[col]);
-                    if (base !== '') changed_cells.push({ row: position, col, base });
-                }
-            }
             continue;
         }
         row_status.push('same');
@@ -254,14 +247,6 @@ export function diff_row_window(
         const in_modified = row < modified_sheet.rowCount;
         if (!in_original || !in_modified) {
             row_status.push(in_modified ? 'added' : 'deleted');
-            if (!in_modified) {
-                // Removed row: ship the original texts so the band shows them.
-                const original_row = original_rows[row - first] ?? [];
-                for (let col = 0; col < column_count; col++) {
-                    const base = raw_text(original_row[col]);
-                    if (base !== '') changed_cells.push({ row, col, base });
-                }
-            }
             continue;
         }
         row_status.push('same');

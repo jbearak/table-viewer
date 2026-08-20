@@ -5107,20 +5107,12 @@ export function App(): React.JSX.Element {
     }
 
     const sheet_names = meta.sheets.map((s) => s.name);
-    // Git compare badges: mark sheets that exist on only one side. The compare
-    // source's meta lists the modified sheets first, then each deleted
-    // (original-only) sheet appended in pairing order — so added sheets are
-    // named by modifiedIndex and deleted ones fill the appended tail.
-    let sheet_badges: (SheetTabBadge | undefined)[] | undefined;
-    if (git_compare !== undefined) {
-        sheet_badges = meta.sheets.map(() => undefined);
-        let appended = meta.sheets.length
-            - git_compare.pairings.filter((p) => p.status === 'deleted').length;
-        for (const pairing of git_compare.pairings) {
-            if (pairing.status === 'added') sheet_badges[pairing.modifiedIndex] = 'added';
-            if (pairing.status === 'deleted') sheet_badges[appended++] = 'deleted';
-        }
-    }
+    // Git compare badges: mark sheets that exist on only one side. The host
+    // states each grid sheet's pair status positionally (sheetStatuses), so
+    // nothing here re-derives the compare source's sheet ordering.
+    const sheet_badges: (SheetTabBadge | undefined)[] | undefined =
+        git_compare?.sheetStatuses.map((status) =>
+            status === 'matched' ? undefined : status);
     const has_multiple_sheets = meta.sheets.length > 1;
     // Scope menus exist only where "all sheets" means something. On a single-sheet
     // workbook the chevron could only restate the button, so there is none — and

@@ -1,4 +1,5 @@
 import React from 'react';
+import type { SheetPairStatus } from '../diff-compare/compare-source';
 
 /**
  * What pressing the orientation control does, named as the destination rather than
@@ -11,8 +12,9 @@ export function tab_orientation_label(vertical: boolean): string {
         : 'Move sheet tabs to the left of the table';
 }
 
-/** Git compare marker on a tab: the sheet exists on only one side. */
-export type SheetTabBadge = 'added' | 'deleted';
+/** Git compare marker on a tab: the sheet exists on only one side. Derived
+ *  from the pairing statuses so the two unions cannot drift. */
+export type SheetTabBadge = Exclude<SheetPairStatus, 'matched'>;
 
 export interface SheetTabsProps {
     sheets: string[];
