@@ -32,6 +32,8 @@ import {
     type ViewerHost,
 } from './host-ports';
 import { create_resource_identity, type ResourceUriLike } from './resource-identity';
+import { CompareDataSource } from './diff-compare/compare-session';
+import type { WorkbookSnapshotCompare } from './viewer-snapshot';
 import {
     assert_safe_file_size,
     FileSizeLimitExceededError,
@@ -252,6 +254,10 @@ export interface ViewerControllerOptions {
     readonly scheduler?: ViewerControllerScheduler;
     /** Close the exact host surface when its initial source load is declined. */
     readonly requestClose?: () => void | Promise<void>;
+    /** Git compare mode: render the file read-only with per-cell diffs against
+     *  this original (the `git:` side of an SCM diff). A failure to read or
+     *  parse the original degrades to a normal read-only open, never a block. */
+    readonly compare?: { readonly originalUri: ResourceUriLike | string };
 }
 
 export interface ViewerController extends Disposable {
@@ -944,6 +950,11 @@ export function attach_viewer(
 ): ViewerController {
     const uri = create_resource_identity(resource).uri;
     const file_path = uri.fsPath;
+    const compare_original_uri = options.compare
+        ? create_resource_identity(options.compare.originalUri).uri
+        : undefined;
+    const compare_mode = compare_original_uri !== undefined;
+    let compare_unavailable_warned = false;
     const scheduler: ViewerControllerScheduler = options.scheduler ?? {
         setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
         clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
@@ -1168,6 +1179,35 @@ export function attach_viewer(
         } catch {
             return Promise.resolve(false);
         }
+    }
+
+    /**
+     * Answer a served row page with its compare diff. Rides beside `rowData`
+     * (posted by the core for the same request) with the same generation guard,
+     * so the renderer can correlate the two by requestId and drop stale pages.
+     */
+    function post_compare_diff(
+        msg: Extract<WebviewMessage, { type: 'requestRows' }>,
+    ): void {
+        if (!(source instanceof CompareDataSource) || !core) return;
+        if (msg.generation !== core.generation) return;
+        const start_row = Math.max(0, msg.startRow);
+        let window;
+        try {
+            window = source.diff_page(msg.sheetIndex, start_row, msg.count);
+        } catch {
+            return;
+        }
+        if (!window) return;
+        void post_to_receiver({
+            type: 'compareDiff',
+            sheetIndex: msg.sheetIndex,
+            startRow: window.startRow,
+            rowStatus: [...window.rowStatus],
+            changedCells: window.changedCells.map((cell) => ({ ...cell })),
+            requestId: msg.requestId,
+            generation: msg.generation,
+        });
     }
 
     function flush_sheet_selections(): void {
@@ -3476,14 +3516,60 @@ export function attach_viewer(
             fingerprint: `${stat.mtime}:${stat.size}`,
             digest: content_digest(raw),
         };
-        return new SourceCandidate(
-            await profile.build_source(
-                raw,
-                file_path,
-                state,
-                load_all_csv_rows ? { loadAllRows: true } : undefined,
-            ),
-            observation,
+        const modified = await profile.build_source(
+            raw,
+            file_path,
+            state,
+            load_all_csv_rows ? { loadAllRows: true } : undefined,
+        );
+        return new SourceCandidate(await wrap_for_compare(modified), observation);
+    }
+
+    /**
+     * Bind the working-tree source to its git original when compare mode is on.
+     * The original must never block the file itself: any failure to read or
+     * parse it degrades to a plain open with a one-time warning.
+     */
+    async function wrap_for_compare(modified: DataSource): Promise<DataSource> {
+        if (!compare_original_uri) return modified;
+        try {
+            const original_raw = await host.fs.read_file(compare_original_uri);
+            const original = await build_source_from_buffer(original_raw, file_path);
+            try {
+                return new CompareDataSource(modified, original);
+            } catch (error) {
+                original.close();
+                throw error;
+            }
+        } catch (error) {
+            warn_compare_unavailable(error);
+            return modified;
+        }
+    }
+
+    /** The snapshot's compare payload — present exactly when the adopted source
+     *  is a live compare session (a degraded compare open carries nothing). */
+    function compare_configuration(
+        adopted: DataSource | undefined,
+    ): { gitCompare: WorkbookSnapshotCompare } | Record<string, never> {
+        if (!(adopted instanceof CompareDataSource)) return {};
+        return {
+            gitCompare: {
+                pairings: adopted.pairings,
+                changedColumnNames: adopted.meta().sheets.map(
+                    (_sheet, sheet_index) => adopted.changed_column_names(sheet_index),
+                ),
+            },
+        };
+    }
+
+    function warn_compare_unavailable(error: unknown): void {
+        if (compare_unavailable_warned) return;
+        compare_unavailable_warned = true;
+        log_sanitized_failure('Table compare unavailable', error);
+        show_owner_warning(
+            'Table compare is unavailable: the original version could not be loaded. '
+            + 'Showing the file without change highlighting.',
         );
     }
 
@@ -3873,10 +3959,12 @@ export function attach_viewer(
                             configuration: {
                                 defaultTabOrientation: host.config.default_tab_orientation(),
                                 previewMode: profile.previewMode === true,
+                                ...compare_configuration(next),
                             },
                             capabilities: {
-                                csvEditingSupported: profile.editing,
+                                csvEditingSupported: profile.editing && !compare_mode,
                                 csvEditable: profile.editing
+                                    && !compare_mode
                                     && may_retain_capability()
                                     && !next.truncationMessage,
                                 csvSaveLifecycle: projected_save_lifecycle(),
@@ -4133,10 +4221,12 @@ export function attach_viewer(
                                     configuration: {
                                         defaultTabOrientation: host.config.default_tab_orientation(),
                                         previewMode: profile.previewMode === true,
+                                        ...compare_configuration(source),
                                     },
                                     capabilities: {
-                                        csvEditingSupported: profile.editing,
+                                        csvEditingSupported: profile.editing && !compare_mode,
                                         csvEditable: profile.editing
+                                            && !compare_mode
                                             && may_retain_capability()
                                             && !source!.truncationMessage,
                                         csvSaveLifecycle: projected_save_lifecycle(),
@@ -7268,6 +7358,7 @@ export function attach_viewer(
                 ) return;
                 if (profile.on_message && await profile.on_message(msg)) return;
                 await core?.handle_message(msg);
+                if (msg.type === 'requestRows') post_compare_diff(msg);
         }
         }));
     } catch (error) {
