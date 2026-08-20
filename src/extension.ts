@@ -48,6 +48,45 @@ function open_workbook_at_sheet_arguments(value: unknown): OpenWorkbookAtSheetAr
     return { uri: value.uri, sheetName: value.sheetName };
 }
 
+/** The resourceUri of an SCM resource-state command argument, if that is what
+ *  `value` is. The SCM menus pass a SourceControlResourceState; anything else
+ *  (palette invocation, stray argument) yields undefined. */
+function scm_resource_uri(value: unknown): vscode.Uri | undefined {
+    if (typeof value !== 'object' || value === null) return undefined;
+    const candidate = (value as { resourceUri?: unknown }).resourceUri;
+    // Duck-typed rather than instanceof: the SCM state's URI may come from a
+    // different extension-host realm than this module's vscode import.
+    return typeof candidate === 'object' && candidate !== null
+        && typeof (candidate as vscode.Uri).scheme === 'string'
+        && typeof (candidate as vscode.Uri).with === 'function'
+        ? candidate as vscode.Uri
+        : undefined;
+}
+
+/**
+ * The git extension's URI for the last committed/staged version of `uri`.
+ * Ref `~` means "index, falling back to HEAD", which is what the SCM view
+ * diffs the working tree against. Prefer the git extension's own `toGitUri`
+ * (it owns the encoding); fall back to the same construction (scheme `git`,
+ * JSON query with `{path, ref}`) when the API is unavailable.
+ */
+function to_git_uri(uri: vscode.Uri): vscode.Uri {
+    try {
+        const git = vscode.extensions.getExtension<{
+            getAPI(version: 1): { toGitUri(target: vscode.Uri, ref: string): vscode.Uri };
+        }>('vscode.git')?.exports;
+        const from_api = git?.getAPI(1).toGitUri(uri, '~');
+        if (from_api) return from_api;
+    } catch {
+        // The git extension may be disabled or not yet activated; the manual
+        // construction below matches its current encoding.
+    }
+    return uri.with({
+        scheme: 'git',
+        query: JSON.stringify({ path: uri.fsPath, ref: '~' }),
+    });
+}
+
 let active_runtime: ActiveExtensionRuntime | undefined;
 let active_teardown: Promise<void> | undefined;
 
@@ -139,10 +178,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             () => vscode.window.activeTextEditor?.document.uri,
         ));
         register('tableViewer.openAsText', open_with('default', active_custom_tab_uri));
-        register('tableViewer.openWorkbookAtSheet', async (value: unknown) => {
-            const args = open_workbook_at_sheet_arguments(value);
-            const uri = vscode.Uri.parse(args.uri, true);
+        // Command failures surface as an error message but stay thrown, so
+        // callers (tests, other extensions) still observe the rejection.
+        const reporting_errors = async <T>(action: () => Promise<T>): Promise<T> => {
             try {
+                return await action();
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                void vscode.window.showErrorMessage(message);
+                throw error;
+            }
+        };
+        register('tableViewer.openWorkbookAtSheet', (value: unknown) => reporting_errors(
+            async () => {
+                const args = open_workbook_at_sheet_arguments(value);
+                const uri = vscode.Uri.parse(args.uri, true);
                 const found = await viewers!.openWorkbookAtSheet(uri, args.sheetName);
                 if (!found) {
                     void vscode.window.showWarningMessage(
@@ -150,11 +200,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                     );
                 }
                 return found;
-            } catch (error) {
-                const message = error instanceof Error ? error.message : String(error);
-                void vscode.window.showErrorMessage(message);
-                throw error;
-            }
+            },
+        ));
+        register('tableViewer.openTableDiff', async (resource_state?: unknown) => {
+            const uri = scm_resource_uri(resource_state)
+                ?? vscode.window.activeTextEditor?.document.uri;
+            if (!uri || uri.scheme !== 'file') return;
+            await reporting_errors(async () => {
+                // A deleted resource has no working-tree side to open; the
+                // viewer's primary document must exist. Say so instead of
+                // surfacing the raw stat failure from the open.
+                try {
+                    await vscode.workspace.fs.stat(uri);
+                } catch {
+                    throw new Error(
+                        'The file no longer exists in the working tree, so there is '
+                        + 'nothing to compare. Restore or check out the file to view it.',
+                    );
+                }
+                await viewers!.openTableDiff(uri, to_git_uri(uri));
+            });
         });
         register('tableViewer.manageStoredFileState', () => {
             show_state_inspector_panel({

@@ -100,11 +100,42 @@ describe('extension runtime manifest', () => {
             'tableViewer.openAsText',
             'tableViewer.openWorkbookAtSheet',
             'tableViewer.manageStoredFileState',
+            'tableViewer.openTableDiff',
         ]);
         expect(manifest.contributes?.menus?.commandPalette).toContainEqual({
             command: 'tableViewer.openWorkbookAtSheet',
             when: 'false',
         });
+    });
+
+    it('offers the table diff on git SCM resources for every supported format', () => {
+        // The custom-editor selector is the authority on supported formats;
+        // decode its casing-class pattern (e.g. `[cC][sS][vV]` -> `csv`) so the
+        // SCM menu cannot silently drift from it.
+        const selector_pattern = String(
+            custom_editors[0]?.selector?.[0]?.filenamePattern,
+        );
+        const supported_extensions = selector_pattern
+            .replace(/^\*\.\{|\}$/gu, '')
+            .split(',')
+            .map((extension) =>
+                extension.replace(/\[(.)(.)\]/gu, (_, lower: string) => lower));
+        expect(supported_extensions.length).toBeGreaterThan(0);
+        const entries = (manifest.contributes?.menus as Record<string, unknown[]>)[
+            'scm/resourceState/context'
+        ] as { command: string; when: string; group: string }[];
+        const diff_entries = entries.filter(
+            (entry) => entry.command === 'tableViewer.openTableDiff',
+        );
+        expect(diff_entries.map((entry) => entry.group).sort()).toEqual(
+            ['inline', 'navigation'],
+        );
+        for (const entry of diff_entries) {
+            expect(entry.when).toContain('scmProvider == git');
+            for (const extension of supported_extensions) {
+                expect(entry.when).toContain(extension);
+            }
+        }
     });
 
     it('externalizes the host-provided SQLite runtime from the one bundle it builds', () => {

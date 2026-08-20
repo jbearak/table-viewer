@@ -489,6 +489,58 @@ describe('register_table_viewer', () => {
         vi.useRealTimers();
     });
 
+    it('opens a compare panel via openTableDiff and keeps later plain opens uncompared', async () => {
+        const csv = Buffer.from('a\n1\n');
+        vscode_mock.__setStatImplementation(async () => ({ size: csv.length, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => csv);
+        const registration = register_table_viewer(context(), state_store());
+        const provider = excel_provider();
+        const uri = vscode_mock.Uri.file('/repo/data.csv') as unknown as vscode.Uri;
+        const original = vscode_mock.Uri.file('/repo/data.csv')
+            .with({ scheme: 'git', query: JSON.stringify({ path: '/repo/data.csv', ref: '~' }) },
+            ) as unknown as vscode.Uri;
+        vscode_mock.__setCommand('vscode.openWith', async (target: unknown, view_type: unknown) => {
+            expect(view_type).toBe('tableViewer.editor');
+            const panel = vscode_mock.window.createWebviewPanel(
+                'tableViewer.editor',
+                'data.csv',
+            ) as unknown as vscode.WebviewPanel;
+            const document = await provider.openCustomDocument(target as vscode.Uri);
+            await provider.resolveCustomEditor(document, panel);
+        });
+
+        const workbook_snapshot = async (
+            panel: ReturnType<typeof vscode_mock.__getPanels>[number],
+        ) => {
+            await panel.__receive({ type: 'ready' });
+            await vi.waitFor(() => expect(panel.__messages.some((message) => (
+                typeof message === 'object' && message !== null
+                && 'type' in message && message.type === 'workbookSnapshot'
+            ))).toBe(true));
+            return (panel.__messages.find((message) => (
+                typeof message === 'object' && message !== null
+                && 'type' in message && message.type === 'workbookSnapshot'
+            )) as { snapshot: { configuration: { gitCompare?: unknown } } }).snapshot;
+        };
+
+        await registration.openTableDiff(uri, original);
+        const compare_panel = vscode_mock.__getPanels()[0];
+        const compare_snapshot = await workbook_snapshot(compare_panel);
+        expect(compare_snapshot.configuration.gitCompare).toBeDefined();
+
+        // A later plain open of the same file must not inherit the compare.
+        const plain_panel = vscode_mock.window.createWebviewPanel(
+            'tableViewer.editor',
+            'data.csv',
+        ) as unknown as vscode.WebviewPanel;
+        const document = await provider.openCustomDocument(uri);
+        await provider.resolveCustomEditor(document, plain_panel);
+        const plain_mock = vscode_mock.__getPanels()[1];
+        const plain_snapshot = await workbook_snapshot(plain_mock);
+        expect(plain_snapshot.configuration.gitCompare).toBeUndefined();
+        await dispose_registration(registration, plain_mock);
+    });
+
     it('edits native-local CSV resources', async () => {
         expect(await csv_capabilities(native_csv_uri())).toMatchObject({
             csvEditingSupported: true,
