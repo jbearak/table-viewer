@@ -1182,29 +1182,54 @@ export function attach_viewer(
     }
 
     /**
-     * Answer a served row page with its compare diff. Rides beside `rowData`
-     * (posted by the core for the same request) with the same generation guard,
-     * so the renderer can correlate the two by requestId and drop stale pages.
+     * Answer a served row page with its compare diff. Invoked by the core with
+     * the exact window `rowData` carried — clamped and transform-projected — so
+     * the diff describes the rows the renderer received, keyed by the same
+     * display positions. `sourceRows` maps each display row back to the source
+     * row the positional diff is defined over; contiguous source runs are
+     * diffed in one page each.
      */
     function post_compare_diff(
         msg: Extract<WebviewMessage, { type: 'requestRows' }>,
+        window: { startRow: number; sourceRows: number[] },
     ): void {
-        if (!(source instanceof CompareDataSource) || !core) return;
-        if (msg.generation !== core.generation) return;
-        const start_row = Math.max(0, msg.startRow);
-        let window;
+        if (!(source instanceof CompareDataSource)) return;
+        const source_rows = window.sourceRows;
+        const row_status: ('same' | 'added' | 'deleted')[] = [];
+        const changed_cells: { row: number; col: number; base: string }[] = [];
         try {
-            window = source.diff_page(msg.sheetIndex, start_row, msg.count);
+            let position = 0;
+            while (position < source_rows.length) {
+                const run_start = source_rows[position];
+                let run_length = 1;
+                while (
+                    position + run_length < source_rows.length
+                    && source_rows[position + run_length] === run_start + run_length
+                ) run_length++;
+                const page = source.diff_page(msg.sheetIndex, run_start, run_length);
+                for (let offset = 0; offset < run_length; offset++) {
+                    row_status.push(page?.rowStatus[offset] ?? 'same');
+                }
+                if (page) {
+                    for (const cell of page.changedCells) {
+                        changed_cells.push({
+                            ...cell,
+                            row: window.startRow + position + (cell.row - run_start),
+                        });
+                    }
+                }
+                position += run_length;
+            }
         } catch {
             return;
         }
-        if (!window) return;
+        if (source_rows.length === 0) return;
         void post_to_receiver({
             type: 'compareDiff',
             sheetIndex: msg.sheetIndex,
             startRow: window.startRow,
-            rowStatus: [...window.rowStatus],
-            changedCells: window.changedCells.map((cell) => ({ ...cell })),
+            rowStatus: row_status,
+            changedCells: changed_cells,
             requestId: msg.requestId,
             generation: msg.generation,
         });
@@ -3556,9 +3581,7 @@ export function attach_viewer(
         return {
             gitCompare: {
                 pairings: adopted.pairings,
-                changedColumnNames: adopted.meta().sheets.map(
-                    (_sheet, sheet_index) => adopted.changed_column_names(sheet_index),
-                ),
+                changedColumnNames: adopted.changedColumnNames,
             },
         };
     }
@@ -3888,6 +3911,7 @@ export function attach_viewer(
                     onInvalidRestore: cleanup_invalid_restore,
                     durablePendingEditKeys: durable_pending_edit_keys,
                     durableRowHeights: durable_row_heights,
+                    ...(compare_mode ? { onRowWindowServed: post_compare_diff } : {}),
                 },
                 (installed) => {
                     installed.begin_receiver_epoch(session.current_receiver_epoch);
@@ -7358,7 +7382,6 @@ export function attach_viewer(
                 ) return;
                 if (profile.on_message && await profile.on_message(msg)) return;
                 await core?.handle_message(msg);
-                if (msg.type === 'requestRows') post_compare_diff(msg);
         }
         }));
     } catch (error) {

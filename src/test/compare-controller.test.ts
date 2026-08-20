@@ -37,13 +37,6 @@ function posted(panel: ReturnType<typeof open_compare_table>, type: string): Pos
     return (panel.__messages as Posted[]).filter((message) => message.type === type);
 }
 
-async function poll(check: () => boolean): Promise<void> {
-    for (let attempt = 0; attempt < 200 && !check(); attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-    expect(check()).toBe(true);
-}
-
 beforeEach(() => {
     for (const panel of vscode_mock.__getPanels()) panel.dispose();
     vi.restoreAllMocks();
@@ -57,7 +50,7 @@ describe('compare mode controller', () => {
     it('projects gitCompare configuration and withdraws editing', async () => {
         const panel = open_compare_table();
         await panel.__receive({ type: 'ready' });
-        await poll(() => posted(panel, 'workbookSnapshot').length > 0);
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThan(0));
         const snapshot = posted(panel, 'workbookSnapshot')[0].snapshot as {
             configuration: { gitCompare?: { pairings: unknown[] } };
             capabilities: { csvEditingSupported: boolean; csvEditable: boolean };
@@ -72,7 +65,7 @@ describe('compare mode controller', () => {
     it('answers a row request with a compareDiff page beside rowData', async () => {
         const panel = open_compare_table();
         await panel.__receive({ type: 'ready' });
-        await poll(() => posted(panel, 'workbookSnapshot').length > 0);
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThan(0));
         const { generation } = posted(panel, 'workbookSnapshot')[0]
             .snapshot as { generation: number };
         await panel.__receive({
@@ -83,7 +76,7 @@ describe('compare mode controller', () => {
             requestId: 'r1',
             generation,
         });
-        await poll(() => posted(panel, 'compareDiff').length > 0);
+        await vi.waitFor(() => expect(posted(panel, 'compareDiff').length).toBeGreaterThan(0));
         const diff = posted(panel, 'compareDiff')[0];
         expect(diff.requestId).toBe('r1');
         expect(diff.rowStatus).toEqual(['same', 'added']);
@@ -101,7 +94,7 @@ describe('compare mode controller', () => {
         const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
         const panel = open_compare_table();
         await panel.__receive({ type: 'ready' });
-        await poll(() => posted(panel, 'workbookSnapshot').length > 0);
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThan(0));
         const snapshot = posted(panel, 'workbookSnapshot')[0].snapshot as {
             configuration: { gitCompare?: unknown };
             capabilities: { csvEditingSupported: boolean };
@@ -120,7 +113,7 @@ describe('compare mode controller', () => {
             requestId: 'r1',
             generation,
         });
-        await poll(() => posted(panel, 'rowData').length > 0);
+        await vi.waitFor(() => expect(posted(panel, 'rowData').length).toBeGreaterThan(0));
         expect(posted(panel, 'compareDiff')).toEqual([]);
     });
 });
