@@ -200,7 +200,7 @@ export function blitResizedCol(
     height: number,
     totalHeaderHeight: number,
     effectiveCols: readonly MappedGridColumn[],
-    resizedIndex: number
+    redrawFromSourceIndex: number
 ) {
     const drawRegions: Rectangle[] = [];
 
@@ -216,7 +216,11 @@ export function blitResizedCol(
     }
 
     walkColumns(effectiveCols, cellYOffset, translateX, translateY, totalHeaderHeight, (c, drawX, _drawY, clipX) => {
-        if (c.sourceIndex === resizedIndex) {
+        // The merged-cell resolver may move the redraw boundary left of the
+        // resized column. Use the first visible column at or after that point so
+        // a merge whose anchor is just offscreen still repaints from the viewport
+        // edge rather than returning no region at all.
+        if (c.sourceIndex >= redrawFromSourceIndex) {
             const x = Math.max(drawX, clipX) + 1;
             drawRegions.push({
                 x,

@@ -110,6 +110,23 @@ export class MergedCellResolver {
     }
 
     /**
+     * Leftmost column whose pixels must be repainted when `col` changes width,
+     * considering only merges intersecting the row interval `[top, bottom)`.
+     * A merged cell lays out its text across the sum of all covered columns, so
+     * resizing any member invalidates the paint all the way back to its anchor.
+     */
+    public redrawStartForColumnResize(col: number, top: number, bottom: number): number {
+        let result = col;
+        // The covered-cell index makes this proportional to visible rows, not
+        // total sheet merges, on every pointer-move frame of a resize drag.
+        for (let row = top; row < bottom; row++) {
+            const range = this.cellToRange.get(packColRowToNumber(col, row));
+            if (range !== undefined) result = Math.min(result, range.x);
+        }
+        return result;
+    }
+
+    /**
      * Grows a rectangle until it fully contains every merge it touches
      * (fixpoint — growing over one merge can reach another). Returns the
      * input rectangle (same identity) when nothing grows. Mirrors the app's

@@ -541,6 +541,27 @@ export function drawGrid(arg: DrawGridArg, lastArg: DrawGridArg | undefined) {
     } else if (canBlit !== false) {
         assert(last !== undefined);
         const resizedCol = canBlit;
+        // A merged cell's wrapped lines depend on its full combined width.
+        // Repainting only from a covered column's own left edge leaves the
+        // anchor-side pixels from the old layout behind, making wrapping appear
+        // to disappear as soon as any interior column is resized.
+        const lastVisibleRow = getLastRow(
+            effectiveCols,
+            height,
+            totalHeaderHeight,
+            translateX,
+            translateY,
+            cellYOffset,
+            rows,
+            getRowHeight,
+            freezeTrailingRows,
+            hasAppendRow
+        );
+        const redrawFromSourceCol = mergedCells?.redrawStartForColumnResize(
+            resizedCol,
+            cellYOffset,
+            lastVisibleRow + 1
+        ) ?? resizedCol;
         drawRegions = blitResizedCol(
             last,
             cellXOffset,
@@ -551,7 +572,7 @@ export function drawGrid(arg: DrawGridArg, lastArg: DrawGridArg | undefined) {
             height,
             totalHeaderHeight,
             effectiveCols,
-            resizedCol
+            redrawFromSourceCol
         );
     }
 

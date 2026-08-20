@@ -163,6 +163,22 @@ describe("MergedCellResolver", () => {
         expect(r.adjustColBoundary(2, 6, 9, 9)).toBe(2);
     });
 
+    test("moves a column-resize redraw back to every affected merge anchor", () => {
+        const r = new MergedCellResolver([
+            { x: 1, y: 0, width: 4, height: 1 },
+            { x: 0, y: 5, width: 3, height: 1 },
+        ]);
+
+        // Column 2 belongs to both merges, so the earliest anchor wins.
+        expect(r.redrawStartForColumnResize(2, 0, 10)).toBe(0);
+        expect(r.redrawStartForColumnResize(3, 0, 10)).toBe(1);
+        expect(r.redrawStartForColumnResize(4, 0, 10)).toBe(1);
+        expect(r.redrawStartForColumnResize(5, 0, 10)).toBe(5);
+
+        // The lower merge must not widen repainting while it is offscreen.
+        expect(r.redrawStartForColumnResize(2, 0, 5)).toBe(1);
+    });
+
     test("expandDamage handles many members of one merge", () => {
         const r = new MergedCellResolver([{ x: 0, y: 0, width: 3, height: 3 }]);
         const expanded = r.expandDamage(
