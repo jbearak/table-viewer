@@ -86,13 +86,24 @@ describe('register_table_viewer', () => {
         await registration.drain();
     }
 
-    // Read-only panels (compare mode, git: revisions) never open edit sessions,
-    // so disposal sends no pending-edits flush request to wait on.
-    async function dispose_read_only_registration(
-        registration: ReturnType<typeof register_table_viewer>,
-    ): Promise<void> {
-        registration.dispose();
-        await registration.drain();
+    async function receive_ready_and_get_snapshot(
+        panel: ReturnType<typeof vscode_mock.__getPanels>[number],
+    ): Promise<{
+        configuration: { gitCompare?: unknown };
+        capabilities: { csvEditingSupported: boolean };
+    }> {
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(panel.__messages.some((message) => (
+            typeof message === 'object' && message !== null
+            && 'type' in message && message.type === 'workbookSnapshot'
+        ))).toBe(true));
+        return (panel.__messages.find((message) => (
+            typeof message === 'object' && message !== null
+            && 'type' in message && message.type === 'workbookSnapshot'
+        )) as { snapshot: {
+            configuration: { gitCompare?: unknown };
+            capabilities: { csvEditingSupported: boolean };
+        } }).snapshot;
     }
 
     async function acknowledge_latest_snapshot(
@@ -518,23 +529,9 @@ describe('register_table_viewer', () => {
             await provider.resolveCustomEditor(document, panel);
         });
 
-        const workbook_snapshot = async (
-            panel: ReturnType<typeof vscode_mock.__getPanels>[number],
-        ) => {
-            await panel.__receive({ type: 'ready' });
-            await vi.waitFor(() => expect(panel.__messages.some((message) => (
-                typeof message === 'object' && message !== null
-                && 'type' in message && message.type === 'workbookSnapshot'
-            ))).toBe(true));
-            return (panel.__messages.find((message) => (
-                typeof message === 'object' && message !== null
-                && 'type' in message && message.type === 'workbookSnapshot'
-            )) as { snapshot: { configuration: { gitCompare?: unknown } } }).snapshot;
-        };
-
         await registration.openTableDiff(uri, original);
         const compare_panel = vscode_mock.__getPanels()[0];
-        const compare_snapshot = await workbook_snapshot(compare_panel);
+        const compare_snapshot = await receive_ready_and_get_snapshot(compare_panel);
         expect(compare_snapshot.configuration.gitCompare).toBeDefined();
 
         // A later plain open of the same file must not inherit the compare.
@@ -545,7 +542,7 @@ describe('register_table_viewer', () => {
         const document = await provider.openCustomDocument(uri);
         await provider.resolveCustomEditor(document, plain_panel);
         const plain_mock = vscode_mock.__getPanels()[1];
-        const plain_snapshot = await workbook_snapshot(plain_mock);
+        const plain_snapshot = await receive_ready_and_get_snapshot(plain_mock);
         expect(plain_snapshot.configuration.gitCompare).toBeUndefined();
         await dispose_registration(registration, plain_mock);
     });
@@ -564,23 +561,6 @@ describe('register_table_viewer', () => {
             query: JSON.stringify({ path: '/repo/data.csv', ref: '~' }),
         }) as unknown as vscode.Uri;
 
-        const snapshot_of = async (
-            panel: ReturnType<typeof vscode_mock.__getPanels>[number],
-        ) => {
-            await panel.__receive({ type: 'ready' });
-            await vi.waitFor(() => expect(panel.__messages.some((message) => (
-                typeof message === 'object' && message !== null
-                && 'type' in message && message.type === 'workbookSnapshot'
-            ))).toBe(true));
-            return (panel.__messages.find((message) => (
-                typeof message === 'object' && message !== null
-                && 'type' in message && message.type === 'workbookSnapshot'
-            )) as { snapshot: {
-                configuration: { gitCompare?: unknown };
-                capabilities: { csvEditingSupported: boolean };
-            } }).snapshot;
-        };
-
         // vscode.diff resolves the git: side first, then the file: side.
         for (const uri of [git_uri, file_uri]) {
             const panel = vscode_mock.window.createWebviewPanel(
@@ -592,15 +572,18 @@ describe('register_table_viewer', () => {
         }
         const [git_panel, file_panel] = vscode_mock.__getPanels();
 
-        const git_snapshot = await snapshot_of(git_panel);
+        const git_snapshot = await receive_ready_and_get_snapshot(git_panel);
         expect(git_snapshot.configuration.gitCompare).toBeUndefined();
         expect(git_snapshot.capabilities.csvEditingSupported).toBe(false);
 
-        const file_snapshot = await snapshot_of(file_panel);
+        const file_snapshot = await receive_ready_and_get_snapshot(file_panel);
         expect(file_snapshot.configuration.gitCompare).toBeDefined();
         expect(file_snapshot.capabilities.csvEditingSupported).toBe(false);
 
-        await dispose_read_only_registration(registration);
+        // Read-only panels never open edit sessions, so disposal sends no
+        // pending-edits flush request to wait on.
+        registration.dispose();
+        await registration.drain();
     });
 
     it('renders a bare git: URI read-only and leaves later plain opens uncompared', async () => {
@@ -621,18 +604,7 @@ describe('register_table_viewer', () => {
             git_panel_handle,
         );
         const git_panel = vscode_mock.__getPanels()[0];
-        await git_panel.__receive({ type: 'ready' });
-        await vi.waitFor(() => expect(git_panel.__messages.some((message) => (
-            typeof message === 'object' && message !== null
-            && 'type' in message && message.type === 'workbookSnapshot'
-        ))).toBe(true));
-        const snapshot = (git_panel.__messages.find((message) => (
-            typeof message === 'object' && message !== null
-            && 'type' in message && message.type === 'workbookSnapshot'
-        )) as { snapshot: {
-            configuration: { gitCompare?: unknown };
-            capabilities: { csvEditingSupported: boolean };
-        } }).snapshot;
+        const snapshot = await receive_ready_and_get_snapshot(git_panel);
         expect(snapshot.configuration.gitCompare).toBeUndefined();
         expect(snapshot.capabilities.csvEditingSupported).toBe(false);
 
@@ -647,15 +619,7 @@ describe('register_table_viewer', () => {
             plain_handle,
         );
         const plain_panel = vscode_mock.__getPanels()[1];
-        await plain_panel.__receive({ type: 'ready' });
-        await vi.waitFor(() => expect(plain_panel.__messages.some((message) => (
-            typeof message === 'object' && message !== null
-            && 'type' in message && message.type === 'workbookSnapshot'
-        ))).toBe(true));
-        const plain_snapshot = (plain_panel.__messages.find((message) => (
-            typeof message === 'object' && message !== null
-            && 'type' in message && message.type === 'workbookSnapshot'
-        )) as { snapshot: { configuration: { gitCompare?: unknown } } }).snapshot;
+        const plain_snapshot = await receive_ready_and_get_snapshot(plain_panel);
         expect(plain_snapshot.configuration.gitCompare).toBeUndefined();
         await dispose_registration(registration, plain_panel);
     });
@@ -692,15 +656,7 @@ describe('register_table_viewer', () => {
             plain_handle,
         );
         const plain_panel = vscode_mock.__getPanels().at(-1)!;
-        await plain_panel.__receive({ type: 'ready' });
-        await vi.waitFor(() => expect(plain_panel.__messages.some((message) => (
-            typeof message === 'object' && message !== null
-            && 'type' in message && message.type === 'workbookSnapshot'
-        ))).toBe(true));
-        const snapshot = (plain_panel.__messages.find((message) => (
-            typeof message === 'object' && message !== null
-            && 'type' in message && message.type === 'workbookSnapshot'
-        )) as { snapshot: { configuration: { gitCompare?: unknown } } }).snapshot;
+        const snapshot = await receive_ready_and_get_snapshot(plain_panel);
         expect(snapshot.configuration.gitCompare).toBeUndefined();
         await dispose_registration(registration, plain_panel);
     });
