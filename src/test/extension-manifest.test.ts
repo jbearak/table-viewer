@@ -109,6 +109,18 @@ describe('extension runtime manifest', () => {
     });
 
     it('offers the table diff on git SCM resources for every supported format', () => {
+        // The custom-editor selector is the authority on supported formats;
+        // decode its casing-class pattern (e.g. `[cC][sS][vV]` -> `csv`) so the
+        // SCM menu cannot silently drift from it.
+        const selector_pattern = String(
+            custom_editors[0]?.selector?.[0]?.filenamePattern,
+        );
+        const supported_extensions = selector_pattern
+            .replace(/^\*\.\{|\}$/gu, '')
+            .split(',')
+            .map((extension) =>
+                extension.replace(/\[(.)(.)\]/gu, (_, lower: string) => lower));
+        expect(supported_extensions.length).toBeGreaterThan(0);
         const entries = (manifest.contributes?.menus as Record<string, unknown[]>)[
             'scm/resourceState/context'
         ] as { command: string; when: string; group: string }[];
@@ -120,7 +132,7 @@ describe('extension runtime manifest', () => {
         );
         for (const entry of diff_entries) {
             expect(entry.when).toContain('scmProvider == git');
-            for (const extension of ['csv', 'tsv', 'xlsx', 'xls']) {
+            for (const extension of supported_extensions) {
                 expect(entry.when).toContain(extension);
             }
         }

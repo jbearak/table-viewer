@@ -167,10 +167,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             () => vscode.window.activeTextEditor?.document.uri,
         ));
         register('tableViewer.openAsText', open_with('default', active_custom_tab_uri));
-        register('tableViewer.openWorkbookAtSheet', async (value: unknown) => {
-            const args = open_workbook_at_sheet_arguments(value);
-            const uri = vscode.Uri.parse(args.uri, true);
+        // Command failures surface as an error message but stay thrown, so
+        // callers (tests, other extensions) still observe the rejection.
+        const reporting_errors = async <T>(action: () => Promise<T>): Promise<T> => {
             try {
+                return await action();
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                void vscode.window.showErrorMessage(message);
+                throw error;
+            }
+        };
+        register('tableViewer.openWorkbookAtSheet', (value: unknown) => reporting_errors(
+            async () => {
+                const args = open_workbook_at_sheet_arguments(value);
+                const uri = vscode.Uri.parse(args.uri, true);
                 const found = await viewers!.openWorkbookAtSheet(uri, args.sheetName);
                 if (!found) {
                     void vscode.window.showWarningMessage(
@@ -178,23 +189,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                     );
                 }
                 return found;
-            } catch (error) {
-                const message = error instanceof Error ? error.message : String(error);
-                void vscode.window.showErrorMessage(message);
-                throw error;
-            }
-        });
+            },
+        ));
         register('tableViewer.openTableDiff', async (resource_state?: unknown) => {
             const uri = scm_resource_uri(resource_state)
                 ?? vscode.window.activeTextEditor?.document.uri;
             if (!uri || uri.scheme !== 'file') return;
-            try {
-                await viewers!.openTableDiff(uri, to_git_uri(uri));
-            } catch (error) {
-                const message = error instanceof Error ? error.message : String(error);
-                void vscode.window.showErrorMessage(message);
-                throw error;
-            }
+            await reporting_errors(() => viewers!.openTableDiff(uri, to_git_uri(uri)));
         });
         register('tableViewer.manageStoredFileState', () => {
             show_state_inspector_panel({

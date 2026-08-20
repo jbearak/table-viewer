@@ -509,18 +509,24 @@ describe('register_table_viewer', () => {
             await provider.resolveCustomEditor(document, panel);
         });
 
+        const workbook_snapshot = async (
+            panel: ReturnType<typeof vscode_mock.__getPanels>[number],
+        ) => {
+            await panel.__receive({ type: 'ready' });
+            await vi.waitFor(() => expect(panel.__messages.some((message) => (
+                typeof message === 'object' && message !== null
+                && 'type' in message && message.type === 'workbookSnapshot'
+            ))).toBe(true));
+            return (panel.__messages.find((message) => (
+                typeof message === 'object' && message !== null
+                && 'type' in message && message.type === 'workbookSnapshot'
+            )) as { snapshot: { configuration: { gitCompare?: unknown } } }).snapshot;
+        };
+
         await registration.openTableDiff(uri, original);
         const compare_panel = vscode_mock.__getPanels()[0];
-        await compare_panel.__receive({ type: 'ready' });
-        await vi.waitFor(() => expect(compare_panel.__messages.some((message) => (
-            typeof message === 'object' && message !== null
-            && 'type' in message && message.type === 'workbookSnapshot'
-        ))).toBe(true));
-        const compare_snapshot = compare_panel.__messages.find((message) => (
-            typeof message === 'object' && message !== null
-            && 'type' in message && message.type === 'workbookSnapshot'
-        )) as { snapshot: { configuration: { gitCompare?: unknown } } };
-        expect(compare_snapshot.snapshot.configuration.gitCompare).toBeDefined();
+        const compare_snapshot = await workbook_snapshot(compare_panel);
+        expect(compare_snapshot.configuration.gitCompare).toBeDefined();
 
         // A later plain open of the same file must not inherit the compare.
         const plain_panel = vscode_mock.window.createWebviewPanel(
@@ -530,16 +536,8 @@ describe('register_table_viewer', () => {
         const document = await provider.openCustomDocument(uri);
         await provider.resolveCustomEditor(document, plain_panel);
         const plain_mock = vscode_mock.__getPanels()[1];
-        await plain_mock.__receive({ type: 'ready' });
-        await vi.waitFor(() => expect(plain_mock.__messages.some((message) => (
-            typeof message === 'object' && message !== null
-            && 'type' in message && message.type === 'workbookSnapshot'
-        ))).toBe(true));
-        const plain_snapshot = plain_mock.__messages.find((message) => (
-            typeof message === 'object' && message !== null
-            && 'type' in message && message.type === 'workbookSnapshot'
-        )) as { snapshot: { configuration: { gitCompare?: unknown } } };
-        expect(plain_snapshot.snapshot.configuration.gitCompare).toBeUndefined();
+        const plain_snapshot = await workbook_snapshot(plain_mock);
+        expect(plain_snapshot.configuration.gitCompare).toBeUndefined();
         await dispose_registration(registration, plain_mock);
     });
 
