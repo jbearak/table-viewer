@@ -34,13 +34,30 @@ import { parse_relationships, rels_path_for_part, type OoxmlRelationship } from 
 import {
     decode_xml,
     get_attr,
-    find_element_section,
     get_text,
     iter_elements,
     iter_elements_markup,
 } from './ooxml-xml';
+import {
+    element_content,
+    find_element_section,
+    find_first_element,
+    find_tag_end,
+    get_tag_attr,
+    index_of_bytes,
+    is_self_closing,
+    is_tag_boundary,
+    scan_rows,
+    utf8_text,
+    worksheet_scan_input,
+} from './ooxml-worksheet-scan';
 
 // --- ZIP / Entry Access ---
+
+function get_entry_bytes(cfb_file: ReturnType<typeof CFB.read>, path: string): Uint8Array | null {
+    const entry = CFB.find(cfb_file, path);
+    return entry?.content ? entry.content as Uint8Array : null;
+}
 
 function get_entry_text(cfb_file: ReturnType<typeof CFB.read>, path: string): string | null {
     const entry = CFB.find(cfb_file, path);
@@ -268,10 +285,45 @@ function parse_cell_ref(ref: string): { row: number; col: number } | null {
     };
 }
 
-function parse_dimension(xml: string): { row_count: number; col_count: number } | null {
+function iter_worksheet_elements(
+    xml: Uint8Array,
+    tag: string,
+    callback: (tag_start: number, tag_end: number, inner_start: number, inner_end: number) => void,
+): void {
+    const open = `<${tag}`;
+    let pos = 0;
+    while (true) {
+        const start = index_of_bytes(xml, open, pos);
+        if (start === -1) return;
+        if (!is_tag_boundary(xml[start + open.length])) { pos = start + 1; continue; }
+        const tag_end = find_tag_end(xml, start);
+        if (tag_end === -1) return;
+        if (is_self_closing(xml, start, tag_end)) {
+            callback(start, tag_end + 1, tag_end + 1, tag_end + 1);
+            pos = tag_end + 1;
+            continue;
+        }
+        const close = `</${tag}>`;
+        const close_pos = index_of_bytes(xml, close, tag_end);
+        if (close_pos === -1) { pos = tag_end + 1; continue; }
+        callback(start, tag_end + 1, tag_end + 1, close_pos);
+        pos = close_pos + close.length;
+    }
+}
+
+/** The same first-literal-element rule as `get_text`, but over worksheet bytes. */
+function get_worksheet_text(xml: Uint8Array, tag: string): Uint8Array | null {
+    let result: Uint8Array | null = null;
+    iter_worksheet_elements(xml, tag, (_start, _end, inner_start, inner_end) => {
+        if (result === null) result = xml.subarray(inner_start, inner_end);
+    });
+    return result;
+}
+
+function parse_dimension(xml: Uint8Array): { row_count: number; col_count: number } | null {
     let result: { row_count: number; col_count: number } | null = null;
-    iter_elements(xml, 'dimension', (open_tag) => {
-        const ref = get_attr(open_tag, 'ref');
+    iter_worksheet_elements(xml, 'dimension', (tag_start, tag_end) => {
+        const ref = get_tag_attr(xml, tag_start, tag_end, 'ref');
         if (!ref) return;
         const parts = ref.split(':');
         if (parts.length === 1) {
@@ -298,8 +350,105 @@ interface WorksheetWorking extends WorkingSet {
     merges: MergeRange[];
 }
 
+/** Optional probe used by tests to prove ordinary numeric values avoid decoding. */
+export interface Utf8NumberParseDiagnostics {
+    fallback_count: number;
+}
+
+/**
+ * Parse the ordinary finite decimal spelling directly from UTF-8 bytes. Values
+ * outside the deliberately narrow fast grammar decode only their own `<v>` text
+ * and defer to `Number()`, preserving its accepted spellings and whitespace.
+ */
+export function parse_finite_number_utf8(
+    value: Uint8Array,
+    diagnostics?: Utf8NumberParseDiagnostics,
+): number | null {
+    let start = 0;
+    let end = value.length;
+    const ascii_space = (code: number): boolean => (
+        code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0d
+    );
+    while (start < end && ascii_space(value[start])) start++;
+    while (end > start && ascii_space(value[end - 1])) end--;
+    if (start === end) return null;
+
+    let i = start;
+    let negative = false;
+    if (value[i] === 0x2b || value[i] === 0x2d) {
+        negative = value[i] === 0x2d;
+        i++;
+    }
+    let coefficient = 0;
+    let significant_digits = 0;
+    let saw_digit = false;
+    let saw_nonzero = false;
+    let fractional_digits = 0;
+    while (i < end && value[i] >= 0x30 && value[i] <= 0x39) {
+        const digit = value[i] - 0x30;
+        saw_digit = true;
+        if (digit !== 0 || saw_nonzero) {
+            saw_nonzero = true;
+            significant_digits++;
+            if (significant_digits <= 15) coefficient = coefficient * 10 + digit;
+        }
+        i++;
+    }
+    if (value[i] === 0x2e) {
+        i++;
+        while (i < end && value[i] >= 0x30 && value[i] <= 0x39) {
+            const digit = value[i] - 0x30;
+            saw_digit = true;
+            fractional_digits++;
+            if (digit !== 0 || saw_nonzero) {
+                saw_nonzero = true;
+                significant_digits++;
+                if (significant_digits <= 15) coefficient = coefficient * 10 + digit;
+            }
+            i++;
+        }
+    }
+    let exponent = 0;
+    if (i < end && (value[i] === 0x65 || value[i] === 0x45)) {
+        i++;
+        let exponent_negative = false;
+        if (value[i] === 0x2b || value[i] === 0x2d) {
+            exponent_negative = value[i] === 0x2d;
+            i++;
+        }
+        const exponent_start = i;
+        while (i < end && value[i] >= 0x30 && value[i] <= 0x39) {
+            exponent = Math.min(10_000, exponent * 10 + value[i] - 0x30);
+            i++;
+        }
+        if (i === exponent_start) return number_fallback(value, diagnostics);
+        if (exponent_negative) exponent = -exponent;
+    }
+    const scale = exponent - fractional_digits;
+    // The classic exact-operation fast path: at most 15 significant digits and
+    // a decimal scale within the powers Number can apply without a second-rounding
+    // disagreement with decimal-to-binary conversion. Wider values use Number().
+    if (!saw_digit || i !== end || significant_digits > 15 || scale < -22 || scale > 22) {
+        return number_fallback(value, diagnostics);
+    }
+    if (!saw_nonzero) return negative ? -0 : 0;
+    const parsed = scale < 0 ? coefficient / (10 ** -scale) : coefficient * (10 ** scale);
+    if (!Number.isFinite(parsed)) return null;
+    return negative ? -parsed : parsed;
+}
+
+function number_fallback(
+    value: Uint8Array,
+    diagnostics: Utf8NumberParseDiagnostics | undefined,
+): number | null {
+    if (diagnostics) diagnostics.fallback_count++;
+    const text = utf8_text(value);
+    const parsed = Number(text);
+    return text.trim() === '' || !Number.isFinite(parsed) ? null : parsed;
+}
+
 function parse_worksheet_core(
-    xml: string,
+    xml: Uint8Array,
     sst: ParsedXlsxString[],
     xfs: XfEntry[],
     fonts: FontEntry[],
@@ -334,8 +483,9 @@ function parse_worksheet_core(
 
     // Parse merge cells
     const merges: MergeRange[] = [];
-    const merge_cells_section = get_text(xml, 'mergeCells');
-    if (merge_cells_section) {
+    const merge_cells_bytes = get_worksheet_text(xml, 'mergeCells');
+    if (merge_cells_bytes && merge_cells_bytes.length > 0) {
+        const merge_cells_section = utf8_text(merge_cells_bytes);
         iter_elements(merge_cells_section, 'mergeCell', (open_tag) => {
             const ref = get_attr(open_tag, 'ref');
             if (!ref) return;
@@ -352,22 +502,22 @@ function parse_worksheet_core(
     let max_row = 0;
     let max_col = 0;
 
-    const sheet_data = get_text(xml, 'sheetData');
+    const sheet_data = find_first_element(xml, 'sheetData');
     if (sheet_data) {
-        iter_elements(sheet_data, 'row', (_row_open, row_inner) => {
-            iter_elements(row_inner, 'c', (c_open, c_inner) => {
-                const ref = get_attr(c_open, 'r');
-                if (!ref) return;
-                const cell_ref = parse_cell_ref(ref);
-                if (!cell_ref) return;
-                const { row, col } = cell_ref;
+        scan_rows(xml, sheet_data.inner_start, sheet_data.inner_end, {
+            on_cell: (row, col, cell_span) => {
                 if (row + 1 > max_row) max_row = row + 1;
                 if (col + 1 > max_col) max_col = col + 1;
 
-                const t = get_attr(c_open, 't');
-                const s = get_attr(c_open, 's');
+                const t = get_tag_attr(xml, cell_span.start, cell_span.inner_start, 't');
+                const s = get_tag_attr(xml, cell_span.start, cell_span.inner_start, 's');
                 const xf_index = s ? parseInt(s, 10) : 0;
-                const v_text = get_text(c_inner, 'v');
+                const v_bytes = element_content(
+                    xml,
+                    'v',
+                    cell_span.inner_start,
+                    cell_span.inner_end,
+                );
                 const style = get_style(xf_index, xfs, fonts);
 
                 let raw: string | number | boolean | null = null;
@@ -377,7 +527,7 @@ function parse_worksheet_core(
 
                 if (t === 's') {
                     // Shared string (already decoded during SST parsing)
-                    const idx = v_text !== null ? parseInt(v_text, 10) : -1;
+                    const idx = v_bytes !== null ? parseInt(utf8_text(v_bytes), 10) : -1;
                     if (idx >= 0 && idx < sst.length) {
                         const entry = sst[idx];
                         raw = typeof entry === 'string' ? entry : entry.text;
@@ -386,24 +536,29 @@ function parse_worksheet_core(
                     formatted = raw !== null ? String(raw) : '';
                 } else if (t === 'b') {
                     // Boolean
-                    raw = v_text === '1';
+                    raw = v_bytes?.length === 1 && v_bytes[0] === 0x31;
                     formatted = raw ? 'TRUE' : 'FALSE';
                 } else if (t === 'e') {
                     // Error
-                    raw = v_text !== null ? decode_xml(v_text) : null;
+                    raw = v_bytes !== null ? decode_xml(utf8_text(v_bytes)) : null;
                     formatted = raw !== null ? String(raw) : '';
                 } else if (t === 'str') {
                     // Inline formula string result
-                    raw = v_text !== null ? decode_xml(v_text) : null;
+                    raw = v_bytes !== null ? decode_xml(utf8_text(v_bytes)) : null;
                     formatted = raw !== null ? String(raw) : '';
                 } else if (t === 'inlineStr') {
                     // Inline string — same rich-run parsing as shared strings.
                     // Note the legacy plain path returned null for an <is> with
                     // no <t>; parse_xlsx_string_item returns '' there, and an
                     // empty string densifies identically to a blank cell.
-                    const is_elem = get_text(c_inner, 'is');
-                    if (is_elem) {
-                        const parsed = parse_xlsx_string_item(is_elem);
+                    const is_elem = element_content(
+                        xml,
+                        'is',
+                        cell_span.inner_start,
+                        cell_span.inner_end,
+                    );
+                    if (is_elem && is_elem.length > 0) {
+                        const parsed = parse_xlsx_string_item(utf8_text(is_elem));
                         if (typeof parsed === 'string') {
                             raw = parsed;
                         } else {
@@ -414,18 +569,17 @@ function parse_worksheet_core(
                     formatted = raw !== null ? String(raw) : '';
                 } else if (t === 'd') {
                     // ISO 8601 date cell
-                    if (v_text !== null && v_text !== '') {
-                        raw = v_text;
-                        formatted = v_text;
+                    if (v_bytes !== null && v_bytes.length > 0) {
+                        const value = utf8_text(v_bytes);
+                        raw = value;
+                        formatted = value;
                         rawType = 'date';
                     }
                 } else {
                     // Numeric (default) — includes dates, formulas with numeric results
-                    if (v_text !== null && v_text !== '') {
-                        const num = Number(v_text);
-                        if (v_text.trim() === '' || !Number.isFinite(num)) {
-                            // non-numeric or infinite — leave as null
-                        } else if (is_date_format(xf_index, xfs, format_map)) {
+                    const num = v_bytes === null ? null : parse_finite_number_utf8(v_bytes);
+                    if (num !== null) {
+                        if (is_date_format(xf_index, xfs, format_map)) {
                             raw = is_valid_excel_date_serial(num, datemode)
                                 ? serial_to_iso(num, datemode)
                                 : num;
@@ -452,7 +606,7 @@ function parse_worksheet_core(
                         `Spreadsheet has too many cells to open safely (max ${MAX_WORKBOOK_CELLS.toLocaleString()})`
                     );
                 }
-            });
+            },
         });
     }
 
@@ -467,7 +621,12 @@ function parse_worksheet_core(
     // `<sheetData>` bodies iter_elements usually walks, so this is free here.
     const hyperlinks_section = find_element_section(xml, 'hyperlinks');
     if (hyperlinks_section) {
-        iter_elements_markup(hyperlinks_section.inner, 'hyperlink', (open_tag) => {
+        const hyperlinks_inner = utf8_text(
+            xml,
+            hyperlinks_section.inner_start,
+            hyperlinks_section.inner_end,
+        );
+        iter_elements_markup(hyperlinks_inner, 'hyperlink', (open_tag) => {
             const ref = get_attr(open_tag, 'ref');
             if (!ref) return;
             const cell_ref = parse_cell_ref(ref);
@@ -652,8 +811,8 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookDa
         const sheet_path = rels.get(entry.rId);
         if (!sheet_path) continue;
 
-        const ws_xml = get_entry_text(cfb_file, `/${sheet_path}`);
-        if (!ws_xml) {
+        const ws_content = get_entry_bytes(cfb_file, `/${sheet_path}`);
+        if (!ws_content) {
             // Empty or missing sheet
             sheets.push({
                 name: entry.name,
@@ -667,7 +826,7 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookDa
         }
 
         const working = parse_worksheet_core(
-            ws_xml, sst, xfs, fonts, format_map, datemode, budget,
+            worksheet_scan_input(ws_content), sst, xfs, fonts, format_map, datemode, budget,
             worksheet_rels(cfb_file, sheet_path)
         );
         workings.push(working);
@@ -703,8 +862,8 @@ export async function parse_xlsx_streaming(buffer: Uint8Array): Promise<Streamin
         const sheet_path = rels.get(entry.rId);
         if (!sheet_path) continue;
 
-        const ws_xml = get_entry_text(cfb_file, `/${sheet_path}`);
-        if (!ws_xml) {
+        const ws_content = get_entry_bytes(cfb_file, `/${sheet_path}`);
+        if (!ws_content) {
             sheets.push({
                 name: entry.name,
                 worksheetId: entry.worksheetId,
@@ -717,7 +876,7 @@ export async function parse_xlsx_streaming(buffer: Uint8Array): Promise<Streamin
         }
 
         const working = parse_worksheet_core(
-            ws_xml, sst, xfs, fonts, format_map, datemode, budget,
+            worksheet_scan_input(ws_content), sst, xfs, fonts, format_map, datemode, budget,
             worksheet_rels(cfb_file, sheet_path)
         );
         workings.push(working);

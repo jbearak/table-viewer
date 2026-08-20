@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import CFB from 'cfb';
 import {
+    parse_finite_number_utf8,
     parse_workbook_xml,
     parse_xlsx,
     parse_xlsx_streaming,
@@ -349,6 +350,23 @@ describe('parse_xlsx', () => {
             const sheet = data.sheets[0];
             expect(sheet.rows[0][0]?.raw).toBe(1234.56);
             expect(sheet.rows[0][1]?.raw).toBe(0.75);
+        });
+
+        it('parses the ordinary fixture numbers without decoding fallbacks', () => {
+            const diagnostics = { fallback_count: 0 };
+            for (const text of ['1234.56', '0.75']) {
+                expect(parse_finite_number_utf8(Buffer.from(text), diagnostics)).toBe(Number(text));
+            }
+            expect(diagnostics.fallback_count).toBe(0);
+        });
+
+        it('preserves Number fallback spellings outside the byte fast path', () => {
+            const diagnostics = { fallback_count: 0 };
+            expect(parse_finite_number_utf8(Buffer.from('0x10'), diagnostics)).toBe(16);
+            expect(parse_finite_number_utf8(Buffer.from('Infinity'), diagnostics)).toBeNull();
+            expect(parse_finite_number_utf8(Buffer.from(' 42 '), diagnostics)).toBe(42);
+            expect(parse_finite_number_utf8(Buffer.from('1.2e-30'), diagnostics)).toBe(1.2e-30);
+            expect(diagnostics.fallback_count).toBe(4);
         });
 
         it('applies number formatting via SSF', async () => {

@@ -161,6 +161,7 @@
   },
   "scripts": {
     "test": "vitest run",
+    "test:ooxml:conformance": "vitest run src/test/ooxml-conformance.test.ts src/test/ooxml-public-api.test.ts",
     "test:watch": "vitest",
     "test:sqlite:multiprocess": "vitest run src/test/sqlite-multiprocess.test.ts",
     "test:sqlite:backend": "vitest run --no-file-parallelism src/test/sqlite-file-state-persistence.test.ts src/test/sqlite-file-state-schema.test.ts src/test/sqlite-file-state-validation.test.ts src/test/sqlite-multiprocess.test.ts src/test/sqlite-open-recovery.test.ts src/test/sqlite-runtime.test.ts src/test/vscode-state-database.test.ts",
@@ -198,6 +199,7 @@
     "test:desktop-smoke:relaunch": "npm run desktop:prepackage && playwright test --config=desktop/test-smoke/playwright.config.ts desktop/test-smoke/state-relaunch.spec.ts",
     "test:desktop-perf": "npm run desktop:prepackage && playwright test --config=desktop/test-performance/playwright.config.ts",
     "perf:compare": "node benchmarks/grid/compare.mjs",
+    "perf:ooxml": "node benchmarks/ooxml/run.mjs --compare benchmarks/ooxml/baselines/main-string-scanner.json",
     "watch": "tsc -watch -p ./",
     "package": "vsce package --no-dependencies"
   },

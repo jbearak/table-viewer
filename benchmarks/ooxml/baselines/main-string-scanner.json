@@ -1,0 +1,83 @@
+{
+  "meta": {
+    "schema": 1,
+    "date": "2026-08-19T18:08:47.644Z",
+    "node": "v26.7.0",
+    "node_major": 26,
+    "platform": "darwin",
+    "arch": "arm64",
+    "label": "main-string-scanner",
+    "sample_count": 3,
+    "aggregation": "median of fresh child processes",
+    "fixtures": {
+      "real": {
+        "path": "src/test/fixtures/undesa_pd_2024_wcu_country_data_survey-based.xlsx",
+        "bytes": 7123695,
+        "sha256": "d673a5e7f0a79e46f6df9d1a9e65382ca39f40004a4e4bf43696d0f7eff80e78",
+        "worksheet_path": "/xl/worksheets/sheet4.xml",
+        "worksheet_bytes": 59945240,
+        "worksheet_rows": 70453
+      },
+      "non_ascii": {
+        "generator": "inline-string-v1",
+        "package_bytes": 6143324,
+        "worksheet_path": "/xl/worksheets/sheet1.xml",
+        "worksheet_bytes": 27528923,
+        "worksheet_sha256": "3f9cecdaa48a4d668bb1bf0a3f82acca61ffc8150b3bce87b3b33a94b4bcabfd",
+        "worksheet_rows": 70453,
+        "worksheet_columns": 7,
+        "cell_text": "café"
+      }
+    }
+  },
+  "scenarios": {
+    "real-cfb-read": {
+      "time_ms": 193.815,
+      "peak_rss_mib": 125.453,
+      "live_external_delta_mib": 59.638,
+      "live_heap_used_delta_mib": 0.164
+    },
+    "real-worksheet-decode": {
+      "time_ms": 3.401,
+      "peak_rss_mib": 182.953,
+      "live_external_delta_mib": 57.168,
+      "live_heap_used_delta_mib": -0.007
+    },
+    "real-coordinate-scan": {
+      "time_ms": 554.297,
+      "peak_rss_mib": 248.016,
+      "live_external_delta_mib": 57.168,
+      "live_heap_used_delta_mib": 4.22
+    },
+    "real-full-save": {
+      "time_ms": 2395.671,
+      "peak_rss_mib": 582.516,
+      "live_external_delta_mib": 15.982,
+      "live_heap_used_delta_mib": 57.589
+    },
+    "non-ascii-cfb-read": {
+      "time_ms": 54.476,
+      "peak_rss_mib": 88.047,
+      "live_external_delta_mib": 26.254,
+      "live_heap_used_delta_mib": 0.063
+    },
+    "non-ascii-worksheet-decode": {
+      "time_ms": 10.45,
+      "peak_rss_mib": 139.656,
+      "live_external_delta_mib": 25.783,
+      "live_heap_used_delta_mib": 0.013
+    },
+    "non-ascii-coordinate-scan": {
+      "time_ms": 319.173,
+      "peak_rss_mib": 204.641,
+      "live_external_delta_mib": 25.783,
+      "live_heap_used_delta_mib": 4.225
+    },
+    "non-ascii-full-save": {
+      "time_ms": 1039.512,
+      "peak_rss_mib": 370.422,
+      "live_external_delta_mib": 5.859,
+      "live_heap_used_delta_mib": 51.9
+    }
+  }
+}
