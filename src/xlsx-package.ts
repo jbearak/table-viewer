@@ -1,12 +1,5 @@
 import CFB from 'cfb';
-import {
-    apply_cell_edits,
-    cells_present,
-    element_close,
-    formula_count,
-    widen_dimension,
-    type XlsxCellEdit,
-} from './xlsx-cell-write';
+import { element_close, type XlsxCellEdit } from './xlsx-cell-write';
 import { worksheet_scan_input } from './ooxml-worksheet-scan';
 import { get_style, is_date_format } from './spreadsheet-format';
 import {
@@ -28,11 +21,8 @@ import {
 } from './parse-xlsx';
 import type { XfEntry, DateMode } from './spreadsheet-format';
 import { rels_path_for_part } from './ooxml-relationships';
-import {
-    apply_hyperlink_edits,
-    cleared_display_texts,
-    type XlsxHyperlinkEdit,
-} from './xlsx-hyperlink-write';
+import type { XlsxHyperlinkEdit } from './xlsx-hyperlink-write';
+import { apply_worksheet_edits } from './ooxml-surgery';
 
 /**
  * Package-level (.xlsx container) side of `putexcel`-style saving.
@@ -404,82 +394,32 @@ export function write_xlsx_workbook_cell_edits(
         if (sheet_content === null) throw new Error('Could not read a worksheet to save');
         const sheet_xml = worksheet_scan_input(sheet_content);
 
-        // A `<hyperlink display="…">` about to be cleared may be the only place
-        // the cell's visible text lives — parse-xlsx falls back to `display` for
-        // a coordinate with no `<c>` at all — so it is promoted to a real cell
-        // value before the link element goes. Composed here rather than in the
-        // hyperlink writer because the promotion IS a cell edit: it has to go
-        // through `apply_cell_edits` to pick up the cell's style, the inlineStr
-        // rules and the duplicate-coordinate handling, and that pass runs first.
-        //
-        // Only a coordinate the sheet has no `<c>` for is promoted, because only
-        // there is `display` what the reader shows. A styled-but-empty
-        // `<c r="B2" s="3"/>` reads as blank today, and promoting into it would
-        // invent text the user never saw.
-        const cleared_displays = link_edits && link_edits.length > 0
-            ? cleared_display_texts(sheet_xml, link_edits)
-            : [];
-        // One batched scan for the whole set: asking per coordinate re-walked
-        // the worksheet once per cleared link.
-        const present = cleared_displays.length > 0
-            ? cells_present(sheet_xml, cleared_displays)
-            : new Set<string>();
-        const promotions: XlsxCellEdit[] = [];
-        for (const { row, col, text } of cleared_displays) {
-            if (present.has(`${row}:${col}`)) continue;
-            // `force_text`: this is text the file already held, not something a
-            // user typed, so inference must not reinterpret it — a display of
-            // `1e3` is the string `1e3` to the reader and would otherwise be
-            // stored as a number that reads back as 1000.
-            promotions.push({ row, col, value: text, force_text: true });
-        }
-        // Promotions go FIRST so `canonical_edits`' last-wins rule lets a value
-        // the user typed into the same cell override the promoted text — their
-        // edit is the newer intent.
-        const all_edits = promotions.length > 0 ? [...promotions, ...edits] : edits;
-
-        let updated = all_edits.length > 0
-            ? apply_cell_edits(sheet_xml, all_edits, {
+        const rels_path = `/${rels_path_for_part(part)}`;
+        const rels_xml = link_edits && link_edits.length > 0
+            ? read_part_text(cfb_file, rels_path)
+            : null;
+        const result = apply_worksheet_edits({
+            worksheet_xml: sheet_xml,
+            relationships_xml: rels_xml,
+            cell_edits: edits,
+            hyperlink_edits: link_edits,
+            write_options: {
                 datemode,
                 is_date_style,
                 cell_font_style,
                 run_font_base,
-            })
-            : sheet_xml;
-        if (all_edits.length > 0) {
-            let min_row = Infinity, min_col = Infinity, max_row = 0, max_col = 0;
-            for (const edit of all_edits) {
-                if (edit.row < min_row) min_row = edit.row;
-                if (edit.col < min_col) min_col = edit.col;
-                if (edit.row > max_row) max_row = edit.row;
-                if (edit.col > max_col) max_col = edit.col;
-            }
-            updated = widen_dimension(updated, min_row, min_col, max_row, max_col);
+            },
+        });
+        if (result.relationships_xml !== null) {
+            replacements.push({
+                path: rels_path,
+                text: result.relationships_xml,
+                // A sheet that had no `.rels` part gets one created.
+                created: rels_xml === null,
+            });
         }
-        if (link_edits && link_edits.length > 0) {
-            // The `.rels` splice is planned here with everything else so a bad
-            // link edit rejects the whole save before any part is mutated.
-            const rels_path = `/${rels_path_for_part(part)}`;
-            const rels_xml = read_part_text(cfb_file, rels_path);
-            const link_result = apply_hyperlink_edits(updated, rels_xml, link_edits);
-            updated = link_result.sheet_xml;
-            if (link_result.rels_xml !== null) {
-                replacements.push({
-                    path: rels_path,
-                    text: link_result.rels_xml,
-                    // A sheet that had no `.rels` part gets one created.
-                    created: rels_xml === null,
-                });
-            }
-        }
-        // Only a cell write can drop a formula; a hyperlink splice touches the
-        // `<hyperlinks>` section and the rels, never a `<c>`. Skipping the two
-        // whole-sheet scans keeps a link-only save off the worksheet body — and
-        // a save that only promotes a display text is a cell write, so it counts.
-        if (all_edits.length > 0) {
-            removed_formula ||= formula_count(updated) < formula_count(sheet_xml);
-        }
-        replacements.push({ path, bytes: updated });
+        removed_formula ||= result.formula_removed;
+        replacements.push({ path, bytes: result.worksheet_xml });
     }
 
     for (const replacement of replacements) {
