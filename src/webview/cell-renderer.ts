@@ -70,8 +70,9 @@ export interface CellEditOverlay {
     dirty_rich?: RichText;
     /** themeOverride background tint for dirty / conflicted cells. */
     bg?: string;
-    /** Diff toggle is on and this cell has a value edit: the pre-edit text to
-     * show before/against `dirty_value`. Always accompanied by `dirty_value`. */
+    /** The "before" text to diff against what the cell displays. The Diff
+     * toggle supplies it with `dirty_value` (pre-edit vs edited text); git
+     * compare mode supplies it alone (original vs the cell's own text). */
     diff_base?: string;
     /** Open Glide's edit overlay on this cell. */
     editable?: boolean;

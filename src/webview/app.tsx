@@ -49,6 +49,7 @@ import {
     normalize_complete_per_file_state,
     normalize_workbook_snapshot_state,
     type RetainedSnapshotCommandResult,
+    type WorkbookSnapshotCompare,
     type WorkbookSnapshotIdentity,
 } from '../viewer-snapshot';
 import { Toolbar, type ToolbarFocusHandle } from './toolbar';
@@ -61,7 +62,7 @@ import {
     type FilterHistogramReady,
     type FilterHistogramStatus,
 } from './transform-ui-model';
-import { SheetTabs, tab_orientation_label } from './sheet-tabs';
+import { SheetTabs, tab_orientation_label, type SheetTabBadge } from './sheet-tabs';
 import { StateStrip } from './state-strip';
 import { ContextMenu, type MenuItem } from './context-menu';
 import {
@@ -543,6 +544,10 @@ export function App(): React.JSX.Element {
     // survives the round trip within the session.
     const [diff_mode, set_diff_mode] = useState(false);
     const handle_toggle_diff_mode = useCallback(() => set_diff_mode((d) => !d), []);
+    // Git compare session (SCM diff click): per-cell diff highlighting against
+    // the git original, read-only. Snapshot-delivered like the capabilities.
+    const [git_compare, set_git_compare] =
+        useState<WorkbookSnapshotCompare | undefined>(undefined);
     const edit_mode_ref = useRef(false);
     // Passed down as the admission lifetime instead of asking GridShell to derive
     // one during render. React can abandon a child render; only these parent-owned
@@ -2024,6 +2029,7 @@ export function App(): React.JSX.Element {
                     }
                     preview_mode_ref.current = snapshot.configuration.previewMode;
                     set_preview_mode(snapshot.configuration.previewMode);
+                    set_git_compare(snapshot.configuration.gitCompare);
                     meta_ref.current = snapshot.meta;
                     set_meta(snapshot.meta);
                     set_filter_editor(null);
@@ -5101,6 +5107,20 @@ export function App(): React.JSX.Element {
     }
 
     const sheet_names = meta.sheets.map((s) => s.name);
+    // Git compare badges: mark sheets that exist on only one side. The compare
+    // source's meta lists the modified sheets first, then each deleted
+    // (original-only) sheet appended in pairing order — so added sheets are
+    // named by modifiedIndex and deleted ones fill the appended tail.
+    let sheet_badges: (SheetTabBadge | undefined)[] | undefined;
+    if (git_compare !== undefined) {
+        sheet_badges = meta.sheets.map(() => undefined);
+        let appended = meta.sheets.length
+            - git_compare.pairings.filter((p) => p.status === 'deleted').length;
+        for (const pairing of git_compare.pairings) {
+            if (pairing.status === 'added') sheet_badges[pairing.modifiedIndex] = 'added';
+            if (pairing.status === 'deleted') sheet_badges[appended++] = 'deleted';
+        }
+    }
     const has_multiple_sheets = meta.sheets.length > 1;
     // Scope menus exist only where "all sheets" means something. On a single-sheet
     // workbook the chevron could only restate the button, so there is none — and
@@ -5511,6 +5531,7 @@ export function App(): React.JSX.Element {
             preview_mode={preview_mode}
             edit_mode={edit_mode_on_active_sheet}
             diff_mode={diff_mode}
+            git_compare={git_compare !== undefined}
             edit_activation_id={edit_activation_id}
             highlight_in_flight={highlight_request_pending}
             csv_editable={csv_editable}
@@ -5826,6 +5847,7 @@ export function App(): React.JSX.Element {
                 <div className="content-area">
                     <SheetTabs
                         sheets={sheet_names}
+                        badges={sheet_badges}
                         active_sheet_index={active_sheet_index}
                         on_select={handle_sheet_select}
                         on_context_menu={handle_sheet_context_menu}
@@ -5839,6 +5861,7 @@ export function App(): React.JSX.Element {
                 <>
                     <SheetTabs
                         sheets={sheet_names}
+                        badges={sheet_badges}
                         active_sheet_index={active_sheet_index}
                         on_select={handle_sheet_select}
                         on_context_menu={handle_sheet_context_menu}

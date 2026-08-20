@@ -625,6 +625,26 @@ describe('build_grid_cell — diff overlay (Diff toggle)', () => {
         ]]);
     });
 
+    it('diffs the cell\'s own text when compare supplies diff_base alone', () => {
+        const c = build_grid_cell(
+            0,
+            [rc('7')],
+            true,
+            { diff_base: '3' },
+            undefined,
+            false,
+            false,
+            colors,
+        ) as unknown as { data: { lines: unknown[] }; copyData: string };
+        expect(c.data.lines).toEqual([[
+            { text: '3', style: { strikethrough: true }, diff_color: '#c00' },
+            { text: ' -> ' },
+            { text: '7', diff_color: '#0c0' },
+        ]]);
+        // Copy still takes the modified (displayed) value, not the base.
+        expect(c.copyData).toBe('7');
+    });
+
     it('never reuses a cached rich cell for a diff overlay', () => {
         const shared = {
             raw: 'ab',

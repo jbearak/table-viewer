@@ -11,8 +11,13 @@ export function tab_orientation_label(vertical: boolean): string {
         : 'Move sheet tabs to the left of the table';
 }
 
+/** Git compare marker on a tab: the sheet exists on only one side. */
+export type SheetTabBadge = 'added' | 'deleted';
+
 export interface SheetTabsProps {
     sheets: string[];
+    /** Positional compare badges; absent (or undefined slots) = no badge. */
+    badges?: (SheetTabBadge | undefined)[];
     active_sheet_index: number;
     on_select: (sheet_index: number) => void;
     on_context_menu: (sheet_index: number, x: number, y: number) => void;
@@ -24,6 +29,7 @@ export interface SheetTabsProps {
 
 export function SheetTabs({
     sheets,
+    badges,
     active_sheet_index,
     on_select,
     on_context_menu,
@@ -65,6 +71,18 @@ export function SheetTabs({
                     }}
                 >
                     {name}
+                    {badges?.[index] && (
+                        // Visible glyph + spoken word, so the badge is not
+                        // color-only: + for a sheet the change added, − for one
+                        // it deleted (shown read-only from the original).
+                        <span
+                            className={`sheet-tab-badge sheet-tab-badge-${badges[index]}`}
+                            role="img"
+                            aria-label={`(${badges[index]} sheet)`}
+                        >
+                            {badges[index] === 'added' ? '+' : '−'}
+                        </span>
+                    )}
                 </button>
             ))}
             {/*

@@ -587,6 +587,20 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
     font-family: inherit;
 }
 
+/* Git compare badge: sheet exists on only one side of the diff. */
+.sheet-tab-badge {
+    margin-left: 6px;
+    font-weight: bold;
+}
+
+.sheet-tab-badge-added {
+    color: var(--vscode-gitDecoration-addedResourceForeground, green);
+}
+
+.sheet-tab-badge-deleted {
+    color: var(--vscode-gitDecoration-deletedResourceForeground, red);
+}
+
 .sheet-tab:hover {
     background: var(--vscode-list-hoverBackground, #2a2d2e);
     opacity: 1;
