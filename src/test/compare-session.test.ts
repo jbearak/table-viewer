@@ -180,6 +180,27 @@ describe('CompareDataSource', () => {
         expect(source.projected_row_index(0, 1)).toBe(0);
     });
 
+    it('surfaces original-side truncation and warnings beside the modified side', () => {
+        const modified = new FixtureSource([{ name: 'Sheet1', rows: [['a']] }]);
+        const original = new FixtureSource([{ name: 'Sheet1', rows: [['a']] }]);
+        (modified as { truncationMessage?: string }).truncationMessage = 'mod cut';
+        (original as { truncationMessage?: string }).truncationMessage = 'orig cut';
+        (modified as { warnings?: string[] }).warnings = ['mod warn'];
+        (original as { warnings?: string[] }).warnings = ['orig warn'];
+        const source = new CompareDataSource(modified, original);
+        expect(source.truncationMessage).toBe('mod cut (git original: orig cut)');
+        expect(source.warnings).toEqual(['mod warn', 'Git original: orig warn']);
+    });
+
+    it('prefixes an original-only truncation message', () => {
+        const modified = new FixtureSource([{ name: 'Sheet1', rows: [['a']] }]);
+        const original = new FixtureSource([{ name: 'Sheet1', rows: [['a']] }]);
+        (original as { truncationMessage?: string }).truncationMessage = 'orig cut';
+        const source = new CompareDataSource(modified, original);
+        expect(source.truncationMessage).toBe('Git original: orig cut');
+        expect(source.warnings).toBeUndefined();
+    });
+
     it('clamps read windows to the padded row count', () => {
         const source = compare([['a'], ['b']], [['a']]);
         const window = source.read_rows(0, 1, 10);

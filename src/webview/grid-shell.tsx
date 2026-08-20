@@ -426,6 +426,10 @@ export interface GridShellProps {
      *  window; changed cells paint before/after and added/deleted rows get a
      *  band tint. Read-only — App withdraws editing when this is on. */
     git_compare?: boolean;
+    /** Compare-mode header diffs for this sheet: promoted column names live
+     *  outside the row space, so a header-only edit never reaches the per-cell
+     *  diff. Changed headers are annotated in the column title instead. */
+    compare_changed_column_names?: readonly { col: number; base: string }[];
     /** Parent-owned identity of the committed edit-mode activation. */
     edit_activation_id: number;
     csv_editable?: boolean;
@@ -570,6 +574,7 @@ export function GridShell({
     edit_mode = false,
     diff_mode = false,
     git_compare = false,
+    compare_changed_column_names,
     edit_activation_id,
     csv_editable = false,
     highlight_in_flight = false,
@@ -734,12 +739,34 @@ export function GridShell({
     }) | null>(null);
 
     const columns = useMemo<GridColumn[]>(
-        () => build_grid_columns(
+        () => {
+            const built = build_grid_columns(
+                visible_source_columns,
+                column_widths,
+                sheet_meta.columnNames,
+            );
+            if (!compare_changed_column_names?.length) return built;
+            // Promoted headers live outside the row space, so a header-only
+            // change never reaches the per-cell diff; annotate the title with
+            // the original name instead.
+            const base_by_col = new Map(compare_changed_column_names
+                .map(({ col, base }) => [col, base]));
+            return built.map((column, display_index) => {
+                const source_column = visible_source_columns[display_index];
+                const base = source_column === undefined
+                    ? undefined
+                    : base_by_col.get(source_column);
+                return base === undefined
+                    ? column
+                    : { ...column, title: `${column.title} (was: ${base || 'blank'})` };
+            });
+        },
+        [
             visible_source_columns,
             column_widths,
             sheet_meta.columnNames,
-        ),
-        [visible_source_columns, column_widths, sheet_meta.columnNames],
+            compare_changed_column_names,
+        ],
     );
 
     const sort_metadata = useMemo(

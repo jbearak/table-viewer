@@ -2,6 +2,13 @@
 // modified-side source to its git original so one object owns both lifetimes,
 // pads matched sheets' row counts to max(original, modified) so trailing
 // added/deleted rows render as full grid bands, and answers per-page diffs.
+//
+// Deliberately NOT an ExcelHeaderDataSource, so the controller's
+// `instanceof ExcelHeaderDataSource` mutation paths (first-row-header toggle,
+// committed-state override/hidden-row re-application) refuse in compare mode.
+// Both sides bake the per-file state in at build time and share projection
+// policy; mutating the wrapped modified source afterwards would invalidate
+// the padding and pairings computed here at construction.
 import {
     read_source_rows_indexed,
     type DataSource,
@@ -334,10 +341,24 @@ export class CompareDataSource implements DataSource {
     }
 
     get truncationMessage(): string | undefined {
-        return this.modified.truncationMessage;
+        // A truncated original silently degrades the diff (rows beyond its cap
+        // read as added), so its message must surface alongside the modified
+        // side's.
+        const original = this.original.truncationMessage;
+        const modified = this.modified.truncationMessage;
+        if (modified !== undefined && original !== undefined) {
+            return `${modified} (git original: ${original})`;
+        }
+        return modified
+            ?? (original !== undefined ? `Git original: ${original}` : undefined);
     }
 
     get warnings(): string[] | undefined {
-        return this.modified.warnings;
+        const original = this.original.warnings?.map(
+            (warning) => `Git original: ${warning}`,
+        );
+        const modified = this.modified.warnings;
+        if (!original?.length) return modified;
+        return [...(modified ?? []), ...original];
     }
 }

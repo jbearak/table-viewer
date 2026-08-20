@@ -5524,6 +5524,9 @@ export function App(): React.JSX.Element {
             edit_mode={edit_mode_on_active_sheet}
             diff_mode={diff_mode}
             git_compare={git_compare !== undefined}
+            compare_changed_column_names={
+                git_compare?.changedColumnNames[active_sheet_index]
+            }
             edit_activation_id={edit_activation_id}
             highlight_in_flight={highlight_request_pending}
             csv_editable={csv_editable}
