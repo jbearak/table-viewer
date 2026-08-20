@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/jbearak/table-viewer/conformance/schema-v1.json",
+  "title": "Table Viewer worksheet OOXML conformance corpus",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["$schema", "format_version", "corpus", "corpus_version", "api_version", "operation", "encoding", "coordinate_base", "refusal_codes", "cases"],
+  "properties": {
+    "$schema": { "const": "schema-v1.json" },
+    "format_version": { "const": 1 },
+    "corpus": { "const": "ooxml-worksheet-edit" },
+    "corpus_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "api_version": { "const": 1 },
+    "operation": { "const": "apply-worksheet-edits" },
+    "encoding": { "const": "utf-8" },
+    "coordinate_base": { "const": 0 },
+    "refusal_codes": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/refusalCode" }
+    },
+    "cases": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/case" } }
+  },
+  "$defs": {
+    "refusalCode": {
+      "enum": [
+        "namespace-prefixed-worksheet-element",
+        "markup-compatibility-alternate-content",
+        "foreign-worksheet-namespace",
+        "missing-cell-reference",
+        "invalid-cell-reference"
+      ]
+    },
+    "style": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bold": { "const": true },
+        "italic": { "const": true },
+        "underline": { "const": true },
+        "strikethrough": { "const": true }
+      }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["date_system", "date_style_matches", "font_styles", "run_font_bases"],
+      "properties": {
+        "date_system": { "enum": ["1900", "1904"] },
+        "date_style_matches": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["style_index", "serial"],
+            "properties": {
+              "style_index": { "type": "integer", "minimum": 0 },
+              "serial": { "type": "number" }
+            }
+          }
+        },
+        "font_styles": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["style_index"],
+            "properties": {
+              "style_index": { "type": "integer", "minimum": 0 },
+              "bold": { "const": true },
+              "italic": { "const": true },
+              "underline": { "const": true },
+              "strikethrough": { "const": true }
+            }
+          }
+        },
+        "run_font_bases": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["style_index", "xml"],
+            "properties": {
+              "style_index": { "type": "integer", "minimum": 0 },
+              "xml": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["text"],
+      "properties": {
+        "text": { "type": "string" },
+        "style": { "$ref": "#/$defs/style" }
+      }
+    },
+    "edit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["row", "column", "value"],
+      "properties": {
+        "row": { "type": "integer", "minimum": 0 },
+        "column": { "type": "integer", "minimum": 0 },
+        "value": { "type": "string" },
+        "runs": { "type": "array", "items": { "$ref": "#/$defs/run" } },
+        "force_text": { "type": "boolean" }
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "description", "input", "edits", "context", "expected"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+        "description": { "type": "string", "minLength": 1 },
+        "input": { "type": "string", "pattern": "^fixtures/[a-z0-9-]+\\.xml$" },
+        "edits": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/edit" } },
+        "context": { "$ref": "#/$defs/context" },
+        "expected": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "golden"],
+              "properties": {
+                "kind": { "const": "output" },
+                "golden": { "type": "string", "pattern": "^goldens/[a-z0-9-]+\\.xml$" }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "code"],
+              "properties": {
+                "kind": { "const": "refusal" },
+                "code": { "$ref": "#/$defs/refusalCode" }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind"],
+              "properties": { "kind": { "const": "no-authoritative-sheet-data" } }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

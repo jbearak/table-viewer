@@ -1,0 +1,927 @@
+{
+  "$schema": "schema-v1.json",
+  "format_version": 1,
+  "corpus": "ooxml-worksheet-edit",
+  "corpus_version": "1.0.0",
+  "api_version": 1,
+  "operation": "apply-worksheet-edits",
+  "encoding": "utf-8",
+  "coordinate_base": 0,
+  "refusal_codes": [
+    "namespace-prefixed-worksheet-element",
+    "markup-compatibility-alternate-content",
+    "foreign-worksheet-namespace",
+    "missing-cell-reference",
+    "invalid-cell-reference"
+  ],
+  "cases": [
+    {
+      "id": "basic-replace-preserves-style",
+      "description": "Replacing a cell keeps its existing style index.",
+      "input": "fixtures/basic-replace-preserves-style.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "output",
+        "golden": "goldens/basic-replace-preserves-style.xml"
+      }
+    },
+    {
+      "id": "insert-cells-in-column-order",
+      "description": "Several new cells are emitted in canonical column order, not edit order.",
+      "input": "fixtures/insert-cells-in-column-order.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 2,
+          "value": "3"
+        },
+        {
+          "row": 0,
+          "column": 0,
+          "value": "1"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "output",
+        "golden": "goldens/insert-cells-in-column-order.xml"
+      }
+    },
+    {
+      "id": "commented-cell-is-text",
+      "description": "A cell-shaped comment remains byte-for-byte text while the live cell is edited.",
+      "input": "fixtures/commented-cell-is-text.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "output",
+        "golden": "goldens/commented-cell-is-text.xml"
+      }
+    },
+    {
+      "id": "cdata-and-pi-are-text",
+      "description": "Cell-shaped CDATA and processing-instruction payloads are not worksheet cells.",
+      "input": "fixtures/cdata-and-pi-are-text.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "output",
+        "golden": "goldens/cdata-and-pi-are-text.xml"
+      }
+    },
+    {
+      "id": "duplicate-coordinate-last-wins",
+      "description": "The last scanned cell for a duplicate coordinate receives the edit.",
+      "input": "fixtures/duplicate-coordinate-last-wins.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "output",
+        "golden": "goldens/duplicate-coordinate-last-wins.xml"
+      }
+    },
+    {
+      "id": "whitespace-in-end-tags",
+      "description": "Whitespace before the closing bracket of cell and row end tags remains supported.",
+      "input": "fixtures/whitespace-in-end-tags.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "output",
+        "golden": "goldens/whitespace-in-end-tags.xml"
+      }
+    },
+    {
+      "id": "self-closing-sheet-data",
+      "description": "A self-closing sheetData expands without losing its attributes.",
+      "input": "fixtures/self-closing-sheet-data.xml",
+      "edits": [
+        {
+          "row": 1,
+          "column": 1,
+          "value": "2"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "output",
+        "golden": "goldens/self-closing-sheet-data.xml"
+      }
+    },
+    {
+      "id": "self-closing-row",
+      "description": "A self-closing row expands, preserves unrelated attributes, and drops stale spans.",
+      "input": "fixtures/self-closing-row.xml",
+      "edits": [
+        {
+          "row": 1,
+          "column": 2,
+          "value": "3"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "output",
+        "golden": "goldens/self-closing-row.xml"
+      }
+    },
+    {
+      "id": "entity-spelled-reference",
+      "description": "An entity-spelled canonical reference is edited in place without a duplicate.",
+      "input": "fixtures/entity-spelled-reference.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "output",
+        "golden": "goldens/entity-spelled-reference.xml"
+      }
+    },
+    {
+      "id": "single-quoted-reference-and-style",
+      "description": "Single-quoted row, coordinate, and style attributes are read correctly.",
+      "input": "fixtures/single-quoted-reference-and-style.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "output",
+        "golden": "goldens/single-quoted-reference-and-style.xml"
+      }
+    },
+    {
+      "id": "grouped-formula-outside-edit",
+      "description": "An edit outside a shared-formula range preserves the complete group.",
+      "input": "fixtures/grouped-formula-outside-edit.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 2,
+          "value": "3"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "output",
+        "golden": "goldens/grouped-formula-outside-edit.xml"
+      }
+    },
+    {
+      "id": "merged-top-left-edit",
+      "description": "Editing a merged range top-left cell preserves the merged follower declaration.",
+      "input": "fixtures/merged-top-left-edit.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "output",
+        "golden": "goldens/merged-top-left-edit.xml"
+      }
+    },
+    {
+      "id": "transitional-root-redundant-declarations",
+      "description": "A Transitional root and same-dialect redundant descendant declarations edit successfully.",
+      "input": "fixtures/transitional-root-redundant-declarations.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "output",
+        "golden": "goldens/transitional-root-redundant-declarations.xml"
+      }
+    },
+    {
+      "id": "strict-root-redundant-declarations",
+      "description": "An ISO Strict root and same-dialect redundant descendant declarations edit successfully.",
+      "input": "fixtures/strict-root-redundant-declarations.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "output",
+        "golden": "goldens/strict-root-redundant-declarations.xml"
+      }
+    },
+    {
+      "id": "first-direct-sheet-data-is-authoritative",
+      "description": "The first complete unprefixed direct sheetData is edited; nested and later lookalikes remain untouched.",
+      "input": "fixtures/first-direct-sheet-data-is-authoritative.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "output",
+        "golden": "goldens/first-direct-sheet-data-is-authoritative.xml"
+      }
+    },
+    {
+      "id": "bare-alternate-content-is-not-mc",
+      "description": "A bare AlternateContent name with no MC binding does not receive the MC refusal code.",
+      "input": "fixtures/bare-alternate-content-is-not-mc.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "output",
+        "golden": "goldens/bare-alternate-content-is-not-mc.xml"
+      }
+    },
+    {
+      "id": "wrongly-bound-mc-prefix-is-not-mc",
+      "description": "The mc prefix bound to a vendor URI does not receive the MC refusal code.",
+      "input": "fixtures/wrongly-bound-mc-prefix-is-not-mc.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "output",
+        "golden": "goldens/wrongly-bound-mc-prefix-is-not-mc.xml"
+      }
+    },
+    {
+      "id": "disjoint-extension-alternate-content",
+      "description": "Vendor names and exact MC AlternateContent inside disjoint extLst payloads remain opaque.",
+      "input": "fixtures/disjoint-extension-alternate-content.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "output",
+        "golden": "goldens/disjoint-extension-alternate-content.xml"
+      }
+    },
+    {
+      "id": "prefixed-namespace-declaration-is-accepted",
+      "description": "An unused prefixed namespace declaration does not rebind unprefixed worksheet elements.",
+      "input": "fixtures/prefixed-namespace-declaration-is-accepted.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "output",
+        "golden": "goldens/prefixed-namespace-declaration-is-accepted.xml"
+      }
+    },
+    {
+      "id": "maximum-cell-reference",
+      "description": "XFD1048576 is the last accepted SpreadsheetML coordinate.",
+      "input": "fixtures/maximum-cell-reference.xml",
+      "edits": [
+        {
+          "row": 1048575,
+          "column": 16383,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "output",
+        "golden": "goldens/maximum-cell-reference.xml"
+      }
+    },
+    {
+      "id": "date-style-context-is-data",
+      "description": "Style context encoded as data converts a date-looking edit to a serial.",
+      "input": "fixtures/date-style-context-is-data.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "2024-01-15"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [
+          {
+            "style_index": 3,
+            "serial": 45306
+          }
+        ],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "output",
+        "golden": "goldens/date-style-context-is-data.xml"
+      }
+    },
+    {
+      "id": "cross-dialect-descendant",
+      "description": "A Strict descendant under a Transitional root refuses as a foreign effective namespace.",
+      "input": "fixtures/cross-dialect-descendant.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "refusal",
+        "code": "foreign-worksheet-namespace"
+      }
+    },
+    {
+      "id": "foreign-root",
+      "description": "A genuinely foreign worksheet root refuses before any descendant edit.",
+      "input": "fixtures/foreign-root.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "refusal",
+        "code": "foreign-worksheet-namespace"
+      }
+    },
+    {
+      "id": "supported-prefixed-sheet-data",
+      "description": "A direct prefixed sheetData explains the missing body only when its QName resolves to SpreadsheetML.",
+      "input": "fixtures/supported-prefixed-sheet-data.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "refusal",
+        "code": "namespace-prefixed-worksheet-element"
+      }
+    },
+    {
+      "id": "mc-alternate-content-inside-sheet-data",
+      "description": "Exact MC AlternateContent structurally contained by authoritative sheetData refuses.",
+      "input": "fixtures/mc-alternate-content-inside-sheet-data.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "refusal",
+        "code": "markup-compatibility-alternate-content"
+      }
+    },
+    {
+      "id": "mc-wrapper-with-sheet-data-candidate",
+      "description": "A direct worksheet-child MC wrapper with no body refuses when its subtree contains a SpreadsheetML sheetData candidate.",
+      "input": "fixtures/mc-wrapper-with-sheet-data-candidate.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "refusal",
+        "code": "markup-compatibility-alternate-content"
+      }
+    },
+    {
+      "id": "missing-cell-reference",
+      "description": "A cell whose coordinate is omitted refuses with the dedicated missing-reference code.",
+      "input": "fixtures/missing-cell-reference.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "refusal",
+        "code": "missing-cell-reference"
+      }
+    },
+    {
+      "id": "column-past-format-limit",
+      "description": "XFE1048576 is one column beyond the format limit.",
+      "input": "fixtures/column-past-format-limit.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "refusal",
+        "code": "invalid-cell-reference"
+      }
+    },
+    {
+      "id": "row-past-format-limit",
+      "description": "XFD1048577 is one row beyond the format limit.",
+      "input": "fixtures/row-past-format-limit.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "refusal",
+        "code": "invalid-cell-reference"
+      }
+    },
+    {
+      "id": "leading-zero-row-reference",
+      "description": "A01 is non-canonical and refuses rather than being normalized.",
+      "input": "fixtures/leading-zero-row-reference.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "refusal",
+        "code": "invalid-cell-reference"
+      }
+    },
+    {
+      "id": "lowercase-reference",
+      "description": "a1 is non-canonical and refuses rather than being normalized.",
+      "input": "fixtures/lowercase-reference.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "refusal",
+        "code": "invalid-cell-reference"
+      }
+    },
+    {
+      "id": "row-zero-reference",
+      "description": "A0 is outside the one-based row space.",
+      "input": "fixtures/row-zero-reference.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "refusal",
+        "code": "invalid-cell-reference"
+      }
+    },
+    {
+      "id": "early-invalid-before-late-prefixed",
+      "description": "An early invalid reference wins over a later prefixed worksheet element.",
+      "input": "fixtures/early-invalid-before-late-prefixed.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "refusal",
+        "code": "invalid-cell-reference"
+      }
+    },
+    {
+      "id": "early-invalid-before-late-mc",
+      "description": "An early invalid reference wins over later exact MC AlternateContent.",
+      "input": "fixtures/early-invalid-before-late-mc.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "refusal",
+        "code": "invalid-cell-reference"
+      }
+    },
+    {
+      "id": "ancestor-foreign-before-descendant-missing",
+      "description": "A foreign ancestor wins over a descendant cell with no reference.",
+      "input": "fixtures/ancestor-foreign-before-descendant-missing.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "refusal",
+        "code": "foreign-worksheet-namespace"
+      }
+    },
+    {
+      "id": "same-tag-foreign-before-invalid",
+      "description": "Within one opening tag, foreign effective namespace wins over invalid reference.",
+      "input": "fixtures/same-tag-foreign-before-invalid.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "refusal",
+        "code": "foreign-worksheet-namespace"
+      }
+    },
+    {
+      "id": "early-prefixed-before-late-invalid",
+      "description": "Reversing physical order makes the prefixed element win over a later invalid reference.",
+      "input": "fixtures/early-prefixed-before-late-invalid.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "refusal",
+        "code": "namespace-prefixed-worksheet-element"
+      }
+    },
+    {
+      "id": "mc-wrapper-without-sheet-data-candidate",
+      "description": "A direct MC wrapper without a SpreadsheetML sheetData candidate produces only the plain no-body outcome.",
+      "input": "fixtures/mc-wrapper-without-sheet-data-candidate.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "no-authoritative-sheet-data"
+      }
+    },
+    {
+      "id": "nested-vendor-sheet-data-only",
+      "description": "A nested vendor sheetData is never selected as the worksheet body.",
+      "input": "fixtures/nested-vendor-sheet-data-only.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "no-authoritative-sheet-data"
+      }
+    },
+    {
+      "id": "foreign-prefixed-sheet-data-only",
+      "description": "A direct foreign-prefixed sheetData does not explain the missing authoritative body.",
+      "input": "fixtures/foreign-prefixed-sheet-data-only.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "no-authoritative-sheet-data"
+      }
+    },
+    {
+      "id": "nested-mc-wrapper-with-sheet-data-candidate",
+      "description": "A nested MC wrapper with a SpreadsheetML sheetData candidate does not receive the direct-child MC refusal.",
+      "input": "fixtures/nested-mc-wrapper-with-sheet-data-candidate.xml",
+      "edits": [
+        {
+          "row": 0,
+          "column": 0,
+          "value": "9"
+        }
+      ],
+      "context": {
+        "date_system": "1900",
+        "date_style_matches": [],
+        "font_styles": [],
+        "run_font_bases": []
+      },
+      "expected": {
+        "kind": "no-authoritative-sheet-data"
+      }
+    }
+  ]
+}

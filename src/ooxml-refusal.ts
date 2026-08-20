@@ -1,9 +1,13 @@
-export type OoxmlRefusalCode =
-    | 'namespace-prefixed-worksheet-element'
-    | 'markup-compatibility-alternate-content'
-    | 'foreign-worksheet-namespace'
-    | 'missing-cell-reference'
-    | 'invalid-cell-reference';
+/** Stable refusal surface shared with the language-neutral conformance corpus. */
+export const OOXML_REFUSAL_CODES = [
+    'namespace-prefixed-worksheet-element',
+    'markup-compatibility-alternate-content',
+    'foreign-worksheet-namespace',
+    'missing-cell-reference',
+    'invalid-cell-reference',
+] as const;
+
+export type OoxmlRefusalCode = typeof OOXML_REFUSAL_CODES[number];
 
 const REFUSAL_DESCRIPTIONS: Readonly<Record<OoxmlRefusalCode, string>> = {
     'namespace-prefixed-worksheet-element': 'namespace-prefixed cell elements',
