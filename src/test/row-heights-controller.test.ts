@@ -16,6 +16,7 @@ import { attach_viewer, csv_table_profile, type ViewerProfile } from '../viewer-
 import type { FileStateStore } from '../state';
 import {
     MAX_PERSISTED_ROW_HEIGHTS,
+    decode_stored_per_file_state,
     transform_schema_for_sheet,
     type HostMessage,
     type StoredPerFileState,
@@ -162,6 +163,25 @@ beforeEach(() => {
 });
 
 describe('the setRowHeights host handler', () => {
+    it('delivers a first resize after sparse persisted heights were decoded from JSON', async () => {
+        // JSON spells sparse array slots as `null`. The durable decoder accepts that
+        // representation, so runtime normalization must turn the slots back into
+        // `undefined` before the row-height identity-retention comparison sees them.
+        // Otherwise the first map written into a formerly empty slot reaches
+        // `Object.keys(null)`: the durable write lands, but the controller fails before
+        // delivering it and a later edit save reports that same TypeError.
+        const state = versioned_state_store(
+            decode_stored_per_file_state(JSON.parse('{"rowHeights":[null]}')),
+        );
+        const panel = open_csv_table(state.store);
+        const initial = await ready(panel);
+
+        await resize(panel, initial, [{ start: 0, end: 0 }], 44);
+
+        await vi.waitFor(() => expect(latest_projection(panel)).toEqual([{ 0: 44 }]));
+        expect(state.get_state(file_path).rowHeights?.[0]).toEqual({ 0: 44 });
+    });
+
     it('writes the height against source rows, not the display rows requested', async () => {
         const state = versioned_state_store();
         const panel = open_csv_table(state.store);

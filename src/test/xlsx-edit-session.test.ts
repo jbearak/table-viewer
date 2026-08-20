@@ -6,7 +6,11 @@ import { attach_viewer, profile_for } from '../viewer-controller';
 import { with_in_memory_authority_transactions } from '../state-authority';
 import { versioned_state_store } from './helpers/versioned-state-store';
 import CFB from 'cfb';
-import type { PerFileState, SheetPendingEditCells } from '../types';
+import {
+    decode_stored_per_file_state,
+    type PerFileState,
+    type SheetPendingEditCells,
+} from '../types';
 import { parse_xlsx } from '../parse-xlsx';
 import * as vscode_mock from './mocks/vscode';
 import { fake_viewer_host } from './mocks/host-ports';
@@ -84,6 +88,8 @@ function latest_snapshot(panel: { __messages: unknown[] }) {
     )) as { snapshot: { identity: unknown } };
     return message.snapshot as unknown as {
         identity: unknown;
+        generation: number;
+        sourceGeneration: number;
         capabilities: { csvEditSessionId?: string };
         meta: { sheets: { name: string; worksheetId?: string }[] };
         state?: PerFileState;
@@ -320,6 +326,80 @@ describe('xlsx edit sessions', () => {
         // The sibling worksheet is untouched, which is the whole point of the
         // worksheet being the edited object.
         expect(after.data.sheets[0].rows[1][0]?.raw).toBe(people_before);
+    });
+
+    it('saves and exits the first of two editing files after an auto-grown row height', async () => {
+        // A sparse per-sheet array is persisted with JSON nulls. Editing a long
+        // value can auto-grow a row before the save-on-exit request arrives, so
+        // this is the user-visible sequence that used to leave the durable height
+        // written but make the following save fail with Object.keys(null).
+        const second_path = `/tmp/edit-peer-${case_index}.xlsx`;
+        const initial_a = read_fixture('basic.xlsx');
+        const initial_b = read_fixture('basic.xlsx');
+        const disks = new Map<string, Uint8Array>([
+            [file_path, initial_a],
+            [second_path, initial_b],
+        ]);
+        vscode_mock.__setStatImplementation(async (resource) => {
+            const content = disks.get(resource.fsPath);
+            if (!content) throw new Error('missing test file');
+            return { size: content.byteLength, mtime: 1 };
+        });
+        vscode_mock.__setReadFileImplementation(async (resource) => {
+            const content = disks.get(resource.fsPath);
+            if (!content) throw new Error('missing test file');
+            return content;
+        });
+        vscode_mock.__setWriteFileImplementation(async (resource, content) => {
+            disks.set(resource.fsPath, new Uint8Array(content));
+        });
+        const state = versioned_state_store(decode_stored_per_file_state({
+            rowHeights: [null, null],
+        }));
+        const first = await open_ready_xlsx(file_path, state);
+        const second = await open_ready_xlsx(second_path, state);
+        await first.__receive({ type: 'requestEditSession', requestId: 'edit-a', sheetIndex: 0 });
+        await second.__receive({ type: 'requestEditSession', requestId: 'edit-b', sheetIndex: 0 });
+        const first_result = latest_edit_session(first);
+        const second_result = latest_edit_session(second);
+        expect(first_result).toMatchObject({ granted: true, editSessionId: expect.any(String) });
+        expect(second_result).toMatchObject({ granted: true, editSessionId: expect.any(String) });
+        const first_session = first_result!.editSessionId!;
+        const second_session = second_result!.editSessionId!;
+        expect(first_session).not.toBe('');
+        expect(second_session).not.toBe('');
+        expect(latest_snapshot(first).capabilities.csvEditSessionId).toBe(first_session);
+        expect(latest_snapshot(second).capabilities.csvEditSessionId).toBe(second_session);
+        const basis = latest_snapshot(first);
+
+        await first.__receive({
+            type: 'setRowHeights',
+            sheetIndex: 0,
+            rows: [{ start: 1, end: 1 }],
+            height: 44,
+            generation: basis.generation,
+            sourceGeneration: basis.sourceGeneration,
+        });
+        await wait_for_observable(() => (
+            // People promotes its first source row to headers, so display row 1
+            // maps back to canonical source row 2.
+            state.get_state(file_path).rowHeights?.[0]?.[2] === 44
+        ));
+
+        await first.__receive({
+            type: 'saveCsv',
+            operation: workbook_request(first_session, 'save-a', save_worksheet()),
+        });
+        await wait_for_observable(() => save_results(first).length > 0);
+        await wait_for_observable(
+            () => latest_snapshot(first).capabilities.csvEditSessionId === undefined,
+        );
+
+        expect(save_results(first).at(-1)).toMatchObject({ success: true });
+        expect(latest_snapshot(second).capabilities.csvEditSessionId).toBe(second_session);
+        const saved_a = await parse_xlsx(disks.get(file_path)!);
+        expect(saved_a.data.sheets[0].rows[1][0]?.raw).toBe('Alicia');
+        expect(disks.get(second_path)).toEqual(initial_b);
     });
 
     it('writes a styled edit as a rich inline string the reader resolves back', async () => {

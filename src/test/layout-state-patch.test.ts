@@ -255,17 +255,22 @@ describe('showFormatting layout leaf', () => {
     });
 });
 
-describe('showFormatting decoding', () => {
-    it('reads a gap left by JSON as the default, and keeps a recorded false', () => {
-        // The webview writes the array sparsely, so a sheet nobody has touched has no
-        // entry — and JSON has no holes, so every gap comes back as `null`. Decoded
-        // to `undefined` rather than left as a third spelling of the default.
+describe('sparse per-sheet state decoding', () => {
+    it('restores JSON null gaps to undefined across every layout array', () => {
+        // These arrays are written sparsely, but JSON has no holes, so every gap
+        // comes back as `null`. Decoded state must restore the runtime spelling;
+        // in particular, the row-height retention path calls Object.keys on maps.
         const decoded = decode_stored_per_file_state({
+            columnWidths: [null, { 0: 120 }],
+            rowHeights: [null, { 3: 44 }],
+            scrollPosition: [null, { top: 10, left: 20 }],
             showFormatting: [null, false, true],
         }) as PerFileState;
 
+        expect(decoded.columnWidths).toEqual([undefined, { 0: 120 }]);
+        expect(decoded.rowHeights).toEqual([undefined, { 3: 44 }]);
+        expect(decoded.scrollPosition).toEqual([undefined, { top: 10, left: 20 }]);
         expect(decoded.showFormatting).toEqual([undefined, false, true]);
-        expect(decoded.showFormatting![0]).toBeUndefined();
     });
 
     it('rejects a non-boolean entry', () => {

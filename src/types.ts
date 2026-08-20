@@ -896,19 +896,33 @@ export function stringify_stored_per_file_state(state: StoredPerFileState): stri
 export function decode_stored_per_file_state(value: unknown): StoredPerFileState {
     if (!is_plain_record(value)) throw new TypeError('Persisted file state must be an object.');
     const state = structuredClone(value);
-    if (state.columnWidths !== undefined) validate_number_record_collection(state.columnWidths, 'columnWidths');
-    if (state.rowHeights !== undefined) validate_number_record_collection(state.rowHeights, 'rowHeights');
-    if (state.scrollPosition !== undefined) validate_scroll_positions(state.scrollPosition);
+    if (state.columnWidths !== undefined) {
+        validate_number_record_collection(state.columnWidths, 'columnWidths');
+        if (Array.isArray(state.columnWidths)) {
+            state.columnWidths = state.columnWidths.map((entry) => entry ?? undefined);
+        }
+    }
+    if (state.rowHeights !== undefined) {
+        validate_number_record_collection(state.rowHeights, 'rowHeights');
+        if (Array.isArray(state.rowHeights)) {
+            state.rowHeights = state.rowHeights.map((entry) => entry ?? undefined);
+        }
+    }
+    if (state.scrollPosition !== undefined) {
+        validate_scroll_positions(state.scrollPosition);
+        if (Array.isArray(state.scrollPosition)) {
+            state.scrollPosition = state.scrollPosition.map((entry) => entry ?? undefined);
+        }
+    }
     if (state.transforms !== undefined) validate_transforms(state.transforms);
     if (state.columnVisibility !== undefined) validate_column_visibility(state.columnVisibility);
     if (state.cellHighlights !== undefined) validate_cell_highlights(state.cellHighlights);
     if (state.showFormatting !== undefined) {
         validate_show_formatting(state.showFormatting);
-        // JSON has no holes. The webview writes this array sparsely — a sheet the
-        // user never touched has no entry — and every gap comes back as `null`.
-        // Canonicalized here so the decoded value matches its declared type, rather
-        // than leaving every reader to know that `null` is a third spelling of the
-        // default. `false` is a recorded choice and survives.
+        // Like the three per-sheet layout arrays above, JSON turns every sparse
+        // hole into `null`. Canonicalize it so decoded state matches its declared
+        // runtime type instead of making each reader understand a third spelling
+        // of the default. `false` is a recorded choice and survives.
         state.showFormatting = (state.showFormatting as readonly (boolean | null)[])
             .map((entry) => entry ?? undefined);
     }
