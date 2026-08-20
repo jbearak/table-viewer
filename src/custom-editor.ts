@@ -7,6 +7,29 @@ import { generate_nonce } from './webview-html';
 
 export const TABLE_VIEW_TYPE = 'tableViewer.editor';
 
+/**
+ * The working-tree file path a git: revision URI diffs, from the git
+ * extension's URI encoding (JSON query `{path, ref}`). Undefined when the
+ * query is absent or malformed — such a URI still opens, just as a plain
+ * read-only render with no compare pairing.
+ */
+export function git_diffed_file_path(uri: vscode.Uri): string | undefined {
+    if (!uri.query) return undefined;
+    try {
+        const parsed: unknown = JSON.parse(uri.query);
+        if (
+            typeof parsed === 'object' && parsed !== null
+            && 'path' in parsed && typeof parsed.path === 'string'
+            && parsed.path.length > 0
+        ) {
+            return parsed.path;
+        }
+    } catch {
+        // Not the git extension's encoding; treat as a bare revision URI.
+    }
+    return undefined;
+}
+
 class TableViewerDocument implements vscode.CustomDocument {
     constructor(public readonly uri: vscode.Uri) {}
     dispose(): void {}
@@ -166,6 +189,32 @@ export class TableViewerEditorProvider
             webview_panel.webview, this.extension_uri, generate_nonce());
 
         const resource = create_resource_identity(document.uri).key;
+        // An SCM-pane click runs `vscode.diff`, which resolves BOTH sides
+        // through this provider: first the git: revision, then the working-tree
+        // file. The git: side has no working tree to write back to, so it
+        // renders plain read-only — and parks a compare intent so the file:
+        // side that follows attaches the diff session against it. A bare git:
+        // URI (no parseable {path} query) is just a read-only render.
+        const read_only = document.uri.scheme === 'git';
+        if (read_only) {
+            const diffed_path = git_diffed_file_path(document.uri);
+            if (diffed_path !== undefined) {
+                const diffed_key = create_resource_identity(
+                    vscode.Uri.file(diffed_path),
+                ).key;
+                const intent = { originalUri: document.uri };
+                this.#pending_compares.set(diffed_key, intent);
+                // In a `vscode.diff` the file: side resolves right after this
+                // one and consumes the intent. If it never comes (the git:
+                // side was opened alone), retire the intent with this panel so
+                // a later plain open cannot inherit a stale compare.
+                webview_panel.onDidDispose(() => {
+                    if (this.#pending_compares.get(diffed_key) === intent) {
+                        this.#pending_compares.delete(diffed_key);
+                    }
+                });
+            }
+        }
         const compare_original = this.#pending_compares.get(resource);
         if (compare_original) this.#pending_compares.delete(resource);
         const controller = attach_viewer(
@@ -176,9 +225,10 @@ export class TableViewerEditorProvider
             vscode_viewer_host,
             {
                 requestClose: () => webview_panel.dispose(),
-                ...(compare_original
+                ...(compare_original && !read_only
                     ? { compare: { originalUri: compare_original.originalUri } }
                     : {}),
+                ...(read_only ? { readOnly: true } : {}),
             },
         );
         this.#controllers.add(controller);

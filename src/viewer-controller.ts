@@ -258,6 +258,9 @@ export interface ViewerControllerOptions {
      *  this original (the `git:` side of an SCM diff). A failure to read or
      *  parse the original degrades to a normal read-only open, never a block. */
     readonly compare?: { readonly originalUri: ResourceUriLike | string };
+    /** Render read-only regardless of the profile (e.g. a git: revision URI,
+     *  which has no working-tree file to write back to). */
+    readonly readOnly?: boolean;
 }
 
 export interface ViewerController extends Disposable {
@@ -962,7 +965,7 @@ export function attach_viewer(
      * messages, and only this flag stands between those and the working-tree
      * file. Every edit gate below reads this, never profile.editing directly.
      */
-    const editing_supported = profile.editing && !compare_mode;
+    const editing_supported = profile.editing && !compare_mode && !options.readOnly;
     let compare_unavailable_warned = false;
     const scheduler: ViewerControllerScheduler = options.scheduler ?? {
         setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
