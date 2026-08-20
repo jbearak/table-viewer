@@ -32,6 +32,8 @@ import {
     type ViewerHost,
 } from './host-ports';
 import { create_resource_identity, type ResourceUriLike } from './resource-identity';
+import { CompareDataSource } from './diff-compare/compare-session';
+import type { WorkbookSnapshotCompare } from './viewer-snapshot';
 import {
     assert_safe_file_size,
     FileSizeLimitExceededError,
@@ -252,6 +254,10 @@ export interface ViewerControllerOptions {
     readonly scheduler?: ViewerControllerScheduler;
     /** Close the exact host surface when its initial source load is declined. */
     readonly requestClose?: () => void | Promise<void>;
+    /** Git compare mode: render the file read-only with per-cell diffs against
+     *  this original (the `git:` side of an SCM diff). A failure to read or
+     *  parse the original degrades to a normal read-only open, never a block. */
+    readonly compare?: { readonly originalUri: ResourceUriLike | string };
 }
 
 export interface ViewerController extends Disposable {
@@ -944,6 +950,11 @@ export function attach_viewer(
 ): ViewerController {
     const uri = create_resource_identity(resource).uri;
     const file_path = uri.fsPath;
+    const compare_original_uri = options.compare
+        ? create_resource_identity(options.compare.originalUri).uri
+        : undefined;
+    const compare_mode = compare_original_uri !== undefined;
+    let compare_unavailable_warned = false;
     const scheduler: ViewerControllerScheduler = options.scheduler ?? {
         setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
         clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
@@ -1168,6 +1179,51 @@ export function attach_viewer(
         } catch {
             return Promise.resolve(false);
         }
+    }
+
+    /**
+     * Answer a served row page with its compare diff. Invoked by the core with
+     * the exact window `rowData` carried — clamped and transform-projected — so
+     * the diff describes the rows the renderer received, keyed by the same
+     * display positions. `sourceRows` maps each display row back to the source
+     * row the positional diff is defined over; contiguous source runs are
+     * diffed in one page each.
+     */
+    function post_compare_diff(
+        msg: Extract<WebviewMessage, { type: 'requestRows' }>,
+        window: { startRow: number; sourceRows: number[] },
+    ): void {
+        if (!(source instanceof CompareDataSource) || window.sourceRows.length === 0) return;
+        const compare_source = source;
+        let diff;
+        try {
+            // The diff is positional over the compare source's projected row
+            // space; the window carries canonical rows, so map them back.
+            const projected_rows = window.sourceRows.map((source_row) =>
+                compare_source.projected_row_index(msg.sheetIndex, source_row));
+            if (projected_rows.some((row) => row === undefined)) return;
+            diff = compare_source.diff_rows(
+                msg.sheetIndex,
+                projected_rows as number[],
+            );
+        } catch {
+            return;
+        }
+        if (!diff) return;
+        void post_to_receiver({
+            type: 'compareDiff',
+            sheetIndex: msg.sheetIndex,
+            startRow: window.startRow,
+            // Positional results: entry i / row offsets are display slots
+            // startRow + i of the served window, matching rowData's rows.
+            rowStatus: diff.rowStatus,
+            changedCells: diff.changedCells.map((cell) => ({
+                ...cell,
+                row: window.startRow + cell.row,
+            })),
+            requestId: msg.requestId,
+            generation: msg.generation,
+        });
     }
 
     function flush_sheet_selections(): void {
@@ -3476,14 +3532,80 @@ export function attach_viewer(
             fingerprint: `${stat.mtime}:${stat.size}`,
             digest: content_digest(raw),
         };
-        return new SourceCandidate(
-            await profile.build_source(
+        // The original side builds concurrently with the modified parse; both
+        // are independent reads of already-committed bytes.
+        const original_promise = build_compare_original(state);
+        let modified: DataSource;
+        try {
+            modified = await profile.build_source(
                 raw,
                 file_path,
                 state,
                 load_all_csv_rows ? { loadAllRows: true } : undefined,
-            ),
-            observation,
+            );
+        } catch (error) {
+            void original_promise.then((original) => original?.close());
+            throw error;
+        }
+        const original = await original_promise;
+        let adopted = modified;
+        if (original) {
+            try {
+                adopted = new CompareDataSource(modified, original);
+            } catch (error) {
+                original.close();
+                warn_compare_unavailable(error);
+            }
+        }
+        return new SourceCandidate(adopted, observation);
+    }
+
+    /**
+     * Build the git original through the same profile and per-file state as
+     * the modified side, so both sides share projection policy (CSV row caps,
+     * Excel header overrides/hidden rows) and differ only in bytes. The
+     * original must never block the file itself: any failure — including
+     * exceeding the configured size limit — degrades to a plain open with a
+     * one-time warning.
+     */
+    async function build_compare_original(
+        state: PerFileState,
+    ): Promise<DataSource | undefined> {
+        if (!compare_original_uri) return undefined;
+        try {
+            const original_raw = await host.fs.read_file(compare_original_uri);
+            assert_safe_file_size(
+                original_raw.byteLength,
+                host.config.max_file_size_mib(),
+            );
+            return await profile.build_source(original_raw, file_path, state);
+        } catch (error) {
+            warn_compare_unavailable(error);
+            return undefined;
+        }
+    }
+
+    /** The snapshot's compare payload — present exactly when the adopted source
+     *  is a live compare session (a degraded compare open carries nothing). */
+    function compare_configuration(
+        adopted: DataSource | undefined,
+    ): { gitCompare: WorkbookSnapshotCompare } | Record<string, never> {
+        if (!(adopted instanceof CompareDataSource)) return {};
+        return {
+            gitCompare: {
+                pairings: adopted.pairings,
+                changedColumnNames: adopted.changedColumnNames,
+            },
+        };
+    }
+
+    function warn_compare_unavailable(error: unknown): void {
+        if (compare_unavailable_warned) return;
+        compare_unavailable_warned = true;
+        log_sanitized_failure('Table compare unavailable', error);
+        show_owner_warning(
+            'Table compare is unavailable: the original version could not be loaded. '
+            + 'Showing the file without change highlighting.',
         );
     }
 
@@ -3802,6 +3924,7 @@ export function attach_viewer(
                     onInvalidRestore: cleanup_invalid_restore,
                     durablePendingEditKeys: durable_pending_edit_keys,
                     durableRowHeights: durable_row_heights,
+                    ...(compare_mode ? { onRowWindowServed: post_compare_diff } : {}),
                 },
                 (installed) => {
                     installed.begin_receiver_epoch(session.current_receiver_epoch);
@@ -3873,10 +3996,12 @@ export function attach_viewer(
                             configuration: {
                                 defaultTabOrientation: host.config.default_tab_orientation(),
                                 previewMode: profile.previewMode === true,
+                                ...compare_configuration(next),
                             },
                             capabilities: {
-                                csvEditingSupported: profile.editing,
+                                csvEditingSupported: profile.editing && !compare_mode,
                                 csvEditable: profile.editing
+                                    && !compare_mode
                                     && may_retain_capability()
                                     && !next.truncationMessage,
                                 csvSaveLifecycle: projected_save_lifecycle(),
@@ -4133,10 +4258,12 @@ export function attach_viewer(
                                     configuration: {
                                         defaultTabOrientation: host.config.default_tab_orientation(),
                                         previewMode: profile.previewMode === true,
+                                        ...compare_configuration(source),
                                     },
                                     capabilities: {
-                                        csvEditingSupported: profile.editing,
+                                        csvEditingSupported: profile.editing && !compare_mode,
                                         csvEditable: profile.editing
+                                            && !compare_mode
                                             && may_retain_capability()
                                             && !source!.truncationMessage,
                                         csvSaveLifecycle: projected_save_lifecycle(),

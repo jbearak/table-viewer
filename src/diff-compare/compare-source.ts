@@ -1,7 +1,13 @@
 // Pure compare-session core for git table diffs. No vscode imports: everything
 // here operates on DataSource/WorkbookMeta values so it is unit-testable with
 // in-memory fixtures and shareable across hosts.
-import type { DataSource, SheetMeta, WorkbookMeta } from '../data-source/interface';
+import {
+    read_source_rows_indexed,
+    type DataSource,
+    type RowWindow,
+    type SheetMeta,
+    type WorkbookMeta,
+} from '../data-source/interface';
 import { get_raw_cell_text } from '../cell-display';
 
 export type SheetPairStatus = SheetPairing['status'];
@@ -122,6 +128,77 @@ export interface CompareDiffWindow {
     readonly startRow: number;
     readonly rowStatus: CompareRowStatus[];
     readonly changedCells: ChangedCell[];
+}
+
+/**
+ * Positional diff for an arbitrary set of unified-grid rows (a transformed
+ * page's `sourceRows`). One batched indexed read per side, so cost stays
+ * bounded by the page even when a sort/filter fragments it. `rowStatus[i]`
+ * and `changedCells[*].row` are positional: they name `rows[i]`, not the
+ * display slot — callers map positions back themselves.
+ */
+export function diff_rows_indexed(
+    original: DataSource,
+    modified: DataSource,
+    pairing: SheetPairing,
+    rows: ArrayLike<number>,
+): CompareDiffWindow {
+    if (pairing.status !== 'matched') {
+        throw new Error('diff_rows_indexed requires a matched sheet pairing.');
+    }
+    const original_sheet = original.meta().sheets[pairing.originalIndex];
+    const modified_sheet = modified.meta().sheets[pairing.modifiedIndex];
+    if (!original_sheet || !modified_sheet) {
+        throw new RangeError('sheet pairing indexes a missing sheet');
+    }
+    const read_side = (
+        source: DataSource,
+        sheet_index: number,
+        row_count: number,
+    ): ReadonlyMap<number, RowWindow['rows'][number]> => {
+        const in_range: number[] = [];
+        for (let position = 0; position < rows.length; position++) {
+            const row = rows[position];
+            if (row >= 0 && row < row_count) in_range.push(row);
+        }
+        const side_rows = in_range.length > 0
+            ? read_source_rows_indexed(source, sheet_index, in_range).rows
+            : [];
+        return new Map(in_range.map((row, position) => [row, side_rows[position] ?? []]));
+    };
+    const original_rows = read_side(original, pairing.originalIndex, original_sheet.rowCount);
+    const modified_rows = read_side(modified, pairing.modifiedIndex, modified_sheet.rowCount);
+
+    const row_status: CompareRowStatus[] = [];
+    const changed_cells: ChangedCell[] = [];
+    const column_count = Math.max(original_sheet.columnCount, modified_sheet.columnCount);
+    for (let position = 0; position < rows.length; position++) {
+        const row = rows[position];
+        const in_original = row < original_sheet.rowCount;
+        const in_modified = row < modified_sheet.rowCount;
+        if (!in_original || !in_modified) {
+            row_status.push(in_modified ? 'added' : 'deleted');
+            if (!in_modified) {
+                // Removed row: ship the original texts so the band shows them.
+                const original_row = original_rows.get(row) ?? [];
+                for (let col = 0; col < column_count; col++) {
+                    const base = raw_text(original_row[col]);
+                    if (base !== '') changed_cells.push({ row: position, col, base });
+                }
+            }
+            continue;
+        }
+        row_status.push('same');
+        const original_row = original_rows.get(row) ?? [];
+        const modified_row = modified_rows.get(row) ?? [];
+        for (let col = 0; col < column_count; col++) {
+            const base = raw_text(original_row[col]);
+            if (base !== raw_text(modified_row[col])) {
+                changed_cells.push({ row: position, col, base });
+            }
+        }
+    }
+    return { startRow: 0, rowStatus: row_status, changedCells: changed_cells };
 }
 
 function raw_text(cell: { raw: string | null } | null | undefined): string {
