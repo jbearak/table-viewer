@@ -431,6 +431,35 @@ function stored_setting(key: string): unknown {
     return JSON.parse(fs.readFileSync(file, 'utf8'))[key];
 }
 
+test('Diff default is explained and saved immediately', async () => {
+    let prefs = await open_preferences(app);
+    let control = prefs.locator('#diffOnByDefault');
+    try {
+        await expect(control).not.toBeChecked();
+        await expect(control).toHaveAccessibleName('Show Diff by default in Edit mode');
+        await expect(control.locator('xpath=following-sibling::div').locator('.hint'))
+            .toContainText('when Edit mode is first entered');
+
+        await control.check();
+        await expect.poll(
+            () => stored_setting('diffOnByDefault'),
+            { timeout: 15_000 },
+        ).toBe(true);
+        await close_preferences(app);
+
+        prefs = await open_preferences(app);
+        control = prefs.locator('#diffOnByDefault');
+        await expect(control).toBeChecked();
+        await control.uncheck();
+        await expect.poll(
+            () => stored_setting('diffOnByDefault'),
+            { timeout: 15_000 },
+        ).toBe(false);
+    } finally {
+        await close_preferences(app);
+    }
+});
+
 test('automatic update checking is explained and saved immediately', async () => {
     const prefs = await open_preferences(app);
     const control = prefs.locator('#automaticallyCheckForUpdates');

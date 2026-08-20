@@ -70,6 +70,7 @@ export type RetainedSnapshotCommandResult = ExcelHeaderSnapshotResult;
 export interface WorkbookSnapshotConfiguration {
     readonly defaultTabOrientation: 'horizontal' | 'vertical';
     readonly previewMode: boolean;
+    readonly diffOnByDefault: boolean;
 }
 
 export interface WorkbookSnapshotCapabilities {

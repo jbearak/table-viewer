@@ -542,6 +542,8 @@ export function App(): React.JSX.Element {
     // when edit mode exits: the button hides with edit mode, but the choice
     // survives the round trip within the session.
     const [diff_mode, set_diff_mode] = useState(false);
+    const diff_mode_initialized_ref = useRef(false);
+    const diff_on_by_default_ref = useRef(false);
     const handle_toggle_diff_mode = useCallback(() => set_diff_mode((d) => !d), []);
     const edit_mode_ref = useRef(false);
     // Passed down as the admission lifetime instead of asking GridShell to derive
@@ -2012,7 +2014,10 @@ export function App(): React.JSX.Element {
                             : null,
                     );
                     set_toolbar_focus_restore(null);
+                    diff_on_by_default_ref.current = snapshot.configuration.diffOnByDefault;
                     if (snapshot.presentation === 'initial') {
+                        set_diff_mode(snapshot.configuration.diffOnByDefault);
+                        diff_mode_initialized_ref.current = false;
                         last_preview_visible_row_ref.current = null;
                         clear_pending_preview_scroll();
                     } else if (
@@ -2278,10 +2283,10 @@ export function App(): React.JSX.Element {
                                     cells,
                                 );
                         });
-                        set_edit_mode(
-                            owns_clean_or_dirty_session
-                            || restored_edits !== undefined,
-                        );
+                        const enters_edit_mode = owns_clean_or_dirty_session
+                            || restored_edits !== undefined;
+                        diff_mode_initialized_ref.current = enters_edit_mode;
+                        set_edit_mode(enters_edit_mode);
                         set_editing_status(null);
                         // A fresh document: the rejection and the dismissal go
                         // together. The install above deliberately does not clear the
@@ -4313,6 +4318,10 @@ export function App(): React.JSX.Element {
                 pending_edit_request_ref.current = null;
                 set_edit_session_pending(false);
                 if (msg.granted && msg.editSessionId) {
+                    if (!diff_mode_initialized_ref.current) {
+                        set_diff_mode(msg.diffOnByDefault ?? diff_on_by_default_ref.current);
+                        diff_mode_initialized_ref.current = true;
+                    }
                     if (
                         edit_mode_ref.current
                         && csv_edit_session_id_ref.current !== msg.editSessionId

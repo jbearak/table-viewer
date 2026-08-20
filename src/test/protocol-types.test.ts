@@ -129,6 +129,7 @@ describe('paginated protocol message shapes', () => {
                 configuration: {
                     defaultTabOrientation: 'horizontal',
                     previewMode: false,
+                    diffOnByDefault: false,
                 },
                 capabilities: {
                     csvEditable: false,

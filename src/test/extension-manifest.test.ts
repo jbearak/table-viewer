@@ -79,6 +79,16 @@ describe('extension runtime manifest', () => {
         });
     });
 
+    it('defaults Diff off when entering Edit mode', () => {
+        expect(manifest.contributes?.configuration?.properties?.[
+            'tableViewer.diffOnByDefault'
+        ]).toMatchObject({
+            type: 'boolean',
+            default: false,
+            description: expect.stringMatching(/Diff.*Edit mode/u),
+        });
+    });
+
     it('bounds the retention setting so a large value cannot disable eviction', () => {
         expect(manifest.contributes?.configuration?.properties?.[
             'tableViewer.maxStoredFiles'

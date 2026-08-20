@@ -218,6 +218,7 @@ vi.mock('../webview/grid-shell', () => ({
                 'data-auto-fit-active': String(props.auto_fit_active ?? false),
                 'data-preview': String(props.preview_mode ?? false),
                 'data-edit-mode': String(props.edit_mode ?? false),
+                'data-diff-mode': String(props.diff_mode ?? false),
                 'data-edit-activation-id': String(props.edit_activation_id),
                 'data-host-rejected-keys': JSON.stringify(props.host_rejected_keys ?? []),
                 'data-store-edits': JSON.stringify(Object.fromEntries(store_edits)),
@@ -709,6 +710,7 @@ function latest_histogram_request(post_message: ReturnType<typeof vi.fn>) {
 async function enter_edit_mode(
     post_message: ReturnType<typeof vi.fn>,
     edit_session_id = 'test-edit-session',
+    diff_on_by_default?: boolean,
 ) {
     await click_button('Edit');
     expect(post_message).toHaveBeenCalledWith(expect.objectContaining({
@@ -719,6 +721,7 @@ async function enter_edit_mode(
         type: 'editSessionResult',
         granted: true,
         editSessionId: edit_session_id,
+        ...(diff_on_by_default === undefined ? {} : { diffOnByDefault: diff_on_by_default }),
     });
 }
 
@@ -848,6 +851,7 @@ function workbook_snapshot_message(
             configuration: {
                 defaultTabOrientation: 'horizontal',
                 previewMode: false,
+                diffOnByDefault: false,
                 ...configuration,
             },
             capabilities: {
@@ -4877,6 +4881,83 @@ describe('truncation banner', () => {
 });
 
 describe('edit mode save exit', () => {
+    it('starts Diff off by default on the first Edit entry', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }),
+        );
+
+        expect(container!.textContent).not.toContain('Diff');
+        await enter_edit_mode(post_message);
+
+        expect(get_button('Diff').getAttribute('aria-pressed')).toBe('false');
+        expect(grid_stub().getAttribute('data-diff-mode')).toBe('false');
+    });
+
+    it('samples the configured Diff default when Edit is first entered', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                configuration: { diffOnByDefault: false },
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }),
+        );
+
+        // The host samples configuration for the grant, so a setting changed after
+        // the viewer opened still controls the first successful Edit entry.
+        await enter_edit_mode(post_message, 'test-edit-session', true);
+
+        expect(get_button('Diff').getAttribute('aria-pressed')).toBe('true');
+        expect(grid_stub().getAttribute('data-diff-mode')).toBe('true');
+    });
+
+    it('does not reapply the Diff default on refresh or Edit re-entry', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['Sheet1'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            configuration: { diffOnByDefault: true },
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message, 'same-session');
+        await click_button('Diff');
+        expect(grid_stub().getAttribute('data-diff-mode')).toBe('false');
+
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            configuration: { diffOnByDefault: true },
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'same-session',
+            },
+        }));
+        expect(get_button('Diff').getAttribute('aria-pressed')).toBe('false');
+
+        await click_button('Edit');
+        await enter_edit_mode(post_message, 'same-session');
+        expect(get_button('Diff').getAttribute('aria-pressed')).toBe('false');
+        expect(grid_stub().getAttribute('data-diff-mode')).toBe('false');
+    });
+
+    it('uses the configured Diff default for a restored Edit session', async () => {
+        await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                configuration: { diffOnByDefault: true },
+                capabilities: {
+                    csvEditable: true,
+                    csvEditingSupported: true,
+                    csvEditSessionId: 'restored-session',
+                },
+            }),
+        );
+
+        expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
+        expect(get_button('Diff').getAttribute('aria-pressed')).toBe('true');
+        expect(grid_stub().getAttribute('data-diff-mode')).toBe('true');
+    });
+
     it('discarding from the save dialog clears persisted edits before releasing edit ownership', async () => {
         grid_shell_mock.is_dirty = true;
         grid_shell_mock.has_uncommitted_changes = true;

@@ -289,13 +289,19 @@ function edit_session_results(panel: { __messages: unknown[] }) {
             granted: boolean;
             editSessionId?: string;
             pendingEdits?: PerFileState['pendingEdits'];
+            diffOnByDefault?: boolean;
         } => (
             typeof message === 'object'
             && message !== null
             && 'type' in message
             && message.type === 'editSessionResult'
         )
-    ).map(({ editSessionId: _session, requestId: _request, ...message }) => message);
+    ).map(({
+        editSessionId: _session,
+        requestId: _request,
+        diffOnByDefault: _diff_on_by_default,
+        ...message
+    }) => message);
 }
 
 function latest_edit_session_message(panel: { __messages: unknown[] }) {
@@ -304,6 +310,7 @@ function latest_edit_session_message(panel: { __messages: unknown[] }) {
         granted: boolean;
         editSessionId?: string;
         pendingEdits?: PerFileState['pendingEdits'];
+        diffOnByDefault?: boolean;
     } => (
         typeof message === 'object'
         && message !== null
@@ -417,6 +424,7 @@ beforeEach(() => {
 
 describe('CSV edit sessions', () => {
     it('flushes only after the exact renderer sequence reaches the current backend', async () => {
+        vscode_mock.__setConfigurationValue('tableViewer.diffOnByDefault', true);
         const versioned = state_store();
         const write_started = deferred();
         const write_gate = deferred();
@@ -442,7 +450,11 @@ describe('CSV edit sessions', () => {
         await panel.__receive({ type: 'ready' });
         await panel.__receive({ type: 'requestEditSession', requestId: 'edit:flush' });
         const granted = latest_edit_session_message(panel);
-        expect(granted).toMatchObject({ granted: true, editSessionId: expect.any(String) });
+        expect(granted).toMatchObject({
+            granted: true,
+            editSessionId: expect.any(String),
+            diffOnByDefault: true,
+        });
 
         gate_pending_edits = true;
         const pending_write = panel.__receive({

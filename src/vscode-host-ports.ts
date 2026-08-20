@@ -15,6 +15,7 @@ import type { ResourceUriLike } from './resource-identity';
 import {
     get_csv_max_rows,
     get_default_orientation,
+    get_diff_on_by_default,
     get_font_family,
     get_font_size,
     get_max_file_size_mib,
@@ -96,6 +97,7 @@ export const vscode_config_port: ConfigPort = {
     max_file_size_mib: get_max_file_size_mib,
     csv_max_rows: get_csv_max_rows,
     default_tab_orientation: get_default_orientation,
+    diff_on_by_default: get_diff_on_by_default,
     on_font_change(listener) {
         return vscode.workspace.onDidChangeConfiguration((event) => {
             if (

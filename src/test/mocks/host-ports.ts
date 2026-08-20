@@ -87,6 +87,7 @@ export const fake_config_port: ConfigPort = {
     csv_max_rows: () => config_value('csvMaxRows', 1_000_000),
     default_tab_orientation: () =>
         config_value<'horizontal' | 'vertical'>('tabOrientation', 'horizontal'),
+    diff_on_by_default: () => config_value('diffOnByDefault', false),
     on_font_change(listener: () => void) {
         return vscode_mock.workspace.onDidChangeConfiguration((event) => {
             if (
