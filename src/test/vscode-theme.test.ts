@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
     apply_font_family,
     apply_font_size,
+    build_diff_colors_from_vars,
     build_edit_tints_from_vars,
     build_theme_from_vars,
     is_vscode_high_contrast,
@@ -95,6 +96,24 @@ describe('build_theme_from_vars', () => {
             true,
         );
         expect(theme.accentLight).toBe('rgba(38, 79, 120, 0.5)');
+    });
+});
+
+describe('build_diff_colors_from_vars', () => {
+    it('reads the git decoration foregrounds verbatim', () => {
+        const vars: Record<string, string> = {
+            '--vscode-gitDecoration-deletedResourceForeground': ' #c74e39 ',
+            '--vscode-gitDecoration-addedResourceForeground': '#81b88b',
+        };
+        const colors = build_diff_colors_from_vars((name) => vars[name] ?? '');
+        expect(colors.diffDeletedFg).toBe('#c74e39');
+        expect(colors.diffAddedFg).toBe('#81b88b');
+    });
+
+    it('falls back to red/green when the vars are unset or blank', () => {
+        const colors = build_diff_colors_from_vars(() => '  ');
+        expect(colors.diffDeletedFg).toBe('red');
+        expect(colors.diffAddedFg).toBe('green');
     });
 });
 

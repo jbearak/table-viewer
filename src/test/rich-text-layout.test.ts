@@ -69,6 +69,18 @@ describe('wrap_rich_text_lines', () => {
         ]);
     });
 
+    it('carries diff colors across a wrap', () => {
+        // Diff-mode segments tag a paint-only diff_color; the wrapper must
+        // forward it or a wrapped deleted word loses its color mid-line.
+        expect(wrap_rich_text_lines([[
+            { text: 'gone ', style: { strikethrough: true }, diff_color: 'red' },
+            { text: 'fresh', diff_color: 'green' },
+        ]], 5, measure)).toEqual([
+            [{ text: 'gone', style: { strikethrough: true }, diff_color: 'red' }],
+            [{ text: 'fresh', diff_color: 'green' }],
+        ]);
+    });
+
     it('does not treat a style boundary inside a word as a wrap point', () => {
         expect(wrap_rich_text_lines([[
             { text: 'ab' },

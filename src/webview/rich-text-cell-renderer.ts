@@ -171,7 +171,9 @@ export const rich_text_cell_renderer: CustomRenderer<RichTextGridCell> = {
             ctx.rect(x, y, w, h);
             ctx.clip();
         }
-        ctx.fillStyle = linked ? theme.linkColor : theme.textDark;
+        // Per-segment below when a diff color applies; this is the default.
+        const base_fill = linked ? theme.linkColor : theme.textDark;
+        ctx.fillStyle = base_fill;
         // RTL text lays out from the right edge, mirroring the built-in Text
         // cell's whole-string heuristic; ctx.direction handles glyph order
         // inside each segment, the pen direction handles segment order.
@@ -204,6 +206,10 @@ export const rich_text_cell_renderer: CustomRenderer<RichTextGridCell> = {
                     last_font = font;
                 }
                 const seg_w = measureTextCached(text, ctx, font).width;
+                // Diff mode's addition/deletion text colors; the decoration
+                // fillRects below inherit it, so a deleted word's strike is
+                // drawn in its own color.
+                ctx.fillStyle = segment.diff_color ?? base_fill;
                 // With ctx.direction='rtl' and the default 'start' alignment,
                 // fillText anchors at the segment's RIGHT edge — so the rtl
                 // pen holds that edge and moves leftward.

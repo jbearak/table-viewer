@@ -52,6 +52,8 @@ function render_toolbar(props?: Partial<React.ComponentProps<typeof Toolbar>>) {
         auto_fit_active: false,
         on_toggle_auto_fit: vi.fn(),
         edit_mode: false,
+        diff_mode: false,
+        on_toggle_diff_mode: vi.fn(),
         is_dirty: false,
         on_toggle_edit_mode: vi.fn(),
         show_edit_button: false,
@@ -254,6 +256,40 @@ describe('Toolbar', () => {
             'Columns',
             'Auto-fit Columns',
         ]);
+    });
+
+    it('shows Diff to the left of Edit only while edit mode is on', () => {
+        const { container } = render_toolbar({
+            show_edit_button: true,
+            edit_mode: true,
+        });
+        expect(get_action_labels(container)).toEqual([
+            'Diff',
+            'Edit',
+            '|',
+            'Formatting',
+            'Columns',
+            'Auto-fit Columns',
+        ]);
+    });
+
+    it('hides Diff while edit mode is off', () => {
+        const { container } = render_toolbar({ show_edit_button: true });
+        expect(get_action_labels(container)).not.toContain('Diff');
+    });
+
+    it('reflects diff_mode as pressed state and toggles through its handler', () => {
+        const on_toggle_diff_mode = vi.fn();
+        render_toolbar({
+            show_edit_button: true,
+            edit_mode: true,
+            diff_mode: true,
+            on_toggle_diff_mode,
+        });
+        const button = get_button('Diff');
+        expect(button.getAttribute('aria-pressed')).toBe('true');
+        act(() => button.click());
+        expect(on_toggle_diff_mode).toHaveBeenCalledTimes(1);
     });
 
     it('marks the divider as a vertical separator', () => {

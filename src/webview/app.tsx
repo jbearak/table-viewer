@@ -538,6 +538,11 @@ export function App(): React.JSX.Element {
         );
     }
     const [edit_mode, set_edit_mode_state] = useState(false);
+    // Diff toggle (before/after view of dirty cells). Deliberately never reset
+    // when edit mode exits: the button hides with edit mode, but the choice
+    // survives the round trip within the session.
+    const [diff_mode, set_diff_mode] = useState(false);
+    const handle_toggle_diff_mode = useCallback(() => set_diff_mode((d) => !d), []);
     const edit_mode_ref = useRef(false);
     // Passed down as the admission lifetime instead of asking GridShell to derive
     // one during render. React can abandon a child render; only these parent-owned
@@ -5505,6 +5510,7 @@ export function App(): React.JSX.Element {
             merges={merges_flattened ? [] : current_sheet.merges}
             preview_mode={preview_mode}
             edit_mode={edit_mode_on_active_sheet}
+            diff_mode={diff_mode}
             edit_activation_id={edit_activation_id}
             highlight_in_flight={highlight_request_pending}
             csv_editable={csv_editable}
@@ -5649,6 +5655,8 @@ export function App(): React.JSX.Element {
                         : 'Wait for sorting and filtering to finish.'
                 }
                 edit_mode={edit_mode_on_active_sheet}
+                diff_mode={diff_mode}
+                on_toggle_diff_mode={handle_toggle_diff_mode}
                 is_dirty={edit_session_registry_ref.current!.has_dirty_entries()}
                 on_toggle_edit_mode={handle_toggle_edit_mode}
                 show_edit_button={csv_editing_supported}

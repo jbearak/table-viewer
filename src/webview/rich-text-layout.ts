@@ -12,6 +12,10 @@ import { split_lines } from './line-breaks';
 export interface RichTextSegment {
     readonly text: string;
     readonly style?: CellTextStyle;
+    /** Resolved paint-only text color (Diff mode's addition/deletion colors).
+     *  Never part of persisted cell content — produced by cell-renderer.ts,
+     *  consumed by rich-text-cell-renderer.ts. */
+    readonly diff_color?: string;
 }
 
 /** One visual line: its segments in order. A blank line has no segments. */
@@ -114,6 +118,7 @@ function wrap_tokens(line: RichTextLine): WrapToken[] {
             const fragment: WrapFragment = {
                 text: segment.text.slice(start, end),
                 style: segment.style,
+                diff_color: segment.diff_color,
                 source,
             };
             const last = tokens[tokens.length - 1];
@@ -238,7 +243,11 @@ function split_overwide_word(
 }
 
 function public_line(fragments: readonly WrapFragment[]): RichTextLine {
-    return fragments.map(({ text, style }) => style ? { text, style } : { text });
+    return fragments.map(({ text, style, diff_color }) => ({
+        text,
+        ...(style ? { style } : {}),
+        ...(diff_color ? { diff_color } : {}),
+    }));
 }
 
 /**

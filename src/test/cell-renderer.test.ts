@@ -506,3 +506,145 @@ describe('build_grid_cell — rich cells, code-review regressions', () => {
         expect(ltr.data.rtl).toBeUndefined();
     });
 });
+
+describe('build_grid_cell — diff overlay (Diff toggle)', () => {
+    const colors = { deleted: '#c00', added: '#0c0' };
+    const diff_cell = (
+        c: RenderedCell | null,
+        diff_base: string,
+        dirty_value: string,
+        show_formatting = true,
+    ) => build_grid_cell(
+        0,
+        [c],
+        show_formatting,
+        { diff_base, dirty_value, editable: true },
+        undefined,
+        false,
+        false,
+        colors,
+    );
+
+    it('forces a plain cell onto the rich path', () => {
+        const c = diff_cell(rc('old text with words'), 'old text with words', 'new words here now');
+        expect(c.kind).toBe(GridCellKind.Custom);
+    });
+
+    it('renders numbers as old -> new, deletion/addition colored', () => {
+        const c = diff_cell(
+            { raw: '5', formatted: '5', bold: false, italic: false, rawType: 'number' },
+            '5',
+            '7',
+        ) as unknown as { data: { lines: unknown[] } };
+        expect(c.data.lines).toEqual([[
+            { text: '5', style: { strikethrough: true }, diff_color: '#c00' },
+            { text: ' -> ' },
+            { text: '7', diff_color: '#0c0' },
+        ]]);
+    });
+
+    it('renders short text as old -> new', () => {
+        const c = diff_cell(rc('New York'), 'New York', 'Boston') as unknown as {
+            data: { lines: unknown[] };
+        };
+        expect(c.data.lines).toEqual([[
+            { text: 'New York', style: { strikethrough: true }, diff_color: '#c00' },
+            { text: ' -> ' },
+            { text: 'Boston', diff_color: '#0c0' },
+        ]]);
+    });
+
+    it('renders longer text as an inline word diff', () => {
+        const c = diff_cell(
+            rc('the quick brown fox'),
+            'the quick brown fox',
+            'the slow brown fox',
+        ) as unknown as { data: { lines: unknown[] } };
+        expect(c.data.lines).toEqual([[
+            { text: 'the ' },
+            { text: 'quick', style: { strikethrough: true }, diff_color: '#c00' },
+            { text: 'slow', diff_color: '#0c0' },
+            { text: ' brown fox' },
+        ]]);
+    });
+
+    it('splits hard breaks in either side into visual lines and keeps wrapping on', () => {
+        const c = diff_cell(
+            rc('single line'),
+            'was\nsplit over lines already',
+            'single line',
+        ) as unknown as { data: { lines: unknown[][]; allow_wrapping?: true } };
+        expect(c.data.lines.length).toBeGreaterThan(1);
+        expect(c.data.allow_wrapping).toBe(true);
+    });
+
+    it('keeps the cell editable and copies the new value, not the diff text', () => {
+        const c = diff_cell(rc('old'), 'old words here really', 'new words here truly') as unknown as {
+            allowOverlay: boolean;
+            copyData: string;
+        };
+        expect(c.allowOverlay).toBe(true);
+        expect(c.copyData).toBe('new words here truly');
+    });
+
+    it('outranks a markdown edit\'s rich runs', () => {
+        const c = build_grid_cell(
+            0,
+            [rc('x')],
+            true,
+            {
+                diff_base: 'x',
+                dirty_value: 'y',
+                dirty_rich: { runs: [{ text: 'y', style: { bold: true } }] },
+            },
+            undefined,
+            false,
+            false,
+            colors,
+        ) as unknown as { data: { lines: unknown[] } };
+        expect(c.data.lines).toEqual([[
+            { text: 'x', style: { strikethrough: true }, diff_color: '#c00' },
+            { text: ' -> ' },
+            { text: 'y', diff_color: '#0c0' },
+        ]]);
+    });
+
+    it('shows the diff in the tooltip payload too', () => {
+        const data = rich_cell_display_data(
+            rc('plain'),
+            true,
+            undefined,
+            { diff_base: 'plain', dirty_value: 'fancy' },
+            false,
+            colors,
+        );
+        expect(data?.lines).toEqual([[
+            { text: 'plain', style: { strikethrough: true }, diff_color: '#c00' },
+            { text: ' -> ' },
+            { text: 'fancy', diff_color: '#0c0' },
+        ]]);
+    });
+
+    it('never reuses a cached rich cell for a diff overlay', () => {
+        const shared = {
+            raw: 'ab',
+            formatted: 'ab',
+            bold: false,
+            italic: false,
+            richText: { runs: [{ text: 'ab' }] },
+        } as RenderedCell;
+        const plain = build_grid_cell(0, [shared], true) as unknown as {
+            data: { lines: unknown[] };
+        };
+        const diffed = build_grid_cell(
+            0, [shared], true,
+            { diff_base: 'ab', dirty_value: 'cd' },
+            undefined, false, false, colors,
+        ) as unknown as { data: { lines: unknown[] } };
+        expect(diffed.data.lines).not.toEqual(plain.data.lines);
+        const plain_again = build_grid_cell(0, [shared], true) as unknown as {
+            data: { lines: unknown[] };
+        };
+        expect(plain_again.data.lines).toEqual(plain.data.lines);
+    });
+});
