@@ -215,6 +215,7 @@ vi.mock('../webview/grid-shell', () => ({
                 'data-generation': String(props.generation),
                 'data-row-count': String(props.row_count ?? ''),
                 'data-show-formatting': String(props.show_formatting),
+                'data-auto-fit-active': String(props.auto_fit_active ?? false),
                 'data-preview': String(props.preview_mode ?? false),
                 'data-edit-mode': String(props.edit_mode ?? false),
                 'data-edit-activation-id': String(props.edit_activation_id),
@@ -4261,9 +4262,11 @@ describe('auto-fit state', () => {
 
         await click_button('Auto-fit Columns');
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);
+        expect(grid_stub().getAttribute('data-auto-fit-active')).toBe('true');
 
         await dispatch_host_message(initial_snapshot_message(make_meta(['Second'])));
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(false);
+        expect(grid_stub().getAttribute('data-auto-fit-active')).toBe('false');
 
         await click_button('Auto-fit Columns');
         expect(get_button('Auto-fit Columns').classList.contains('active')).toBe(true);

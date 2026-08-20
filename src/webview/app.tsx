@@ -5484,6 +5484,7 @@ export function App(): React.JSX.Element {
             generation={generation}
             row_count={effective_row_count}
             show_formatting={show_formatting}
+            auto_fit_active={auto_fit_active[active_sheet_index] ?? false}
             column_projection={current_column_projection}
             // Read from the ref during render, which is sound because every writer
             // of it also moves `generation` — the state this component re-renders

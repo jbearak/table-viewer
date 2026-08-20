@@ -357,6 +357,9 @@ export interface GridShellProps {
      */
     row_count?: number;
     show_formatting: boolean;
+    /** The toolbar fit is installed for this sheet. Fitting changes widths,
+     * but must not disable word wrapping for capped, unsampled, or edited text. */
+    auto_fit_active?: boolean;
     column_projection: ColumnProjection;
     /** Persisted widths keyed by canonical source column. */
     column_widths: Record<number, number>;
@@ -519,6 +522,7 @@ export function GridShell({
     generation,
     row_count = sheet_meta.rowCount,
     show_formatting,
+    auto_fit_active = false,
     column_projection,
     column_widths,
     on_column_resize,
@@ -2154,7 +2158,8 @@ export function GridShell({
             // logical (merge-aware) geometry used by build_grid_cell instead.
             const cell_height = get_cell_height(row, display_column);
             const cell_width = get_cell_width(row, display_column);
-            const soft_wrap = cell_height > default_row_height;
+            const soft_wrap = auto_fit_active
+                || cell_height > default_row_height;
             // Measure the same effective payload the grid paints. In particular,
             // a pending Markdown edit may introduce styled runs into a plain or
             // blank cell, and an empty dirty value must suppress persisted runs.
@@ -2240,6 +2245,7 @@ export function GridShell({
         },
         [
             clear_cell_tooltip_timer,
+            auto_fit_active,
             displayed_cell_text,
             font_flags_for_cell,
             font_size_px,
@@ -2468,8 +2474,11 @@ export function GridShell({
                 font_size_px,
                 // Cells taller than one default row get soft wrapping — including
                 // vertical merges whose constituent rows remain at default height.
-                // One-line-high cells keep Glide's cheap single-line paint.
-                get_cell_height(row, display_column) > default_row_height,
+                // An active toolbar fit keeps wrapping too. It samples only loaded
+                // rows and has a width ceiling, so fitting is never permission to
+                // clip capped, unsampled, or subsequently edited text.
+                auto_fit_active
+                    || get_cell_height(row, display_column) > default_row_height,
                 link_modifier_held,
             );
         },
@@ -2487,6 +2496,7 @@ export function GridShell({
             get_highlight_background,
             store,
             get_cell_height,
+            auto_fit_active,
             default_row_height,
             // A theme switch re-derives the tints, so the callback must close
             // over the new ones (the full-region repaint effect below then

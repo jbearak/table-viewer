@@ -508,6 +508,39 @@ describe('GridShell cell wrapping', () => {
             (cell: [number, number]) => { data?: { allow_wrapping?: true } };
         expect(get_cell_content([1, 0]).data?.allow_wrapping).toBe(true);
     });
+
+    it('keeps wrapping enabled when auto-fit caps a column at its maximum', async () => {
+        const text = 'A long value whose fitted width is capped';
+        grid_mock.get_row.mockImplementation(() => [
+            {
+                raw: text,
+                formatted: text,
+                bold: false,
+                italic: false,
+            },
+            null,
+            null,
+        ] as any);
+        await render_grid(props({
+            auto_fit_active: true,
+            column_widths: { 0: MAX_AUTO_FIT_COLUMN_WIDTH_PX },
+        }));
+
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => { allowWrapping?: boolean };
+        expect(get_cell_content([0, 0]).allowWrapping).toBe(true);
+    });
+
+    it('keeps wrapping for auto-fitted columns below the cap', async () => {
+        await render_grid(props({
+            auto_fit_active: true,
+            column_widths: { 0: MAX_AUTO_FIT_COLUMN_WIDTH_PX - 1 },
+        }));
+
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => { allowWrapping?: boolean };
+        expect(get_cell_content([0, 0]).allowWrapping).toBe(true);
+    });
 });
 
 describe('GridShell column projection', () => {
