@@ -207,6 +207,11 @@ export class ZipPackage {
             const method = u16(raw, offset + 10);
             const compressed_size = u32(raw, offset + 20);
             const uncompressed_size = u32(raw, offset + 24);
+            if ((flags & 0x2041) === 0
+                && method === 0
+                && compressed_size !== uncompressed_size) {
+                throw new ZipPackageError('Invalid stored ZIP entry size');
+            }
             const name_length = u16(raw, offset + 28);
             const extra_length = u16(raw, offset + 30);
             const comment_length = u16(raw, offset + 32);

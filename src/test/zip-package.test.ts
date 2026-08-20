@@ -254,6 +254,34 @@ describe('lazy XLSX ZIP packages', () => {
         expect(() => zip.read('/xl/member.bin')).toThrow('Invalid ZIP entry checksum');
     });
 
+    it('rejects inconsistent stored-entry sizes before copying the payload', () => {
+        const raw = single_member_zip({
+            content: Buffer.from('stored size check longer than sixteen bytes'),
+        });
+        const { central, local } = zip_member(raw, 'xl/member.bin');
+        const declared = u32(raw, central + 24) - 1;
+        put_u32(raw, central + 24, declared);
+        put_u32(raw, local + 22, declared);
+        expect(() => ZipPackage.open(raw)).toThrow('Invalid stored ZIP entry size');
+    });
+
+    it('preserves an unread encrypted stored member verbatim', () => {
+        const raw = single_member_zip({
+            content: Buffer.from('encrypted framing plus stored content'),
+        });
+        const { central, local } = zip_member(raw, 'xl/member.bin');
+        put_u16(raw, central + 8, 0x0001);
+        put_u16(raw, local + 6, 0x0001);
+        // Traditional ZIP encryption adds a 12-byte header to the stored payload.
+        const declared = u32(raw, central + 24) - 12;
+        put_u32(raw, central + 24, declared);
+        put_u32(raw, local + 22, declared);
+        const zip = ZipPackage.open(raw);
+        expect(Buffer.from(zip.write())).toEqual(raw);
+        expect(() => zip.read('/xl/member.bin'))
+            .toThrow('Encrypted ZIP entries are not supported');
+    });
+
     it('rejects trailing bytes after a complete DEFLATE stream', () => {
         const raw = single_member_zip({
             content: Buffer.from('compressed content'),
@@ -275,7 +303,9 @@ describe('lazy XLSX ZIP packages', () => {
         const first = locations[0];
         const overlapping_size = locations[1].local - first.data + 1;
         put_u32(corrupt, first.central + 20, overlapping_size);
+        put_u32(corrupt, first.central + 24, overlapping_size);
         put_u32(corrupt, first.local + 18, overlapping_size);
+        put_u32(corrupt, first.local + 22, overlapping_size);
         expect(() => ZipPackage.open(corrupt)).toThrow('Overlapping ZIP entries');
     });
 });

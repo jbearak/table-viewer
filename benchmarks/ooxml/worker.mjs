@@ -107,19 +107,34 @@ function raw_zip_members(raw) {
     }
     if (eocd < 0) shape_error('saved output has no ZIP end record');
     const count = raw.readUInt16LE(eocd + 10);
+    const central_size = raw.readUInt32LE(eocd + 12);
     const central_offset = raw.readUInt32LE(eocd + 16);
+    const central_end = central_offset + central_size;
+    if (central_offset > eocd || central_end !== eocd) {
+        shape_error('saved output has an invalid central directory');
+    }
     const entries = [];
     let central = central_offset;
     for (let index = 0; index < count; index++) {
+        if (central + 46 > central_end) {
+            shape_error('saved output has an invalid central directory');
+        }
         if (raw.readUInt32LE(central) !== 0x02014b50) {
             shape_error('saved output has an invalid central directory');
         }
         const name_length = raw.readUInt16LE(central + 28);
         const extra_length = raw.readUInt16LE(central + 30);
         const comment_length = raw.readUInt16LE(central + 32);
+        const next = central + 46 + name_length + extra_length + comment_length;
+        if (next > central_end) {
+            shape_error('saved output has an invalid central directory');
+        }
         const name = raw.subarray(central + 46, central + 46 + name_length).toString('utf8');
         entries.push({ name, local_offset: raw.readUInt32LE(central + 42) });
-        central += 46 + name_length + extra_length + comment_length;
+        central = next;
+    }
+    if (central !== central_end) {
+        shape_error('saved output has an invalid central directory');
     }
     const physical = [...entries].sort((left, right) => left.local_offset - right.local_offset);
     const local_end = new Map();
