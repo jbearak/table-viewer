@@ -122,6 +122,62 @@ describe('CompareDataSource', () => {
         expect(original.closed).toBe(true);
     });
 
+    it('exposes deleted sheets as navigable read-only all-deleted bands', () => {
+        const source = new CompareDataSource(
+            new FixtureSource([{ name: 'Kept', rows: [['x']] }]),
+            new FixtureSource([
+                { name: 'Kept', rows: [['x']] },
+                { name: 'Gone', rows: [['g1'], ['g2']] },
+            ]),
+        );
+        const sheets = source.meta().sheets;
+        expect(sheets.map((sheet) => sheet.name)).toEqual(['Kept', 'Gone']);
+        expect(sheets[1].rowCount).toBe(2);
+        const window = source.read_rows(1, 0, 10);
+        expect(window.rows.map((row) => row[0]?.raw)).toEqual(['g1', 'g2']);
+        expect(source.read_rows_indexed(1, [1]).rows[0][0]?.raw).toBe('g2');
+        expect(source.diff_rows(1, [0, 1])?.rowStatus).toEqual(['deleted', 'deleted']);
+    });
+
+    it('serves repeated diff_rows requests from the cache', () => {
+        const original = new FixtureSource([{ name: 'Sheet1', rows: [['a']] }]);
+        const source = new CompareDataSource(
+            new FixtureSource([{ name: 'Sheet1', rows: [['b']] }]),
+            original,
+        );
+        const first = source.diff_rows(0, [0]);
+        let reads = 0;
+        const read_rows = original.read_rows.bind(original);
+        original.read_rows = (...read_args) => {
+            reads += 1;
+            return read_rows(...read_args);
+        };
+        expect(source.diff_rows(0, [0])).toBe(first);
+        expect(reads).toBe(0);
+    });
+
+    it('maps padded rows to canonical rows appended after the modified side', () => {
+        const source = compare([['a'], ['b'], ['c']], [['a']]);
+        // Grid rows 1-2 are the deleted band; modified has 1 source row.
+        expect([...source.source_row_indices(0, [0, 1, 2])]).toEqual([0, 1, 2]);
+        expect(source.projected_row_index(0, 1)).toBe(1);
+        expect(source.projected_row_index(0, 5)).toBeUndefined();
+    });
+
+    it('forwards the modified side row mapping for real rows', () => {
+        const modified = new FixtureSource([{ name: 'Sheet1', rows: [['a'], ['b']] }]);
+        (modified as DataSource).source_row_indices = (_sheet, rows) =>
+            Uint32Array.from(rows as number[], (row) => row + 1);
+        (modified as DataSource).projected_row_index = (_sheet, source_row) =>
+            source_row - 1;
+        const source = new CompareDataSource(
+            modified,
+            new FixtureSource([{ name: 'Sheet1', rows: [['a']] }]),
+        );
+        expect([...source.source_row_indices(0, [0, 1])]).toEqual([1, 2]);
+        expect(source.projected_row_index(0, 1)).toBe(0);
+    });
+
     it('clamps read windows to the padded row count', () => {
         const source = compare([['a'], ['b']], [['a']]);
         const window = source.read_rows(0, 1, 10);

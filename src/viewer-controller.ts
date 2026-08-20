@@ -1193,43 +1193,34 @@ export function attach_viewer(
         msg: Extract<WebviewMessage, { type: 'requestRows' }>,
         window: { startRow: number; sourceRows: number[] },
     ): void {
-        if (!(source instanceof CompareDataSource)) return;
-        const source_rows = window.sourceRows;
-        const row_status: ('same' | 'added' | 'deleted')[] = [];
-        const changed_cells: { row: number; col: number; base: string }[] = [];
+        if (!(source instanceof CompareDataSource) || window.sourceRows.length === 0) return;
+        const compare_source = source;
+        let diff;
         try {
-            let position = 0;
-            while (position < source_rows.length) {
-                const run_start = source_rows[position];
-                let run_length = 1;
-                while (
-                    position + run_length < source_rows.length
-                    && source_rows[position + run_length] === run_start + run_length
-                ) run_length++;
-                const page = source.diff_page(msg.sheetIndex, run_start, run_length);
-                for (let offset = 0; offset < run_length; offset++) {
-                    row_status.push(page?.rowStatus[offset] ?? 'same');
-                }
-                if (page) {
-                    for (const cell of page.changedCells) {
-                        changed_cells.push({
-                            ...cell,
-                            row: window.startRow + position + (cell.row - run_start),
-                        });
-                    }
-                }
-                position += run_length;
-            }
+            // The diff is positional over the compare source's projected row
+            // space; the window carries canonical rows, so map them back.
+            const projected_rows = window.sourceRows.map((source_row) =>
+                compare_source.projected_row_index(msg.sheetIndex, source_row));
+            if (projected_rows.some((row) => row === undefined)) return;
+            diff = compare_source.diff_rows(
+                msg.sheetIndex,
+                projected_rows as number[],
+            );
         } catch {
             return;
         }
-        if (source_rows.length === 0) return;
+        if (!diff) return;
         void post_to_receiver({
             type: 'compareDiff',
             sheetIndex: msg.sheetIndex,
             startRow: window.startRow,
-            rowStatus: row_status,
-            changedCells: changed_cells,
+            // Positional results: entry i / row offsets are display slots
+            // startRow + i of the served window, matching rowData's rows.
+            rowStatus: diff.rowStatus,
+            changedCells: diff.changedCells.map((cell) => ({
+                ...cell,
+                row: window.startRow + cell.row,
+            })),
             requestId: msg.requestId,
             generation: msg.generation,
         });
@@ -3541,34 +3532,56 @@ export function attach_viewer(
             fingerprint: `${stat.mtime}:${stat.size}`,
             digest: content_digest(raw),
         };
-        const modified = await profile.build_source(
-            raw,
-            file_path,
-            state,
-            load_all_csv_rows ? { loadAllRows: true } : undefined,
-        );
-        return new SourceCandidate(await wrap_for_compare(modified), observation);
+        // The original side builds concurrently with the modified parse; both
+        // are independent reads of already-committed bytes.
+        const original_promise = build_compare_original(state);
+        let modified: DataSource;
+        try {
+            modified = await profile.build_source(
+                raw,
+                file_path,
+                state,
+                load_all_csv_rows ? { loadAllRows: true } : undefined,
+            );
+        } catch (error) {
+            void original_promise.then((original) => original?.close());
+            throw error;
+        }
+        const original = await original_promise;
+        let adopted = modified;
+        if (original) {
+            try {
+                adopted = new CompareDataSource(modified, original);
+            } catch (error) {
+                original.close();
+                warn_compare_unavailable(error);
+            }
+        }
+        return new SourceCandidate(adopted, observation);
     }
 
     /**
-     * Bind the working-tree source to its git original when compare mode is on.
-     * The original must never block the file itself: any failure to read or
-     * parse it degrades to a plain open with a one-time warning.
+     * Build the git original through the same profile and per-file state as
+     * the modified side, so both sides share projection policy (CSV row caps,
+     * Excel header overrides/hidden rows) and differ only in bytes. The
+     * original must never block the file itself: any failure — including
+     * exceeding the configured size limit — degrades to a plain open with a
+     * one-time warning.
      */
-    async function wrap_for_compare(modified: DataSource): Promise<DataSource> {
-        if (!compare_original_uri) return modified;
+    async function build_compare_original(
+        state: PerFileState,
+    ): Promise<DataSource | undefined> {
+        if (!compare_original_uri) return undefined;
         try {
             const original_raw = await host.fs.read_file(compare_original_uri);
-            const original = await build_source_from_buffer(original_raw, file_path);
-            try {
-                return new CompareDataSource(modified, original);
-            } catch (error) {
-                original.close();
-                throw error;
-            }
+            assert_safe_file_size(
+                original_raw.byteLength,
+                host.config.max_file_size_mib(),
+            );
+            return await profile.build_source(original_raw, file_path, state);
         } catch (error) {
             warn_compare_unavailable(error);
-            return modified;
+            return undefined;
         }
     }
 
