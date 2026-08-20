@@ -1,6 +1,7 @@
 import * as React from "react";
 import type { FullTheme } from "../../common/styles.js";
 import {
+    clearTextMetricsCache,
     computeBounds,
     getColumnIndexForX,
     getEffectiveColumns,
@@ -907,13 +908,34 @@ const DataGrid: React.ForwardRefRenderFunction<DataGridRef, DataGridProps> = (p,
     }, [draw]);
 
     React.useLayoutEffect(() => {
-        const fn = async () => {
-            if (document?.fonts?.ready === undefined) return;
-            await document.fonts.ready;
-            lastArgsRef.current = undefined;
-            lastDrawRef.current();
+        const fonts = document?.fonts;
+        if (fonts?.ready === undefined) return;
+
+        let disposed = false;
+        let scheduledReady: Promise<FontFaceSet> | undefined;
+        const redrawWhenReady = () => {
+            const ready = fonts.ready;
+            if (ready === scheduledReady) return;
+            scheduledReady = ready;
+            void ready.then(() => {
+                if (disposed) return;
+                clearTextMetricsCache();
+                lastArgsRef.current = undefined;
+                lastDrawRef.current();
+            });
         };
-        void fn();
+
+        // Fork addition: the initial promise covers faces already loading on
+        // mount. A later loadingdone can belong to a new `fonts.ready` promise
+        // (for example the first bold face encountered while scrolling), so
+        // schedule one redraw for each distinct load cycle rather than only the
+        // mount-time cycle.
+        redrawWhenReady();
+        fonts.addEventListener?.("loadingdone", redrawWhenReady);
+        return () => {
+            disposed = true;
+            fonts.removeEventListener?.("loadingdone", redrawWhenReady);
+        };
     }, []);
 
     // Fork addition: damaging any cell of a merge must repaint the whole

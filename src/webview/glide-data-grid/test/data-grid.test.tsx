@@ -1,8 +1,8 @@
 import * as React from "react";
-import { render, fireEvent, screen, cleanup } from "@testing-library/react";
+import { act, render, fireEvent, screen, cleanup } from "@testing-library/react";
 import DataGrid, { type DataGridProps, type DataGridRef } from "../internal/data-grid/data-grid.js";
 import { CompactSelection, GridCellKind } from "../internal/data-grid/data-grid-types.js";
-import { getDefaultTheme } from "../index.js";
+import { getDefaultTheme, getMiddleCenterBias, measureTextCached } from "../index.js";
 import { AllCellRenderers } from "../cells/index.js";
 import { vi, expect, describe, test, beforeEach, afterEach } from "vitest";
 import ImageWindowLoaderImpl from "../common/image-window-loader.js";
@@ -336,6 +336,84 @@ describe("data-grid", () => {
                 location: [2, -2],
             })
         );
+    });
+
+    test("Redraws after a later web-font load completes", async () => {
+        const fontsDescriptor = Object.getOwnPropertyDescriptor(document, "fonts");
+        let ready = Promise.resolve({} as FontFaceSet);
+        const fonts = new EventTarget();
+        Object.defineProperty(fonts, "ready", { get: () => ready });
+        Object.defineProperty(document, "fonts", {
+            configurable: true,
+            value: fonts,
+        });
+        const spy = vi.fn(basicProps.getCellContent);
+
+        try {
+            await act(async () => {
+                render(<DataGrid {...basicProps} getCellContent={spy} />);
+                await ready;
+            });
+            spy.mockClear();
+
+            let measuredWidth = 10;
+            const measureContext = {
+                font: "13px FontCycleProbe",
+                measureText: () => ({ width: measuredWidth }) as TextMetrics,
+            } as unknown as CanvasRenderingContext2D;
+            expect(measureTextCached(
+                "font-ready-cache-probe",
+                measureContext,
+                measureContext.font,
+            ).width).toBe(10);
+
+            let finalBiasMetrics = false;
+            let textBaseline: CanvasTextBaseline = "middle";
+            const biasContext = {
+                font: "13px FontCycleBiasProbe",
+                get textBaseline() {
+                    return textBaseline;
+                },
+                set textBaseline(value: CanvasTextBaseline) {
+                    textBaseline = value;
+                },
+                save: () => undefined,
+                restore: () => undefined,
+                measureText: () => ({
+                    actualBoundingBoxAscent: finalBiasMetrics ? 10 : 8,
+                    actualBoundingBoxDescent: textBaseline === "middle"
+                        ? (finalBiasMetrics ? 4 : 3)
+                        : (finalBiasMetrics ? 2 : 1),
+                }) as TextMetrics,
+            } as unknown as CanvasRenderingContext2D;
+            expect(getMiddleCenterBias(biasContext, biasContext.font)).toBe(2);
+
+            // A later face/weight gets its own FontFaceSet.ready promise. The
+            // completion event must clear fallback width and alignment metrics,
+            // then trigger a grid draw without user damage.
+            measuredWidth = 20;
+            finalBiasMetrics = true;
+            ready = Promise.resolve({} as FontFaceSet);
+            await act(async () => {
+                fonts.dispatchEvent(new Event("loadingdone"));
+                await ready;
+            });
+
+            expect(spy).toHaveBeenCalled();
+            expect(measureTextCached(
+                "font-ready-cache-probe",
+                measureContext,
+                measureContext.font,
+            ).width).toBe(20);
+            expect(getMiddleCenterBias(biasContext, biasContext.font)).toBe(3);
+        } finally {
+            cleanup();
+            if (fontsDescriptor) {
+                Object.defineProperty(document, "fonts", fontsDescriptor);
+            } else {
+                Reflect.deleteProperty(document, "fonts");
+            }
+        }
     });
 
     test("Simple damage", () => {

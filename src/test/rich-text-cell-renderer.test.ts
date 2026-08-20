@@ -4,12 +4,17 @@ import {
     rich_text_cell_renderer,
     type RichTextGridCell,
 } from '../webview/rich-text-cell-renderer';
-import { GridCellKind, getDefaultTheme, type FullTheme } from '../webview/glide-data-grid';
+import {
+    clearTextMetricsCache,
+    GridCellKind,
+    getDefaultTheme,
+    type FullTheme,
+} from '../webview/glide-data-grid';
 import type { RichTextLine } from '../webview/rich-text-layout';
 
-/** Stub 2D context: width = 10px/char, so layout is assertable. Records every
- *  fillText with the font active at the time. */
-function stub_ctx() {
+/** Stub 2D context: width defaults to 10px/char, so layout is assertable.
+ * Records every fillText with the font active at the time. */
+function stub_ctx(measure_width: (text: string) => number = text => text.length * 10) {
     const calls: { text: string; x: number; y: number; font: string }[] = [];
     const rects: { x: number; y: number; w: number; h: number }[] = [];
     const ctx = {
@@ -17,7 +22,7 @@ function stub_ctx() {
         fillStyle: '',
         textBaseline: 'middle',
         measureText: (s: string) => ({
-            width: s.length * 10,
+            width: measure_width(s),
             actualBoundingBoxAscent: 9,
             actualBoundingBoxDescent: 3,
         }),
@@ -44,7 +49,18 @@ const theme: FullTheme = {
     fontFamily: 'sans',
 };
 
-function make_cell(lines: RichTextLine[], hyperlink = false): RichTextGridCell {
+const width_with_padding = (content_width: number): number =>
+    content_width + 2 * theme.cellHorizontalPadding;
+
+interface CellOptions {
+    readonly hyperlink?: boolean;
+    readonly allow_wrapping?: boolean;
+}
+
+function make_cell(
+    lines: RichTextLine[],
+    { hyperlink = false, allow_wrapping = false }: CellOptions = {},
+): RichTextGridCell {
     return {
         kind: GridCellKind.Custom,
         data: {
@@ -54,19 +70,23 @@ function make_cell(lines: RichTextLine[], hyperlink = false): RichTextGridCell {
             ...(hyperlink
                 ? { hyperlink: { kind: 'external' as const, target: 'https://x.example/' } }
                 : {}),
+            ...(allow_wrapping ? { allow_wrapping: true as const } : {}),
         },
         copyData: 'x',
         allowOverlay: false,
     };
 }
 
-function draw(cell: RichTextGridCell) {
-    const stub = stub_ctx();
+function draw(
+    cell: RichTextGridCell,
+    rect = { x: 0, y: 0, width: 200, height: 30 },
+    stub = stub_ctx(),
+) {
     rich_text_cell_renderer.draw(
         {
             ctx: stub.ctx,
             theme,
-            rect: { x: 0, y: 0, width: 200, height: 30 },
+            rect,
             cell,
             col: 0,
             row: 0,
@@ -132,6 +152,96 @@ describe('rich_text_cell_renderer.draw', () => {
         expect(calls[1].x).toBe(calls[0].x);
     });
 
+    it('soft-wraps mixed runs and preserves wrapped fonts and decorations', () => {
+        // 50px content width: exactly five stub characters.
+        const { calls, rects } = draw(make_cell([[
+            { text: 'alpha ' },
+            { text: 'beta', style: { bold: true, underline: true } },
+        ]], { allow_wrapping: true }), { x: 0, y: 0, width: width_with_padding(50), height: 80 });
+
+        expect(calls.map(call => call.text)).toEqual(['alpha', 'beta']);
+        expect(calls[1].y).toBeGreaterThan(calls[0].y);
+        expect(calls[1].x).toBe(calls[0].x);
+        expect(calls[1].font).toBe('600 13px sans');
+        expect(rects).toHaveLength(1);
+        expect(rects[0].x).toBe(calls[1].x);
+        expect(rects[0].w).toBe(40);
+    });
+
+    it('does not cache wrapping measured while a web font starts loading', () => {
+        const fonts = { status: 'loaded' };
+        let character_width = 10;
+        let start_loading_on_measure = true;
+        const stub = stub_ctx(text => {
+            // Canvas can request a previously unused face/weight. The status
+            // transition therefore happens inside the first layout measurement,
+            // after the renderer sampled its initial state.
+            if (start_loading_on_measure) {
+                start_loading_on_measure = false;
+                fonts.status = 'loading';
+            }
+            return text.length * character_width;
+        });
+        const document_descriptor = Object.getOwnPropertyDescriptor(globalThis, 'document');
+        Object.defineProperty(globalThis, 'document', {
+            configurable: true,
+            value: { fonts },
+        });
+
+        try {
+            const cell = make_cell([[{ text: 'aaaa bbbb' }]], { allow_wrapping: true });
+            const rect = { x: 0, y: 0, width: width_with_padding(50), height: 80 };
+            draw(cell, rect, stub);
+            expect(stub.calls.map(call => call.text)).toEqual(['aaaa', 'bbbb']);
+
+            // The fallback layout was not cached: final-font metrics recompute it.
+            stub.calls.length = 0;
+            character_width = 5;
+            fonts.status = 'loaded';
+            draw(cell, rect, stub);
+            expect(stub.calls.map(call => call.text)).toEqual(['aaaa bbbb']);
+        } finally {
+            if (document_descriptor) {
+                Object.defineProperty(globalThis, 'document', document_descriptor);
+            } else {
+                Reflect.deleteProperty(globalThis, 'document');
+            }
+        }
+    });
+
+    it('invalidates cached wrapping with Glide text metrics', () => {
+        let character_width = 5;
+        const stub = stub_ctx(text => text.length * character_width);
+        const cell = make_cell([[{ text: 'aaaa bbbb' }]], { allow_wrapping: true });
+        const rect = { x: 0, y: 0, width: width_with_padding(50), height: 80 };
+
+        draw(cell, rect, stub);
+        expect(stub.calls.map(call => call.text)).toEqual(['aaaa bbbb']);
+
+        stub.calls.length = 0;
+        character_width = 8;
+        clearTextMetricsCache();
+        draw(cell, rect, stub);
+        expect(stub.calls.map(call => call.text)).toEqual(['aaaa', 'bbbb']);
+    });
+
+    it('starts each wrapped RTL line at the right padding edge', () => {
+        const base = make_cell([[
+            { text: 'אבגד ' },
+            { text: 'הוזח', style: { bold: true } },
+        ]], { allow_wrapping: true });
+        const rtl_cell: RichTextGridCell = {
+            ...base,
+            data: { ...base.data, rtl: true },
+        };
+        const width = width_with_padding(40);
+        const { calls } = draw(rtl_cell, { x: 0, y: 0, width, height: 80 });
+        expect(calls).toHaveLength(2);
+        expect(calls[0].x).toBe(width - theme.cellHorizontalPadding);
+        expect(calls[1].x).toBe(width - theme.cellHorizontalPadding);
+        expect(calls[1].y).toBeGreaterThan(calls[0].y);
+    });
+
     it('underlines and strikes styled segments via fillRect', () => {
         const { calls, rects } = draw(make_cell([[
             { text: 'plain' },
@@ -152,7 +262,7 @@ describe('rich_text_cell_renderer.draw', () => {
     it('underlines every segment of a linked cell in the link color', () => {
         const { calls, rects } = draw(make_cell(
             [[{ text: 'go' }, { text: 'to', style: { bold: true } }]],
-            true,
+            { hyperlink: true },
         ));
         expect(rects).toHaveLength(2);
         expect(rects[0].x).toBe(calls[0].x);
@@ -167,8 +277,19 @@ describe('rich_text_cell_renderer.measure', () => {
             [{ text: 'abc' }, { text: 'de', style: { bold: true } }],
             [{ text: 'xy' }],
         ]);
-        // Widest line: 5 chars * 10 = 50, plus 2 * padding (8) = 66.
-        expect(rich_text_cell_renderer.measure!(ctx, cell, theme)).toBe(66);
+        // Widest line: 5 chars * 10 = 50, plus horizontal padding.
+        expect(rich_text_cell_renderer.measure!(ctx, cell, theme))
+            .toBe(width_with_padding(50));
+    });
+
+    it('keeps auto-fit measurement at the natural width when wrapping is enabled', () => {
+        const { ctx } = stub_ctx();
+        const cell = make_cell([[
+            { text: 'abc ' },
+            { text: 'de', style: { bold: true } },
+        ]], { allow_wrapping: true });
+        expect(rich_text_cell_renderer.measure!(ctx, cell, theme))
+            .toBe(width_with_padding(60));
     });
 
     it('leaves the measurement font as it found it', () => {
@@ -187,29 +308,7 @@ describe('rich_text_cell_renderer.draw — code-review regressions', () => {
     it('restores the base font after a cell ending in a styled run', () => {
         const stub = stub_ctx();
         const cell = make_cell([[{ text: 'end bold', style: { bold: true } }]]);
-        rich_text_cell_renderer.draw(
-            {
-                ctx: stub.ctx,
-                theme,
-                rect: { x: 0, y: 0, width: 200, height: 30 },
-                cell,
-                col: 0,
-                row: 0,
-                highlighted: false,
-                hoverAmount: 0,
-                hoverX: undefined,
-                hoverY: undefined,
-                cellFillColor: '#fff',
-                imageLoader: undefined as never,
-                spriteManager: undefined as never,
-                hyperWrapping: false,
-                requestAnimationFrame: () => {},
-                drawState: [undefined, () => {}],
-                frameTime: 0,
-                overrideCursor: undefined,
-            },
-            cell,
-        );
+        draw(cell, undefined, stub);
         // Glide's draw loop tracks the canvas font and skips resetting it
         // between cells, so draw must leave the base font behind.
         expect((stub.ctx as unknown as { font: string }).font).toBe(theme.baseFontFull);
@@ -237,7 +336,7 @@ describe('rich_text_cell_renderer.draw — code-review regressions', () => {
         expect(calls).toHaveLength(2);
         // First segment anchors at the right padding edge; the next continues
         // leftward (each segment is 2 chars * 10px wide).
-        expect(calls[0].x).toBe(200 - 8);
-        expect(calls[1].x).toBe(200 - 8 - 20);
+        expect(calls[0].x).toBe(200 - theme.cellHorizontalPadding);
+        expect(calls[1].x).toBe(200 - theme.cellHorizontalPadding - 20);
     });
 });

@@ -17,6 +17,8 @@ export { getDataEditorTheme as getDefaultTheme } from "./common/styles.js";
 // a renderer needs to draw consistently with the built-in text cell.
 export type { CustomRenderer } from "./cells/cell-types.js";
 export {
+    clearTextMetricsCache,
+    getTextMetricsGeneration,
     measureTextCached,
     getEmHeight,
     getMiddleCenterBias,

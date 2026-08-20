@@ -116,12 +116,16 @@ export function needs_rich_renderer(c: RenderedCell): boolean {
 /** Memoized rich cells: build_grid_cell is Glide's per-cell paint callback
  *  (every visible cell, every frame, no caching above it), and splitting runs
  *  into lines allocates. RenderedCells are immutable and shared by reference
- *  from the row store, so the object is the cache key; font size and the
- *  Formatting toggle are the other inputs that shape the payload. Entries die
- *  with their cells. */
+ *  from the row store, so the object is the cache key; font size, Formatting,
+ *  and the row-height wrapping input are the other inputs that shape the payload.
+ *  Entries die with their cells. */
 const rich_cell_cache = new WeakMap<
     RenderedCell,
-    { font_size_px: number; show_formatting: boolean; cell: CustomCell<RichCellData> }
+    {
+        show_formatting: boolean;
+        soft_wrap: boolean;
+        cell: CustomCell<RichCellData>;
+    }
 >();
 
 function rich_cell(
@@ -129,23 +133,26 @@ function rich_cell(
     show_formatting: boolean,
     overlay: CellEditOverlay | undefined,
     font_size_px: number,
+    soft_wrap = false,
     link_modifier_held = false,
-): GridCell {
+): CustomCell<RichCellData> {
     const can_cache = overlay?.dirty_rich === undefined && overlay?.dirty_value === undefined;
     const cached = can_cache ? rich_cell_cache.get(c) : undefined;
     let cell = cached !== undefined
-        && cached.font_size_px === font_size_px
+        && cached.cell.data.font_size_px === font_size_px
         && cached.show_formatting === show_formatting
+        && cached.soft_wrap === soft_wrap
         ? cached.cell
         : undefined;
     if (!cell) {
-        // Same displayed-text rule as the Text path: the Formatting toggle
-        // switches between the formatted value and the raw one (a linked date
-        // cell must show '7/16/2023', not its serial). Line breaks are handled
-        // by rich_text_lines splitting runs on the canonical hard-break rule,
-        // mirroring the Text path's normalize_line_breaks.
+        // Same displayed-text rule as the Text path: the Formatting toggle switches
+        // between the formatted value and the raw one (a linked date cell must show
+        // '7/16/2023', not its serial). Hard breaks are sufficient to request the
+        // rich multiline path; otherwise GridShell enables wrapping only after the
+        // effective row/merge height exceeds one default row.
         const display = overlay?.dirty_value
             ?? (show_formatting ? c.formatted : (c.raw ?? ''));
+        const allow_wrapping = cell_allows_wrapping(display, soft_wrap);
         // Whole-cell flags become one styled run for link/underline-only
         // cells. With formatting off only the link presentation survives
         // (mirroring the Text path dropping bold/italic): plain runs, and the
@@ -172,6 +179,7 @@ function rich_cell(
                 lines: rich_text_lines(runs),
                 ...(c.hyperlink ? { hyperlink: c.hyperlink } : {}),
                 font_size_px,
+                ...(allow_wrapping ? { allow_wrapping: true as const } : {}),
                 // Whole-string RTL heuristic, same as Glide's Text cell.
                 ...(direction(display) === 'rtl' ? { rtl: true as const } : {}),
             },
@@ -183,7 +191,11 @@ function rich_cell(
             // does for Text.
             readonly: true,
         };
-        if (can_cache) rich_cell_cache.set(c, { font_size_px, show_formatting, cell });
+        if (can_cache) rich_cell_cache.set(c, {
+            show_formatting,
+            soft_wrap,
+            cell,
+        });
     }
     // Per-view state, not cell content — applied outside the cache. The
     // pointer cursor appears only while the open gesture is actually
@@ -225,17 +237,19 @@ export function rich_cell_display_data(
     show_formatting: boolean,
     font_size_px: number = DEFAULT_CELL_FONT_SIZE_PX,
     overlay?: CellEditOverlay,
+    soft_wrap = false,
 ): RichCellData | undefined {
     if (
         !(c && renders_rich(c, show_formatting))
         && !(show_formatting && overlay?.dirty_rich !== undefined)
     ) return undefined;
-    return (rich_cell(
+    return rich_cell(
         c ?? EMPTY_CELL,
         show_formatting,
         overlay,
         font_size_px,
-    ) as CustomCell<RichCellData>).data;
+        soft_wrap,
+    ).data;
 }
 
 function text_cell(
@@ -341,7 +355,14 @@ export function build_grid_cell(
         (c && renders_rich(c, show_formatting))
         || (show_formatting && overlay?.dirty_rich !== undefined)
     ) {
-        return rich_cell(c ?? EMPTY_CELL, show_formatting, overlay, font_size_px, link_modifier_held);
+        return rich_cell(
+            c ?? EMPTY_CELL,
+            show_formatting,
+            overlay,
+            font_size_px,
+            soft_wrap,
+            link_modifier_held,
+        );
     }
     return text_cell(c ?? EMPTY_CELL, show_formatting, overlay, font_size_px, soft_wrap);
 }

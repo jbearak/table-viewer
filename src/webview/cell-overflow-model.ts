@@ -8,7 +8,11 @@
  */
 import { has_line_break, split_lines } from './line-breaks';
 import type { CellHyperlink, CellTextStyle } from '../cell-content';
-import { rich_lines_max_width, type RichTextLine } from './rich-text-layout';
+import {
+    rich_lines_max_width,
+    wrap_rich_text_lines,
+    type RichTextLine,
+} from './rich-text-layout';
 
 /** Mirrors Glide's default `cellHorizontalPadding`. */
 export const CELL_TOOLTIP_HORIZONTAL_PADDING_PX = 8;
@@ -92,30 +96,31 @@ export function text_overflows_cell(
     return needed_height > available_height + 0.5;
 }
 
-/** Clamp tooltip copy so a single pathological cell cannot flood the DOM. */
 /**
- * Overflow rule for cells the rich renderer draws: hard line breaks only (no
- * soft wrap), each segment measured with its own style. `measure` returns the
- * width of one segment's text under one style — the same measurer the rich
- * renderer and the column fitter use, so tooltip visibility matches what
- * actually clips.
+ * Overflow rule for cells the rich renderer draws. Each segment is measured
+ * with its own style; when wrapping is enabled, the same run-aware layout used
+ * by the canvas renderer determines visual lines before fit is evaluated.
  */
 export function rich_text_overflows_cell(
     lines: readonly RichTextLine[],
     cell_width: number,
     measure: (text: string, style: CellTextStyle | undefined) => number,
-    options: Pick<CellOverflowOptions, 'cell_height' | 'line_height' | 'horizontal_padding'> = {},
+    options: CellOverflowOptions = {},
 ): boolean {
     const padding = options.horizontal_padding ?? CELL_TOOLTIP_HORIZONTAL_PADDING_PX;
     const available_width = Math.max(0, cell_width - padding * 2);
     if (available_width <= 0) return lines.some((line) => line.length > 0);
-    if (rich_lines_max_width(lines, measure) > available_width + 0.5) return true;
-    if (lines.length <= 1) return false;
+    const visual_lines = options.wrapping
+        ? wrap_rich_text_lines(lines, available_width, measure)
+        : lines;
+    // A single grapheme can remain wider than the cell even after wrapping.
+    if (rich_lines_max_width(visual_lines, measure) > available_width + 0.5) return true;
+    if (visual_lines.length <= 1) return false;
     const cell_height = options.cell_height;
     // No height budget: a default single-row cell clips past the first line.
     if (cell_height === undefined) return true;
     const line_height = options.line_height ?? CELL_TOOLTIP_LINE_HEIGHT_PX;
-    return lines.length * line_height > Math.max(0, cell_height - padding) + 0.5;
+    return visual_lines.length * line_height > Math.max(0, cell_height - padding) + 0.5;
 }
 
 /** What a hyperlink hover surfaces: the author's tooltip when set, else where
@@ -151,6 +156,7 @@ export function cell_tooltip_content(
     return overflows ? `${text}\n${link_text}${hint}` : `${link_text}${hint}`;
 }
 
+/** Clamp tooltip copy so a single pathological cell cannot flood the DOM. */
 export function clamp_tooltip_text(
     text: string,
     max_chars: number = CELL_TOOLTIP_MAX_CHARS,
