@@ -304,6 +304,7 @@ export function getRowIndexForY(
 let metricsSize = 0;
 let metricsCache: Record<string, TextMetrics | undefined> = {};
 let textMetricsGeneration = 0;
+const biasCache: { key: string; val: number }[] = [];
 
 /** Fork addition: discard every font-dependent text cache before a redraw that
  * follows web-font loading. Later face/weight cycles need the same invalidation
@@ -311,6 +312,7 @@ let textMetricsGeneration = 0;
 export function clearTextMetricsCache(): void {
     metricsSize = 0;
     metricsCache = {};
+    biasCache.length = 0;
     clearCache();
     textMetricsGeneration++;
 }
@@ -377,8 +379,6 @@ function loadMetric(ctx: CanvasRenderingContext2D, baseline: "alphabetic" | "mid
 
     return result;
 }
-
-const biasCache: { key: string; val: number }[] = [];
 
 function getMiddleCenterBiasInner(ctx: CanvasRenderingContext2D, font: string): number {
     for (const x of biasCache) {
