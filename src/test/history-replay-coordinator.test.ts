@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { CellHighlightColor, WorksheetTarget } from '../types';
 import {
     absent_overlay,
@@ -356,7 +356,9 @@ describe('beginning a replay', () => {
             record([highlight_change(9, 9, null, 'yellow')]);
             session.gate?.();
 
-            for (let index = 0; index < 20; index += 1) await Promise.resolve();
+            await vi.waitFor(() => expect(posted.some(
+                (message) => message.type === 'prepareHistoryReplay',
+            )).toBe(true));
 
             expect(last_prepare(posted).highlights).toHaveLength(1);
             expect(coordinator.is_busy()).toBe(true);
