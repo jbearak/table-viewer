@@ -139,7 +139,7 @@
         "tableViewer.diffOnByDefault": {
           "type": "boolean",
           "default": false,
-          "description": "Show Diff (original and edited values) by default when entering Edit mode."
+          "description": "Turn Diff on when Edit mode is entered, so that every cell you edit keeps showing its original value next to the new one. Can be overridden per viewer from the toolbar."
         },
         "tableViewer.maxStoredFiles": {
           "type": "integer",

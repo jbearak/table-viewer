@@ -436,9 +436,9 @@ test('Diff default is explained and saved immediately', async () => {
     let control = prefs.locator('#diffOnByDefault');
     try {
         await expect(control).not.toBeChecked();
-        await expect(control).toHaveAccessibleName('Show Diff by default in Edit mode');
+        await expect(control).toHaveAccessibleName('Turn Diff on when entering Edit mode');
         await expect(control.locator('xpath=following-sibling::div').locator('.hint'))
-            .toContainText('when Edit mode is first entered');
+            .toContainText('shows its original value next to the new one');
 
         await control.check();
         await expect.poll(
