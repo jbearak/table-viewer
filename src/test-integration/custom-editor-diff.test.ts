@@ -4,7 +4,10 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { TABLE_DIFF_SCHEME } from '../table-diff-uris';
+import {
+    TABLE_DIFF_SCHEME,
+    table_diff_document_uris,
+} from '../table-diff-uris';
 import {
     activate_extension,
     all_tabs,
@@ -62,16 +65,10 @@ describe('custom editor diffs', () => {
     let temporary_directory: string | undefined;
 
     afterEach(async () => {
-        const directory = temporary_directory;
         temporary_directory = undefined;
-        try {
-            await close_all_editors();
-        } finally {
-            if (directory) {
-                fs.rmSync(directory, { recursive: true, force: true });
-                temporary_directories.delete(directory);
-            }
-        }
+        await close_all_editors();
+        // The built-in Git extension can still have delayed repository work in
+        // flight. Keep its working directory alive until the extension host exits.
     });
 
     async function prepare_repository(): Promise<{
@@ -191,6 +188,59 @@ describe('custom editor diffs', () => {
             file_open,
             true,
             `expected staged Open File to activate the working tree; tabs=${tab_diagnostics()}`,
+        );
+        assert.ok(all_tabs().includes(comparison_tab));
+    });
+
+    it('replaces a Source Control Graph commit change with one Table Viewer comparison', async () => {
+        const { file, api } = await prepare_repository();
+        const parent = execFileSync(
+            'git',
+            ['-C', temporary_directory!, 'rev-parse', 'HEAD'],
+            { encoding: 'utf8' },
+        ).trim();
+        fs.writeFileSync(file.fsPath, 'value\n2\n');
+        execFileSync('git', ['-C', temporary_directory!, 'add', 'data.csv']);
+        execFileSync('git', ['-C', temporary_directory!, 'commit', '-qm', 'Update table']);
+        const commit = execFileSync(
+            'git',
+            ['-C', temporary_directory!, 'rev-parse', 'HEAD'],
+            { encoding: 'utf8' },
+        ).trim();
+        const original = api.toGitUri(file, parent);
+        const modified = api.toGitUri(file, commit);
+        assert.ok((await vscode.workspace.fs.stat(original)).size > 0);
+        assert.ok((await vscode.workspace.fs.stat(modified)).size > 0);
+        assert.strictEqual(await read_text(original), 'value\n1\n');
+        assert.strictEqual(await read_text(modified), 'value\n2\n');
+
+        await vscode.commands.executeCommand(
+            'vscode.diff',
+            original,
+            modified,
+            'Source Control Graph table diff',
+        );
+
+        await expect_one_table_diff();
+        const comparison_tab = all_tabs()[0];
+        assert.ok(comparison_tab.input instanceof vscode.TabInputCustom);
+        const decoded = table_diff_document_uris(comparison_tab.input.uri);
+        assert.ok(decoded, 'the comparison document must decode');
+        assert.strictEqual(decoded.original.toString(), original.toString());
+        assert.strictEqual(decoded.modified.toString(), modified.toString());
+
+        await vscode.commands.executeCommand('tableViewer.openWorkingTreeFile');
+        const file_open = await wait_for(() => {
+            const active = vscode.window.tabGroups.activeTabGroup.activeTab;
+            return all_tabs().length === 2
+                && active?.input instanceof vscode.TabInputCustom
+                && active.input.uri.scheme === 'file'
+                && active.input.uri.fsPath === file.fsPath;
+        });
+        assert.strictEqual(
+            file_open,
+            true,
+            `expected Source Control Graph Open File to retain the comparison; tabs=${tab_diagnostics()}`,
         );
         assert.ok(all_tabs().includes(comparison_tab));
     });

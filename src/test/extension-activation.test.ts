@@ -185,6 +185,62 @@ describe('table_diff_uris', () => {
         });
     });
 
+    it.each(['csv', 'TSV', 'xls', 'XLSX'])(
+        'recognizes a Source Control Graph %s commit diff',
+        (extension) => {
+            const file_path = `/repo/tables/data.${extension}`;
+            const original = git_uri(file_path, 'a'.repeat(40));
+            const modified = git_uri(file_path, 'b'.repeat(40));
+
+            expect(table_diff_uris(original, modified)).toEqual({ original, modified });
+        },
+    );
+
+    it('rejects non-object and mismatched Git history revisions', () => {
+        const file_path = '/repo/data.csv';
+        const parent = 'a'.repeat(40);
+        const commit = 'b'.repeat(40);
+        const original = git_uri(file_path, parent);
+        const modified = git_uri(file_path, commit);
+
+        expect(table_diff_uris(git_uri(file_path, parent.slice(0, 7)), modified))
+            .toBeUndefined();
+        expect(table_diff_uris(git_uri(file_path, 'HEAD'), modified)).toBeUndefined();
+        expect(table_diff_uris(original, git_uri(file_path, parent))).toBeUndefined();
+        expect(table_diff_uris(
+            original,
+            git_uri('/repo/other.csv', commit).with({ path: file_path }) as vscode.Uri,
+        )).toBeUndefined();
+        expect(table_diff_uris(
+            original.with({
+                query: JSON.stringify({ path: '/repo/other.csv', ref: parent }),
+            }) as vscode.Uri,
+            modified,
+        )).toBeUndefined();
+    });
+
+    it('round-trips Source Control Graph revisions and derives the working-tree file', () => {
+        const diff = {
+            original: git_uri('/repo/nested/data.csv', 'c'.repeat(40)),
+            modified: git_uri('/repo/nested/data.csv', 'd'.repeat(40)),
+        };
+
+        const document = table_diff_document_uri(diff);
+        const decoded = table_diff_document_uris(document);
+
+        expect(decoded).toMatchObject({
+            original: expect.objectContaining({ scheme: 'git' }),
+            modified: expect.objectContaining({ scheme: 'git' }),
+        });
+        expect(table_diff_document_uri(decoded!).toString()).toBe(document.toString());
+        expect(table_diff_working_tree_uri(decoded!)).toMatchObject({
+            scheme: 'file',
+            path: '/repo/nested/data.csv',
+            query: '',
+            fragment: '',
+        });
+    });
+
     it('ignores non-SCM refs, unsupported files, and mismatched resources', () => {
         const file = vscode_mock.Uri.file('/repo/data.csv') as unknown as vscode.Uri;
         expect(table_diff_uris(git_uri('/repo/data.csv', '~1'), file)).toBeUndefined();
@@ -436,6 +492,11 @@ describe('VS Code activation', () => {
             name: 'staged',
             original: git_uri('/repo/data.csv', 'HEAD'),
             modified: git_uri('/repo/data.csv', ''),
+        },
+        {
+            name: 'Source Control Graph history',
+            original: git_uri('/repo/data.csv', 'd'.repeat(40)),
+            modified: git_uri('/repo/data.csv', 'e'.repeat(40)),
         },
     ])('replaces a native $name diff tab with one Table Viewer comparison', async ({
         original,

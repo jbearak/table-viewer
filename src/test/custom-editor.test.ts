@@ -26,6 +26,13 @@ function context(): vscode.ExtensionContext {
     } as unknown as vscode.ExtensionContext;
 }
 
+function git_uri(file_path: string, ref: string): vscode.Uri {
+    return vscode_mock.Uri.file(file_path).with({
+        scheme: 'git',
+        query: JSON.stringify({ path: file_path, ref }),
+    }) as unknown as vscode.Uri;
+}
+
 let temporary_directory: string | undefined;
 
 beforeEach(() => {
@@ -583,6 +590,55 @@ describe('register_table_viewer', () => {
         await registration.drain();
     });
 
+    it('loads a Source Control Graph comparison from its Git revisions', async () => {
+        const parent = 'e'.repeat(40);
+        const commit = 'f'.repeat(40);
+        const original = git_uri('/repo/nested/data.csv', parent);
+        const modified = git_uri('/repo/nested/data.csv', commit);
+        const original_bytes = Buffer.from('a\n1\n');
+        const modified_bytes = Buffer.from('a\n2\n');
+        const io_uris: vscode.Uri[] = [];
+        const bytes_for = (uri: vscode.Uri) => {
+            const ref = JSON.parse(uri.query) as { ref: string };
+            return ref.ref === parent ? original_bytes : modified_bytes;
+        };
+        vscode_mock.__setStatImplementation(async (uri) => {
+            io_uris.push(uri as unknown as vscode.Uri);
+            const bytes = bytes_for(uri as unknown as vscode.Uri);
+            return { size: bytes.length, mtime: 1 };
+        });
+        vscode_mock.__setReadFileImplementation(async (uri) => {
+            io_uris.push(uri as unknown as vscode.Uri);
+            return bytes_for(uri as unknown as vscode.Uri);
+        });
+        const registration = register_table_viewer(context(), state_store());
+        const provider = excel_provider();
+        const panel_handle = vscode_mock.window.createWebviewPanel(
+            'tableViewer.editor',
+            'data.csv',
+        ) as unknown as vscode.WebviewPanel;
+
+        await provider.resolveCustomEditor(
+            await provider.openCustomDocument(table_diff_document_uri({ original, modified })),
+            panel_handle,
+        );
+
+        const panel = vscode_mock.__getPanels()[0];
+        const snapshot = await receive_ready_and_get_snapshot(panel);
+        expect(snapshot.configuration.gitCompare).toBeDefined();
+        expect(snapshot.capabilities.csvEditingSupported).toBe(false);
+        expect(panel.title).toBe('data.csv (Changes)');
+        expect(io_uris.length).toBeGreaterThan(0);
+        expect(io_uris.every((uri) => uri.scheme === 'git')).toBe(true);
+        expect(new Set(io_uris.map((uri) => {
+            const query = JSON.parse(uri.query) as { path: string; ref: string };
+            expect(query.path).toBe('/repo/nested/data.csv');
+            return query.ref;
+        }))).toEqual(new Set([parent, commit]));
+        registration.dispose();
+        await registration.drain();
+    });
+
     it('reveals a retained comparison instead of resolving it again', async () => {
         const csv = Buffer.from('a\n1\n');
         vscode_mock.__setStatImplementation(async () => ({ size: csv.length, mtime: 1 }));
@@ -880,6 +936,71 @@ describe('register_table_viewer', () => {
         ignored_result_listener.dispose();
         throwing_listener.dispose();
         tab_listener.dispose();
+    });
+
+    it('preserves Source Control Graph orientation when child panels resolve in reverse', async () => {
+        const parent = '0'.repeat(40);
+        const commit = '1'.repeat(40);
+        const original = git_uri('/repo/data.csv', parent);
+        const modified = git_uri('/repo/data.csv', commit);
+        const bytes = Buffer.from('a\n1\n');
+        const io_uris: vscode.Uri[] = [];
+        vscode_mock.__setStatImplementation(async (uri) => {
+            io_uris.push(uri as unknown as vscode.Uri);
+            return { size: bytes.length, mtime: 1 };
+        });
+        vscode_mock.__setReadFileImplementation(async (uri) => {
+            io_uris.push(uri as unknown as vscode.Uri);
+            return bytes;
+        });
+        vscode_mock.__setExtension('vscode.git', {
+            isActive: true,
+            exports: {
+                getAPI: () => ({
+                    getRepository: () => ({
+                        async getCommit(ref: string) {
+                            return { parents: ref === commit ? [parent] : [] };
+                        },
+                    }),
+                }),
+            },
+        });
+        const tab: vscode_mock.MockTab = { label: 'data.csv', input: undefined };
+        await vscode_mock.__fireTabChange({ opened: [tab] });
+        const replace_native_diff = vi.fn();
+        const registration = register_table_viewer(context(), state_store(), {
+            replaceNativeDiff: replace_native_diff,
+        });
+        const provider = excel_provider();
+
+        for (const uri of [modified, original]) {
+            const panel = vscode_mock.window.createWebviewPanel(
+                'tableViewer.editor',
+                'data.csv',
+            ) as unknown as vscode.WebviewPanel;
+            await provider.resolveCustomEditor(
+                await provider.openCustomDocument(uri),
+                panel,
+            );
+        }
+
+        expect(replace_native_diff).toHaveBeenCalledOnce();
+        expect(replace_native_diff).toHaveBeenCalledWith(tab, { original, modified });
+        const panels = vscode_mock.__getPanels();
+        expect(panels.map((panel) => panel.__disposeCount)).toEqual([0, 0]);
+        for (const panel of panels) await receive_ready_and_get_snapshot(panel);
+        expect(io_uris.length).toBeGreaterThan(0);
+        expect(io_uris.every((uri) => uri.scheme === 'git')).toBe(true);
+        expect(new Set(io_uris.map((uri) => {
+            const query = JSON.parse(uri.query) as { path: string; ref: string };
+            expect(query.path).toBe('/repo/data.csv');
+            return query.ref;
+        }))).toEqual(new Set([parent, commit]));
+
+        registration.dispose();
+        await registration.drain();
+        expect(vscode_mock.__getClosedTabs()).toEqual([tab]);
+        expect(panels.map((panel) => panel.__disposeCount)).toEqual([1, 1]);
     });
 
     it('closes the owning native diff when one side declines its initial load', async () => {
