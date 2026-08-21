@@ -143,6 +143,9 @@ describe('extension runtime manifest', () => {
         for (const entry of diff_entries) {
             expect(entry.when).toContain('scmProvider == git');
             expect(entry.when).toContain('scmResourceGroup == workingTree');
+            // The alternation must match the extension proper, dot included —
+            // without the `\.` an unrelated extension like `.mycsv` matches.
+            expect(entry.when).toContain('resourceExtname =~ /\\.(');
             for (const extension of supported_extensions) {
                 // The full alternation token, not the bare text — `csv` alone
                 // would also match inside an unrelated part of the clause.
