@@ -14,7 +14,15 @@ import {
     type StreamingSheet,
     type StreamingWorkbook,
 } from './data-source/cell-fill';
-import { serial_to_iso, is_date_format, is_valid_excel_date_serial, format_value, get_style } from './spreadsheet-format';
+import {
+    serial_to_iso,
+    create_number_format_resolver,
+    is_valid_excel_date_serial,
+    format_number_value,
+    format_value,
+    get_style,
+    number_format_is_date,
+} from './spreadsheet-format';
 import type { FontEntry, XfEntry, DateMode } from './spreadsheet-format';
 import type { WorkbookData, SheetData, CellData, MergeRange } from './types';
 import type { CellHyperlink, RichText } from './cell-content';
@@ -515,6 +523,8 @@ function parse_worksheet_core(
     let max_row = 0;
     let max_col = 0;
 
+    const number_format_for = create_number_format_resolver(xfs, format_map, datemode);
+
     const sheet_data = find_first_element(xml, 'sheetData');
     if (sheet_data) {
         scan_rows(xml, sheet_data.inner_start, sheet_data.inner_end, {
@@ -532,6 +542,7 @@ function parse_worksheet_core(
                     cell_span.inner_end,
                 );
                 const style = get_style(xf_index, xfs, fonts);
+                const number_format = number_format_for(xf_index);
 
                 let raw: string | number | boolean | null = null;
                 let formatted = '';
@@ -592,20 +603,23 @@ function parse_worksheet_core(
                     // Numeric (default) — includes dates, formulas with numeric results
                     const num = v_bytes === null ? null : parse_finite_number_utf8(v_bytes);
                     if (num !== null) {
-                        if (is_date_format(xf_index, xfs, format_map)) {
+                        if (number_format && number_format_is_date(number_format)) {
                             raw = is_valid_excel_date_serial(num, datemode)
                                 ? serial_to_iso(num, datemode)
                                 : num;
                             if (typeof raw === 'string') rawType = 'date';
-                            formatted = format_value(num, xf_index, xfs, format_map, datemode);
                         } else {
                             raw = num;
-                            formatted = format_value(num, xf_index, xfs, format_map, datemode);
                         }
+                        formatted = number_format
+                            ? format_number_value(num, number_format)
+                            : format_value(num, xf_index, xfs, format_map, datemode);
                     }
                 }
 
                 const cell: CellData = { raw, formatted, rawType, ...style };
+                if (number_format) cell.numberFormat = number_format;
+                if (t === 'd') cell.xlsxIsoDate = true;
                 if (richText) cell.richText = richText;
                 cells.set(`${row}:${col}`, cell);
                 // Defensive pre-check: bound the in-progress cell map during

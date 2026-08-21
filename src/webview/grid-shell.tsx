@@ -92,6 +92,7 @@ import { MergeIndex } from './merge-index';
 import {
     build_grid_cell,
     cell_allows_wrapping,
+    displayed_text,
     rich_cell_display_data,
     type CellEditOverlay,
 } from './cell-renderer';
@@ -117,7 +118,14 @@ import {
     type HistoryCaptureOptions,
 } from './use-editing';
 import type { HistoryStore } from './history-store';
-import { cell_edit_text, dirty_value_edit_text, type EditSyntax } from '../cell-edit-model';
+import {
+    cell_edit_text,
+    cell_whole_style,
+    dirty_value_edit_text,
+    type EditSyntax,
+} from '../cell-edit-model';
+import { format_xlsx_edit_preview } from '../spreadsheet-format';
+import { xlsx_runs_require_inline_string } from '../xlsx-cell-value';
 import {
     create_edit_session_store,
     type EditSessionStore,
@@ -211,6 +219,53 @@ const PREVIEW_RESTORE_SETTLE_MS = 32;
  */
 const markdown_edit_text_cache = new WeakMap<object, string>();
 
+/** Dirty entries and loaded cells are immutable, so the preview dies naturally
+ * when either the edit changes or the row loader replaces its page. */
+interface DirtyPresentation {
+    readonly requires_rich: boolean;
+    readonly display?: string;
+}
+const dirty_presentation_cache
+    = new WeakMap<DirtyEntry, WeakMap<RenderedCell, DirtyPresentation>>();
+
+function dirty_requires_rich_text(
+    dirty: DirtyEntry,
+    cell: RenderedCell | null | undefined,
+): boolean {
+    const runs = dirty.valueRuns?.runs;
+    return runs !== undefined && xlsx_runs_require_inline_string(
+        runs,
+        cell ? cell_whole_style(cell) : undefined,
+    );
+}
+
+function cached_dirty_presentation(
+    dirty: DirtyEntry,
+    cell: RenderedCell,
+): DirtyPresentation {
+    let by_cell = dirty_presentation_cache.get(dirty);
+    if (!by_cell) {
+        by_cell = new WeakMap();
+        dirty_presentation_cache.set(dirty, by_cell);
+    }
+    const cached = by_cell.get(cell);
+    if (cached) return cached;
+    const requires_rich = dirty_requires_rich_text(dirty, cell);
+    const display = cell.numberFormat
+        ? format_xlsx_edit_preview(dirty.value, cell.numberFormat, {
+            was_boolean: cell.rawType === 'boolean',
+            was_iso_date: cell.xlsxIsoDate,
+            force_text: requires_rich,
+        })
+        : undefined;
+    const presentation = {
+        requires_rich,
+        ...(display !== undefined ? { display } : {}),
+    };
+    by_cell.set(cell, presentation);
+    return presentation;
+}
+
 /**
  * What the undo menu will say this gesture was.
  *
@@ -250,10 +305,22 @@ function cached_markdown_edit_text(
 function dirty_value_overlay_fields(
     dirty: DirtyEntry,
     diff_mode: boolean,
-): { dirty_value: string; diff_base?: string } | undefined {
+    show_formatting: boolean,
+    cell: RenderedCell | null | undefined,
+    include_rich = false,
+): Pick<CellEditOverlay, 'dirty_value' | 'dirty_display' | 'dirty_rich' | 'diff_base'> | undefined {
     if (!dirty_entry_value_changed(dirty)) return undefined;
+    const presentation = show_formatting && !diff_mode && cell
+        && (cell.numberFormat || (include_rich && dirty.valueRuns))
+        ? cached_dirty_presentation(dirty, cell)
+        : undefined;
+    const requires_rich = show_formatting && !diff_mode && include_rich && dirty.valueRuns
+        ? presentation?.requires_rich ?? dirty_requires_rich_text(dirty, cell)
+        : false;
     return {
         dirty_value: dirty.value,
+        ...(presentation?.display !== undefined ? { dirty_display: presentation.display } : {}),
+        ...(requires_rich ? { dirty_rich: dirty.valueRuns } : {}),
         ...(diff_mode && !dirty.base_pending ? { diff_base: dirty.base } : {}),
     };
 }
@@ -2133,17 +2200,19 @@ export function GridShell({
             const dirty = source_row === undefined
                 ? undefined
                 : store.get(cell_key(source_row, source_column));
-            if (dirty) return dirty.value;
 
             // Merged blocks need no special case: the grid's hover hit-test
             // reports the anchor's coordinates for any covered cell, so this is
             // already the cell that holds the content.
             const cells = get_row(row);
             const cell = cells?.[source_column];
-            if (!cell) return '';
-            return show_formatting ? cell.formatted : (cell.raw ?? '');
+            const overlay = dirty
+                ? dirty_value_overlay_fields(dirty, diff_mode, show_formatting, cell)
+                : undefined;
+            return displayed_text(cell, show_formatting, overlay);
         },
         [
+            diff_mode,
             get_row,
             get_source_row,
             show_formatting,
@@ -2252,12 +2321,13 @@ export function GridShell({
                 show_formatting,
                 font_size_px,
                 dirty
-                    ? {
-                        ...dirty_value_overlay_fields(dirty, diff_mode),
-                        ...(edit_syntax === 'markdown' && dirty.valueRuns
-                            ? { dirty_rich: dirty.valueRuns }
-                            : {}),
-                    }
+                    ? dirty_value_overlay_fields(
+                        dirty,
+                        diff_mode,
+                        show_formatting,
+                        loaded,
+                        edit_syntax === 'markdown',
+                    )
                     : undefined,
                 soft_wrap,
                 diff_colors,
@@ -2541,16 +2611,19 @@ export function GridShell({
                     // and it does reach this branch, via highlight_bg, which is
                     // plain view state independent of edit mode.
                     refused: editable_cells && source_row === undefined,
-                    ...(dirty ? dirty_value_overlay_fields(dirty, diff_mode) : {}),
+                    ...(dirty ? dirty_value_overlay_fields(
+                        dirty,
+                        diff_mode,
+                        show_formatting,
+                        loaded_row?.[source_column],
+                        edit_syntax === 'markdown',
+                    ) : {}),
                     // Compare's before-text rides the Diff toggle's channel; no
                     // dirty_value, so the "after" side is the cell's own text.
                     ...(compare_base !== undefined ? { diff_base: compare_base } : {}),
                     // A deleted row's cells are the original content, struck
                     // through whole (there is no "after" side to diff against).
                     ...(compare_status === 'deleted' ? { compare_deleted: true as const } : {}),
-                    ...(edit_syntax === 'markdown' && dirty?.valueRuns
-                        ? { dirty_rich: dirty.valueRuns }
-                        : {}),
                     // The flash outranks every persistent tint for its half
                     // second, so the region an undo changed is legible even where
                     // the cells are also dirty, conflicted, or highlighted — which

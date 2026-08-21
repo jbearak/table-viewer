@@ -27,6 +27,12 @@ import {
 } from './ooxml-worksheet-scan';
 import { OoxmlRefusalError, type OoxmlRefusalCode } from './ooxml-refusal';
 import { text_styles_equal, type CellTextStyle, type RichTextRun } from './cell-content';
+import {
+    classify_xlsx_cell_value,
+    xlsx_runs_require_inline_string,
+} from './xlsx-cell-value';
+
+export { iso_to_serial } from './xlsx-cell-value';
 
 /**
  * Surgical, `putexcel`-style cell writes into a worksheet's OOXML.
@@ -103,23 +109,14 @@ export interface XlsxWriteOptions {
     readonly run_font_base?: (xf_index: number) => string;
 }
 
-const MS_PER_DAY = 86400000;
-const EXCEL_1900_EPOCH_MS = Date.UTC(1899, 11, 31);
-const EXCEL_1904_EPOCH_MS = Date.UTC(1904, 0, 1);
-
 function encode_xml(s: string): string {
     return strip_illegal_xml_chars(
         s
             .replace(/&/g, '&amp;')
             .replace(/</g, '&lt;')
             .replace(/>/g, '&gt;')
-            // A raw CR does not survive: XML 1.0 requires every parser to
-            // normalize `\r` and `\r\n` in content to a single `\n` before the
-            // application ever sees it, so a literal one is not "preserved as
-            // typed" — it is silently a line feed on the way back in, and
-            // `\r\n` loses a character outright. The numeric reference is
-            // exempt from that normalization, which is what makes it the only
-            // spelling that round-trips. Excel writes CRs this way too.
+            // XML parsers normalize literal CRs before the application sees them;
+            // a character reference is the only spelling that round-trips.
             .replace(/\r/g, '&#13;'),
     );
 }
@@ -136,175 +133,12 @@ export function col_index_to_letter(index: number): string {
     return out;
 }
 
-/**
- * Excel accepts a narrow set of unambiguous date spellings. We deliberately do
- * NOT attempt locale-sensitive parsing: `03/04/2024` is March 4th to one user and
- * April 3rd to another, and silently picking one would corrupt data in a way the
- * user cannot see. Ambiguous input stays a string, which is visible and
- * correctable; a wrong date is neither.
- */
-const ISO_DATE_RE
-    = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|[+-]\d{2}:?\d{2})?)?$/;
-
-/**
- * Convert an ISO date string to an Excel serial, or null if not an ISO date.
- *
- * The 1900 system reserves serial 60 for 1900-02-29, a day that never existed —
- * Lotus 1-2-3 had the bug and Excel kept it for compatibility. That makes the
- * serial→date map non-injective around the boundary, so going backwards needs a
- * deliberate tie-break: dates on or after 1900-03-01 get the +1 shift, and
- * 1900-02-28 maps to 59 (the real day) rather than 60 (the fictitious one).
- * Nothing round-trips to 60; a workbook containing it still reads back as
- * 1900-02-28, we just never write it.
- */
-export function iso_to_serial(text: string, datemode: 0 | 1): number | null {
-    // A timezone offset is accepted and then ignored for the arithmetic. An Excel
-    // serial is a naive wall-clock number with no zone in it at all, so there is
-    // nothing to carry the offset into: shifting the instant to UTC would move the
-    // displayed date, which is the one thing the user can see. Accepting the
-    // spelling is what matters — `2024-01-15T12:00:00+02:00` is a perfectly ordinary
-    // `t="d"` value, and rejecting it meant retyping exactly what the grid showed
-    // rewrote the cell as an inline string, silently dropping its date type for
-    // every formula and filter downstream.
-    const m = ISO_DATE_RE.exec(text.trim());
-    if (!m) return null;
-    const [, y, mo, d, hh, mm, ss, ms] = m;
-    const year = Number(y), month = Number(mo), day = Number(d);
-    if (month < 1 || month > 12 || day < 1 || day > 31) return null;
-    // Bounded before `Date.UTC`, which rolls `12:60` forward to `13:00` and leaves
-    // the calendar date intact — so the round-trip check below cannot see it, and
-    // we would store a time the user did not type.
-    const hour = hh ? Number(hh) : 0;
-    const minute = mm ? Number(mm) : 0;
-    const second = ss ? Number(ss) : 0;
-    if (hour > 23 || minute > 59 || second > 59) return null;
-    const utc = Date.UTC(
-        year, month - 1, day, hour, minute, second,
-        ms ? Number(ms.padEnd(3, '0')) : 0,
-    );
-    if (!Number.isFinite(utc)) return null;
-    // Reject inputs that rolled over (e.g. 2024-02-31 → March 2nd). Silently
-    // accepting a rollover would write a date the user never typed.
-    const back = new Date(utc);
-    if (back.getUTCFullYear() !== year || back.getUTCMonth() !== month - 1 || back.getUTCDate() !== day) {
-        return null;
-    }
-    if (datemode === 1) {
-        return (utc - EXCEL_1904_EPOCH_MS) / MS_PER_DAY;
-    }
-    const serial = (utc - EXCEL_1900_EPOCH_MS) / MS_PER_DAY;
-    // See the doc comment: only dates strictly after the fictitious 1900-02-29
-    // carry the compatibility shift.
-    return serial >= 60 ? serial + 1 : serial;
-}
-
-/**
- * Excel's own numeric literal grammar — deliberately stricter than `Number()`.
- *
- * Redundant leading zeros are excluded on purpose: `007`, a zip code, a phone
- * extension and an account id are all things a user types *as typed*, and
- * storing them as numbers loses the zeros visibly and irreversibly. `0`, `0.5`
- * and `-0.5` are still numbers — a single leading zero before a decimal point is
- * a spelling of the value, not padding. This matches what editing the same text
- * in a CSV does, where it round-trips verbatim.
- */
-const NUMBER_RE = /^[+-]?((0|[1-9]\d*)(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/;
-
-/**
- * Significant digits a double holds exactly. Excel's own limit is the same 15,
- * and for the same reason: `<v>` is read back as an IEEE double.
- */
-const MAX_EXACT_DIGITS = 15;
-
 /** The two standardized default namespaces for SpreadsheetML worksheet elements. */
 const SPREADSHEETML_NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
 const STRICT_SPREADSHEETML_NS = 'http://purl.oclc.org/ooxml/spreadsheetml/main';
 
 function is_spreadsheetml_namespace(namespace: string): boolean {
     return namespace === SPREADSHEETML_NS || namespace === STRICT_SPREADSHEETML_NS;
-}
-
-/**
- * How many significant digits a numeric literal spells out.
- *
- * Leading zeros and the exponent do not count — `0.00012` and `1.2e-30` carry two
- * — because neither costs precision. Only the digits that must survive the
- * round-trip through a double are counted.
- */
-function significant_digits(text: string): number {
-    const mantissa = text.replace(/[eE][+-]?\d+$/, '').replace(/[+-]/, '').replace('.', '');
-    return mantissa.replace(/^0+/, '').length;
-}
-
-/**
- * Decide how one typed string is stored, given the cell's existing style.
- *
- * Per the agreed `putexcel` semantics the cell keeps its existing `s=` style
- * index in every case — we are changing the value, not the formatting. Type
- * inference only decides what goes between `<v>` and `</v>` and what `t=` says.
- */
-export function classify_value(
-    value: string,
-    xf_index: number,
-    options: XlsxWriteOptions,
-): { kind: 'empty' } | { kind: 'number'; text: string } | { kind: 'string'; text: string } {
-    if (value === '') return { kind: 'empty' };
-
-    // A date spelling is stored as a serial only when the cell is already
-    // formatted as a date. Writing a bare serial into a General cell would show
-    // the user "45000" where they typed a date — visibly wrong. Under a date
-    // style the serial and the format agree, so it renders as they typed it.
-    //
-    // A negative serial is refused: Excel has no date before its own epoch, and
-    // shows one as `########` in a date-formatted cell. Typing `1899-12-30` into
-    // such a cell stored `<v>-1</v>`, which our own reader renders back as the
-    // date — so it looked right here and was unreadable in the application the
-    // file exists to be opened in. Falling through stores the text the user typed,
-    // which every consumer can at least display.
-    const serial = iso_to_serial(value, options.datemode);
-    if (serial !== null && serial >= 0 && options.is_date_style(xf_index, serial)) {
-        return { kind: 'number', text: String(serial) };
-    }
-
-    // Numeric only when storing it as a number is *lossless*. `<v>` is read back
-    // as an IEEE double, so a token carrying more than ~15 significant digits —
-    // an account number, an order id, a long barcode — comes back rounded:
-    // `12345678901234567890` reads as `12345678901234567000`, and the digits the
-    // user typed are gone from the file. Round-tripping the parse is the exact
-    // test for that, and it costs nothing on the ordinary values that dominate.
-    //
-    // Such a token is stored as a string instead, which is also what Excel does
-    // with an identifier too long to hold as a number, and what editing the same
-    // text in a CSV already does here.
-    //
-    // `n !== 0` covers the other end of the same loss: `1e-400` underflows to zero
-    // in every double-based reader there is, so storing it as a number replaces a
-    // nonzero value the user typed with `0` — silently and permanently. A typed
-    // `0` is of course still a number; only a token that *means* nonzero and
-    // *reads back* as zero falls through to text.
-    const trimmed = value.trim();
-    if (NUMBER_RE.test(trimmed)) {
-        const n = Number(trimmed);
-        const underflowed = n === 0 && /[1-9]/.test(trimmed.replace(/[eE][+-]?\d+$/, ''));
-        if (Number.isFinite(n) && !underflowed && significant_digits(trimmed) <= MAX_EXACT_DIGITS) {
-            return { kind: 'number', text: trimmed };
-        }
-    }
-
-    return { kind: 'string', text: value };
-}
-
-/**
- * `'1'`/`'0'` for the two spellings Excel shows a boolean cell as, else null.
- *
- * Matched case-insensitively and trimmed, since that is how a user retypes what
- * the grid displayed; anything else is a value, not a boolean.
- */
-function boolean_literal(value: string): '1' | '0' | null {
-    const text = value.trim().toUpperCase();
-    if (text === 'TRUE') return '1';
-    if (text === 'FALSE') return '0';
-    return null;
 }
 
 /**
@@ -366,7 +200,7 @@ function build_cell_xml(
     // classification below (string, number, date, boolean — unchanged).
     if (edit.runs !== undefined && edit.runs.length > 0) {
         const cell_style = options.cell_font_style?.(xf_index ?? 0);
-        if (!edit.runs.every((run) => text_styles_equal(run.style, cell_style))) {
+        if (xlsx_runs_require_inline_string(edit.runs, cell_style)) {
             const font_base = options.run_font_base?.(xf_index ?? 0) ?? '';
             const runs = edit.runs
                 .map((run) => build_run_xml(run, cell_style, font_base))
@@ -381,55 +215,23 @@ function build_cell_xml(
     if (edit.force_text && value !== '') {
         return `<c r="${ref}"${style_attr} t="inlineStr"><is><t xml:space="preserve">${encode_xml(value)}</t></is></c>`;
     }
-    // An ISO-date cell edited back to a date stays one, for the same reason a
-    // boolean does. `t="d"` stores the date as text and the reader shows it
-    // verbatim — no serial, no style consulted — so the user retypes what looks
-    // like the same thing and got back an inline string: identical on screen,
-    // and no longer a date to any formula, filter or consumer downstream.
-    //
-    // Checked before `classify_value`, which would otherwise turn the typed date
-    // into a serial whenever the cell also carries a date *style*. A serial under
-    // `t="d"` is not a date at all — the reader reads that element's text — so the
-    // two spellings cannot be mixed, and the cell's existing type is the one to
-    // keep. Narrow like the boolean case: only a cell that was already `t="d"`,
-    // and only when what was typed is still a date.
-    //
-    // Validity is decided by `iso_to_serial`, not by `ISO_DATE_RE`, which only
-    // describes the *shape*: `2024-02-31` and `2024-01-01T25:00` match it and are
-    // not dates. Writing those under `t="d"` produced a cell claiming to be a date
-    // whose text no date parser accepts — Excel reports the workbook as needing
-    // repair. The shape test alone was the wrong gate; a value that cannot be a
-    // date falls through and is stored as the text the user typed.
-    if (was_iso_date && iso_to_serial(value, options.datemode) !== null) {
-        // The space-separated spelling `2024-01-15 12:00` is what a user retypes
-        // from a grid, and `ISO_DATE_RE` accepts it — but a `t="d"` cell's text is
-        // an `xsd:dateTime`, where the `T` is required. Written through verbatim it
-        // made a date cell whose value no conforming date parser accepts: strict
-        // consumers reject it and prefix-parsing ones keep the date and drop the
-        // 12:00. Normalized rather than refused, since the value *is* the date the
-        // user meant, and this is the same repair the invalid-date gate above is
-        // there to prevent.
-        return `<c r="${ref}"${style_attr} t="d"><v>${encode_xml(value.trim().replace(' ', 'T'))}</v></c>`;
-    }
-    // A boolean cell edited back to a boolean stays one. The reader renders `t="b"`
-    // as the text TRUE/FALSE, so that is what the user sees in the grid and types
-    // back — and without this it returned as an inline string that merely *looks*
-    // the same, silently changing the cell's type for every formula, filter and
-    // consumer downstream. Narrow on purpose: only a cell that was already boolean,
-    // so typing TRUE into a text cell still stores text.
-    if (was_boolean) {
-        const bool = boolean_literal(value);
-        if (bool !== null) return `<c r="${ref}"${style_attr} t="b"><v>${bool}</v></c>`;
-    }
-    const classified = classify_value(value, xf_index ?? 0, options);
+    const classified = classify_xlsx_cell_value(value, {
+        datemode: options.datemode,
+        is_date_style: (serial) => options.is_date_style(xf_index ?? 0, serial),
+        was_boolean,
+        was_iso_date,
+    });
     switch (classified.kind) {
         case 'empty':
-            // A styled-but-valueless `<c>` is retained rather than deleted so the
-            // cell keeps its formatting, borders and fill after being cleared —
-            // exactly what Delete does in Excel, and what `putexcel` leaves behind.
+            // Retain a styled-but-valueless `<c>` so clearing a value does not
+            // clear the cell's formatting, borders, or fill.
             return `<c r="${ref}"${style_attr}/>`;
         case 'number':
             return `<c r="${ref}"${style_attr}><v>${classified.text}</v></c>`;
+        case 'boolean':
+            return `<c r="${ref}"${style_attr} t="b"><v>${classified.text}</v></c>`;
+        case 'iso-date':
+            return `<c r="${ref}"${style_attr} t="d"><v>${encode_xml(classified.text)}</v></c>`;
         case 'string':
             return `<c r="${ref}"${style_attr} t="inlineStr"><is><t xml:space="preserve">${encode_xml(classified.text)}</t></is></c>`;
     }

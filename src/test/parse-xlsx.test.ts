@@ -8,6 +8,7 @@ import {
     parse_xlsx,
     parse_xlsx_streaming,
 } from '../parse-xlsx';
+import { ColumnarStore } from '../data-source/columnar-store';
 
 const FIXTURES = path.join(__dirname, 'fixtures');
 
@@ -234,6 +235,7 @@ describe('parse_xlsx', () => {
             expect(data.sheets[0].rows[0][0]).toMatchObject({
                 raw: '2024-03-01T00:00:00Z',
                 rawType: 'date',
+                xlsxIsoDate: true,
             });
         });
 
@@ -379,6 +381,50 @@ describe('parse_xlsx', () => {
             const pct = sheet.rows[0][1]?.formatted;
             expect(pct).toContain('75');
             expect(pct).toContain('%');
+        });
+
+        it('retains resolved recipes on physical cells in dense and streaming parses', async () => {
+            const styles = `<?xml version="1.0" encoding="UTF-8"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <numFmts count="1"><numFmt numFmtId="164" formatCode="#,##0.00"/></numFmts>
+  <fonts count="1"><font/></fonts>
+  <cellXfs count="3">
+    <xf numFmtId="0" fontId="0"/>
+    <xf numFmtId="164" fontId="0"/>
+    <xf numFmtId="10" fontId="0"/>
+  </cellXfs>
+</styleSheet>`;
+            const sheet = `<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:D1"/>
+  <sheetData><row r="1">
+    <c r="A1" s="1"><v>1234.5</v></c>
+    <c r="B1" s="2"><v>0.75</v></c>
+    <c r="C1" s="1"/>
+  </row></sheetData>
+</worksheet>`;
+            const bytes = build_test_xlsx(sheet, { styles_xml: styles });
+            const { data } = await parse_xlsx(bytes);
+            const dense = data.sheets[0].rows[0];
+            expect(dense[0]?.numberFormat).toEqual({ code: '#,##0.00' });
+            expect(dense[1]?.numberFormat).toEqual({ code: '0.00%' });
+            expect(dense[2]).toMatchObject({
+                raw: null,
+                numberFormat: { code: '#,##0.00' },
+            });
+            expect(dense[3]?.numberFormat).toBeUndefined();
+
+            const streaming = await parse_xlsx_streaming(bytes);
+            const builder = new ColumnarStore.Builder(
+                streaming.sheets[0].rowCount,
+                streaming.sheets[0].columnCount,
+            );
+            streaming.sheets[0].fill(builder);
+            const streamed = builder.build().read_window(0, 1)[0];
+            expect(streamed[0]?.numberFormat).toEqual({ code: '#,##0.00' });
+            expect(streamed[1]?.numberFormat).toEqual({ code: '0.00%' });
+            expect(streamed[2]?.numberFormat).toEqual({ code: '#,##0.00' });
+            expect(streamed[3]?.numberFormat).toBeUndefined();
         });
     });
 

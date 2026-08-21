@@ -32,6 +32,8 @@ export function build_store_old_way(
                         : typeof cell.raw === 'boolean'
                             ? 'boolean'
                             : 'string',
+                ...(cell.numberFormat ? { numberFormat: cell.numberFormat } : {}),
+                ...(cell.xlsxIsoDate ? { xlsxIsoDate: true as const } : {}),
             });
         }
     }

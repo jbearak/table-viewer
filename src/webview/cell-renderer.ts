@@ -56,8 +56,10 @@ export function font_style(
  * the caller to keep this module canvas/theme-free.
  */
 export interface CellEditOverlay {
-    /** When set, display this dirty value instead of the persisted content. */
+    /** Raw dirty text used for editing, copying, diffing, and saving. */
     dirty_value?: string;
+    /** Formatting-on paint text for a scalar dirty XLSX value. */
+    dirty_display?: string;
     /**
      * What the edit overlay opens with, when it differs from the displayed
      * text — the markdown serialization of the cell's effective rich content
@@ -214,6 +216,20 @@ const rich_cell_cache = new WeakMap<
     }
 >();
 
+export function displayed_text(
+    c: RenderedCell | null | undefined,
+    show_formatting: boolean,
+    overlay: CellEditOverlay | undefined,
+): string {
+    if (overlay?.dirty_value !== undefined) {
+        return show_formatting && overlay.diff_base === undefined
+            ? overlay.dirty_display ?? overlay.dirty_value
+            : overlay.dirty_value;
+    }
+    if (overlay?.diff_base !== undefined) return c?.raw ?? '';
+    return show_formatting ? c?.formatted ?? '' : (c?.raw ?? '');
+}
+
 function rich_cell(
     c: RenderedCell,
     show_formatting: boolean,
@@ -250,10 +266,7 @@ function rich_cell(
         // diffs raw against raw — the host computed `base` from raw text, so
         // letting the Formatting toggle swap in the formatted value would
         // fabricate differences that are not in the file.
-        const display = overlay?.dirty_value
-            ?? (overlay?.diff_base !== undefined
-                ? (c.raw ?? '')
-                : show_formatting ? c.formatted : (c.raw ?? ''));
+        const display = displayed_text(c, show_formatting, overlay);
         // The wrap heuristic looks at everything the cell will paint: for a
         // diff cell that includes the old text, whose hard breaks must still
         // trigger the multiline path even when the new value has none.
@@ -283,7 +296,7 @@ function rich_cell(
                 show_formatting && overlay?.dirty_rich
                     ? overlay.dirty_rich.runs
                     : overlay?.dirty_value !== undefined
-                        ? rich_text_from_plain(display).runs
+                        ? rich_text_from_plain(display, style).runs
                     : (show_formatting && c.richText
                         ? c.richText.runs
                         : rich_text_from_plain(display, style).runs),
@@ -400,9 +413,7 @@ function text_cell(
     // as one line while the app's fit/overflow/row-height models treat it as a
     // break. Normalizing `data` too would silently rewrite the value on the
     // next edit or copy.
-    const display = normalize_line_breaks(
-        overlay?.dirty_value ?? (show_formatting ? c.formatted : (c.raw ?? '')),
-    );
+    const display = normalize_line_breaks(displayed_text(c, show_formatting, overlay));
     return {
         kind: GridCellKind.Text,
         // `edit_value` first: on a markdown sheet the overlay editor must open

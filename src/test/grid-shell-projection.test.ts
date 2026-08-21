@@ -2701,6 +2701,121 @@ describe('GridShell link-only edits', () => {
         expect(get_cell_content([0, 0]).displayData).toBe('1,234.50');
     });
 
+    it('formats a dirty numeric value immediately and keeps its edit data raw', async () => {
+        const loaded = {
+            raw: '1234.5',
+            formatted: '1,234.50',
+            bold: false,
+            italic: false,
+            rawType: 'number' as const,
+            numberFormat: { code: '#,##0.00' },
+        };
+        grid_mock.get_row.mockImplementation(() => [
+            loaded,
+            { raw: 'hidden-b', formatted: 'hidden-b', bold: false, italic: false },
+            { raw: 'source-c', formatted: 'source-c', bold: false, italic: false },
+        ] as any);
+        const initial = props({
+            show_formatting: true,
+            edit_mode: true,
+            csv_editable: true,
+            initial_edits: { '0:0': { value: '9876.5', base: '1234.5' } },
+        });
+        const GridShell = await render_grid(initial);
+        const content = () => {
+            const get_cell_content = grid_mock.props!.getCellContent as
+                (cell: [number, number]) => { data: string; displayData: string };
+            return get_cell_content([0, 0]);
+        };
+        expect(content()).toMatchObject({
+            data: '9876.5',
+            displayData: '9,876.50',
+        });
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...initial,
+                show_formatting: false,
+            }));
+        });
+        expect(content()).toMatchObject({
+            data: '9876.5',
+            displayData: '9876.5',
+        });
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, initial));
+        });
+        expect(content().displayData).toBe('9,876.50');
+    });
+
+    it('formats dirty runs that reduce to the cell font as a scalar', async () => {
+        grid_mock.get_row.mockImplementation(() => [{
+            raw: '1234.5',
+            formatted: '1,234.50',
+            bold: true,
+            italic: false,
+            rawType: 'number' as const,
+            numberFormat: { code: '#,##0.00' },
+        }, null, null] as any);
+        await render_grid(props({
+            show_formatting: true,
+            edit_mode: true,
+            csv_editable: true,
+            edit_syntax: 'markdown',
+            initial_edits: {
+                '0:0': {
+                    value: '9876.5',
+                    base: '1234.5',
+                    valueRuns: { runs: [{ text: '9876.5', style: { bold: true } }] },
+                },
+            },
+        }));
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => { data: string; displayData: string };
+        const cell = get_cell_content([0, 0]);
+        // The editor still receives Markdown spelling, while the canvas receives
+        // the formatted scalar preview under the cell's whole-cell bold style.
+        expect(cell.data).toBe('**9876.5**');
+        expect(cell.displayData).toBe('9,876.50');
+    });
+
+    it('keeps dirty runs that differ from the cell font as literal rich text', async () => {
+        grid_mock.get_row.mockImplementation(() => [{
+            raw: '1234.5',
+            formatted: '1,234.50',
+            bold: true,
+            italic: false,
+            rawType: 'number' as const,
+            numberFormat: { code: '#,##0.00' },
+        }, null, null] as any);
+        await render_grid(props({
+            show_formatting: true,
+            edit_mode: true,
+            csv_editable: true,
+            edit_syntax: 'markdown',
+            initial_edits: {
+                '0:0': {
+                    value: '9876.5',
+                    base: '1234.5',
+                    valueRuns: { runs: [{ text: '9876.5' }] },
+                },
+            },
+        }));
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => {
+                copyData: string;
+                data: { kind: string; lines: { text: string; style?: { bold?: true } }[][] };
+            };
+        const cell = get_cell_content([0, 0]);
+        expect(cell.copyData).toBe('9876.5');
+        expect(cell.data).toMatchObject({
+            kind: 'rich-text',
+            lines: [[{ text: '9876.5' }]],
+        });
+        expect(cell.data.lines[0][0].style).toBeUndefined();
+    });
+
     it('still substitutes the dirty text when the value itself changed', async () => {
         grid_mock.get_row.mockImplementation(() => [
             { raw: '1234.5', formatted: '1,234.50', bold: false, italic: false },

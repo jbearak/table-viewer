@@ -114,6 +114,8 @@ function fill_store(working: WorkingSet, sink: CellSink): void {
             };
             if (cell.underline) rendered.underline = true;
             if (cell.strikethrough) rendered.strikethrough = true;
+            if (cell.numberFormat) rendered.numberFormat = cell.numberFormat;
+            if (cell.xlsxIsoDate) rendered.xlsxIsoDate = true;
             if (cell.richText) rendered.richText = cell.richText;
             if (cell.hyperlink) rendered.hyperlink = cell.hyperlink;
             sink.set(r, c, rendered);

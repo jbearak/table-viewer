@@ -80,6 +80,46 @@ describe('ColumnarStore', () => {
         const store = b.build();
         expect(store.read_window(0, 1)[0][0]?.hyperlink).toBeUndefined();
     });
+    it('round-trips compact XLSX number-format metadata', () => {
+        const b = new ColumnarStore.Builder(1, 3);
+        b.set(0, 0, {
+            raw: '1', formatted: '1.00', bold: false, italic: false, rawType: 'number',
+            numberFormat: { code: '0.00' },
+        });
+        b.set(0, 1, {
+            raw: '2024-01-15T00:00:00Z', formatted: '2024-01-15T00:00:00Z',
+            bold: false, italic: false, rawType: 'date',
+            numberFormat: { code: 'm/d/yyyy', date1904: true },
+            xlsxIsoDate: true,
+        });
+        b.set(0, 2, {
+            raw: 'plain', formatted: 'plain', bold: false, italic: false, rawType: 'string',
+        });
+        const [row] = b.build().read_window(0, 1);
+        expect(row[0]?.numberFormat).toEqual({ code: '0.00' });
+        expect(row[1]?.numberFormat).toEqual({ code: 'm/d/yyyy', date1904: true });
+        expect(row[1]?.xlsxIsoDate).toBe(true);
+        expect(row[2] && 'numberFormat' in row[2]).toBe(false);
+        expect(row[2] && 'xlsxIsoDate' in row[2]).toBe(false);
+    });
+    it('clears XLSX format metadata on overwrite and null', () => {
+        const b = new ColumnarStore.Builder(1, 2);
+        const formatted = {
+            raw: '1', formatted: '1.00', bold: false, italic: false,
+            rawType: 'number' as const, numberFormat: { code: '0.00' },
+            xlsxIsoDate: true as const,
+        };
+        b.set(0, 0, formatted);
+        b.set(0, 1, formatted);
+        b.set(0, 0, {
+            raw: 'plain', formatted: 'plain', bold: false, italic: false, rawType: 'string',
+        });
+        b.set(0, 1, null);
+        const [row] = b.build().read_window(0, 1);
+        expect(row[0]?.numberFormat).toBeUndefined();
+        expect(row[0]?.xlsxIsoDate).toBeUndefined();
+        expect(row[1]).toBeNull();
+    });
     it('materializes only requested columns in compact requested order', () => {
         const builder = new ColumnarStore.Builder(2, 1_000);
         builder.set(0, 2, {
