@@ -6,6 +6,7 @@ import type { HostMessage, WebviewMessage } from '../types';
 import type { WorkbookSnapshot } from '../viewer-snapshot';
 import { with_in_memory_authority_transactions } from '../state-authority';
 import { versioned_state_store } from './helpers/versioned-state-store';
+import { messages_of } from './helpers/panel-messages';
 import * as vscode_mock from './mocks/vscode';
 import { fake_viewer_host } from './mocks/host-ports';
 
@@ -28,18 +29,6 @@ function open_csv_table(store: FileStateStore) {
     );
     panel.onDidDispose(() => controller.dispose());
     return panel;
-}
-
-function messages_of<T extends HostMessage['type']>(
-    panel: { __messages: unknown[] },
-    type: T,
-): Array<Extract<HostMessage, { type: T }>> {
-    return panel.__messages.filter((message): message is Extract<HostMessage, { type: T }> => (
-        typeof message === 'object'
-        && message !== null
-        && 'type' in message
-        && message.type === type
-    ));
 }
 
 /**

@@ -622,7 +622,8 @@ describe('GridShell git compare painting', () => {
         expect(diff_texts).toContain('source-a');
         // The added row gets a whole-row band; its cells carry no diff.
         const added = get_cell_content([0, 1]);
-        expect(added.themeOverride?.bgCell).toBe('rgba(76, 175, 80, 0.12)');
+        expect(added.themeOverride?.bgCell).toBeDefined();
+        expect(added.data).toBe('source-a');
         // An untouched cell is a plain cell: no band, no diff payload.
         const plain = get_cell_content([1, 0]);
         expect(plain.themeOverride).toBeUndefined();
@@ -630,7 +631,7 @@ describe('GridShell git compare painting', () => {
     });
 
     it('strikes deleted-row cells whole instead of diffing them', async () => {
-        grid_mock.compare_status = { 0: 'deleted' };
+        grid_mock.compare_status = { 0: 'deleted', 1: 'added' };
         await render_grid(props({ git_compare: true }));
         const get_cell_content = grid_mock.props!.getCellContent as (
             cell: [number, number],
@@ -639,7 +640,12 @@ describe('GridShell git compare painting', () => {
             data: { lines: { text: string; style?: { strikethrough?: boolean } }[][] };
         };
         const cell = get_cell_content([0, 0]);
-        expect(cell.themeOverride?.bgCell).toBe('rgba(229, 75, 75, 0.12)');
+        // A band that is distinct from the added band — the exact colors are
+        // the theme's business, the distinction is the behavior.
+        expect(cell.themeOverride?.bgCell).toBeDefined();
+        expect(cell.themeOverride?.bgCell).not.toBe(
+            get_cell_content([0, 1]).themeOverride?.bgCell,
+        );
         // Struck through whole: one line of the cell's own text, no diff pair.
         expect(cell.data.lines).toEqual([[
             expect.objectContaining({

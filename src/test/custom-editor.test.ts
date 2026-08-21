@@ -8,6 +8,7 @@ import { register_table_viewer } from '../custom-editor';
 import type { AuthorityFileStateStore } from '../state';
 import { with_in_memory_authority_transactions } from '../state-authority';
 import { versioned_state_store } from './helpers/versioned-state-store';
+import { messages_of } from './helpers/panel-messages';
 import * as vscode_mock from './mocks/vscode';
 
 function state_store(): AuthorityFileStateStore {
@@ -93,17 +94,12 @@ describe('register_table_viewer', () => {
         capabilities: { csvEditingSupported: boolean };
     }> {
         await panel.__receive({ type: 'ready' });
-        await vi.waitFor(() => expect(panel.__messages.some((message) => (
-            typeof message === 'object' && message !== null
-            && 'type' in message && message.type === 'workbookSnapshot'
-        ))).toBe(true));
-        return (panel.__messages.find((message) => (
-            typeof message === 'object' && message !== null
-            && 'type' in message && message.type === 'workbookSnapshot'
-        )) as { snapshot: {
+        await vi.waitFor(() => expect(messages_of(panel, 'workbookSnapshot').length)
+            .toBeGreaterThan(0));
+        return messages_of(panel, 'workbookSnapshot')[0].snapshot as {
             configuration: { gitCompare?: unknown };
             capabilities: { csvEditingSupported: boolean };
-        } }).snapshot;
+        };
     }
 
     async function acknowledge_latest_snapshot(
@@ -590,14 +586,9 @@ describe('register_table_viewer', () => {
             requestId: 'rows-1',
             generation: (file_snapshot as { generation?: number }).generation ?? 1,
         });
-        await vi.waitFor(() => expect(file_panel.__messages.some((message) => (
-            typeof message === 'object' && message !== null
-            && 'type' in message && message.type === 'compareDiff'
-        ))).toBe(true));
-        const diff = file_panel.__messages.find((message) => (
-            typeof message === 'object' && message !== null
-            && 'type' in message && message.type === 'compareDiff'
-        )) as { changedCells: unknown };
+        await vi.waitFor(() => expect(messages_of(file_panel, 'compareDiff').length)
+            .toBeGreaterThan(0));
+        const [diff] = messages_of(file_panel, 'compareDiff');
         expect(diff.changedCells).toEqual([{ row: 0, col: 0, base: '1' }]);
 
         // Read-only panels never open edit sessions, so disposal sends no

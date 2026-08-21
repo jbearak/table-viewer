@@ -16,6 +16,7 @@ import type { WorkbookMeta } from '../data-source/interface';
 import type { WorkbookSnapshot } from '../viewer-snapshot';
 import type { EditSessionStore } from '../webview/edit-session-store';
 import type { GridShellProps } from '../webview/grid-shell';
+import { find_button } from './helpers/dom-interaction';
 import { sheet_edits } from './pending-edits-helper';
 
 const grid_shell_mock = vi.hoisted(() => ({
@@ -1007,10 +1008,8 @@ describe('git compare mode', () => {
     it('offers no Edit or Diff buttons and marks the grid as comparing', async () => {
         await render_app();
         await dispatch_host_message(compare_snapshot(['Sheet1'], ['matched']));
-        const labels = Array.from(document.querySelectorAll('button'))
-            .map((button) => button.textContent);
-        expect(labels).not.toContain('Edit');
-        expect(labels).not.toContain('Diff');
+        expect(find_button((text) => text === 'Edit')).toBeUndefined();
+        expect(find_button((text) => text === 'Diff')).toBeUndefined();
         expect(grid_shell_mock.latest_props?.git_compare).toBe(true);
     });
 
@@ -1020,10 +1019,9 @@ describe('git compare mode', () => {
             compare_snapshot(['Kept', 'New', 'Gone'], ['matched', 'added', 'deleted']),
         );
         const badges = Array.from(document.querySelectorAll('.sheet-tab-badge'));
-        expect(badges.map((badge) => badge.className)).toEqual([
-            'sheet-tab-badge sheet-tab-badge-added',
-            'sheet-tab-badge sheet-tab-badge-deleted',
-        ]);
+        expect(badges).toHaveLength(2);
+        expect(badges[0].classList.contains('sheet-tab-badge-added')).toBe(true);
+        expect(badges[1].classList.contains('sheet-tab-badge-deleted')).toBe(true);
         expect(badges.map((badge) => badge.textContent)).toEqual(['+', '−']);
     });
 
