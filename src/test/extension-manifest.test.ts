@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { TABLE_FILE_EXTENSION_PATTERN } from '../table-diff-uris';
 
 interface CustomEditorContribution {
     viewType?: unknown;
@@ -29,6 +30,7 @@ const manifest = JSON.parse(readFileSync(
     };
     engines?: { node?: unknown; vscode?: unknown };
     extensionKind?: unknown;
+    activationEvents?: unknown;
     extensionDependencies?: unknown;
     extensionPack?: unknown;
     scripts?: Record<string, unknown>;
@@ -51,6 +53,7 @@ describe('extension runtime manifest', () => {
             vscode: '^1.127.0',
         });
         expect(manifest.extensionKind).toEqual(['workspace']);
+        expect(manifest.activationEvents).toEqual(['onStartupFinished']);
         expect(manifest.devDependencies?.electron).toBe('43.4.0');
         expect(manifest.devDependencies?.['@types/node']).toBe('26.1.2');
     });
@@ -108,14 +111,40 @@ describe('extension runtime manifest', () => {
             'tableViewer.showCsvPreview',
             'tableViewer.openCsvTable',
             'tableViewer.openAsText',
+            'tableViewer.openWorkingTreeFile',
             'tableViewer.openWorkbookAtSheet',
             'tableViewer.manageStoredFileState',
             'tableViewer.openTableDiff',
+            'tableViewer.openStagedTableDiff',
         ]);
-        expect(manifest.contributes?.menus?.commandPalette).toContainEqual({
-            command: 'tableViewer.openWorkbookAtSheet',
-            when: 'false',
-        });
+        for (const command of [
+            'tableViewer.openWorkingTreeFile',
+            'tableViewer.openWorkbookAtSheet',
+            'tableViewer.openTableDiff',
+            'tableViewer.openStagedTableDiff',
+        ]) {
+            expect(manifest.contributes?.menus?.commandPalette).toContainEqual({
+                command,
+                when: 'false',
+            });
+        }
+    });
+
+    it('offers Open File only from comparison tabs', () => {
+        const entries = (manifest.contributes?.menus as Record<string, unknown[]>)[
+            'editor/title'
+        ] as { command: string; when: string; group: string }[];
+        const open_file = entries.find(
+            (entry) => entry.command === 'tableViewer.openWorkingTreeFile',
+        );
+        expect(open_file).toMatchObject({ group: 'navigation' });
+        expect(open_file?.when).toContain('activeCustomEditorId == tableViewer.editor');
+        expect(open_file?.when).toContain('resourceScheme == table-viewer-diff');
+
+        const open_as_text = entries.find(
+            (entry) => entry.command === 'tableViewer.openAsText',
+        );
+        expect(open_as_text?.when).toContain('resourceScheme != table-viewer-diff');
     });
 
     it('offers the table diff on git SCM resources for every supported format', () => {
@@ -131,18 +160,30 @@ describe('extension runtime manifest', () => {
             .map((extension) =>
                 extension.replace(/\[(.)(.)\]/gu, (_, lower: string) => lower));
         expect(supported_extensions.length).toBeGreaterThan(0);
+        for (const extension of supported_extensions) {
+            expect(TABLE_FILE_EXTENSION_PATTERN.test(`table.${extension}`)).toBe(true);
+        }
         const entries = (manifest.contributes?.menus as Record<string, unknown[]>)[
             'scm/resourceState/context'
         ] as { command: string; when: string; group: string }[];
+        const resource_group_by_command = new Map([
+            ['tableViewer.openTableDiff', 'workingTree'],
+            ['tableViewer.openStagedTableDiff', 'index'],
+        ]);
         const diff_entries = entries.filter(
-            (entry) => entry.command === 'tableViewer.openTableDiff',
+            (entry) => resource_group_by_command.has(entry.command),
         );
-        expect(diff_entries.map((entry) => entry.group).sort()).toEqual(
-            ['inline', 'navigation'],
-        );
+        expect(diff_entries.map((entry) => `${entry.command}:${entry.group}`).sort()).toEqual([
+            'tableViewer.openStagedTableDiff:inline',
+            'tableViewer.openStagedTableDiff:navigation',
+            'tableViewer.openTableDiff:inline',
+            'tableViewer.openTableDiff:navigation',
+        ]);
         for (const entry of diff_entries) {
             expect(entry.when).toContain('scmProvider == git');
-            expect(entry.when).toContain('scmResourceGroup == workingTree');
+            expect(entry.when).toContain(
+                `scmResourceGroup == ${resource_group_by_command.get(entry.command)}`,
+            );
             // The alternation must match the extension proper, dot included —
             // without the `\.` an unrelated extension like `.mycsv` matches.
             expect(entry.when).toContain('resourceExtname =~ /\\.(');

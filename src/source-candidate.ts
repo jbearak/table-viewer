@@ -3,6 +3,8 @@ import type { DataSource } from './data-source/interface';
 export interface PhysicalSourceObservation {
     readonly fingerprint: string;
     readonly digest: string;
+    readonly comparisonFingerprint?: string;
+    readonly comparisonDigest?: string;
 }
 
 type OwnershipState = 'owned' | 'transferring' | 'transferred' | 'disposed';

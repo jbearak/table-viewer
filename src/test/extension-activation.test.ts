@@ -22,14 +22,32 @@ const seams = vi.hoisted(() => ({
     openSheetError: undefined as Error | undefined,
     openSheetArgs: undefined as { uri: unknown; sheetName: string } | undefined,
     openDiffError: undefined as Error | undefined,
-    openDiffArgs: undefined as { uri: unknown; originalUri: unknown } | undefined,
+    openDiffArgs: undefined as {
+        diff: { modified: unknown; original: unknown };
+        viewColumn: unknown;
+    } | undefined,
+    openWorkingTreeArgs: undefined as unknown,
+    nativeDiffDuringRegistration: undefined as {
+        tab: unknown;
+        diff: { modified: unknown; original: unknown };
+    } | undefined,
 }));
 
 vi.mock('../custom-editor', () => ({
     TABLE_VIEW_TYPE: 'tableViewer.editor',
-    register_table_viewer: (_context: unknown, store: unknown) => {
+    register_table_viewer: (
+        _context: unknown,
+        store: unknown,
+        options?: { replaceNativeDiff?(tab: unknown, diff: unknown): void },
+    ) => {
         seams.events.push(store === seams.store ? 'register:viewers' : 'register:wrong-store');
         if (seams.failViewerRegistration) throw new Error('viewer registration failed');
+        if (seams.nativeDiffDuringRegistration) {
+            options?.replaceNativeDiff?.(
+                seams.nativeDiffDuringRegistration.tab,
+                seams.nativeDiffDuringRegistration.diff,
+            );
+        }
         return {
             dispose() {
                 seams.events.push('dispose:viewers');
@@ -44,9 +62,15 @@ vi.mock('../custom-editor', () => ({
                 if (seams.openSheetError) throw seams.openSheetError;
                 return seams.openSheetResult;
             },
-            async openTableDiff(uri: unknown, originalUri: unknown) {
-                seams.openDiffArgs = { uri, originalUri };
+            async openTableDiff(
+                diff: { modified: unknown; original: unknown },
+                viewColumn: unknown,
+            ) {
+                seams.openDiffArgs = { diff, viewColumn };
                 if (seams.openDiffError) throw seams.openDiffError;
+            },
+            async openWorkingTreeFile(uri: unknown) {
+                seams.openWorkingTreeArgs = uri;
             },
         };
     },
@@ -84,6 +108,20 @@ vi.mock('../vscode-state-database', () => ({
 }));
 
 import { activate, deactivate } from '../extension';
+import {
+    TABLE_DIFF_SCHEME,
+    table_diff_document_uri,
+    table_diff_document_uris,
+    table_diff_uris,
+    table_diff_working_tree_uri,
+} from '../table-diff-uris';
+
+function git_uri(path: string, ref: string): vscode.Uri {
+    return vscode_mock.Uri.file(path).with({
+        scheme: 'git',
+        query: JSON.stringify({ path, ref }),
+    }) as unknown as vscode.Uri;
+}
 
 function context(): vscode.ExtensionContext {
     const values = new Map<string, unknown>();
@@ -122,10 +160,123 @@ beforeEach(async () => {
     seams.openSheetArgs = undefined;
     seams.openDiffError = undefined;
     seams.openDiffArgs = undefined;
+    seams.openWorkingTreeArgs = undefined;
+    seams.nativeDiffDuringRegistration = undefined;
 });
 
 afterEach(async () => {
     await deactivate();
+});
+
+describe('table_diff_uris', () => {
+    it('recognizes the unstaged and staged Git SCM diff shapes', () => {
+        const file = vscode_mock.Uri.file('/repo/data.csv') as unknown as vscode.Uri;
+        const unstaged_original = git_uri('/repo/data.csv', '~');
+        expect(table_diff_uris(unstaged_original, file)).toEqual({
+            original: unstaged_original,
+            modified: file,
+        });
+
+        const staged_original = git_uri('/repo/data.csv', 'HEAD');
+        const staged_modified = git_uri('/repo/data.csv', '');
+        expect(table_diff_uris(staged_original, staged_modified)).toEqual({
+            original: staged_original,
+            modified: staged_modified,
+        });
+    });
+
+    it('ignores non-SCM refs, unsupported files, and mismatched resources', () => {
+        const file = vscode_mock.Uri.file('/repo/data.csv') as unknown as vscode.Uri;
+        expect(table_diff_uris(git_uri('/repo/data.csv', '~1'), file)).toBeUndefined();
+        expect(table_diff_uris(
+            git_uri('/repo/data.txt', '~'),
+            vscode_mock.Uri.file('/repo/data.txt') as unknown as vscode.Uri,
+        )).toBeUndefined();
+        expect(table_diff_uris(
+            git_uri('/repo/other.csv', '~'),
+            file,
+        )).toBeUndefined();
+        expect(table_diff_uris(
+            git_uri('/repo/data.csv', 'HEAD'),
+            git_uri('/repo/data.csv', '~'),
+        )).toBeUndefined();
+        expect(table_diff_uris(
+            git_uri('/repo/other.csv', '~').with({ path: '/repo/data.csv' }) as vscode.Uri,
+            file,
+        )).toBeUndefined();
+    });
+
+    it('round-trips stable, distinct unstaged and staged comparison documents', () => {
+        const file = vscode_mock.Uri.file('/repo/data.csv') as unknown as vscode.Uri;
+        const unstaged = {
+            original: git_uri('/repo/data.csv', '~'),
+            modified: file,
+        };
+        const staged = {
+            original: git_uri('/repo/data.csv', 'HEAD'),
+            modified: git_uri('/repo/data.csv', ''),
+        };
+
+        const unstaged_document = table_diff_document_uri(unstaged);
+        const staged_document = table_diff_document_uri(staged);
+
+        expect(unstaged_document.scheme).toBe(TABLE_DIFF_SCHEME);
+        expect(table_diff_document_uri(unstaged).toString()).toBe(
+            unstaged_document.toString(),
+        );
+        expect(staged_document.toString()).not.toBe(unstaged_document.toString());
+        expect(table_diff_document_uris(unstaged_document)).toMatchObject({
+            original: expect.objectContaining({ scheme: 'git', path: '/repo/data.csv' }),
+            modified: expect.objectContaining({ scheme: 'file', path: '/repo/data.csv' }),
+        });
+        const decoded_staged = table_diff_document_uris(staged_document);
+        expect(decoded_staged).toMatchObject({
+            original: expect.objectContaining({ scheme: 'git', path: '/repo/data.csv' }),
+            modified: expect.objectContaining({ scheme: 'git', path: '/repo/data.csv' }),
+        });
+        expect(table_diff_working_tree_uri(decoded_staged!)).toMatchObject({
+            scheme: 'file',
+            path: '/repo/data.csv',
+            query: '',
+        });
+    });
+
+    it('derives a staged working-tree URI from the embedded Git path', () => {
+        const original = git_uri('/repo/data.csv', 'HEAD').with({
+            path: '/repo/data.csv.git',
+        }) as vscode.Uri;
+        const modified = git_uri('/repo/data.csv', '').with({
+            path: '/repo/data.csv.git',
+        }) as vscode.Uri;
+
+        expect(table_diff_working_tree_uri({ original, modified })).toMatchObject({
+            scheme: 'file',
+            path: '/repo/data.csv',
+            query: '',
+            fragment: '',
+        });
+    });
+
+    it('rejects malformed or spoofed comparison document identities', () => {
+        const file = vscode_mock.Uri.file('/repo/data.csv') as unknown as vscode.Uri;
+        const valid = table_diff_document_uri({
+            original: git_uri('/repo/data.csv', '~'),
+            modified: file,
+        });
+
+        expect(table_diff_document_uris(valid.with({ query: 'not-base64' }) as vscode.Uri))
+            .toBeUndefined();
+        expect(table_diff_document_uris(valid.with({ path: '/repo/other.csv' }) as vscode.Uri))
+            .toBeUndefined();
+        const mismatched_git_path = table_diff_document_uri({
+            original: git_uri('/repo/other.csv', '~').with({
+                path: '/repo/data.csv',
+            }) as vscode.Uri,
+            modified: file,
+        });
+        expect(table_diff_document_uris(mismatched_git_path)).toBeUndefined();
+        expect(table_diff_document_uris(file)).toBeUndefined();
+    });
 });
 
 describe('VS Code activation', () => {
@@ -148,8 +299,10 @@ describe('VS Code activation', () => {
             'tableViewer.showCsvPreview',
             'tableViewer.openCsvTable',
             'tableViewer.openAsText',
+            'tableViewer.openWorkingTreeFile',
             'tableViewer.openWorkbookAtSheet',
             'tableViewer.openTableDiff',
+            'tableViewer.openStagedTableDiff',
             'tableViewer.manageStoredFileState',
         ]);
     });
@@ -199,12 +352,228 @@ describe('VS Code activation', () => {
         );
 
         expect(seams.openDiffArgs).toMatchObject({
-            uri: expect.objectContaining({ scheme: 'file', path: '/repo/data.csv' }),
-            originalUri: expect.objectContaining({
-                scheme: 'git',
-                query: JSON.stringify({ path: '/repo/data.csv', ref: '~' }),
-            }),
+            diff: {
+                modified: expect.objectContaining({ scheme: 'file', path: '/repo/data.csv' }),
+                original: expect.objectContaining({
+                    scheme: 'git',
+                    query: JSON.stringify({ path: '/repo/data.csv', ref: '~' }),
+                }),
+            },
         });
+    });
+
+    it('opens a staged table diff from the index against HEAD', async () => {
+        await activate(context());
+        const uri = vscode_mock.Uri.file('/repo/data.csv');
+
+        await vscode_mock.commands.executeCommand(
+            'tableViewer.openStagedTableDiff',
+            { resourceUri: uri },
+        );
+
+        expect(seams.openDiffArgs).toMatchObject({
+            diff: {
+                modified: expect.objectContaining({
+                    scheme: 'git',
+                    query: JSON.stringify({ path: '/repo/data.csv', ref: '' }),
+                }),
+                original: expect.objectContaining({
+                    scheme: 'git',
+                    query: JSON.stringify({ path: '/repo/data.csv', ref: 'HEAD' }),
+                }),
+            },
+        });
+    });
+
+    it.each([
+        {
+            name: 'unstaged',
+            diff: {
+                original: git_uri('/repo/data.csv', '~'),
+                modified: vscode_mock.Uri.file('/repo/data.csv') as unknown as vscode.Uri,
+            },
+        },
+        {
+            name: 'staged',
+            diff: {
+                original: git_uri('/repo/data.csv', 'HEAD'),
+                modified: git_uri('/repo/data.csv', ''),
+            },
+        },
+    ])('opens the working-tree file from a $name comparison document', async ({ diff }) => {
+        await activate(context());
+
+        await vscode_mock.commands.executeCommand(
+            'tableViewer.openWorkingTreeFile',
+            table_diff_document_uri(diff),
+        );
+
+        expect(seams.openWorkingTreeArgs).toMatchObject({
+            scheme: 'file',
+            path: '/repo/data.csv',
+            query: '',
+        });
+    });
+
+    it('ignores Open File outside a Table Viewer comparison document', async () => {
+        await activate(context());
+
+        await vscode_mock.commands.executeCommand(
+            'tableViewer.openWorkingTreeFile',
+            vscode_mock.Uri.file('/repo/data.csv'),
+        );
+
+        expect(seams.openWorkingTreeArgs).toBeUndefined();
+    });
+
+    it.each([
+        {
+            name: 'unstaged',
+            original: git_uri('/repo/data.csv', '~'),
+            modified: vscode_mock.Uri.file('/repo/data.csv') as unknown as vscode.Uri,
+        },
+        {
+            name: 'staged',
+            original: git_uri('/repo/data.csv', 'HEAD'),
+            modified: git_uri('/repo/data.csv', ''),
+        },
+    ])('replaces a native $name diff tab with one Table Viewer comparison', async ({
+        original,
+        modified,
+    }) => {
+        await activate(context());
+        const tab: vscode_mock.MockTab = {
+            label: 'data.csv',
+            input: new vscode_mock.TabInputTextDiff(original, modified),
+        };
+
+        await vscode_mock.__fireTabChange({ opened: [tab], changed: [tab] });
+
+        expect(vscode_mock.__getClosedTabs()).toEqual([tab]);
+        expect(seams.openDiffArgs).toEqual({
+            diff: { modified, original },
+            viewColumn: vscode_mock.ViewColumn.One,
+        });
+    });
+
+    it('replaces a restored native diff in its own inactive editor group', async () => {
+        const unrelated: vscode_mock.MockTab = { label: 'notes.txt', input: undefined };
+        const original = git_uri('/repo/data.csv', '~');
+        const modified = vscode_mock.Uri.file('/repo/data.csv') as unknown as vscode.Uri;
+        const diff_tab: vscode_mock.MockTab = {
+            label: 'data.csv',
+            input: new vscode_mock.TabInputTextDiff(original, modified),
+        };
+        vscode_mock.__setTabGroups([
+            { viewColumn: vscode_mock.ViewColumn.One, tabs: [unrelated] },
+            { viewColumn: vscode_mock.ViewColumn.Two, tabs: [diff_tab] },
+        ], vscode_mock.ViewColumn.One);
+
+        await activate(context());
+
+        await vi.waitFor(() => expect(seams.openDiffArgs).toEqual({
+            diff: { modified, original },
+            viewColumn: vscode_mock.ViewColumn.Two,
+        }));
+        expect(vscode_mock.__getClosedTabs()).toEqual([diff_tab]);
+        expect(vscode_mock.window.tabGroups.activeTabGroup.activeTab).toBe(unrelated);
+    });
+
+    it('retries replacement after VS Code declines to close a native diff tab', async () => {
+        await activate(context());
+        const tab: vscode_mock.MockTab = {
+            label: 'data.csv',
+            input: new vscode_mock.TabInputTextDiff(
+                git_uri('/repo/data.csv', '~'),
+                vscode_mock.Uri.file('/repo/data.csv'),
+            ),
+        };
+        vscode_mock.__setCloseTabImplementation(async () => false);
+
+        await vscode_mock.__fireTabChange({ opened: [tab] });
+        expect(seams.openDiffArgs).toBeDefined();
+        expect(vscode_mock.__getClosedTabs()).toEqual([]);
+
+        vscode_mock.__setCloseTabImplementation(undefined);
+        await vscode_mock.__fireTabChange({ changed: [tab] });
+        expect(vscode_mock.__getClosedTabs()).toEqual([tab]);
+    });
+
+    it('replays an older custom-editor diff resolved during activation', async () => {
+        const original = git_uri('/repo/data.csv', '~');
+        const modified = vscode_mock.Uri.file('/repo/data.csv') as unknown as vscode.Uri;
+        const tab: vscode_mock.MockTab = { label: 'data.csv', input: undefined };
+        await vscode_mock.__fireTabChange({ opened: [tab] });
+        seams.nativeDiffDuringRegistration = {
+            tab,
+            diff: { original, modified },
+        };
+
+        await activate(context());
+
+        await vi.waitFor(() => expect(seams.openDiffArgs).toEqual({
+            diff: { modified, original },
+            viewColumn: vscode_mock.ViewColumn.One,
+        }));
+        expect(vscode_mock.__getClosedTabs()).toEqual([tab]);
+    });
+
+    it('replaces a native diff that was already open when activation finished', async () => {
+        const original = git_uri('/repo/data.csv', '~');
+        const modified = vscode_mock.Uri.file('/repo/data.csv') as unknown as vscode.Uri;
+        const tab: vscode_mock.MockTab = {
+            label: 'data.csv',
+            input: new vscode_mock.TabInputTextDiff(original, modified),
+        };
+        await vscode_mock.__fireTabChange({ opened: [tab] });
+
+        await activate(context());
+
+        await vi.waitFor(() => expect(seams.openDiffArgs).toEqual({
+            diff: { modified, original },
+            viewColumn: vscode_mock.ViewColumn.One,
+        }));
+        expect(vscode_mock.__getClosedTabs()).toEqual([tab]);
+    });
+
+    it('leaves unrelated native diff tabs open', async () => {
+        await activate(context());
+        const tab: vscode_mock.MockTab = {
+            label: 'data.csv',
+            input: new vscode_mock.TabInputTextDiff(
+                git_uri('/repo/data.csv', '~1'),
+                vscode_mock.Uri.file('/repo/data.csv'),
+            ),
+        };
+
+        await vscode_mock.__fireTabChange({ opened: [tab] });
+
+        expect(vscode_mock.__getClosedTabs()).toEqual([]);
+        expect(seams.openDiffArgs).toBeUndefined();
+    });
+
+    it('reports a native diff replacement failure without rejecting the tab event', async () => {
+        await activate(context());
+        seams.openDiffError = new Error('replacement could not open');
+        const show_error = vi.spyOn(vscode_mock.window, 'showErrorMessage');
+        const tab: vscode_mock.MockTab = {
+            label: 'data.csv',
+            input: new vscode_mock.TabInputTextDiff(
+                git_uri('/repo/data.csv', '~'),
+                vscode_mock.Uri.file('/repo/data.csv'),
+            ),
+        };
+
+        await expect(vscode_mock.__fireTabChange({ opened: [tab] })).resolves.toBeUndefined();
+
+        await vi.waitFor(() => expect(show_error).toHaveBeenCalledWith(
+            'replacement could not open',
+        ));
+        expect(vscode_mock.__getClosedTabs()).toEqual([]);
+
+        seams.openDiffError = undefined;
+        await vscode_mock.__fireTabChange({ changed: [tab] });
+        expect(vscode_mock.__getClosedTabs()).toEqual([tab]);
     });
 
     it('prefers the git extension API for the original URI when available', async () => {
@@ -225,13 +594,13 @@ describe('VS Code activation', () => {
             { resourceUri: vscode_mock.Uri.file('/repo/data.csv') },
         );
 
-        expect(seams.openDiffArgs?.originalUri).toBe(api_uri);
+        expect(seams.openDiffArgs?.diff.original).toBe(api_uri);
     });
 
     it('refuses a table diff for a file missing from the working tree', async () => {
         await activate(context());
         vscode_mock.__setStatImplementation(async () => {
-            throw new Error('ENOENT');
+            throw Object.assign(new Error('missing'), { code: 'FileNotFound' });
         });
         const show_error = vi.spyOn(vscode_mock.window, 'showErrorMessage');
 
@@ -240,6 +609,20 @@ describe('VS Code activation', () => {
             { resourceUri: vscode_mock.Uri.file('/repo/gone.csv') },
         )).rejects.toThrow('no longer exists in the working tree');
         expect(show_error).toHaveBeenCalledOnce();
+        expect(seams.openDiffArgs).toBeUndefined();
+    });
+
+    it('preserves non-missing stat failures when opening an unstaged diff', async () => {
+        await activate(context());
+        const error = Object.assign(new Error('permission denied'), { code: 'NoPermissions' });
+        vscode_mock.__setStatImplementation(async () => { throw error; });
+        const show_error = vi.spyOn(vscode_mock.window, 'showErrorMessage');
+
+        await expect(vscode_mock.commands.executeCommand(
+            'tableViewer.openTableDiff',
+            { resourceUri: vscode_mock.Uri.file('/repo/data.csv') },
+        )).rejects.toBe(error);
+        expect(show_error).toHaveBeenCalledWith('permission denied');
         expect(seams.openDiffArgs).toBeUndefined();
     });
 

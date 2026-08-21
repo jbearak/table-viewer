@@ -122,8 +122,10 @@ export const Uri = {
 };
 
 export const ViewColumn = {
-    Active: 1,
-    Beside: 2,
+    Active: -1,
+    Beside: -2,
+    One: 1,
+    Two: 2,
 };
 
 export const env = {
@@ -152,10 +154,40 @@ type WatchHandler = (uri: UriLike) => unknown;
 type ConfigurationChangeHandler = (
     event: { affectsConfiguration(section: string): boolean },
 ) => unknown;
+type TabChangeHandler = (event: {
+    readonly opened: readonly MockTab[];
+    readonly closed: readonly MockTab[];
+    readonly changed: readonly MockTab[];
+}) => unknown;
+
+export interface MockTab {
+    readonly label: string;
+    readonly input: unknown;
+}
+
+interface MockTabGroup {
+    readonly viewColumn: number;
+    readonly tabs: MockTab[];
+}
+
+export class TabInputCustom {
+    constructor(
+        public readonly uri: UriLike,
+        public readonly viewType: string,
+    ) {}
+}
+
+export class TabInputTextDiff {
+    constructor(
+        public readonly original: UriLike,
+        public readonly modified: UriLike,
+    ) {}
+}
 
 interface MockWebviewPanel {
     title: string;
     active: boolean;
+    readonly viewColumn: number;
     webview: {
         html: string;
         asWebviewUri(uri: UriLike): UriLike;
@@ -166,6 +198,8 @@ interface MockWebviewPanel {
     reveal(): void;
     dispose(): void;
     __messages: unknown[];
+    __reveals: number;
+    __disposeCount: number;
     __autoAckSnapshots: boolean;
     __receive(message: unknown): Promise<void>;
 }
@@ -185,6 +219,13 @@ export interface MockWatcher {
 const panels: MockWebviewPanel[] = [];
 const watchers: MockWatcher[] = [];
 const configuration_change_handlers: ConfigurationChangeHandler[] = [];
+const tab_change_handlers: TabChangeHandler[] = [];
+const tabs: MockTab[] = [];
+const tab_groups: MockTabGroup[] = [{ viewColumn: ViewColumn.One, tabs }];
+let active_tab_group = tab_groups[0];
+const closed_tabs: MockTab[] = [];
+const closing_tabs = new Set<MockTab>();
+const tab_panels = new Map<MockTab, Set<MockWebviewPanel>>();
 const configuration_values = new Map<string, unknown>();
 const custom_editor_registrations: {
     viewType: string;
@@ -198,6 +239,7 @@ let write_file_impl: ((uri: UriLike, content: Uint8Array) => Promise<void>) | un
 let create_directory_impl: ((uri: UriLike) => Promise<void>) | undefined;
 let watcher_registration_failure: 'change' | 'create' | 'delete' | undefined;
 let watcher_dispose_failure = false;
+let close_tab_impl: ((tab: MockTab) => Promise<boolean>) | undefined;
 
 function disposable<T>(handlers?: T[], handler?: T): { dispose(): void } {
     return {
@@ -209,14 +251,16 @@ function disposable<T>(handlers?: T[], handler?: T): { dispose(): void } {
     };
 }
 
-function make_panel(title: string): MockWebviewPanel {
+function make_panel(title: string, view_column: number): MockWebviewPanel {
     const message_handlers: MessageHandler[] = [];
     const dispose_handlers: (() => unknown)[] = [];
     let protocol_sequence = 0;
+    let disposed = false;
     const pending_edit_sequences = new Map<string, number>();
     const panel: MockWebviewPanel = {
         title,
         active: false,
+        viewColumn: view_column,
         webview: {
             html: '',
             asWebviewUri(uri: UriLike): UriLike {
@@ -252,11 +296,20 @@ function make_panel(title: string): MockWebviewPanel {
             dispose_handlers.push(handler);
             return disposable(dispose_handlers, handler);
         },
-        reveal() {},
+        reveal() {
+            for (const candidate of panels) candidate.active = candidate === panel;
+            panel.__reveals += 1;
+        },
         dispose() {
-            for (const handler of dispose_handlers) handler();
+            panel.__disposeCount += 1;
+            if (disposed) return;
+            disposed = true;
+            for (const associated of tab_panels.values()) associated.delete(panel);
+            for (const handler of dispose_handlers.splice(0)) handler();
         },
         __messages: [],
+        __reveals: 0,
+        __disposeCount: 0,
         __autoAckSnapshots: true,
         async __receive(message: unknown): Promise<void> {
             let forwarded = message;
@@ -464,6 +517,54 @@ function make_watcher(pattern: unknown): MockWatcher {
 }
 
 export const window = {
+    tabGroups: {
+        get all() {
+            return tab_groups.map((group) => ({
+                viewColumn: group.viewColumn,
+                tabs: group.tabs,
+                activeTab: group.tabs.at(-1),
+            }));
+        },
+        get activeTabGroup() {
+            return {
+                viewColumn: active_tab_group.viewColumn,
+                tabs: active_tab_group.tabs,
+                activeTab: active_tab_group.tabs.at(-1),
+            };
+        },
+        onDidChangeTabs(handler: TabChangeHandler) {
+            tab_change_handlers.push(handler);
+            return disposable(tab_change_handlers, handler);
+        },
+        async close(tab: MockTab): Promise<boolean> {
+            const tab_group = tab_groups.find((group) => group.tabs.includes(tab));
+            if (!tab_group || closing_tabs.has(tab)) return false;
+            closing_tabs.add(tab);
+            try {
+                const closed = close_tab_impl ? await close_tab_impl(tab) : true;
+                if (!closed || !tab_group.tabs.includes(tab)) return false;
+                closed_tabs.push(tab);
+                tab_group.tabs.splice(tab_group.tabs.indexOf(tab), 1);
+                for (const panel of [...(tab_panels.get(tab) ?? [])]) panel.dispose();
+                tab_panels.delete(tab);
+                const event: Parameters<TabChangeHandler>[0] = {
+                    opened: [],
+                    closed: [tab],
+                    changed: [],
+                };
+                for (const handler of [...tab_change_handlers]) {
+                    try {
+                        handler(event);
+                    } catch {
+                        // VS Code isolates synchronous listener failures and ignores returns.
+                    }
+                }
+                return true;
+            } finally {
+                closing_tabs.delete(tab);
+            }
+        },
+    },
     registerCustomEditorProvider(
         viewType: string,
         provider: unknown,
@@ -473,9 +574,34 @@ export const window = {
         custom_editor_registrations.push(registration);
         return disposable(custom_editor_registrations, registration);
     },
-    createWebviewPanel(_viewType: string, title: string): MockWebviewPanel {
-        const panel = make_panel(title);
+    createWebviewPanel(
+        _viewType: string,
+        title: string,
+        show_options?: number | { viewColumn?: number },
+    ): MockWebviewPanel {
+        const requested = typeof show_options === 'number'
+            ? show_options
+            : show_options?.viewColumn;
+        let view_column = requested === undefined || requested === ViewColumn.Active
+            ? active_tab_group.viewColumn
+            : requested;
+        if (view_column === ViewColumn.Beside) {
+            const adjacent_group = tab_groups
+                .filter((group) => group.viewColumn > active_tab_group.viewColumn)
+                .sort((left, right) => left.viewColumn - right.viewColumn)[0];
+            view_column = adjacent_group?.viewColumn
+                ?? Math.max(0, ...tab_groups.map((group) => group.viewColumn)) + 1;
+            if (!adjacent_group) tab_groups.push({ viewColumn: view_column, tabs: [] });
+        }
+        const panel = make_panel(title, view_column);
         panels.push(panel);
+        const group = tab_groups.find((candidate) => candidate.viewColumn === view_column);
+        const tab = group?.tabs.at(-1);
+        if (tab) {
+            const associated = tab_panels.get(tab) ?? new Set<MockWebviewPanel>();
+            associated.add(panel);
+            tab_panels.set(tab, associated);
+        }
         return panel;
     },
     showErrorMessage(..._args: unknown[]): unknown {
@@ -595,6 +721,13 @@ export function __reset(): void {
     panels.length = 0;
     watchers.length = 0;
     configuration_change_handlers.length = 0;
+    tab_change_handlers.length = 0;
+    tabs.length = 0;
+    tab_groups.splice(0, tab_groups.length, { viewColumn: ViewColumn.One, tabs });
+    active_tab_group = tab_groups[0];
+    tab_panels.clear();
+    closed_tabs.length = 0;
+    closing_tabs.clear();
     configuration_values.clear();
     custom_editor_registrations.length = 0;
     command_handlers.clear();
@@ -608,6 +741,7 @@ export function __reset(): void {
     window.activeTextEditor = undefined;
     watcher_registration_failure = undefined;
     watcher_dispose_failure = false;
+    close_tab_impl = undefined;
 }
 
 export function __setCreateDirectoryImplementation(
@@ -648,6 +782,46 @@ export async function __fireConfigurationChange(
     await Promise.all(
         [...configuration_change_handlers].map((handler) => handler(event)),
     );
+}
+
+export async function __fireTabChange(event: {
+    readonly opened?: readonly MockTab[];
+    readonly closed?: readonly MockTab[];
+    readonly changed?: readonly MockTab[];
+}): Promise<void> {
+    const opened = [...(event.opened ?? [])];
+    for (const tab of opened) {
+        if (!active_tab_group.tabs.includes(tab)) active_tab_group.tabs.push(tab);
+    }
+    await Promise.all([...tab_change_handlers].map((handler) => handler({
+        opened,
+        closed: event.closed ?? [],
+        changed: event.changed ?? [],
+    })));
+    for (let index = 0; index < 100; index += 1) await Promise.resolve();
+}
+
+export function __setTabGroups(
+    groups: readonly { readonly viewColumn: number; readonly tabs: readonly MockTab[] }[],
+    active_view_column: number,
+): void {
+    tab_groups.splice(0, tab_groups.length, ...groups.map((group) => ({
+        viewColumn: group.viewColumn,
+        tabs: [...group.tabs],
+    })));
+    const active = tab_groups.find((group) => group.viewColumn === active_view_column);
+    if (!active) throw new Error(`No mock tab group for view column ${active_view_column}.`);
+    active_tab_group = active;
+}
+
+export function __setCloseTabImplementation(
+    impl: ((tab: MockTab) => Promise<boolean>) | undefined,
+): void {
+    close_tab_impl = impl;
+}
+
+export function __getClosedTabs(): readonly MockTab[] {
+    return closed_tabs;
 }
 
 export function __setWatcherRegistrationFailure(

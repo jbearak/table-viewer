@@ -15,6 +15,12 @@ import {
 } from './vscode-state-database';
 import { DEFAULT_MAX_STORED_FILES } from './state';
 import {
+    table_diff_document_uris,
+    table_diff_uris,
+    table_diff_working_tree_uri,
+    type TableDiffUris,
+} from './table-diff-uris';
+import {
     dispose_state_inspector_panel,
     show_state_inspector_panel,
 } from './state-inspector/vscode-panel';
@@ -51,6 +57,12 @@ function open_workbook_at_sheet_arguments(value: unknown): OpenWorkbookAtSheetAr
 /** The resourceUri of an SCM resource-state command argument, if that is what
  *  `value` is. The SCM menus pass a SourceControlResourceState; anything else
  *  (palette invocation, stray argument) yields undefined. */
+function is_file_not_found_error(error: unknown): boolean {
+    return typeof error === 'object' && error !== null
+        && 'code' in error
+        && (error as { code?: unknown }).code === 'FileNotFound';
+}
+
 function scm_resource_uri(value: unknown): vscode.Uri | undefined {
     if (typeof value !== 'object' || value === null) return undefined;
     const candidate = (value as { resourceUri?: unknown }).resourceUri;
@@ -64,18 +76,16 @@ function scm_resource_uri(value: unknown): vscode.Uri | undefined {
 }
 
 /**
- * The git extension's URI for the last committed/staged version of `uri`.
- * Ref `~` means "index, falling back to HEAD", which is what the SCM view
- * diffs the working tree against. Prefer the git extension's own `toGitUri`
- * (it owns the encoding); fall back to the same construction (scheme `git`,
- * JSON query with `{path, ref}`) when the API is unavailable.
+ * The git extension's URI for `uri` at `ref`. Prefer the git extension's own
+ * `toGitUri` (it owns the encoding); fall back to the same construction
+ * (scheme `git`, JSON query with `{path, ref}`) when the API is unavailable.
  */
-function to_git_uri(uri: vscode.Uri): vscode.Uri {
+function to_git_uri(uri: vscode.Uri, ref: string): vscode.Uri {
     try {
         const git = vscode.extensions.getExtension<{
             getAPI(version: 1): { toGitUri(target: vscode.Uri, ref: string): vscode.Uri };
         }>('vscode.git')?.exports;
-        const from_api = git?.getAPI(1).toGitUri(uri, '~');
+        const from_api = git?.getAPI(1).toGitUri(uri, ref);
         if (from_api) return from_api;
     } catch {
         // The git extension may be disabled or not yet activated; the manual
@@ -83,7 +93,7 @@ function to_git_uri(uri: vscode.Uri): vscode.Uri {
     }
     return uri.with({
         scheme: 'git',
-        query: JSON.stringify({ path: uri.fsPath, ref: '~' }),
+        query: JSON.stringify({ path: uri.fsPath, ref }),
     });
 }
 
@@ -93,6 +103,13 @@ let active_teardown: Promise<void> | undefined;
 function active_custom_tab_uri(): vscode.Uri | undefined {
     const input = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
     return input instanceof vscode.TabInputCustom ? input.uri : undefined;
+}
+
+function active_custom_source_uri(): vscode.Uri | undefined {
+    const uri = active_custom_tab_uri();
+    if (!uri) return undefined;
+    const diff = table_diff_document_uris(uri);
+    return diff ? table_diff_working_tree_uri(diff) : uri;
 }
 
 function extension_version(context: vscode.ExtensionContext): string {
@@ -147,9 +164,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
 
     let viewers: TableViewerRegistration | undefined;
+    let replace_native_diff: ((tab: vscode.Tab, diff: TableDiffUris) => void) | undefined;
+    const pending_native_diffs: Array<{ readonly tab: vscode.Tab; readonly diff: TableDiffUris }> = [];
     const disposables: vscode.Disposable[] = [];
     try {
-        viewers = register_table_viewer(context, database.store);
+        viewers = register_table_viewer(context, database.store, {
+            replaceNativeDiff: (tab, diff) => {
+                if (replace_native_diff) replace_native_diff(tab, diff);
+                else pending_native_diffs.push({ tab, diff });
+            },
+        });
         disposables.push({ dispose: dispose_csv_preview });
         disposables.push({ dispose: dispose_state_inspector_panel });
         // Each registration is pushed as soon as it exists. A single
@@ -177,7 +201,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             TABLE_VIEW_TYPE,
             () => vscode.window.activeTextEditor?.document.uri,
         ));
-        register('tableViewer.openAsText', open_with('default', active_custom_tab_uri));
+        register('tableViewer.openAsText', open_with('default', active_custom_source_uri));
         // Command failures surface as an error message but stay thrown, so
         // callers (tests, other extensions) still observe the rejection.
         const reporting_errors = async <T>(action: () => Promise<T>): Promise<T> => {
@@ -188,6 +212,46 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 void vscode.window.showErrorMessage(message);
                 throw error;
             }
+        };
+        register('tableViewer.openWorkingTreeFile', async (uri?: vscode.Uri) => {
+            const target = uri ?? active_custom_tab_uri();
+            const diff = target ? table_diff_document_uris(target) : undefined;
+            if (!diff) return;
+            await reporting_errors(async () => {
+                await viewers!.openWorkingTreeFile(table_diff_working_tree_uri(diff));
+            });
+        });
+        const replacing_diff_tabs = new WeakSet<vscode.Tab>();
+        const tab_group_for = (tab: vscode.Tab): vscode.TabGroup | undefined => (
+            vscode.window.tabGroups.all.find((group) => group.tabs.includes(tab))
+        );
+        const replace_table_diff = (
+            tab: vscode.Tab,
+            resolved_diff?: TableDiffUris,
+        ): void => {
+            if (replacing_diff_tabs.has(tab)) return;
+            const input = tab.input;
+            const diff = resolved_diff ?? (
+                input instanceof vscode.TabInputTextDiff
+                    ? table_diff_uris(input.original, input.modified)
+                    : undefined
+            );
+            const group = tab_group_for(tab);
+            if (!diff || !group) return;
+            const view_column = group.viewColumn;
+            replacing_diff_tabs.add(tab);
+            void reporting_errors(async () => {
+                try {
+                    // Open or reveal the replacement first. If that fails, the
+                    // working native diff remains intact and can be retried.
+                    await viewers!.openTableDiff(diff, view_column);
+                    if (tab_group_for(tab)) {
+                        await vscode.window.tabGroups.close(tab);
+                    }
+                } finally {
+                    replacing_diff_tabs.delete(tab);
+                }
+            }).catch(() => {});
         };
         register('tableViewer.openWorkbookAtSheet', (value: unknown) => reporting_errors(
             async () => {
@@ -212,13 +276,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 // surfacing the raw stat failure from the open.
                 try {
                     await vscode.workspace.fs.stat(uri);
-                } catch {
+                } catch (error) {
+                    if (!is_file_not_found_error(error)) throw error;
                     throw new Error(
                         'The file no longer exists in the working tree, so there is '
                         + 'nothing to compare. Restore or check out the file to view it.',
                     );
                 }
-                await viewers!.openTableDiff(uri, to_git_uri(uri));
+                await viewers!.openTableDiff({
+                    modified: uri,
+                    original: to_git_uri(uri, '~'),
+                });
+            });
+        });
+        register('tableViewer.openStagedTableDiff', async (resource_state?: unknown) => {
+            const uri = scm_resource_uri(resource_state)
+                ?? vscode.window.activeTextEditor?.document.uri;
+            if (!uri || uri.scheme !== 'file') return;
+            await reporting_errors(async () => {
+                await viewers!.openTableDiff({
+                    modified: to_git_uri(uri, ''),
+                    original: to_git_uri(uri, 'HEAD'),
+                });
             });
         });
         register('tableViewer.manageStoredFileState', () => {
@@ -228,7 +307,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 databasePath: database.databasePath,
             });
         });
+        disposables.push(vscode.window.tabGroups.onDidChangeTabs((event) => {
+            for (const tab of new Set([...event.opened, ...event.changed])) {
+                replace_table_diff(tab);
+            }
+        }));
         context.subscriptions.push(...disposables);
+        replace_native_diff = replace_table_diff;
+        for (const { tab, diff } of pending_native_diffs.splice(0)) {
+            replace_table_diff(tab, diff);
+        }
+        // Activation can race the native diff opening that caused it. Inspect the
+        // current tabs as well as future events so that first click is not missed.
+        for (const group of vscode.window.tabGroups.all) {
+            for (const tab of group.tabs) replace_table_diff(tab);
+        }
         active_runtime = { viewers, disposables, database };
     } catch (error) {
         // Nothing may keep the database open after a failed activation: VS Code

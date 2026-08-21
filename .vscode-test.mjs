@@ -24,6 +24,6 @@ export default defineConfig([
     {
         ...shared,
         label: 'current',
-        version: '1.131.0',
+        version: '1.134.0',
     },
 ]);
