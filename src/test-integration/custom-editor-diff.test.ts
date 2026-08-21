@@ -62,8 +62,16 @@ describe('custom editor diffs', () => {
     let temporary_directory: string | undefined;
 
     afterEach(async () => {
-        await close_all_editors();
+        const directory = temporary_directory;
         temporary_directory = undefined;
+        try {
+            await close_all_editors();
+        } finally {
+            if (directory) {
+                fs.rmSync(directory, { recursive: true, force: true });
+                temporary_directories.delete(directory);
+            }
+        }
     });
 
     async function prepare_repository(): Promise<{

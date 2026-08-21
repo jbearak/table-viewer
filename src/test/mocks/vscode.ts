@@ -300,9 +300,9 @@ function make_panel(title: string, view_column: number): MockWebviewPanel {
             panel.__reveals += 1;
         },
         dispose() {
+            panel.__disposeCount += 1;
             if (disposed) return;
             disposed = true;
-            panel.__disposeCount += 1;
             for (const associated of tab_panels.values()) associated.delete(panel);
             for (const handler of dispose_handlers.splice(0)) handler();
         },
@@ -565,9 +565,17 @@ export const window = {
         const requested = typeof show_options === 'number'
             ? show_options
             : show_options?.viewColumn;
-        const view_column = requested === undefined || requested === ViewColumn.Active
+        let view_column = requested === undefined || requested === ViewColumn.Active
             ? active_tab_group.viewColumn
             : requested;
+        if (view_column === ViewColumn.Beside) {
+            const adjacent_group = tab_groups
+                .filter((group) => group.viewColumn > active_tab_group.viewColumn)
+                .sort((left, right) => left.viewColumn - right.viewColumn)[0];
+            view_column = adjacent_group?.viewColumn
+                ?? Math.max(0, ...tab_groups.map((group) => group.viewColumn)) + 1;
+            if (!adjacent_group) tab_groups.push({ viewColumn: view_column, tabs: [] });
+        }
         const panel = make_panel(title, view_column);
         panels.push(panel);
         const group = tab_groups.find((candidate) => candidate.viewColumn === view_column);

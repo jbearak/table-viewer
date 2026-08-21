@@ -41,6 +41,7 @@ export class TableViewerEditorProvider
     readonly #resources = new Map<ViewerController, string>();
     readonly #compare_documents = new Map<ViewerController, string>();
     readonly #workbook_opens = new Map<string, Promise<void>>();
+    readonly #table_diff_opens = new Map<string, Promise<void>>();
     readonly #native_diff_candidates = new WeakMap<vscode.Tab, NativeDiffCandidate>();
     readonly #host_tabs = new Map<vscode.WebviewPanel, vscode.Tab>();
     readonly #drains = new Set<Promise<void>>();
@@ -211,12 +212,23 @@ export class TableViewerEditorProvider
             await existing.refresh_if_changed();
             return;
         }
-        await vscode.commands.executeCommand(
-            'vscode.openWith',
-            document_uri,
-            TABLE_VIEW_TYPE,
-            view_column,
-        );
+        const document_key = document_uri.toString();
+        let opening = this.#table_diff_opens.get(document_key);
+        if (!opening) {
+            opening = Promise.resolve(vscode.commands.executeCommand(
+                'vscode.openWith',
+                document_uri,
+                TABLE_VIEW_TYPE,
+                view_column,
+            )).then(() => {});
+            this.#table_diff_opens.set(document_key, opening);
+            void opening.finally(() => {
+                if (this.#table_diff_opens.get(document_key) === opening) {
+                    this.#table_diff_opens.delete(document_key);
+                }
+            }).catch(() => {});
+        }
+        await opening;
     }
 
     /** Open or reveal the normal working-tree viewer without closing a comparison. */

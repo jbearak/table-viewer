@@ -241,6 +241,22 @@ describe('table_diff_uris', () => {
         });
     });
 
+    it('derives a staged working-tree URI from the embedded Git path', () => {
+        const original = git_uri('/repo/data.csv', 'HEAD').with({
+            path: '/repo/data.csv.git',
+        }) as vscode.Uri;
+        const modified = git_uri('/repo/data.csv', '').with({
+            path: '/repo/data.csv.git',
+        }) as vscode.Uri;
+
+        expect(table_diff_working_tree_uri({ original, modified })).toMatchObject({
+            scheme: 'file',
+            path: '/repo/data.csv',
+            query: '',
+            fragment: '',
+        });
+    });
+
     it('rejects malformed or spoofed comparison document identities', () => {
         const file = vscode_mock.Uri.file('/repo/data.csv') as unknown as vscode.Uri;
         const valid = table_diff_document_uri({

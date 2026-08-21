@@ -6,7 +6,12 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type * as vscode from 'vscode';
-import { attach_viewer, csv_table_profile } from '../viewer-controller';
+import {
+    attach_viewer,
+    csv_table_profile,
+    type ViewerControllerOptions,
+    type ViewerProfile,
+} from '../viewer-controller';
 import { with_in_memory_authority_transactions } from '../state-authority';
 import { versioned_state_store } from './helpers/versioned-state-store';
 import * as vscode_mock from './mocks/vscode';
@@ -17,18 +22,29 @@ const enc = new TextEncoder();
 const MODIFIED = 'h\na\nb\n';
 const ORIGINAL = 'h\nA\n';
 
-function open_compare_table(original_path = '/tmp/original.csv') {
+function open_compare_controller(
+    original_path = '/tmp/original.csv',
+    profile: ViewerProfile = csv_table_profile(),
+    options: ViewerControllerOptions = {},
+) {
     const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
     const controller = attach_viewer(
         panel as unknown as Parameters<typeof attach_viewer>[0],
         vscode_mock.Uri.file('/tmp/compare.csv') as unknown as vscode.Uri,
         with_in_memory_authority_transactions(versioned_state_store().store),
-        csv_table_profile(),
+        profile,
         fake_viewer_host,
-        { compare: { originalUri: vscode_mock.Uri.file(original_path) as unknown as vscode.Uri } },
+        {
+            ...options,
+            compare: { originalUri: vscode_mock.Uri.file(original_path) as unknown as vscode.Uri },
+        },
     );
     panel.onDidDispose(() => controller.dispose());
-    return panel;
+    return { controller, panel };
+}
+
+function open_compare_table(original_path = '/tmp/original.csv') {
+    return open_compare_controller(original_path).panel;
 }
 
 type Posted = { type: string } & Record<string, unknown>;
@@ -115,6 +131,113 @@ describe('compare mode controller', () => {
         });
         await vi.waitFor(() => expect(posted(panel, 'rowData').length).toBeGreaterThan(0));
         expect(posted(panel, 'compareDiff')).toEqual([]);
+    });
+
+    it('preserves a modified-side build failure when original cleanup also throws', async () => {
+        const base_profile = csv_table_profile();
+        const modified_failure = new Error('modified build failed');
+        const cleanup_failure = new Error('original close failed');
+        let close_calls = 0;
+        const profile: ViewerProfile = {
+            ...base_profile,
+            async build_source(...args) {
+                if (new TextDecoder().decode(args[0]) === MODIFIED) throw modified_failure;
+                const source = await base_profile.build_source(...args);
+                source.close = () => {
+                    close_calls += 1;
+                    throw cleanup_failure;
+                };
+                return source;
+            },
+        };
+        const error = vi.spyOn(vscode_mock.window, 'showErrorMessage');
+        const { panel } = open_compare_controller('/tmp/original.csv', profile);
+
+        await panel.__receive({ type: 'ready' });
+
+        await vi.waitFor(() => expect(error).toHaveBeenCalledWith(modified_failure.message));
+        expect(close_calls).toBeGreaterThan(0);
+    });
+
+    it('degrades after the original disappears during candidate validation', async () => {
+        const base_profile = csv_table_profile();
+        let throw_on_original_close = false;
+        const profile: ViewerProfile = {
+            ...base_profile,
+            async build_source(...args) {
+                const original = new TextDecoder().decode(args[0]) === ORIGINAL;
+                const source = await base_profile.build_source(...args);
+                if (original && throw_on_original_close) {
+                    source.close = () => {
+                        throw new Error('rejected original close failed');
+                    };
+                }
+                return source;
+            },
+        };
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const error = vi.spyOn(vscode_mock.window, 'showErrorMessage');
+        const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const { controller, panel } = open_compare_controller(
+            '/tmp/original.csv',
+            profile,
+        );
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot')).toHaveLength(1));
+        throw_on_original_close = true;
+
+        let original_stat_calls = 0;
+        vscode_mock.__setStatImplementation(async (uri) => {
+            if (String(uri.fsPath ?? uri).includes('original')) {
+                original_stat_calls += 1;
+                if (original_stat_calls >= 2) throw new Error('git object disappeared');
+                return { size: ORIGINAL.length, mtime: 1 };
+            }
+            return { size: MODIFIED.length, mtime: 1 };
+        });
+        vscode_mock.__setReadFileImplementation(async (uri) =>
+            enc.encode(String(uri.fsPath ?? uri).includes('original') ? ORIGINAL : MODIFIED));
+
+        await expect(controller.refresh_if_changed()).resolves.toBe(false);
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot')).toHaveLength(2));
+
+        const snapshot = posted(panel, 'workbookSnapshot')[1].snapshot as {
+            configuration: { gitCompare?: unknown };
+        };
+        expect(snapshot.configuration.gitCompare).toBeUndefined();
+        expect(warning).toHaveBeenCalledTimes(1);
+        expect(error).not.toHaveBeenCalled();
+        expect(log).toHaveBeenCalledWith(
+            'Failed to close unused table source',
+            { code: 'UNKNOWN' },
+        );
+    });
+
+    it('degrades when the original cannot stabilize during validation', async () => {
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const error = vi.spyOn(vscode_mock.window, 'showErrorMessage');
+        const { controller, panel } = open_compare_controller();
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot')).toHaveLength(1));
+
+        let original_stat_calls = 0;
+        vscode_mock.__setStatImplementation(async (uri) => {
+            if (String(uri.fsPath ?? uri).includes('original')) {
+                original_stat_calls += 1;
+                return { size: ORIGINAL.length, mtime: original_stat_calls };
+            }
+            return { size: MODIFIED.length, mtime: 1 };
+        });
+
+        await expect(controller.refresh_if_changed()).resolves.toBe(false);
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot')).toHaveLength(2));
+
+        const snapshot = posted(panel, 'workbookSnapshot')[1].snapshot as {
+            configuration: { gitCompare?: unknown };
+        };
+        expect(snapshot.configuration.gitCompare).toBeUndefined();
+        expect(warning).toHaveBeenCalledTimes(1);
+        expect(error).not.toHaveBeenCalled();
     });
 
     it('refuses an edit session request in compare mode', async () => {

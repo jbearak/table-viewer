@@ -3534,7 +3534,13 @@ export function attach_viewer(
     }
 
     async function build_source(
-        { bypassFileSizeLimit = false }: { bypassFileSizeLimit?: boolean } = {},
+        {
+            bypassFileSizeLimit = false,
+            includeCompareOriginal = true,
+        }: {
+            bypassFileSizeLimit?: boolean;
+            includeCompareOriginal?: boolean;
+        } = {},
     ): Promise<SourceCandidate> {
         const state = (await read_file_state()).state as PerFileState;
         const stat = await host.fs.stat(uri);
@@ -3548,7 +3554,9 @@ export function attach_viewer(
         };
         // The original side builds concurrently with the modified parse; both
         // are independent reads of already-committed bytes.
-        const original_promise = build_compare_original(state);
+        const original_promise = includeCompareOriginal
+            ? build_compare_original(state)
+            : Promise.resolve(undefined);
         let modified: DataSource;
         try {
             modified = await profile.build_source(
@@ -3558,7 +3566,9 @@ export function attach_viewer(
                 load_all_csv_rows ? { loadAllRows: true } : undefined,
             );
         } catch (error) {
-            void original_promise.then((original) => original?.source.close());
+            void original_promise
+                .then((original) => original?.source.close())
+                .catch(() => {});
             throw error;
         }
         const original = await original_promise;
@@ -3655,13 +3665,19 @@ export function attach_viewer(
     async function build_source_with_file_size_decision(
         request: PanelLoadRequest,
         initial: boolean,
+        include_compare_original = true,
     ): Promise<
         | { type: 'candidate'; candidate: SourceCandidate }
         | { type: 'stopped' }
         | { type: 'stale' }
     > {
         try {
-            return { type: 'candidate', candidate: await build_source() };
+            return {
+                type: 'candidate',
+                candidate: await build_source({
+                    includeCompareOriginal: include_compare_original,
+                }),
+            };
         } catch (error) {
             if (!(error instanceof FileSizeLimitExceededError)) throw error;
             if (!load_is_current(request.seq, request.refreshEvent)) return { type: 'stale' };
@@ -3673,7 +3689,10 @@ export function attach_viewer(
             if (choice === 'openAnyway') {
                 return {
                     type: 'candidate',
-                    candidate: await build_source({ bypassFileSizeLimit: true }),
+                    candidate: await build_source({
+                        bypassFileSizeLimit: true,
+                        includeCompareOriginal: include_compare_original,
+                    }),
                 };
             }
             if (choice === 'configure') {
@@ -3685,19 +3704,19 @@ export function attach_viewer(
         }
     }
 
-    async function built_source_is_current(
+    async function built_source_currency(
         seq: number,
         candidate: SourceCandidate,
         refresh_event?: FileRefreshEvent,
-    ): Promise<boolean> {
-        if (!load_is_current(seq, refresh_event)) return false;
+    ): Promise<'current' | 'stale' | 'comparison-stale'> {
+        if (!load_is_current(seq, refresh_event)) return 'stale';
         const { fingerprint, digest } = candidate.observation;
         const stat = await host.fs.stat(uri);
         if (
             !load_is_current(seq, refresh_event)
             || `${stat.mtime}:${stat.size}` !== fingerprint
         ) {
-            return false;
+            return 'stale';
         }
         const raw = await host.fs.read_file(uri);
         const verified_stat = await host.fs.stat(uri);
@@ -3706,23 +3725,31 @@ export function attach_viewer(
             || `${verified_stat.mtime}:${verified_stat.size}` !== fingerprint
             || content_digest(raw) !== digest
         ) {
-            return false;
+            return 'stale';
         }
         const comparison_fingerprint = candidate.observation.comparisonFingerprint;
         const comparison_digest = candidate.observation.comparisonDigest;
         if (!compare_original_uri || !comparison_fingerprint || !comparison_digest) {
-            return true;
+            return 'current';
         }
-        const comparison_stat = await host.fs.stat(compare_original_uri);
-        if (`${comparison_stat.mtime}:${comparison_stat.size}` !== comparison_fingerprint) {
-            return false;
-        }
-        const comparison_raw = await host.fs.read_file(compare_original_uri);
-        const verified_comparison_stat = await host.fs.stat(compare_original_uri);
-        return load_is_current(seq, refresh_event)
-            && `${verified_comparison_stat.mtime}:${verified_comparison_stat.size}`
+        try {
+            const comparison_stat = await host.fs.stat(compare_original_uri);
+            if (`${comparison_stat.mtime}:${comparison_stat.size}` !== comparison_fingerprint) {
+                return 'comparison-stale';
+            }
+            const comparison_raw = await host.fs.read_file(compare_original_uri);
+            const verified_comparison_stat = await host.fs.stat(compare_original_uri);
+            if (!load_is_current(seq, refresh_event)) return 'stale';
+            return `${verified_comparison_stat.mtime}:${verified_comparison_stat.size}`
                 === comparison_fingerprint
-            && content_digest(comparison_raw) === comparison_digest;
+                && content_digest(comparison_raw) === comparison_digest
+                ? 'current'
+                : 'comparison-stale';
+        } catch {
+            // The original is optional. Reject this candidate so a rebuild can
+            // either recover the comparison or use its existing plain-view fallback.
+            return load_is_current(seq, refresh_event) ? 'comparison-stale' : 'stale';
+        }
     }
 
     async function commit_physical_candidate(
@@ -3734,7 +3761,7 @@ export function attach_viewer(
     ): Promise<PhysicalAuthorityCommitResult> {
         if (
             !already_verified
-            && !await built_source_is_current(seq, candidate, refresh_event)
+            && await built_source_currency(seq, candidate, refresh_event) !== 'current'
         ) return { type: 'stale' };
         const { digest } = candidate.observation;
         const started = file_coordinator.begin_physical(
@@ -4606,6 +4633,19 @@ export function attach_viewer(
                 === source_observation?.comparisonDigest;
     }
 
+    function dispose_unadopted_candidate(candidate: SourceCandidate | undefined): void {
+        if (!candidate) return;
+        try {
+            candidate.dispose();
+        } catch (error) {
+            log_sanitized_failure('Failed to close unused table source', error);
+        }
+    }
+
+    function unstable_comparison_error(): Error {
+        return new Error('The original version changed while the comparison was being refreshed.');
+    }
+
     async function run_physical_refresh(
         request: PanelLoadRequest,
         force: boolean,
@@ -4613,30 +4653,41 @@ export function attach_viewer(
         initial = false,
     ): Promise<FileRefreshSubscriberResult> {
         let attempts = 0;
+        let include_compare_original = true;
+        let comparison_fallback_error: Error | undefined;
         let last_error: unknown = new Error('The file changed while it was being refreshed.');
         for (;;) {
             if (!load_is_current(request.seq, request.refreshEvent)) {
                 return inactive_refresh_result();
             }
             let candidate: SourceCandidate | undefined;
+            let comparison_stale = false;
             try {
                 const expected_authority = file_coordinator.authority().authorityRevision;
-                const build = await build_source_with_file_size_decision(request, initial);
+                const build = await build_source_with_file_size_decision(
+                    request,
+                    initial,
+                    include_compare_original,
+                );
                 if (build.type === 'stale') return inactive_refresh_result();
                 if (build.type === 'stopped') return { type: 'completed' };
                 candidate = build.candidate;
                 if (!load_is_current(request.seq, request.refreshEvent)) {
                     return inactive_refresh_result();
                 }
-                if (!await built_source_is_current(
+                const currency = await built_source_currency(
                     request.seq,
                     candidate,
                     request.refreshEvent,
-                )) {
+                );
+                if (currency !== 'current') {
                     if (!load_is_current(request.seq, request.refreshEvent)) {
                         return inactive_refresh_result();
                     }
-                    last_error = new Error('The file changed while it was being refreshed.');
+                    comparison_stale = currency === 'comparison-stale';
+                    last_error = comparison_stale
+                        ? unstable_comparison_error()
+                        : new Error('The file changed while it was being refreshed.');
                 } else if (
                     !force
                     && candidate_matches_acknowledged_source(candidate)
@@ -4658,6 +4709,9 @@ export function attach_viewer(
                             deduplicated.receipt.stateSnapshot,
                             true,
                         );
+                        if (comparison_fallback_error) {
+                            warn_compare_unavailable(comparison_fallback_error);
+                        }
                         return { type: 'completed' };
                     }
                     last_error = new Error('The file authority changed while it was refreshed.');
@@ -4684,7 +4738,12 @@ export function attach_viewer(
                         if (!load_is_current(request.seq, request.refreshEvent)) {
                             return inactive_refresh_result();
                         }
-                        if (adopted) return { type: 'completed' };
+                        if (adopted) {
+                            if (comparison_fallback_error) {
+                                warn_compare_unavailable(comparison_fallback_error);
+                            }
+                            return { type: 'completed' };
+                        }
                     }
                     last_error = new Error('The file authority changed while it was refreshed.');
                 }
@@ -4694,11 +4753,17 @@ export function attach_viewer(
                 }
                 last_error = error;
             } finally {
-                candidate?.dispose();
+                dispose_unadopted_candidate(candidate);
             }
             if (attempts >= RELOAD_RETRY_COUNT) {
                 if (!load_is_current(request.seq, request.refreshEvent)) {
                     return inactive_refresh_result();
+                }
+                if (comparison_stale && include_compare_original) {
+                    include_compare_original = false;
+                    comparison_fallback_error = unstable_comparison_error();
+                    attempts = 0;
+                    continue;
                 }
                 report_refresh_failure(
                     last_error,
@@ -4719,21 +4784,45 @@ export function attach_viewer(
         force: boolean,
         reason: 'ready' | 'fileReload' | 'recovery',
         initial: boolean,
+        include_compare_original = true,
     ): Promise<boolean> {
         if (!load_is_current(request.seq)) return false;
         let candidate: SourceCandidate | undefined;
         try {
             const expected_authority = file_coordinator.authority().authorityRevision;
-            const build = await build_source_with_file_size_decision(request, initial);
+            const build = await build_source_with_file_size_decision(
+                request,
+                initial,
+                include_compare_original,
+            );
             if (build.type !== 'candidate') return false;
             candidate = build.candidate;
-            if (!await built_source_is_current(request.seq, candidate)) {
-                if (
-                    !schedule_local_refresh_retry(request, force, reason, initial)
-                    && load_is_current(request.seq)
-                ) {
+            const currency = await built_source_currency(request.seq, candidate);
+            if (currency !== 'current') {
+                const retry_scheduled = schedule_local_refresh_retry(
+                    request,
+                    force,
+                    reason,
+                    initial,
+                    include_compare_original,
+                );
+                if (!retry_scheduled && load_is_current(request.seq)) {
+                    if (currency === 'comparison-stale' && include_compare_original) {
+                        reset_reload_retry();
+                        dispose_unadopted_candidate(candidate);
+                        candidate = undefined;
+                        return run_local_refresh_attempt(
+                            request,
+                            force,
+                            reason,
+                            initial,
+                            false,
+                        );
+                    }
                     report_refresh_failure(
-                        new Error('The file changed while it was being refreshed.'),
+                        currency === 'comparison-stale'
+                            ? unstable_comparison_error()
+                            : new Error('The file changed while it was being refreshed.'),
                         initial,
                     );
                 }
@@ -4747,11 +4836,20 @@ export function attach_viewer(
                     source_observation = candidate.observation;
                     source_authority = deduplicated.receipt.resultingBasis;
                     update_session_state_material(deduplicated.receipt.stateSnapshot, true);
+                    if (!include_compare_original) {
+                        warn_compare_unavailable(unstable_comparison_error());
+                    }
                     reset_reload_retry();
                     return true;
                 }
                 if (
-                    !schedule_local_refresh_retry(request, force, reason, initial)
+                    !schedule_local_refresh_retry(
+                        request,
+                        force,
+                        reason,
+                        initial,
+                        include_compare_original,
+                    )
                     && load_is_current(request.seq)
                 ) {
                     report_refresh_failure(
@@ -4766,7 +4864,13 @@ export function attach_viewer(
             );
             if (committed.type !== 'committed') {
                 if (
-                    !schedule_local_refresh_retry(request, force, reason, initial)
+                    !schedule_local_refresh_retry(
+                        request,
+                        force,
+                        reason,
+                        initial,
+                        include_compare_original,
+                    )
                     && load_is_current(request.seq)
                 ) {
                     report_refresh_failure(
@@ -4784,16 +4888,25 @@ export function attach_viewer(
                 editing_supported ? await read_file_state() : undefined,
             );
             if (!adopted) return false;
+            if (!include_compare_original) {
+                warn_compare_unavailable(unstable_comparison_error());
+            }
             reset_reload_retry();
             return true;
         } catch (error) {
             if (!load_is_current(request.seq)) return false;
-            if (!schedule_local_refresh_retry(request, force, reason, initial)) {
+            if (!schedule_local_refresh_retry(
+                request,
+                force,
+                reason,
+                initial,
+                include_compare_original,
+            )) {
                 report_refresh_failure(error, initial);
             }
             return false;
         } finally {
-            candidate?.dispose();
+            dispose_unadopted_candidate(candidate);
         }
     }
 
@@ -4847,6 +4960,7 @@ export function attach_viewer(
         force: boolean,
         reason: 'ready' | 'fileReload' | 'recovery',
         initial: boolean,
+        include_compare_original: boolean,
     ): boolean {
         if (
             !load_is_current(request.seq)
@@ -4859,7 +4973,15 @@ export function attach_viewer(
         reload_retry_timer = setTimeout(() => {
             reload_retry_timer = undefined;
             if (load_is_current(request.seq)) {
-                void run_local_refresh_attempt(request, force, reason, initial);
+                void run_local_refresh_attempt(
+                    request,
+                    force,
+                    reason,
+                    initial,
+                    include_compare_original,
+                ).catch((error: unknown) => {
+                    log_sanitized_failure('Failed to retry table viewer refresh', error);
+                });
             }
         }, RELOAD_RETRY_MS);
         return true;

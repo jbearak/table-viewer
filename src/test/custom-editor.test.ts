@@ -615,6 +615,57 @@ describe('register_table_viewer', () => {
         await registration.drain();
     });
 
+    it('coalesces concurrent opens for the same comparison', async () => {
+        const registration = register_table_viewer(context(), state_store());
+        const modified = vscode_mock.Uri.file('/repo/data.csv') as unknown as vscode.Uri;
+        const original = vscode_mock.Uri.file('/repo/data.csv').with({
+            scheme: 'git',
+            query: JSON.stringify({ path: '/repo/data.csv', ref: '~' }),
+        }) as unknown as vscode.Uri;
+        let release_open!: () => void;
+        const open_gate = new Promise<void>((resolve) => { release_open = resolve; });
+        const open_with = vi.fn(async () => open_gate);
+        vscode_mock.__setCommand('vscode.openWith', open_with);
+
+        const first = registration.openTableDiff({ modified, original });
+        const second = registration.openTableDiff({ modified, original });
+
+        expect(open_with).toHaveBeenCalledOnce();
+        release_open();
+        await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined]);
+        registration.dispose();
+        await registration.drain();
+    });
+
+    it('allows a comparison open to retry after a shared failure', async () => {
+        const registration = register_table_viewer(context(), state_store());
+        const modified = vscode_mock.Uri.file('/repo/data.csv') as unknown as vscode.Uri;
+        const original = vscode_mock.Uri.file('/repo/data.csv').with({
+            scheme: 'git',
+            query: JSON.stringify({ path: '/repo/data.csv', ref: '~' }),
+        }) as unknown as vscode.Uri;
+        const failure = new Error('open failed');
+        const open_with = vi.fn()
+            .mockRejectedValueOnce(failure)
+            .mockResolvedValueOnce(undefined);
+        vscode_mock.__setCommand('vscode.openWith', (...args) => open_with(...args));
+
+        const results = await Promise.allSettled([
+            registration.openTableDiff({ modified, original }),
+            registration.openTableDiff({ modified, original }),
+        ]);
+
+        expect(open_with).toHaveBeenCalledOnce();
+        expect(results).toEqual([
+            { status: 'rejected', reason: failure },
+            { status: 'rejected', reason: failure },
+        ]);
+        await expect(registration.openTableDiff({ modified, original })).resolves.toBeUndefined();
+        expect(open_with).toHaveBeenCalledTimes(2);
+        registration.dispose();
+        await registration.drain();
+    });
+
     it('refreshes a retained comparison only when either side changed', async () => {
         const modified_bytes = Buffer.from('a\n2\n');
         let original_bytes = Buffer.from('a\n1\n');
@@ -787,8 +838,8 @@ describe('register_table_viewer', () => {
         const unrelated: vscode_mock.MockTab = { label: 'notes.txt', input: undefined };
         const diff_tab: vscode_mock.MockTab = { label: 'data.csv', input: undefined };
         vscode_mock.__setTabGroups([
-            { viewColumn: vscode_mock.ViewColumn.One, tabs: [unrelated] },
             { viewColumn: vscode_mock.ViewColumn.Two, tabs: [diff_tab] },
+            { viewColumn: vscode_mock.ViewColumn.One, tabs: [unrelated] },
         ], vscode_mock.ViewColumn.One);
         const replace_native_diff = vi.fn();
         const registration = register_table_viewer(context(), state_store(), {
@@ -805,7 +856,7 @@ describe('register_table_viewer', () => {
             const panel = vscode_mock.window.createWebviewPanel(
                 'tableViewer.editor',
                 'data.csv',
-                vscode_mock.ViewColumn.Two,
+                vscode_mock.ViewColumn.Beside,
             ) as unknown as vscode.WebviewPanel;
             await provider.resolveCustomEditor(
                 await provider.openCustomDocument(uri),
@@ -813,6 +864,10 @@ describe('register_table_viewer', () => {
             );
         }
 
+        expect(vscode_mock.__getPanels().map((panel) => panel.viewColumn)).toEqual([
+            vscode_mock.ViewColumn.Two,
+            vscode_mock.ViewColumn.Two,
+        ]);
         expect(replace_native_diff).toHaveBeenCalledOnce();
         expect(replace_native_diff).toHaveBeenCalledWith(diff_tab, { original, modified });
         registration.dispose();

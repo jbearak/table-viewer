@@ -128,7 +128,9 @@ export function table_diff_document_uris(uri: vscode.Uri): TableDiffUris | undef
 
 /** The editable working-tree resource associated with a recognized Git comparison. */
 export function table_diff_working_tree_uri(diff: TableDiffUris): vscode.Uri {
-    return diff.modified.scheme === 'file'
-        ? diff.modified
+    if (diff.modified.scheme === 'file') return diff.modified;
+    const query = git_uri_query(diff.modified);
+    return query
+        ? vscode.Uri.file(query.path)
         : diff.modified.with({ scheme: 'file', query: '', fragment: '' });
 }
