@@ -580,6 +580,26 @@ describe('register_table_viewer', () => {
         expect(file_snapshot.configuration.gitCompare).toBeDefined();
         expect(file_snapshot.capabilities.csvEditingSupported).toBe(false);
 
+        // End to end: the compare side answers a row request with a
+        // compareDiff sidecar naming the cell that actually differs.
+        await file_panel.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 10,
+            requestId: 'rows-1',
+            generation: (file_snapshot as { generation?: number }).generation ?? 1,
+        });
+        await vi.waitFor(() => expect(file_panel.__messages.some((message) => (
+            typeof message === 'object' && message !== null
+            && 'type' in message && message.type === 'compareDiff'
+        ))).toBe(true));
+        const diff = file_panel.__messages.find((message) => (
+            typeof message === 'object' && message !== null
+            && 'type' in message && message.type === 'compareDiff'
+        )) as { changedCells: unknown };
+        expect(diff.changedCells).toEqual([{ row: 0, col: 0, base: '1' }]);
+
         // Read-only panels never open edit sessions, so disposal sends no
         // pending-edits flush request to wait on.
         registration.dispose();

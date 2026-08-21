@@ -991,6 +991,59 @@ describe('initial render', () => {
     });
 });
 
+describe('git compare mode', () => {
+    function compare_snapshot(sheet_names: string[], statuses: ('matched' | 'added' | 'deleted')[]) {
+        return initial_snapshot_message(make_meta(sheet_names), {
+            configuration: {
+                gitCompare: {
+                    pairings: [],
+                    sheetStatuses: statuses,
+                    changedColumnNames: sheet_names.map(() => []),
+                },
+            },
+        });
+    }
+
+    it('offers no Edit or Diff buttons and marks the grid as comparing', async () => {
+        await render_app();
+        await dispatch_host_message(compare_snapshot(['Sheet1'], ['matched']));
+        const labels = Array.from(document.querySelectorAll('button'))
+            .map((button) => button.textContent);
+        expect(labels).not.toContain('Edit');
+        expect(labels).not.toContain('Diff');
+        expect(grid_shell_mock.latest_props?.git_compare).toBe(true);
+    });
+
+    it('badges sheets that exist on only one side of the compare', async () => {
+        await render_app();
+        await dispatch_host_message(
+            compare_snapshot(['Kept', 'New', 'Gone'], ['matched', 'added', 'deleted']),
+        );
+        const badges = Array.from(document.querySelectorAll('.sheet-tab-badge'));
+        expect(badges.map((badge) => badge.className)).toEqual([
+            'sheet-tab-badge sheet-tab-badge-added',
+            'sheet-tab-badge sheet-tab-badge-deleted',
+        ]);
+        expect(badges.map((badge) => badge.textContent)).toEqual(['+', '−']);
+    });
+
+    it('threads the active sheet\'s changed headers into the grid', async () => {
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {
+            configuration: {
+                gitCompare: {
+                    pairings: [],
+                    sheetStatuses: ['matched'],
+                    changedColumnNames: [[{ col: 0, base: 'old name' }]],
+                },
+            },
+        }));
+        expect(grid_shell_mock.latest_props?.compare_changed_column_names).toEqual(
+            [{ col: 0, base: 'old name' }],
+        );
+    });
+});
+
 describe('cell highlight clear-all wiring', () => {
     it('posts a selection-free command and resolves pending from its response', async () => {
         const { post_message } = await render_app();
