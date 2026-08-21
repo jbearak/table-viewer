@@ -254,6 +254,10 @@ export class ViewerPanelCore {
     private readonly on_invalid_restore?: InvalidRestoreCleanup;
     private readonly durable_pending_edit_keys?: (sheet_index: number) => readonly string[];
     private readonly durable_row_heights?: DurableRowHeightsProvider;
+    private readonly on_row_window_served?: (
+        msg: Extract<WebviewMessage, { type: 'requestRows' }>,
+        window: TransformedRowWindow,
+    ) => void;
     /**
      * The last computed display-keyed projection, with the facts it is a function of.
      * See `row_height_projection_by_sheet` for why each is needed and why a memo is
@@ -313,6 +317,16 @@ export class ViewerPanelCore {
              * the correct answer for a file that has none.
              */
             durableRowHeights?: DurableRowHeightsProvider;
+            /**
+             * Observe each row window the core serves, after `rowData` posts.
+             * The window is the resolved one — clamped and transform-projected —
+             * so an augmenting sidecar (git compare's `compareDiff`) describes
+             * exactly the rows the renderer received, not the raw request.
+             */
+            onRowWindowServed?: (
+                msg: Extract<WebviewMessage, { type: 'requestRows' }>,
+                window: TransformedRowWindow,
+            ) => void;
         },
     ) {
         this.max_cached_pages = opts?.maxCachedPages ?? DEFAULT_MAX_CACHED_PAGES;
@@ -323,6 +337,7 @@ export class ViewerPanelCore {
         this.on_invalid_restore = opts?.onInvalidRestore;
         this.durable_pending_edit_keys = opts?.durablePendingEditKeys;
         this.durable_row_heights = opts?.durableRowHeights;
+        this.on_row_window_served = opts?.onRowWindowServed;
     }
 
     get generation(): number {
@@ -1628,6 +1643,7 @@ export class ViewerPanelCore {
             requestId: msg.requestId,
             generation: this._generation,
         });
+        this.on_row_window_served?.(msg, window);
     }
 
     private evict_excess(): void {
@@ -1705,6 +1721,10 @@ export function adopt_source_into_core(
         onInvalidRestore?: InvalidRestoreCleanup;
         durablePendingEditKeys?: (sheet_index: number) => readonly string[];
         durableRowHeights?: DurableRowHeightsProvider;
+        onRowWindowServed?: (
+            msg: Extract<WebviewMessage, { type: 'requestRows' }>,
+            window: TransformedRowWindow,
+        ) => void;
     },
     on_installed?: (installed: ViewerPanelCore) => void,
 ): AdoptSourceIntoCoreResult {

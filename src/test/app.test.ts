@@ -16,6 +16,7 @@ import type { WorkbookMeta } from '../data-source/interface';
 import type { WorkbookSnapshot } from '../viewer-snapshot';
 import type { EditSessionStore } from '../webview/edit-session-store';
 import type { GridShellProps } from '../webview/grid-shell';
+import { find_button } from './helpers/dom-interaction';
 import { sheet_edits } from './pending-edits-helper';
 
 const grid_shell_mock = vi.hoisted(() => ({
@@ -992,6 +993,56 @@ describe('initial render', () => {
 
         await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1'])));
         expect(grid_stub().getAttribute('data-generation')).toBe('2');
+    });
+});
+
+describe('git compare mode', () => {
+    function compare_snapshot(sheet_names: string[], statuses: ('matched' | 'added' | 'deleted')[]) {
+        return initial_snapshot_message(make_meta(sheet_names), {
+            configuration: {
+                gitCompare: {
+                    pairings: [],
+                    sheetStatuses: statuses,
+                    changedColumnNames: sheet_names.map(() => []),
+                },
+            },
+        });
+    }
+
+    it('offers no Edit or Diff buttons and marks the grid as comparing', async () => {
+        await render_app();
+        await dispatch_host_message(compare_snapshot(['Sheet1'], ['matched']));
+        expect(find_button((text) => text === 'Edit')).toBeUndefined();
+        expect(find_button((text) => text === 'Diff')).toBeUndefined();
+        expect(grid_shell_mock.latest_props?.git_compare).toBe(true);
+    });
+
+    it('badges sheets that exist on only one side of the compare', async () => {
+        await render_app();
+        await dispatch_host_message(
+            compare_snapshot(['Kept', 'New', 'Gone'], ['matched', 'added', 'deleted']),
+        );
+        const badges = Array.from(document.querySelectorAll('.sheet-tab-badge'));
+        expect(badges).toHaveLength(2);
+        expect(badges[0].classList.contains('sheet-tab-badge-added')).toBe(true);
+        expect(badges[1].classList.contains('sheet-tab-badge-deleted')).toBe(true);
+        expect(badges.map((badge) => badge.textContent)).toEqual(['+', '−']);
+    });
+
+    it('threads the active sheet\'s changed headers into the grid', async () => {
+        await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {
+            configuration: {
+                gitCompare: {
+                    pairings: [],
+                    sheetStatuses: ['matched'],
+                    changedColumnNames: [[{ col: 0, base: 'old name' }]],
+                },
+            },
+        }));
+        expect(grid_shell_mock.latest_props?.compare_changed_column_names).toEqual(
+            [{ col: 0, base: 'old name' }],
+        );
     });
 });
 

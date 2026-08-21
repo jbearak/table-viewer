@@ -1828,6 +1828,10 @@ export type HostMessage =
     | { type: 'editCommand'; command: 'copy' | 'selectAll' | 'undo' | 'redo' }
     | { type: 'workbookSnapshot'; snapshot: WorkbookSnapshot }
     | { type: 'rowData'; sheetIndex: number; startRow: number; rows: (RenderedCell | null)[][]; sourceRows: number[]; requestId: string; generation: number }
+    /** Git compare mode: sparse positional diff for the same page a rowData
+     *  answered. `rowStatus[i]` describes row `startRow + i`; `changedCells`
+     *  carries only differing cells with the original (`base`) text. */
+    | { type: 'compareDiff'; sheetIndex: number; startRow: number; rowStatus: ('same' | 'added' | 'deleted')[]; changedCells: { row: number; col: number; base: string }[]; requestId: string; generation: number }
     | { type: 'scrollToRow'; row: number }
     | { type: 'saveOperationStarted'; lifecycle: ActiveCsvSaveLifecycle }
     | {

@@ -1,14 +1,30 @@
 import type { RenderedCell } from '../data-source/interface';
 import type { HostMessage, WebviewMessage } from '../types';
+import type { CompareRowStatus } from '../diff-compare/compare-source';
 import { PAGE_SIZE, get_needed_page_starts } from './grid-model';
 
 type PostFn = (msg: WebviewMessage) => void;
 type RowDataMsg = Extract<HostMessage, { type: 'rowData' }>;
+type CompareDiffMsg = Extract<HostMessage, { type: 'compareDiff' }>;
 type Row = (RenderedCell | null)[];
+
+/** One display row's git-compare diff: its band, and the original-side text of
+ *  its changed cells keyed by canonical source column. */
+export interface CompareRowDiff {
+    readonly status?: Exclude<CompareRowStatus, 'same'>;
+    readonly bases?: ReadonlyMap<number, string>;
+}
 
 interface CachedPage {
     readonly rows: Row[];
     readonly source_rows: number[];
+    /** The requestRows id this page answered — the compareDiff sidecar echoes
+     *  it, which is what pairs the diff to exactly this delivery. */
+    readonly request_id: string;
+    /** Git-compare sidecar for this page's rows, by offset. Ingested after the
+     *  page (the host posts compareDiff right behind rowData), and living on
+     *  the page so eviction, clear, and replacement can never strand it. */
+    compare_rows?: (CompareRowDiff | undefined)[];
 }
 
 let next_loader_id = 0;
@@ -274,6 +290,7 @@ export class RowLoader {
         const page: CachedPage = {
             rows: msg.rows,
             source_rows: msg.sourceRows,
+            request_id: msg.requestId,
         };
         this.pending.delete(start);
         // Retract-before-insert. A page replaced in place must give up the claims
@@ -299,6 +316,53 @@ export class RowLoader {
         this.on_change();
         this.settle_load_waiters();
         return true;
+    }
+
+    /**
+     * Ingest the git-compare sidecar the host posts right behind a `rowData`
+     * window. It attaches to the resident page whose `requestId` it echoes, so
+     * it can never describe rows other than the ones that delivery carried —
+     * and it shares that page's whole lifecycle (LRU, clear, replacement) for
+     * free. Returns false (and ignores) when no such page is resident.
+     */
+    on_compare_diff(msg: CompareDiffMsg): boolean {
+        if (msg.generation !== this._generation) return false;
+        if (msg.sheetIndex !== this.sheet_index) return false;
+        const page = this.pages.get(msg.startRow);
+        if (page === undefined || page.request_id !== msg.requestId) return false;
+        if (!Array.isArray(msg.rowStatus) || !Array.isArray(msg.changedCells)) return false;
+        const records: ({ status?: 'added' | 'deleted'; bases?: Map<number, string> } | undefined)[] =
+            new Array<undefined>(page.rows.length);
+        for (let offset = 0; offset < msg.rowStatus.length && offset < page.rows.length; offset++) {
+            const status = msg.rowStatus[offset];
+            if (status === 'added' || status === 'deleted') records[offset] = { status };
+        }
+        for (const cell of msg.changedCells) {
+            const offset = cell.row - msg.startRow;
+            if (!Number.isSafeInteger(offset) || offset < 0 || offset >= page.rows.length) continue;
+            if (!Number.isSafeInteger(cell.col) || cell.col < 0) continue;
+            if (typeof cell.base !== 'string') continue;
+            const record = records[offset] ?? (records[offset] = {});
+            (record.bases ?? (record.bases = new Map())).set(cell.col, cell.base);
+        }
+        page.compare_rows = records;
+        this.on_change();
+        return true;
+    }
+
+    /** Git-compare band ('added'/'deleted') for a display row, when resident. */
+    get_compare_status(row: number): CompareRowDiff['status'] | undefined {
+        return this.compare_row(row)?.status;
+    }
+
+    /** Original-side text of a changed cell in git compare mode, when resident. */
+    get_compare_base(row: number, col: number): string | undefined {
+        return this.compare_row(row)?.bases?.get(col);
+    }
+
+    private compare_row(row: number): CompareRowDiff | undefined {
+        const location = this.locate(row);
+        return location?.page.compare_rows?.[location.offset];
     }
 
     /**

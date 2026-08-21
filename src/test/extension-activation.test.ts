@@ -21,6 +21,8 @@ const seams = vi.hoisted(() => ({
     openSheetResult: true,
     openSheetError: undefined as Error | undefined,
     openSheetArgs: undefined as { uri: unknown; sheetName: string } | undefined,
+    openDiffError: undefined as Error | undefined,
+    openDiffArgs: undefined as { uri: unknown; originalUri: unknown } | undefined,
 }));
 
 vi.mock('../custom-editor', () => ({
@@ -41,6 +43,10 @@ vi.mock('../custom-editor', () => ({
                 seams.openSheetArgs = { uri, sheetName };
                 if (seams.openSheetError) throw seams.openSheetError;
                 return seams.openSheetResult;
+            },
+            async openTableDiff(uri: unknown, originalUri: unknown) {
+                seams.openDiffArgs = { uri, originalUri };
+                if (seams.openDiffError) throw seams.openDiffError;
             },
         };
     },
@@ -114,6 +120,8 @@ beforeEach(async () => {
     seams.openSheetResult = true;
     seams.openSheetError = undefined;
     seams.openSheetArgs = undefined;
+    seams.openDiffError = undefined;
+    seams.openDiffArgs = undefined;
 });
 
 afterEach(async () => {
@@ -141,6 +149,7 @@ describe('VS Code activation', () => {
             'tableViewer.openCsvTable',
             'tableViewer.openAsText',
             'tableViewer.openWorkbookAtSheet',
+            'tableViewer.openTableDiff',
             'tableViewer.manageStoredFileState',
         ]);
     });
@@ -178,6 +187,81 @@ describe('VS Code activation', () => {
             args,
         )).resolves.toBe(false);
         expect(warning).toHaveBeenCalledWith('Worksheet "Table A1" was not found.');
+    });
+
+    it('opens a table diff for an SCM resource state against its git original', async () => {
+        await activate(context());
+        const uri = vscode_mock.Uri.file('/repo/data.csv');
+
+        await vscode_mock.commands.executeCommand(
+            'tableViewer.openTableDiff',
+            { resourceUri: uri },
+        );
+
+        expect(seams.openDiffArgs).toMatchObject({
+            uri: expect.objectContaining({ scheme: 'file', path: '/repo/data.csv' }),
+            originalUri: expect.objectContaining({
+                scheme: 'git',
+                query: JSON.stringify({ path: '/repo/data.csv', ref: '~' }),
+            }),
+        });
+    });
+
+    it('prefers the git extension API for the original URI when available', async () => {
+        await activate(context());
+        const api_uri = vscode_mock.Uri.file('/repo/data.csv')
+            .with({ scheme: 'git', query: 'from-api' });
+        vscode_mock.__setExtension('vscode.git', {
+            exports: {
+                getAPI: () => ({ toGitUri: (_uri: unknown, ref: string) => {
+                    expect(ref).toBe('~');
+                    return api_uri;
+                } }),
+            },
+        });
+
+        await vscode_mock.commands.executeCommand(
+            'tableViewer.openTableDiff',
+            { resourceUri: vscode_mock.Uri.file('/repo/data.csv') },
+        );
+
+        expect(seams.openDiffArgs?.originalUri).toBe(api_uri);
+    });
+
+    it('refuses a table diff for a file missing from the working tree', async () => {
+        await activate(context());
+        vscode_mock.__setStatImplementation(async () => {
+            throw new Error('ENOENT');
+        });
+        const show_error = vi.spyOn(vscode_mock.window, 'showErrorMessage');
+
+        await expect(vscode_mock.commands.executeCommand(
+            'tableViewer.openTableDiff',
+            { resourceUri: vscode_mock.Uri.file('/repo/gone.csv') },
+        )).rejects.toThrow('no longer exists in the working tree');
+        expect(show_error).toHaveBeenCalledOnce();
+        expect(seams.openDiffArgs).toBeUndefined();
+    });
+
+    it('ignores a table diff invocation with no file target', async () => {
+        await activate(context());
+
+        await vscode_mock.commands.executeCommand('tableViewer.openTableDiff', {});
+
+        expect(seams.openDiffArgs).toBeUndefined();
+    });
+
+    it('reports a table diff open failure and preserves the rejection', async () => {
+        await activate(context());
+        const error = new Error('diff could not open');
+        seams.openDiffError = error;
+        const show_error = vi.spyOn(vscode_mock.window, 'showErrorMessage');
+
+        await expect(vscode_mock.commands.executeCommand(
+            'tableViewer.openTableDiff',
+            { resourceUri: vscode_mock.Uri.file('/repo/data.csv') },
+        )).rejects.toBe(error);
+        expect(show_error).toHaveBeenCalledWith('diff could not open');
     });
 
     it('reports a workbook open failure and preserves the command rejection', async () => {

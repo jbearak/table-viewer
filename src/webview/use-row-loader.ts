@@ -39,6 +39,10 @@ export interface UseRowLoader {
     get_cell_for_source(source_row: number, col: number): RenderedCell | null | undefined;
     /** Whether a canonical source row is currently resident on some cached page. */
     has_source_row(source_row: number): boolean;
+    /** Git-compare band ('added'/'deleted') for a display row, when resident. */
+    get_compare_status(row: number): 'added' | 'deleted' | undefined;
+    /** Original-side text of a changed cell in git compare mode, when resident. */
+    get_compare_base(row: number, col: number): string | undefined;
     /** Up to `max` resident rows for sampling (column auto-fit). */
     sample_loaded_rows(max: number): (RenderedCell | null)[][];
     /** Bumps on every ingested page so consumers can re-key Glide redraws. */
@@ -76,6 +80,7 @@ export function use_row_loader(
             if (data === null || typeof data !== 'object') return;
             const msg = data as HostMessage;
             if (msg.type === 'rowData') loader.on_row_data(msg);
+            else if (msg.type === 'compareDiff') loader.on_compare_diff(msg);
         };
         window.addEventListener('message', handler);
         return () => window.removeEventListener('message', handler);
@@ -108,6 +113,14 @@ export function use_row_loader(
         [loader],
     );
     const has_source_row = useCallback((source_row: number) => loader.has_source_row(source_row), [loader]);
+    const get_compare_status = useCallback(
+        (row: number) => loader.get_compare_status(row),
+        [loader],
+    );
+    const get_compare_base = useCallback(
+        (row: number, col: number) => loader.get_compare_base(row, col),
+        [loader],
+    );
     const sample_loaded_rows = useCallback((max: number) => loader.sample_loaded_rows(max), [loader]);
 
     return {
@@ -120,6 +133,8 @@ export function use_row_loader(
         get_cell_raw_for_source,
         get_cell_for_source,
         has_source_row,
+        get_compare_status,
+        get_compare_base,
         sample_loaded_rows,
         version,
     };

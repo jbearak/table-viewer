@@ -787,4 +787,120 @@ describe('RowLoader', () => {
             expect(reqs.some((r) => r.startRow === 0)).toBe(false);
         });
     });
+
+    describe('compare sidecar', () => {
+        type CompareDiff = Extract<HostMessage, { type: 'compareDiff' }>;
+        function compare_diff(
+            startRow: number,
+            requestId: string,
+            rowStatus: CompareDiff['rowStatus'],
+            changedCells: CompareDiff['changedCells'] = [],
+            overrides: Partial<CompareDiff> = {},
+        ): CompareDiff {
+            return {
+                type: 'compareDiff',
+                sheetIndex: 0,
+                startRow,
+                rowStatus,
+                changedCells,
+                requestId,
+                generation: 1,
+                ...overrides,
+            };
+        }
+
+        function loaded_loader(): { loader: RowLoader; post: ReturnType<typeof vi.fn> } {
+            const post = vi.fn();
+            const loader = new RowLoader(post, () => {});
+            loader.configure(0, 1_000, 1);
+            loader.ensure_rows(0, 10);
+            loader.on_row_data(reply_for(post, 0, 0, 1));
+            return { loader, post };
+        }
+
+        it('answers row status and cell bases from an ingested sidecar', () => {
+            const { loader, post } = loaded_loader();
+            expect(loader.on_compare_diff(compare_diff(
+                0,
+                last_request(post, 0).requestId,
+                ['same', 'added', 'deleted'],
+                [{ row: 0, col: 1, base: 'old' }],
+            ))).toBe(true);
+            expect(loader.get_compare_status(0)).toBeUndefined();
+            expect(loader.get_compare_status(1)).toBe('added');
+            expect(loader.get_compare_status(2)).toBe('deleted');
+            expect(loader.get_compare_base(0, 1)).toBe('old');
+            expect(loader.get_compare_base(0, 0)).toBeUndefined();
+        });
+
+        it('bumps on_change when a sidecar lands so the grid repaints', () => {
+            const post = vi.fn();
+            const on_change = vi.fn();
+            const loader = new RowLoader(post, on_change);
+            loader.configure(0, 1_000, 1);
+            loader.ensure_rows(0, 10);
+            loader.on_row_data(reply_for(post, 0, 0, 1));
+            on_change.mockClear();
+            loader.on_compare_diff(compare_diff(
+                0, last_request(post, 0).requestId, ['added']));
+            expect(on_change).toHaveBeenCalledTimes(1);
+        });
+
+        it('drops a sidecar whose requestId does not match the resident page', () => {
+            const { loader } = loaded_loader();
+            expect(loader.on_compare_diff(
+                compare_diff(0, 'someone-else', ['added']),
+            )).toBe(false);
+            expect(loader.get_compare_status(0)).toBeUndefined();
+        });
+
+        it('drops stale-generation and wrong-sheet sidecars', () => {
+            const { loader, post } = loaded_loader();
+            const id = last_request(post, 0).requestId;
+            expect(loader.on_compare_diff(
+                compare_diff(0, id, ['added'], [], { generation: 2 }),
+            )).toBe(false);
+            expect(loader.on_compare_diff(
+                compare_diff(0, id, ['added'], [], { sheetIndex: 3 }),
+            )).toBe(false);
+            expect(loader.get_compare_status(0)).toBeUndefined();
+        });
+
+        it('drops a sidecar for a page that is not resident', () => {
+            const { loader } = loaded_loader();
+            expect(loader.on_compare_diff(
+                compare_diff(PAGE_SIZE, 'anything', ['added']),
+            )).toBe(false);
+        });
+
+        it('dies with its page: clear() forgets the compare data', () => {
+            const { loader, post } = loaded_loader();
+            loader.on_compare_diff(compare_diff(
+                0,
+                last_request(post, 0).requestId,
+                ['added'],
+                [{ row: 0, col: 0, base: 'b' }],
+            ));
+            loader.configure(1, 1_000, 1); // sheet switch clears
+            expect(loader.get_compare_status(0)).toBeUndefined();
+            expect(loader.get_compare_base(0, 0)).toBeUndefined();
+        });
+
+        it('ignores out-of-page and malformed changed cells', () => {
+            const { loader, post } = loaded_loader();
+            expect(loader.on_compare_diff(compare_diff(
+                0,
+                last_request(post, 0).requestId,
+                ['same'],
+                [
+                    { row: -1, col: 0, base: 'x' },
+                    { row: PAGE_SIZE + 5, col: 0, base: 'x' },
+                    { row: 0, col: -2, base: 'x' },
+                    { row: 0, col: 1, base: 'kept' },
+                ],
+            ))).toBe(true);
+            expect(loader.get_compare_base(0, 1)).toBe('kept');
+            expect(loader.get_compare_base(0, 0)).toBeUndefined();
+        });
+    });
 });

@@ -259,7 +259,16 @@ function dirty_value_overlay_fields(
 }
 
 import { use_row_loader } from './use-row-loader';
-import { theme_font_size_px, use_vscode_theme } from './vscode-theme';
+import { theme_font_size_px, tint_from_color, use_vscode_theme } from './vscode-theme';
+
+/** Alpha of the whole-row band behind added/deleted rows in git compare mode.
+ *  Painted under cell text like the edit tints (see DIRTY_TINT_ALPHA), so
+ *  legibility must not depend on the theme's own alpha choices. */
+const COMPARE_BAND_ALPHA = 0.12;
+/** Band fallbacks when the theme's git decoration foregrounds are unparseable
+ *  (named colors) — conventional diff green/red at the band alpha. */
+const COMPARE_ADDED_BG_FALLBACK = `rgba(76, 175, 80, ${COMPARE_BAND_ALPHA})`;
+const COMPARE_DELETED_BG_FALLBACK = `rgba(229, 75, 75, ${COMPARE_BAND_ALPHA})`;
 import { host_bridge, pending_edit_durability } from './host-bridge';
 import { scroll_preview_to_row } from './preview-scroll';
 import './glide-data-grid/styles.css';
@@ -413,6 +422,14 @@ export interface GridShellProps {
     /** Diff toolbar toggle: dirty cells paint before/after instead of just the
      *  new value. App-owned so it survives Edit off/on within the session. */
     diff_mode?: boolean;
+    /** Git compare mode: host posts a compareDiff page beside every rowData
+     *  window; changed cells paint before/after and added/deleted rows get a
+     *  band tint. Read-only — App withdraws editing when this is on. */
+    git_compare?: boolean;
+    /** Compare-mode header diffs for this sheet: promoted column names live
+     *  outside the row space, so a header-only edit never reaches the per-cell
+     *  diff. Changed headers are annotated in the column title instead. */
+    compare_changed_column_names?: readonly { col: number; base: string }[];
     /** Parent-owned identity of the committed edit-mode activation. */
     edit_activation_id: number;
     csv_editable?: boolean;
@@ -556,6 +573,8 @@ export function GridShell({
     preview_mode = false,
     edit_mode = false,
     diff_mode = false,
+    git_compare = false,
+    compare_changed_column_names,
     edit_activation_id,
     csv_editable = false,
     highlight_in_flight = false,
@@ -618,6 +637,16 @@ export function GridShell({
     const diff_colors = useMemo(
         () => ({ deleted: diff_deleted_fg, added: diff_added_fg }),
         [diff_deleted_fg, diff_added_fg],
+    );
+    // Band tints for whole added/deleted rows, derived from the same theme
+    // foregrounds as the diff text so they track the active theme together.
+    const compare_row_bgs = useMemo(
+        () => ({
+            added: tint_from_color(diff_added_fg, COMPARE_BAND_ALPHA, COMPARE_ADDED_BG_FALLBACK),
+            deleted: tint_from_color(
+                diff_deleted_fg, COMPARE_BAND_ALPHA, COMPARE_DELETED_BG_FALLBACK),
+        }),
+        [diff_added_fg, diff_deleted_fg],
     );
     // The configured font size, resolved once from the theme so cell painting,
     // canvas measurement, and default row heights all agree.
@@ -710,12 +739,34 @@ export function GridShell({
     }) | null>(null);
 
     const columns = useMemo<GridColumn[]>(
-        () => build_grid_columns(
+        () => {
+            const built = build_grid_columns(
+                visible_source_columns,
+                column_widths,
+                sheet_meta.columnNames,
+            );
+            if (!compare_changed_column_names?.length) return built;
+            // Promoted headers live outside the row space, so a header-only
+            // change never reaches the per-cell diff; annotate the title with
+            // the original name instead.
+            const base_by_col = new Map(compare_changed_column_names
+                .map(({ col, base }) => [col, base]));
+            return built.map((column, display_index) => {
+                const source_column = visible_source_columns[display_index];
+                const base = source_column === undefined
+                    ? undefined
+                    : base_by_col.get(source_column);
+                return base === undefined
+                    ? column
+                    : { ...column, title: `${column.title} (was: ${base || 'blank'})` };
+            });
+        },
+        [
             visible_source_columns,
             column_widths,
             sheet_meta.columnNames,
-        ),
-        [visible_source_columns, column_widths, sheet_meta.columnNames],
+            compare_changed_column_names,
+        ],
     );
 
     const sort_metadata = useMemo(
@@ -779,6 +830,8 @@ export function GridShell({
         get_source_row,
         get_cell_raw_for_source,
         get_cell_for_source,
+        get_compare_status,
+        get_compare_base,
         sample_loaded_rows,
         version,
     } = loader;
@@ -2463,8 +2516,21 @@ export function GridShell({
             )
                 ? history_flash_rgba(high_contrast)
                 : undefined;
+            // Git compare paint state: a whole-row band for added/deleted rows,
+            // and a per-cell before/after via the same diff_base channel the
+            // Diff toggle uses. Deleted rows carry the original content as the
+            // row itself (see CompareDataSource.read_rows), struck through by
+            // the `compare_deleted` overlay flag.
+            const compare_status = git_compare ? get_compare_status(row) : undefined;
+            const compare_base = git_compare
+                ? get_compare_base(row, source_column)
+                : undefined;
+            const compare_bg = compare_status !== undefined
+                ? compare_row_bgs[compare_status]
+                : undefined;
             let overlay: CellEditOverlay | undefined;
-            if (editable_cells || dirty || highlight_bg || flash_bg) {
+            if (editable_cells || dirty || highlight_bg || flash_bg
+                || compare_bg || compare_base !== undefined) {
                 overlay = {
                     editable,
                     ...(edit_value !== undefined ? { edit_value } : {}),
@@ -2476,6 +2542,12 @@ export function GridShell({
                     // plain view state independent of edit mode.
                     refused: editable_cells && source_row === undefined,
                     ...(dirty ? dirty_value_overlay_fields(dirty, diff_mode) : {}),
+                    // Compare's before-text rides the Diff toggle's channel; no
+                    // dirty_value, so the "after" side is the cell's own text.
+                    ...(compare_base !== undefined ? { diff_base: compare_base } : {}),
+                    // A deleted row's cells are the original content, struck
+                    // through whole (there is no "after" side to diff against).
+                    ...(compare_status === 'deleted' ? { compare_deleted: true as const } : {}),
                     ...(edit_syntax === 'markdown' && dirty?.valueRuns
                         ? { dirty_rich: dirty.valueRuns }
                         : {}),
@@ -2488,7 +2560,7 @@ export function GridShell({
                         ? key !== undefined && conflicted_keys_ref.current.has(key)
                             ? conflict_bg
                             : dirty_bg
-                        : highlight_bg),
+                        : highlight_bg ?? compare_bg),
                 };
             }
             return build_grid_cell(
@@ -2514,6 +2586,12 @@ export function GridShell({
             get_row,
             show_formatting,
             version,
+            git_compare,
+            // `version` above also bumps when a compareDiff sidecar lands, so
+            // freshly-diffed cells repaint through the same channel as pages.
+            get_compare_status,
+            get_compare_base,
+            compare_row_bgs,
             editable_cells,
             edit_syntax,
             font_size_px,

@@ -7,6 +7,29 @@ import { generate_nonce } from './webview-html';
 
 export const TABLE_VIEW_TYPE = 'tableViewer.editor';
 
+/**
+ * The working-tree file path a git: revision URI diffs, from the git
+ * extension's URI encoding (JSON query `{path, ref}`). Undefined when the
+ * query is absent or malformed — such a URI still opens, just as a plain
+ * read-only render with no compare pairing.
+ */
+export function git_diffed_file_path(uri: vscode.Uri): string | undefined {
+    if (!uri.query) return undefined;
+    try {
+        const parsed: unknown = JSON.parse(uri.query);
+        if (
+            typeof parsed === 'object' && parsed !== null
+            && 'path' in parsed && typeof parsed.path === 'string'
+            && parsed.path.length > 0
+        ) {
+            return parsed.path;
+        }
+    } catch {
+        // Not the git extension's encoding; treat as a bare revision URI.
+    }
+    return undefined;
+}
+
 class TableViewerDocument implements vscode.CustomDocument {
     constructor(public readonly uri: vscode.Uri) {}
     dispose(): void {}
@@ -19,6 +42,11 @@ export class TableViewerEditorProvider
     readonly #panels = new Map<ViewerController, vscode.WebviewPanel>();
     readonly #resources = new Map<ViewerController, string>();
     readonly #workbook_opens = new Map<string, Promise<void>>();
+    /** Compare intents awaiting their resolveCustomEditor, keyed by the
+     *  modified file's resource identity. `vscode.openWith` cannot carry
+     *  options, so openTableDiff parks the original's URI here and the next
+     *  resolve for that resource consumes it. */
+    readonly #pending_compares = new Map<string, { readonly originalUri: vscode.Uri }>();
     readonly #drains = new Set<Promise<void>>();
     #close_barrier: Promise<void> | undefined;
     #close_barrier_settled = false;
@@ -115,6 +143,50 @@ export class TableViewerEditorProvider
         return controller.select_sheet(sheet_name);
     }
 
+    /**
+     * Park a compare intent under `resource` and return its release. A fresh
+     * wrapper object per call: overlapping parks for the same resource each
+     * hold their own intent, and a release removes only its own entry rather
+     * than a successor's. Releasing after consumption is a no-op.
+     */
+    #park_compare_intent(resource: string, original_uri: vscode.Uri): () => void {
+        const intent = { originalUri: original_uri };
+        this.#pending_compares.set(resource, intent);
+        return () => {
+            if (this.#pending_compares.get(resource) === intent) {
+                this.#pending_compares.delete(resource);
+            }
+        };
+    }
+
+    /**
+     * Open `uri` as a table compared against `original_uri` (its git original).
+     * The comparison needs a fresh resolve: an existing viewer for the file may
+     * hold an edit session, and compare panels are read-only by construction.
+     */
+    async openTableDiff(uri: vscode.Uri, original_uri: vscode.Uri): Promise<void> {
+        const release = this.#park_compare_intent(
+            create_resource_identity(uri).key,
+            original_uri,
+        );
+        try {
+            await vscode.commands.executeCommand(
+                'vscode.openWith',
+                uri,
+                TABLE_VIEW_TYPE,
+                // A new editor group: reusing an existing table tab for this
+                // file would reveal it without calling resolveCustomEditor, so
+                // the comparison would silently never attach.
+                vscode.ViewColumn.Beside,
+            );
+        } finally {
+            // If no resolve consumed the intent — the open failed or revealed
+            // an existing tab — clear it so a later plain open of this file
+            // cannot inherit a stale compare.
+            release();
+        }
+    }
+
     async resolveCustomEditor(
         document: TableViewerDocument,
         webview_panel: vscode.WebviewPanel,
@@ -128,17 +200,54 @@ export class TableViewerEditorProvider
         webview_panel.webview.html = build_vscode_webview_html(
             webview_panel.webview, this.extension_uri, generate_nonce());
 
+        const resource = create_resource_identity(document.uri).key;
+        // An SCM-pane click runs `vscode.diff`, which resolves BOTH sides
+        // through this provider: first the git: revision, then the working-tree
+        // file. The git: side has no working tree to write back to, so it
+        // renders plain read-only — and parks a compare intent so the file:
+        // side that follows attaches the diff session against it. A bare git:
+        // URI (no parseable {path} query) is just a read-only render.
+        const read_only = document.uri.scheme === 'git';
+        if (read_only) {
+            if (git_diffed_file_path(document.uri) !== undefined) {
+                // The git extension builds its revision URI from the file's
+                // URI via `with({scheme: 'git', query})`, preserving authority
+                // and path — so inverting that transformation (rather than
+                // reconstructing from the query's fsPath with `Uri.file`)
+                // keeps remote-workspace authorities and Windows paths intact.
+                const diffed_key = create_resource_identity(
+                    document.uri.with({ scheme: 'file', query: '' }),
+                ).key;
+                const release = this.#park_compare_intent(diffed_key, document.uri);
+                // In a `vscode.diff` the file: side resolves right after this
+                // one and consumes the intent. VS Code offers no handle that
+                // correlates the two resolves, so pairing is by resource key:
+                // while a revision panel is open, any resolve of its file
+                // attaches the compare. If the file: side never comes (the
+                // git: side was opened alone), retire the intent with this
+                // panel so a later plain open cannot inherit a stale compare.
+                webview_panel.onDidDispose(release);
+            }
+        }
+        const compare_original = this.#pending_compares.get(resource);
+        if (compare_original) this.#pending_compares.delete(resource);
         const controller = attach_viewer(
             webview_panel,
             document.uri,
             this.state_store,
             profile_for(document.uri.fsPath, vscode_viewer_host.config),
             vscode_viewer_host,
-            { requestClose: () => webview_panel.dispose() },
+            {
+                requestClose: () => webview_panel.dispose(),
+                ...(compare_original && !read_only
+                    ? { compare: { originalUri: compare_original.originalUri } }
+                    : {}),
+                ...(read_only ? { readOnly: true } : {}),
+            },
         );
         this.#controllers.add(controller);
         this.#panels.set(controller, webview_panel);
-        this.#resources.set(controller, create_resource_identity(document.uri).key);
+        this.#resources.set(controller, resource);
         webview_panel.onDidDispose(() => this.#dispose_controller(controller));
     }
 }
@@ -146,6 +255,7 @@ export class TableViewerEditorProvider
 export interface TableViewerRegistration extends vscode.Disposable {
     drain(): Promise<void>;
     openWorkbookAtSheet(uri: vscode.Uri, sheetName: string): Promise<boolean>;
+    openTableDiff(uri: vscode.Uri, originalUri: vscode.Uri): Promise<void>;
 }
 
 export function register_table_viewer(
@@ -183,6 +293,7 @@ export function register_table_viewer(
         },
         drain: () => provider.drain_viewers(),
         openWorkbookAtSheet: (uri, sheetName) => provider.openWorkbookAtSheet(uri, sheetName),
+        openTableDiff: (uri, originalUri) => provider.openTableDiff(uri, originalUri),
     };
     context.subscriptions.push(registration);
     return registration;

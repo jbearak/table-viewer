@@ -1,7 +1,9 @@
 import { createHash } from 'crypto';
-import { XlsxDataSource } from './data-source/xlsx-source';
-import { XlsDataSource } from './data-source/xls-source';
 import { CsvDataSource } from './data-source/csv-source';
+import {
+    build_source_from_buffer,
+    csv_source_from_buffer,
+} from './data-source/from-buffer';
 import { ExcelHeaderDataSource } from './data-source/excel-header-source';
 import type {
     DataSource,
@@ -30,6 +32,8 @@ import {
     type ViewerHost,
 } from './host-ports';
 import { create_resource_identity, type ResourceUriLike } from './resource-identity';
+import { CompareDataSource } from './diff-compare/compare-session';
+import type { WorkbookSnapshotCompare } from './viewer-snapshot';
 import {
     assert_safe_file_size,
     FileSizeLimitExceededError,
@@ -250,6 +254,13 @@ export interface ViewerControllerOptions {
     readonly scheduler?: ViewerControllerScheduler;
     /** Close the exact host surface when its initial source load is declined. */
     readonly requestClose?: () => void | Promise<void>;
+    /** Git compare mode: render the file read-only with per-cell diffs against
+     *  this original (the `git:` side of an SCM diff). A failure to read or
+     *  parse the original degrades to a normal read-only open, never a block. */
+    readonly compare?: { readonly originalUri: ResourceUriLike | string };
+    /** Render read-only regardless of the profile (e.g. a git: revision URI,
+     *  which has no working-tree file to write back to). */
+    readonly readOnly?: boolean;
 }
 
 export interface ViewerController extends Disposable {
@@ -741,16 +752,14 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
 
 function excel_profile(file_path: string): ViewerProfile {
     const base: ViewerProfileBase = {
-        async build_source(raw, file_path, state) {
-            const physical = file_path.toLowerCase().endsWith('.xlsx')
-                ? await XlsxDataSource.create(raw)
-                : await XlsDataSource.create(Buffer.from(raw));
-            const physical_sheets = physical.meta().sheets;
-            return new ExcelHeaderDataSource(
-                physical,
-                sanitize_excel_header_overrides(state.excelFirstRowHeaders),
-                excel_hidden_rows_for_source(physical_sheets, state.transforms),
-            );
+        build_source(raw, file_path, state) {
+            return build_source_from_buffer(raw, file_path, {
+                excelHeaderOverrides: sanitize_excel_header_overrides(
+                    state.excelFirstRowHeaders,
+                ),
+                excelHiddenRows: (physical_sheets) =>
+                    excel_hidden_rows_for_source(physical_sheets, state.transforms),
+            });
         },
     };
     // .xls is out of scope for editing: the writer above is an OOXML package
@@ -781,11 +790,7 @@ export function build_csv_source(
     const max_rows = options?.loadAllRows
         ? Number.MAX_SAFE_INTEGER
         : Math.max(0, requested_max_rows);
-    // CSV/TSV files conventionally carry column names in their first row, so the
-    // grid promotes it to the column header rather than showing letters.
-    return CsvDataSource.create(raw, get_delimiter(file_path), max_rows, {
-        firstRowIsHeader: true,
-    });
+    return csv_source_from_buffer(raw, file_path, max_rows);
 }
 
 type CsvTextEncoder = Pick<TextEncoder, 'encode'>;
@@ -948,6 +953,20 @@ export function attach_viewer(
 ): ViewerController {
     const uri = create_resource_identity(resource).uri;
     const file_path = uri.fsPath;
+    const compare_original_uri = options.compare
+        ? create_resource_identity(options.compare.originalUri).uri
+        : undefined;
+    const compare_mode = compare_original_uri !== undefined;
+    /**
+     * Whether editing exists for this panel at all. A compare panel is
+     * read-only regardless of the profile, and the guard must hold on the
+     * *host* side — the snapshot capabilities hide the edit UI, but a stale or
+     * buggy renderer could still post requestEditSession/saveCsv/edit
+     * messages, and only this flag stands between those and the working-tree
+     * file. Every edit gate below reads this, never profile.editing directly.
+     */
+    const editing_supported = profile.editing && !compare_mode && !options.readOnly;
+    let compare_unavailable_warned = false;
     const scheduler: ViewerControllerScheduler = options.scheduler ?? {
         setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
         clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
@@ -964,10 +983,10 @@ export function attach_viewer(
     const file_coordinator = acquire_file_coordinator(uri, durable_state_store);
     const state_path = file_coordinator.statePath;
     const file_key = file_coordinator.authority().fileKey;
-    let file_edit_state = profile.editing
+    let file_edit_state = editing_supported
         ? csv_edit_file_states.get(file_key)
         : undefined;
-    if (profile.editing && !file_edit_state) {
+    if (editing_supported && !file_edit_state) {
         file_edit_state = {
             attachments: 0,
             phase: { type: 'free' },
@@ -1172,6 +1191,51 @@ export function attach_viewer(
         } catch {
             return Promise.resolve(false);
         }
+    }
+
+    /**
+     * Answer a served row page with its compare diff. Invoked by the core with
+     * the exact window `rowData` carried — clamped and transform-projected — so
+     * the diff describes the rows the renderer received, keyed by the same
+     * display positions. `sourceRows` maps each display row back to the source
+     * row the positional diff is defined over; contiguous source runs are
+     * diffed in one page each.
+     */
+    function post_compare_diff(
+        msg: Extract<WebviewMessage, { type: 'requestRows' }>,
+        window: { startRow: number; sourceRows: number[] },
+    ): void {
+        if (!(source instanceof CompareDataSource) || window.sourceRows.length === 0) return;
+        const compare_source = source;
+        let diff;
+        try {
+            // The diff is positional over the compare source's projected row
+            // space; the window carries canonical rows, so map them back.
+            const projected_rows = window.sourceRows.map((source_row) =>
+                compare_source.projected_row_index(msg.sheetIndex, source_row));
+            if (projected_rows.some((row) => row === undefined)) return;
+            diff = compare_source.diff_rows(
+                msg.sheetIndex,
+                projected_rows as number[],
+            );
+        } catch {
+            return;
+        }
+        if (!diff) return;
+        void post_to_receiver({
+            type: 'compareDiff',
+            sheetIndex: msg.sheetIndex,
+            startRow: window.startRow,
+            // Positional results: entry i / row offsets are display slots
+            // startRow + i of the served window, matching rowData's rows.
+            rowStatus: diff.rowStatus,
+            changedCells: diff.changedCells.map((cell) => ({
+                ...cell,
+                row: window.startRow + cell.row,
+            })),
+            requestId: msg.requestId,
+            generation: msg.generation,
+        });
     }
 
     function flush_sheet_selections(): void {
@@ -2845,11 +2909,11 @@ export function attach_viewer(
         const owns_session = owns_edit_session();
         // A claim is only worth making when some slot describes a worksheet this
         // workbook actually has. Already-owned projections never need this scan.
-        const rehydratable = !owns_session && allow_claim && profile.editing
+        const rehydratable = !owns_session && allow_claim && editing_supported
             && has_rehydratable_pending_edits(state.pendingEdits, sheets);
         const represents_session = !predates_completed_clear
             && !edit_cleanup_blocked()
-            && profile.editing
+            && editing_supported
             && (
                 owns_session
                 || (rehydratable && try_claim_edit_session(false))
@@ -2881,7 +2945,7 @@ export function attach_viewer(
         // `try_claim_edit_session` refused a session nobody holds.
         if (
             allow_claim
-            && profile.editing
+            && editing_supported
             && !!file_edit_state
             && !predates_completed_clear
             // Slots naming no live worksheet decline the claim deliberately. The
@@ -3480,14 +3544,90 @@ export function attach_viewer(
             fingerprint: `${stat.mtime}:${stat.size}`,
             digest: content_digest(raw),
         };
-        return new SourceCandidate(
-            await profile.build_source(
+        // The original side builds concurrently with the modified parse; both
+        // are independent reads of already-committed bytes.
+        const original_promise = build_compare_original(state);
+        let modified: DataSource;
+        try {
+            modified = await profile.build_source(
                 raw,
                 file_path,
                 state,
                 load_all_csv_rows ? { loadAllRows: true } : undefined,
-            ),
-            observation,
+            );
+        } catch (error) {
+            void original_promise.then((original) => original?.close());
+            throw error;
+        }
+        const original = await original_promise;
+        let adopted = modified;
+        if (original) {
+            try {
+                adopted = new CompareDataSource(modified, original);
+            } catch (error) {
+                original.close();
+                warn_compare_unavailable(error);
+            }
+        }
+        return new SourceCandidate(adopted, observation);
+    }
+
+    /**
+     * Build the git original through the same profile and per-file state as
+     * the modified side, so both sides share projection policy (CSV row caps,
+     * Excel header overrides/hidden rows) and differ only in bytes. The
+     * original must never block the file itself: any failure — including
+     * exceeding the configured size limit — degrades to a plain open with a
+     * one-time warning.
+     */
+    async function build_compare_original(
+        state: PerFileState,
+    ): Promise<DataSource | undefined> {
+        if (!compare_original_uri) return undefined;
+        try {
+            const max_mib = host.config.max_file_size_mib();
+            // Stat before reading so an oversized original degrades without
+            // pulling its full bytes into memory first.
+            const stat = await host.fs.stat(compare_original_uri);
+            assert_safe_file_size(stat.size, max_mib);
+            const original_raw = await host.fs.read_file(compare_original_uri);
+            assert_safe_file_size(original_raw.byteLength, max_mib);
+            // Mirror the modified side's row cap: uncapping only one side
+            // would report every row beyond the other's cap as added/deleted.
+            return await profile.build_source(
+                original_raw,
+                file_path,
+                state,
+                load_all_csv_rows ? { loadAllRows: true } : undefined,
+            );
+        } catch (error) {
+            warn_compare_unavailable(error);
+            return undefined;
+        }
+    }
+
+    /** The snapshot's compare payload — present exactly when the adopted source
+     *  is a live compare session (a degraded compare open carries nothing). */
+    function compare_configuration(
+        adopted: DataSource | undefined,
+    ): { gitCompare: WorkbookSnapshotCompare } | Record<string, never> {
+        if (!(adopted instanceof CompareDataSource)) return {};
+        return {
+            gitCompare: {
+                pairings: adopted.pairings,
+                sheetStatuses: adopted.sheetStatuses,
+                changedColumnNames: adopted.changedColumnNames,
+            },
+        };
+    }
+
+    function warn_compare_unavailable(error: unknown): void {
+        if (compare_unavailable_warned) return;
+        compare_unavailable_warned = true;
+        log_sanitized_failure('Table compare unavailable', error);
+        show_owner_warning(
+            'Table compare is unavailable: the original version could not be loaded. '
+            + 'Showing the file without change highlighting.',
         );
     }
 
@@ -3806,6 +3946,7 @@ export function attach_viewer(
                     onInvalidRestore: cleanup_invalid_restore,
                     durablePendingEditKeys: durable_pending_edit_keys,
                     durableRowHeights: durable_row_heights,
+                    ...(compare_mode ? { onRowWindowServed: post_compare_diff } : {}),
                 },
                 (installed) => {
                     installed.begin_receiver_epoch(session.current_receiver_epoch);
@@ -3878,17 +4019,18 @@ export function attach_viewer(
                                 defaultTabOrientation: host.config.default_tab_orientation(),
                                 previewMode: profile.previewMode === true,
                                 diffOnByDefault: host.config.diff_on_by_default(),
+                                ...compare_configuration(next),
                             },
                             capabilities: {
-                                csvEditingSupported: profile.editing,
-                                csvEditable: profile.editing
+                                csvEditingSupported: editing_supported,
+                                csvEditable: editing_supported
                                     && may_retain_capability()
                                     && !next.truncationMessage,
                                 csvSaveLifecycle: projected_save_lifecycle(),
                                 ...(owns_edit_session() && active_edit_session_id
                                     ? { csvEditSessionId: active_edit_session_id }
                                     : {}),
-                                ...(profile.editing && profile.edit_syntax
+                                ...(editing_supported && profile.edit_syntax
                                     ? { editSyntax: profile.edit_syntax }
                                     : {}),
                             },
@@ -4139,17 +4281,18 @@ export function attach_viewer(
                                         defaultTabOrientation: host.config.default_tab_orientation(),
                                         previewMode: profile.previewMode === true,
                                         diffOnByDefault: host.config.diff_on_by_default(),
+                                        ...compare_configuration(source),
                                     },
                                     capabilities: {
-                                        csvEditingSupported: profile.editing,
-                                        csvEditable: profile.editing
+                                        csvEditingSupported: editing_supported,
+                                        csvEditable: editing_supported
                                             && may_retain_capability()
                                             && !source!.truncationMessage,
                                         csvSaveLifecycle: projected_save_lifecycle(),
                                         ...(owns_edit_session() && active_edit_session_id
                                             ? { csvEditSessionId: active_edit_session_id }
                                             : {}),
-                                        ...(profile.editing && profile.edit_syntax
+                                        ...(editing_supported && profile.edit_syntax
                                             ? { editSyntax: profile.edit_syntax }
                                             : {}),
                                     },
@@ -4490,7 +4633,7 @@ export function attach_viewer(
                             committed,
                             request.seq,
                             reason,
-                            profile.editing ? await read_file_state() : undefined,
+                            editing_supported ? await read_file_state() : undefined,
                             request.refreshEvent,
                         );
                         if (!load_is_current(request.seq, request.refreshEvent)) {
@@ -4597,7 +4740,7 @@ export function attach_viewer(
                 committed,
                 request.seq,
                 reason,
-                profile.editing ? await read_file_state() : undefined,
+                editing_supported ? await read_file_state() : undefined,
             );
             if (!adopted) return false;
             reset_reload_retry();
@@ -4972,7 +5115,7 @@ export function attach_viewer(
         if (
             edit_cleanup_blocked()
             || transform_work_in_flight()
-            || !profile.editing
+            || !editing_supported
             || !src
             || !!src.truncationMessage
             || expected_digest === undefined
@@ -5401,7 +5544,7 @@ export function attach_viewer(
                 return;
             }
         }
-        const transform_admission: TransformAdmission = profile.editing
+        const transform_admission: TransformAdmission = editing_supported
             ? begin_transform_admission()
             : { operation: Symbol(file_key) };
         if ('refusal' in transform_admission) {
@@ -5450,7 +5593,7 @@ export function attach_viewer(
             ) latest_transform_authority_by_sheet.delete(message.sheetIndex);
             transform_commit_barriers.delete(transform_authority);
             transform_authority.resolveCompletion();
-            if (profile.editing) {
+            if (editing_supported) {
                 finish_transform_admission(transform_admission.operation);
             }
         }
@@ -5534,7 +5677,7 @@ export function attach_viewer(
                             || ready_core.source_generation !== ready_source_generation
                         ) continue;
 
-                        const transform_admission: TransformAdmission = profile.editing
+                        const transform_admission: TransformAdmission = editing_supported
                             ? begin_transform_admission()
                             : { operation: Symbol(file_key) };
                         if ('refusal' in transform_admission) {
@@ -5675,7 +5818,7 @@ export function attach_viewer(
                             update_session_state_material(confirmed, false);
                             break;
                         } finally {
-                            if (profile.editing) {
+                            if (editing_supported) {
                                 finish_transform_admission(transform_admission.operation);
                             }
                         }
@@ -6129,7 +6272,7 @@ export function attach_viewer(
                 const already_owned = phase.type === 'owned'
                     && phase.token === edit_session_token;
                 let can_edit = recovery_authorized
-                    && profile.editing
+                    && editing_supported
                     && !cleanup_blocked
                     && active_save_operation === undefined
                     && !!source
@@ -6171,7 +6314,7 @@ export function attach_viewer(
                 cleanup_blocked = phase.type === 'cleanupPending'
                     || phase.type === 'uncertain';
                 can_edit = recovery_authorized
-                    && profile.editing
+                    && editing_supported
                     && !cleanup_blocked
                     && active_save_operation === undefined
                     && !!source
@@ -6220,7 +6363,7 @@ export function attach_viewer(
                 // sort or filter is not a denial, because editing under one is
                 // supported and the rows stay exactly where they are. Only work in
                 // flight refuses, and it refuses transiently.
-                const denied_by_transform = profile.editing
+                const denied_by_transform = editing_supported
                     && !!source
                     && !source.truncationMessage
                     && !may_begin_editing();
@@ -6698,14 +6841,14 @@ export function attach_viewer(
                 return;
             }
             case 'releaseEditSession':
-                if (profile.editing && edit_message_is_current(msg.editSessionId)) {
+                if (editing_supported && edit_message_is_current(msg.editSessionId)) {
                     active_save_dialog_request = undefined;
                     await release_edit_session(msg.editSessionId);
                     if (!disposed) await refresh_session_state_material(false);
                 }
                 return;
             case 'discardEditSession':
-                if (profile.editing && edit_message_is_current(msg.editSessionId)) {
+                if (editing_supported && edit_message_is_current(msg.editSessionId)) {
                     const writing = active_save_operation?.phase === 'writing'
                         && active_save_operation.identity.editSessionId === msg.editSessionId;
                     if (writing) return;
@@ -6776,7 +6919,7 @@ export function attach_viewer(
                 }
                 return;
             case 'saveCsv':
-                if (profile.editing) {
+                if (editing_supported) {
                     const save = handle_save(msg.operation);
                     active_save_drain = save;
                     try {
@@ -6789,7 +6932,7 @@ export function attach_viewer(
                 }
                 return;
             case 'pendingEditsChanged': {
-                if (!profile.editing) return;
+                if (!editing_supported) return;
                 if (!edit_message_is_current(msg.editSessionId)) return;
                 const message_target: WorksheetTarget = {
                     sheetIndex: msg.sheetIndex ?? 0,
@@ -7125,7 +7268,7 @@ export function attach_viewer(
                     refuse('unavailable');
                     return;
                 }
-                if (requires_edit_session && !profile.editing) {
+                if (requires_edit_session && !editing_supported) {
                     refuse('unavailable');
                     return;
                 }
@@ -7247,7 +7390,7 @@ export function attach_viewer(
                 return;
             }
             case 'showSaveDialog': {
-                if (!profile.editing || !edit_message_is_current(msg.editSessionId)) return;
+                if (!editing_supported || !edit_message_is_current(msg.editSessionId)) return;
                 const request = {
                     requestId: msg.requestId,
                     receiverEpoch: session.current_receiver_epoch,
@@ -8060,7 +8203,7 @@ export function attach_viewer(
 
     async function flush_pending_edits(): Promise<void> {
         stop_edit_admission();
-        if (!profile.editing || !renderer_ready) {
+        if (!editing_supported || !renderer_ready) {
             await drain_controller();
             return;
         }

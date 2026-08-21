@@ -1,4 +1,5 @@
 import type { WorkbookMeta } from './data-source/interface';
+import type { SheetPairStatus, SheetPairing } from './diff-compare/compare-source';
 import type {
     AuthorityCommitReceiptBase,
     FileAuthoritySnapshot,
@@ -66,11 +67,26 @@ export interface ExcelHeaderSnapshotResult {
 
 export type RetainedSnapshotCommandResult = ExcelHeaderSnapshotResult;
 
+/** Git compare mode payload delivered with every snapshot when active. */
+export interface WorkbookSnapshotCompare {
+    /** Sheet pairing between the git original and the working-tree file. */
+    readonly pairings: readonly SheetPairing[];
+    /** Pair status per grid sheet, positionally matching `meta.sheets` — the
+     *  compare source's sheet ordering stated as data, so the webview never
+     *  re-derives sheet positions from `pairings`. */
+    readonly sheetStatuses: readonly SheetPairStatus[];
+    /** Changed promoted column headers per modified sheet, positionally
+     *  matching `meta.sheets`; empty for sheets without header changes. */
+    readonly changedColumnNames: readonly (readonly { col: number; base: string }[])[];
+}
+
 /** Fully explicit configuration and capabilities; absence is not overloaded. */
 export interface WorkbookSnapshotConfiguration {
     readonly defaultTabOrientation: 'horizontal' | 'vertical';
     readonly previewMode: boolean;
     readonly diffOnByDefault: boolean;
+    /** Present exactly when the panel is a read-only git compare session. */
+    readonly gitCompare?: WorkbookSnapshotCompare;
 }
 
 export interface WorkbookSnapshotCapabilities {

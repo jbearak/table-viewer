@@ -73,6 +73,11 @@
       {
         "command": "tableViewer.manageStoredFileState",
         "title": "Table Viewer: Manage Stored File State"
+      },
+      {
+        "command": "tableViewer.openTableDiff",
+        "title": "Table Viewer: Open Table Diff",
+        "icon": "$(diff)"
       }
     ],
     "menus": {
@@ -80,6 +85,22 @@
         {
           "command": "tableViewer.openWorkbookAtSheet",
           "when": "false"
+        },
+        {
+          "command": "tableViewer.openTableDiff",
+          "when": "false"
+        }
+      ],
+      "scm/resourceState/context": [
+        {
+          "command": "tableViewer.openTableDiff",
+          "when": "scmProvider == git && scmResourceGroup == workingTree && resourceExtname =~ /\\.(csv|tsv|xlsx|xls)$/i",
+          "group": "inline"
+        },
+        {
+          "command": "tableViewer.openTableDiff",
+          "when": "scmProvider == git && scmResourceGroup == workingTree && resourceExtname =~ /\\.(csv|tsv|xlsx|xls)$/i",
+          "group": "navigation"
         }
       ],
       "editor/title": [
