@@ -140,17 +140,23 @@ describe('desktop-config', () => {
     it('persists updates and re-reads them from disk', () => {
         const file = settings_file_path(dir);
         const store = new DesktopConfigStore(file);
-        store.update({ fontFamily: 'Menlo', tabOrientation: 'vertical' });
+        store.update({
+            fontFamily: 'Menlo',
+            tabOrientation: 'vertical',
+            diffOnByDefault: true,
+        });
         const reread = new DesktopConfigStore(file);
         expect(reread.settings().fontFamily).toBe('Menlo');
         expect(reread.settings().tabOrientation).toBe('vertical');
+        expect(reread.settings().diffOnByDefault).toBe(true);
         // Untouched keys keep their defaults.
         expect(reread.settings().csvMaxRows).toBe(DEFAULT_SETTINGS.csvMaxRows);
         expect(reread.settings().automaticallyCheckForUpdates).toBe(true);
     });
 
-    it('defaults worksheet tabs to vertical, like the extension', () => {
+    it('defaults worksheet tabs to vertical and Diff to off', () => {
         expect(DEFAULT_SETTINGS.tabOrientation).toBe('vertical');
+        expect(DEFAULT_SETTINGS.diffOnByDefault).toBe(false);
     });
 
     it('defaults the appearance to following the OS and round-trips a pinned one', () => {
@@ -193,6 +199,7 @@ describe('desktop-config', () => {
             csvMaxRows: -5,
             maxFileSizeMiB: 'huge',
             maxStoredFiles: 2.9,
+            diffOnByDefault: 'yes',
             automaticallyCheckForUpdates: 'yes',
             dismissedUpdateVersion: 42,
             newWindowSize: 'whatever',
@@ -208,6 +215,7 @@ describe('desktop-config', () => {
             csvMaxRows: 1,
             maxFileSizeMiB: DEFAULT_SETTINGS.maxFileSizeMiB,
             maxStoredFiles: 2,
+            diffOnByDefault: false,
             automaticallyCheckForUpdates: true,
             dismissedUpdateVersion: '',
             newWindowSize: 'match-last',
@@ -239,8 +247,9 @@ describe('desktop-config', () => {
         const listener = vi.fn();
         const subscription = port.on_font_change(listener);
 
-        store.update({ csvMaxRows: 5 });
+        store.update({ csvMaxRows: 5, diffOnByDefault: true });
         expect(listener).not.toHaveBeenCalled();
+        expect(port.diff_on_by_default()).toBe(true);
         store.update({ fontFamily: 'Menlo' });
         expect(listener).toHaveBeenCalledTimes(1);
         store.update({ fontSize: 17 });

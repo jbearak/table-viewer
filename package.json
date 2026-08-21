@@ -136,6 +136,11 @@
           "default": "horizontal",
           "description": "Default worksheet tab orientation. Can be overridden per file."
         },
+        "tableViewer.diffOnByDefault": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show Diff (original and edited values) by default when entering Edit mode."
+        },
         "tableViewer.maxStoredFiles": {
           "type": "integer",
           "default": 10000,

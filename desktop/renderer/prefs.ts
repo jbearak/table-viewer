@@ -34,6 +34,7 @@ const window_width = document.getElementById('windowWidth') as HTMLInputElement;
 const window_height = document.getElementById('windowHeight') as HTMLInputElement;
 const csv_max_rows = document.getElementById('csvMaxRows') as HTMLInputElement;
 const max_file_size = document.getElementById('maxFileSizeMiB') as HTMLInputElement;
+const diff_on_by_default = document.getElementById('diffOnByDefault') as HTMLInputElement;
 const automatically_check_for_updates = document.getElementById(
     'automaticallyCheckForUpdates',
 ) as HTMLInputElement;
@@ -182,6 +183,7 @@ function populate(settings: DesktopSettings): void {
     tab_orientation.value = settings.tabOrientation;
     set_input(csv_max_rows, String(settings.csvMaxRows));
     set_input(max_file_size, String(settings.maxFileSizeMiB));
+    diff_on_by_default.checked = settings.diffOnByDefault;
     automatically_check_for_updates.checked = settings.automaticallyCheckForUpdates;
     apply_window_size(settings);
     apply_fonts(settings);
@@ -468,6 +470,9 @@ tab_orientation.addEventListener('change', () => {
 });
 new_window_size.addEventListener('change', () => {
     save({ newWindowSize: sanitize_new_window_size_mode(new_window_size.value) });
+});
+diff_on_by_default.addEventListener('change', () => {
+    save({ diffOnByDefault: diff_on_by_default.checked });
 });
 automatically_check_for_updates.addEventListener('change', () => {
     save({ automaticallyCheckForUpdates: automatically_check_for_updates.checked });

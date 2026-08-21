@@ -66,6 +66,7 @@ export interface ConfigPort {
     max_file_size_mib(): number;
     csv_max_rows(): number;
     default_tab_orientation(): 'horizontal' | 'vertical';
+    diff_on_by_default(): boolean;
     /** Fires whenever the configured font (family or size) may have changed. */
     on_font_change(listener: () => void): Disposable;
 }
