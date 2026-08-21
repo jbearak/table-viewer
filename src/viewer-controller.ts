@@ -3579,7 +3579,14 @@ export function attach_viewer(
                 adopted = new CompareDataSource(modified, original.source);
                 comparison_observation = original.observation;
             } catch (error) {
-                original.source.close();
+                try {
+                    original.source.close();
+                } catch (close_error) {
+                    log_sanitized_failure(
+                        'Failed to close unavailable comparison source',
+                        close_error,
+                    );
+                }
                 warn_compare_unavailable(error);
             }
         }

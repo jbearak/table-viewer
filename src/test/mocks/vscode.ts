@@ -224,6 +224,7 @@ const tabs: MockTab[] = [];
 const tab_groups: MockTabGroup[] = [{ viewColumn: ViewColumn.One, tabs }];
 let active_tab_group = tab_groups[0];
 const closed_tabs: MockTab[] = [];
+const closing_tabs = new Set<MockTab>();
 const tab_panels = new Map<MockTab, Set<MockWebviewPanel>>();
 const configuration_values = new Map<string, unknown>();
 const custom_editor_registrations: {
@@ -536,16 +537,32 @@ export const window = {
             return disposable(tab_change_handlers, handler);
         },
         async close(tab: MockTab): Promise<boolean> {
-            const closed = close_tab_impl ? await close_tab_impl(tab) : true;
-            if (!closed) return false;
-            closed_tabs.push(tab);
-            for (const group of tab_groups) {
-                const index = group.tabs.indexOf(tab);
-                if (index >= 0) group.tabs.splice(index, 1);
+            const tab_group = tab_groups.find((group) => group.tabs.includes(tab));
+            if (!tab_group || closing_tabs.has(tab)) return false;
+            closing_tabs.add(tab);
+            try {
+                const closed = close_tab_impl ? await close_tab_impl(tab) : true;
+                if (!closed || !tab_group.tabs.includes(tab)) return false;
+                closed_tabs.push(tab);
+                tab_group.tabs.splice(tab_group.tabs.indexOf(tab), 1);
+                for (const panel of [...(tab_panels.get(tab) ?? [])]) panel.dispose();
+                tab_panels.delete(tab);
+                const event: Parameters<TabChangeHandler>[0] = {
+                    opened: [],
+                    closed: [tab],
+                    changed: [],
+                };
+                for (const handler of [...tab_change_handlers]) {
+                    try {
+                        handler(event);
+                    } catch {
+                        // VS Code isolates event-listener failures from close().
+                    }
+                }
+                return true;
+            } finally {
+                closing_tabs.delete(tab);
             }
-            for (const panel of [...(tab_panels.get(tab) ?? [])]) panel.dispose();
-            tab_panels.delete(tab);
-            return true;
         },
     },
     registerCustomEditorProvider(
@@ -710,6 +727,7 @@ export function __reset(): void {
     active_tab_group = tab_groups[0];
     tab_panels.clear();
     closed_tabs.length = 0;
+    closing_tabs.clear();
     configuration_values.clear();
     custom_editor_registrations.length = 0;
     command_handlers.clear();

@@ -788,10 +788,41 @@ describe('register_table_viewer', () => {
         // of the DiffEditorInput independently.
         const panels = vscode_mock.__getPanels();
         expect(panels).toHaveLength(2);
+        const ignored_result_listener = vscode_mock.window.tabGroups.onDidChangeTabs(() => ({
+            then() {
+                throw new Error('Tab listeners must not delay or reject close.');
+            },
+        }));
+        const throwing_listener = vscode_mock.window.tabGroups.onDidChangeTabs(() => {
+            throw new Error('Tab listener failed.');
+        });
+        let repeated_close: Promise<boolean> | undefined;
+        const close_observations: unknown[] = [];
+        const tab_listener = vscode_mock.window.tabGroups.onDidChangeTabs((event) => {
+            close_observations.push({
+                closed: event.closed,
+                tabOpen: vscode_mock.window.tabGroups.all.some(
+                    (group) => group.tabs.includes(tab),
+                ),
+            });
+            repeated_close = vscode_mock.window.tabGroups.close(tab);
+        });
         registration.dispose();
         await registration.drain();
         expect(vscode_mock.__getClosedTabs()).toEqual([tab]);
         expect(panels.map((panel) => panel.__disposeCount)).toEqual([1, 1]);
+        expect(close_observations).toEqual([{
+            closed: [tab],
+            tabOpen: false,
+        }]);
+
+        expect(repeated_close).toBeDefined();
+        await expect(repeated_close!).resolves.toBe(false);
+        expect(vscode_mock.__getClosedTabs()).toEqual([tab]);
+        expect(close_observations).toHaveLength(1);
+        ignored_result_listener.dispose();
+        throwing_listener.dispose();
+        tab_listener.dispose();
     });
 
     it('closes the owning native diff when one side declines its initial load', async () => {

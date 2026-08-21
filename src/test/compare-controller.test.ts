@@ -133,6 +133,49 @@ describe('compare mode controller', () => {
         expect(posted(panel, 'compareDiff')).toEqual([]);
     });
 
+    it('preserves the plain fallback when unavailable comparison cleanup throws', async () => {
+        const base_profile = csv_table_profile();
+        const comparison_failure = new Error('comparison metadata failed');
+        const cleanup_failure = new Error('comparison cleanup failed');
+        let close_calls = 0;
+        const profile: ViewerProfile = {
+            ...base_profile,
+            async build_source(...args) {
+                const original = new TextDecoder().decode(args[0]) === ORIGINAL;
+                const source = await base_profile.build_source(...args);
+                if (original) {
+                    source.meta = () => {
+                        throw comparison_failure;
+                    };
+                    source.close = () => {
+                        close_calls += 1;
+                        throw cleanup_failure;
+                    };
+                }
+                return source;
+            },
+        };
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const error = vi.spyOn(vscode_mock.window, 'showErrorMessage');
+        const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const { panel } = open_compare_controller('/tmp/original.csv', profile);
+
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot')).toHaveLength(1));
+
+        const snapshot = posted(panel, 'workbookSnapshot')[0].snapshot as {
+            configuration: { gitCompare?: unknown };
+        };
+        expect(snapshot.configuration.gitCompare).toBeUndefined();
+        expect(close_calls).toBe(1);
+        expect(warning).toHaveBeenCalledTimes(1);
+        expect(error).not.toHaveBeenCalled();
+        expect(log).toHaveBeenCalledWith(
+            'Failed to close unavailable comparison source',
+            { code: 'UNKNOWN' },
+        );
+    });
+
     it('preserves a modified-side build failure when original cleanup also throws', async () => {
         const base_profile = csv_table_profile();
         const modified_failure = new Error('modified build failed');
