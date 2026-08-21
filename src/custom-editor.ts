@@ -144,17 +144,31 @@ export class TableViewerEditorProvider
     }
 
     /**
+     * Park a compare intent under `resource` and return its release. A fresh
+     * wrapper object per call: overlapping parks for the same resource each
+     * hold their own intent, and a release removes only its own entry rather
+     * than a successor's. Releasing after consumption is a no-op.
+     */
+    #park_compare_intent(resource: string, original_uri: vscode.Uri): () => void {
+        const intent = { originalUri: original_uri };
+        this.#pending_compares.set(resource, intent);
+        return () => {
+            if (this.#pending_compares.get(resource) === intent) {
+                this.#pending_compares.delete(resource);
+            }
+        };
+    }
+
+    /**
      * Open `uri` as a table compared against `original_uri` (its git original).
      * The comparison needs a fresh resolve: an existing viewer for the file may
      * hold an edit session, and compare panels are read-only by construction.
      */
     async openTableDiff(uri: vscode.Uri, original_uri: vscode.Uri): Promise<void> {
-        const resource = create_resource_identity(uri).key;
-        // A fresh wrapper object per call: overlapping diff opens for the same
-        // resource each park their own intent, and the cleanup below removes
-        // only its own entry rather than a successor's.
-        const intent = { originalUri: original_uri };
-        this.#pending_compares.set(resource, intent);
+        const release = this.#park_compare_intent(
+            create_resource_identity(uri).key,
+            original_uri,
+        );
         try {
             await vscode.commands.executeCommand(
                 'vscode.openWith',
@@ -166,12 +180,10 @@ export class TableViewerEditorProvider
                 vscode.ViewColumn.Beside,
             );
         } finally {
-            if (this.#pending_compares.get(resource) === intent) {
-                // No resolve consumed the intent — the open failed or revealed
-                // an existing tab. Clear it so a later plain open of this file
-                // cannot inherit a stale compare.
-                this.#pending_compares.delete(resource);
-            }
+            // If no resolve consumed the intent — the open failed or revealed
+            // an existing tab — clear it so a later plain open of this file
+            // cannot inherit a stale compare.
+            release();
         }
     }
 
@@ -197,22 +209,24 @@ export class TableViewerEditorProvider
         // URI (no parseable {path} query) is just a read-only render.
         const read_only = document.uri.scheme === 'git';
         if (read_only) {
-            const diffed_path = git_diffed_file_path(document.uri);
-            if (diffed_path !== undefined) {
+            if (git_diffed_file_path(document.uri) !== undefined) {
+                // The git extension builds its revision URI from the file's
+                // URI via `with({scheme: 'git', query})`, preserving authority
+                // and path — so inverting that transformation (rather than
+                // reconstructing from the query's fsPath with `Uri.file`)
+                // keeps remote-workspace authorities and Windows paths intact.
                 const diffed_key = create_resource_identity(
-                    vscode.Uri.file(diffed_path),
+                    document.uri.with({ scheme: 'file', query: '' }),
                 ).key;
-                const intent = { originalUri: document.uri };
-                this.#pending_compares.set(diffed_key, intent);
+                const release = this.#park_compare_intent(diffed_key, document.uri);
                 // In a `vscode.diff` the file: side resolves right after this
-                // one and consumes the intent. If it never comes (the git:
-                // side was opened alone), retire the intent with this panel so
-                // a later plain open cannot inherit a stale compare.
-                webview_panel.onDidDispose(() => {
-                    if (this.#pending_compares.get(diffed_key) === intent) {
-                        this.#pending_compares.delete(diffed_key);
-                    }
-                });
+                // one and consumes the intent. VS Code offers no handle that
+                // correlates the two resolves, so pairing is by resource key:
+                // while a revision panel is open, any resolve of its file
+                // attaches the compare. If the file: side never comes (the
+                // git: side was opened alone), retire the intent with this
+                // panel so a later plain open cannot inherit a stale compare.
+                webview_panel.onDidDispose(release);
             }
         }
         const compare_original = this.#pending_compares.get(resource);
