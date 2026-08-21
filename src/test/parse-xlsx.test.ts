@@ -383,6 +383,28 @@ describe('parse_xlsx', () => {
             expect(pct).toContain('%');
         });
 
+        it('keeps numeric raw values when a conditional format selects a numeric section', async () => {
+            const styles = `<?xml version="1.0" encoding="UTF-8"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <numFmts count="1"><numFmt numFmtId="164" formatCode="[&gt;50000]yyyy-mm-dd;0"/></numFmts>
+  <fonts count="1"><font/></fonts>
+  <cellXfs count="1"><xf numFmtId="164" fontId="0"/></cellXfs>
+</styleSheet>`;
+            const sheet = `<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1"/>
+  <sheetData><row r="1"><c r="A1" s="0"><v>12</v></c></row></sheetData>
+</worksheet>`;
+
+            const { data } = await parse_xlsx(build_test_xlsx(sheet, { styles_xml: styles }));
+            expect(data.sheets[0].rows[0][0]).toMatchObject({
+                raw: 12,
+                formatted: '12',
+                numberFormat: { code: '[>50000]yyyy-mm-dd;0' },
+            });
+            expect(data.sheets[0].rows[0][0]?.rawType).toBeUndefined();
+        });
+
         it('retains resolved recipes on physical cells in dense and streaming parses', async () => {
             const styles = `<?xml version="1.0" encoding="UTF-8"?>
 <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">

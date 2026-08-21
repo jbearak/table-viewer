@@ -603,7 +603,7 @@ function parse_worksheet_core(
                     // Numeric (default) — includes dates, formulas with numeric results
                     const num = v_bytes === null ? null : parse_finite_number_utf8(v_bytes);
                     if (num !== null) {
-                        if (number_format && number_format_is_date(number_format)) {
+                        if (number_format && number_format_is_date(number_format, num)) {
                             raw = is_valid_excel_date_serial(num, datemode)
                                 ? serial_to_iso(num, datemode)
                                 : num;
