@@ -48,6 +48,10 @@ export class CompareDataSource implements DataSource {
     >[];
     private readonly modified_sheet_count: number;
     private readonly padded_meta: WorkbookMeta;
+    /** Both sides are immutable after construction (see the module comment),
+     *  so their metas are cached here instead of re-asked on every read. */
+    private readonly modified_meta: WorkbookMeta;
+    private readonly original_meta: WorkbookMeta;
     private static readonly MAX_CACHED_DIFF_PAGES = 64;
     private readonly diff_cache = new Map<string, CompareDiffWindow>();
 
@@ -55,13 +59,15 @@ export class CompareDataSource implements DataSource {
         private readonly modified: DataSource,
         private readonly original: DataSource,
     ) {
-        this.pairings = pair_sheets(original.meta(), modified.meta());
+        this.original_meta = original.meta();
+        this.modified_meta = modified.meta();
+        this.pairings = pair_sheets(this.original_meta, this.modified_meta);
         this.matched_by_modified_index = new Map(
             this.pairings.flatMap((pairing) =>
                 pairing.status === 'matched' ? [[pairing.modifiedIndex, pairing]] : []),
         );
-        const original_sheets = original.meta().sheets;
-        const modified_meta = modified.meta();
+        const original_sheets = this.original_meta.sheets;
+        const modified_meta = this.modified_meta;
         this.deleted_pairings = this.pairings.filter(
             (pairing): pairing is Extract<SheetPairing, { status: 'deleted' }> =>
                 pairing.status === 'deleted',
@@ -180,7 +186,7 @@ export class CompareDataSource implements DataSource {
     ): RowWindow['rows'] | undefined {
         const pairing = this.matched_by_modified_index.get(sheet_index);
         if (!pairing) return undefined;
-        const original_sheet = this.original.meta().sheets[pairing.originalIndex];
+        const original_sheet = this.original_meta.sheets[pairing.originalIndex];
         if (!original_sheet) return undefined;
         const end = Math.min(start_row + count, original_sheet.rowCount);
         if (end <= start_row) return undefined;
@@ -195,7 +201,7 @@ export class CompareDataSource implements DataSource {
     ): RowWindow['rows'] | undefined {
         const pairing = this.matched_by_modified_index.get(sheet_index);
         if (!pairing) return undefined;
-        const original_sheet = this.original.meta().sheets[pairing.originalIndex];
+        const original_sheet = this.original_meta.sheets[pairing.originalIndex];
         if (!original_sheet) return undefined;
         const in_range = rows.filter((row) => row >= 0 && row < original_sheet.rowCount);
         const batched = in_range.length > 0
@@ -213,7 +219,7 @@ export class CompareDataSource implements DataSource {
         if (deleted_index !== undefined) {
             return this.original.read_rows(deleted_index, start_row, count);
         }
-        const real = this.modified.meta().sheets[sheet_index];
+        const real = this.modified_meta.sheets[sheet_index];
         const padded = this.padded_meta.sheets[sheet_index];
         if (!real || !padded) return this.modified.read_rows(sheet_index, start_row, count);
         const start = Math.max(0, Math.min(start_row, padded.rowCount));
@@ -240,7 +246,7 @@ export class CompareDataSource implements DataSource {
         if (deleted_index !== undefined) {
             return read_source_rows_indexed(this.original, deleted_index, row_indices);
         }
-        const real = this.modified.meta().sheets[sheet_index];
+        const real = this.modified_meta.sheets[sheet_index];
         // One batched read per side keeps the underlying sources' indexed
         // batching; padded (deleted-band) positions read the *original* rows so
         // transforms and copies see the removed text the grid shows.
@@ -288,7 +294,7 @@ export class CompareDataSource implements DataSource {
                 ? this.original.source_row_indices(deleted_index, projected_rows)
                 : Uint32Array.from(projected_rows);
         }
-        const real = this.modified.meta().sheets[sheet_index];
+        const real = this.modified_meta.sheets[sheet_index];
         if (!real) return Uint32Array.from(projected_rows);
         const result = new Uint32Array(projected_rows.length);
         const real_positions: number[] = [];
@@ -320,7 +326,7 @@ export class CompareDataSource implements DataSource {
                 ? this.original.projected_row_index(deleted_index, source_row)
                 : source_row;
         }
-        const real = this.modified.meta().sheets[sheet_index];
+        const real = this.modified_meta.sheets[sheet_index];
         if (!real) return source_row;
         if (source_row >= real.sourceRowCount) {
             const padded_row = real.rowCount + (source_row - real.sourceRowCount);

@@ -597,6 +597,49 @@ describe('register_table_viewer', () => {
         await registration.drain();
     });
 
+    it('pairs a vscode.diff whose working-tree URI carries a remote authority', async () => {
+        const modified = Buffer.from('a\n2\n');
+        const original = Buffer.from('a\n1\n');
+        vscode_mock.__setStatImplementation(async () => ({ size: modified.length, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async (uri) =>
+            (String(uri.scheme) === 'git' ? original : modified));
+        const registration = register_table_viewer(context(), state_store());
+        const provider = excel_provider();
+        // A remote workspace host hands the extension file: URIs that keep the
+        // remote authority. The git extension derives its revision URI from
+        // that URI via with(), preserving the authority — so the compare
+        // pairing must invert the same transformation, not rebuild the key
+        // from the query's path with Uri.file(). The query's path deliberately
+        // disagrees with the URI path: pairing keyed off the query would miss.
+        const working_uri = vscode_mock.Uri.file('/repo/data.csv')
+            .with({ authority: 'ssh-remote+box' });
+        const file_uri = working_uri as unknown as vscode.Uri;
+        const git_uri = working_uri.with({
+            scheme: 'git',
+            query: JSON.stringify({ path: '/serialized/elsewhere.csv', ref: '~' }),
+        }) as unknown as vscode.Uri;
+
+        for (const uri of [git_uri, file_uri]) {
+            const panel = vscode_mock.window.createWebviewPanel(
+                'tableViewer.editor',
+                'data.csv',
+            ) as unknown as vscode.WebviewPanel;
+            const document = await provider.openCustomDocument(uri);
+            await provider.resolveCustomEditor(document, panel);
+        }
+        const [git_panel, file_panel] = vscode_mock.__getPanels();
+
+        const git_snapshot = await receive_ready_and_get_snapshot(git_panel);
+        expect(git_snapshot.configuration.gitCompare).toBeUndefined();
+
+        const file_snapshot = await receive_ready_and_get_snapshot(file_panel);
+        expect(file_snapshot.configuration.gitCompare).toBeDefined();
+        expect(file_snapshot.capabilities.csvEditingSupported).toBe(false);
+
+        registration.dispose();
+        await registration.drain();
+    });
+
     it('renders a bare git: URI read-only and leaves later plain opens uncompared', async () => {
         const csv = Buffer.from('a\n1\n');
         vscode_mock.__setStatImplementation(async () => ({ size: csv.length, mtime: 1 }));

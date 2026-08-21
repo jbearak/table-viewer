@@ -2,63 +2,12 @@ import { describe, expect, it } from 'vitest';
 import {
     diff_column_names,
     diff_row_window,
+    diff_rows_indexed,
     pair_sheets,
     type SheetPairing,
 } from '../diff-compare/compare-source';
 import { build_source_from_buffer } from '../data-source/from-buffer';
-import type {
-    DataSource,
-    RenderedCell,
-    RowWindow,
-    WorkbookMeta,
-} from '../data-source/interface';
-
-const cell = (raw: string): RenderedCell => ({
-    raw,
-    formatted: raw,
-    bold: false,
-    italic: false,
-    rawType: 'string',
-});
-
-interface FixtureSheet {
-    name: string;
-    worksheetId?: string;
-    rows: string[][];
-}
-
-class FixtureSource implements DataSource {
-    constructor(private readonly fixture_sheets: FixtureSheet[]) {}
-
-    meta(): WorkbookMeta {
-        return {
-            hasFormatting: false,
-            sheets: this.fixture_sheets.map((sheet) => ({
-                name: sheet.name,
-                ...(sheet.worksheetId !== undefined
-                    ? { worksheetId: sheet.worksheetId }
-                    : {}),
-                rowCount: sheet.rows.length,
-                sourceRowCount: sheet.rows.length,
-                columnCount: Math.max(0, ...sheet.rows.map((row) => row.length)),
-                merges: [],
-                hasFormatting: false,
-            })),
-        };
-    }
-
-    read_rows(sheet_index: number, start_row: number, count: number): RowWindow {
-        const rows = this.fixture_sheets[sheet_index].rows;
-        const start = Math.max(0, Math.min(start_row, rows.length));
-        return {
-            startRow: start,
-            rows: rows.slice(start, start + count)
-                .map((row) => row.map((value) => (value === '' ? null : cell(value)))),
-        };
-    }
-
-    close(): void {}
-}
+import { FixtureSource } from './helpers/fixture-source';
 
 const single = (rows: string[][]): FixtureSource =>
     new FixtureSource([{ name: 'Sheet1', rows }]);
@@ -229,6 +178,44 @@ describe('diff_row_window', () => {
             { status: 'added', name: 'X', modifiedIndex: 0 },
             0,
             1,
+        )).toThrow();
+    });
+});
+
+describe('diff_rows_indexed', () => {
+    it('names positions in the requested row set, not absolute grid rows', () => {
+        // A sorted/filtered page requests non-contiguous, out-of-order rows;
+        // rowStatus[i] and changedCells[*].row must name rows[i]'s position.
+        const original = single([['a'], ['b'], ['c'], ['d']]);
+        const modified = single([['a'], ['B'], ['c'], ['D']]);
+        const diff = diff_rows_indexed(original, modified, matched, [3, 0, 1]);
+        expect(diff).toEqual({
+            startRow: 0,
+            rowStatus: ['same', 'same', 'same'],
+            changedCells: [
+                { row: 0, col: 0, base: 'd' },
+                { row: 2, col: 0, base: 'b' },
+            ],
+        });
+    });
+
+    it('marks rows past one side as added or deleted, positionally', () => {
+        const original = single([['a'], ['gone']]);
+        const modified = single([['a'], ['b'], ['new']]);
+        // Row 2 exists only in modified (added); with the sides swapped a row
+        // past the modified count would be deleted — cover both directions.
+        expect(diff_rows_indexed(original, modified, matched, [2, 0]).rowStatus)
+            .toEqual(['added', 'same']);
+        expect(diff_rows_indexed(modified, original, matched, [2, 0]).rowStatus)
+            .toEqual(['deleted', 'same']);
+    });
+
+    it('rejects unmatched pairings', () => {
+        expect(() => diff_rows_indexed(
+            single([]),
+            single([]),
+            { status: 'added', name: 'X', modifiedIndex: 0 },
+            [0],
         )).toThrow();
     });
 });

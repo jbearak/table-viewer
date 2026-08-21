@@ -1,62 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { CompareDataSource } from '../diff-compare/compare-session';
-import type {
-    DataSource,
-    RenderedCell,
-    RowWindow,
-    WorkbookMeta,
-} from '../data-source/interface';
-
-const cell = (raw: string): RenderedCell => ({
-    raw,
-    formatted: raw,
-    bold: false,
-    italic: false,
-    rawType: 'string',
-});
-
-interface FixtureSheet {
-    name: string;
-    worksheetId?: string;
-    rows: string[][];
-}
-
-class FixtureSource implements DataSource {
-    closed = false;
-
-    constructor(private readonly fixture_sheets: FixtureSheet[]) {}
-
-    meta(): WorkbookMeta {
-        return {
-            hasFormatting: false,
-            sheets: this.fixture_sheets.map((sheet) => ({
-                name: sheet.name,
-                ...(sheet.worksheetId !== undefined
-                    ? { worksheetId: sheet.worksheetId }
-                    : {}),
-                rowCount: sheet.rows.length,
-                sourceRowCount: sheet.rows.length,
-                columnCount: Math.max(0, ...sheet.rows.map((row) => row.length)),
-                merges: [],
-                hasFormatting: false,
-            })),
-        };
-    }
-
-    read_rows(sheet_index: number, start_row: number, count: number): RowWindow {
-        const rows = this.fixture_sheets[sheet_index].rows;
-        const start = Math.max(0, Math.min(start_row, rows.length));
-        return {
-            startRow: start,
-            rows: rows.slice(start, start + count)
-                .map((row) => row.map((value) => (value === '' ? null : cell(value)))),
-        };
-    }
-
-    close(): void {
-        this.closed = true;
-    }
-}
+import type { DataSource } from '../data-source/interface';
+import { FixtureSource } from './helpers/fixture-source';
 
 const compare = (
     original_rows: string[][],
@@ -134,6 +79,10 @@ describe('CompareDataSource', () => {
         );
         const sheets = source.meta().sheets;
         expect(sheets.map((sheet) => sheet.name)).toEqual(['Kept', 'Gone']);
+        // The ordering contract: statuses and changed headers are positional
+        // against meta().sheets, with deleted originals appended at the end.
+        expect(source.sheetStatuses).toEqual(['matched', 'deleted']);
+        expect(source.changedColumnNames).toEqual([[], []]);
         expect(sheets[1].rowCount).toBe(2);
         const window = source.read_rows(1, 0, 10);
         expect(window.rows.map((row) => row[0]?.raw)).toEqual(['g1', 'g2']);
