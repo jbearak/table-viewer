@@ -7,6 +7,29 @@ import { generate_nonce } from './webview-html';
 
 export const TABLE_VIEW_TYPE = 'tableViewer.editor';
 
+/**
+ * The working-tree file path a git: revision URI diffs, from the git
+ * extension's URI encoding (JSON query `{path, ref}`). Undefined when the
+ * query is absent or malformed — such a URI still opens, just as a plain
+ * read-only render with no compare pairing.
+ */
+export function git_diffed_file_path(uri: vscode.Uri): string | undefined {
+    if (!uri.query) return undefined;
+    try {
+        const parsed: unknown = JSON.parse(uri.query);
+        if (
+            typeof parsed === 'object' && parsed !== null
+            && 'path' in parsed && typeof parsed.path === 'string'
+            && parsed.path.length > 0
+        ) {
+            return parsed.path;
+        }
+    } catch {
+        // Not the git extension's encoding; treat as a bare revision URI.
+    }
+    return undefined;
+}
+
 class TableViewerDocument implements vscode.CustomDocument {
     constructor(public readonly uri: vscode.Uri) {}
     dispose(): void {}
@@ -121,17 +144,31 @@ export class TableViewerEditorProvider
     }
 
     /**
+     * Park a compare intent under `resource` and return its release. A fresh
+     * wrapper object per call: overlapping parks for the same resource each
+     * hold their own intent, and a release removes only its own entry rather
+     * than a successor's. Releasing after consumption is a no-op.
+     */
+    #park_compare_intent(resource: string, original_uri: vscode.Uri): () => void {
+        const intent = { originalUri: original_uri };
+        this.#pending_compares.set(resource, intent);
+        return () => {
+            if (this.#pending_compares.get(resource) === intent) {
+                this.#pending_compares.delete(resource);
+            }
+        };
+    }
+
+    /**
      * Open `uri` as a table compared against `original_uri` (its git original).
      * The comparison needs a fresh resolve: an existing viewer for the file may
      * hold an edit session, and compare panels are read-only by construction.
      */
     async openTableDiff(uri: vscode.Uri, original_uri: vscode.Uri): Promise<void> {
-        const resource = create_resource_identity(uri).key;
-        // A fresh wrapper object per call: overlapping diff opens for the same
-        // resource each park their own intent, and the cleanup below removes
-        // only its own entry rather than a successor's.
-        const intent = { originalUri: original_uri };
-        this.#pending_compares.set(resource, intent);
+        const release = this.#park_compare_intent(
+            create_resource_identity(uri).key,
+            original_uri,
+        );
         try {
             await vscode.commands.executeCommand(
                 'vscode.openWith',
@@ -143,12 +180,10 @@ export class TableViewerEditorProvider
                 vscode.ViewColumn.Beside,
             );
         } finally {
-            if (this.#pending_compares.get(resource) === intent) {
-                // No resolve consumed the intent — the open failed or revealed
-                // an existing tab. Clear it so a later plain open of this file
-                // cannot inherit a stale compare.
-                this.#pending_compares.delete(resource);
-            }
+            // If no resolve consumed the intent — the open failed or revealed
+            // an existing tab — clear it so a later plain open of this file
+            // cannot inherit a stale compare.
+            release();
         }
     }
 
@@ -166,6 +201,34 @@ export class TableViewerEditorProvider
             webview_panel.webview, this.extension_uri, generate_nonce());
 
         const resource = create_resource_identity(document.uri).key;
+        // An SCM-pane click runs `vscode.diff`, which resolves BOTH sides
+        // through this provider: first the git: revision, then the working-tree
+        // file. The git: side has no working tree to write back to, so it
+        // renders plain read-only — and parks a compare intent so the file:
+        // side that follows attaches the diff session against it. A bare git:
+        // URI (no parseable {path} query) is just a read-only render.
+        const read_only = document.uri.scheme === 'git';
+        if (read_only) {
+            if (git_diffed_file_path(document.uri) !== undefined) {
+                // The git extension builds its revision URI from the file's
+                // URI via `with({scheme: 'git', query})`, preserving authority
+                // and path — so inverting that transformation (rather than
+                // reconstructing from the query's fsPath with `Uri.file`)
+                // keeps remote-workspace authorities and Windows paths intact.
+                const diffed_key = create_resource_identity(
+                    document.uri.with({ scheme: 'file', query: '' }),
+                ).key;
+                const release = this.#park_compare_intent(diffed_key, document.uri);
+                // In a `vscode.diff` the file: side resolves right after this
+                // one and consumes the intent. VS Code offers no handle that
+                // correlates the two resolves, so pairing is by resource key:
+                // while a revision panel is open, any resolve of its file
+                // attaches the compare. If the file: side never comes (the
+                // git: side was opened alone), retire the intent with this
+                // panel so a later plain open cannot inherit a stale compare.
+                webview_panel.onDidDispose(release);
+            }
+        }
         const compare_original = this.#pending_compares.get(resource);
         if (compare_original) this.#pending_compares.delete(resource);
         const controller = attach_viewer(
@@ -176,9 +239,10 @@ export class TableViewerEditorProvider
             vscode_viewer_host,
             {
                 requestClose: () => webview_panel.dispose(),
-                ...(compare_original
+                ...(compare_original && !read_only
                     ? { compare: { originalUri: compare_original.originalUri } }
                     : {}),
+                ...(read_only ? { readOnly: true } : {}),
             },
         );
         this.#controllers.add(controller);
