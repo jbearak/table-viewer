@@ -44,7 +44,7 @@ export function file_size_limit_dialog_detail(
 export interface HostUiPort {
     show_warning(message: string): void;
     show_error(message: string): void;
-    /** Modal "You have unsaved changes." dialog with Save / Discard / cancel. */
+    /** Modal "Leave edit mode?" dialog with Save Edits / Discard Edits / cancel. */
     show_save_discard_dialog(): Promise<SaveDialogChoice>;
     show_file_size_limit_dialog(
         details: FileSizeLimitDialogDetails,
