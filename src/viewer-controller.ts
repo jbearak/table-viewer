@@ -4928,7 +4928,6 @@ export function attach_viewer(
     }
 
     function refresh_if_changed(): Promise<boolean> {
-        if (!renderer_ready) return Promise.resolve(false);
         return refresh_panel_source(false);
     }
 

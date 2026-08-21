@@ -615,6 +615,63 @@ describe('register_table_viewer', () => {
         await registration.drain();
     });
 
+    it('refreshes a retained comparison before its renderer is ready', async () => {
+        const modified_bytes = Buffer.from('h\nmodified\n');
+        let original_bytes = Buffer.from('h\nold\n');
+        let original_mtime = 1;
+        vscode_mock.__setStatImplementation(async (uri) => ({
+            size: uri.scheme === 'git' ? original_bytes.length : modified_bytes.length,
+            mtime: uri.scheme === 'git' ? original_mtime : 1,
+        }));
+        vscode_mock.__setReadFileImplementation(async (uri) => (
+            uri.scheme === 'git' ? original_bytes : modified_bytes
+        ));
+        const registration = register_table_viewer(context(), state_store());
+        const provider = excel_provider();
+        const modified = vscode_mock.Uri.file('/repo/data.csv') as unknown as vscode.Uri;
+        const original = vscode_mock.Uri.file('/repo/data.csv').with({
+            scheme: 'git',
+            query: JSON.stringify({ path: '/repo/data.csv', ref: '~' }),
+        }) as unknown as vscode.Uri;
+        vscode_mock.__setCommand('vscode.openWith', async (target: unknown) => {
+            const panel = vscode_mock.window.createWebviewPanel(
+                'tableViewer.editor',
+                'data.csv',
+            ) as unknown as vscode.WebviewPanel;
+            await provider.resolveCustomEditor(
+                await provider.openCustomDocument(target as vscode.Uri),
+                panel,
+            );
+        });
+
+        await registration.openTableDiff({ modified, original });
+        const panel = vscode_mock.__getPanels()[0];
+        await vscode_mock.__getWatchers()[0].__fireChange();
+        original_bytes = Buffer.from('h\nlatest\n');
+        original_mtime = 2;
+
+        await registration.openTableDiff({ modified, original });
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(messages_of(panel, 'workbookSnapshot')).toHaveLength(1));
+        const snapshot = messages_of(panel, 'workbookSnapshot')[0].snapshot as {
+            generation: number;
+        };
+        await panel.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 10,
+            requestId: 'rows',
+            generation: snapshot.generation,
+        });
+        await vi.waitFor(() => expect(messages_of(panel, 'compareDiff')).toHaveLength(1));
+        expect(messages_of(panel, 'compareDiff')[0].changedCells).toEqual([
+            { row: 0, col: 0, base: 'latest' },
+        ]);
+        registration.dispose();
+        await registration.drain();
+    });
+
     it('coalesces concurrent opens for the same comparison', async () => {
         const registration = register_table_viewer(context(), state_store());
         const modified = vscode_mock.Uri.file('/repo/data.csv') as unknown as vscode.Uri;

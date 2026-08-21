@@ -556,7 +556,7 @@ export const window = {
                     try {
                         handler(event);
                     } catch {
-                        // VS Code isolates event-listener failures from close().
+                        // VS Code isolates synchronous listener failures and ignores returns.
                     }
                 }
                 return true;
