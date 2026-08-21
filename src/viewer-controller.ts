@@ -266,6 +266,8 @@ export interface ViewerControllerOptions {
 export interface ViewerController extends Disposable {
     /** Select a worksheet by its workbook name once the renderer has a snapshot. */
     select_sheet(sheet_name: string): Promise<boolean>;
+    /** Re-read a retained panel only when either comparison side has changed. */
+    refresh_if_changed(): Promise<boolean>;
     /** Refuse every new edit session before a shutdown/activation barrier begins. */
     stop_edit_admission(): void;
     /** Fence the current renderer and wait for its exact durable edit acknowledgement. */
@@ -3540,7 +3542,7 @@ export function attach_viewer(
         if (!bypassFileSizeLimit) assert_safe_file_size(stat.size, max_mib);
         const raw = await host.fs.read_file(uri);
         if (!bypassFileSizeLimit) assert_safe_file_size(raw.byteLength, max_mib);
-        const observation = {
+        const observation: PhysicalSourceObservation = {
             fingerprint: `${stat.mtime}:${stat.size}`,
             digest: content_digest(raw),
         };
@@ -3556,20 +3558,30 @@ export function attach_viewer(
                 load_all_csv_rows ? { loadAllRows: true } : undefined,
             );
         } catch (error) {
-            void original_promise.then((original) => original?.close());
+            void original_promise.then((original) => original?.source.close());
             throw error;
         }
         const original = await original_promise;
         let adopted = modified;
+        let comparison_observation: Readonly<PhysicalSourceObservation> | undefined;
         if (original) {
             try {
-                adopted = new CompareDataSource(modified, original);
+                adopted = new CompareDataSource(modified, original.source);
+                comparison_observation = original.observation;
             } catch (error) {
-                original.close();
+                original.source.close();
                 warn_compare_unavailable(error);
             }
         }
-        return new SourceCandidate(adopted, observation);
+        return new SourceCandidate(adopted, {
+            ...observation,
+            ...(comparison_observation
+                ? {
+                    comparisonFingerprint: comparison_observation.fingerprint,
+                    comparisonDigest: comparison_observation.digest,
+                }
+                : {}),
+        });
     }
 
     /**
@@ -3582,7 +3594,10 @@ export function attach_viewer(
      */
     async function build_compare_original(
         state: PerFileState,
-    ): Promise<DataSource | undefined> {
+    ): Promise<{
+        readonly source: DataSource;
+        readonly observation: Readonly<PhysicalSourceObservation>;
+    } | undefined> {
         if (!compare_original_uri) return undefined;
         try {
             const max_mib = host.config.max_file_size_mib();
@@ -3594,12 +3609,18 @@ export function attach_viewer(
             assert_safe_file_size(original_raw.byteLength, max_mib);
             // Mirror the modified side's row cap: uncapping only one side
             // would report every row beyond the other's cap as added/deleted.
-            return await profile.build_source(
-                original_raw,
-                file_path,
-                state,
-                load_all_csv_rows ? { loadAllRows: true } : undefined,
-            );
+            return {
+                source: await profile.build_source(
+                    original_raw,
+                    file_path,
+                    state,
+                    load_all_csv_rows ? { loadAllRows: true } : undefined,
+                ),
+                observation: {
+                    fingerprint: `${stat.mtime}:${stat.size}`,
+                    digest: content_digest(original_raw),
+                },
+            };
         } catch (error) {
             warn_compare_unavailable(error);
             return undefined;
@@ -3680,9 +3701,28 @@ export function attach_viewer(
         }
         const raw = await host.fs.read_file(uri);
         const verified_stat = await host.fs.stat(uri);
+        if (
+            !load_is_current(seq, refresh_event)
+            || `${verified_stat.mtime}:${verified_stat.size}` !== fingerprint
+            || content_digest(raw) !== digest
+        ) {
+            return false;
+        }
+        const comparison_fingerprint = candidate.observation.comparisonFingerprint;
+        const comparison_digest = candidate.observation.comparisonDigest;
+        if (!compare_original_uri || !comparison_fingerprint || !comparison_digest) {
+            return true;
+        }
+        const comparison_stat = await host.fs.stat(compare_original_uri);
+        if (`${comparison_stat.mtime}:${comparison_stat.size}` !== comparison_fingerprint) {
+            return false;
+        }
+        const comparison_raw = await host.fs.read_file(compare_original_uri);
+        const verified_comparison_stat = await host.fs.stat(compare_original_uri);
         return load_is_current(seq, refresh_event)
-            && `${verified_stat.mtime}:${verified_stat.size}` === fingerprint
-            && content_digest(raw) === digest;
+            && `${verified_comparison_stat.mtime}:${verified_comparison_stat.size}`
+                === comparison_fingerprint
+            && content_digest(comparison_raw) === comparison_digest;
     }
 
     async function commit_physical_candidate(
@@ -4560,6 +4600,12 @@ export function attach_viewer(
         }
     }
 
+    function candidate_matches_acknowledged_source(candidate: SourceCandidate): boolean {
+        return candidate.observation.digest === session.acknowledged_physical_digest()
+            && candidate.observation.comparisonDigest
+                === source_observation?.comparisonDigest;
+    }
+
     async function run_physical_refresh(
         request: PanelLoadRequest,
         force: boolean,
@@ -4593,8 +4639,7 @@ export function attach_viewer(
                     last_error = new Error('The file changed while it was being refreshed.');
                 } else if (
                     !force
-                    && candidate.observation.digest
-                        === session.acknowledged_physical_digest()
+                    && candidate_matches_acknowledged_source(candidate)
                 ) {
                     const deduplicated = await commit_physical_candidate(
                         candidate,
@@ -4694,11 +4739,7 @@ export function attach_viewer(
                 }
                 return false;
             }
-            if (
-                !force
-                && candidate.observation.digest
-                    === session.acknowledged_physical_digest()
-            ) {
+            if (!force && candidate_matches_acknowledged_source(candidate)) {
                 const deduplicated = await commit_physical_candidate(
                     candidate, request.seq, expected_authority, true,
                 );
@@ -4764,6 +4805,11 @@ export function attach_viewer(
         if (disposed) return Promise.resolve(false);
         const request = { seq: supersede_panel_load() };
         return run_local_refresh_attempt(request, force, reason, initial);
+    }
+
+    function refresh_if_changed(): Promise<boolean> {
+        if (!renderer_ready) return Promise.resolve(false);
+        return refresh_panel_source(false);
     }
 
     function refresh_from_event(
@@ -8237,6 +8283,7 @@ export function attach_viewer(
 
     return {
         select_sheet,
+        refresh_if_changed,
         stop_edit_admission,
         flush_pending_edits,
         drain: drain_controller,

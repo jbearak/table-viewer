@@ -25,6 +25,11 @@ describe('extension activation', () => {
             'tableViewer.showCsvPreview',
             'tableViewer.openCsvTable',
             'tableViewer.openAsText',
+            'tableViewer.openWorkingTreeFile',
+            'tableViewer.openWorkbookAtSheet',
+            'tableViewer.manageStoredFileState',
+            'tableViewer.openTableDiff',
+            'tableViewer.openStagedTableDiff',
         ]) {
             assert.ok(commands.includes(id), `command ${id} not registered`);
         }

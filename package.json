@@ -21,7 +21,9 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "languages": [
@@ -67,6 +69,11 @@
         "icon": "$(go-to-file)"
       },
       {
+        "command": "tableViewer.openWorkingTreeFile",
+        "title": "Table Viewer: Open File",
+        "icon": "$(go-to-file)"
+      },
+      {
         "command": "tableViewer.openWorkbookAtSheet",
         "title": "Table Viewer: Open Workbook at Worksheet"
       },
@@ -78,16 +85,29 @@
         "command": "tableViewer.openTableDiff",
         "title": "Table Viewer: Open Table Diff",
         "icon": "$(diff)"
+      },
+      {
+        "command": "tableViewer.openStagedTableDiff",
+        "title": "Table Viewer: Open Staged Table Diff",
+        "icon": "$(diff)"
       }
     ],
     "menus": {
       "commandPalette": [
+        {
+          "command": "tableViewer.openWorkingTreeFile",
+          "when": "false"
+        },
         {
           "command": "tableViewer.openWorkbookAtSheet",
           "when": "false"
         },
         {
           "command": "tableViewer.openTableDiff",
+          "when": "false"
+        },
+        {
+          "command": "tableViewer.openStagedTableDiff",
           "when": "false"
         }
       ],
@@ -100,6 +120,16 @@
         {
           "command": "tableViewer.openTableDiff",
           "when": "scmProvider == git && scmResourceGroup == workingTree && resourceExtname =~ /\\.(csv|tsv|xlsx|xls)$/i",
+          "group": "navigation"
+        },
+        {
+          "command": "tableViewer.openStagedTableDiff",
+          "when": "scmProvider == git && scmResourceGroup == index && resourceExtname =~ /\\.(csv|tsv|xlsx|xls)$/i",
+          "group": "inline"
+        },
+        {
+          "command": "tableViewer.openStagedTableDiff",
+          "when": "scmProvider == git && scmResourceGroup == index && resourceExtname =~ /\\.(csv|tsv|xlsx|xls)$/i",
           "group": "navigation"
         }
       ],
@@ -117,7 +147,12 @@
         },
         {
           "command": "tableViewer.openAsText",
-          "when": "resourceExtname =~ /\\.(csv|tsv|CSV|TSV)$/ && activeCustomEditorId == tableViewer.editor",
+          "when": "resourceExtname =~ /\\.(csv|tsv|CSV|TSV)$/ && activeCustomEditorId == tableViewer.editor && resourceScheme != table-viewer-diff",
+          "group": "navigation"
+        },
+        {
+          "command": "tableViewer.openWorkingTreeFile",
+          "when": "activeCustomEditorId == tableViewer.editor && resourceScheme == table-viewer-diff",
           "group": "navigation"
         }
       ]

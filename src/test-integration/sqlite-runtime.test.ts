@@ -15,8 +15,8 @@ interface SqliteError extends Error {
 describe('embedded node:sqlite runtime', () => {
     it('supports the shared API intersection and representative errors', () => {
         assert.ok(
-            vscode.version === '1.127.0' || vscode.version === '1.131.0',
-            `runtime probe must run in VS Code 1.127.0 or 1.131.0, received ${vscode.version}`,
+            vscode.version === '1.127.0' || vscode.version === '1.134.0',
+            `runtime probe must run in VS Code 1.127.0 or 1.134.0, received ${vscode.version}`,
         );
         assert.strictEqual(typeof DatabaseSync, 'function');
 
