@@ -102,6 +102,10 @@ const grid_mock = vi.hoisted(() => ({
     })),
     loader_enabled: [] as boolean[],
     loader_version: 0,
+    // Git compare sidecar state, keyed by display row (status) and
+    // `row:col` (per-cell base text). Empty = everything unchanged.
+    compare_status: {} as Record<number, 'added' | 'deleted' | undefined>,
+    compare_base: {} as Record<string, string | undefined>,
     // Display row → canonical source row; null means identity, which is what a
     // CSV with no transform installed reports. Overridable so a test can make the
     // two row spaces diverge — the only condition under which an assertion about
@@ -206,6 +210,9 @@ vi.mock('../webview/use-row-loader', () => ({
             has_source_row: (source_row: number) => (
                 resident_display_row(source_row) !== undefined
             ),
+            get_compare_status: (row: number) => grid_mock.compare_status[row],
+            get_compare_base: (row: number, col: number) =>
+                grid_mock.compare_base[`${row}:${col}`],
             sample_loaded_rows: () => [],
             version: grid_mock.loader_version,
         };
@@ -373,6 +380,8 @@ afterEach(() => {
     ] as any);
     grid_mock.loader_enabled = [];
     grid_mock.loader_version = 0;
+    grid_mock.compare_status = {};
+    grid_mock.compare_base = {};
     vi.unstubAllGlobals();
     Reflect.deleteProperty(navigator, 'clipboard');
     vi.useRealTimers();
@@ -588,6 +597,74 @@ describe('GridShell cell wrapping', () => {
         const get_cell_content = grid_mock.props!.getCellContent as
             (cell: [number, number]) => { allowWrapping?: boolean };
         expect(get_cell_content([0, 0]).allowWrapping).toBe(true);
+    });
+});
+
+describe('GridShell git compare painting', () => {
+    it('paints row bands and per-cell before-text from the compare sidecar', async () => {
+        grid_mock.compare_status = { 1: 'added' };
+        grid_mock.compare_base = { '0:0': 'before-a' };
+        await render_grid(props({ git_compare: true }));
+
+        const get_cell_content = grid_mock.props!.getCellContent as (
+            cell: [number, number],
+        ) => {
+            themeOverride?: { bgCell?: string };
+            data: string | { kind: string; lines: { text: string }[][] };
+        };
+        // The changed cell diffs its own text against the sidecar's base
+        // through the same rich-text channel the Diff toggle uses.
+        const changed = get_cell_content([0, 0]);
+        expect(changed.data).toMatchObject({ kind: 'rich-text' });
+        const diff_texts = (changed.data as { lines: { text: string }[][] })
+            .lines.flat().map((run) => run.text);
+        expect(diff_texts).toContain('before-a');
+        expect(diff_texts).toContain('source-a');
+        // The added row gets a whole-row band; its cells carry no diff.
+        const added = get_cell_content([0, 1]);
+        expect(added.themeOverride?.bgCell).toBeDefined();
+        expect(added.data).toBe('source-a');
+        // An untouched cell is a plain cell: no band, no diff payload.
+        const plain = get_cell_content([1, 0]);
+        expect(plain.themeOverride).toBeUndefined();
+        expect(plain.data).toBe('source-c');
+    });
+
+    it('strikes deleted-row cells whole instead of diffing them', async () => {
+        grid_mock.compare_status = { 0: 'deleted', 1: 'added' };
+        await render_grid(props({ git_compare: true }));
+        const get_cell_content = grid_mock.props!.getCellContent as (
+            cell: [number, number],
+        ) => {
+            themeOverride?: { bgCell?: string };
+            data: { lines: { text: string; style?: { strikethrough?: boolean } }[][] };
+        };
+        const cell = get_cell_content([0, 0]);
+        // A band that is distinct from the added band — the exact colors are
+        // the theme's business, the distinction is the behavior.
+        expect(cell.themeOverride?.bgCell).toBeDefined();
+        expect(cell.themeOverride?.bgCell).not.toBe(
+            get_cell_content([0, 1]).themeOverride?.bgCell,
+        );
+        // Struck through whole: one line of the cell's own text, no diff pair.
+        expect(cell.data.lines).toEqual([[
+            expect.objectContaining({
+                text: 'source-a',
+                style: { strikethrough: true },
+            }),
+        ]]);
+    });
+
+    it('ignores the compare sidecar entirely when git_compare is off', async () => {
+        grid_mock.compare_status = { 0: 'added' };
+        grid_mock.compare_base = { '0:0': 'before-a' };
+        await render_grid(props());
+        const get_cell_content = grid_mock.props!.getCellContent as (
+            cell: [number, number],
+        ) => { themeOverride?: unknown; data: string };
+        const cell = get_cell_content([0, 0]);
+        expect(cell.themeOverride).toBeUndefined();
+        expect(cell.data).toBe('source-a');
     });
 });
 
