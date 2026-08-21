@@ -33,3 +33,8 @@ export function get_default_orientation(): 'horizontal' | 'vertical' {
     return vscode.workspace.getConfiguration('tableViewer')
         .get<'horizontal' | 'vertical'>('tabOrientation', 'horizontal');
 }
+
+export function get_diff_on_by_default(): boolean {
+    return vscode.workspace.getConfiguration('tableViewer')
+        .get<boolean>('diffOnByDefault', false);
+}

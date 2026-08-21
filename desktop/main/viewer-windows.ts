@@ -1526,8 +1526,8 @@ export class ViewerWindowManager {
                 show_save_discard_dialog: async () => {
                     const { response } = await message_box({
                         type: 'warning',
-                        message: 'You have unsaved changes.',
-                        buttons: ['Save', 'Discard', 'Cancel'],
+                        message: 'Leave edit mode?',
+                        buttons: ['Save Edits', 'Discard Edits', 'Stay in Edit Mode'],
                         defaultId: 0,
                         cancelId: 2,
                         noLink: true,

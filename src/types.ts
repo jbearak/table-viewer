@@ -1845,7 +1845,7 @@ export type HostMessage =
     // `sheetIndex` mirrors the request's: optional, defaulting to the only sheet
     // a single-sheet source has. Every host answer echoes back the sheet it was
     // asked about, so the webview can route a grant to the right worksheet store.
-    | { type: 'editSessionResult'; requestId: string; granted: boolean; editSessionId?: string; sheetIndex?: number; pendingEdits?: SheetPendingEditCells }
+    | { type: 'editSessionResult'; requestId: string; granted: boolean; editSessionId?: string; sheetIndex?: number; pendingEdits?: SheetPendingEditCells; diffOnByDefault?: boolean }
     /**
      * A discard's host-side cleanup has settled.
      *

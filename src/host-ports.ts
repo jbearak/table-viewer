@@ -44,7 +44,7 @@ export function file_size_limit_dialog_detail(
 export interface HostUiPort {
     show_warning(message: string): void;
     show_error(message: string): void;
-    /** Modal "You have unsaved changes." dialog with Save / Discard / cancel. */
+    /** Modal "Leave edit mode?" dialog with Save Edits / Discard Edits / cancel. */
     show_save_discard_dialog(): Promise<SaveDialogChoice>;
     show_file_size_limit_dialog(
         details: FileSizeLimitDialogDetails,
@@ -66,6 +66,7 @@ export interface ConfigPort {
     max_file_size_mib(): number;
     csv_max_rows(): number;
     default_tab_orientation(): 'horizontal' | 'vertical';
+    diff_on_by_default(): boolean;
     /** Fires whenever the configured font (family or size) may have changed. */
     on_font_change(listener: () => void): Disposable;
 }

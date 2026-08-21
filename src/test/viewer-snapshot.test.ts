@@ -75,6 +75,7 @@ describe('workbook snapshot builder', () => {
             configuration: {
                 defaultTabOrientation: 'vertical',
                 previewMode: false,
+                diffOnByDefault: false,
             },
             capabilities: {
                 csvEditable: false,
@@ -98,7 +99,10 @@ describe('workbook snapshot builder', () => {
         });
         expect(snapshot.generation).toBe(7);
         expect(snapshot.sourceGeneration).toBe(6);
-        expect(snapshot.configuration.previewMode).toBe(false);
+        expect(snapshot.configuration).toMatchObject({
+            previewMode: false,
+            diffOnByDefault: false,
+        });
         expect(snapshot.capabilities).toEqual({
             csvEditable: false,
             csvEditingSupported: false,
@@ -136,6 +140,7 @@ describe('workbook snapshot builder', () => {
         const configuration = {
             defaultTabOrientation: 'horizontal' as const,
             previewMode: false,
+            diffOnByDefault: true,
         };
         const capabilities = {
             csvEditable: false,
@@ -204,6 +209,7 @@ describe('workbook snapshot builder', () => {
         state.pendingEdits![0]!.cells['0:0'] = 'Grace';
         state.excelFirstRowHeaders.People = 'off';
         configuration.previewMode = true;
+        configuration.diffOnByDefault = false;
         capabilities.csvEditable = true;
         diagnostics.truncationMessage = null;
         hidden_edited_cell_keys[0].push('3:0');
@@ -228,7 +234,10 @@ describe('workbook snapshot builder', () => {
             pendingEdits: sheet_edits({ '0:0': 'Ada' }),
             excelFirstRowHeaders: { People: 'on' },
         });
-        expect(snapshot.configuration.previewMode).toBe(false);
+        expect(snapshot.configuration).toMatchObject({
+            previewMode: false,
+            diffOnByDefault: true,
+        });
         expect(snapshot.capabilities.csvEditable).toBe(false);
         expect(snapshot.truncationMessage).toBe('Rows were truncated.');
         expect(snapshot.hiddenEditedCellKeys).toEqual([['2:0']]);
@@ -276,7 +285,11 @@ describe('workbook snapshot builder', () => {
             },
             presentation: 'initial',
             reason: 'ready',
-            configuration: { defaultTabOrientation: 'horizontal', previewMode: false },
+            configuration: {
+                defaultTabOrientation: 'horizontal',
+                previewMode: false,
+                diffOnByDefault: false,
+            },
             capabilities: {
                 csvEditable: false,
                 csvEditingSupported: false,
@@ -322,7 +335,11 @@ describe('workbook snapshot builder', () => {
             },
             presentation: 'initial',
             reason: 'ready',
-            configuration: { defaultTabOrientation: 'horizontal', previewMode: false },
+            configuration: {
+                defaultTabOrientation: 'horizontal',
+                previewMode: false,
+                diffOnByDefault: false,
+            },
             capabilities: {
                 csvEditable: false,
                 csvEditingSupported: false,
@@ -385,6 +402,7 @@ describe('workbook snapshot builder', () => {
             configuration: {
                 defaultTabOrientation: 'horizontal',
                 previewMode: false,
+                diffOnByDefault: false,
             },
             capabilities: {
                 csvEditable: false,

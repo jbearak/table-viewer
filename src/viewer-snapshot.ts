@@ -84,6 +84,7 @@ export interface WorkbookSnapshotCompare {
 export interface WorkbookSnapshotConfiguration {
     readonly defaultTabOrientation: 'horizontal' | 'vertical';
     readonly previewMode: boolean;
+    readonly diffOnByDefault: boolean;
     /** Present exactly when the panel is a read-only git compare session. */
     readonly gitCompare?: WorkbookSnapshotCompare;
 }

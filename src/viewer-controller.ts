@@ -4018,6 +4018,7 @@ export function attach_viewer(
                             configuration: {
                                 defaultTabOrientation: host.config.default_tab_orientation(),
                                 previewMode: profile.previewMode === true,
+                                diffOnByDefault: host.config.diff_on_by_default(),
                                 ...compare_configuration(next),
                             },
                             capabilities: {
@@ -4279,6 +4280,7 @@ export function attach_viewer(
                                     configuration: {
                                         defaultTabOrientation: host.config.default_tab_orientation(),
                                         previewMode: profile.previewMode === true,
+                                        diffOnByDefault: host.config.diff_on_by_default(),
                                         ...compare_configuration(source),
                                     },
                                     capabilities: {
@@ -6404,6 +6406,9 @@ export function attach_viewer(
                     sheetIndex: granted_sheet_index,
                     ...(granted && active_edit_session_id
                         ? { editSessionId: active_edit_session_id }
+                        : {}),
+                    ...(granted
+                        ? { diffOnByDefault: host.config.diff_on_by_default() }
                         : {}),
                     ...(pendingEdits ? { pendingEdits } : {}),
                 }, request.receiverEpoch);

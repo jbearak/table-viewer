@@ -82,6 +82,8 @@ export interface DesktopSettings {
     csvMaxRows: number;
     maxFileSizeMiB: number;
     maxStoredFiles: number;
+    /** Whether Diff starts on when Edit mode is entered, so edits show the original value too. */
+    diffOnByDefault: boolean;
     /** Check the release feed once after the desktop app finishes opening. */
     automaticallyCheckForUpdates: boolean;
     /** The available version whose notification the user dismissed. Empty means
@@ -123,6 +125,7 @@ export const DEFAULT_SETTINGS: Readonly<DesktopSettings> = Object.freeze({
     csvMaxRows: 1_000_000,
     maxFileSizeMiB: 256,
     maxStoredFiles: 10_000,
+    diffOnByDefault: false,
     automaticallyCheckForUpdates: true,
     dismissedUpdateVersion: '',
     newWindowSize: 'match-last',
@@ -163,6 +166,9 @@ export function sanitize_settings(raw: unknown): DesktopSettings {
         csvMaxRows: Math.floor(sanitize_number(record.csvMaxRows, DEFAULT_SETTINGS.csvMaxRows, 1)),
         maxFileSizeMiB: sanitize_number(record.maxFileSizeMiB, DEFAULT_SETTINGS.maxFileSizeMiB, 1),
         maxStoredFiles: Math.floor(sanitize_number(record.maxStoredFiles, DEFAULT_SETTINGS.maxStoredFiles, 1)),
+        diffOnByDefault: typeof record.diffOnByDefault === 'boolean'
+            ? record.diffOnByDefault
+            : DEFAULT_SETTINGS.diffOnByDefault,
         automaticallyCheckForUpdates: typeof record.automaticallyCheckForUpdates === 'boolean'
             ? record.automaticallyCheckForUpdates
             : DEFAULT_SETTINGS.automaticallyCheckForUpdates,
@@ -246,6 +252,7 @@ export class DesktopConfigStore {
             max_file_size_mib: () => this.settings().maxFileSizeMiB,
             csv_max_rows: () => this.settings().csvMaxRows,
             default_tab_orientation: () => this.settings().tabOrientation,
+            diff_on_by_default: () => this.settings().diffOnByDefault,
             on_font_change: (notify) => this.on_change((previous, next) => {
                 if (
                     previous.fontFamily !== next.fontFamily

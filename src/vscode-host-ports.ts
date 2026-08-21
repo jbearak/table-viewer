@@ -15,6 +15,7 @@ import type { ResourceUriLike } from './resource-identity';
 import {
     get_csv_max_rows,
     get_default_orientation,
+    get_diff_on_by_default,
     get_font_family,
     get_font_size,
     get_max_file_size_mib,
@@ -63,8 +64,14 @@ export const vscode_host_ui_port: HostUiPort = {
     },
     async show_save_discard_dialog(): Promise<SaveDialogChoice> {
         const choice = await vscode.window.showWarningMessage(
-            'You have unsaved changes.', { modal: true }, 'Save', 'Discard');
-        return choice === 'Save' ? 'save' : choice === 'Discard' ? 'discard' : 'cancel';
+            'Leave edit mode?',
+            { modal: true },
+            'Save Edits',
+            'Discard Edits',
+        );
+        return choice === 'Save Edits'
+            ? 'save'
+            : choice === 'Discard Edits' ? 'discard' : 'cancel';
     },
     async show_file_size_limit_dialog(details): Promise<FileSizeLimitDialogChoice> {
         const choice = await vscode.window.showWarningMessage(
@@ -96,6 +103,7 @@ export const vscode_config_port: ConfigPort = {
     max_file_size_mib: get_max_file_size_mib,
     csv_max_rows: get_csv_max_rows,
     default_tab_orientation: get_default_orientation,
+    diff_on_by_default: get_diff_on_by_default,
     on_font_change(listener) {
         return vscode.workspace.onDidChangeConfiguration((event) => {
             if (

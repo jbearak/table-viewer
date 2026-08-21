@@ -126,6 +126,7 @@ function adoption(overrides: Partial<ObservedAdoption> = {}): ObservedAdoption {
             configuration: {
                 defaultTabOrientation: 'horizontal',
                 previewMode: false,
+                diffOnByDefault: false,
             },
             capabilities: {
                 csvEditable: false,
@@ -1195,6 +1196,7 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
                 configuration: {
                     defaultTabOrientation: 'horizontal',
                     previewMode: false,
+                    diffOnByDefault: false,
                 },
                 capabilities: {
                     csvEditable: editable,
@@ -1286,6 +1288,7 @@ describe('PanelSession lifecycle and reliable snapshot transport', () => {
             configuration: {
                 defaultTabOrientation: 'horizontal' as const,
                 previewMode: false,
+                diffOnByDefault: false,
             },
             capabilities: {
                 csvEditable: false,
