@@ -7,8 +7,8 @@
  * FileSystemPort, `__setConfigurationValue` + `__fireConfigurationChange`
  * drive the ConfigPort, and spies on `vscode_mock.window.show*Message`
  * observe the HostUiPort (including the modal save/discard dialog, which
- * preserves the historical showWarningMessage('You have unsaved changes.',
- * { modal: true }, 'Save', 'Discard') call shape for assertions).
+ * mirrors the real showWarningMessage('Leave edit mode?',
+ * { modal: true }, 'Save Edits', 'Discard Edits') call shape for assertions).
  */
 import {
     file_size_limit_dialog_detail,
@@ -45,8 +45,14 @@ export const fake_host_ui_port: HostUiPort = {
     },
     async show_save_discard_dialog(): Promise<SaveDialogChoice> {
         const choice = await vscode_mock.window.showWarningMessage(
-            'You have unsaved changes.', { modal: true }, 'Save', 'Discard');
-        return choice === 'Save' ? 'save' : choice === 'Discard' ? 'discard' : 'cancel';
+            'Leave edit mode?',
+            { modal: true },
+            'Save Edits',
+            'Discard Edits',
+        );
+        return choice === 'Save Edits'
+            ? 'save'
+            : choice === 'Discard Edits' ? 'discard' : 'cancel';
     },
     async show_file_size_limit_dialog(details): Promise<FileSizeLimitDialogChoice> {
         const choice = await vscode_mock.window.showWarningMessage(
