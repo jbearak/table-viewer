@@ -530,7 +530,7 @@ describe('build_grid_cell — diff overlay (Diff toggle)', () => {
         expect(c.kind).toBe(GridCellKind.Custom);
     });
 
-    it('renders numbers as old -> new, deletion/addition colored', () => {
+    it('renders numbers as old → new, deletion/addition colored', () => {
         const c = diff_cell(
             { raw: '5', formatted: '5', bold: false, italic: false, rawType: 'number' },
             '5',
@@ -538,18 +538,18 @@ describe('build_grid_cell — diff overlay (Diff toggle)', () => {
         ) as unknown as { data: { lines: unknown[] } };
         expect(c.data.lines).toEqual([[
             { text: '5', style: { strikethrough: true }, diff_color: '#c00' },
-            { text: ' -> ' },
+            { text: ' → ' },
             { text: '7', diff_color: '#0c0' },
         ]]);
     });
 
-    it('renders short text as old -> new', () => {
+    it('renders short text as old → new', () => {
         const c = diff_cell(rc('New York'), 'New York', 'Boston') as unknown as {
             data: { lines: unknown[] };
         };
         expect(c.data.lines).toEqual([[
             { text: 'New York', style: { strikethrough: true }, diff_color: '#c00' },
-            { text: ' -> ' },
+            { text: ' → ' },
             { text: 'Boston', diff_color: '#0c0' },
         ]]);
     });
@@ -604,7 +604,7 @@ describe('build_grid_cell — diff overlay (Diff toggle)', () => {
         ) as unknown as { data: { lines: unknown[] } };
         expect(c.data.lines).toEqual([[
             { text: 'x', style: { strikethrough: true }, diff_color: '#c00' },
-            { text: ' -> ' },
+            { text: ' → ' },
             { text: 'y', diff_color: '#0c0' },
         ]]);
     });
@@ -620,7 +620,7 @@ describe('build_grid_cell — diff overlay (Diff toggle)', () => {
         );
         expect(data?.lines).toEqual([[
             { text: 'plain', style: { strikethrough: true }, diff_color: '#c00' },
-            { text: ' -> ' },
+            { text: ' → ' },
             { text: 'fancy', diff_color: '#0c0' },
         ]]);
     });
@@ -638,7 +638,7 @@ describe('build_grid_cell — diff overlay (Diff toggle)', () => {
         ) as unknown as { data: { lines: unknown[] }; copyData: string };
         expect(c.data.lines).toEqual([[
             { text: '3', style: { strikethrough: true }, diff_color: '#c00' },
-            { text: ' -> ' },
+            { text: ' → ' },
             { text: '7', diff_color: '#0c0' },
         ]]);
         // Copy still takes the modified (displayed) value, not the base.
@@ -660,7 +660,7 @@ describe('build_grid_cell — diff overlay (Diff toggle)', () => {
         ) as unknown as { data: { lines: unknown[] } };
         expect(c.data.lines).toEqual([[
             { text: '3', style: { strikethrough: true }, diff_color: '#c00' },
-            { text: ' -> ' },
+            { text: ' → ' },
             { text: '3.14159', diff_color: '#0c0' },
         ]]);
     });
@@ -698,7 +698,7 @@ describe('build_grid_cell — diff overlay (Diff toggle)', () => {
         ) as unknown as { data: { lines: unknown[] } };
         expect(changed.data.lines).toEqual([[
             { text: '4', style: { strikethrough: true }, diff_color: '#c00' },
-            { text: ' -> ' },
+            { text: ' → ' },
             { text: '7', diff_color: '#0c0' },
         ]]);
     });

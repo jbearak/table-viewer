@@ -141,11 +141,11 @@ export interface DiffColors {
 export const DIFF_FALLBACK_COLORS: DiffColors = { deleted: 'red', added: 'green' };
 
 /** Separator between the before and after halves of an arrow-form diff. */
-const DIFF_ARROW = ' -> ';
+const DIFF_ARROW = ' → ';
 
 /**
  * Visual lines for a Diff-mode cell. Numbers and short values render as
- * `old -> new` (old in the deletion color, new in the addition color); longer
+ * `old → new` (old in the deletion color, new in the addition color); longer
  * text gets an inline word diff with deleted words struck through. Splits on
  * hard breaks the way rich_text_lines does, so multiline values lay out
  * exactly like every other rich cell.

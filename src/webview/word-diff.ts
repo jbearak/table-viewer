@@ -37,7 +37,7 @@ export function is_numeric_text(text: string): boolean {
 /**
  * Arrow form for numbers (the cell's loaded scalar type, or both sides
  * parsing as numbers — a freshly typed value has no loaded type) and for
- * short values, where `old -> new` reads better than an inline splice; the
+ * short values, where `old → new` reads better than an inline splice; the
  * word diff is for text long enough that spotting the change matters.
  */
 export function choose_diff_mode(
