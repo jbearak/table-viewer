@@ -44,7 +44,7 @@ describe('CompareDataSource', () => {
         expect(source.meta().sheets[0].rowCount).toBe(2);
     });
 
-    it('answers diff pages only for matched sheets', () => {
+    it('diffs a matched sheet cell by cell, and a one-sided one as a whole band', () => {
         const source = new CompareDataSource(
             new FixtureSource([
                 { name: 'Kept', rows: [['x']] },
@@ -54,7 +54,12 @@ describe('CompareDataSource', () => {
         );
         const kept = diff_page(source, 0, 10);
         expect(kept?.changedCells).toEqual([{ row: 0, col: 0, base: 'z' }]);
-        expect(diff_page(source, 1, 10)).toBeUndefined();
+        // There is no original to compare the added sheet against, so it has no
+        // cell-level diff — but it is still all added, and saying nothing left
+        // it painted as unchanged.
+        expect(diff_page(source, 1, 10)).toMatchObject({
+            rowStatus: ['added'], changedCells: [],
+        });
     });
 
     it('exposes pairings including added and deleted sheets', () => {
@@ -100,6 +105,25 @@ describe('CompareDataSource', () => {
         expect(window.rows.map((row) => row[0]?.raw)).toEqual(['g1', 'g2']);
         expect(source.read_rows_indexed(1, [1]).rows[0][0]?.raw).toBe('g2');
         expect(source.diff_rows(1, [0, 1])?.rowStatus).toEqual(['deleted', 'deleted']);
+    });
+
+    it('bands an added sheet the way it bands a deleted one', () => {
+        // An added sheet has no original to align against, so it has no
+        // alignment — and used to fall through to no diff at all, leaving a
+        // wholly new sheet painted as ordinary unchanged rows while its tab
+        // badge and the summary both called it added.
+        const source = new CompareDataSource(
+            new FixtureSource([
+                { name: 'Kept', rows: [['x']] },
+                { name: 'Fresh', rows: [['f1'], ['f2']] },
+            ]),
+            new FixtureSource([{ name: 'Kept', rows: [['x']] }]),
+        );
+        expect(source.sheetStatuses).toEqual(['matched', 'added']);
+        expect(source.diff_rows(1, [0, 1])?.rowStatus).toEqual(['added', 'added']);
+        // And the filter already kept them, which is what made the gap visible:
+        // "only changed rows" showed every row of the sheet, unbanded.
+        expect(source.changed_grid_rows(1)).toEqual([0, 1]);
     });
 
     it('serves repeated diff_rows requests from the cache', () => {

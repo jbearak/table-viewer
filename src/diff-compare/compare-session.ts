@@ -445,6 +445,18 @@ export class CompareDataSource implements DataSource {
                 changedCells: [],
             };
         }
+        if (this.sheetStatuses[sheet_index] === 'added') {
+            // The mirror of the deleted case, and it has to be stated: an added
+            // sheet has no original to align against, so it has no alignment
+            // and would otherwise fall through to `undefined` — painting a
+            // wholly new sheet as ordinary unchanged rows, while the tab badge
+            // and the summary both call it added.
+            return {
+                startRow: 0,
+                rowStatus: Array.from(rows, () => 'added' as const),
+                changedCells: [],
+            };
+        }
         const alignment = this.alignment_of(sheet_index);
         if (!alignment) return undefined;
         const key = `${sheet_index}:${rows.join(',')}`;
