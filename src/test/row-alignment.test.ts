@@ -285,6 +285,16 @@ describe('align_sheet', () => {
         })).rejects.toBeInstanceOf(AlignmentCancelledError);
     });
 
+    it('throws when cancelled before a sheet too small to checkpoint', async () => {
+        // Cancellation used to be observed only at a hash checkpoint, so a
+        // sheet that finished hashing without reaching one ran to completion
+        // after the user had already cancelled — and a workbook of small
+        // sheets ignored Cancel outright.
+        await expect(align_sheet(single([]), single([['x']]), matched, {
+            isCancelled: () => true,
+        })).rejects.toBeInstanceOf(AlignmentCancelledError);
+    });
+
     it('refuses an unmatched pairing', async () => {
         await expect(align_sheet(single([]), single([]), {
             status: 'added', name: 'Sheet1', modifiedIndex: 0,

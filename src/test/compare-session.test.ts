@@ -187,6 +187,58 @@ describe('CompareDataSource with a content alignment', () => {
         );
     };
 
+    it('moves merges into unified-grid row space', async () => {
+        // The unified grid interleaves the deleted row above the merge, so a
+        // block anchored at modified rows 1-2 renders at 2-3. Left unprojected
+        // it covered whatever sat at its old numbers.
+        const modified = new FixtureSource([{
+            name: 'Sheet1',
+            rows: [['a'], ['b'], ['c']],
+            merges: [{ startRow: 1, endRow: 2, startCol: 0, endCol: 0 }],
+        }]);
+        const original = new FixtureSource([{
+            name: 'Sheet1',
+            rows: [['GONE'], ['a'], ['b'], ['c']],
+        }]);
+        const source = new CompareDataSource(
+            modified, original, await align_workbook(modified, original));
+        expect(source.meta().sheets[0].merges)
+            .toEqual([{ startRow: 2, endRow: 3, startCol: 0, endCol: 0 }]);
+    });
+
+    it('drops a merge an interleaved deletion splits apart', async () => {
+        // Stretching it over the gap would swallow a deleted row into a block
+        // that never contained it, which reads as a data change, not a layout
+        // one.
+        const modified = new FixtureSource([{
+            name: 'Sheet1',
+            rows: [['a'], ['b']],
+            merges: [{ startRow: 0, endRow: 1, startCol: 0, endCol: 0 }],
+        }]);
+        const original = new FixtureSource([{
+            name: 'Sheet1',
+            rows: [['a'], ['GONE'], ['b']],
+        }]);
+        const source = new CompareDataSource(
+            modified, original, await align_workbook(modified, original));
+        expect(source.meta().sheets[0].merges).toEqual([]);
+    });
+
+    it('reports formatting when only the original side has it', async () => {
+        // Deleted rows are served from the original, so their cells can be
+        // formatted even when the modified file carries none; a consumer told
+        // the comparison has no formatting would never ask for it.
+        const modified = new FixtureSource([{ name: 'Sheet1', rows: [['a']] }]);
+        const original = new FixtureSource([{
+            name: 'Sheet1',
+            rows: [['GONE'], ['a']],
+            hasFormatting: true,
+        }]);
+        const source = new CompareDataSource(
+            modified, original, await align_workbook(modified, original));
+        expect(source.meta().hasFormatting).toBe(true);
+    });
+
     it('reports an inserted row as one addition, not a cascade of changed cells', async () => {
         // The regression this whole mechanism exists for: positionally, rows
         // 1..3 all differ, and the grid used to say so.

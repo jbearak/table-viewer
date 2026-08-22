@@ -1,5 +1,6 @@
 // In-memory DataSource fixture shared by the compare-mode suites, so a change
 // to the DataSource contract lands in one place.
+import type { MergeRange } from '../../types';
 import type {
     DataSource,
     RenderedCell,
@@ -20,6 +21,9 @@ export interface FixtureSheet {
     worksheetId?: string;
     /** Marks the sheet the way a delimited reader does: one grid, placeholder name. */
     unnamedSingleSheet?: boolean;
+    /** Merged ranges in this sheet's own row space, for compare projection tests. */
+    merges?: MergeRange[];
+    hasFormatting?: boolean;
     rows: string[][];
 }
 
@@ -30,7 +34,7 @@ export class FixtureSource implements DataSource {
 
     meta(): WorkbookMeta {
         return {
-            hasFormatting: false,
+            hasFormatting: this.fixture_sheets.some((sheet) => sheet.hasFormatting === true),
             sheets: this.fixture_sheets.map((sheet) => ({
                 name: sheet.name,
                 ...(sheet.worksheetId !== undefined
@@ -45,8 +49,8 @@ export class FixtureSource implements DataSource {
                     (widest, row) => Math.max(widest, row.length),
                     0,
                 ),
-                merges: [],
-                hasFormatting: false,
+                merges: sheet.merges ?? [],
+                hasFormatting: sheet.hasFormatting === true,
             })),
         };
     }

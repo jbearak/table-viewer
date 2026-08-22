@@ -26,6 +26,7 @@ import {
     type SheetPairStatus,
 } from './compare-source';
 import { get_raw_cell_text } from '../cell-display';
+import type { MergeRange } from '../types';
 import {
     ABSENT,
     align_sheet,
@@ -86,6 +87,46 @@ export async function align_workbook(
         options.onProgress?.(scanned_before, workbook_rows);
     }
     return alignments;
+}
+
+/**
+ * Move a modified-side sheet's merges into unified-grid row space.
+ *
+ * The unified grid interleaves deleted original rows among the modified ones,
+ * so a merge anchored at modified row 1 may render two rows lower. Left
+ * unprojected it covered whatever happened to sit at its old numbers — the
+ * wrong cells, and visibly so once a deletion lands above it.
+ *
+ * A merge whose rows are split apart by an interleaved deletion is dropped
+ * rather than stretched over the gap: widening it would silently swallow a
+ * deleted row into a block that never contained it, which reads as a data
+ * change rather than a layout one. Returns the input array unchanged when
+ * nothing moves, so the caller can keep the original sheet object.
+ */
+function project_merges(
+    merges: readonly MergeRange[],
+    rows: readonly { readonly modified: number }[],
+): MergeRange[] {
+    if (merges.length === 0) return merges as MergeRange[];
+    const grid_row_by_modified = new Map<number, number>();
+    rows.forEach((row, grid_row) => {
+        if (row.modified !== ABSENT) grid_row_by_modified.set(row.modified, grid_row);
+    });
+    const projected: MergeRange[] = [];
+    let moved = false;
+    for (const merge of merges) {
+        const start = grid_row_by_modified.get(merge.startRow);
+        const end = grid_row_by_modified.get(merge.endRow);
+        // Contiguity is what says no deleted row was interleaved inside it.
+        if (start === undefined || end === undefined
+            || end - start !== merge.endRow - merge.startRow) {
+            moved = true;
+            continue;
+        }
+        if (start !== merge.startRow) moved = true;
+        projected.push({ ...merge, startRow: start, endRow: end });
+    }
+    return moved ? projected : merges as MergeRange[];
 }
 
 export class CompareDataSource implements DataSource {
@@ -188,6 +229,11 @@ export class CompareDataSource implements DataSource {
             (alignment) => alignment.degraded);
         this.padded_meta = {
             ...modified_meta,
+            // Either side can carry formatting: a deleted row is served from
+            // the original, so a comparison of an unformatted modified file
+            // against a formatted original still renders formatted cells, and
+            // a consumer told otherwise would not ask for them.
+            hasFormatting: modified_meta.hasFormatting || this.original_meta.hasFormatting,
             sheets: [...modified_meta.sheets.map((sheet, sheet_index) => {
                 const pairing = this.matched_by_modified_index.get(sheet_index);
                 if (!pairing) return sheet;
@@ -197,13 +243,18 @@ export class CompareDataSource implements DataSource {
                 // max(original, modified) — the old padding — and with a content
                 // alignment it interleaves inserts and deletions where they
                 // actually happened.
-                const row_count = this.alignments.get(sheet_index)!.rows.length;
+                const alignment = this.alignments.get(sheet_index)!;
+                const row_count = alignment.rows.length;
                 const column_count = Math.max(sheet.columnCount, original_sheet.columnCount);
-                return row_count === sheet.rowCount && column_count === sheet.columnCount
+                const merges = project_merges(sheet.merges, alignment.rows);
+                return row_count === sheet.rowCount
+                    && column_count === sheet.columnCount
+                    && merges === sheet.merges
                     ? sheet
                     : {
                         ...sheet,
                         rowCount: row_count,
+                        merges,
                         // Deleted rows get their own canonical rows appended
                         // after the modified side's, so their mapping can never
                         // collide with a real row's.

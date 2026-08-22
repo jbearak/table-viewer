@@ -495,6 +495,11 @@ export async function align_sheet(
     if (!original_sheet || !modified_sheet) {
         throw new RangeError('sheet pairing indexes a missing sheet');
     }
+    // Before any work, not only at checkpoints. A sheet small enough to hash
+    // without reaching one — an empty side, or a handful of rows — otherwise
+    // ran to completion after the user had already cancelled, and a workbook
+    // of such sheets ignored Cancel entirely.
+    if (options.isCancelled?.()) throw new AlignmentCancelledError();
     const original_rows = original_sheet.rowCount;
     const modified_rows = modified_sheet.rowCount;
     const total_rows = original_rows + modified_rows;
