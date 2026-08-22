@@ -76,7 +76,7 @@ export function table_diff_uris(
 }
 
 /** Orient two child resources from an opaque native diff. Most SCM pairs are
- * directional by shape; two history revisions require the repository's parent
+ * directional by shape; two history revisions require the repository's ancestry
  * metadata because either URI order is otherwise syntactically valid. */
 export async function table_diff_uris_from_unordered_pair(
     first: vscode.Uri,
@@ -93,7 +93,7 @@ export async function table_diff_uris_from_unordered_pair(
         const extension = vscode.extensions.getExtension<{
             getAPI(version: 1): {
                 getRepository(uri: vscode.Uri): {
-                    getCommit(ref: string): Promise<{ readonly parents: readonly string[] }>;
+                    getMergeBase(ref1: string, ref2: string): Promise<string | undefined>;
                 } | null;
             };
         }>('vscode.git');
@@ -101,12 +101,12 @@ export async function table_diff_uris_from_unordered_pair(
         const exports = extension.isActive ? extension.exports : await extension.activate();
         const repository = exports.getAPI(1).getRepository(vscode.Uri.file(first_query.path));
         if (!repository) return undefined;
-        const [first_commit, second_commit] = await Promise.all([
-            repository.getCommit(first_query.ref),
-            repository.getCommit(second_query.ref),
-        ]);
-        if (second_commit.parents.includes(first_query.ref)) return forward;
-        if (first_commit.parents.includes(second_query.ref)) return reverse;
+        const common_ancestor = (await repository.getMergeBase(
+            first_query.ref,
+            second_query.ref,
+        ))?.toLowerCase();
+        if (common_ancestor === first_query.ref.toLowerCase()) return forward;
+        if (common_ancestor === second_query.ref.toLowerCase()) return reverse;
     } catch {
         // Keep the native diff when repository metadata is unavailable.
     }

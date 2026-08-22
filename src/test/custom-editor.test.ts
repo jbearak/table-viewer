@@ -938,7 +938,7 @@ describe('register_table_viewer', () => {
         tab_listener.dispose();
     });
 
-    it('preserves Source Control Graph orientation when child panels resolve in reverse', async () => {
+    it('preserves Source Control Graph orientation when panels resolve in reverse', async () => {
         const parent = '0'.repeat(40);
         const commit = '1'.repeat(40);
         const original = git_uri('/repo/data.csv', parent);
@@ -958,9 +958,7 @@ describe('register_table_viewer', () => {
             exports: {
                 getAPI: () => ({
                     getRepository: () => ({
-                        async getCommit(ref: string) {
-                            return { parents: ref === commit ? [parent] : [] };
-                        },
+                        getMergeBase: async () => parent,
                     }),
                 }),
             },

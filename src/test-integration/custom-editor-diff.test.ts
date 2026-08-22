@@ -7,6 +7,7 @@ import * as vscode from 'vscode';
 import {
     TABLE_DIFF_SCHEME,
     table_diff_document_uris,
+    table_diff_uris_from_unordered_pair,
 } from '../table-diff-uris';
 import {
     activate_extension,
@@ -201,7 +202,9 @@ describe('custom editor diffs', () => {
         ).trim();
         fs.writeFileSync(file.fsPath, 'value\n2\n');
         execFileSync('git', ['-C', temporary_directory!, 'add', 'data.csv']);
-        execFileSync('git', ['-C', temporary_directory!, 'commit', '-qm', 'Update table']);
+        execFileSync('git', ['-C', temporary_directory!, 'commit', '-qm', 'Intermediate update']);
+        fs.writeFileSync(file.fsPath, 'value\n3\n');
+        execFileSync('git', ['-C', temporary_directory!, 'commit', '-qam', 'Final update']);
         const commit = execFileSync(
             'git',
             ['-C', temporary_directory!, 'rev-parse', 'HEAD'],
@@ -212,7 +215,16 @@ describe('custom editor diffs', () => {
         assert.ok((await vscode.workspace.fs.stat(original)).size > 0);
         assert.ok((await vscode.workspace.fs.stat(modified)).size > 0);
         assert.strictEqual(await read_text(original), 'value\n1\n');
-        assert.strictEqual(await read_text(modified), 'value\n2\n');
+        assert.strictEqual(await read_text(modified), 'value\n3\n');
+        const orientations = await Promise.all([
+            table_diff_uris_from_unordered_pair(original, modified),
+            table_diff_uris_from_unordered_pair(modified, original),
+        ]);
+        for (const oriented of orientations) {
+            assert.ok(oriented, 'the Git API must resolve non-adjacent revision ancestry');
+            assert.strictEqual(oriented.original.toString(), original.toString());
+            assert.strictEqual(oriented.modified.toString(), modified.toString());
+        }
 
         await vscode.commands.executeCommand(
             'vscode.diff',
