@@ -129,6 +129,10 @@ export interface SheetTransformState {
     /** Fingerprint of sheet identity + available column names. Prevents a saved
      *  transform from silently attaching to a reordered/replaced sheet. */
     schema?: string;
+    /** Compare mode: keep only rows that are added, deleted, or have a changed
+     *  cell. Which rows those are is the compare source's answer, supplied to
+     *  the transform rather than derived here — see PanelCore. */
+    onlyChangedRows?: boolean;
 }
 
 /**
@@ -385,6 +389,7 @@ export function transform_is_active(state: SheetTransformState | undefined): boo
         state.sort.length > 0
         || state.filters.some((entry) => entry.enabled)
         || (state.hiddenRows?.length ?? 0) > 0
+        || state.onlyChangedRows === true
     );
 }
 
@@ -393,6 +398,7 @@ export function transform_has_entries(state: SheetTransformState | undefined): b
         state.sort.length > 0
         || state.filters.length > 0
         || (state.hiddenRows?.length ?? 0) > 0
+        || state.onlyChangedRows === true
     );
 }
 

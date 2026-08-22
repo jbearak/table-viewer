@@ -64,6 +64,7 @@ import {
 } from './transform-ui-model';
 import { SheetTabs, tab_orientation_label, type SheetTabBadge } from './sheet-tabs';
 import { StateStrip } from './state-strip';
+import { CompareStrip } from './compare-strip';
 import { ContextMenu, type MenuItem } from './context-menu';
 import {
     pending_sheet_action_to_run,
@@ -548,6 +549,7 @@ export function App(): React.JSX.Element {
     const handle_toggle_diff_mode = useCallback(() => set_diff_mode((d) => !d), []);
     // Git compare session (SCM diff click): per-cell diff highlighting against
     // the git original, read-only. Snapshot-delivered like the capabilities.
+    const [only_changed_rows, set_only_changed_rows] = useState(false);
     const [git_compare, set_git_compare] =
         useState<WorkbookSnapshotCompare | undefined>(undefined);
     const edit_mode_ref = useRef(false);
@@ -4137,6 +4139,31 @@ export function App(): React.JSX.Element {
         [handle_transform_change],
     );
 
+    /**
+     * Compare mode's changed-rows filter. Expressed as a transform so it
+     * composes with sorting and column filters instead of being a second,
+     * parallel notion of "which rows are shown".
+     */
+    const handle_toggle_only_changed_rows = useCallback(
+        (next: boolean) => {
+            // Read from the same refs handle_transform_change validates against,
+            // so the toggle rides whatever sort and filters are current rather
+            // than a render-time copy that may be a beat behind.
+            const current = pending_transform_states_ref.current[active_sheet_index]
+                ?? state_ref.current.transforms?.[active_sheet_index]
+                ?? EMPTY_TRANSFORM;
+            const applied = handle_transform_change(
+                { ...current, onlyChangedRows: next },
+                'toolbar',
+            );
+            // Only follow the button once the request is accepted: a refused
+            // transform must not leave the control claiming a view that is not
+            // installed.
+            if (applied) set_only_changed_rows(next);
+        },
+        [handle_transform_change, active_sheet_index],
+    );
+
     const open_filter_editor = useCallback((
         column_index: number,
         anchor: { left: number; top: number },
@@ -5586,6 +5613,20 @@ export function App(): React.JSX.Element {
         />
     );
 
+    // What the comparison found, and the filter that acts on it. Workbook state —
+    // the totals span every sheet — so it sits above the tabs, unlike StateStrip.
+    const compare_strip = git_compare
+        ? (
+            <CompareStrip
+                counts={git_compare.counts}
+                degraded={git_compare.degraded}
+                only_changed_rows={only_changed_rows}
+                on_toggle_only_changed_rows={handle_toggle_only_changed_rows}
+                filter_pending={transform_pending}
+            />
+        )
+        : null;
+
     // Sort, filter, row hiding and the merge notice — worksheet state, so it sits
     // with the worksheet's pane below the tabs rather than in the workbook chrome
     // above them (#154). Renders nothing when the view is untransformed.
@@ -5841,6 +5882,8 @@ export function App(): React.JSX.Element {
                     </div>
                 </div>
             )}
+            {/* Above the tabs, because the comparison spans the whole workbook. */}
+            {compare_strip}
             {/*
               * The tabs come first in both arrangements and the pane follows, so the
               * state strip is always below them: vertically the rail runs the full

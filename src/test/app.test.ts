@@ -606,10 +606,12 @@ function transform_installed_message(
     const rules = options.state ?? request.state;
     const has_entries = rules.sort.length > 0
         || rules.filters.length > 0
-        || (rules.hiddenRows?.length ?? 0) > 0;
+        || (rules.hiddenRows?.length ?? 0) > 0
+        || rules.onlyChangedRows === true;
     const is_active = rules.sort.length > 0
         || rules.filters.some((filter) => filter.enabled)
-        || (rules.hiddenRows?.length ?? 0) > 0;
+        || (rules.hiddenRows?.length ?? 0) > 0
+        || rules.onlyChangedRows === true;
     const permuted = options.permuted ?? is_active;
     const basis = {
         generation: options.generation,

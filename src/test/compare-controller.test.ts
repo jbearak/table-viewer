@@ -12,6 +12,7 @@ import {
     type ViewerControllerOptions,
     type ViewerProfile,
 } from '../viewer-controller';
+import { transform_schema_for_sheet } from '../types';
 import { with_in_memory_authority_transactions } from '../state-authority';
 import { versioned_state_store } from './helpers/versioned-state-store';
 import * as vscode_mock from './mocks/vscode';
@@ -141,6 +142,52 @@ describe('compare mode controller', () => {
             addedRows: 1, deletedRows: 0, changedRows: 1, changedCells: 1,
         });
         expect(snapshot.configuration.gitCompare?.degraded).toBe(false);
+    });
+
+    it('filters the grid to the changed rows and back', async () => {
+        // The compare window's "Only changed rows" toggle, end to end: the
+        // controller is the only place that knows which grid rows changed.
+        vscode_mock.__setReadFileImplementation(async (uri) =>
+            enc.encode(String(uri.fsPath ?? uri).includes('original')
+                ? 'h\na\nb\nc\n'
+                : 'h\na\nNEW\nb\nc\n'));
+        const panel = open_compare_table();
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThan(0));
+        const snapshot = posted(panel, 'workbookSnapshot')[0].snapshot as {
+            generation: number;
+            meta: { sheets: readonly Parameters<typeof transform_schema_for_sheet>[0][] };
+        };
+        const schema = transform_schema_for_sheet(snapshot.meta.sheets[0]);
+        const set_transform = async (onlyChangedRows: boolean, requestId: string) => {
+            await panel.__receive({
+                type: 'setTransform',
+                sheetIndex: 0,
+                requestId,
+                intent: 'apply',
+                sourceGeneration: snapshot.generation,
+                state: {
+                    sort: [],
+                    filters: [],
+                    onlyChangedRows,
+                    schema,
+                },
+            });
+            return await vi.waitFor(() => {
+                const install = posted(panel, 'transformInstalled')
+                    .find((message) => message.requestId === requestId);
+                expect(install).toBeDefined();
+                return install as Posted & { view: { rowCount: number; permuted: boolean } };
+            });
+        };
+
+        // Four grid rows past the header; only the inserted one changed.
+        const on = await set_transform(true, 't1');
+        expect(on.view.permuted).toBe(true);
+        expect(on.view.rowCount).toBe(1);
+
+        const off = await set_transform(false, 't2');
+        expect(off.view.rowCount).toBe(4);
     });
 
     it('degrades to a plain open with a warning when the original is unreadable', async () => {
