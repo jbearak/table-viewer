@@ -556,6 +556,26 @@ describe('desktop window request routing', () => {
         )).toEqual({ kind: 'show-launcher', focus: true });
     });
 
+    it('opens a comparison regardless of what is already on screen', () => {
+        const request = {
+            kind: 'compare-files',
+            originalPath: '/tmp/old.xlsx',
+            modifiedPath: '/tmp/new.xlsx',
+        } as const;
+        const expected = {
+            kind: 'compare-files',
+            originalPath: '/tmp/old.xlsx',
+            modifiedPath: '/tmp/new.xlsx',
+        };
+        // The user named two specific files, so an existing window is no reason
+        // to do anything else with the request.
+        expect(route_desktop_window_request(request, NOTHING_ON_SCREEN)).toEqual(expected);
+        expect(route_desktop_window_request(
+            request,
+            { hasViewerWindow: true, hasLauncherWindow: true },
+        )).toEqual(expected);
+    });
+
     it('gives a dock activation somewhere to work only when there is nowhere', () => {
         expect(route_desktop_window_request({ kind: 'activate' }, NOTHING_ON_SCREEN))
             .toEqual({ kind: 'show-launcher', focus: false });

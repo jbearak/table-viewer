@@ -109,6 +109,10 @@ import {
 } from './viewer-html';
 import {
     CHANNEL_ABOUT_GET_INFO,
+    CHANNEL_COMPARE_BROWSE,
+    CHANNEL_COMPARE_CANCEL,
+    CHANNEL_COMPARE_CHECK_PATH,
+    CHANNEL_COMPARE_SUBMIT,
     CHANNEL_ABOUT_OPEN_LINK,
     CHANNEL_ABOUT_OPEN_NOTICES,
     CHANNEL_APP_UPDATE_ACTION,
@@ -128,6 +132,8 @@ import {
     CHANNEL_TITLEBAR_ZOOM_CHANGED,
     CHANNEL_WELCOME_OPEN_FILES,
     CHANNEL_WELCOME_OPEN_PREFERENCES,
+    type ComparePathCheck,
+    type CompareFilesRequest,
     type PreferencesTarget,
 } from '../shared/ipc';
 
@@ -176,6 +182,7 @@ const PREFS_PRELOAD = path.join(DESKTOP_DIST_DIR, 'prefs-preload.js');
 const ABOUT_PRELOAD = path.join(DESKTOP_DIST_DIR, 'about-preload.js');
 const STATE_INSPECTOR_PRELOAD = path.join(DESKTOP_DIST_DIR, 'state-inspector-preload.js');
 const APP_UPDATE_PRELOAD = path.join(DESKTOP_DIST_DIR, 'app-update-preload.js');
+const COMPARE_PRELOAD = path.join(DESKTOP_DIST_DIR, 'compare-preload.js');
 const UPDATE_SMOKE_READY = 'table-viewer:test-update-ready';
 const UPDATE_SMOKE_GATE_MARKER = '.update-startup-gate-evaluated';
 
@@ -617,6 +624,12 @@ function submit_window_request(request: DesktopWindowRequest, source?: BrowserWi
             return;
         }
         if (!viewer_windows) return;
+        if (action.kind === 'compare-files') {
+            viewer_windows.open_comparison(action.originalPath, action.modifiedPath);
+            // The dialog is done the moment the comparison is on screen.
+            close_compare_window();
+            return;
+        }
         let opened_any = false;
         for (const file of action.files) {
             if (viewer_windows.open_file(file)) {
@@ -694,6 +707,47 @@ async function show_open_dialog(source?: BrowserWindow): Promise<void> {
         ? dialog.showOpenDialog(source, options)
         : dialog.showOpenDialog(options));
     if (!canceled) open_files(filePaths, source);
+}
+
+/** The Compare Files dialog. Singleton, like Preferences: two of them would
+ *  each be collecting a different pair with no way to tell them apart. */
+let compare_window: BrowserWindow | undefined;
+
+function show_compare_window(): void {
+    if (compare_window && !compare_window.isDestroyed()) {
+        compare_window.focus();
+        return;
+    }
+    const created = new BrowserWindow({
+        width: 560,
+        // Fixed size, and the fields scale with the app font, so the page
+        // scrolls rather than pushing the buttons out of reach.
+        height: 400,
+        resizable: false,
+        minimizable: false,
+        maximizable: false,
+        fullscreenable: false,
+        title: 'Compare Files',
+        // macOS themed title bar (desktop/shared/titlebar.ts); the
+        // strip is redrawn by this window's renderer.
+        ...TITLEBAR_WINDOW_OPTIONS,
+        backgroundColor: window_background_color(current_theme_id()),
+        webPreferences: {
+            preload: COMPARE_PRELOAD,
+            contextIsolation: true,
+            nodeIntegration: false,
+        },
+    });
+    compare_window = created;
+    created.once('closed', () => {
+        if (compare_window === created) compare_window = undefined;
+    });
+    void created.loadFile(path.join(DESKTOP_DIST_DIR, 'compare.html'));
+}
+
+function close_compare_window(): void {
+    if (compare_window && !compare_window.isDestroyed()) compare_window.close();
+    compare_window = undefined;
 }
 
 function show_preferences_window(target?: PreferencesTarget): void {
@@ -927,6 +981,13 @@ function build_menu(): void {
                     click: (_item, window) =>
                         void show_open_dialog(window as BrowserWindow | undefined),
                 },
+                {
+                    // Beside Open…, the other command that brings files in. Acts
+                    // on nothing that is already open, so it is always enabled.
+                    label: 'Compare Files…',
+                    accelerator: 'CmdOrCtrl+Shift+O',
+                    click: () => show_compare_window(),
+                },
                 ...(is_mac
                     ? [{
                         label: 'Open Recent',
@@ -1139,6 +1200,51 @@ function register_ipc(): void {
             app_update_presenter.handle_action(action as AppUpdateWindowAction);
         }
     });
+    ipcMain.handle(
+        CHANNEL_COMPARE_BROWSE,
+        async (_event, side: unknown): Promise<string | undefined> => {
+            const options: Electron.OpenDialogOptions = {
+                title: side === 'original'
+                    ? 'Choose the original file'
+                    : 'Choose the file to compare against it',
+                properties: ['openFile'],
+                filters: [
+                    { name: 'Tables', extensions: [...SUPPORTED_FILE_EXTENSIONS] },
+                    { name: 'All Files', extensions: ['*'] },
+                ],
+            };
+            // Sheeted to the dialog when it is still there; the picker outliving
+            // its parent is possible, and a sheet on a dead window throws.
+            const { canceled, filePaths } = compare_window && !compare_window.isDestroyed()
+                ? await dialog.showOpenDialog(compare_window, options)
+                : await dialog.showOpenDialog(options);
+            return canceled ? undefined : filePaths[0];
+        },
+    );
+    ipcMain.handle(
+        CHANNEL_COMPARE_CHECK_PATH,
+        (_event, file_path: unknown): ComparePathCheck => {
+            const candidate = typeof file_path === 'string' ? file_path : '';
+            const extension = path.extname(candidate).toLowerCase().replace(/^\./, '');
+            let exists = false;
+            try {
+                exists = fs.statSync(candidate).isFile();
+            } catch {
+                exists = false;
+            }
+            return { exists, supported: is_supported_file(candidate), extension };
+        },
+    );
+    ipcMain.on(CHANNEL_COMPARE_SUBMIT, (_event, request: unknown) => {
+        // Re-validated here rather than trusted from the renderer: the dialog
+        // has already checked, but this is the boundary that opens a window.
+        if (typeof request !== 'object' || request === null) return;
+        const { originalPath, modifiedPath } = request as Partial<CompareFilesRequest>;
+        if (typeof originalPath !== 'string' || typeof modifiedPath !== 'string') return;
+        if (!is_supported_file(originalPath) || !is_supported_file(modifiedPath)) return;
+        submit_window_request({ kind: 'compare-files', originalPath, modifiedPath });
+    });
+    ipcMain.on(CHANNEL_COMPARE_CANCEL, () => close_compare_window());
     ipcMain.handle(CHANNEL_PREFS_GET, () => config_store.settings());
     ipcMain.handle(CHANNEL_PREFS_SET, (_event, partial: unknown) => update_settings(partial));
     // The closing Preferences window's last write; see CHANNEL_PREFS_SET_SYNC.

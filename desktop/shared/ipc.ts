@@ -85,6 +85,28 @@ export const CHANNEL_PREFS_SET_SYNC = 'prefs:setSync';
  *  the app chrome can follow the configured font. */
 export const CHANNEL_SETTINGS_CHANGED = 'settings:changed';
 
+/** Compare Files dialog (File → Compare Files…). */
+export interface CompareFilesRequest {
+    readonly originalPath: string;
+    readonly modifiedPath: string;
+}
+/** What the dialog knows about one chosen path, so it can enable Compare and
+ *  warn about a cross-format pair without reaching into the filesystem itself. */
+export interface ComparePathCheck {
+    readonly exists: boolean;
+    readonly supported: boolean;
+    /** Lower-case extension without the dot, for the cross-format warning. */
+    readonly extension: string;
+}
+/** Renderer → main: show a native picker, and report what was chosen. */
+export const CHANNEL_COMPARE_BROWSE = 'compare:browse';
+/** Renderer → main: does this typed path exist and can it be opened? */
+export const CHANNEL_COMPARE_CHECK_PATH = 'compare:checkPath';
+/** Renderer → main: open the compare window for these two files. */
+export const CHANNEL_COMPARE_SUBMIT = 'compare:submit';
+/** Renderer → main: close the dialog without comparing. */
+export const CHANNEL_COMPARE_CANCEL = 'compare:cancel';
+
 /** Non-modal application-update window channels. */
 export const CHANNEL_APP_UPDATE_GET_STATE = 'appUpdate:getState';
 export const CHANNEL_APP_UPDATE_STATE_CHANGED = 'appUpdate:stateChanged';
