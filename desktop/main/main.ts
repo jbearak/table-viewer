@@ -1308,8 +1308,18 @@ function register_ipc(): void {
         }
         const launcher = compare_source_window;
         compare_source_window = undefined;
+        // Expanded here too. The checks above ran against the expanded paths,
+        // so a `~/…` entry validates and enables Compare, and handing the raw
+        // string on opened a window for a literal `~` directory under the
+        // process working directory — a file the user was just told exists,
+        // failing to load.
+        const home = app.getPath('home');
         submit_window_request(
-            { kind: 'compare-files', originalPath, modifiedPath },
+            {
+                kind: 'compare-files',
+                originalPath: expand_tilde(originalPath, home),
+                modifiedPath: expand_tilde(modifiedPath, home),
+            },
             launcher && !launcher.isDestroyed() ? launcher : undefined,
         );
         return { accepted: true, checks };
