@@ -75,6 +75,20 @@ export class AlignmentCancelledError extends Error {
 }
 
 const DEFAULT_ROWS_PER_CHECKPOINT = 4096;
+/** Divide-and-conquer steps between cancellation checks in the Myers walk. */
+const MYERS_STEPS_PER_CHECKPOINT = 256;
+
+/**
+ * Yield to a real event-loop turn, not just a microtask.
+ *
+ * `await Promise.resolve()` drains into the microtask queue, which runs to
+ * completion before any I/O or IPC callback — so a `cancelCompare` arriving
+ * from the renderer would not be delivered until alignment had already
+ * finished. A macrotask is what actually lets the cancel through.
+ */
+function yield_to_event_loop(): Promise<void> {
+    return new Promise((resolve) => { setTimeout(resolve, 0); });
+}
 /** Rows read from a side in one batched call while hashing. */
 const HASH_READ_BATCH = 512;
 
@@ -83,8 +97,14 @@ const HASH_READ_BATCH = 512;
  * bounds the *work*, not the file size: a million-row file with a thousand
  * changed rows aligns well inside it, while two unrelated files hit it early
  * and degrade instead of grinding.
+ *
+ * Chosen against the cost of *failing*. Reaching the cap is quadratic in it —
+ * two unrelated 50,000-row files degrade in about 0.2 s at 10,000 and about
+ * 1.6 s at 40,000 — so the cap is really a budget for the answer "these files
+ * do not correspond". 20,000 differing rows is far past any edit someone would
+ * still call a revision, and buys that answer in about half a second.
  */
-export const DEFAULT_MAX_EDIT_DISTANCE = 100_000;
+export const DEFAULT_MAX_EDIT_DISTANCE = 20_000;
 
 /** FNV-1a over the row's raw cell text, with a unit separator between cells so
  *  `['ab','c']` and `['a','bc']` cannot collide. */
@@ -127,7 +147,7 @@ async function hash_side(
             options.onProgress?.(scanned_before + start + count, total_rows);
             // Yield so the host stays responsive and a cancel is observed
             // promptly on a file large enough for this to matter.
-            await Promise.resolve();
+            await yield_to_event_loop();
             if (options.isCancelled?.()) throw new AlignmentCancelledError();
         }
     }
@@ -157,94 +177,270 @@ export function identity_alignment(
 interface EditScript {
     /** Paired runs and one-sided runs, in unified order. */
     readonly ops: readonly { kind: 'equal' | 'delete' | 'insert'; count: number }[];
-    readonly editDistance: number;
     readonly degraded: boolean;
 }
-
 /**
- * Myers' O(ND) diff over two hash arrays, bounded by `max_distance`. Returns
- * `degraded` when the bound is hit, in which case `ops` is meaningless and the
- * caller falls back to positional.
+ * Myers' O(ND) diff over two hash arrays, in O(N+M) memory.
+ *
+ * The textbook formulation records every frontier so the path can be walked
+ * back at the end, which costs O(D^2) memory — at a distance cap of 100,000
+ * that is tens of gigabytes, so the process dies long before the cap it was
+ * supposed to degrade at. This is instead Myers' linear-space refinement: find
+ * the middle snake of the edit path by running the forward and reverse
+ * frontiers until they overlap, emit it, and recurse into the two halves. Same
+ * O(ND) time and the same edit script; the frontiers are the only large
+ * allocation, and there are two of them rather than D.
+ *
+ * `degraded` is returned when the edit distance exceeds `max_distance`, in
+ * which case `ops` is meaningless and the caller falls back to positional.
  *
  * Equality here is hash equality; the caller confirms candidate pairs by
  * comparing actual cell text, so a collision costs an extra read and a
  * spuriously "changed" row, never a wrong row count.
  */
-function myers_diff(
+async function myers_diff(
     left: Uint32Array,
     right: Uint32Array,
     max_distance: number,
-): EditScript {
-    const n = left.length;
-    const m = right.length;
-    if (n === 0 || m === 0) {
-        const ops: { kind: 'equal' | 'delete' | 'insert'; count: number }[] = [];
-        if (n > 0) ops.push({ kind: 'delete', count: n });
-        if (m > 0) ops.push({ kind: 'insert', count: m });
-        return { ops, editDistance: n + m, degraded: false };
-    }
-    const max = Math.min(n + m, max_distance);
-    const offset = max;
-    const v = new Int32Array(2 * max + 1).fill(-1);
-    v[offset + 1] = 0;
-    /** One furthest-reaching frontier per edit distance, kept so the path can
-     *  be walked back once the end is reached. */
-    const trace: Int32Array[] = [];
-    for (let d = 0; d <= max; d++) {
-        trace.push(v.slice());
-        for (let k = -d; k <= d; k += 2) {
-            const index = offset + k;
-            // Step down (an insert) when that reaches further than stepping
-            // right (a delete) — the standard Myers frontier choice.
-            let x = (k === -d || (k !== d && v[index - 1] < v[index + 1]))
-                ? v[index + 1]
-                : v[index - 1] + 1;
-            let y = x - k;
-            while (x < n && y < m && left[x] === right[y]) {
-                x++;
-                y++;
-            }
-            v[index] = x;
-            if (x >= n && y >= m) {
-                return { ...backtrack(trace, n, m, offset), editDistance: d, degraded: false };
-            }
+    options: AlignSheetOptions,
+): Promise<EditScript> {
+    const builder = new OpBuilder();
+    const frontiers = new MiddleSnakeFrontiers(left.length + right.length);
+    /** Edit distance consumed so far, against which `max_distance` is charged.
+     *  Bounding the total rather than each recursion is what makes the cap mean
+     *  what it says: many cheap snakes are still an expensive diff. */
+    let spent = 0;
+    let steps = 0;
+
+    /**
+     * Emit the diff of `left[l0, l1)` against `right[r0, r1)` in order.
+     *
+     * Iterative over an explicit stack rather than recursive: the recursion
+     * depth is O(D), and a deep one on a large diff would overflow the call
+     * stack — the same way the 200k-row fixture once did.
+     */
+    type Work =
+        | { kind: 'split'; l0: number; l1: number; r0: number; r1: number }
+        /** An op whose position in the script is already decided, held on the
+         *  stack so it is emitted between its two halves rather than before
+         *  them — the script is ordered, and a snake belongs after everything
+         *  to its left. */
+        | { kind: 'emit'; op: 'equal' | 'delete' | 'insert'; count: number };
+    const stack: Work[] = [
+        { kind: 'split', l0: 0, l1: left.length, r0: 0, r1: right.length },
+    ];
+    while (stack.length > 0) {
+        const work = stack.pop()!;
+        if (work.kind === 'emit') { builder.emit(work.op, work.count); continue; }
+        const { l0, l1, r0, r1 } = work;
+        const n = l1 - l0;
+        const m = r1 - r0;
+        if (n === 0 && m === 0) continue;
+        if (n === 0) { builder.emit('insert', m); continue; }
+        if (m === 0) { builder.emit('delete', n); continue; }
+
+        // Myers is the expensive half of alignment and, unlike hashing, has no
+        // natural batch boundary. Without a checkpoint a Cancel is not observed
+        // until the whole diff finishes, which on the files that make
+        // cancelling worth offering is precisely too late.
+        if (++steps % MYERS_STEPS_PER_CHECKPOINT === 0) {
+            await yield_to_event_loop();
+            if (options.isCancelled?.()) throw new AlignmentCancelledError();
         }
+
+        // Charged against the remaining budget rather than checked after the
+        // fact: the middle-snake search is itself O(ND), so a sub-problem that
+        // will blow the cap has to be abandoned while it is running, not once
+        // it has finished proving how expensive it was.
+        const snake = frontiers.find(left, right, l0, l1, r0, r1, max_distance - spent);
+        if (snake === undefined) return { ops: [], degraded: true };
+        spent += snake.distance;
+
+        if (snake.distance <= 1) {
+            // One edit or none: the halves are a common prefix, a single
+            // insert or delete, and a common suffix — cheaper to state
+            // directly than to recurse for.
+            emit_single_edit(builder, left, right, l0, l1, r0, r1);
+            continue;
+        }
+        // Pushed in reverse of emission order: left half, then the snake the
+        // two halves meet on, then the right half.
+        stack.push({ kind: 'split', l0: snake.x1, l1, r0: snake.y1, r1 });
+        stack.push({ kind: 'emit', op: 'equal', count: snake.x1 - snake.x0 });
+        stack.push({ kind: 'split', l0, l1: snake.x0, r0, r1: snake.y0 });
     }
-    return { ops: [], editDistance: max, degraded: true };
+    return { ops: builder.ops(), degraded: false };
 }
 
-/** Walk the recorded frontiers back to a unified op list. */
-function backtrack(
-    trace: readonly Int32Array[],
-    n: number,
-    m: number,
-    offset: number,
-): { ops: { kind: 'equal' | 'delete' | 'insert'; count: number }[] } {
-    const reversed: { kind: 'equal' | 'delete' | 'insert'; count: number }[] = [];
-    let x = n;
-    let y = m;
-    const push = (kind: 'equal' | 'delete' | 'insert', count: number) => {
-        if (count <= 0) return;
-        const last = reversed[reversed.length - 1];
-        if (last?.kind === kind) reversed[reversed.length - 1] = { kind, count: last.count + count };
-        else reversed.push({ kind, count });
-    };
-    for (let d = trace.length - 1; d > 0; d--) {
-        const v = trace[d];
-        const k = x - y;
-        const index = offset + k;
-        const down = k === -d || (k !== d && v[index - 1] < v[index + 1]);
-        const previous_k = down ? k + 1 : k - 1;
-        const previous_x = v[offset + previous_k];
-        const previous_y = previous_x - previous_k;
-        // The diagonal run this frontier extended, before the single edit.
-        push('equal', x - previous_x - (down ? 0 : 1));
-        push(down ? 'insert' : 'delete', 1);
-        x = previous_x;
-        y = previous_y;
+/**
+ * The one-edit case of the divide step.
+ *
+ * With a common prefix and suffix trimmed off, `n` and `m` differ by at most
+ * one and the remainder is a single insert or delete.
+ */
+function emit_single_edit(
+    builder: OpBuilder,
+    left: Uint32Array,
+    right: Uint32Array,
+    l0: number,
+    l1: number,
+    r0: number,
+    r1: number,
+): void {
+    let prefix = 0;
+    while (l0 + prefix < l1 && r0 + prefix < r1 && left[l0 + prefix] === right[r0 + prefix]) {
+        prefix++;
     }
-    push('equal', x);
-    return { ops: reversed.reverse() };
+    builder.emit('equal', prefix);
+    const remaining_left = l1 - l0 - prefix;
+    const remaining_right = r1 - r0 - prefix;
+    const shared = Math.min(remaining_left, remaining_right);
+    if (remaining_left > remaining_right) builder.emit('delete', 1);
+    else if (remaining_right > remaining_left) builder.emit('insert', 1);
+    builder.emit('equal', shared);
+}
+
+/**
+ * Accumulates ops in emission order, coalescing adjacent runs of a kind.
+ *
+ * The divide-and-conquer walk produces the script in fragments — a snake here,
+ * a single edit there — and consumers downstream reason about runs, so the
+ * joining has to happen somewhere. Doing it on the way in keeps the op list
+ * proportional to the number of hunks rather than to the number of rows.
+ */
+class OpBuilder {
+    private readonly emitted: { kind: 'equal' | 'delete' | 'insert'; count: number }[] = [];
+
+    emit(kind: 'equal' | 'delete' | 'insert', count: number): void {
+        if (count <= 0) return;
+        const last = this.emitted[this.emitted.length - 1];
+        if (last?.kind === kind) last.count += count;
+        else this.emitted.push({ kind, count });
+    }
+
+    ops(): { kind: 'equal' | 'delete' | 'insert'; count: number }[] {
+        return this.emitted;
+    }
+}
+
+/** Where the forward and reverse frontiers met, and what it cost to get there. */
+interface MiddleSnake {
+    /** Start of the shared run, in each side's coordinates. */
+    readonly x0: number;
+    readonly y0: number;
+    /** End of the shared run, exclusive. */
+    readonly x1: number;
+    readonly y1: number;
+    /** Edit distance of the whole sub-problem this snake splits. */
+    readonly distance: number;
+}
+
+/**
+ * The two frontier buffers the middle-snake search needs, allocated once.
+ *
+ * Reused across every step of the divide-and-conquer walk: the sub-problems
+ * only ever shrink, so buffers sized for the whole input fit all of them, and
+ * allocating per step would put the garbage collector in the inner loop.
+ */
+class MiddleSnakeFrontiers {
+    private readonly forward: Int32Array;
+    private readonly reverse: Int32Array;
+
+    constructor(max_distance: number) {
+        const width = 2 * max_distance + 3;
+        this.forward = new Int32Array(width);
+        this.reverse = new Int32Array(width);
+    }
+
+    /**
+     * Find the middle snake of `left[l0, l1)` against `right[r0, r1)`.
+     *
+     * Runs the forward frontier from the top-left and the reverse frontier from
+     * the bottom-right one step at a time; the first time they overlap on a
+     * diagonal, that overlap is on a shortest edit path, and its snake splits
+     * the problem into two strictly smaller ones. Returns undefined only if the
+     * frontiers could not meet within `budget`, which is the caller's signal
+     * to degrade to a positional alignment.
+     */
+    find(
+        left: Uint32Array,
+        right: Uint32Array,
+        l0: number,
+        l1: number,
+        r0: number,
+        r1: number,
+        /** Edit distance still affordable; searching past it is wasted work
+         *  because the caller degrades either way. */
+        budget: number,
+    ): MiddleSnake | undefined {
+        const n = l1 - l0;
+        const m = r1 - r0;
+        const delta = n - m;
+        const odd = (delta & 1) !== 0;
+        // Each search step d resolves an edit distance of about 2d, so a
+        // budget of B is exhausted by the time d reaches B/2.
+        const half = Math.min(Math.ceil((n + m) / 2), Math.floor(budget / 2) + 1);
+        const offset = Math.ceil((n + m) / 2) + 1;
+        const forward = this.forward;
+        const reverse = this.reverse;
+        forward[offset + 1] = 0;
+        reverse[offset + 1] = 0;
+
+        for (let d = 0; d <= half; d++) {
+            for (let k = -d; k <= d; k += 2) {
+                const index = offset + k;
+                let x = (k === -d || (k !== d && forward[index - 1] < forward[index + 1]))
+                    ? forward[index + 1]
+                    : forward[index - 1] + 1;
+                let y = x - k;
+                const snake_start_x = x;
+                const snake_start_y = y;
+                while (x < n && y < m && left[l0 + x] === right[r0 + y]) { x++; y++; }
+                forward[index] = x;
+                // On an odd delta the forward frontier is the one that can
+                // overtake a reverse path already laid down at d-1.
+                if (odd && k >= delta - (d - 1) && k <= delta + (d - 1)) {
+                    if (x + reverse[offset + delta - k] >= n) {
+                        return {
+                            x0: l0 + snake_start_x,
+                            y0: r0 + snake_start_y,
+                            x1: l0 + x,
+                            y1: r0 + y,
+                            distance: 2 * d - 1,
+                        };
+                    }
+                }
+            }
+            for (let k = -d; k <= d; k += 2) {
+                const index = offset + k;
+                let x = (k === -d || (k !== d && reverse[index - 1] < reverse[index + 1]))
+                    ? reverse[index + 1]
+                    : reverse[index - 1] + 1;
+                let y = x - k;
+                const snake_start_x = x;
+                const snake_start_y = y;
+                while (
+                    x < n && y < m
+                    && left[l1 - 1 - x] === right[r1 - 1 - y]
+                ) { x++; y++; }
+                reverse[index] = x;
+                if (!odd && k >= delta - d && k <= delta + d) {
+                    if (x + forward[offset + delta - k] >= n) {
+                        // Reverse coordinates count from the end; flip them
+                        // back so the caller only ever sees forward ones.
+                        return {
+                            x0: l1 - x,
+                            y0: r1 - y,
+                            x1: l1 - snake_start_x,
+                            y1: r1 - snake_start_y,
+                            distance: 2 * d,
+                        };
+                    }
+                }
+            }
+        }
+        return undefined;
+    }
 }
 
 /**
@@ -289,10 +485,11 @@ export async function align_sheet(
         && original_hashes[original_rows - 1 - suffix] === modified_hashes[modified_rows - 1 - suffix]
     ) suffix++;
 
-    const script = myers_diff(
+    const script = await myers_diff(
         original_hashes.subarray(prefix, original_rows - suffix),
         modified_hashes.subarray(prefix, modified_rows - suffix),
         options.maxEditDistance ?? DEFAULT_MAX_EDIT_DISTANCE,
+        options,
     );
 
     const rows: AlignedRow[] = script.degraded
@@ -422,7 +619,7 @@ async function count_changes(
             if (row_changed) changed_row_indices.push(batch[offset].gridRow);
         }
         if (start % checkpoint === 0) {
-            await Promise.resolve();
+            await yield_to_event_loop();
             if (options.isCancelled?.()) throw new AlignmentCancelledError();
         }
     }

@@ -211,7 +211,7 @@ describe('CompareDataSource with a content alignment', () => {
             [['a'], ['b'], ['c'], ['d']],
             [['a'], ['CHANGED'], ['c'], ['d'], ['NEW']],
         );
-        expect(source.changedGridRows(0)).toEqual([1, 4]);
+        expect(source.changed_grid_rows(0)).toEqual([1, 4]);
     });
 
     it('treats every row of a one-sided sheet as changed', async () => {
@@ -219,8 +219,8 @@ describe('CompareDataSource with a content alignment', () => {
         const original = new FixtureSource([{ name: 'Gone', rows: [['z']] }]);
         const source = new CompareDataSource(
             modified, original, await align_workbook(modified, original));
-        expect(source.changedGridRows(0)).toEqual([0, 1]);
-        expect(source.changedGridRows(1)).toEqual([0]);
+        expect(source.changed_grid_rows(0)).toEqual([0, 1]);
+        expect(source.changed_grid_rows(1)).toEqual([0]);
     });
 
     it('totals changes across sheets, counting one-sided sheets whole', async () => {
@@ -231,7 +231,7 @@ describe('CompareDataSource with a content alignment', () => {
         const original = new FixtureSource([{ name: 'Kept', rows: [['a'], ['b']] }]);
         const source = new CompareDataSource(
             modified, original, await align_workbook(modified, original));
-        expect(source.changeCounts()).toEqual({
+        expect(source.change_counts()).toEqual({
             addedRows: 3,      // one row in Kept, two from the whole Fresh sheet
             deletedRows: 0,
             changedRows: 1,

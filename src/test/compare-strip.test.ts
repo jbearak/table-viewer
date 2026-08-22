@@ -87,6 +87,27 @@ describe('CompareStrip', () => {
         expect(toggle().disabled).toBe(true);
     });
 
+    it('does not dress a degraded comparison up as counted findings', async () => {
+        // A reordered row is positionally a screenful of changed cells. Stating
+        // that total would present a failed alignment as a result.
+        await strip({ degraded: true });
+        expect(text()).toContain('Rows compared by position');
+        expect(text()).not.toMatch(/rows added/u);
+        expect(text()).not.toMatch(/changed cells/u);
+    });
+
+    it('does not claim "no differences" when a header changed', async () => {
+        // Header renames and one-sided sheets are annotated in the grid and the
+        // tabs but are not rows or cells, so the counts alone cannot answer this.
+        await strip({
+            counts: { addedRows: 0, deletedRows: 0, changedRows: 0, changedCells: 0 },
+            other_differences: true,
+        });
+        expect(text()).not.toContain('No differences found.');
+        // Still nothing for the row filter to keep, though.
+        expect(toggle().disabled).toBe(true);
+    });
+
     it('says nothing about alignment when the rows did match up', async () => {
         await strip();
         expect(container!.querySelector('[role="status"]')).toBeNull();

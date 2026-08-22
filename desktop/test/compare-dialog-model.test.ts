@@ -59,10 +59,22 @@ describe('dialog_state', () => {
         });
     });
 
-    it('refuses to compare a file with itself', () => {
+    it('warns about comparing a file with itself, but allows it', () => {
+        // Confirming a tool changed nothing is a real use; only an unreadable
+        // path blocks.
         const state = dialog_state(ok('/a.xlsx'), ok('/a.xlsx'));
-        expect(state.canCompare).toBe(false);
+        expect(state.canCompare).toBe(true);
+        expect(state.compareLabel).toBe('Compare Anyway');
         expect(state.warning).toMatch(/same file/u);
+    });
+
+    it('says which way unmatched sheets will read, per direction', () => {
+        // A delimited original means the workbook is the modified side, so its
+        // extra sheets are additions; the mirror makes them deletions.
+        expect(dialog_state(ok('/a.csv', 'csv'), ok('/b.xlsx')).warning)
+            .toMatch(/show as added/u);
+        expect(dialog_state(ok('/a.xlsx'), ok('/b.csv', 'csv')).warning)
+            .toMatch(/show as deleted/u);
     });
 
     it('warns but allows a delimited-vs-workbook pair', () => {

@@ -3612,8 +3612,21 @@ export function attach_viewer(
                     );
                 }
                 // A cancel is the user's own decision, not a failure to report
-                // back to them: the window is on its way out.
-                if (error instanceof AlignmentCancelledError) throw error;
+                // back to them: the window is on its way out. Nothing is
+                // adopted on this path, so the modified side has no other
+                // owner and is closed here — unlike an alignment *failure*,
+                // where it survives as the plain-file fallback.
+                if (error instanceof AlignmentCancelledError) {
+                    try {
+                        modified.close();
+                    } catch (close_error) {
+                        log_sanitized_failure(
+                            'Failed to close a cancelled comparison source',
+                            close_error,
+                        );
+                    }
+                    throw error;
+                }
                 warn_compare_unavailable(error);
             }
         }
@@ -3682,7 +3695,7 @@ export function attach_viewer(
                 pairings: adopted.pairings,
                 sheetStatuses: adopted.sheetStatuses,
                 changedColumnNames: adopted.changedColumnNames,
-                counts: adopted.changeCounts(),
+                counts: adopted.change_counts(),
                 degraded: adopted.degraded,
             },
         };

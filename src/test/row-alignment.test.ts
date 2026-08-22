@@ -168,6 +168,41 @@ describe('align_sheet', () => {
         expect(alignment).toMatchObject({ addedRows: 0, deletedRows: 0, changedRows: 4 });
     });
 
+    it('aligns two wholly unrelated files without a quadratic-memory blowup', async () => {
+        // The regression the linear-space rewrite exists for. The textbook
+        // Myers keeps one frontier per edit distance, which for inputs this
+        // dissimilar is O(D^2) — gigabytes here, and tens of gigabytes at the
+        // default cap, so the process died rather than reaching the graceful
+        // degradation it was supposed to reach. Memory is now O(N+M): what
+        // this asserts is that the call simply completes.
+        const rows = (tag: string) =>
+            rows_of(...Array.from({ length: 4_000 }, (_, i) => `${tag}-${i}`));
+        const alignment = await align_sheet(
+            single(rows('original')),
+            single(rows('modified')),
+            matched,
+        );
+        // Nothing in common, so every row is one delete plus one insert; the
+        // point is that it answers at all.
+        expect(alignment.rows.length).toBeGreaterThan(0);
+    });
+
+    it('abandons a hopeless comparison at the cap rather than after it', async () => {
+        // The cap is charged against the middle-snake search itself, not
+        // checked once the search has finished. Checking afterwards made the
+        // capped path slower than the uncapped one — it paid the full cost and
+        // then threw the answer away.
+        const rows = (tag: string) =>
+            rows_of(...Array.from({ length: 4_000 }, (_, i) => `${tag}-${i}`));
+        const alignment = await align_sheet(
+            single(rows('original')),
+            single(rows('modified')),
+            matched,
+            { maxEditDistance: 64 },
+        );
+        expect(alignment.degraded).toBe(true);
+    });
+
     it('still aligns a large file whose changes are few', async () => {
         // Prefix/suffix trimming must keep this cheap: without it, Myers would
         // run over 20,000 rows rather than the handful that actually differ.

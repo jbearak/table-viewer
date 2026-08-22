@@ -246,7 +246,7 @@ export class CompareDataSource implements DataSource {
     }
 
     /** Per-sheet change totals, for the compare window's counts. */
-    changeCounts(): {
+    change_counts(): {
         addedRows: number;
         deletedRows: number;
         changedRows: number;
@@ -284,7 +284,7 @@ export class CompareDataSource implements DataSource {
      * grid order — the row set behind the "only changed rows" filter. Every row
      * of a one-sided sheet qualifies.
      */
-    changedGridRows(sheet_index: number): number[] {
+    changed_grid_rows(sheet_index: number): number[] {
         const alignment = this.alignments.get(sheet_index);
         if (!alignment) {
             const sheet = this.padded_meta.sheets[sheet_index];
@@ -512,7 +512,14 @@ export class CompareDataSource implements DataSource {
                 : Uint32Array.from(projected_rows);
         }
         const alignment = this.alignment_of(sheet_index);
-        if (!alignment) return Uint32Array.from(projected_rows);
+        if (!alignment) {
+            // An unaligned sheet is still a modified-side sheet — an added
+            // worksheet has no original to align against but can carry header
+            // promotion or hidden rows, so its projection is not the identity.
+            return this.modified.source_row_indices
+                ? this.modified.source_row_indices(sheet_index, projected_rows)
+                : Uint32Array.from(projected_rows);
+        }
         const canonical = this.deleted_canonical_rows.get(sheet_index);
         const result = new Uint32Array(projected_rows.length);
         const real_positions: number[] = [];
@@ -546,7 +553,11 @@ export class CompareDataSource implements DataSource {
                 : source_row;
         }
         const alignment = this.alignment_of(sheet_index);
-        if (!alignment) return source_row;
+        if (!alignment) {
+            return this.modified.projected_row_index
+                ? this.modified.projected_row_index(sheet_index, source_row)
+                : source_row;
+        }
         const real = this.modified_meta.sheets[sheet_index];
         if (!real) return source_row;
         if (source_row >= real.sourceRowCount) {

@@ -550,7 +550,6 @@ export function App(): React.JSX.Element {
     const handle_toggle_diff_mode = useCallback(() => set_diff_mode((d) => !d), []);
     // Git compare session (SCM diff click): per-cell diff highlighting against
     // the git original, read-only. Snapshot-delivered like the capabilities.
-    const [only_changed_rows, set_only_changed_rows] = useState(false);
     const [git_compare, set_git_compare] =
         useState<WorkbookSnapshotCompare | undefined>(undefined);
     // Row alignment runs before the workbook snapshot exists, so this is the
@@ -4145,15 +4144,17 @@ export function App(): React.JSX.Element {
         [handle_transform_change],
     );
 
-    /**
-     * Compare mode's changed-rows filter. Expressed as a transform so it
-     * composes with sorting and column filters instead of being a second,
-     * parallel notion of "which rows are shown".
-     */
     const handle_cancel_compare = useCallback(() => {
         host_bridge.postMessage({ type: 'cancelCompare' });
     }, []);
 
+    /**
+     * Compare mode's changed-rows filter. Expressed as a transform so it
+     * composes with sorting and column filters instead of being a second,
+     * parallel notion of "which rows are shown" — which is also why the button
+     * reads its state back off the installed transform rather than keeping its
+     * own copy: a refusal, a rollback, or a sheet switch would desync a copy.
+     */
     const handle_toggle_only_changed_rows = useCallback(
         (next: boolean) => {
             // Read from the same refs handle_transform_change validates against,
@@ -4162,14 +4163,7 @@ export function App(): React.JSX.Element {
             const current = pending_transform_states_ref.current[active_sheet_index]
                 ?? state_ref.current.transforms?.[active_sheet_index]
                 ?? EMPTY_TRANSFORM;
-            const applied = handle_transform_change(
-                { ...current, onlyChangedRows: next },
-                'toolbar',
-            );
-            // Only follow the button once the request is accepted: a refused
-            // transform must not leave the control claiming a view that is not
-            // installed.
-            if (applied) set_only_changed_rows(next);
+            handle_transform_change({ ...current, onlyChangedRows: next }, 'toolbar');
         },
         [handle_transform_change, active_sheet_index],
     );
@@ -5644,7 +5638,11 @@ export function App(): React.JSX.Element {
             <CompareStrip
                 counts={git_compare.counts}
                 degraded={git_compare.degraded}
-                only_changed_rows={only_changed_rows}
+                other_differences={
+                    git_compare.changedColumnNames.some((columns) => columns.length > 0)
+                    || git_compare.sheetStatuses.some((status) => status !== 'matched')
+                }
+                only_changed_rows={visible_transform.onlyChangedRows === true}
                 on_toggle_only_changed_rows={handle_toggle_only_changed_rows}
                 filter_pending={transform_pending}
             />

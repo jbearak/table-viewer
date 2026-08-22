@@ -794,7 +794,7 @@ export class ViewerPanelCore {
         if (!state.onlyChangedRows) return undefined;
         const source = this.source;
         return source instanceof CompareDataSource
-            ? source.changedGridRows(sheet_index)
+            ? source.changed_grid_rows(sheet_index)
             : undefined;
     }
 

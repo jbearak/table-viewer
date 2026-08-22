@@ -11,6 +11,13 @@ export interface CompareStripProps {
     readonly counts: CompareStripCounts;
     /** The aligner could not match the rows up and compared by position. */
     readonly degraded: boolean;
+    /**
+     * Whether anything differs that the row and cell counts do not cover — a
+     * renamed promoted header, or a sheet present on only one side. Without it
+     * the strip would answer "No differences found" over a grid that is
+     * visibly annotating one.
+     */
+    readonly other_differences?: boolean;
     readonly only_changed_rows: boolean;
     readonly on_toggle_only_changed_rows: (next: boolean) => void;
     /** Filtering is a transform, so it waits like any other. */
@@ -33,13 +40,15 @@ function plural(count: number, noun: string): string {
 export function CompareStrip({
     counts,
     degraded,
+    other_differences = false,
     only_changed_rows,
     on_toggle_only_changed_rows,
     filter_pending = false,
 }: CompareStripProps): React.JSX.Element {
-    const unchanged = counts.addedRows === 0
+    const no_counted_changes = counts.addedRows === 0
         && counts.deletedRows === 0
         && counts.changedCells === 0;
+    const unchanged = no_counted_changes && !other_differences;
     return (
         <div className="compare-strip">
             {degraded && (
@@ -57,19 +66,25 @@ export function CompareStrip({
                     className={`compare-strip-toggle${only_changed_rows ? ' is-on' : ''}`}
                     aria-pressed={only_changed_rows}
                     // Nothing to filter down to when the rows could not be
-                    // matched up, or when the files are identical.
-                    disabled={degraded || unchanged || filter_pending}
+                    // matched up, or when no row or cell differs.
+                    disabled={degraded || no_counted_changes || filter_pending}
                     title={degraded
                         ? 'The rows could not be matched up, so changed rows cannot be singled out.'
-                        : unchanged
-                            ? 'There are no changes to show.'
+                        : no_counted_changes
+                            ? 'There are no changed rows to show.'
                             : 'Hide rows that are the same in both files.'}
                     onClick={() => on_toggle_only_changed_rows(!only_changed_rows)}
                 >
                     Only changed rows
                 </button>
                 <div className="compare-strip-counts">
-                    {unchanged
+                    {degraded
+                        // Positional totals are not findings about the files:
+                        // a reordered row counts as changed cells it does not
+                        // really have, so stating them as such would dress a
+                        // failed alignment up as a result.
+                        ? 'Rows compared by position'
+                        : unchanged
                         ? 'No differences found.'
                         : (
                             <>

@@ -1221,27 +1221,37 @@ function register_ipc(): void {
             return canceled ? undefined : filePaths[0];
         },
     );
-    ipcMain.handle(
-        CHANNEL_COMPARE_CHECK_PATH,
-        (_event, file_path: unknown): ComparePathCheck => {
-            const candidate = typeof file_path === 'string' ? file_path : '';
-            const extension = path.extname(candidate).toLowerCase().replace(/^\./, '');
-            let exists = false;
-            try {
-                exists = fs.statSync(candidate).isFile();
-            } catch {
-                exists = false;
-            }
-            return { exists, supported: is_supported_file(candidate), extension };
-        },
-    );
+    /**
+     * What the main process is willing to say about a candidate path.
+     *
+     * Shared by the check and the submit so the boundary that opens a window
+     * applies the same test the dialog was told to trust — a renderer that
+     * skipped, raced, or lied about the check gets the same answer.
+     */
+    const check_compare_path = (file_path: unknown): ComparePathCheck => {
+        const candidate = typeof file_path === 'string' ? file_path : '';
+        const extension = path.extname(candidate).toLowerCase().replace(/^\./, '');
+        let exists = false;
+        try {
+            exists = fs.statSync(candidate).isFile();
+        } catch {
+            exists = false;
+        }
+        return { exists, supported: is_supported_file(candidate), extension };
+    };
+    ipcMain.handle(CHANNEL_COMPARE_CHECK_PATH, (_event, file_path: unknown) =>
+        check_compare_path(file_path));
     ipcMain.on(CHANNEL_COMPARE_SUBMIT, (_event, request: unknown) => {
         // Re-validated here rather than trusted from the renderer: the dialog
-        // has already checked, but this is the boundary that opens a window.
+        // has already checked, but this is the boundary that opens a window,
+        // and the file may have gone away since the check in any case.
         if (typeof request !== 'object' || request === null) return;
         const { originalPath, modifiedPath } = request as Partial<CompareFilesRequest>;
         if (typeof originalPath !== 'string' || typeof modifiedPath !== 'string') return;
-        if (!is_supported_file(originalPath) || !is_supported_file(modifiedPath)) return;
+        for (const candidate of [originalPath, modifiedPath]) {
+            const check = check_compare_path(candidate);
+            if (!check.exists || !check.supported) return;
+        }
         submit_window_request({ kind: 'compare-files', originalPath, modifiedPath });
     });
     ipcMain.on(CHANNEL_COMPARE_CANCEL, () => close_compare_window());
