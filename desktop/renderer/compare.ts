@@ -115,6 +115,8 @@ function schedule_check(side: Side): void {
  * checks come from another process, and a filesystem that kept offering
  * completions must not hang the dialog.
  */
+const MAX_COMPLETION_STEPS = 8;
+
 async function complete_and_check(side: Side): Promise<void> {
     for (let step = 0; step < MAX_COMPLETION_STEPS; step++) {
         await check_side(side);
@@ -126,8 +128,6 @@ async function complete_and_check(side: Side): Promise<void> {
     }
     await check_side(side);
 }
-
-const MAX_COMPLETION_STEPS = 8;
 
 for (const side of ['original', 'modified'] as const) {
     inputs[side].addEventListener('input', () => {

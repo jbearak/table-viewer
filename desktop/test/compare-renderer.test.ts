@@ -212,9 +212,12 @@ describe('compare dialog renderer', () => {
         input('originalPath').value = '/tmp/me';
         input('originalPath').dispatchEvent(new Event('input'));
         await settle();
-        // Force the pending check to land without a blur, the way the debounce
-        // would, so the completion is known but not yet applied.
-        await new Promise((resolve) => { setTimeout(resolve, 400); });
+        // Wait for the debounced check to land without a blur, so the
+        // completion is known but not yet applied. Polled rather than slept
+        // past the 350ms debounce: a fixed delay that clears locally is a CI
+        // flake already written, and it costs the run that time on every pass.
+        await vi.waitFor(() => expect(api.check_path).toHaveBeenCalledWith('/tmp/me'));
+        await settle();
         expect(input('originalPath').value).toBe('/tmp/me');
 
         compare_button().click();

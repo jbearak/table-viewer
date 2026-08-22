@@ -1229,8 +1229,12 @@ function register_ipc(): void {
             // back at the default folder. `defaultPath` naming a file selects
             // it; naming its folder only opens there, which is what is wanted
             // when the two files are siblings but not the same file.
+            // Expanded first: `path.dirname('~/reports/old.xlsx')` is
+            // `~/reports`, which is not a directory the native dialog can open,
+            // so browsing from a tilde path silently landed on the default
+            // folder instead of beside the file already named.
             const folder = typeof near_path === 'string' && near_path.trim() !== ''
-                ? path.dirname(near_path)
+                ? path.dirname(expand_tilde(near_path, app.getPath('home')))
                 : undefined;
             const options: Electron.OpenDialogOptions = {
                 title: side === 'original'

@@ -49,7 +49,11 @@ export function unique_completion(
 export function expand_tilde(candidate: string, tilde_home?: string): string {
     if (!tilde_home) return candidate;
     if (candidate === '~') return tilde_home;
-    if (candidate.startsWith(`~${path.sep}`)) {
+    // Both separators, not just `path.sep`. On Windows `path.sep` is `\`, but
+    // `~/reports` is what people type and what every shell accepts, and Windows
+    // takes forward slashes everywhere else too. Matching only `path.sep` there
+    // left `~/x` unexpanded — the path was then checked, and opened, literally.
+    if (candidate.startsWith('~/') || candidate.startsWith(`~${path.sep}`)) {
         return path.join(tilde_home, candidate.slice(2));
     }
     return candidate;

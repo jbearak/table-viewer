@@ -80,4 +80,16 @@ describe('expand_tilde', () => {
         // A tilde inside the path is part of a filename, not a home reference.
         expect(expand_tilde('/tmp/~x', '/home/j')).toBe('/tmp/~x');
     });
+
+    it('expands a forward-slash tilde path on every platform', () => {
+        // `~/x` is what people type, and what every shell takes, on Windows as
+        // much as anywhere. Matching only `path.sep` left it unexpanded there,
+        // so the dialog validated and then opened the literal path.
+        expect(expand_tilde('~/x', path.join(path.sep, 'home', 'j')))
+            .toBe(path.join(path.sep, 'home', 'j', 'x'));
+        expect(expand_tilde(`~${path.sep}x`, path.join(path.sep, 'home', 'j')))
+            .toBe(path.join(path.sep, 'home', 'j', 'x'));
+        // Still only a leading `~` followed by a separator: `~other` is a name.
+        expect(expand_tilde('~other/x', '/home/j')).toBe('~other/x');
+    });
 });

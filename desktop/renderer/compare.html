@@ -36,6 +36,10 @@
   .row { display: flex; gap: 8px; align-items: center; }
   input[type=text] {
     font: inherit;
+    /* body sets user-select: none for chrome that should not look like a
+       document. It inherits, and these fields hold long paths the user needs
+       to select, edit and copy. */
+    user-select: text;
     flex: 1;
     min-width: 0;
     padding: 5px 8px;

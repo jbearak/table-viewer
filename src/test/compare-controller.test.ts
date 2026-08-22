@@ -495,6 +495,96 @@ describe('compare mode controller', () => {
         );
     });
 
+    it('stops an alignment a refresh has already superseded', async () => {
+        // Two alignments can be in flight over one window: a refresh replaces
+        // the load, and the original side has a watcher of its own. The stale
+        // one used to run to completion — on a large file that is real time
+        // spent on a result already thrown away, and its progress reports still
+        // reached the renderer, sending the one bar backwards.
+        const big_modified = `h\n${Array.from({ length: 4_000 }, (_, i) => `r${i}`).join('\n')}\n`;
+        const big_original = `h\n${Array.from({ length: 4_000 }, (_, i) => `q${i}`).join('\n')}\n`;
+        vscode_mock.__setStatImplementation(async (uri) =>
+            (String(uri.fsPath ?? uri).includes('original')
+                ? { size: big_original.length, mtime: 1 }
+                : { size: big_modified.length, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async (uri) =>
+            enc.encode(String(uri.fsPath ?? uri).includes('original')
+                ? big_original
+                : big_modified));
+
+        // Counting the aligner's own work, which is what "stops" has to mean.
+        // Progress messages cannot answer it: `onProgress` carries a supersede
+        // check of its own, so a stale alignment that runs to completion goes
+        // quiet either way and the count stays the same whether or not it
+        // actually stopped.
+        let reads_after_supersede = 0;
+        let counting = false;
+        const counting_profile: ViewerProfile = {
+            ...csv_table_profile(),
+            async build_source(raw, file_path, state, extra) {
+                const source = await csv_table_profile()
+                    .build_source(raw, file_path, state, extra);
+                return new Proxy(source, {
+                    get(target, property, receiver) {
+                        const value = Reflect.get(target, property, receiver);
+                        if (property !== 'read_rows' || typeof value !== 'function') return value;
+                        return (...args: unknown[]) => {
+                            if (counting) reads_after_supersede++;
+                            return (value as (...a: unknown[]) => unknown).apply(target, args);
+                        };
+                    },
+                });
+            },
+        };
+
+        const { controller, panel } = open_compare_controller(
+            '/tmp/original.csv',
+            counting_profile,
+        );
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot')).toHaveLength(1));
+
+        // A real change on the modified side — new bytes, new size, new mtime —
+        // so the refresh genuinely rebuilds and realigns rather than no-opping.
+        let revision = 2;
+        const revised = () => `${big_modified}extra${revision}\n`;
+        vscode_mock.__setStatImplementation(async (uri) =>
+            (String(uri.fsPath ?? uri).includes('original')
+                ? { size: big_original.length, mtime: 1 }
+                : { size: revised().length, mtime: revision }));
+        vscode_mock.__setReadFileImplementation(async (uri) =>
+            enc.encode(String(uri.fsPath ?? uri).includes('original')
+                ? big_original
+                : revised()));
+
+        // Supersede while the alignment is under way, then let both settle.
+        const first = controller.refresh_if_changed();
+        revision = 3;
+        const second = controller.refresh_if_changed();
+        counting = true;
+        await Promise.all([first, second]);
+        counting = false;
+        await vi.waitFor(() =>
+            expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThanOrEqual(2));
+
+        // Progress still tracks forward, but it is corroboration, not the
+        // proof: `onProgress` carries a supersede check of its own.
+        const reports = posted(panel, 'compareProgress') as unknown as {
+            scannedRows: number;
+        }[];
+        expect(reports).toHaveLength(2);
+
+        // The real assertion: one alignment's worth of reads after the
+        // supersede, not two. A stale alignment that keeps going doubles this
+        // exactly, because it re-walks the same rows the live one is walking.
+        expect(reads_after_supersede).toBeLessThan(24);
+        let previous = 0;
+        for (const report of reports) {
+            expect(report.scannedRows).toBeGreaterThanOrEqual(previous);
+            previous = report.scannedRows;
+        }
+    });
+
     it('degrades when the original cannot stabilize during validation', async () => {
         const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
         const error = vi.spyOn(vscode_mock.window, 'showErrorMessage');

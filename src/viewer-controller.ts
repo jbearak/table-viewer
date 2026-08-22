@@ -3609,10 +3609,19 @@ export function attach_viewer(
         {
             bypassFileSizeLimit = false,
             includeCompareOriginal = true,
+            load: load_request,
         }: {
             bypassFileSizeLimit?: boolean;
             includeCompareOriginal?: boolean;
-        } = {},
+            /**
+             * The load this build serves, so a superseded alignment can stop.
+             *
+             * Required, not optional: omitting it would silently opt that build
+             * out of supersede cancellation, which is the failure this
+             * parameter exists to prevent. Every caller has a request in hand.
+             */
+            load: Pick<PanelLoadRequest, 'seq' | 'refreshEvent'>;
+        },
     ): Promise<SourceCandidate> {
         const state = (await read_file_state()).state as PerFileState;
         const stat = await host.fs.stat(uri);
@@ -3624,6 +3633,9 @@ export function attach_viewer(
             fingerprint: `${stat.mtime}:${stat.size}`,
             digest: content_digest(raw),
         };
+        // Captured before any await, so it names the receiver this build began
+        // for rather than whichever one is current when progress is reported.
+        const receiver_epoch = session.current_receiver_epoch;
         // The original side builds concurrently with the modified parse; both
         // are independent reads of already-committed bytes.
         const original_promise = includeCompareOriginal
@@ -3656,13 +3668,39 @@ export function attach_viewer(
                     modified,
                     original.source,
                     await align_workbook(modified, original.source, {
-                        isCancelled: () => compare_alignment_cancelled || disposed,
+                        // Superseded counts as cancelled. A refresh replaces the
+                        // load this alignment is for, and the original side has a
+                        // watcher of its own, so two alignments can be in flight
+                        // over the same window; without this the outdated one runs
+                        // to completion on a large file for a result already thrown
+                        // away.
+                        isCancelled: () => compare_alignment_cancelled
+                            || disposed
+                            || !load_is_current(
+                                load_request.seq, load_request.refreshEvent),
                         onProgress: (scannedRows, totalRows) => {
+                            // Superseded is checked here too, not left to
+                            // `isCancelled`: the aligner reports progress at the
+                            // top of a checkpoint and tests for cancellation at
+                            // the bottom, so an alignment superseded between
+                            // checkpoints gets one more report out first — into
+                            // the bar its replacement is now driving, which is
+                            // how a bar moves backwards. Narrow enough that no
+                            // test pins the interleaving; the cancel below is
+                            // what the regression test covers.
+                            if (!load_is_current(
+                                load_request.seq, load_request.refreshEvent)) return;
+                            // Epoch-gated so a webview that reloaded mid-align is
+                            // not driven by the bar of the load it replaced.
+                            // Defensive, and matching what every other epoch-aware
+                            // post here does: no test drives it, because a reload
+                            // supersedes the load as well and the cancel above
+                            // wins the race in practice.
                             void post_to_receiver({
                                 type: 'compareProgress',
                                 scannedRows,
                                 totalRows,
-                            });
+                            }, receiver_epoch);
                         },
                     }),
                 );
@@ -3676,11 +3714,12 @@ export function attach_viewer(
                         close_error,
                     );
                 }
-                // A cancel is the user's own decision, not a failure to report
-                // back to them: the window is on its way out. Nothing is
-                // adopted on this path, so the modified side has no other
-                // owner and is closed here — unlike an alignment *failure*,
-                // where it survives as the plain-file fallback.
+                // A cancel is either the user's own decision — the window is on
+                // its way out — or a refresh superseding this load, and neither
+                // is a failure to report back. Nothing is adopted on this path
+                // either way, so the modified side has no other owner and is
+                // closed here, unlike an alignment *failure*, where it survives
+                // as the plain-file fallback.
                 if (error instanceof AlignmentCancelledError) {
                     try {
                         modified.close();
@@ -3810,6 +3849,7 @@ export function attach_viewer(
                 type: 'candidate',
                 candidate: await build_source({
                     includeCompareOriginal: include_compare_original,
+                    load: request,
                 }),
             };
         } catch (error) {
@@ -3826,6 +3866,7 @@ export function attach_viewer(
                     candidate: await build_source({
                         bypassFileSizeLimit: true,
                         includeCompareOriginal: include_compare_original,
+                        load: request,
                     }),
                 };
             }
@@ -4885,9 +4926,12 @@ export function attach_viewer(
                 if (!load_is_current(request.seq, request.refreshEvent)) {
                     return inactive_refresh_result();
                 }
-                // The user cancelled the comparison; the window is closing.
-                // Retrying it, or reporting it as a load failure, would be
-                // arguing with a decision already made.
+                // The user cancelled the comparison, and the window is closing:
+                // retrying it, or reporting it as a load failure, would argue
+                // with a decision already made. A *superseded* alignment also
+                // throws this, but never reaches here — the currency check
+                // above returns first, leaving the retry to the newer load that
+                // superseded it.
                 if (error instanceof AlignmentCancelledError) {
                     return { type: 'completed' };
                 }

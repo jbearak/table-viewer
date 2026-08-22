@@ -134,19 +134,32 @@ async function click_grid_cell(
 ): Promise<void> {
     const target = page.locator(`#glide-cell-${cell.column}-${cell.row}`);
     await target.waitFor({ state: 'attached' });
+    // Read BEFORE the click, because it is what the click will mean. A click on
+    // a cell that was ALREADY selected — which is what an earlier test in this
+    // shared window leaves behind — opens the overlay editor outright. The
+    // callers here want a selected cell, not an open one: they press Enter next,
+    // and against an already-open editor that Enter COMMITS instead of opening,
+    // so the editor they then wait for has just closed.
+    const was_selected = await target.getAttribute('aria-selected') === 'true';
     const box = (await page.locator(GRID_CANVAS).first().boundingBox())!;
     await page.mouse.click(box.x + offset.x, box.y + offset.y);
     await expect(target).toHaveAttribute('aria-selected', 'true');
-    // A click on a cell that was ALREADY selected — which is what an earlier test
-    // in this shared window leaves behind — opens the overlay editor outright. The
-    // callers here want a selected cell, not an open one: they press Enter next,
-    // and against an already-open editor that Enter COMMITS instead of opening, so
-    // the editor they then wait for has just closed. Cancelled rather than
-    // committed, so nothing typed by a previous test can leak through this helper.
-    const editor = page.locator('.cell-editor-input');
-    if (await editor.count() > 0) {
-        await page.keyboard.press('Escape');
-        await expect(editor).toBeHidden();
+    if (was_selected) {
+        // Only re-clicking an already-selected cell can open the editor, and
+        // only in Edit mode — in read mode it opens nothing, so this is a wait
+        // that is allowed to time out rather than an assertion. Bounded and
+        // retried, because `count()` does not retry: a slow-mounting editor
+        // read as absent and the caller's Enter then committed into it.
+        const editor = page.locator('.cell-editor-input');
+        const opened = await editor.waitFor({ state: 'visible', timeout: 2_000 })
+            .then(() => true, () => false);
+        if (opened) {
+            // Cancelled rather than committed, so nothing typed by a previous
+            // test leaks through this helper. Escape only here: with no editor
+            // open the grid maps Escape to clearing the selection just made.
+            await page.keyboard.press('Escape');
+            await expect(editor).toBeHidden();
+        }
     }
 }
 
