@@ -89,15 +89,21 @@ export function CompareStrip({
                               * path itself as one left-to-right run, without
                               * which bidi reordering moves the leading `/` to
                               * the visual end and the toolbar reads
-                              * `Users/…/x.csv/`. */}
-                            <bdi>{named_sides.originalPath}</bdi>
+                              * `Users/…/x.csv/`. `dir` is pinned rather than
+                              * left at `bdi`'s default `auto`: auto resolves
+                              * from the first strong character, so a path under
+                              * an RTL-named folder would resolve RTL and
+                              * reorder its separators all over again. A path's
+                              * structure is left-to-right whatever its segments
+                              * are named. */}
+                            <bdi dir="ltr">{named_sides.originalPath}</bdi>
                         </span>
                     </span>
                     <span className="compare-strip-side">
                         <span className="compare-strip-side-mark" aria-hidden="true">+</span>
                         <span className="compare-strip-side-label">Modified</span>
                         <span className="compare-strip-side-path" title={named_sides.modifiedPath}>
-                            <bdi>{named_sides.modifiedPath}</bdi>
+                            <bdi dir="ltr">{named_sides.modifiedPath}</bdi>
                         </span>
                     </span>
                 </div>

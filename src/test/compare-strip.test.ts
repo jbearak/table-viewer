@@ -203,14 +203,22 @@ describe('CompareStrip', () => {
         // `bdi` the leading separator reorders to the visual end.
         await strip({
             sides: {
-                originalPath: '/Reports/a.xlsx',
+                // The original leads with an RTL folder name: the case that
+                // makes `dir="auto"` insufficient, since it would resolve the
+                // whole path RTL from that first strong character.
+                originalPath: '/דוחות/a.xlsx',
                 modifiedPath: '/Reports/b.xlsx',
             },
         });
         const paths = container!.querySelectorAll('.compare-strip-side-path');
         expect(paths).toHaveLength(2);
         for (const path of paths) {
-            expect(path.firstElementChild?.tagName.toLowerCase()).toBe('bdi');
+            const isolate = path.firstElementChild;
+            expect(isolate?.tagName.toLowerCase()).toBe('bdi');
+            // Pinned, not `bdi`'s default `auto`: auto resolves from the first
+            // strong character, so a path under an RTL-named folder would
+            // resolve RTL and reorder its separators anyway.
+            expect(isolate?.getAttribute('dir')).toBe('ltr');
         }
     });
 
