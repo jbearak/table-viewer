@@ -183,6 +183,11 @@ export class CompareDataSource implements DataSource {
     /** True when any matched sheet fell back to positional alignment, so the
      *  host can say so rather than present an all-changed grid as a finding. */
     readonly degraded: boolean;
+    /** True when any matched sheet had more unpaired rows than the move search
+     *  will score, so some moves are still reported as a deletion plus an
+     *  addition. The alignment is correct; it is not the whole answer about
+     *  moves, and a window that stayed quiet would imply it was. */
+    readonly moveSearchTruncated: boolean;
     /** Grid row -> canonical row, for deleted rows only, per matched sheet. */
     private readonly deleted_canonical_rows: ReadonlyMap<number, ReadonlyMap<number, number>>;
     private readonly grid_row_by_modified_cache = new Map<number, ReadonlyMap<number, number>>();
@@ -249,6 +254,8 @@ export class CompareDataSource implements DataSource {
         );
         this.degraded = [...this.alignments.values()].some(
             (alignment) => alignment.degraded);
+        this.moveSearchTruncated = [...this.alignments.values()].some(
+            (alignment) => alignment.moveSearchTruncated);
         this.padded_meta = {
             ...modified_meta,
             // Either side can carry formatting: a deleted row is served from

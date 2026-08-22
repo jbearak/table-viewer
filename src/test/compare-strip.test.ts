@@ -127,6 +127,26 @@ describe('CompareStrip', () => {
         expect(toggle().disabled).toBe(true);
     });
 
+    it('says when there were too many rows to check them all for moves', async () => {
+        // Otherwise the window under-reports moves in silence, and a row that
+        // only moved reads as an unrelated deletion and addition with nothing
+        // saying the search gave up.
+        await strip({ move_search_truncated: true });
+        const status = container!.querySelector('.compare-strip-degraded');
+        expect(status?.textContent).toMatch(/some rows that only moved/u);
+        // The alignment itself stands, unlike a degraded one.
+        expect(text()).not.toMatch(/compared by position/u);
+        expect(toggle().disabled).toBe(false);
+    });
+
+    it('does not mention missed moves when the rows were compared by position', async () => {
+        // A positional comparison never looked for moves, so reporting that
+        // some were missed would imply a search that did not happen.
+        await strip({ degraded: true, move_search_truncated: true });
+        expect(text()).toMatch(/compared by position/u);
+        expect(text()).not.toMatch(/only moved/u);
+    });
+
     it('says nothing about alignment when the rows did match up', async () => {
         await strip();
         expect(container!.querySelector('.compare-strip-degraded')).toBeNull();

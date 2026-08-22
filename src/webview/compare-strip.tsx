@@ -19,6 +19,9 @@ export interface CompareStripProps {
     readonly counts: CompareStripCounts;
     /** The aligner could not match the rows up and compared by position. */
     readonly degraded: boolean;
+    /** Some moves went undetected because the sheet had too many unpaired rows
+     *  to score. The counts stand; the move annotation is incomplete. */
+    readonly move_search_truncated?: boolean;
     /**
      * Whether anything differs that the row and cell counts do not cover — a
      * renamed promoted header, or a sheet present on only one side. Without it
@@ -49,6 +52,7 @@ export function CompareStrip({
     sides,
     counts,
     degraded,
+    move_search_truncated = false,
     other_differences = false,
     only_changed_rows,
     on_toggle_only_changed_rows,
@@ -86,13 +90,21 @@ export function CompareStrip({
                     <span className="compare-strip-readonly">Read-only</span>
                 </div>
             )}
-            {degraded && (
+            {degraded ? (
                 // role="status" rather than "alert": it is a caveat about the
                 // grid the user is about to read, not an interruption.
                 <div className="compare-strip-degraded" role="status">
                     These files were too dissimilar to match up row by row, so rows are
                     compared by position instead. If the rows are in a different order,
                     the differences below will overstate what actually changed.
+                </div>
+            ) : move_search_truncated && (
+                // Not shown alongside the degraded notice: a positional
+                // comparison never looked for moves at all, so saying some were
+                // missed would imply a search that did not happen.
+                <div className="compare-strip-degraded" role="status">
+                    Too many rows differ to check them all for moves, so some rows that
+                    only moved are counted as one deleted and one added.
                 </div>
             )}
             <div className="compare-strip-row">

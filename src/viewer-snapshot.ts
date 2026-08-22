@@ -100,6 +100,13 @@ export interface WorkbookSnapshotCompare {
      * grid produced this way is not a finding about the files.
      */
     readonly degraded: boolean;
+    /**
+     * Some moved rows are still reported as a deletion plus an addition: the
+     * sheet had more unpaired rows than the move search will score. Distinct
+     * from `degraded`, which invalidates the whole alignment — here the
+     * alignment stands and only the move annotation is incomplete.
+     */
+    readonly moveSearchTruncated: boolean;
 }
 
 /** Fully explicit configuration and capabilities; absence is not overloaded. */

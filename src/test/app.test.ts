@@ -1009,7 +1009,7 @@ describe('git compare mode', () => {
                     counts: {
                         addedRows: 0, deletedRows: 0, movedRows: 0, changedCells: 0,
                     },
-                    degraded: false,
+                    degraded: false, moveSearchTruncated: false,
                 },
             },
         });
@@ -1046,7 +1046,7 @@ describe('git compare mode', () => {
                     counts: {
                         addedRows: 0, deletedRows: 0, movedRows: 0, changedCells: 0,
                     },
-                    degraded: false,
+                    degraded: false, moveSearchTruncated: false,
                 },
             },
         }));

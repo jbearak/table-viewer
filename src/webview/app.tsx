@@ -5672,6 +5672,7 @@ export function App(): React.JSX.Element {
                 {...(git_compare.sides ? { sides: git_compare.sides } : {})}
                 counts={git_compare.counts}
                 degraded={git_compare.degraded}
+                move_search_truncated={git_compare.moveSearchTruncated}
                 other_differences={
                     git_compare.changedColumnNames.some((columns) => columns.length > 0)
                     || git_compare.sheetStatuses.some((status) => status !== 'matched')

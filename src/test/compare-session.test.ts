@@ -295,6 +295,26 @@ describe('CompareDataSource with a content alignment', () => {
         expect(diff?.changedCells).toEqual([{ row: 2, col: 2, base: '20' }]);
     });
 
+    it('reports when a sheet had too many rows to check them all for moves', async () => {
+        // The moved row is also edited, so it needs a similarity score rather
+        // than an exact hash match — the only phase the cap gates.
+        const modified = new FixtureSource([
+            { name: 'S', rows: [['keep'], ['y'], ['Bo', 'Ops', '99']] },
+        ]);
+        const original = new FixtureSource([
+            { name: 'S', rows: [['Bo', 'Ops', '20'], ['keep'], ['y']] },
+        ]);
+        const relaxed = new CompareDataSource(
+            modified, original, await align_workbook(modified, original));
+        expect(relaxed.moveSearchTruncated).toBe(false);
+        const capped = new CompareDataSource(
+            modified,
+            original,
+            await align_workbook(modified, original, { maxMoveSearchRows: 0 }),
+        );
+        expect(capped.moveSearchTruncated).toBe(true);
+    });
+
     it('keeps a purely moved row under the changed-rows filter', async () => {
         // It is neither one-sided nor in changedRowIndices, so it would vanish
         // from the one view a user hunting changes would most expect it in.

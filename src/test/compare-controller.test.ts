@@ -159,12 +159,21 @@ describe('compare mode controller', () => {
         await panel.__receive({ type: 'ready' });
         await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThan(0));
         const snapshot = posted(panel, 'workbookSnapshot')[0].snapshot as {
-            configuration: { gitCompare?: { counts: unknown; degraded: boolean } };
+            configuration: {
+                gitCompare?: {
+                    counts: unknown;
+                    degraded: boolean;
+                    moveSearchTruncated: boolean;
+                };
+            };
         };
         expect(snapshot.configuration.gitCompare?.counts).toEqual({
             addedRows: 1, deletedRows: 0, movedRows: 0, changedCells: 1,
         });
         expect(snapshot.configuration.gitCompare?.degraded).toBe(false);
+        // Carried on the snapshot, not just the session: the strip's caveat is
+        // rendered from this and would otherwise never be reachable.
+        expect(snapshot.configuration.gitCompare?.moveSearchTruncated).toBe(false);
     });
 
     it('filters the grid to the changed rows and back', async () => {

@@ -3781,6 +3781,7 @@ export function attach_viewer(
                     : {}),
                 counts: adopted.change_counts(),
                 degraded: adopted.degraded,
+                moveSearchTruncated: adopted.moveSearchTruncated,
             },
         };
     }
