@@ -888,6 +888,17 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
     flex-shrink: 0;
 }
 
+/*
+ * Reuses `.truncation-banner` wholesale — same layout, same neutral info
+ * colours, same responsive collapse — because it is the same kind of notice:
+ * the grid below is legitimate but incomplete, and nothing is broken. The only
+ * thing this class adds is room for two full sentences, which a row-cap message
+ * does not need.
+ */
+.lfs-banner .truncation-banner-copy {
+    max-width: 80ch;
+}
+
 .truncation-banner-copy {
     min-width: 0;
     line-height: 1.35;

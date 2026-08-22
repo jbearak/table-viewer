@@ -34,7 +34,10 @@ import {
 import { create_resource_identity, type ResourceUriLike } from './resource-identity';
 import { CompareDataSource, align_workbook } from './diff-compare/compare-session';
 import { AlignmentCancelledError } from './diff-compare/row-alignment';
-import type { WorkbookSnapshotCompare } from './viewer-snapshot';
+import type { UnresolvedLfsObject, WorkbookSnapshotCompare } from './viewer-snapshot';
+import type { GitLfsResolveOutcome } from './host-ports';
+import { parse_git_lfs_pointer } from './git-lfs-pointer';
+import { UnresolvedLfsDataSource } from './data-source/unresolved-lfs-source';
 import {
     assert_safe_file_size,
     FileSizeLimitExceededError,
@@ -977,6 +980,56 @@ export function attach_viewer(
      */
     const editing_supported = profile.editing && !compare_mode && !options.readOnly;
     let compare_unavailable_warned = false;
+    /**
+     * The unfetched Git LFS object one of this panel's sides turned out to be,
+     * or undefined in the ordinary case. Set while building a source and read
+     * when projecting the snapshot, so the banner appears with the very
+     * delivery that carries the empty (or undiffed) grid.
+     *
+     * Held on the controller rather than derived from the adopted source
+     * because a *failed resolve* has to change it while the source stays
+     * exactly as it was — the grid does not move, only the banner's message.
+     */
+    let unresolved_lfs: UnresolvedLfsObject | undefined;
+    /**
+     * Record that a side is an unfetched pointer, carrying over a failure
+     * already attached to the *same* object.
+     *
+     * The carry-over is what makes a failed resolve legible. Reporting a
+     * failure re-delivers the snapshot, that delivery rebuilds the source, and
+     * the rebuild finds the very same pointer again — so a plain assignment
+     * here would erase the explanation between attaching it and rendering it,
+     * leaving the banner silently unchanged after a click. Matched on side and
+     * oid, so a *different* pointer legitimately starts clean.
+     */
+    function note_unresolved_lfs(
+        side: UnresolvedLfsObject['side'],
+        pointer: { readonly oid: string; readonly size: number },
+    ): void {
+        const carried = unresolved_lfs?.side === side && unresolved_lfs.oid === pointer.oid
+            ? unresolved_lfs.failure
+            : undefined;
+        unresolved_lfs = {
+            side,
+            oid: pointer.oid,
+            size: pointer.size,
+            resolvable: host.gitLfs !== undefined,
+            ...(carried === undefined ? {} : { failure: carried }),
+        };
+    }
+    /**
+     * Bytes fetched for a compare original that was a pointer, keyed by oid.
+     *
+     * Only the original side is cached, and only in memory. A working-tree
+     * pointer is fixed on disk by `pull`, so the next read finds real bytes and
+     * there is nothing to remember; the original side has no disk state to fix
+     * — a `git:` read returns the committed pointer blob forever — so without
+     * this every refresh of a resolved comparison would re-download the object.
+     */
+    let resolved_lfs_original: { readonly oid: string; readonly content: Uint8Array }
+        | undefined;
+    /** Guards against concurrent resolves from repeated banner clicks. */
+    let lfs_resolve_in_flight = false;
     /**
      * Set when the renderer asks to abandon a comparison that is still
      * aligning. Alignment is what makes the diff correct, so there is nothing
@@ -3633,6 +3686,24 @@ export function attach_viewer(
             fingerprint: `${stat.mtime}:${stat.size}`,
             digest: content_digest(raw),
         };
+        // Before the parser, which is the whole point: a `.csv` pointer parses
+        // into a convincing three-row grid of LFS metadata and an `.xlsx`
+        // pointer fails somewhere inside the ZIP reader. Neither tells the user
+        // the bytes were never fetched, so a pointer never reaches a profile.
+        const pointer = parse_git_lfs_pointer(raw);
+        if (pointer) {
+            note_unresolved_lfs('file', pointer);
+            // The comparison is moot when the file itself has no content: there
+            // is nothing to diff against, and fetching the original would spend
+            // a download on an alignment against an empty grid.
+            return new SourceCandidate(new UnresolvedLfsDataSource(), observation);
+        }
+        // Only this side's record is cleared. A blanket clear here would run
+        // *before* the original side is read, so it would erase the failure
+        // `note_unresolved_lfs` is about to carry over — the compare original's
+        // record is written later in this same build, and clearing it is that
+        // path's own business.
+        if (unresolved_lfs?.side === 'file') unresolved_lfs = undefined;
         // Captured before any await, so it names the receiver this build began
         // for rather than whichever one is current when progress is reported.
         const receiver_epoch = session.current_receiver_epoch;
@@ -3766,9 +3837,37 @@ export function attach_viewer(
             // pulling its full bytes into memory first.
             const stat = await host.fs.stat(compare_original_uri);
             assert_safe_file_size(stat.size, max_mib);
-            const original_raw = await host.fs.read_file(compare_original_uri);
-            assert_safe_file_size(original_raw.byteLength, max_mib);
+            const read_raw = await host.fs.read_file(compare_original_uri);
+            assert_safe_file_size(read_raw.byteLength, max_mib);
             const original_path = compare_original_uri.fsPath;
+            // The pointer case is not an edge case on this side: a `git:` read
+            // returns the *committed* blob, and for an LFS-tracked file that
+            // blob is the pointer whether or not the working tree was smudged.
+            // So every Git table diff of an LFS file arrives here as a pointer,
+            // and without this the diff would compare real rows against three
+            // lines of metadata and call almost everything changed.
+            const original_pointer = parse_git_lfs_pointer(read_raw);
+            let original_raw = read_raw;
+            if (!original_pointer && unresolved_lfs?.side === 'original') {
+                unresolved_lfs = undefined;
+            }
+            if (original_pointer) {
+                // A resolve earlier in this panel's life already fetched it.
+                // Matched on oid rather than trusted blindly: a refresh may be
+                // reading a different revision than the one that was resolved.
+                if (resolved_lfs_original?.oid === original_pointer.oid) {
+                    original_raw = resolved_lfs_original.content;
+                    if (unresolved_lfs?.side === 'original') unresolved_lfs = undefined;
+                } else {
+                    note_unresolved_lfs('original', original_pointer);
+                    // Undefined rather than a placeholder source: the modified
+                    // side is real and readable, so the panel shows the file
+                    // plainly and only the diff is missing — exactly the
+                    // existing degrade-to-plain-open contract, minus the
+                    // warning, because the banner says it better.
+                    return undefined;
+                }
+            }
             // Mirror the modified side's row cap: uncapping only one side
             // would report every row beyond the other's cap as added/deleted.
             // The window is attached for the modified file, so its profile
@@ -3790,7 +3889,14 @@ export function attach_viewer(
                 ),
                 observation: {
                     fingerprint: `${stat.mtime}:${stat.size}`,
-                    digest: content_digest(original_raw),
+                    // Digested from what was *read*, not from what was parsed.
+                    // The two differ only for a resolved LFS original, where
+                    // `original_raw` holds smudged bytes that are nowhere on
+                    // the other end of this URI: `built_source_currency`
+                    // re-reads it and digests what it finds, so digesting the
+                    // substitute here would make every resolved comparison
+                    // permanently stale and the resolve itself never land.
+                    digest: content_digest(read_raw),
                 },
             };
         } catch (error) {
@@ -3823,6 +3929,13 @@ export function attach_viewer(
                 moveSearchTruncated: adopted.moveSearchTruncated,
             },
         };
+    }
+
+    /** The snapshot's LFS payload — present exactly while a side is an
+     *  unfetched pointer. Spread beside `compare_configuration` so both
+     *  controller-owned snapshot facts are projected the same way. */
+    function lfs_configuration(): { unresolvedLfs: UnresolvedLfsObject } | Record<string, never> {
+        return unresolved_lfs ? { unresolvedLfs: unresolved_lfs } : {};
     }
 
     function warn_compare_unavailable(error: unknown): void {
@@ -4262,6 +4375,7 @@ export function attach_viewer(
                                 previewMode: profile.previewMode === true,
                                 diffOnByDefault: host.config.diff_on_by_default(),
                                 ...compare_configuration(next),
+                                ...lfs_configuration(),
                             },
                             capabilities: {
                                 csvEditingSupported: editing_supported,
@@ -4524,6 +4638,7 @@ export function attach_viewer(
                                         previewMode: profile.previewMode === true,
                                         diffOnByDefault: host.config.diff_on_by_default(),
                                         ...compare_configuration(source),
+                                        ...lfs_configuration(),
                                     },
                                     capabilities: {
                                         csvEditingSupported: editing_supported,
@@ -7265,6 +7380,92 @@ export function attach_viewer(
             case 'openCsvRowLimitSetting':
                 await host.ui.open_setting('csvMaxRows');
                 return;
+            case 'resolveLfsObject': {
+                // Modelled on `loadAllCsvRows` below: a banner action that
+                // changes what the next build will read, then re-runs the
+                // ordinary load path so the real table arrives through the
+                // same currency checks as any other refresh.
+                const target = unresolved_lfs;
+                if (!target || lfs_resolve_in_flight) return;
+                const lfs = host.gitLfs;
+                if (!lfs) return;
+                lfs_resolve_in_flight = true;
+                try {
+                    // Which side decides the operation, and they are not
+                    // interchangeable. A working-tree pointer is fixed on disk
+                    // by `pull`; the original side has no disk state to fix, so
+                    // its object is smudged into memory for this comparison.
+                    // The fetched bytes are carried out of the branch rather
+                    // than read off the outcome afterwards, because only the
+                    // smudge outcome has any — the side and the shape of the
+                    // result correspond, and this keeps that visible.
+                    let fetched: Uint8Array | undefined;
+                    let outcome: GitLfsResolveOutcome;
+                    if (target.side === 'file') {
+                        outcome = await lfs.pull(uri);
+                    } else {
+                        const smudged = await lfs.smudge(compare_original_uri ?? uri, {
+                            oid: target.oid,
+                            size: target.size,
+                        });
+                        if (smudged.type === 'resolved') fetched = smudged.content;
+                        outcome = smudged.type === 'resolved'
+                            ? { type: 'resolved' }
+                            : smudged;
+                    }
+                    if (disposed) return;
+                    // The panel may have moved on to a different pointer — or to
+                    // no pointer at all — while the fetch was in flight. Landing
+                    // this outcome on whatever is current now would attach a
+                    // failure to the wrong object.
+                    //
+                    // Compared by side and oid rather than by identity: an
+                    // intervening delivery rebuilds the source and records the
+                    // same pointer as a fresh object, so identity would reject
+                    // every outcome for the compare-original side, whose record
+                    // is rewritten on every build.
+                    const current = unresolved_lfs;
+                    if (
+                        current === undefined
+                        || current.side !== target.side
+                        || current.oid !== target.oid
+                    ) return;
+                    if (outcome.type === 'failed') {
+                        unresolved_lfs = {
+                            ...target,
+                            failure: {
+                                reason: outcome.reason,
+                                ...(outcome.detail === undefined
+                                    ? {}
+                                    : { detail: outcome.detail }),
+                            },
+                        };
+                        // Re-deliver so the banner can explain the failure. The
+                        // source has not changed, which is exactly why this
+                        // state lives on the controller rather than on it.
+                        await refresh_panel_source(true, 'recovery');
+                        return;
+                    }
+                    if (fetched) {
+                        resolved_lfs_original = { oid: target.oid, content: fetched };
+                    }
+                    // Cleared before the rebuild rather than after: the build
+                    // sets it again if the side is still a pointer, and leaving
+                    // a stale failure in place would outlive the retry it
+                    // describes.
+                    unresolved_lfs = undefined;
+                    if (!await refresh_panel_source(true, 'recovery')) {
+                        // A failed refresh must leave the action retryable, and
+                        // with no banner there is no button. Restoring the
+                        // pointer state is what keeps one on screen.
+                        unresolved_lfs = target;
+                        if (target.side === 'original') resolved_lfs_original = undefined;
+                    }
+                } finally {
+                    lfs_resolve_in_flight = false;
+                }
+                return;
+            }
             case 'loadAllCsvRows':
                 // Only a currently truncated CSV-like profile can make this do
                 // useful work. The source check also makes duplicate clicks after

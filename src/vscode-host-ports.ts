@@ -20,6 +20,7 @@ import {
     get_font_size,
     get_max_file_size_mib,
 } from './viewer-config';
+import { node_git_lfs_port } from './node-git-lfs';
 import { vscode_file_refresh_watcher_factory } from './vscode-file-refresh-watcher';
 import { build_webview_html } from './webview-html';
 
@@ -120,6 +121,9 @@ export const vscode_viewer_host: ViewerHost = {
     ui: vscode_host_ui_port,
     config: vscode_config_port,
     refreshWatcherFactory: vscode_file_refresh_watcher_factory,
+    // The extension host is Node, so the shared implementation applies
+    // unchanged; there is no vscode API for LFS to prefer over it.
+    gitLfs: node_git_lfs_port,
 };
 
 /** Build the viewer HTML from a vscode webview + extension uri (asWebviewUri

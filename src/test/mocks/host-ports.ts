@@ -15,6 +15,9 @@ import {
     type ConfigPort,
     type FileSizeLimitDialogChoice,
     type FileSystemPort,
+    type GitLfsPort,
+    type GitLfsResolveOutcome,
+    type GitLfsSmudgeOutcome,
     type HostUiPort,
     type SaveDialogChoice,
     type ViewerHost,
@@ -105,11 +108,68 @@ export const fake_config_port: ConfigPort = {
     },
 };
 
+/** One recorded call to the fake LFS port. */
+export interface FakeGitLfsCall {
+    readonly operation: 'pull' | 'smudge';
+    readonly path: string;
+    readonly oid?: string;
+}
+
+/**
+ * A scriptable `GitLfsPort`. Tests push outcomes onto `pull_outcomes` /
+ * `smudge_outcomes` (consumed in order, with the last one repeating) and read
+ * `calls` to assert which operation the controller chose for which side — the
+ * distinction that matters most, since `pull` and `smudge` are not
+ * interchangeable.
+ */
+export const fake_git_lfs = {
+    calls: [] as FakeGitLfsCall[],
+    pull_outcomes: [] as GitLfsResolveOutcome[],
+    smudge_outcomes: [] as GitLfsSmudgeOutcome[],
+    reset(): void {
+        fake_git_lfs.calls.length = 0;
+        fake_git_lfs.pull_outcomes.length = 0;
+        fake_git_lfs.smudge_outcomes.length = 0;
+    },
+    port: {
+        pull(resource): Promise<GitLfsResolveOutcome> {
+            fake_git_lfs.calls.push({ operation: 'pull', path: resource.fsPath });
+            return Promise.resolve(
+                fake_git_lfs.pull_outcomes.length > 1
+                    ? fake_git_lfs.pull_outcomes.shift()!
+                    : fake_git_lfs.pull_outcomes[0] ?? { type: 'resolved' },
+            );
+        },
+        smudge(resource, pointer): Promise<GitLfsSmudgeOutcome> {
+            fake_git_lfs.calls.push({
+                operation: 'smudge',
+                path: resource.fsPath,
+                oid: pointer.oid,
+            });
+            return Promise.resolve(
+                fake_git_lfs.smudge_outcomes.length > 1
+                    ? fake_git_lfs.smudge_outcomes.shift()!
+                    : fake_git_lfs.smudge_outcomes[0]
+                        ?? { type: 'failed', reason: 'failed' },
+            );
+        },
+    } satisfies GitLfsPort,
+};
+
 export const fake_viewer_host: ViewerHost = {
     fs: fake_file_system_port,
     ui: fake_host_ui_port,
     config: fake_config_port,
     // Resolves to the mock watcher via the vitest `vscode` alias, so
     // `__getWatchers()` / `__fireChange()` keep driving refreshes.
+    refreshWatcherFactory: vscode_file_refresh_watcher_factory,
+    gitLfs: fake_git_lfs.port,
+};
+
+/** A host that cannot resolve LFS objects, for the `resolvable: false` path. */
+export const fake_viewer_host_without_lfs: ViewerHost = {
+    fs: fake_file_system_port,
+    ui: fake_host_ui_port,
+    config: fake_config_port,
     refreshWatcherFactory: vscode_file_refresh_watcher_factory,
 };

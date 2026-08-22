@@ -29,6 +29,7 @@ import {
 } from '../../src/host-ports';
 import { canonical_file_key } from '../../src/resource-identity';
 import { node_file_refresh_watcher_factory } from '../../src/node-file-refresh-watcher';
+import { node_git_lfs_port } from '../../src/node-git-lfs';
 import type { HostMessage, WebviewMessage } from '../../src/types';
 import {
     sanitized_history_menu_state,
@@ -1620,6 +1621,7 @@ export class ViewerWindowManager {
             }),
             config: this.config_store.config_port(),
             refreshWatcherFactory: node_file_refresh_watcher_factory,
+            gitLfs: node_git_lfs_port,
         };
     }
 }

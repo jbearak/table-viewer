@@ -49,6 +49,7 @@ import {
     normalize_complete_per_file_state,
     normalize_workbook_snapshot_state,
     type RetainedSnapshotCommandResult,
+    type UnresolvedLfsObject,
     type WorkbookSnapshotCompare,
     type WorkbookSnapshotIdentity,
 } from '../viewer-snapshot';
@@ -66,6 +67,7 @@ import { SheetTabs, tab_orientation_label, type SheetTabBadge } from './sheet-ta
 import { StateStrip } from './state-strip';
 import { CompareProgress } from './compare-progress';
 import { CompareStrip } from './compare-strip';
+import { LfsBanner } from './lfs-banner';
 import { ContextMenu, type MenuItem } from './context-menu';
 import {
     pending_sheet_action_to_run,
@@ -581,6 +583,16 @@ export function App(): React.JSX.Element {
     // the git original, read-only. Snapshot-delivered like the capabilities.
     const [git_compare, set_git_compare] =
         useState<WorkbookSnapshotCompare | undefined>(undefined);
+    // A side of this panel is an unfetched Git LFS object. Snapshot-delivered
+    // beside `git_compare` because it is the same kind of fact: host-owned
+    // state about what this panel is showing, not about the grid's contents.
+    const [unresolved_lfs, set_unresolved_lfs] =
+        useState<UnresolvedLfsObject | undefined>(undefined);
+    // A resolve is in flight. Local rather than snapshot-delivered: the host
+    // sends no message while the download runs, and the button has to reflect
+    // the click immediately. Cleared by the snapshot that ends the operation —
+    // either the resolved table, or the same pointer carrying a failure.
+    const [lfs_resolving, set_lfs_resolving] = useState(false);
     // Row alignment runs before the workbook snapshot exists, so this is the
     // only thing the compare window has to show meanwhile. Its arrival is what
     // tells the renderer a comparison is being aligned at all.
@@ -2071,6 +2083,11 @@ export function App(): React.JSX.Element {
                     preview_mode_ref.current = snapshot.configuration.previewMode;
                     set_preview_mode(snapshot.configuration.previewMode);
                     set_git_compare(snapshot.configuration.gitCompare);
+                    set_unresolved_lfs(snapshot.configuration.unresolvedLfs);
+                    // Any snapshot is the end of a resolve: it is either the
+                    // real table or the pointer again with a failure attached,
+                    // and in both cases the download is no longer running.
+                    set_lfs_resolving(false);
                     meta_ref.current = snapshot.meta;
                     set_meta(snapshot.meta);
                     set_filter_editor(null);
@@ -5834,6 +5851,19 @@ export function App(): React.JSX.Element {
                         reason === 'escape' || reason === 'explicit',
                     )}
                     on_remove={remove_filter_editor}
+                />
+            )}
+            {unresolved_lfs && (
+                // Above the truncation banner: an unfetched object is the more
+                // fundamental fact — there is no data at all on that side — and
+                // in the `file` case a row cap on an empty grid is moot anyway.
+                <LfsBanner
+                    unresolved={unresolved_lfs}
+                    resolving={lfs_resolving}
+                    on_resolve={() => {
+                        set_lfs_resolving(true);
+                        host_bridge.postMessage({ type: 'resolveLfsObject' });
+                    }}
                 />
             )}
             {truncation_message && (

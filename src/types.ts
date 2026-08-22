@@ -1986,6 +1986,10 @@ export type WebviewMessage =
     | { type: 'cancelCompare' }
     | { type: 'openCsvRowLimitSetting' }
     | { type: 'loadAllCsvRows' }
+    /** The LFS banner's Resolve button. Carries nothing: which object and
+     *  which side are the host's own state, and a renderer-supplied oid would
+     *  be a stale identity the host would have to re-validate anyway. */
+    | { type: 'resolveLfsObject' }
     | { type: 'snapshotApplied'; identity: WorkbookSnapshotIdentity; disposition: SnapshotDisposition }
     | { type: 'requestRows'; sheetIndex: number; startRow: number; count: number; requestId: string; generation: number }
     | { type: 'stateChanged'; state: PerFileState; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity }

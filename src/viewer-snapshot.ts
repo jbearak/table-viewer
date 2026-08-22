@@ -4,6 +4,7 @@ import type {
     AuthorityCommitReceiptBase,
     FileAuthoritySnapshot,
 } from './file-coordinator';
+import type { GitLfsFailureReason } from './host-ports';
 import type { FileStateSnapshot } from './state';
 import { deep_clone_and_freeze } from './immutable';
 import { project_renderable_cell_highlight_state } from './cell-highlights';
@@ -109,6 +110,32 @@ export interface WorkbookSnapshotCompare {
     readonly moveSearchTruncated: boolean;
 }
 
+/**
+ * A side of this panel is a Git LFS pointer whose object is not available
+ * locally, so the bytes behind it were never read.
+ *
+ * `side` names which one, and the distinction is the whole reason this is a
+ * structure rather than a boolean. `file` means the file the user opened is
+ * itself a pointer and the grid below is empty. `original` means the file
+ * opened fine but the revision it is being compared against is a pointer, so
+ * the grid holds real data and only the diff is missing.
+ */
+export interface UnresolvedLfsObject {
+    readonly side: 'file' | 'original';
+    readonly oid: string;
+    /** Byte length of the real object, per the pointer — for "resolve 40 MB?". */
+    readonly size: number;
+    /** Whether the host can actually fetch it. False on a host with no
+     *  git-lfs port, where the notice stands but there is no button. */
+    readonly resolvable: boolean;
+    /** Set once a resolve has been tried and failed, so the banner can explain
+     *  rather than silently do nothing on the next click. */
+    readonly failure?: {
+        readonly reason: GitLfsFailureReason;
+        readonly detail?: string;
+    };
+}
+
 /** Fully explicit configuration and capabilities; absence is not overloaded. */
 export interface WorkbookSnapshotConfiguration {
     readonly defaultTabOrientation: 'horizontal' | 'vertical';
@@ -116,6 +143,14 @@ export interface WorkbookSnapshotConfiguration {
     readonly diffOnByDefault: boolean;
     /** Present exactly when the panel is a read-only git compare session. */
     readonly gitCompare?: WorkbookSnapshotCompare;
+    /**
+     * Present exactly while a side of this panel is an unfetched Git LFS
+     * object. Configuration rather than a diagnostic because it is the
+     * controller's state, not the source's: `gitCompare` beside it is the
+     * precedent, and the same reasoning applies — a failed resolve has to be
+     * able to change this without the adopted source changing at all.
+     */
+    readonly unresolvedLfs?: UnresolvedLfsObject;
 }
 
 export interface WorkbookSnapshotCapabilities {
