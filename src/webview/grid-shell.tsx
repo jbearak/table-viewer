@@ -2207,12 +2207,19 @@ export function GridShell({
             const cells = get_row(row);
             const cell = cells?.[source_column];
             const overlay = dirty
-                ? dirty_value_overlay_fields(dirty, diff_mode, show_formatting, cell)
+                ? dirty_value_overlay_fields(
+                    dirty,
+                    diff_mode,
+                    show_formatting,
+                    cell,
+                    edit_syntax === 'markdown',
+                )
                 : undefined;
             return displayed_text(cell, show_formatting, overlay);
         },
         [
             diff_mode,
+            edit_syntax,
             get_row,
             get_source_row,
             show_formatting,

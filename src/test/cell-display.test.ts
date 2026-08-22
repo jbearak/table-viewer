@@ -42,4 +42,10 @@ describe('working_has_formatting', () => {
     it('detects italic cells as having formatting', () => {
         expect(working_has_formatting([working([cell('text', 'text', false, true)])])).toBe(true);
     });
+
+    it('counts a retained number format even when the current value looks raw', () => {
+        const formatted = cell(1, '1');
+        formatted.numberFormat = { code: '0' };
+        expect(working_has_formatting([working([formatted])])).toBe(true);
+    });
 });

@@ -153,6 +153,9 @@ function format_sections(code: string): string[] {
         if (ch === '\\') { i += 1; continue; }
         if (ch === '"') { quoted = !quoted; continue; }
         if (quoted) continue;
+        // `_` consumes the following padding character. In particular, `_;`
+        // does not introduce a new format section.
+        if (ch === '_') { i += 1; continue; }
         if (ch === '[') bracket += 1;
         else if (ch === ']') bracket = Math.max(0, bracket - 1);
         else if (ch === ';' && bracket === 0) {
@@ -164,14 +167,38 @@ function format_sections(code: string): string[] {
     return out;
 }
 
-const CONDITION_RE = /^\s*(?:\[(?![<>=])[^\]]*\]\s*)*\[\s*(<=|>=|<>|<|>|=)\s*([+-]?[\d.]+(?:[eE][+-]?\d+)?)\s*\]/;
+// Keep these in sync with SSF's choose_fmt grammar and precedence. Date
+// classification must select the same section that SSF.format will render.
+const CONDITION_MARKER_RE = /\[[=<>]/;
+const CONDITION_RE = /\[(=|>[=]?|<[>=]?)(-?\d+(?:\.\d*)?)\]/;
 
-function condition_holds(section: string, value: number): boolean | null {
+type NumberFormatCondition = readonly [operator: string, bound: number];
+
+interface CompiledNumberFormatSection {
+    readonly code: string;
+    readonly condition?: NumberFormatCondition;
+    readonly hasConditionMarker: boolean;
+    readonly isDate: boolean;
+}
+
+interface CompiledNumberFormatSections {
+    readonly sections: readonly CompiledNumberFormatSection[];
+    readonly normalized?: readonly [
+        positive: CompiledNumberFormatSection,
+        negative: CompiledNumberFormatSection,
+        zero: CompiledNumberFormatSection,
+    ];
+}
+
+function parse_number_format_condition(section: string): NumberFormatCondition | undefined {
     const match = CONDITION_RE.exec(section);
-    if (!match) return null;
-    const bound = Number(match[2]);
-    if (!Number.isFinite(bound)) return null;
-    switch (match[1]) {
+    return match ? [match[1], Number(match[2])] : undefined;
+}
+
+function condition_holds(condition: NumberFormatCondition | undefined, value: number): boolean {
+    if (!condition) return false;
+    const [operator, bound] = condition;
+    switch (operator) {
         case '<': return value < bound;
         case '>': return value > bound;
         case '<=': return value <= bound;
@@ -181,29 +208,74 @@ function condition_holds(section: string, value: number): boolean | null {
     }
 }
 
-/** The numeric section Excel will use for a candidate value. */
-export function number_format_section_for_value(code: string, value: number): string {
-    const sections = format_sections(code);
-    if (sections.length === 1) return sections[0];
-    const conditional = sections.some((section) => CONDITION_RE.test(section));
-    if (!conditional) {
-        if (value > 0) return sections[0];
-        if (value < 0) return sections[1] ?? sections[0];
-        return sections[2] ?? sections[0];
+function normalize_numeric_sections(
+    sections: readonly CompiledNumberFormatSection[],
+): CompiledNumberFormatSections['normalized'] {
+    const last = sections[sections.length - 1];
+    const has_text_section = sections.length < 4 && last?.code.includes('@');
+    switch (sections.length) {
+        case 1:
+            return has_text_section ? undefined : [sections[0], sections[0], sections[0]];
+        case 2:
+            return has_text_section
+                ? [sections[0], sections[0], sections[0]]
+                : [sections[0], sections[1], sections[0]];
+        case 3:
+            return has_text_section
+                ? [sections[0], sections[1], sections[0]]
+                : [sections[0], sections[1], sections[2]];
+        case 4:
+            return [sections[0], sections[1], sections[2]];
+        default:
+            return undefined;
     }
-    const numeric = sections.length === 4 ? sections.slice(0, 3) : sections;
-    for (const section of numeric) {
-        const holds = condition_holds(section, value);
-        if (holds === true || holds === null) return section;
-    }
-    return numeric[numeric.length - 1];
 }
 
+function compile_number_format_sections(code: string): CompiledNumberFormatSections {
+    const sections = format_sections(code).map((section) => ({
+        code: section,
+        condition: parse_number_format_condition(section),
+        hasConditionMarker: CONDITION_MARKER_RE.test(section),
+        isDate: SSF.is_date(section) && !ELAPSED_TIME_RE.test(section),
+    }));
+    return {
+        sections,
+        normalized: normalize_numeric_sections(sections),
+    };
+}
+
+function number_format_section_from(
+    compiled: CompiledNumberFormatSections,
+    value: number,
+): CompiledNumberFormatSection {
+    const normalized = compiled.normalized;
+    if (!normalized) return compiled.sections[0];
+    const [positive, negative, zero] = normalized;
+    if (!positive.hasConditionMarker && !negative.hasConditionMarker) {
+        return value > 0 ? positive : value < 0 ? negative : zero;
+    }
+    if (condition_holds(positive.condition, value)) return positive;
+    if (condition_holds(negative.condition, value)) return negative;
+    return positive.condition && negative.condition ? zero : negative;
+}
+
+/** The numeric section Excel will use for a candidate value. */
+export function number_format_section_for_value(code: string, value: number): string {
+    return number_format_section_from(compile_number_format_sections(code), value).code;
+}
+
+const NUMBER_FORMAT_SECTIONS = new WeakMap<XlsxNumberFormat, CompiledNumberFormatSections>();
+
 export function number_format_is_date(format: XlsxNumberFormat, value?: number): boolean {
-    const code = value === undefined
-        ? format.code
-        : number_format_section_for_value(format.code, value);
-    return SSF.is_date(code) && !ELAPSED_TIME_RE.test(code);
+    if (value === undefined) {
+        return SSF.is_date(format.code) && !ELAPSED_TIME_RE.test(format.code);
+    }
+    let compiled = NUMBER_FORMAT_SECTIONS.get(format);
+    if (!compiled) {
+        compiled = compile_number_format_sections(format.code);
+        NUMBER_FORMAT_SECTIONS.set(format, compiled);
+    }
+    return number_format_section_from(compiled, value).isDate;
 }
 
 /** Check whether an XF format index refers to a date/time format. */

@@ -2816,6 +2816,44 @@ describe('GridShell link-only edits', () => {
         expect(cell.data.lines[0][0].style).toBeUndefined();
     });
 
+    it('uses the same literal rich edit in the overflow tooltip', async () => {
+        vi.useFakeTimers();
+        grid_mock.get_row.mockImplementation(() => [{
+            raw: '1234.5',
+            formatted: '1,234.50',
+            bold: true,
+            italic: false,
+            rawType: 'number' as const,
+            numberFormat: { code: '#,##0.00' },
+        }, null, null] as any);
+        await render_grid(props({
+            show_formatting: true,
+            edit_mode: true,
+            csv_editable: true,
+            edit_syntax: 'markdown',
+            column_widths: { 0: 20, 1: 150, 2: 200 },
+            initial_edits: {
+                '0:0': {
+                    value: '9876.5',
+                    base: '1234.5',
+                    valueRuns: { runs: [{ text: '9876.5' }] },
+                },
+            },
+        }));
+        const on_item_hovered = grid_mock.props!.onItemHovered as
+            (args: Record<string, unknown>) => void;
+        await act(async () => {
+            on_item_hovered({
+                kind: 'cell', location: [0, 0], buttons: 0,
+                bounds: { x: 30, y: 10, width: 20, height: 36 },
+                localEventX: 10, localEventY: 18,
+            });
+            await vi.runAllTimersAsync();
+        });
+        expect(container!.querySelector('[role="tooltip"]')?.textContent)
+            .toBe('9876.5');
+    });
+
     it('still substitutes the dirty text when the value itself changed', async () => {
         grid_mock.get_row.mockImplementation(() => [
             { raw: '1234.5', formatted: '1,234.50', bold: false, italic: false },

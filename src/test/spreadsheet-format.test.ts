@@ -118,6 +118,36 @@ describe('dirty XLSX number-format preview', () => {
         expect(number_format_section_for_value(code, 11)).toContain('high;value');
         expect(number_format_section_for_value(code, 10)).toBe('[<=10]0.00');
     });
+
+    it('matches SSF conditional-section precedence and fallbacks', () => {
+        const condition_second = { code: '0;[>40000]yyyy-mm-dd' };
+        const two_conditions = { code: '[>50000]yyyy-mm-dd;[<0]0' };
+        expect(number_format_is_date(condition_second, 45306)).toBe(true);
+        expect(number_format_is_date(two_conditions, 45306)).toBe(true);
+        expect(number_format_section_for_value(
+            two_conditions.code,
+            45306,
+        )).toBe('[>50000]yyyy-mm-dd');
+    });
+
+    it('recognizes short formats with a trailing text section', () => {
+        const format = { code: 'yyyy-mm-dd;0;@' };
+        expect(number_format_is_date(format, 0)).toBe(true);
+        expect(number_format_section_for_value(format.code, 0)).toBe('yyyy-mm-dd');
+    });
+
+    it('does not accept condition spellings that SSF does not parse', () => {
+        const format = { code: '[>4.5e4]0;yyyy-mm-dd' };
+        expect(number_format_is_date(format, 45306)).toBe(true);
+        expect(number_format_section_for_value(format.code, 45306)).toBe('yyyy-mm-dd');
+    });
+
+    it('does not split on a semicolon consumed by an underscore token', () => {
+        const format = { code: '0_;yyyy-mm-dd' };
+        expect(number_format_section_for_value(format.code, 45306))
+            .toBe('0_;yyyy-mm-dd');
+        expect(number_format_is_date(format, 45306)).toBe(true);
+    });
 });
 
 describe('spreadsheet-format date serial guards', () => {

@@ -171,16 +171,18 @@ export function densify(working: WorkingSet): (CellData | null)[][] {
 
 /**
  * Compute the workbook-level hasFormatting flag directly from sheet working sets,
- * without densifying. Equivalent to workbook_has_formatting() over the densified
- * sheets: that function skips null cells (merged-covered) and cells with
- * raw === null (blanks), so only real `cells` entries that are NOT merged-covered
- * can flip the flag — exactly what we check here.
+ * without densifying. Number-format recipes count even on currently blank or
+ * visually unchanged cells because they can change how the next edit paints.
+ * Merged-covered cells remain excluded because densification removes them.
  */
 export function working_has_formatting(workings: WorkingSet[]): boolean {
     for (const working of workings) {
         for (const [key, cell] of working.cells) {
-            if (cell.raw === null) continue;
             if (working.merged_cells.has(key)) continue; // densified -> null, skipped
+            // A retained recipe can affect the next edit even when the current
+            // scalar happens to render identically (for example, `1` under `0`).
+            if (cell.numberFormat) return true;
+            if (cell.raw === null) continue;
             if (cell.formatted !== get_raw_cell_text(cell.raw)) return true;
             if (cell.bold || cell.italic || cell.underline || cell.strikethrough) return true;
             // A hyperlink alone deliberately does NOT flip the flag: link
