@@ -102,7 +102,7 @@ const HASH_READ_BATCH = 512;
  * do not correspond". 20,000 differing rows is far past any edit someone would
  * still call a revision, and buys that answer in about half a second.
  */
-export const DEFAULT_MAX_EDIT_DISTANCE = 20_000;
+const DEFAULT_MAX_EDIT_DISTANCE = 20_000;
 
 /** FNV-1a over the row's raw cell text, with a unit separator between cells so
  *  `['ab','c']` and `['a','bc']` cannot collide. */
@@ -204,10 +204,6 @@ async function myers_diff(
 ): Promise<EditScript> {
     const builder = new OpBuilder();
     const frontiers = new MiddleSnakeFrontiers(left.length + right.length);
-    /** Edit distance consumed so far, against which `max_distance` is charged.
-     *  Bounding the total rather than each recursion is what makes the cap mean
-     *  what it says: many cheap snakes are still an expensive diff. */
-    let spent = 0;
     let steps = 0;
 
     /**
@@ -246,13 +242,19 @@ async function myers_diff(
             if (options.isCancelled?.()) throw new AlignmentCancelledError();
         }
 
-        // Charged against the remaining budget rather than checked after the
-        // fact: the middle-snake search is itself O(ND), so a sub-problem that
-        // will blow the cap has to be abandoned while it is running, not once
-        // it has finished proving how expensive it was.
-        const snake = frontiers.find(left, right, l0, l1, r0, r1, max_distance - spent);
+        // The bound is handed to the search rather than checked after it
+        // returns: the middle-snake search is itself O(ND), so a sub-problem
+        // that will blow the cap has to be abandoned while it is running, not
+        // once it has finished proving how expensive it was.
+        //
+        // Each sub-problem is bounded by the *whole* cap, and nothing is
+        // deducted for its children. A parent's distance already accounts for
+        // every edit its children will find — they are the same edits, seen at
+        // finer grain — so subtracting as the recursion descended charged the
+        // same work repeatedly and degraded inputs that were comfortably
+        // inside the cap.
+        const snake = frontiers.find(left, right, l0, l1, r0, r1, max_distance);
         if (snake === undefined) return { ops: [], degraded: true };
-        spent += snake.distance;
 
         if (snake.distance <= 1) {
             // One edit or none: the halves are a common prefix, a single
@@ -376,7 +378,9 @@ class MiddleSnakeFrontiers {
         const delta = n - m;
         const odd = (delta & 1) !== 0;
         // Each search step d resolves an edit distance of about 2d, so a
-        // budget of B is exhausted by the time d reaches B/2.
+        // budget of B is exhausted by the time d reaches B/2. The `+ 1` keeps
+        // the odd-delta case reachable, where step d proves a distance of
+        // 2d - 1; the exact distance is re-checked at each return site.
         const half = Math.min(Math.ceil((n + m) / 2), Math.floor(budget / 2) + 1);
         const offset = Math.ceil((n + m) / 2) + 1;
         const forward = this.forward;
@@ -399,6 +403,9 @@ class MiddleSnakeFrontiers {
                 // overtake a reverse path already laid down at d-1.
                 if (odd && k >= delta - (d - 1) && k <= delta + (d - 1)) {
                     if (x + reverse[offset + delta - k] >= n) {
+                        // d only grows, so a distance over budget here means
+                        // every later overlap is over budget too: give up now.
+                        if (2 * d - 1 > budget) return undefined;
                         return {
                             x0: l0 + snake_start_x,
                             y0: r0 + snake_start_y,
@@ -424,6 +431,7 @@ class MiddleSnakeFrontiers {
                 reverse[index] = x;
                 if (!odd && k >= delta - d && k <= delta + d) {
                     if (x + forward[offset + delta - k] >= n) {
+                        if (2 * d > budget) return undefined;
                         // Reverse coordinates count from the end; flip them
                         // back so the caller only ever sees forward ones.
                         return {

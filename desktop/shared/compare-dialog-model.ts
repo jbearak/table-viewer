@@ -67,17 +67,19 @@ export function dialog_state(
     if (original.extension !== modified.extension) {
         const csv_like = (extension: string) => extension === 'csv' || extension === 'tsv';
         const original_is_delimited = csv_like(original.extension);
+        const modified_is_delimited = csv_like(modified.extension);
+        let warning = 'These files are in different formats.';
         // A delimited file is one sheet, so pairing it with a workbook compares
         // it against that workbook's first sheet and reports the rest as
         // one-sided. Which side the workbook is on decides whether those sheets
         // read as added or deleted, so the warning has to name it.
-        const warning = original_is_delimited !== csv_like(modified.extension)
-            ? original_is_delimited
+        if (original_is_delimited !== modified_is_delimited) {
+            warning = original_is_delimited
                 ? 'Different formats. The original is compared as a single sheet; '
                     + 'the modified workbook\u2019s other sheets will show as added.'
                 : 'Different formats. The modified file is compared as a single sheet; '
-                    + 'the original workbook\u2019s other sheets will show as deleted.'
-            : 'These files are in different formats.';
+                    + 'the original workbook\u2019s other sheets will show as deleted.';
+        }
         return { canCompare: true, compareLabel: 'Compare Anyway', warning };
     }
     return { canCompare: true, compareLabel: 'Compare' };

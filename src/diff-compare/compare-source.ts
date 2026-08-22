@@ -1,4 +1,5 @@
-// Pure compare-session core for git table diffs. No vscode imports: everything
+// Pure compare-session core for compare sessions (Git table diffs and
+// file-to-file comparison alike). No vscode imports: everything
 // here operates on DataSource/WorkbookMeta values so it is unit-testable with
 // in-memory fixtures and shareable across hosts.
 import {
@@ -83,7 +84,7 @@ export function pair_sheets(
 /**
  * Compare promoted column headers of a matched sheet pair. Both CSV and Excel
  * sources can promote the first row into `columnNames`, taking it out of the
- * grid's row space — so a header-only edit is invisible to `diff_row_window`.
+ * grid's row space — so a header-only edit is invisible to the row comparison.
  * Returns the changed column indexes with the original header text (`''` when
  * the column had no name or did not exist).
  */
@@ -116,9 +117,10 @@ export type CompareRowStatus = 'same' | 'added' | 'deleted';
 
 /**
  * Sparse per-page diff. `rowStatus[i]` describes absolute row `startRow + i` of
- * the unified grid (whose row count is `max(original, modified)` row counts):
- * `added` rows exist only in the modified side, `deleted` rows only in the
- * original. `changedCells` carries only differing cells of rows present on both
+ * the unified grid, whose rows follow the sheet alignment rather than
+ * positional padding — interleaved deletions and additions can make it longer
+ * than either side. `added` rows exist only in the modified side, `deleted`
+ * rows only in the original. `changedCells` carries only differing cells of rows present on both
  * sides; `deleted` rows need none — the grid rows themselves carry the original
  * content (see CompareDataSource.read_rows), struck through by row status.
  */

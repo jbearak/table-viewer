@@ -168,6 +168,35 @@ describe('align_sheet', () => {
         expect(alignment).toMatchObject({ addedRows: 0, deletedRows: 0 });
     });
 
+    it('accepts an edit distance that exactly fills the cap', async () => {
+        // The cap bounds the whole comparison, and a parent's distance already
+        // covers every edit its children re-find at finer grain. Deducting each
+        // recursive step from the remaining budget charged the same edits twice
+        // and degraded inputs that comfortably fit.
+        const alignment = await align_sheet(
+            single(rows_of('a', 'M', 'b', 'c')),
+            single(rows_of('A', 'M', 'B', 'C')),
+            matched,
+            { maxEditDistance: 6 },
+        );
+        expect(alignment.degraded).toBe(false);
+    });
+
+    it('degrades when a single substitution exceeds a tiny cap', async () => {
+        // One substitution is a distance of 2, so caps of 0 and 1 must both
+        // degrade. The search's depth bound alone is a step too loose to say
+        // so — the distance itself is what has to be checked.
+        for (const cap of [0, 1]) {
+            const alignment = await align_sheet(
+                single(rows_of('a')),
+                single(rows_of('b')),
+                matched,
+                { maxEditDistance: cap },
+            );
+            expect(alignment.degraded, `cap ${cap}`).toBe(true);
+        }
+    });
+
     it('aligns two wholly unrelated files without a quadratic-memory blowup', async () => {
         // The regression the linear-space rewrite exists for. The textbook
         // Myers keeps one frontier per edit distance, which for inputs this
