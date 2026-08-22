@@ -66,7 +66,9 @@ describe('pair_sheets', () => {
         // A CSV is one sheet the reader calls Sheet1. Matching on that name
         // reported it and every worksheet as one-sided unless the workbook
         // happened to have a sheet called Sheet1.
-        const original = new FixtureSource([{ name: 'Sheet1', rows: [] }]).meta();
+        const original = new FixtureSource([
+            { name: 'Sheet1', unnamedSingleSheet: true, rows: [] },
+        ]).meta();
         const modified = new FixtureSource([
             { name: 'Sales', worksheetId: 'w1', rows: [] },
             { name: 'Notes', worksheetId: 'w2', rows: [] },
@@ -82,10 +84,65 @@ describe('pair_sheets', () => {
             { name: 'Sales', worksheetId: 'w1', rows: [] },
             { name: 'Notes', worksheetId: 'w2', rows: [] },
         ]).meta();
-        const modified = new FixtureSource([{ name: 'Sheet1', rows: [] }]).meta();
+        const modified = new FixtureSource([
+            { name: 'Sheet1', unnamedSingleSheet: true, rows: [] },
+        ]).meta();
         expect(pair_sheets(original, modified)).toEqual([
             { status: 'matched', name: 'Sheet1', modifiedIndex: 0, originalIndex: 0 },
             { status: 'deleted', name: 'Notes', originalIndex: 1 },
+        ]);
+    });
+
+    it('pairs a delimited file with a single-sheet .xls by position', () => {
+        // .xls exposes no worksheetId, so inferring \u201cdelimited\u201d from a missing
+        // identity made a one-sheet .xls look like a CSV: neither side won the
+        // XOR, and the two fell back to the placeholder name that the
+        // first-sheet rule exists to avoid depending on.
+        const csv = [{ name: 'Sheet1', unnamedSingleSheet: true, rows: [] }];
+        const xls = [{ name: 'Budget', rows: [] }];
+        expect(pair_sheets(
+            new FixtureSource(csv).meta(),
+            new FixtureSource(xls).meta(),
+        )).toEqual([
+            { status: 'matched', name: 'Budget', modifiedIndex: 0, originalIndex: 0 },
+        ]);
+        expect(pair_sheets(
+            new FixtureSource(xls).meta(),
+            new FixtureSource(csv).meta(),
+        )).toEqual([
+            { status: 'matched', name: 'Sheet1', modifiedIndex: 0, originalIndex: 0 },
+        ]);
+    });
+
+    it('keeps name pairing between two single-sheet workbooks', () => {
+        // Neither side is delimited, so their names are the user's own and
+        // differing ones mean genuinely different worksheets.
+        const original = new FixtureSource([{ name: 'Budget', rows: [] }]).meta();
+        const modified = new FixtureSource([{ name: 'Forecast', rows: [] }]).meta();
+        expect(pair_sheets(original, modified)).toEqual([
+            { status: 'added', name: 'Forecast', modifiedIndex: 0 },
+            { status: 'deleted', name: 'Budget', originalIndex: 0 },
+        ]);
+    });
+
+    it('pairs two delimited files with each other', () => {
+        const side = () => new FixtureSource([
+            { name: 'Sheet1', unnamedSingleSheet: true, rows: [] },
+        ]).meta();
+        expect(pair_sheets(side(), side())).toEqual([
+            { status: 'matched', name: 'Sheet1', modifiedIndex: 0, originalIndex: 0 },
+        ]);
+    });
+
+    it('reports a delimited file against an empty workbook as one-sided', () => {
+        // First-sheet pairing needs a first sheet on both sides; with none,
+        // fall through rather than index into an empty array.
+        const original = new FixtureSource([]).meta();
+        const modified = new FixtureSource([
+            { name: 'Sheet1', unnamedSingleSheet: true, rows: [] },
+        ]).meta();
+        expect(pair_sheets(original, modified)).toEqual([
+            { status: 'added', name: 'Sheet1', modifiedIndex: 0 },
         ]);
     });
 

@@ -70,13 +70,17 @@ export function pair_sheets(
     modified: WorkbookMeta,
 ): SheetPairing[] {
     if (original.sheets.length > 0 && modified.sheets.length > 0) {
-        const single = (meta: WorkbookMeta) => meta.sheets.length === 1
-            && meta.sheets[0].worksheetId === undefined;
-        // Only when exactly one side is a lone anonymous sheet: two such sides
-        // already pair by their shared name, and two workbooks must keep
-        // identity-based pairing or an added first sheet would glue unrelated
-        // worksheets together.
-        if (single(original) !== single(modified)) {
+        // Asked of the source rather than inferred from a missing worksheetId:
+        // .xls exposes no worksheet identity either, so inferring it made a
+        // one-sheet .xls indistinguishable from a CSV and left the two of them
+        // pairing on the placeholder name that started the problem.
+        const delimited = (meta: WorkbookMeta) =>
+            meta.sheets.length === 1 && meta.sheets[0].unnamedSingleSheet === true;
+        // Only when exactly one side is delimited: two delimited sides already
+        // pair by their shared placeholder name, and two workbooks must keep
+        // identity-based pairing or an inserted first sheet would glue
+        // unrelated worksheets together.
+        if (delimited(original) !== delimited(modified)) {
             return pair_first_sheets(original, modified);
         }
     }

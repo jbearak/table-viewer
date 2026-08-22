@@ -18,6 +18,8 @@ export const cell = (raw: string): RenderedCell => ({
 export interface FixtureSheet {
     name: string;
     worksheetId?: string;
+    /** Marks the sheet the way a delimited reader does: one grid, placeholder name. */
+    unnamedSingleSheet?: boolean;
     rows: string[][];
 }
 
@@ -34,6 +36,7 @@ export class FixtureSource implements DataSource {
                 ...(sheet.worksheetId !== undefined
                     ? { worksheetId: sheet.worksheetId }
                     : {}),
+                ...(sheet.unnamedSingleSheet ? { unnamedSingleSheet: true } : {}),
                 rowCount: sheet.rows.length,
                 sourceRowCount: sheet.rows.length,
                 columnCount: sheet.rows.reduce(
