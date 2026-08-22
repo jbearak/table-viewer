@@ -173,6 +173,32 @@ describe('build_grid_cell — edit overlay (CSV edit mode)', () => {
         expect((c as { displayData: string }).displayData).toBe('EDITED');
     });
 
+    it('paints a formatted dirty preview while editing and copying the raw value', () => {
+        const overlay = {
+            editable: true,
+            dirty_value: '9876.5',
+            dirty_display: '9,876.50',
+        };
+        const formatted = ecell(1, overlay, true) as { data: string; displayData: string };
+        expect(formatted.data).toBe('9876.5');
+        expect(formatted.displayData).toBe('9,876.50');
+
+        const raw = ecell(1, overlay, false) as { data: string; displayData: string };
+        expect(raw.data).toBe('9876.5');
+        expect(raw.displayData).toBe('9876.5');
+    });
+
+    it('uses raw dirty text for before/after diffs even when a preview exists', () => {
+        const c = ecell(1, {
+            dirty_value: '9876.5',
+            dirty_display: '9,876.50',
+            diff_base: '1234.5',
+        }) as unknown as { data: { lines: Array<Array<{ text: string }>> }; copyData: string };
+        expect(c.data.lines.flat().map((segment) => segment.text).join('')).toContain('9876.5');
+        expect(c.data.lines.flat().map((segment) => segment.text).join('')).not.toContain('9,876.50');
+        expect(c.copyData).toBe('9876.5');
+    });
+
     it('tints the background via themeOverride.bgCell', () => {
         const c = ecell(1, { editable: true, bg: '#332200' });
         expect((c as { themeOverride?: { bgCell?: string } }).themeOverride?.bgCell).toBe('#332200');

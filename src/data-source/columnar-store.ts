@@ -3,6 +3,7 @@ import type { RenderedCell } from './interface';
 
 const NULL_IDX = -1;
 const BOLD = 1, ITALIC = 2, UNDERLINE = 4, STRIKETHROUGH = 8, HAS_EXTRAS = 16;
+const DATE_1904 = 64, XLSX_ISO_DATE = 128;
 const TYPE_STRING = 1, TYPE_NUMBER = 2, TYPE_BOOLEAN = 3, TYPE_EMPTY = 4, TYPE_DATE = 5;
 
 /** Sparse per-cell metadata that only exceptional cells carry. Immutable
@@ -20,6 +21,7 @@ export class ColumnarStore {
         private readonly pool: string[],
         private readonly rawIdx: Int32Array,
         private readonly fmtIdx: Int32Array,
+        private readonly numberFormatIdx: Int32Array | undefined,
         private readonly flags: Uint8Array,
         private readonly types: Uint8Array,
         /** Keyed by linear cell index (row * cols + col). */
@@ -98,6 +100,14 @@ export class ColumnarStore {
         };
         if ((flags & UNDERLINE) !== 0) cell.underline = true;
         if ((flags & STRIKETHROUGH) !== 0) cell.strikethrough = true;
+        const format_index = this.numberFormatIdx?.[index] ?? NULL_IDX;
+        if (format_index !== NULL_IDX) {
+            cell.numberFormat = {
+                code: this.pool[format_index],
+                ...((flags & DATE_1904) !== 0 ? { date1904: true as const } : {}),
+            };
+        }
+        if ((flags & XLSX_ISO_DATE) !== 0) cell.xlsxIsoDate = true;
         // The HAS_EXTRAS bit keeps plain-cell reads off the map entirely, so
         // one linked cell doesn't turn every read into a hash probe.
         if ((flags & HAS_EXTRAS) !== 0) {
@@ -113,6 +123,7 @@ export class ColumnarStore {
         private readonly poolMap = new Map<string, number>([['', 0]]);
         private readonly rawIdx: Int32Array;
         private readonly fmtIdx: Int32Array;
+        private numberFormatIdx: Int32Array | undefined;
         private readonly flags: Uint8Array;
         private readonly types: Uint8Array;
         private readonly extras = new Map<number, CellExtras>();
@@ -137,8 +148,9 @@ export class ColumnarStore {
                 throw new RangeError(`cell (${r},${c}) out of bounds for ${this.rows}x${this.cols} store`);
             }
             // Overwrites are rare (fills write each index once), so only pay
-            // the map delete when this index actually held extras.
+            // the sparse cleanup when this index actually held optional data.
             if ((this.flags[i] & HAS_EXTRAS) !== 0) this.extras.delete(i);
+            if (this.numberFormatIdx) this.numberFormatIdx[i] = NULL_IDX;
             if (cell === null) {
                 this.rawIdx[i] = NULL_IDX;
                 this.fmtIdx[i] = NULL_IDX;
@@ -152,6 +164,14 @@ export class ColumnarStore {
                 | (cell.italic ? ITALIC : 0)
                 | (cell.underline ? UNDERLINE : 0)
                 | (cell.strikethrough ? STRIKETHROUGH : 0);
+            if (cell.numberFormat) {
+                if (!this.numberFormatIdx) {
+                    this.numberFormatIdx = new Int32Array(this.rawIdx.length).fill(NULL_IDX);
+                }
+                this.numberFormatIdx[i] = this.intern(cell.numberFormat.code);
+                if (cell.numberFormat.date1904) flags |= DATE_1904;
+            }
+            if (cell.xlsxIsoDate) flags |= XLSX_ISO_DATE;
             this.types[i] = encode_type(cell.rawType);
             if (cell.richText || cell.hyperlink) {
                 // Stored by reference: the parser hands over immutable objects
@@ -168,7 +188,8 @@ export class ColumnarStore {
         build(): ColumnarStore {
             return new ColumnarStore(
                 this.rows, this.cols, this.pool,
-                this.rawIdx, this.fmtIdx, this.flags, this.types, this.extras,
+                this.rawIdx, this.fmtIdx, this.numberFormatIdx,
+                this.flags, this.types, this.extras,
             );
         }
     };

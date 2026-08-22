@@ -1,6 +1,10 @@
 import { element_close, type XlsxCellEdit } from './xlsx-cell-write';
 import { worksheet_scan_input } from './ooxml-worksheet-scan';
-import { get_style, is_date_format } from './spreadsheet-format';
+import {
+    create_number_format_resolver,
+    get_style,
+    number_format_is_date,
+} from './spreadsheet-format';
 import {
     decode_xml,
     find_tag_end,
@@ -18,7 +22,7 @@ import {
     resolve_part_path,
     worksheet_part_paths_from_package,
 } from './parse-xlsx';
-import type { XfEntry, DateMode } from './spreadsheet-format';
+import type { DateMode } from './spreadsheet-format';
 import { rels_path_for_part } from './ooxml-relationships';
 import type { XlsxHyperlinkEdit } from './xlsx-hyperlink-write';
 import { apply_worksheet_edits } from './ooxml-surgery';
@@ -62,97 +66,6 @@ function write_part_bytes(
 
 function write_part_text(zip: ZipPackage, path: string, text: string): boolean {
     return write_part_bytes(zip, path, Buffer.from(text, 'utf8'));
-}
-
-/**
- * Split a number format into its sections.
- *
- * A `;` inside a quoted literal, an escape, or a bracketed condition/colour is not
- * a section break, so this cannot be a `split(';')`: `"a;b";0` is one section, and
- * cutting it in half would leave a fragment that classifies as anything at all.
- */
-function format_sections(code: string): string[] {
-    const out: string[] = [];
-    let quoted = false;
-    let bracket = 0;
-    let start = 0;
-    for (let i = 0; i < code.length; i += 1) {
-        const ch = code[i];
-        if (ch === '\\') { i += 1; continue; }
-        if (ch === '"') { quoted = !quoted; continue; }
-        if (quoted) continue;
-        if (ch === '[') bracket += 1;
-        else if (ch === ']') bracket = Math.max(0, bracket - 1);
-        else if (ch === ';' && bracket === 0) {
-            out.push(code.slice(start, i));
-            start = i + 1;
-        }
-    }
-    out.push(code.slice(start));
-    return out;
-}
-
-/**
- * A `[>=100]`-style condition, if the section carries one.
- *
- * Not anchored to the very start: a section may carry a colour or a locale
- * bracket ahead of its condition (`[Red][>50000]yyyy-mm-dd`), and requiring the
- * condition to come first made those read as unconditional — which then took the
- * positive/negative/zero path and picked the wrong section entirely.
- *
- * The bound's sign may be written explicitly: `[>+50000]` is the same condition as
- * `[>50000]`. Accepting only a leading `-` made the format read as unconditional
- * for the same reason and with the same consequence — the date section was picked
- * for a value the cell will not display as a date, so a typed date went in as a
- * serial the user then sees as `45306`.
- */
-const CONDITION_RE = /^\s*(?:\[(?![<>=])[^\]]*\]\s*)*\[\s*(<=|>=|<>|<|>|=)\s*([+-]?[\d.]+(?:[eE][+-]?\d+)?)\s*\]/;
-
-function condition_holds(section: string, value: number): boolean | null {
-    const m = CONDITION_RE.exec(section);
-    if (!m) return null;
-    const bound = Number(m[2]);
-    if (!Number.isFinite(bound)) return null;
-    switch (m[1]) {
-        case '<': return value < bound;
-        case '>': return value > bound;
-        case '<=': return value <= bound;
-        case '>=': return value >= bound;
-        case '=': return value === bound;
-        default: return value !== bound;
-    }
-}
-
-/**
- * The section of `code` that `value` will actually be displayed by.
- *
- * Sections are ordinarily `positive;negative;zero;text`, so a positive serial
- * takes the first — but a section may instead carry its own condition
- * (`[>50000]yyyy-mm-dd;0`), and then Excel uses the first condition that holds and
- * the last section as the fallback. Getting this wrong is not cosmetic: the writer
- * asks whether a typed date will *render* as a date, and both directions corrupt.
- * Assuming section one, `[>50000]0;yyyy-mm-dd` stored an inline string where the
- * cell would have shown a date, and `[>50000]yyyy-mm-dd;0` stored a serial the
- * cell then displayed as `45306`.
- */
-function section_for_value(code: string, value: number): string {
-    const sections = format_sections(code);
-    if (sections.length === 1) return sections[0];
-    const conditional = sections.some((section) => CONDITION_RE.test(section));
-    if (!conditional) {
-        if (value > 0) return sections[0];
-        if (value < 0) return sections[1] ?? sections[0];
-        return sections[2] ?? sections[0];
-    }
-    // The text section never applies to a number, and a trailing one would
-    // otherwise be picked up as the fallback below.
-    const numeric = sections.length === 4 ? sections.slice(0, 3) : sections;
-    for (const section of numeric) {
-        const holds = condition_holds(section, value);
-        if (holds === true) return section;
-        if (holds === null) return section;
-    }
-    return numeric[numeric.length - 1];
 }
 
 /**
@@ -230,6 +143,8 @@ function read_style_write_context(zip: ZipPackage): StyleWriteContext {
     }
     const { xfs, fonts, format_map } = parse_styles(xml);
 
+    const number_format_for = create_number_format_resolver(xfs, format_map, 0);
+
     // Narrowed to the section the serial about to be written will be *displayed*
     // by. `SSF.is_date` says true if any section of a format is a date, so
     // `0;0;yyyy-mm-dd` counted and a typed date was stored as a serial the cell
@@ -239,9 +154,8 @@ function read_style_write_context(zip: ZipPackage): StyleWriteContext {
     // candidate serial rather than answering for the format as a whole. Only the
     // reading side wants that whole-format answer.
     const is_date_style = (xf_index: number, serial: number) => {
-        const scoped = new Map<number, string>();
-        for (const [id, code] of format_map) scoped.set(id, section_for_value(code, serial));
-        return is_date_format(xf_index, xfs, scoped);
+        const format = number_format_for(xf_index);
+        return format !== undefined && number_format_is_date(format, serial);
     };
 
     // The <rPr> bases are only wanted when some edit actually carries runs, so
@@ -299,21 +213,6 @@ function attr(tag: string, name: string): string | null {
     const m = new RegExp(`\\b${name}=(?:"([^"]*)"|'([^']*)')`).exec(tag);
     if (!m) return null;
     return decode_xml(m[1] ?? m[2]);
-}
-
-/**
- * A non-negative integer attribute of `tag`, or null if absent or not one.
- *
- * The pattern cannot be `"(\d+)"` directly: an encoded digit is still a digit,
- * so `numFmtId="16&#52;"` is `164` — a custom date format — and matching the raw
- * text failed, left the index at its `0` default, and stored a typed date as an
- * inline string under a format that renders dates. Decoding first and validating
- * after also rejects the encoded spelling of a genuinely malformed value rather
- * than reading it as `NaN`.
- */
-function numeric_attr(tag: string, name: string): number | null {
-    const text = attr(tag, name);
-    return text !== null && /^\d+$/.test(text) ? Number(text) : null;
 }
 
 /**

@@ -3,6 +3,7 @@ import type {
     WorkbookMeta,
     RenderedCell,
 } from './data-source/interface';
+import type { XlsxCellFormatFields } from './spreadsheet-format';
 import type {
     SnapshotDisposition,
     WorkbookSnapshot,
@@ -48,7 +49,7 @@ export interface SheetData {
     rowCount: number;
 }
 
-export interface CellData extends RichCellFields {
+export interface CellData extends RichCellFields, XlsxCellFormatFields {
     raw: string | number | boolean | null;
     formatted: string;
     bold: boolean;

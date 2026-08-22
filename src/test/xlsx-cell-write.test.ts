@@ -9,13 +9,14 @@ import { parse_xlsx, worksheet_part_paths } from '../parse-xlsx';
 import {
     apply_cell_edits,
     apply_utf8_splices,
-    classify_value,
     col_index_to_letter,
     formula_count,
     iso_to_serial,
     widen_dimension,
 } from '../xlsx-cell-write';
 import { OoxmlRefusalError, type OoxmlRefusalCode } from '../ooxml-refusal';
+import { format_xlsx_edit_preview } from '../spreadsheet-format';
+import { classify_xlsx_cell_value } from '../xlsx-cell-value';
 import { ZipPackage } from '../zip-package';
 
 const FORMATTED = 'src/test/fixtures/formatted.xlsx';
@@ -121,41 +122,43 @@ describe('iso_to_serial', () => {
     });
 });
 
-describe('classify_value', () => {
+describe('classify_xlsx_cell_value', () => {
     it('treats the empty string as a cleared cell', () => {
-        expect(classify_value('', 0, OPTS)).toEqual({ kind: 'empty' });
+        expect(classify_xlsx_cell_value('', OPTS)).toEqual({ kind: 'empty' });
     });
 
     it('infers numbers', () => {
-        expect(classify_value('42', 0, OPTS)).toEqual({ kind: 'number', text: '42' });
-        expect(classify_value('-1.5e3', 0, OPTS)).toEqual({ kind: 'number', text: '-1.5e3' });
+        expect(classify_xlsx_cell_value('42', OPTS)).toEqual({ kind: 'number', text: '42' });
+        expect(classify_xlsx_cell_value('-1.5e3', OPTS)).toEqual({ kind: 'number', text: '-1.5e3' });
     });
 
     it('keeps number-adjacent strings as strings', () => {
         // Zip codes, phone extensions and account ids are typed for their
         // spelling; storing them as numbers loses the padding irreversibly, and
         // the same text in a CSV round-trips verbatim.
-        expect(classify_value('007', 0, OPTS)).toEqual({ kind: 'string', text: '007' });
-        expect(classify_value('00', 0, OPTS).kind).toBe('string');
-        expect(classify_value('007.5', 0, OPTS).kind).toBe('string');
-        expect(classify_value('1,000', 0, OPTS).kind).toBe('string');
-        expect(classify_value('12abc', 0, OPTS).kind).toBe('string');
-        expect(classify_value('Infinity', 0, OPTS).kind).toBe('string');
+        expect(classify_xlsx_cell_value('007', OPTS)).toEqual({ kind: 'string', text: '007' });
+        expect(classify_xlsx_cell_value('00', OPTS).kind).toBe('string');
+        expect(classify_xlsx_cell_value('007.5', OPTS).kind).toBe('string');
+        expect(classify_xlsx_cell_value('1,000', OPTS).kind).toBe('string');
+        expect(classify_xlsx_cell_value('12abc', OPTS).kind).toBe('string');
+        expect(classify_xlsx_cell_value('Infinity', OPTS).kind).toBe('string');
     });
 
     it('still reads a single leading zero as part of the number', () => {
         // `0`, `0.5` and `0e0` spell their value; the zero is not padding.
         for (const text of ['0', '0.5', '-0.5', '.5', '0e0', '1.']) {
-            expect(classify_value(text, 0, OPTS).kind, text).toBe('number');
+            expect(classify_xlsx_cell_value(text, OPTS).kind, text).toBe('number');
         }
     });
 
     it('stores a date as a serial only when the cell is already date-formatted', () => {
         const date_style = { datemode: 0 as const, is_date_style: () => true };
-        expect(classify_value('2024-01-15', 3, date_style)).toEqual({ kind: 'number', text: '45306' });
+        expect(classify_xlsx_cell_value('2024-01-15', date_style))
+            .toEqual({ kind: 'number', text: '45306' });
         // Under a General style the same text stays a string, so the user does
         // not see a bare serial where they typed a date.
-        expect(classify_value('2024-01-15', 0, OPTS)).toEqual({ kind: 'string', text: '2024-01-15' });
+        expect(classify_xlsx_cell_value('2024-01-15', OPTS))
+            .toEqual({ kind: 'string', text: '2024-01-15' });
     });
 });
 
@@ -1698,6 +1701,25 @@ describe('write_xlsx_cell_edits', () => {
         const cell = data.sheets[0].rows[0][2]!;
         expect(cell.rawType).toBe('date');
         expect(String(cell.raw)).toContain('2024-01-15');
+    });
+
+    it('makes dirty previews match the formatted result after save and reparse', async () => {
+        const raw = readFileSync(FORMATTED);
+        const before = (await parse_xlsx(raw)).data.sheets[0].rows[0];
+        const numeric_format = before[0]!.numberFormat!;
+        const date_format = before[2]!.numberFormat!;
+        const numeric_preview = format_xlsx_edit_preview('9876.5', numeric_format);
+        const date_preview = format_xlsx_edit_preview('2024-01-15', date_format);
+
+        const out = write_xlsx_cell_edits(raw, 0, [
+            { row: 0, col: 0, value: '9876.5' },
+            { row: 0, col: 2, value: '2024-01-15' },
+        ]);
+        const after = (await parse_xlsx(out)).data.sheets[0].rows[0];
+        expect(after[0]?.formatted).toBe(numeric_preview);
+        expect(after[0]?.raw).toBe(9876.5);
+        expect(after[2]?.formatted).toBe(date_preview);
+        expect(String(after[2]?.raw)).toContain('2024-01-15');
     });
 
     it('reads a format code as it means, not as it is escaped', async () => {
