@@ -3324,12 +3324,33 @@ export function attach_viewer(
                 snapshot.state,
                 sheets,
             );
-            const transforms = sheets.map((sheet, index) => sanitize_transform_state(
-                durable.transforms?.[index],
-                sheet.columnCount,
-                transform_schema_for_sheet(sheet),
-                sheet.sourceRowCount,
-            ));
+            const transforms = sheets.map((sheet, index) => {
+                const state = sanitize_transform_state(
+                    durable.transforms?.[index],
+                    sheet.columnCount,
+                    transform_schema_for_sheet(sheet),
+                    sheet.sourceRowCount,
+                );
+                // The compare window's changed-rows filter is session state and is
+                // stripped at the durable write, so it is absent from what was just
+                // read back. Reconciling against that alone un-installed the filter
+                // one generation after it installed — the commit that persisted it
+                // is what triggers this very reconciliation — so the rows sprang
+                // back and the toggle appeared to do nothing. Carried over from
+                // what this core actually has installed, which is the live answer.
+                if (
+                    reconciliation_core.installed_transform_state(index)
+                        ?.onlyChangedRows !== true
+                ) return state;
+                return {
+                    ...(state ?? {
+                        sort: [],
+                        filters: [],
+                        schema: transform_schema_for_sheet(sheet),
+                    }),
+                    onlyChangedRows: true as const,
+                };
+            });
             const prepared = await reconciliation_core.prepare_transform_reconciliation(
                 transforms,
                 () => !transform_authority_is_current(message, authority)

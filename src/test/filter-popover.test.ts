@@ -574,6 +574,63 @@ describe('FilterPopover', () => {
             .toBe(false);
     });
 
+    it('treats an only-changed-rows toggle over a sort as a semantic change', async () => {
+        // Session state, but a difference like any other. Comparing equal here
+        // made handle_transform_change drop the toolbar's request as a no-op, so
+        // the compare window's "Only changed rows" toggle filtered nothing.
+        vi.stubGlobal('acquireVsCodeApi', () => ({
+            postMessage: vi.fn(),
+            getState: vi.fn(),
+            setState: vi.fn(),
+        }));
+        const { transforms_semantically_equal } = await import('../webview/app');
+        const sorted: SheetTransformState = {
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [],
+        };
+        expect(transforms_semantically_equal(
+            sorted,
+            { ...sorted, onlyChangedRows: true },
+        )).toBe(false);
+        expect(transforms_semantically_equal(sorted, { ...sorted })).toBe(true);
+    });
+
+    it('carries the compare session filter through a reconciliation', async () => {
+        // The host strips onlyChangedRows at the durable write, so the record
+        // read back never has it. Reconciling against that record alone asked
+        // for the filter to be turned straight back off — including on the
+        // install the toggle itself triggered, so it filtered nothing.
+        vi.stubGlobal('acquireVsCodeApi', () => ({
+            postMessage: vi.fn(),
+            getState: vi.fn(),
+            setState: vi.fn(),
+        }));
+        const { reconciliation_intent } = await import('../webview/app');
+        const schema = '["Sheet1",1,null]';
+        const rules: SheetTransformState = {
+            sort: [], filters: [], schema, onlyChangedRows: true,
+        };
+        const installed = {
+            basis: { generation: 2, sourceGeneration: 1, schema },
+            permuted: true as const,
+            rules,
+            rowCount: 3,
+            hiddenEditedCellKeys: [],
+        };
+        // Nothing durable at all: the intent is the filter alone, not undefined.
+        expect(reconciliation_intent(undefined, installed, schema))
+            .toEqual({ sort: [], filters: [], schema, onlyChangedRows: true });
+        // Alongside a durable sort, both survive.
+        const sorted: SheetTransformState = {
+            sort: [{ colIndex: 0, direction: 'asc' }], filters: [], schema,
+        };
+        expect(reconciliation_intent(sorted, installed, schema))
+            .toEqual({ ...sorted, onlyChangedRows: true });
+        // A view without the filter installed carries nothing over, so turning
+        // it off still reconciles to the durable rules.
+        expect(reconciliation_intent(sorted, undefined, schema)).toEqual(sorted);
+    });
+
     it('reclamps after isEmpty expands to between near the viewport edge', () => {
         const resize_callbacks: ResizeObserverCallback[] = [];
         vi.stubGlobal('ResizeObserver', class {

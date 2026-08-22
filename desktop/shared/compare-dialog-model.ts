@@ -7,7 +7,15 @@ export type ComparePathState =
     | { readonly kind: 'empty' }
     | { readonly kind: 'ok'; readonly path: string; readonly extension: string }
     | { readonly kind: 'missing'; readonly path: string }
-    | { readonly kind: 'unsupported'; readonly path: string };
+    | { readonly kind: 'unsupported'; readonly path: string }
+    /** An existing folder, or a path with a unique completion pending. Neither
+     *  is a file yet, but neither is a mistake to report — the user is still on
+     *  their way to one. `completion`, when present, is what to fill in. */
+    | {
+        readonly kind: 'incomplete';
+        readonly path: string;
+        readonly completion?: string;
+    };
 
 /** Report a checked path as the state the field should render. */
 export function path_state(path: string, check: ComparePathCheck | undefined): ComparePathState {
@@ -16,7 +24,21 @@ export function path_state(path: string, check: ComparePathCheck | undefined): C
     // the state must name the file that was actually checked.
     if (path.trim() === '') return { kind: 'empty' };
     if (!check) return { kind: 'empty' };
-    if (!check.exists) return { kind: 'missing', path };
+    if (!check.exists) {
+        // Reported before "missing", because both of these mean the path is
+        // unfinished rather than wrong. Accusing someone of a nonexistent file
+        // while they are still typing its name is the complaint this answers.
+        if (check.isDirectory === true || check.completion !== undefined) {
+            return {
+                kind: 'incomplete',
+                path,
+                ...(check.completion !== undefined
+                    ? { completion: check.completion }
+                    : {}),
+            };
+        }
+        return { kind: 'missing', path };
+    }
     if (!check.supported) return { kind: 'unsupported', path };
     return { kind: 'ok', path, extension: check.extension };
 }
@@ -25,7 +47,7 @@ export function path_state(path: string, check: ComparePathCheck | undefined): C
 export function path_error(state: ComparePathState): string | undefined {
     switch (state.kind) {
         case 'missing':
-            return 'That file no longer exists.';
+            return 'That file does not exist.';
         case 'unsupported':
             return 'Table Viewer cannot open that kind of file.';
         default:
@@ -53,6 +75,19 @@ export function dialog_state(
     original: ComparePathState,
     modified: ComparePathState,
 ): CompareDialogState {
+    // A side with a completion pending counts as offerable, because Compare is
+    // one of the two moments the dialog finishes a path (blur is the other).
+    // Leaving the button dead until the last letter meant the click that was
+    // supposed to complete the path could never be made.
+    const completable = (state: ComparePathState) =>
+        state.kind === 'incomplete' && state.completion !== undefined;
+    if (completable(original) || completable(modified)) {
+        const blocked = [original, modified].some((state) =>
+            state.kind !== 'ok' && !completable(state));
+        return blocked
+            ? { canCompare: false, compareLabel: 'Compare' }
+            : { canCompare: true, compareLabel: 'Compare' };
+    }
     if (original.kind !== 'ok' || modified.kind !== 'ok') {
         return { canCompare: false, compareLabel: 'Compare' };
     }

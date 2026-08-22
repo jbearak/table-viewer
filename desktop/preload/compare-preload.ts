@@ -18,8 +18,9 @@ import type { ThemePayload } from '../main/theme';
 import type { DesktopSettings } from '../main/desktop-config';
 
 export interface CompareApi extends TitlebarApi {
-    /** Native picker for one side; resolves undefined when cancelled. */
-    browse(side: 'original' | 'modified'): Promise<string | undefined>;
+    /** Native picker for one side; resolves undefined when cancelled.
+     *  `nearPath` is a file path whose folder the picker should open in. */
+    browse(side: 'original' | 'modified', nearPath?: string): Promise<string | undefined>;
     check_path(path: string): Promise<ComparePathCheck>;
     submit(request: CompareFilesRequest): Promise<CompareSubmitResult>;
     cancel(): void;
@@ -31,7 +32,7 @@ export interface CompareApi extends TitlebarApi {
 
 const api: CompareApi = {
     ...titlebar_preload_api(),
-    browse: (side) => ipcRenderer.invoke(CHANNEL_COMPARE_BROWSE, side),
+    browse: (side, near_path) => ipcRenderer.invoke(CHANNEL_COMPARE_BROWSE, side, near_path),
     check_path: (path) => ipcRenderer.invoke(CHANNEL_COMPARE_CHECK_PATH, path),
     submit: (request) => ipcRenderer.invoke(CHANNEL_COMPARE_SUBMIT, request),
     cancel: () => ipcRenderer.send(CHANNEL_COMPARE_CANCEL),

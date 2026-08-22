@@ -137,6 +137,17 @@ async function click_grid_cell(
     const box = (await page.locator(GRID_CANVAS).first().boundingBox())!;
     await page.mouse.click(box.x + offset.x, box.y + offset.y);
     await expect(target).toHaveAttribute('aria-selected', 'true');
+    // A click on a cell that was ALREADY selected — which is what an earlier test
+    // in this shared window leaves behind — opens the overlay editor outright. The
+    // callers here want a selected cell, not an open one: they press Enter next,
+    // and against an already-open editor that Enter COMMITS instead of opening, so
+    // the editor they then wait for has just closed. Cancelled rather than
+    // committed, so nothing typed by a previous test can leak through this helper.
+    const editor = page.locator('.cell-editor-input');
+    if (await editor.count() > 0) {
+        await page.keyboard.press('Escape');
+        await expect(editor).toBeHidden();
+    }
 }
 
 test.beforeAll(async () => {
@@ -438,7 +449,7 @@ test('Diff default is explained and saved immediately', async () => {
         await expect(control).not.toBeChecked();
         await expect(control).toHaveAccessibleName('Turn Diff on when entering Edit mode');
         await expect(control.locator('xpath=following-sibling::div').locator('.hint'))
-            .toContainText('shows its original value next to the new one');
+            .toContainText('keeps showing its original value next to the new one');
 
         await control.check();
         await expect.poll(

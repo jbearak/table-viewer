@@ -72,6 +72,11 @@ import {
     type ThemeSetting,
 } from './theme';
 import { notices_file_path } from './notices-path';
+import {
+    expand_tilde,
+    is_existing_directory,
+    unique_completion,
+} from './compare-path-complete';
 import { save_open_window_paths, take_open_window_paths } from './window-restoration';
 import { REPOSITORY_URL, about_link_url } from './about-links';
 import {
@@ -1218,11 +1223,20 @@ function register_ipc(): void {
     });
     ipcMain.handle(
         CHANNEL_COMPARE_BROWSE,
-        async (_event, side: unknown): Promise<string | undefined> => {
+        async (_event, side: unknown, near_path: unknown): Promise<string | undefined> => {
+            // Opened beside whatever the dialog already names, so browsing for
+            // the second file starts where the first one was found rather than
+            // back at the default folder. `defaultPath` naming a file selects
+            // it; naming its folder only opens there, which is what is wanted
+            // when the two files are siblings but not the same file.
+            const folder = typeof near_path === 'string' && near_path.trim() !== ''
+                ? path.dirname(near_path)
+                : undefined;
             const options: Electron.OpenDialogOptions = {
                 title: side === 'original'
                     ? 'Choose the original file'
                     : 'Choose the file to compare against it',
+                ...(folder ? { defaultPath: folder } : {}),
                 properties: ['openFile'],
                 filters: [
                     { name: 'Tables', extensions: [...SUPPORTED_FILE_EXTENSIONS] },
@@ -1246,14 +1260,29 @@ function register_ipc(): void {
      */
     const check_compare_path = (file_path: unknown): ComparePathCheck => {
         const candidate = typeof file_path === 'string' ? file_path : '';
-        const extension = path.extname(candidate).toLowerCase().replace(/^\./, '');
+        const home = app.getPath('home');
+        const resolved = expand_tilde(candidate, home);
+        const extension = path.extname(resolved).toLowerCase().replace(/^\./, '');
         let exists = false;
         try {
-            exists = fs.statSync(candidate).isFile();
+            exists = fs.statSync(resolved).isFile();
         } catch {
             exists = false;
         }
-        return { exists, supported: is_supported_file(candidate), extension };
+        // A directory and a unique completion are both reasons *not* to call a
+        // path missing: the first says the user is navigating, the second that
+        // they have typed enough to be unambiguous but not to the last letter.
+        const is_directory = is_existing_directory(candidate, home);
+        const completion = exists || is_directory
+            ? undefined
+            : unique_completion(candidate, home);
+        return {
+            exists,
+            supported: is_supported_file(resolved),
+            extension,
+            ...(is_directory ? { isDirectory: true } : {}),
+            ...(completion !== undefined ? { completion } : {}),
+        };
     };
     ipcMain.handle(CHANNEL_COMPARE_CHECK_PATH, (_event, file_path: unknown) =>
         check_compare_path(file_path));

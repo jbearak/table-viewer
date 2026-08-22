@@ -338,4 +338,31 @@ describe('CompareDataSource with a content alignment', () => {
         // Positional fallback: three rows, all changed, none added or deleted.
         expect(diff_page(source, 0, 10)?.rowStatus).toEqual(['same', 'same', 'same']);
     });
+    it('withholds the first-row-header capability from every grid sheet', async () => {
+        // The wrapper is deliberately not an ExcelHeaderDataSource, so the
+        // controller refuses every header command it is sent. Reporting the
+        // capability anyway put a live Header Row button in front of the user
+        // whose only outcome was the refusal dialog — and a pending header
+        // request blocks transforms and column visibility until it settles, so
+        // the refusal stalled whatever they tried next.
+        const header = {
+            mode: 'auto', detected: true, active: true, available: true, sourceRow: 0,
+        } as const;
+        const modified = new FixtureSource([
+            { name: 'S', excelFirstRowHeader: header, rows: [['a'], ['b']] },
+            { name: 'Added', excelFirstRowHeader: header, rows: [['n']] },
+        ]);
+        const original = new FixtureSource([
+            { name: 'S', excelFirstRowHeader: header, rows: [['a'], ['b']] },
+            { name: 'Gone', excelFirstRowHeader: header, rows: [['g']] },
+        ]);
+        const source = new CompareDataSource(
+            modified, original, await align_workbook(modified, original),
+        );
+        // Matched, added and deleted sheets alike.
+        expect(source.meta().sheets).toHaveLength(3);
+        for (const sheet of source.meta().sheets) {
+            expect(sheet.excelFirstRowHeader).toBeUndefined();
+        }
+    });
 });

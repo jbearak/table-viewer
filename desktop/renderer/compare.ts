@@ -84,20 +84,87 @@ async function check_side(side: Side): Promise<void> {
     render();
 }
 
+/**
+ * How long a field must sit unchanged before its path is checked.
+ *
+ * Without it, every prefix of a path the user is typing out is a real path
+ * that really does not exist, so the field accused them of a missing file
+ * once per keystroke all the way to the last character. Blur checks
+ * immediately, so nothing waits on this timer to be told the truth.
+ */
+const CHECK_DEBOUNCE_MS = 350;
+const check_timers: Record<Side, ReturnType<typeof setTimeout> | undefined> = {
+    original: undefined,
+    modified: undefined,
+};
+
+function schedule_check(side: Side): void {
+    if (check_timers[side] !== undefined) clearTimeout(check_timers[side]);
+    check_timers[side] = setTimeout(() => {
+        check_timers[side] = undefined;
+        void check_side(side);
+    }, CHECK_DEBOUNCE_MS);
+}
+
+/**
+ * Fill in the field's unique completion, if it has one, and settle its verdict.
+ *
+ * Loops because completing can reveal another completion — `/p/t/me` may
+ * complete to `/p/to/merp.xlsx` in one step or to a directory in two — and
+ * stops as soon as a check offers none. Bounded rather than `while (true)`: the
+ * checks come from another process, and a filesystem that kept offering
+ * completions must not hang the dialog.
+ */
+async function complete_and_check(side: Side): Promise<void> {
+    for (let step = 0; step < MAX_COMPLETION_STEPS; step++) {
+        await check_side(side);
+        const completion = checks[side]?.completion;
+        if (completion === undefined || completion === inputs[side].value) return;
+        inputs[side].value = completion;
+        checks[side] = undefined;
+        render();
+    }
+    await check_side(side);
+}
+
+const MAX_COMPLETION_STEPS = 8;
+
 for (const side of ['original', 'modified'] as const) {
     inputs[side].addEventListener('input', () => {
         // Drop the stale verdict immediately, so the button cannot stay enabled
-        // on the strength of a check of the previous text.
+        // on the strength of a check of the previous text. Retire the in-flight
+        // token too: its answer describes text that is no longer there.
         checks[side] = undefined;
+        check_tokens[side]++;
         render();
-        void check_side(side);
+        schedule_check(side);
+    });
+    // Leaving the field ends the typing, so the verdict is owed now rather
+    // than a debounce later — and with it, the completion.
+    inputs[side].addEventListener('blur', () => {
+        if (check_timers[side] !== undefined) {
+            clearTimeout(check_timers[side]);
+            check_timers[side] = undefined;
+        }
+        void complete_and_check(side);
     });
 }
 
 const browse = async (side: Side): Promise<void> => {
-    const chosen = await compare_api.browse(side);
+    // Start in the folder the other side already names, falling back to this
+    // side's own text. Browsing for the second file of a pair almost always
+    // means browsing the folder the first one came from.
+    const other: Side = side === 'original' ? 'modified' : 'original';
+    const near = inputs[other].value.trim() !== ''
+        ? inputs[other].value
+        : inputs[side].value;
+    const chosen = await compare_api.browse(side, near.trim() === '' ? undefined : near);
     if (chosen === undefined) return;
     inputs[side].value = chosen;
+    if (check_timers[side] !== undefined) {
+        clearTimeout(check_timers[side]);
+        check_timers[side] = undefined;
+    }
     // Cleared before the check, exactly as the input handler does. Leaving the
     // previous path's verdict standing kept Compare enabled while the new path
     // was still being checked, so a click in that window submitted the new
@@ -134,6 +201,15 @@ swap_button.addEventListener('click', () => {
 compare_button.addEventListener('click', () => {
     if (compare_button.disabled) return;
     void (async () => {
+        // Compare finishes the paths first, for the same reason blur does: the
+        // user may have typed enough to be unambiguous without typing the last
+        // letter, and refusing that is the complaint this answers. A side that
+        // completes into something unusable fails the check below and reports
+        // itself rather than being submitted.
+        await Promise.all((['original', 'modified'] as const)
+            .filter((side) => checks[side]?.completion !== undefined)
+            .map((side) => complete_and_check(side)));
+        if (compare_button.disabled) return;
         const result = await compare_api.submit({
             // Submitted as typed, for the same reason `check_side` checks as
             // typed: the path that was validated has to be the path opened.
@@ -180,7 +256,12 @@ function apply_theme(payload: ThemePayload): void {
     root.style.setProperty('--compare-muted', vars['--vscode-descriptionForeground']);
     root.style.setProperty('--compare-foot-bg', vars['--vscode-editorGroupHeader-tabsBackground']);
     root.style.setProperty('--compare-button-bg', vars['--vscode-button-secondaryBackground']);
+    root.style.setProperty(
+        '--compare-button-hover-bg',
+        vars['--vscode-button-secondaryHoverBackground'],
+    );
     root.style.setProperty('--compare-accent', vars['--vscode-button-background']);
+    root.style.setProperty('--compare-accent-hover', vars['--vscode-button-hoverBackground']);
     root.style.setProperty('--compare-accent-fg', vars['--vscode-button-foreground']);
     root.style.setProperty('--compare-error', vars['--vscode-errorForeground']);
     root.style.setProperty('--compare-warning', vars['--vscode-editorWarning-foreground']);

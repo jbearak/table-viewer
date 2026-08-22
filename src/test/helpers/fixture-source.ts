@@ -5,6 +5,7 @@ import type {
     DataSource,
     RenderedCell,
     RowWindow,
+    SheetMeta,
     WorkbookMeta,
 } from '../../data-source/interface';
 
@@ -24,6 +25,9 @@ export interface FixtureSheet {
     /** Merged ranges in this sheet's own row space, for compare projection tests. */
     merges?: MergeRange[];
     hasFormatting?: boolean;
+    /** Reported the way an ExcelHeaderDataSource sheet reports it, so the
+     *  compare wrapper's withholding of the capability can be observed. */
+    excelFirstRowHeader?: SheetMeta['excelFirstRowHeader'];
     rows: string[][];
 }
 
@@ -41,6 +45,9 @@ export class FixtureSource implements DataSource {
                     ? { worksheetId: sheet.worksheetId }
                     : {}),
                 ...(sheet.unnamedSingleSheet ? { unnamedSingleSheet: true } : {}),
+                ...(sheet.excelFirstRowHeader !== undefined
+                    ? { excelFirstRowHeader: sheet.excelFirstRowHeader }
+                    : {}),
                 rowCount: sheet.rows.length,
                 sourceRowCount: sheet.rows.length,
                 columnCount: sheet.rows.reduce(

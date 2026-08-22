@@ -39,12 +39,60 @@ describe('path_state', () => {
     });
 });
 
+describe('path_state, unfinished paths', () => {
+    it('does not call a folder a missing file', () => {
+        // Typing `~/repos` names somewhere the user is going, not a file that
+        // is not there.
+        expect(path_state('/Users/jmb/repos', check({ exists: false, isDirectory: true })))
+            .toEqual({ kind: 'incomplete', path: '/Users/jmb/repos' });
+    });
+
+    it('does not call a completable prefix a missing file', () => {
+        expect(path_state('/path/to/me', check({
+            exists: false,
+            completion: '/path/to/merp.xlsx',
+        }))).toEqual({
+            kind: 'incomplete',
+            path: '/path/to/me',
+            completion: '/path/to/merp.xlsx',
+        });
+    });
+
+    it('still reports a path that is neither a folder nor completable', () => {
+        expect(path_state('/path/to/nope.xlsx', check({ exists: false })).kind)
+            .toBe('missing');
+    });
+});
+
 describe('path_error', () => {
+    it('says nothing about a path that is merely unfinished', () => {
+        expect(path_error({ kind: 'incomplete', path: '/x' })).toBeUndefined();
+        expect(path_error({ kind: 'incomplete', path: '/x', completion: '/xy.csv' }))
+            .toBeUndefined();
+    });
+
     it('explains only the states the user must fix', () => {
         expect(path_error({ kind: 'empty' })).toBeUndefined();
         expect(path_error(ok('/tmp/a.xlsx'))).toBeUndefined();
-        expect(path_error({ kind: 'missing', path: '/x' })).toMatch(/no longer exists/u);
+        expect(path_error({ kind: 'missing', path: '/x' })).toMatch(/does not exist/u);
         expect(path_error({ kind: 'unsupported', path: '/x' })).toMatch(/cannot open/u);
+    });
+});
+
+describe('dialog_state, unfinished paths', () => {
+    it('will not compare a folder, which has nowhere further to go', () => {
+        expect(dialog_state({ kind: 'incomplete', path: '/d' }, ok('/b.xlsx')).canCompare)
+            .toBe(false);
+    });
+
+    it('offers Compare when a side has a completion, since the click applies it', () => {
+        // Dead until the last letter meant the click that was supposed to
+        // finish the path could never be made.
+        const half = { kind: 'incomplete', path: '/p/me', completion: '/p/merp.csv' } as const;
+        expect(dialog_state(half, ok('/b.xlsx')).canCompare).toBe(true);
+        // But not when the *other* side is still unusable on its own.
+        expect(dialog_state(half, { kind: 'missing', path: '/gone' }).canCompare).toBe(false);
+        expect(dialog_state(half, { kind: 'empty' }).canCompare).toBe(false);
     });
 });
 

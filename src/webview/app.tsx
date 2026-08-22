@@ -342,6 +342,10 @@ export function transforms_semantically_equal(
 ): boolean {
     if (!transform_has_entries(left) && !transform_has_entries(right)) return true;
     if (!left || !right) return false;
+    // Session state, but a semantic difference like any other: without this a
+    // toggle of "only changed rows" over an existing sort compared equal to the
+    // sort alone, and handle_transform_change dropped the request as a no-op.
+    if ((left.onlyChangedRows === true) !== (right.onlyChangedRows === true)) return false;
     if (JSON.stringify(left.sort) !== JSON.stringify(right.sort)) return false;
     const left_hidden = [...(left.hiddenRows ?? [])].sort((a, b) => a - b);
     const right_hidden = [...(right.hiddenRows ?? [])].sort((a, b) => a - b);
@@ -385,6 +389,31 @@ export function transforms_semantically_equal(
         .sort((a, b) => a.colIndex - b.colIndex);
     return JSON.stringify(semantic_filters(left.filters))
         === JSON.stringify(semantic_filters(right.filters));
+}
+
+/**
+ * The durable rules to reconcile against, with the compare window's session
+ * filter carried over from the installed view.
+ *
+ * "Only changed rows" is session state: the host strips it at the durable
+ * write, so it is never in the record read back here. Without carrying it over,
+ * every reconciliation — including the one the filter's own install triggers —
+ * read the durable record as "no filter" and immediately asked for the filter
+ * to be turned back off. That is what made the toggle flash the worksheet and
+ * change nothing.
+ */
+export function reconciliation_intent(
+    durable: SheetTransformState | undefined,
+    installed: SheetViewRecord | undefined,
+    schema: string,
+): SheetTransformState | undefined {
+    const only_changed_rows = installed?.permuted === true
+        && installed.rules.onlyChangedRows === true;
+    if (!only_changed_rows) return durable;
+    return {
+        ...(durable ?? { ...EMPTY_TRANSFORM, schema }),
+        onlyChangedRows: true,
+    };
 }
 
 function transform_reconciliation_required(
@@ -3128,13 +3157,17 @@ export function App(): React.JSX.Element {
         ) {
             return;
         }
-        const state = sanitize_transform_state(
-            state_ref.current.transforms?.[active_sheet_index],
-            sheet.columnCount,
-            transform_schema_for_sheet(sheet),
-            sheet.sourceRowCount,
-        );
         const installed = sheet_views[active_sheet_index];
+        const state = reconciliation_intent(
+            sanitize_transform_state(
+                state_ref.current.transforms?.[active_sheet_index],
+                sheet.columnCount,
+                transform_schema_for_sheet(sheet),
+                sheet.sourceRowCount,
+            ),
+            installed,
+            transform_schema_for_sheet(sheet),
+        );
         // One comparison, both directions, one request. An install branch with no
         // else was how a sibling's cleared sort came to leave the rows permuted
         // under a toolbar showing no rules: only the host can un-permute the loader,

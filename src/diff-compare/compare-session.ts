@@ -14,6 +14,7 @@ import {
     type DataSource,
     type IndexedRows,
     type RowWindow,
+    type SheetMeta,
     type WorkbookMeta,
 } from '../data-source/interface';
 import {
@@ -35,6 +36,25 @@ import {
     type AlignSheetOptions,
     type SheetAlignment,
 } from './row-alignment';
+
+/**
+ * A sheet with its first-row-header capability withheld.
+ *
+ * The wrapper is deliberately not an ExcelHeaderDataSource (see the file
+ * header), so the controller refuses every `setExcelFirstRowHeader` it is sent.
+ * Reporting the capability anyway put a live Header Row button in front of the
+ * user whose only possible outcome was the refusal dialog — and, because a
+ * pending header request blocks transforms and column-visibility work until it
+ * settles, the refusal also stalled the next thing they tried.
+ *
+ * Withheld here rather than filtered in the webview so there is one answer to
+ * "can this sheet promote a header row", and it is the source's.
+ */
+function without_header_capability(sheet: SheetMeta): SheetMeta {
+    if (sheet.excelFirstRowHeader === undefined) return sheet;
+    const { excelFirstRowHeader: _withheld, ...rest } = sheet;
+    return rest;
+}
 
 /** Alignments for a compare session, keyed by *modified* sheet index. Sheets
  *  without a matched original have none: there is nothing to align them to. */
@@ -235,6 +255,7 @@ export class CompareDataSource implements DataSource {
             // a consumer told otherwise would not ask for them.
             hasFormatting: modified_meta.hasFormatting || this.original_meta.hasFormatting,
             sheets: [...modified_meta.sheets.map((sheet, sheet_index) => {
+                sheet = without_header_capability(sheet);
                 const pairing = this.matched_by_modified_index.get(sheet_index);
                 if (!pairing) return sheet;
                 const original_sheet = original_sheets[pairing.originalIndex];
@@ -265,7 +286,7 @@ export class CompareDataSource implements DataSource {
                     };
             }),
             ...this.deleted_pairings.map((pairing) =>
-                original_sheets[pairing.originalIndex]),
+                without_header_capability(original_sheets[pairing.originalIndex])),
             ],
         };
         // Canonical row numbers for deleted rows, assigned once in grid order so

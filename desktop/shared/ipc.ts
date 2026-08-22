@@ -97,6 +97,13 @@ export interface ComparePathCheck {
     readonly supported: boolean;
     /** Lower-case extension without the dot, for the cross-format warning. */
     readonly extension: string;
+    /** The path names an existing directory. Not an error to report: someone
+     *  typing `~/repos/` is on their way somewhere, not naming a missing file. */
+    readonly isDirectory?: boolean;
+    /** The single existing path this text is a proper prefix of, when there is
+     *  exactly one. Offered as a completion rather than applied by main, so the
+     *  dialog decides when to take it (on blur, or on Compare). */
+    readonly completion?: string;
 }
 /** Renderer → main: show a native picker, and report what was chosen. */
 export const CHANNEL_COMPARE_BROWSE = 'compare:browse';

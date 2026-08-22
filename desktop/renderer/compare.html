@@ -59,6 +59,11 @@
     color: var(--compare-accent-fg, #ffffff);
     font-weight: 600;
   }
+  button:hover:not(:disabled) { background: var(--compare-button-hover-bg, rgba(128, 128, 128, 0.2)); }
+  button.primary:hover:not(:disabled) {
+    background: var(--compare-accent-hover, #0258a8);
+    border-color: var(--compare-accent-hover, #0258a8);
+  }
   button:disabled { opacity: 0.45; }
   /* Between the two fields, because it acts on both of them. */
   .swap { display: flex; justify-content: center; margin: -4px 0 8px; }
