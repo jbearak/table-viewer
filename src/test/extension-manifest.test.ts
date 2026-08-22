@@ -130,21 +130,16 @@ describe('extension runtime manifest', () => {
         }
     });
 
-    it('offers Open File only from comparison tabs', () => {
+    it('offers the text editor from file-backed table tabs', () => {
         const entries = (manifest.contributes?.menus as Record<string, unknown[]>)[
             'editor/title'
         ] as { command: string; when: string; group: string }[];
-        const open_file = entries.find(
-            (entry) => entry.command === 'tableViewer.openWorkingTreeFile',
-        );
-        expect(open_file).toMatchObject({ group: 'navigation' });
-        expect(open_file?.when).toContain('activeCustomEditorId == tableViewer.editor');
-        expect(open_file?.when).toContain('resourceScheme == table-viewer-diff');
-
         const open_as_text = entries.find(
             (entry) => entry.command === 'tableViewer.openAsText',
         );
-        expect(open_as_text?.when).toContain('resourceScheme != table-viewer-diff');
+        expect(open_as_text).toMatchObject({ group: 'navigation' });
+        expect(open_as_text?.when).toContain('activeCustomEditorId == tableViewer.editor');
+        expect(open_as_text?.when).toContain('resourceScheme == file');
     });
 
     it('offers the table diff on git SCM resources for every supported format', () => {

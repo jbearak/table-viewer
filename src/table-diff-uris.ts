@@ -1,6 +1,9 @@
 import * as vscode from 'vscode';
 
-export const TABLE_DIFF_SCHEME = 'table-viewer-diff';
+// Keep the comparison identity in the file scheme so VS Code's file-scoped
+// services (notably Git Timeline) recognize the resource. The encoded query
+// remains the discriminator between a comparison and a normal file URI.
+export const TABLE_DIFF_SCHEME = 'file';
 export const TABLE_FILE_EXTENSION_PATTERN = /\.(csv|tsv|xlsx|xls)$/iu;
 const GIT_OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu;
 

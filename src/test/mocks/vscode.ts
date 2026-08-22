@@ -71,10 +71,10 @@ function make_uri(components: UriComponents): UriLike {
             });
         },
         toString() {
-            if (normalized.scheme === 'file') return normalized.fsPath;
-            const authority = normalized.authority ? `//${normalized.authority}` : '';
             const query = normalized.query ? `?${normalized.query}` : '';
             const fragment = normalized.fragment ? `#${normalized.fragment}` : '';
+            if (normalized.scheme === 'file') return `${normalized.fsPath}${query}${fragment}`;
+            const authority = normalized.authority ? `//${normalized.authority}` : '';
             return `${normalized.scheme}:${authority}${normalized.path}${query}${fragment}`;
         },
     };

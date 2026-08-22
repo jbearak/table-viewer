@@ -147,12 +147,7 @@
         },
         {
           "command": "tableViewer.openAsText",
-          "when": "resourceExtname =~ /\\.(csv|tsv|CSV|TSV)$/ && activeCustomEditorId == tableViewer.editor && resourceScheme != table-viewer-diff",
-          "group": "navigation"
-        },
-        {
-          "command": "tableViewer.openWorkingTreeFile",
-          "when": "activeCustomEditorId == tableViewer.editor && resourceScheme == table-viewer-diff",
+          "when": "resourceExtname =~ /\\.(csv|tsv|CSV|TSV)$/ && activeCustomEditorId == tableViewer.editor && resourceScheme == file",
           "group": "navigation"
         }
       ]
