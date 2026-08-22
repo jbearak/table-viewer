@@ -390,6 +390,11 @@ export class CompareDataSource implements DataSource {
         // so without it the row vanishes from the one view where someone
         // hunting changes would most expect to find it. The Set also
         // deduplicates a moved-and-edited row, which is in two of the three.
+        //
+        // All three sources are already ascending, so a cursor merge would be
+        // O(n) against this O(n log n). Measured at a million rows: 4 ms
+        // versus 29 ms — once, behind the memo above, on a sheet whose
+        // alignment took seconds. Not worth the cursor bookkeeping.
         const rows = new Set<number>(alignment.changedRowIndices);
         alignment.rows.forEach((row, grid_row) => {
             if (row.original === ABSENT || row.modified === ABSENT) rows.add(grid_row);

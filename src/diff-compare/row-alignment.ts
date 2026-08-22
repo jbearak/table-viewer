@@ -801,9 +801,14 @@ function rows_are_similar(left: CandidateRow, right: CandidateRow): boolean {
     if (max_total === 0) return true;
     let matched = 0;
     for (let col = 0; col < left.texts.length; col++) {
-        if (left.texts[col] === right.texts[col]) matched += left.texts[col].length;
+        if (left.texts[col] !== right.texts[col]) continue;
+        matched += left.texts[col].length;
+        // Stop at the verdict rather than at the last column: the remaining
+        // cells can only raise a score that has already cleared the bar, and
+        // this loop runs once per scored pair.
+        if (is_at_least_half(matched, max_total)) return true;
     }
-    return is_at_least_half(matched, max_total);
+    return false;
 }
 
 /**
