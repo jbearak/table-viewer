@@ -1714,6 +1714,13 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
     color: var(--vscode-gitDecoration-deletedResourceForeground, red);
 }
 
+/* Purple, and a literal: no gitDecoration variable is purple, and the
+   semantically exact one (renamedResourceForeground) defaults to a green too
+   close to added. Matches the grid's moved band — see DIFF_MOVED_FALLBACK. */
+.compare-strip-moved {
+    color: #9333ea;
+}
+
 /* The compare window before it has any rows: alignment is what makes the diff
    correct, so the grid does not exist yet and this is the whole window. */
 .compare-progress {

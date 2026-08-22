@@ -5,7 +5,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CompareStrip, type CompareStripProps } from '../webview/compare-strip';
 
-const COUNTS = { addedRows: 12, deletedRows: 4, changedCells: 37 };
+const COUNTS = { addedRows: 12, deletedRows: 4, movedRows: 0, changedCells: 37 };
 
 let container: HTMLDivElement | undefined;
 let root: Root | undefined;
@@ -47,7 +47,7 @@ describe('CompareStrip', () => {
 
     it('does not say "1 rows"', async () => {
         await strip({
-            counts: { addedRows: 1, deletedRows: 1, changedCells: 1 },
+            counts: { addedRows: 1, deletedRows: 1, movedRows: 0, changedCells: 1 },
         });
         expect(text()).toMatch(/1 row added/u);
         expect(text()).toMatch(/1 row deleted/u);
@@ -57,10 +57,29 @@ describe('CompareStrip', () => {
 
     it('says so plainly when the files match, and offers nothing to filter', async () => {
         await strip({
-            counts: { addedRows: 0, deletedRows: 0, changedCells: 0 },
+            counts: { addedRows: 0, deletedRows: 0, movedRows: 0, changedCells: 0 },
         });
         expect(text()).toContain('No differences found.');
         expect(toggle().disabled).toBe(true);
+    });
+
+    it('counts moved rows, and does not call a reordered file unchanged', async () => {
+        // Nothing added, deleted or edited — only rows in new places. Claiming
+        // "No differences found." over a grid that is visibly banding them,
+        // with the filter that would isolate them disabled, is the bug.
+        await strip({
+            counts: { addedRows: 0, deletedRows: 0, movedRows: 3, changedCells: 0 },
+        });
+        expect(text()).not.toContain('No differences found.');
+        expect(text()).toContain('3 rows moved');
+        expect(toggle().disabled).toBe(false);
+    });
+
+    it('omits the moved count when nothing moved', async () => {
+        await strip({
+            counts: { addedRows: 1, deletedRows: 0, movedRows: 0, changedCells: 0 },
+        });
+        expect(text()).not.toContain('moved');
     });
 
     it('toggles the filter and reports its state to assistive technology', async () => {
@@ -100,7 +119,7 @@ describe('CompareStrip', () => {
         // Header renames and one-sided sheets are annotated in the grid and the
         // tabs but are not rows or cells, so the counts alone cannot answer this.
         await strip({
-            counts: { addedRows: 0, deletedRows: 0, changedCells: 0 },
+            counts: { addedRows: 0, deletedRows: 0, movedRows: 0, changedCells: 0 },
             other_differences: true,
         });
         expect(text()).not.toContain('No differences found.');

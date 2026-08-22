@@ -278,6 +278,33 @@ describe('CompareDataSource with a content alignment', () => {
         expect(source.changed_grid_rows(0)).toEqual([1, 4]);
     });
 
+    it('reports a moved row status, with its edits, end to end', async () => {
+        const source = await aligned(
+            [['Al', 'Eng', '10'], ['Bo', 'Ops', '20'], ['Cy', 'Fin', '30']],
+            [['Al', 'Eng', '10'], ['Cy', 'Fin', '30'], ['Bo', 'Ops', '99']],
+        );
+        const diff = diff_page(source, 0, 10);
+        // Only Bo is 'moved'. Cy also shifted up a row, but Myers paired it as
+        // part of the longest common subsequence, so it was never one-sided and
+        // never reached the move pass. 'moved' means "re-paired across a move",
+        // not "sits at a different row number" — which is the right meaning:
+        // marking every row below an insertion point as moved would be noise.
+        expect(diff?.rowStatus).toEqual(['same', 'same', 'moved']);
+        // The moved row is still diffed cell by cell, which is the whole point:
+        // its edit is reported as an edit rather than left to the eye.
+        expect(diff?.changedCells).toEqual([{ row: 2, col: 2, base: '20' }]);
+    });
+
+    it('keeps a purely moved row under the changed-rows filter', async () => {
+        // It is neither one-sided nor in changedRowIndices, so it would vanish
+        // from the one view a user hunting changes would most expect it in.
+        const source = await aligned(
+            [['a'], ['b'], ['c'], ['d']],
+            [['b'], ['c'], ['d'], ['a']],
+        );
+        expect(source.changed_grid_rows(0)).toEqual([3]);
+    });
+
     it('treats every row of a one-sided sheet as changed', async () => {
         const modified = new FixtureSource([{ name: 'Fresh', rows: [['x'], ['y']] }]);
         const original = new FixtureSource([{ name: 'Gone', rows: [['z']] }]);
@@ -298,6 +325,7 @@ describe('CompareDataSource with a content alignment', () => {
         expect(source.change_counts()).toEqual({
             addedRows: 3,      // one row in Kept, two from the whole Fresh sheet
             deletedRows: 0,
+            movedRows: 0,
             changedCells: 1,
         });
     });

@@ -162,7 +162,7 @@ describe('compare mode controller', () => {
             configuration: { gitCompare?: { counts: unknown; degraded: boolean } };
         };
         expect(snapshot.configuration.gitCompare?.counts).toEqual({
-            addedRows: 1, deletedRows: 0, changedCells: 1,
+            addedRows: 1, deletedRows: 0, movedRows: 0, changedCells: 1,
         });
         expect(snapshot.configuration.gitCompare?.degraded).toBe(false);
     });

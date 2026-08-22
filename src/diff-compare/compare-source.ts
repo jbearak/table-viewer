@@ -163,7 +163,10 @@ export interface ChangedCell {
     readonly base: string;
 }
 
-export type CompareRowStatus = 'same' | 'added' | 'deleted';
+/** `moved` is a paired row that the aligner re-matched across a change of
+ *  position. It is a *pairing provenance*, not a content verdict: a moved row
+ *  may also carry changed cells, and reports both. */
+export type CompareRowStatus = 'same' | 'added' | 'deleted' | 'moved';
 
 /**
  * Sparse per-page diff. `rowStatus[i]` describes absolute row `startRow + i` of

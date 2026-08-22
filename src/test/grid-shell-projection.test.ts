@@ -104,7 +104,7 @@ const grid_mock = vi.hoisted(() => ({
     loader_version: 0,
     // Git compare sidecar state, keyed by display row (status) and
     // `row:col` (per-cell base text). Empty = everything unchanged.
-    compare_status: {} as Record<number, 'added' | 'deleted' | undefined>,
+    compare_status: {} as Record<number, 'added' | 'deleted' | 'moved' | undefined>,
     compare_base: {} as Record<string, string | undefined>,
     // Display row → canonical source row; null means identity, which is what a
     // CSV with no transform installed reports. Overridable so a test can make the
@@ -653,6 +653,27 @@ describe('GridShell git compare painting', () => {
                 style: { strikethrough: true },
             }),
         ]]);
+    });
+
+    it('bands a moved row distinctly and does not strike it through', async () => {
+        // A purely moved row has no changed cells, so the band is the only
+        // thing saying it moved — reusing added's or deleted's would make it
+        // read as one of those.
+        grid_mock.compare_status = { 0: 'moved', 1: 'added', 2: 'deleted' };
+        await render_grid(props({ git_compare: true }));
+        const get_cell_content = grid_mock.props!.getCellContent as (
+            cell: [number, number],
+        ) => {
+            themeOverride?: { bgCell?: string };
+            data: string | { lines: { style?: { strikethrough?: boolean } }[][] };
+        };
+        const moved = get_cell_content([0, 0]);
+        const bands = [0, 1, 2].map((row) => get_cell_content([0, row]).themeOverride?.bgCell);
+        expect(bands.every((band) => band !== undefined)).toBe(true);
+        expect(new Set(bands).size).toBe(3);
+        // Its cells are the modified side's own text, not struck-through
+        // originals — the strikethrough belongs to deleted rows alone.
+        expect(moved.data).toBe('source-a');
     });
 
     it('ignores the compare sidecar entirely when git_compare is off', async () => {

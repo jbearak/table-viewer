@@ -129,9 +129,12 @@ export interface SheetTransformState {
     /** Fingerprint of sheet identity + available column names. Prevents a saved
      *  transform from silently attaching to a reordered/replaced sheet. */
     schema?: string;
-    /** Compare mode: keep only rows that are added, deleted, or have a changed
-     *  cell. Which rows those are is the compare source's answer, supplied to
-     *  the transform rather than derived here — see PanelCore. */
+    /** Compare mode: keep only rows that are added, deleted, moved, or have a
+     *  changed cell. A purely moved row has no changed cell and is not
+     *  one-sided, so it has to be included deliberately — it is precisely the
+     *  kind of row someone using this filter is looking for. Which rows those
+     *  are is the compare source's answer, supplied to the transform rather
+     *  than derived here — see PanelCore. */
     onlyChangedRows?: boolean;
 }
 
@@ -1844,7 +1847,7 @@ export type HostMessage =
     /** Git compare mode: sparse positional diff for the same page a rowData
      *  answered. `rowStatus[i]` describes row `startRow + i`; `changedCells`
      *  carries only differing cells with the original (`base`) text. */
-    | { type: 'compareDiff'; sheetIndex: number; startRow: number; rowStatus: ('same' | 'added' | 'deleted')[]; changedCells: { row: number; col: number; base: string }[]; requestId: string; generation: number }
+    | { type: 'compareDiff'; sheetIndex: number; startRow: number; rowStatus: ('same' | 'added' | 'deleted' | 'moved')[]; changedCells: { row: number; col: number; base: string }[]; requestId: string; generation: number }
     | { type: 'scrollToRow'; row: number }
     | { type: 'saveOperationStarted'; lifecycle: ActiveCsvSaveLifecycle }
     | {

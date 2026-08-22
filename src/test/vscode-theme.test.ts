@@ -115,6 +115,16 @@ describe('build_diff_colors_from_vars', () => {
         expect(colors.diffDeletedFg).toBe('red');
         expect(colors.diffAddedFg).toBe('green');
     });
+
+    it('reports a moved color that no theme variable can turn green', () => {
+        // Deliberately not read from a variable. gitDecoration's semantically
+        // exact key (renamedResourceForeground) defaults to a green close
+        // enough to added that a moved row would read as added.
+        const themed = build_diff_colors_from_vars((name) =>
+            name === '--vscode-gitDecoration-renamedResourceForeground' ? '#73C991' : '');
+        expect(themed.diffMovedFg).toBe('#9333ea');
+        expect(build_diff_colors_from_vars(() => '  ').diffMovedFg).toBe('#9333ea');
+    });
 });
 
 describe('build_edit_tints_from_vars', () => {

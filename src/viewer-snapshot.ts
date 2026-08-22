@@ -91,6 +91,7 @@ export interface WorkbookSnapshotCompare {
     readonly counts: {
         readonly addedRows: number;
         readonly deletedRows: number;
+        readonly movedRows: number;
         readonly changedCells: number;
     };
     /**

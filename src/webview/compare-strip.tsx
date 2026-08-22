@@ -3,6 +3,7 @@ import React from 'react';
 export interface CompareStripCounts {
     readonly addedRows: number;
     readonly deletedRows: number;
+    readonly movedRows: number;
     readonly changedCells: number;
 }
 
@@ -53,8 +54,12 @@ export function CompareStrip({
     on_toggle_only_changed_rows,
     filter_pending = false,
 }: CompareStripProps): React.JSX.Element {
+    // Moved rows count. A file whose only change is reordering would otherwise
+    // claim "No differences found." over a grid visibly banding those rows, and
+    // leave the filter that would isolate them disabled.
     const no_counted_changes = counts.addedRows === 0
         && counts.deletedRows === 0
+        && counts.movedRows === 0
         && counts.changedCells === 0;
     const unchanged = no_counted_changes && !other_differences;
     return (
@@ -133,6 +138,14 @@ export function CompareStrip({
                                 <span className="compare-strip-deleted">
                                     −{plural(counts.deletedRows, 'row')} deleted
                                 </span>
+                                {counts.movedRows > 0 && (
+                                    <>
+                                        {' · '}
+                                        <span className="compare-strip-moved">
+                                            {plural(counts.movedRows, 'row')} moved
+                                        </span>
+                                    </>
+                                )}
                                 {' · '}
                                 <span>{plural(counts.changedCells, 'changed cell')}</span>
                             </>

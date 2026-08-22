@@ -71,15 +71,131 @@ describe('align_sheet', () => {
         });
     });
 
-    it('represents a moved row as a delete and an add, not changed cells', async () => {
+    it('pairs a moved row at its new position instead of a delete and an add', async () => {
+        // Was asserted the other way until move detection existed: Myers has no
+        // move op, so 'a' came out as a deletion plus an unrelated insertion.
         const alignment = await align_sheet(
             single(rows_of('a', 'b', 'c', 'd')),
             single(rows_of('b', 'c', 'd', 'a')),
             matched,
         );
+        expect(shape(alignment.rows)).toEqual(['1,0', '2,1', '3,2', '0,3']);
         expect(alignment).toMatchObject({
-            addedRows: 1, deletedRows: 1, changedCells: 0,
+            addedRows: 0, deletedRows: 0, changedCells: 0, movedRowIndices: [3],
         });
+    });
+
+    it('reports the changed cells of a row that moved and was edited', async () => {
+        // The case that motivates move detection. Before it existed this was
+        // one deletion plus one addition with changedCells 0 — the 20 to 99
+        // edit was invisible AS an edit, leaving the user to eyeball a red row
+        // against a green one to find it.
+        const alignment = await align_sheet(
+            single([['Al', 'Eng', '10'], ['Bo', 'Ops', '20'], ['Cy', 'Fin', '30']]),
+            single([['Al', 'Eng', '10'], ['Cy', 'Fin', '30'], ['Bo', 'Ops', '99']]),
+            matched,
+        );
+        expect(shape(alignment.rows)).toEqual(['0,0', '2,1', '1,2']);
+        expect(alignment).toMatchObject({
+            addedRows: 0, deletedRows: 0,
+            changedCells: 1, changedRowIndices: [2], movedRowIndices: [2],
+        });
+    });
+
+    it('pairs a whole re-sort on hashes alone', async () => {
+        const alignment = await align_sheet(
+            single(rows_of('a', 'b', 'c', 'd')),
+            single(rows_of('d', 'c', 'b', 'a')),
+            matched,
+        );
+        expect(shape(alignment.rows)).toEqual(['3,0', '2,1', '1,2', '0,3']);
+        expect(alignment).toMatchObject({
+            addedRows: 0, deletedRows: 0, changedCells: 0,
+        });
+    });
+
+    it('pairs an adjacent swap as two moves rather than four one-sided rows', async () => {
+        const alignment = await align_sheet(
+            single(rows_of('a', 'b', 'c')),
+            single(rows_of('b', 'a', 'c')),
+            matched,
+        );
+        expect(alignment).toMatchObject({ addedRows: 0, deletedRows: 0, changedCells: 0 });
+        expect(alignment.rows).toHaveLength(3);
+    });
+
+    it('leaves a below-threshold pair as a delete and an add', async () => {
+        // Similarity is whole-cell, so a row whose content lives in one edited
+        // cell scores zero. Pinned deliberately: the metric fails safely (this
+        // is exactly the pre-move-detection behavior), and asserting the
+        // boundary keeps it a decision rather than an accident.
+        const alignment = await align_sheet(
+            single(rows_of('x', 'customer-000123', 'y')),
+            single(rows_of('x', 'y', 'customer-000124')),
+            matched,
+        );
+        expect(alignment).toMatchObject({
+            addedRows: 1, deletedRows: 1, movedRowIndices: [],
+        });
+    });
+
+    it('pairs duplicate identical rows identically across runs', async () => {
+        const original = single(rows_of('dup', 'dup', 'a', 'b', 'dup'));
+        const modified = single(rows_of('a', 'b', 'dup', 'dup', 'dup'));
+        const first = await align_sheet(original, modified, matched);
+        const second = await align_sheet(original, modified, matched);
+        expect(shape(second.rows)).toEqual(shape(first.rows));
+        expect(second.movedRowIndices).toEqual(first.movedRowIndices);
+    });
+
+    it('still finds exact moves when the inexact phase is over its work cap', async () => {
+        // 'x' moves identically and costs nothing to detect; the edited Bo row
+        // moved too far to be adjacent, so it needs a similarity score and is
+        // given up on. Exact moves are never
+        // discarded for being numerous — a re-sorted huge file is the case that
+        // most needs detection and is the cheapest to serve.
+        const alignment = await align_sheet(
+            single([['x'], ['Bo', 'Ops', '20'], ['keep'], ['y']]),
+            single([['keep'], ['y'], ['x'], ['Bo', 'Ops', '99']]),
+            matched,
+            { maxMoveSearchRows: 0 },
+        );
+        expect(alignment.moveSearchTruncated).toBe(true);
+        expect(alignment.movedRowIndices.length).toBeGreaterThan(0);
+        // The row needing a score stayed a delete plus an add, as before.
+        expect(alignment).toMatchObject({ addedRows: 1, deletedRows: 1 });
+    });
+
+    it('does not hunt for moves in a degraded alignment', async () => {
+        // A degraded alignment is positional and means "these files do not
+        // correspond"; decorating it with moves would dress a failed alignment
+        // up as a partial result.
+        const alignment = await align_sheet(
+            single(rows_of('a', 'b', 'c', 'd')),
+            single(rows_of('d', 'c', 'b', 'a')),
+            matched,
+            { maxEditDistance: 1 },
+        );
+        expect(alignment.degraded).toBe(true);
+        expect(alignment.movedRowIndices).toEqual([]);
+        expect(alignment.moveSearchTruncated).toBe(false);
+    });
+
+    it('observes a cancel raised before the move pass runs', async () => {
+        let hashed = false;
+        await expect(align_sheet(
+            single(rows_of('a', 'b', 'c', 'd')),
+            single(rows_of('d', 'c', 'b', 'a')),
+            matched,
+            {
+                rowsPerCheckpoint: 1,
+                isCancelled: () => {
+                    const was = hashed;
+                    hashed = true;
+                    return was;
+                },
+            },
+        )).rejects.toBeInstanceOf(AlignmentCancelledError);
     });
 
     it('pairs a replaced block row for row, then reports the excess', async () => {
@@ -95,17 +211,19 @@ describe('align_sheet', () => {
         });
     });
 
-    it('does not pair a deletion with a distant insertion', async () => {
-        // 'a' leaves the top and reappears at the bottom with unchanged rows in
-        // between: a move, so the runs are not adjacent and must not coalesce
-        // into a changed row.
+    it('reports a distant deletion and insertion of the same row as one move', async () => {
+        // 'a' leaves the top and reappears at the bottom. The runs are not
+        // adjacent, so build_rows cannot coalesce them into a changed row —
+        // which would be wrong anyway. The move pass pairs them instead, and
+        // must not report the pairing as changed cells.
         const alignment = await align_sheet(
             single(rows_of('a', 'b', 'c', 'd', 'e')),
             single(rows_of('b', 'c', 'd', 'e', 'a')),
             matched,
         );
         expect(alignment).toMatchObject({
-            addedRows: 1, deletedRows: 1, changedCells: 0,
+            addedRows: 0, deletedRows: 0, changedCells: 0,
+            movedRowIndices: [4], changedRowIndices: [],
         });
     });
 
@@ -363,21 +481,34 @@ describe('aligner minimality', () => {
             );
             expect(alignment.degraded, context).toBe(false);
 
-            // Every row of each side appears exactly once, in its original
-            // order: an alignment may pair or orphan a row, never drop,
-            // duplicate, or reorder one.
-            expect(
-                alignment.rows.map((row) => row.original).filter((row) => row !== ABSENT),
-                context,
-            ).toEqual(left.map((_, index) => index));
+            // Every row of each side appears exactly once: an alignment may
+            // pair or orphan a row, never drop or duplicate one. The original
+            // side is checked as a permutation rather than a sequence, because
+            // detecting a move deliberately lifts a row out of its original
+            // order — that reordering IS the finding. Its exactly-once half is
+            // the invariant that must survive, so it is asserted separately
+            // rather than folded into a weaker single check.
+            const originals = alignment.rows
+                .map((row) => row.original).filter((row) => row !== ABSENT);
+            expect(originals.length, context).toBe(left.length);
+            expect([...originals].sort((a, b) => a - b), context)
+                .toEqual(left.map((_, index) => index));
+            // The modified side stays strictly ascending: a moved row is
+            // emitted at the modified slot it already occupied.
             expect(
                 alignment.rows.map((row) => row.modified).filter((row) => row !== ABSENT),
                 context,
             ).toEqual(right.map((_, index) => index));
 
             // And it pairs as many equal rows as any diff possibly could.
-            const equal_pairs = alignment.rows.filter((row) =>
-                row.original !== ABSENT && row.modified !== ABSENT
+            // Moved rows are excluded: they pair rows Myers left one-sided, so
+            // counting them would push the total above the LCS and turn this
+            // minimality check into a tautology. Restricting it to the
+            // stationary pairs keeps it pinning what it was written to pin.
+            const moved = new Set(alignment.movedRowIndices);
+            const equal_pairs = alignment.rows.filter((row, index) =>
+                !moved.has(index)
+                && row.original !== ABSENT && row.modified !== ABSENT
                 && left[row.original] === right[row.modified]).length;
             expect(equal_pairs, context).toBe(lcs(left, right));
         }

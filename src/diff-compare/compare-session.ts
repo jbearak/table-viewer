@@ -241,6 +241,8 @@ export class CompareDataSource implements DataSource {
                     deletedRows: 0,
                     changedCells: 0,
                     changedRowIndices: [],
+                    movedRowIndices: [],
+                    moveSearchTruncated: false,
                     degraded: true,
                 },
             ]),
@@ -320,14 +322,17 @@ export class CompareDataSource implements DataSource {
     change_counts(): {
         addedRows: number;
         deletedRows: number;
+        movedRows: number;
         changedCells: number;
     } {
         let added = 0;
         let deleted = 0;
+        let moved = 0;
         let changed_cells = 0;
         for (const alignment of this.alignments.values()) {
             added += alignment.addedRows;
             deleted += alignment.deletedRows;
+            moved += alignment.movedRowIndices.length;
             changed_cells += alignment.changedCells;
         }
         // Sheets present on only one side are whole-sheet changes; their rows
@@ -342,6 +347,7 @@ export class CompareDataSource implements DataSource {
         return {
             addedRows: added,
             deletedRows: deleted,
+            movedRows: moved,
             changedCells: changed_cells,
         };
     }
@@ -365,17 +371,28 @@ export class CompareDataSource implements DataSource {
         alignment.rows.forEach((row, grid_row) => {
             if (row.original === ABSENT || row.modified === ABSENT) one_sided.push(grid_row);
         });
-        const changed = alignment.changedRowIndices;
+        // Three ascending sources, not two. A purely-moved row is neither
+        // one-sided nor in `changedRowIndices`, so without this it vanishes
+        // under the filter — in the one view where someone hunting changes
+        // would most expect to find it.
+        const sources = [one_sided, alignment.changedRowIndices, alignment.movedRowIndices];
+        const cursors = sources.map(() => 0);
         const rows: number[] = [];
-        let left = 0;
-        let right = 0;
-        while (left < one_sided.length || right < changed.length) {
-            if (right >= changed.length || (left < one_sided.length
-                && one_sided[left] < changed[right])) {
-                rows.push(one_sided[left++]);
-            } else {
-                rows.push(changed[right++]);
-            }
+        for (;;) {
+            let next = -1;
+            let from = -1;
+            sources.forEach((source, index) => {
+                const cursor = cursors[index];
+                if (cursor >= source.length) return;
+                if (from === -1 || source[cursor] < next) {
+                    next = source[cursor];
+                    from = index;
+                }
+            });
+            if (from === -1) break;
+            cursors[from]++;
+            // A moved-and-edited row is in two sources; the filter wants it once.
+            if (rows[rows.length - 1] !== next) rows.push(next);
         }
         return rows;
     }
@@ -442,6 +459,7 @@ export class CompareDataSource implements DataSource {
         const original_sheet = this.original_meta.sheets[pairing.originalIndex];
         const modified_sheet = this.modified_meta.sheets[sheet_index];
         const column_count = Math.max(original_sheet.columnCount, modified_sheet.columnCount);
+        const moved = new Set(this.alignments.get(sheet_index)?.movedRowIndices ?? []);
         const row_status: CompareRowStatus[] = [];
         const paired_positions: number[] = [];
         const original_rows: number[] = [];
@@ -460,7 +478,10 @@ export class CompareDataSource implements DataSource {
                 row_status.push('added');
                 return;
             }
-            row_status.push('same');
+            // A moved row is an ordinary two-index row and still falls through
+            // to the cell comparison below, so a row that moved *and* was
+            // edited reports its changed cells as well as its band.
+            row_status.push(moved.has(grid_row) ? 'moved' : 'same');
             paired_positions.push(position);
             original_rows.push(aligned.original);
             modified_rows.push(aligned.modified);
