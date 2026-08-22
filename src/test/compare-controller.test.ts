@@ -290,6 +290,12 @@ describe('compare mode controller', () => {
             totalRows: number;
         }[];
         expect(reports.length).toBeGreaterThan(0);
+        // "Before" is the whole claim, so it is asserted by position rather
+        // than by the two message kinds merely both being present: a bar that
+        // only appears once the snapshot is ready has nothing left to report.
+        const types = (panel.__messages as { type: string }[]).map((message) => message.type);
+        expect(types.indexOf('compareProgress'))
+            .toBeLessThan(types.indexOf('workbookSnapshot'));
         // Monotonic and bounded: a bar that goes backwards, or past its own
         // total, reads as a bug in the comparison rather than in the readout.
         let previous = 0;

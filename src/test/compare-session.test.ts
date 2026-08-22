@@ -293,6 +293,13 @@ describe('CompareDataSource with a content alignment', () => {
         // The moved row is still diffed cell by cell, which is the whole point:
         // its edit is reported as an edit rather than left to the eye.
         expect(diff?.changedCells).toEqual([{ row: 2, col: 2, base: '20' }]);
+        // The summary has to agree with the banding. Asserted here because
+        // every other movedRows assertion in the suite is either zero or a
+        // hand-supplied prop, so a count that never left the aligner would go
+        // unnoticed and a move-only comparison would read as no differences.
+        expect(source.change_counts()).toMatchObject({
+            movedRows: 1, addedRows: 0, deletedRows: 0,
+        });
     });
 
     it('reports when a sheet had too many rows to check them all for moves', async () => {

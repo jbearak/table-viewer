@@ -184,7 +184,12 @@ describe('align_sheet', () => {
             { maxMoveSearchRows: 0 },
         );
         expect(alignment.moveSearchTruncated).toBe(true);
-        expect(alignment.movedRowIndices.length).toBeGreaterThan(0);
+        // Pinned by shape, not by count: an implementation that lost the exact
+        // pass but ran the capped inexact one would pair the edited Bo row
+        // instead, and both a non-zero moved count and the add/delete pair
+        // below would still hold, with the two rows swapped.
+        expect(shape(alignment.rows)).toEqual(['1,-', '2,0', '3,1', '0,2', '-,3']);
+        expect(alignment.movedRowIndices).toEqual([3]);
         // The row needing a score stayed a delete plus an add, as before.
         expect(alignment).toMatchObject({ addedRows: 1, deletedRows: 1 });
     });
