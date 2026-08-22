@@ -33,6 +33,17 @@ const OID = 'b'.repeat(64);
 const POINTER = `version https://git-lfs.github.com/spec/v1\noid sha256:${OID}\nsize 24\n`;
 /** Exactly 24 bytes, so a smudge outcome matches the pointer's stated size. */
 const RESOLVED_CSV = 'h,k\nreal,rows\nmore,rows\n';
+/**
+ * A second object, for the case where *both* sides of a comparison are
+ * pointers. A distinct oid is the point: the two sides are separate objects
+ * with separate fetches, and matching on oid is what keeps one side's bytes
+ * from being served for the other.
+ */
+const OID_OTHER = 'c'.repeat(64);
+const POINTER_OTHER =
+    `version https://git-lfs.github.com/spec/v1\noid sha256:${OID_OTHER}\nsize 24\n`;
+/** Also exactly 24 bytes. */
+const RESOLVED_OTHER_CSV = 'h,k\nolder,rows\nolder,rows\n';
 const MODIFIED = 'h\na\nb\n';
 const ORIGINAL = 'h\nA\n';
 
@@ -114,11 +125,15 @@ async function latest_lfs(
 }
 
 /** Serve the pointer for the named side and real content for the other. */
-function serve(pointer_side: 'file' | 'original' | 'none'): void {
+function serve(pointer_side: 'file' | 'original' | 'both' | 'none'): void {
     vscode_mock.__setReadFileImplementation(async (uri) => {
         const is_original = String(uri.fsPath ?? uri).includes('original');
-        if (pointer_side === 'file' && !is_original) return enc.encode(POINTER);
-        if (pointer_side === 'original' && is_original) return enc.encode(POINTER);
+        const pointer_here = pointer_side === 'both'
+            || (pointer_side === 'file' && !is_original)
+            || (pointer_side === 'original' && is_original);
+        if (pointer_here) {
+            return enc.encode(is_original && pointer_side === 'both' ? POINTER_OTHER : POINTER);
+        }
         return enc.encode(is_original ? ORIGINAL : MODIFIED);
     });
 }
@@ -366,6 +381,59 @@ describe('a comparison whose own modified side is an LFS pointer', () => {
         await panel.__receive({ type: 'resolveLfsObject' });
         expect(await latest_lfs(panel, (value) => value?.failure !== undefined))
             .toMatchObject({ side: 'file', failure: { reason: 'objectMissing' } });
+    });
+});
+
+describe('a comparison with a pointer on both sides', () => {
+    it('resolves both from a single click', async () => {
+        // What a real staged-vs-HEAD diff of an LFS file looks like: two
+        // objects, two fetches. Resolving only the side the banner names left
+        // the user with a second, differently-worded banner — which reads as
+        // the first download having half-failed rather than as there being two.
+        serve('both');
+        const panel = open_git_main_compare();
+        await panel.__receive({ type: 'ready' });
+        expect(await latest_lfs(panel, (value) => value !== undefined))
+            .toMatchObject({ side: 'file', oid: OID });
+        // Queued in the order the sides are reached: the main side must parse
+        // before the original is read at all.
+        fake_git_lfs.smudge_outcomes.push(
+            { type: 'resolved', content: enc.encode(RESOLVED_CSV) },
+            { type: 'resolved', content: enc.encode(RESOLVED_OTHER_CSV) },
+        );
+        await panel.__receive({ type: 'resolveLfsObject' });
+        await latest_lfs(panel, (value) => value === undefined);
+        // Both objects fetched, and each by its own oid — one click.
+        expect(fake_git_lfs.calls.map((call) => call.oid)).toEqual([OID, OID_OTHER]);
+        await vi.waitFor(() => {
+            const latest = snapshots(panel)[snapshots(panel).length - 1];
+            expect(latest.configuration.unresolvedLfs).toBeUndefined();
+            // The diff is the point: both sides resolved means a real
+            // comparison, not just a populated grid.
+            expect(latest.configuration.gitCompare).toBeDefined();
+        });
+    });
+
+    it('stops at the side that fails rather than looping', async () => {
+        // The loop is bounded by the objects it has attempted, so a side that
+        // stays a pointer ends it — with its own failure on the banner, still
+        // retryable, and no second fetch of the side that worked.
+        serve('both');
+        const panel = open_git_main_compare();
+        await panel.__receive({ type: 'ready' });
+        await latest_lfs(panel, (value) => value !== undefined);
+        fake_git_lfs.smudge_outcomes.push(
+            { type: 'resolved', content: enc.encode(RESOLVED_CSV) },
+            { type: 'failed', reason: 'objectMissing', detail: 'remote missing object …' },
+        );
+        await panel.__receive({ type: 'resolveLfsObject' });
+        expect(await latest_lfs(panel, (value) => value?.failure !== undefined))
+            .toMatchObject({
+                side: 'original',
+                oid: OID_OTHER,
+                failure: { reason: 'objectMissing' },
+            });
+        expect(fake_git_lfs.calls.map((call) => call.oid)).toEqual([OID, OID_OTHER]);
     });
 });
 

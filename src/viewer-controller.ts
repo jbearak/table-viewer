@@ -7437,12 +7437,29 @@ export function attach_viewer(
                 // changes what the next build will read, then re-runs the
                 // ordinary load path so the real table arrives through the
                 // same currency checks as any other refresh.
-                const target = unresolved_lfs;
-                if (!target || lfs_resolve_in_flight) return;
+                if (!unresolved_lfs || lfs_resolve_in_flight) return;
                 const lfs = host.gitLfs;
                 if (!lfs) return;
                 lfs_resolve_in_flight = true;
+                // One click, both sides. A comparison has two pointers — the
+                // modified side and the version it is compared against — and
+                // each is a separate object with its own fetch. Resolving only
+                // the one the banner happens to name leaves the user looking at
+                // a second, differently-worded banner, which reads as the first
+                // download having half-failed rather than as there being two.
+                //
+                // Bounded by the objects already attempted rather than by a
+                // count: the loop advances only to a pointer it has not fetched,
+                // so a side that stays unresolved ends it instead of retrying
+                // forever.
+                const attempted = new Set<string>();
                 try {
+                    for (;;) {
+                    const target = unresolved_lfs;
+                    if (!target) return;
+                    const attempt_key = `${target.side}:${target.oid}`;
+                    if (attempted.has(attempt_key)) return;
+                    attempted.add(attempt_key);
                     // Which side decides the operation, and they are not
                     // interchangeable. A working-tree pointer is fixed on disk
                     // by `pull`; the original side has no disk state to fix, so
@@ -7571,6 +7588,13 @@ export function attach_viewer(
                         // As above: restoring the banner is pointless if no
                         // snapshot carries it back to the webview.
                         session.recapture_current_projection({ deliver: true });
+                        return;
+                    }
+                    // Round again. The rebuild that just ran reads the side
+                    // this fetch repaired, and a comparison's *other* side is
+                    // only reached once the first one parses — so the second
+                    // pointer becomes visible here and nowhere earlier. If
+                    // there is none, the loop's own guard ends it.
                     }
                 } finally {
                     lfs_resolve_in_flight = false;
