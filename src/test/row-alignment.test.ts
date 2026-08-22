@@ -139,6 +139,29 @@ describe('align_sheet', () => {
         });
     });
 
+    it('pairs each moved row with its strongest match, not its nearest', async () => {
+        // Both destinations clear the 50% threshold against both sources, so
+        // ranking decides. Ranking on displacement alone pairs each row with
+        // whichever source sits closest, which here is the weaker match on
+        // both counts: four changed cells reported where two actually changed.
+        const alignment = await align_sheet(
+            new FixtureSource([{ name: 'S', rows: [
+                ['a', 'a', 'b', 'b'],
+                ['a', 'a', 'x', 'z'],
+                ['KEEP', '', '', ''],
+            ] }]),
+            new FixtureSource([{ name: 'S', rows: [
+                ['KEEP', '', '', ''],
+                ['a', 'a', 'b', 'y'],
+                ['a', 'a', 'x', 'y'],
+            ] }]),
+            matched,
+        );
+        expect(alignment.movedRowIndices).toEqual([1, 2]);
+        expect(shape(alignment.rows)).toEqual(['2,0', '0,1', '1,2']);
+        expect(alignment.changedCells).toBe(2);
+    });
+
     it('pairs duplicate identical rows identically across runs', async () => {
         const original = single(rows_of('dup', 'dup', 'a', 'b', 'dup'));
         const modified = single(rows_of('a', 'b', 'dup', 'dup', 'dup'));

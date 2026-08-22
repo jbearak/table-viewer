@@ -779,10 +779,12 @@ function normalize_candidate(
 }
 
 /**
- * Whether two rows are similar enough to call one a move of the other.
+ * How strongly two rows resemble each other, or 0 if not enough to call one a
+ * move of the other.
  *
  * Length-weighted after git's `src_copied / max_size`: the matched characters
- * must be at least half the longer row's.
+ * must be at least half the longer row's. The ratio is returned rather than a
+ * verdict because it also ranks candidates against one another.
  *
  * Matching is *whole-cell* — a cell contributes its length only when both
  * sides' text is exactly equal. Cell *counts* (what xlCompare uses) were
@@ -794,21 +796,22 @@ function normalize_candidate(
  * Catching it would need intra-cell chunk matching — a second diff algorithm
  * with its own effort cap.
  */
-function rows_are_similar(left: CandidateRow, right: CandidateRow): boolean {
+function similarity_of(left: CandidateRow, right: CandidateRow): number {
     const max_total = Math.max(left.length, right.length);
-    // Two empty rows are identical, not undefined. Returning false here would
+    // Two empty rows are identical, not undefined. Returning 0 here would
     // leave a moved blank separator row as a delete plus an add.
-    if (max_total === 0) return true;
+    if (max_total === 0) return 1;
     let matched = 0;
     for (let col = 0; col < left.texts.length; col++) {
         if (left.texts[col] !== right.texts[col]) continue;
         matched += left.texts[col].length;
-        // Stop at the verdict rather than at the last column: the remaining
-        // cells can only raise a score that has already cleared the bar, and
-        // this loop runs once per scored pair.
-        if (is_at_least_half(matched, max_total)) return true;
     }
-    return false;
+    // Every column is scored, with no early exit once the threshold is
+    // cleared: the score also ranks candidates against each other, so
+    // stopping at the verdict would flatten every survivor to "at least
+    // half" and leave only displacement to choose between a 50% match and a
+    // 95% one.
+    return is_at_least_half(matched, max_total) ? matched / max_total : 0;
 }
 
 /**
@@ -933,13 +936,17 @@ async function detect_moves(
 interface MoveCandidate {
     readonly originalRow: number;
     readonly modifiedRow: number;
+    /** Matched characters over the longer row's, as git ranks renames. */
+    readonly similarity: number;
     readonly displacement: number;
 }
 
-/** Order candidates best-first. Every tie is broken down to the row indexes, so
- *  the result never depends on sort stability and two runs agree exactly. */
+/** Order candidates best-first: strongest match, then least movement. Every tie
+ *  is broken down to the row indexes, so the result never depends on sort
+ *  stability and two runs agree exactly. */
 function compare_candidates(left: MoveCandidate, right: MoveCandidate): number {
-    return left.displacement - right.displacement
+    return right.similarity - left.similarity
+        || left.displacement - right.displacement
         || left.originalRow - right.originalRow
         || left.modifiedRow - right.modifiedRow;
 }
@@ -1004,13 +1011,15 @@ async function score_moves(
             // compare cells to reach a conclusion arithmetic already reached.
             const delta = Math.abs(source_row.length - destination_row.length);
             if (max_length > 0 && !is_at_least_half(max_length - delta, max_length)) continue;
-            if (!rows_are_similar(source_row, destination_row)) continue;
-            // Similarity is a boolean at this point, so displacement is what
-            // distinguishes candidates: of two equally similar sources, the one
-            // that moved less is the likelier origin.
+            const similarity = similarity_of(source_row, destination_row);
+            if (similarity === 0) continue;
+            // Displacement only separates equally strong matches: of two
+            // sources that resemble the destination alike, the one that moved
+            // less is the likelier origin.
             const candidate: MoveCandidate = {
                 originalRow: source.row,
                 modifiedRow: destination.row,
+                similarity,
                 displacement: Math.abs(source.gridRow - destination.gridRow),
             };
             // Sorted on every insert, which is free at this size and avoids
