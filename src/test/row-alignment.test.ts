@@ -253,3 +253,78 @@ describe('identity_alignment', () => {
         expect(shape(identity_alignment(3, 1))).toEqual(['0,0', '1,-', '2,-']);
     });
 });
+
+// A randomized cross-check of the aligner against a brute-force LCS.
+//
+// The linear-space Myers rewrite is subtle in a way that fails quietly: a
+// mistaken parity case or a stale frontier entry yields a valid-looking but
+// non-minimal edit script, which reads as "these rows changed" for rows that
+// merely moved. The examples above pin the behaviours that were specified;
+// this pins the property that makes them all true at once.
+describe('aligner minimality', () => {
+    /** Longest common subsequence — the ground truth a minimal diff must reach. */
+    function lcs(a: readonly string[], b: readonly string[]): number {
+        const dp = Array.from({ length: a.length + 1 }, () => new Int32Array(b.length + 1));
+        for (let i = 1; i <= a.length; i++) {
+            for (let j = 1; j <= b.length; j++) {
+                dp[i][j] = a[i - 1] === b[j - 1]
+                    ? dp[i - 1][j - 1] + 1
+                    : Math.max(dp[i - 1][j], dp[i][j - 1]);
+            }
+        }
+        return dp[a.length][b.length];
+    }
+
+    /** Seeded so a failure is reproducible rather than a one-off CI story. */
+    function rng(seed: number): () => number {
+        let state = seed >>> 0;
+        return () => {
+            state = (state * 1664525 + 1013904223) >>> 0;
+            return state / 4294967296;
+        };
+    }
+
+    it('produces a minimal, correctly ordered alignment for random inputs', async () => {
+        const random = rng(12345);
+        for (let trial = 0; trial < 400; trial++) {
+            // A small alphabet makes coincidental matches common, which is what
+            // actually exercises the divide-and-conquer rather than the
+            // prefix/suffix trim.
+            const alphabet = 1 + Math.floor(random() * 6);
+            const generate = (length: number) => Array.from({ length },
+                () => String.fromCharCode(97 + Math.floor(random() * alphabet)));
+            const left = generate(Math.floor(random() * 30));
+            // Sometimes a truncation of the other side: empty and lopsided
+            // pairs take branches random pairs rarely reach.
+            const right = random() < 0.25
+                ? left.slice(0, Math.floor(random() * (left.length + 1)))
+                : generate(Math.floor(random() * 30));
+            const context = `${left.join('')} vs ${right.join('')}`;
+
+            const alignment = await align_sheet(
+                single(rows_of(...left)),
+                single(rows_of(...right)),
+                matched,
+            );
+            expect(alignment.degraded, context).toBe(false);
+
+            // Every row of each side appears exactly once, in its original
+            // order: an alignment may pair or orphan a row, never drop,
+            // duplicate, or reorder one.
+            expect(
+                alignment.rows.map((row) => row.original).filter((row) => row !== ABSENT),
+                context,
+            ).toEqual(left.map((_, index) => index));
+            expect(
+                alignment.rows.map((row) => row.modified).filter((row) => row !== ABSENT),
+                context,
+            ).toEqual(right.map((_, index) => index));
+
+            // And it pairs as many equal rows as any diff possibly could.
+            const equal_pairs = alignment.rows.filter((row) =>
+                row.original !== ABSENT && row.modified !== ABSENT
+                && left[row.original] === right[row.modified]).length;
+            expect(equal_pairs, context).toBe(lcs(left, right));
+        }
+    }, 60_000);
+});
