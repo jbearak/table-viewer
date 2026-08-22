@@ -36,7 +36,12 @@ export class FixtureSource implements DataSource {
                     : {}),
                 rowCount: sheet.rows.length,
                 sourceRowCount: sheet.rows.length,
-                columnCount: Math.max(0, ...sheet.rows.map((row) => row.length)),
+                columnCount: sheet.rows.reduce(
+                    // Reduced rather than spread into Math.max: a large fixture
+                    // would overflow the argument list.
+                    (widest, row) => Math.max(widest, row.length),
+                    0,
+                ),
                 merges: [],
                 hasFormatting: false,
             })),

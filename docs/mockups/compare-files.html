@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>Compare Files — UX mockups</title>
+<style>
+:root{
+  --bg:#ffffff; --bgAlt:#f3f3f3; --bgElev:#ffffff; --fg:#3b3b3b; --muted:#717171;
+  --subtle:#a0a0a0; --border:#cecece; --accent:#005fb8; --accentFg:#ffffff;
+  --hover:#e8e8e8; --added:#587c0c; --deleted:#ad0707;
+  --addedBand:rgba(88,124,12,.12); --deletedBand:rgba(173,7,7,.12);
+  --font:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+}
+body{margin:0;padding:32px;background:#e9ecef;font-family:var(--font);font-size:13px;color:var(--fg)}
+h2{font-size:15px;margin:38px 0 4px;color:#1c2733}
+h2:first-of-type{margin-top:0}
+.cap{color:#5a6672;margin:0 0 14px;max-width:760px;line-height:1.5}
+.frame{background:var(--bg);border:1px solid #b9c0c7;border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.13);overflow:hidden;display:inline-block;vertical-align:top}
+.tb{height:30px;background:var(--bgAlt);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 12px;gap:8px;position:relative}
+.lights{display:flex;gap:6px}.lights i{width:11px;height:11px;border-radius:50%;display:block}
+.l1{background:#ff5f57}.l2{background:#febc2e}.l3{background:#28c840}
+.ttl{position:absolute;left:0;right:0;text-align:center;font-size:12px;font-weight:600;color:var(--fg);pointer-events:none}
+.body{padding:18px 22px}
+label{font-weight:600;display:block;margin-bottom:4px}
+.hint{color:var(--muted);font-size:12px}
+.row{display:flex;gap:8px;align-items:center}
+input[type=text]{font:inherit;flex:1;padding:6px 9px;border:1px solid var(--border);border-radius:5px;background:var(--bgElev);color:inherit}
+input::placeholder{color:var(--subtle)}
+button{font:inherit;padding:6px 14px;border-radius:5px;border:1px solid var(--border);background:#fafafa;color:inherit;cursor:pointer}
+button.primary{background:var(--accent);color:var(--accentFg);border-color:var(--accent);font-weight:600}
+button:disabled{opacity:.45}
+.field{margin-bottom:16px}
+.swap{display:flex;justify-content:center;margin:-6px 0 10px}
+.swap button{border-radius:14px;padding:3px 12px;font-size:12px;color:var(--muted)}
+.foot{display:flex;justify-content:flex-end;gap:8px;padding:14px 22px;border-top:1px solid var(--border);background:var(--bgAlt)}
+.err{display:flex;gap:8px;align-items:flex-start;background:rgba(173,7,7,.08);border:1px solid rgba(173,7,7,.35);border-radius:6px;padding:8px 10px;color:#8a1010;margin-bottom:14px}
+.warn{background:rgba(180,120,0,.08);border-color:rgba(180,120,0,.4);color:#7a5300}
+/* menu */
+.menubar{background:var(--bgAlt);border-bottom:1px solid var(--border);display:flex;gap:2px;padding:3px 8px;font-size:13px}
+.menubar span{padding:3px 9px;border-radius:4px}
+.menubar span.open{background:var(--accent);color:#fff}
+.menu{width:250px;background:#fbfbfb;border:1px solid var(--border);border-radius:7px;box-shadow:0 10px 30px rgba(0,0,0,.2);padding:5px;margin:4px 0 0 32px}
+.mi{display:flex;justify-content:space-between;padding:5px 10px;border-radius:4px}
+.mi.hl{background:var(--accent);color:#fff}
+.mi .k{color:var(--muted)}.mi.hl .k{color:#dbe8f7}
+.sep{height:1px;background:var(--border);margin:5px 8px}
+/* compare window */
+.strip{display:flex;align-items:center;gap:10px;padding:6px 12px;background:var(--bgAlt);border-bottom:1px solid var(--border);font-size:12px}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:2px 8px;border-radius:10px;font-weight:600}
+.pill.o{background:var(--deletedBand);color:var(--deleted)}
+.pill.m{background:var(--addedBand);color:var(--added)}
+.strip .path{color:var(--muted)}
+.strip .ro{margin-left:auto;color:var(--muted);border:1px solid var(--border);border-radius:9px;padding:1px 8px}
+.tools{display:flex;gap:6px;padding:5px 12px;border-bottom:1px solid var(--border);font-size:12px;align-items:center}
+.tog{border:1px solid var(--border);border-radius:5px;padding:3px 9px;background:#fafafa}
+.tog.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+.counts{margin-left:auto;color:var(--muted)}
+.counts b.a{color:var(--added)}.counts b.d{color:var(--deleted)}
+.scan{display:flex;align-items:center;gap:8px;color:var(--muted)}
+.bar{width:120px;height:5px;border-radius:3px;background:var(--hover);overflow:hidden}
+.bar i{display:block;height:100%;width:46%;background:var(--accent)}
+.tog.busy{opacity:.5}
+table{border-collapse:collapse;font-size:12px;font-family:ui-monospace,Menlo,Consolas,monospace;width:100%}
+th,td{border:1px solid #e3e3e3;padding:3px 8px;text-align:left;white-space:nowrap}
+th{background:var(--bgAlt);font-family:var(--font);font-weight:600}
+th.chg{box-shadow:inset 0 -2px 0 var(--accent)}
+td.rn{background:var(--bgAlt);color:var(--muted);text-align:right;font-family:var(--font)}
+tr.add td{background:var(--addedBand)}
+tr.del td{background:var(--deletedBand);text-decoration:line-through;color:var(--deleted)}
+tr.add td.rn::after{content:'+';color:var(--added);float:left;font-weight:700}
+tr.del td.rn::after{content:'−';color:var(--deleted);float:left;font-weight:700}
+del{color:var(--deleted);text-decoration:line-through;margin-right:5px}
+ins{color:var(--added);text-decoration:none;font-weight:600}
+.tabs{display:flex;gap:4px;padding:5px 10px;background:var(--bgAlt);border-top:1px solid var(--border);font-size:12px}
+.tab{padding:3px 11px;border:1px solid var(--border);border-radius:5px 5px 0 0;background:#fafafa;display:flex;gap:5px;align-items:center}
+.tab.sel{background:#fff;font-weight:600;border-bottom-color:#fff}
+.badge{font-size:10px;padding:0 5px;border-radius:7px;font-weight:700}
+.badge.a{background:var(--addedBand);color:var(--added)}
+.badge.d{background:var(--deletedBand);color:var(--deleted)}
+.side{display:inline-block;margin-left:26px}
+</style></head><body>
+
+<h2>1 · File menu entry</h2>
+<p class="cap">Sits directly under <b>Open…</b>, before Open Recent — the two "bring files in" commands stay together. Enabled always; it does not act on the current window.</p>
+<div class="frame" style="width:520px">
+  <div class="tb"><div class="lights"><i class="l1"></i><i class="l2"></i><i class="l3"></i></div><div class="ttl">quarterly.xlsx</div></div>
+  <div class="menubar"><span>Table&nbsp;Viewer</span><span class="open">File</span><span>Edit</span><span>View</span><span>Window</span><span>Help</span></div>
+  <div class="menu">
+    <div class="mi"><span>New Window</span><span class="k">⌘N</span></div>
+    <div class="mi"><span>Open…</span><span class="k">⌘O</span></div>
+    <div class="mi hl"><span>Compare Files…</span><span class="k">⇧⌘O</span></div>
+    <div class="mi"><span>Open Recent</span><span class="k">›</span></div>
+    <div class="sep"></div>
+    <div class="mi"><span>Close</span><span class="k">⌘W</span></div>
+  </div>
+  <div style="height:14px"></div>
+</div>
+
+<h2>2 · Compare Files dialog — empty</h2>
+<p class="cap">A small fixed-size window, same chrome as Preferences. Two labelled fields so the direction is explicit and correctable before anything opens. <b>Compare</b> stays disabled until both paths resolve.</p>
+<div class="frame" style="width:560px">
+  <div class="tb"><div class="lights"><i class="l1"></i><i class="l2"></i><i class="l3"></i></div><div class="ttl">Compare Files</div></div>
+  <div class="body">
+    <p class="hint" style="margin:0 0 16px">Opens a read-only window showing the differences between two spreadsheets. Neither file is modified.</p>
+    <div class="field"><label>Original</label>
+      <div class="row"><input type="text" placeholder="Choose the earlier or baseline file…"><button>Browse…</button></div>
+      <div class="hint" style="margin-top:4px">Shown as the “before” side: its removed rows and old cell values.</div></div>
+    <div class="swap"><button>⇅&nbsp; Swap</button></div>
+    <div class="field" style="margin-bottom:4px"><label>Modified</label>
+      <div class="row"><input type="text" placeholder="Choose the file to compare against it…"><button>Browse…</button></div>
+      <div class="hint" style="margin-top:4px">Shown as the “after” side: added rows and new cell values.</div></div>
+  </div>
+  <div class="foot"><button>Cancel</button><button class="primary" disabled>Compare</button></div>
+</div>
+
+<h2>3 · Filled, and the two problem states</h2>
+<p class="cap">Left: both files chosen, ready. Middle: a path that no longer exists — inline, on the offending field, not a modal alert. Right: a cross-format pair — allowed (you chose “any two files”), so it warns rather than blocks.</p>
+<div class="frame" style="width:520px">
+  <div class="tb"><div class="lights"><i class="l1"></i><i class="l2"></i><i class="l3"></i></div><div class="ttl">Compare Files</div></div>
+  <div class="body">
+    <div class="field"><label>Original</label>
+      <div class="row"><input type="text" value="~/Reports/2025-Q3/quarterly.xlsx"><button>Browse…</button></div></div>
+    <div class="swap"><button>⇅&nbsp; Swap</button></div>
+    <div class="field" style="margin-bottom:0"><label>Modified</label>
+      <div class="row"><input type="text" value="~/Reports/2025-Q4/quarterly.xlsx"><button>Browse…</button></div></div>
+  </div>
+  <div class="foot"><button>Cancel</button><button class="primary">Compare</button></div>
+</div>
+<div class="frame side" style="width:430px">
+  <div class="tb"><div class="lights"><i class="l1"></i><i class="l2"></i><i class="l3"></i></div><div class="ttl">Compare Files</div></div>
+  <div class="body">
+    <div class="field"><label>Original</label>
+      <div class="row"><input type="text" value="~/Reports/old/quarterly.xlsx" style="border-color:#ad0707"><button>Browse…</button></div>
+      <div class="err" style="margin:8px 0 0">⚠️&nbsp;<span>That file no longer exists.</span></div></div>
+    <div class="swap"><button>⇅&nbsp; Swap</button></div>
+    <div class="field" style="margin-bottom:0"><label>Modified</label>
+      <div class="row"><input type="text" value="~/Reports/quarterly.xlsx"><button>Browse…</button></div></div>
+  </div>
+  <div class="foot"><button>Cancel</button><button class="primary" disabled>Compare</button></div>
+</div>
+<div class="frame side" style="width:430px">
+  <div class="tb"><div class="lights"><i class="l1"></i><i class="l2"></i><i class="l3"></i></div><div class="ttl">Compare Files</div></div>
+  <div class="body">
+    <div class="field"><label>Original</label>
+      <div class="row"><input type="text" value="~/exports/ledger.csv"><button>Browse…</button></div></div>
+    <div class="swap"><button>⇅&nbsp; Swap</button></div>
+    <div class="field"><label>Modified</label>
+      <div class="row"><input type="text" value="~/exports/ledger.xlsx"><button>Browse…</button></div></div>
+    <div class="err warn">⚠️&nbsp;<span>Different formats. The CSV is compared as a single sheet against “Sheet1”; other sheets will show as added.</span></div>
+  </div>
+  <div class="foot"><button>Cancel</button><button class="primary">Compare Anyway</button></div>
+</div>
+
+<h2>4 · The compare window</h2>
+<p class="cap">One grid, not two panes — the unified view the existing engine already produces. Title is <code>old ↔ new</code>. A header strip names both sides with the diff colors they own; a Read-only pill states why nothing is editable. Deleted rows keep the original's content, struck through; changed cells show <del>before</del> <ins>after</ins>; changed column headers get an accent underline; sheet tabs carry added/deleted badges.</p>
+<div class="frame" style="width:880px">
+  <div class="tb"><div class="lights"><i class="l1"></i><i class="l2"></i><i class="l3"></i></div><div class="ttl">quarterly.xlsx (Q3) ↔ quarterly.xlsx (Q4)</div></div>
+  <div class="strip">
+    <span class="pill o">− Original</span><span class="path">~/Reports/2025-Q3/quarterly.xlsx</span>
+    <span class="pill m" style="margin-left:14px">+ Modified</span><span class="path">~/Reports/2025-Q4/quarterly.xlsx</span>
+    <span class="ro">🔒 Read-only</span>
+  </div>
+  <div class="tools">
+    <span class="tog">Only changed rows</span><span class="tog">Formatted values</span>
+    <span class="counts"><b class="a">+12 added</b> · <b class="d">−4 deleted</b> · 37 changed cells</span>
+  </div>
+  <table>
+    <tr><th style="width:36px"></th><th>Region</th><th>Product</th><th class="chg">Net revenue</th><th>Units</th><th>Owner</th></tr>
+    <tr><td class="rn">1</td><td>North</td><td>Widget A</td><td><del>142,300</del> <ins>151,900</ins></td><td>1,204</td><td>Ada L.</td></tr>
+    <tr><td class="rn">2</td><td>North</td><td>Widget B</td><td>88,750</td><td>612</td><td>Ada L.</td></tr>
+    <tr class="del"><td class="rn">3</td><td>South</td><td>Widget C</td><td>31,020</td><td>288</td><td>Grace H.</td></tr>
+    <tr class="add"><td class="rn">4</td><td>South</td><td>Widget C2</td><td>44,610</td><td>331</td><td>Grace H.</td></tr>
+    <tr class="add"><td class="rn">5</td><td>South</td><td>Widget D</td><td>19,880</td><td>147</td><td>Grace H.</td></tr>
+    <tr><td class="rn">6</td><td>East</td><td>Widget A</td><td><del>97,400</del> <ins>97,410</ins></td><td><del>803</del> <ins>804</ins></td><td>Alan T.</td></tr>
+    <tr><td class="rn">7</td><td>West</td><td>Widget B</td><td>120,065</td><td>975</td><td>Alan T.</td></tr>
+  </table>
+  <div class="tabs">
+    <div class="tab sel">Summary</div>
+    <div class="tab">Detail</div>
+    <div class="tab">Forecast <span class="badge a">added</span></div>
+    <div class="tab">Archive <span class="badge d">deleted</span></div>
+  </div>
+</div>
+
+<h2>5 · Aligning, before any rows are shown</h2>
+<p class="cap">The alignment pass is not an optimisation — it is what makes the diff correct. Comparing row&nbsp;N to row&nbsp;N (what the Git path does today) reports every row below an inserted one as changed, so no rows are shown until the two sides have been aligned. The window opens immediately into this state, with a Cancel that closes it.</p>
+<div class="frame" style="width:880px">
+  <div class="tb"><div class="lights"><i class="l1"></i><i class="l2"></i><i class="l3"></i></div><div class="ttl">quarterly.xlsx (Q3) ↔ quarterly.xlsx (Q4)</div></div>
+  <div class="strip">
+    <span class="pill o">− Original</span><span class="path">~/Reports/2025-Q3/quarterly.xlsx</span>
+    <span class="pill m" style="margin-left:14px">+ Modified</span><span class="path">~/Reports/2025-Q4/quarterly.xlsx</span>
+    <span class="ro">🔒 Read-only</span>
+  </div>
+  <div style="height:300px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px">
+    <div style="font-weight:600">Comparing…</div>
+    <div class="bar" style="width:260px"><i style="width:58%"></i></div>
+    <div class="hint">Aligning rows · 412,000 of 900,000</div>
+    <button style="margin-top:6px">Cancel</button>
+  </div>
+</div>
+
+<h2>6 · When the files will not align</h2>
+<p class="cap">Two unrelated or fully re-sorted files make any content diff degenerate. The alignment stops after a bounded effort and falls back to comparing row&nbsp;N against row&nbsp;N — the grid is still shown, but the banner states plainly that the rows could not be matched up, so an all-changed grid is never mistaken for a real result.</p>
+<div class="frame" style="width:880px">
+  <div class="tb"><div class="lights"><i class="l1"></i><i class="l2"></i><i class="l3"></i></div><div class="ttl">ledger-a.csv ↔ ledger-b.csv</div></div>
+  <div class="err warn" style="margin:0;border-radius:0;border-left:0;border-right:0;border-top:0;padding:9px 14px">⚠️&nbsp;<span>These files were too dissimilar to match up row by row, so rows are compared by position instead. If the rows are in a different order, the differences below will overstate what actually changed.</span></div>
+  <div class="tools">
+    <span class="tog busy">Only changed rows</span><span class="tog">Formatted values</span>
+    <span class="counts">rows compared by position</span>
+  </div>
+  <table>
+    <tr><th style="width:36px"></th><th>Region</th><th>Product</th><th class="chg">Net revenue</th><th>Units</th></tr>
+    <tr><td class="rn">1</td><td><del>North</del> <ins>West</ins></td><td><del>Widget A</del> <ins>Widget D</ins></td><td><del>142,300</del> <ins>19,880</ins></td><td><del>1,204</del> <ins>147</ins></td></tr>
+    <tr><td class="rn">2</td><td><del>North</del> <ins>East</ins></td><td>Widget B</td><td><del>88,750</del> <ins>97,410</ins></td><td><del>612</del> <ins>804</ins></td></tr>
+  </table>
+</div>
+
+<h2>7 · Only changed rows, on</h2>
+<p class="cap">Unchanged rows drop out; the original row numbers are kept so a row stays findable in the real file, and a gap marker states what was skipped. Same grid, same paint rules — this is a filter over the diff, expressed through the transform layer the viewer already uses for sorts and filters.</p>
+<div class="frame" style="width:880px">
+  <div class="tb"><div class="lights"><i class="l1"></i><i class="l2"></i><i class="l3"></i></div><div class="ttl">quarterly.xlsx (Q3) ↔ quarterly.xlsx (Q4)</div></div>
+  <div class="tools">
+    <span class="tog on">Only changed rows</span><span class="tog">Formatted values</span>
+    <span class="counts"><b class="a">+12 added</b> · <b class="d">−4 deleted</b> · 37 changed cells</span>
+  </div>
+  <table>
+    <tr><th style="width:36px"></th><th>Region</th><th>Product</th><th class="chg">Net revenue</th><th>Units</th><th>Owner</th></tr>
+    <tr><td class="rn">1</td><td>North</td><td>Widget A</td><td><del>142,300</del> <ins>151,900</ins></td><td>1,204</td><td>Ada L.</td></tr>
+    <tr><td colspan="6" style="background:var(--bgAlt);color:var(--muted);font-family:var(--font);text-align:center">1 unchanged row hidden</td></tr>
+    <tr class="del"><td class="rn">3</td><td>South</td><td>Widget C</td><td>31,020</td><td>288</td><td>Grace H.</td></tr>
+    <tr class="add"><td class="rn">4</td><td>South</td><td>Widget C2</td><td>44,610</td><td>331</td><td>Grace H.</td></tr>
+    <tr class="add"><td class="rn">5</td><td>South</td><td>Widget D</td><td>19,880</td><td>147</td><td>Grace H.</td></tr>
+    <tr><td class="rn">6</td><td>East</td><td>Widget A</td><td><del>97,400</del> <ins>97,410</ins></td><td><del>803</del> <ins>804</ins></td><td>Alan T.</td></tr>
+    <tr><td colspan="6" style="background:var(--bgAlt);color:var(--muted);font-family:var(--font);text-align:center">1 unchanged row hidden</td></tr>
+  </table>
+</div>
+
+<h2>8 · What is deliberately absent</h2>
+<p class="cap" style="max-width:880px">
+No side-by-side split, no edit affordances, no Save. The window refuses edits at the host level, not just in the UI — the same guard the Git compare panel already uses. There is no “show changes” toggle: in a compare window the diff <em>is</em> the document, and switching it off would just show the modified file — which plain Open already does. “Only changed rows” and the change counts are the two genuinely new pieces of the viewer surface; the paint rules in mockup 4 are already implemented for Git diffs. The row <em>alignment</em>, however, is new: the Git path compares row N to row N, which is adequate for in-place working-tree edits and wrong for two arbitrary files.
+</p>
+</body></html>
