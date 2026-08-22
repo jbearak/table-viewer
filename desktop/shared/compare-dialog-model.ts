@@ -11,12 +11,14 @@ export type ComparePathState =
 
 /** Report a checked path as the state the field should render. */
 export function path_state(path: string, check: ComparePathCheck | undefined): ComparePathState {
-    const trimmed = path.trim();
-    if (trimmed === '') return { kind: 'empty' };
+    // Trimmed only to decide emptiness. The path itself is carried through as
+    // typed, because a filename may legitimately begin or end with a space and
+    // the state must name the file that was actually checked.
+    if (path.trim() === '') return { kind: 'empty' };
     if (!check) return { kind: 'empty' };
-    if (!check.exists) return { kind: 'missing', path: trimmed };
-    if (!check.supported) return { kind: 'unsupported', path: trimmed };
-    return { kind: 'ok', path: trimmed, extension: check.extension };
+    if (!check.exists) return { kind: 'missing', path };
+    if (!check.supported) return { kind: 'unsupported', path };
+    return { kind: 'ok', path, extension: check.extension };
 }
 
 /** The message a field shows under itself, or undefined when it is fine. */

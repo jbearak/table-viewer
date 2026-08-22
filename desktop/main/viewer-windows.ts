@@ -70,6 +70,8 @@ const ERR_ABORTED = -3;
 interface ViewerWindow {
     readonly filePath: string;
     readonly fileKey: string;
+    /** The original side, when this window is a comparison rather than a file. */
+    readonly comparePath?: string;
     readonly window: BrowserWindow;
     readonly panel: DesktopViewerPanel;
     readonly controller: ViewerController;
@@ -363,6 +365,14 @@ export class ViewerWindowManager {
     open_file_paths(): string[] {
         return this.windows
             .filter((entry) => !entry.window.isDestroyed())
+            // Comparisons are left out rather than reduced to their modified
+            // side. The restoration record holds bare paths, so a comparison
+            // written into it came back as an ordinary — and editable — window
+            // on the modified file, which is not what was open and quietly
+            // drops the read-only guarantee. Omitting it restores nothing,
+            // which is the honest of the two wrong answers; restoring the pair
+            // needs a format that can carry both sides.
+            .filter((entry) => entry.comparePath === undefined)
             .map((entry) => entry.filePath);
     }
     /** Source of `ViewerWindow.resize_seq`; monotonic across all windows. */
@@ -981,6 +991,7 @@ export class ViewerWindowManager {
         entry = {
             filePath: file_path,
             fileKey: file_key,
+            ...(compare ? { comparePath: compare.originalPath } : {}),
             window,
             panel,
             controller,

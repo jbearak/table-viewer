@@ -30,8 +30,12 @@ describe('path_state', () => {
         expect(path_state('/tmp/a.pdf', check({ supported: false })).kind).toBe('unsupported');
     });
 
-    it('trims the path it reports', () => {
-        expect(path_state('  /tmp/a.xlsx  ', check())).toMatchObject({ path: '/tmp/a.xlsx' });
+    it('reports the path as typed, so a padded filename survives', () => {
+        // Trimming here rewrote legal filenames: ' leading.csv' is a real file
+        // whose name starts with a space, and the dialog would check and open
+        // 'leading.csv' instead. Whitespace still only decides emptiness.
+        expect(path_state('  /tmp/a.xlsx  ', check())).toMatchObject({ path: '  /tmp/a.xlsx  ' });
+        expect(path_state('   ', check())).toEqual({ kind: 'empty' });
     });
 });
 

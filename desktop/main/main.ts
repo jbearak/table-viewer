@@ -133,6 +133,7 @@ import {
     CHANNEL_WELCOME_OPEN_FILES,
     CHANNEL_WELCOME_OPEN_PREFERENCES,
     type ComparePathCheck,
+    type CompareSubmitResult,
     type CompareFilesRequest,
     type PreferencesTarget,
 } from '../shared/ipc';
@@ -628,6 +629,10 @@ function submit_window_request(request: DesktopWindowRequest, source?: BrowserWi
             viewer_windows.open_comparison(action.originalPath, action.modifiedPath);
             // The dialog is done the moment the comparison is on screen.
             close_compare_window();
+            const launcher = source && welcome_windows.has(source) ? source : undefined;
+            if (launcher && launcher_steps_aside(true, true) && !launcher.isDestroyed()) {
+                launcher.close();
+            }
             return;
         }
         let opened_any = false;
@@ -712,8 +717,14 @@ async function show_open_dialog(source?: BrowserWindow): Promise<void> {
 /** The Compare Files dialog. Singleton, like Preferences: two of them would
  *  each be collecting a different pair with no way to tell them apart. */
 let compare_window: BrowserWindow | undefined;
+/** The welcome window a comparison was launched from, if any, so it can step
+ *  aside once the comparison is on screen — the same courtesy Open… does. Held
+ *  here rather than passed through the dialog because the submit arrives later,
+ *  over IPC, with no memory of what opened it. */
+let compare_source_window: BrowserWindow | undefined;
 
-function show_compare_window(): void {
+function show_compare_window(source?: BrowserWindow): void {
+    compare_source_window = source;
     if (compare_window && !compare_window.isDestroyed()) {
         compare_window.focus();
         return;
@@ -748,6 +759,7 @@ function show_compare_window(): void {
 function close_compare_window(): void {
     if (compare_window && !compare_window.isDestroyed()) compare_window.close();
     compare_window = undefined;
+    compare_source_window = undefined;
 }
 
 function show_preferences_window(target?: PreferencesTarget): void {
@@ -986,7 +998,11 @@ function build_menu(): void {
                     // on nothing that is already open, so it is always enabled.
                     label: 'Compare Files…',
                     accelerator: 'CmdOrCtrl+Shift+O',
-                    click: () => show_compare_window(),
+                    // Carries the initiating window for the same reason Open…
+                    // does: a comparison launched from the welcome window should
+                    // replace it, not open behind it.
+                    click: (_item, window) =>
+                        show_compare_window(window as BrowserWindow | undefined),
                 },
                 ...(is_mac
                     ? [{
@@ -1241,18 +1257,33 @@ function register_ipc(): void {
     };
     ipcMain.handle(CHANNEL_COMPARE_CHECK_PATH, (_event, file_path: unknown) =>
         check_compare_path(file_path));
-    ipcMain.on(CHANNEL_COMPARE_SUBMIT, (_event, request: unknown) => {
+    ipcMain.handle(CHANNEL_COMPARE_SUBMIT, (_event, request: unknown): CompareSubmitResult => {
         // Re-validated here rather than trusted from the renderer: the dialog
         // has already checked, but this is the boundary that opens a window,
         // and the file may have gone away since the check in any case.
-        if (typeof request !== 'object' || request === null) return;
+        if (typeof request !== 'object' || request === null) return { accepted: false };
         const { originalPath, modifiedPath } = request as Partial<CompareFilesRequest>;
-        if (typeof originalPath !== 'string' || typeof modifiedPath !== 'string') return;
-        for (const candidate of [originalPath, modifiedPath]) {
-            const check = check_compare_path(candidate);
-            if (!check.exists || !check.supported) return;
+        if (typeof originalPath !== 'string' || typeof modifiedPath !== 'string') {
+            return { accepted: false };
         }
-        submit_window_request({ kind: 'compare-files', originalPath, modifiedPath });
+        const checks = {
+            original: check_compare_path(originalPath),
+            modified: check_compare_path(modifiedPath),
+        };
+        // The fresh verdicts go back either way. Returning silently on failure
+        // left the dialog showing its stale successful checks, with Compare
+        // enabled and every further click doing nothing visible.
+        const usable = (check: ComparePathCheck) => check.exists && check.supported;
+        if (!usable(checks.original) || !usable(checks.modified)) {
+            return { accepted: false, checks };
+        }
+        const launcher = compare_source_window;
+        compare_source_window = undefined;
+        submit_window_request(
+            { kind: 'compare-files', originalPath, modifiedPath },
+            launcher && !launcher.isDestroyed() ? launcher : undefined,
+        );
+        return { accepted: true, checks };
     });
     ipcMain.on(CHANNEL_COMPARE_CANCEL, () => close_compare_window());
     ipcMain.handle(CHANNEL_PREFS_GET, () => config_store.settings());
@@ -1333,6 +1364,7 @@ function broadcast_theme(): void {
         about_window,
         state_inspector_window,
         app_update_window,
+        compare_window,
     ]) {
         if (window && !window.isDestroyed()) window.setBackgroundColor(background);
     }

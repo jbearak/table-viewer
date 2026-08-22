@@ -102,8 +102,21 @@ export interface ComparePathCheck {
 export const CHANNEL_COMPARE_BROWSE = 'compare:browse';
 /** Renderer → main: does this typed path exist and can it be opened? */
 export const CHANNEL_COMPARE_CHECK_PATH = 'compare:checkPath';
-/** Renderer → main: open the compare window for these two files. */
+/** Renderer → main: open the compare window for these two files. Answers rather
+ *  than fires and forgets: main re-validates both paths at this boundary, and a
+ *  file that vanished between the check and the click has to be reported, or the
+ *  dialog sits there with Compare enabled and clicks doing nothing. */
 export const CHANNEL_COMPARE_SUBMIT = 'compare:submit';
+
+/** Main's answer to a submit: which side failed re-validation, if either. */
+export interface CompareSubmitResult {
+    readonly accepted: boolean;
+    /** Fresh verdicts for the paths that were re-checked, by side. */
+    readonly checks?: {
+        readonly original: ComparePathCheck;
+        readonly modified: ComparePathCheck;
+    };
+}
 /** Renderer → main: close the dialog without comparing. */
 export const CHANNEL_COMPARE_CANCEL = 'compare:cancel';
 

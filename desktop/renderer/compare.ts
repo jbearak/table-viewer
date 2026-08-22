@@ -69,8 +69,11 @@ function render(): void {
 
 async function check_side(side: Side): Promise<void> {
     const token = ++check_tokens[side];
-    const path = inputs[side].value.trim();
-    if (path === '') {
+    // Checked as typed. A filename may legitimately begin or end with a space,
+    // so trimming before the check asks about a different file than the one
+    // that will be opened — `trim()` here is only for the emptiness test.
+    const path = inputs[side].value;
+    if (path.trim() === '') {
         checks[side] = undefined;
         render();
         return;
@@ -95,6 +98,12 @@ const browse = async (side: Side): Promise<void> => {
     const chosen = await compare_api.browse(side);
     if (chosen === undefined) return;
     inputs[side].value = chosen;
+    // Cleared before the check, exactly as the input handler does. Leaving the
+    // previous path's verdict standing kept Compare enabled while the new path
+    // was still being checked, so a click in that window submitted the new
+    // selection on the strength of the old one's answer.
+    checks[side] = undefined;
+    render();
     await check_side(side);
 };
 
@@ -108,17 +117,39 @@ swap_button.addEventListener('click', () => {
     const original_check = checks.original;
     checks.original = checks.modified;
     checks.modified = original_check;
-    // Both sides already have verdicts; swapping them is enough, and re-checking
-    // would flash the fields empty for no reason.
+    // The verdicts move with their paths, but a check still in flight does not:
+    // it would land on whichever side its token names, which is now the other
+    // path's. Retiring both tokens drops those answers on arrival.
+    check_tokens.original++;
+    check_tokens.modified++;
+    // A side whose verdict had not arrived yet has nothing to swap, so re-ask
+    // for it. Sides that already answered are left alone rather than re-checked,
+    // which would flash the fields empty for no reason.
+    const pending: Side[] = (['original', 'modified'] as const)
+        .filter((side) => checks[side] === undefined && inputs[side].value.trim() !== '');
     render();
+    for (const side of pending) void check_side(side);
 });
 
 compare_button.addEventListener('click', () => {
     if (compare_button.disabled) return;
-    compare_api.submit({
-        originalPath: inputs.original.value.trim(),
-        modifiedPath: inputs.modified.value.trim(),
-    });
+    void (async () => {
+        const result = await compare_api.submit({
+            // Submitted as typed, for the same reason `check_side` checks as
+            // typed: the path that was validated has to be the path opened.
+            originalPath: inputs.original.value,
+            modifiedPath: inputs.modified.value,
+        });
+        // Accepted means the window is opening and this dialog is closing, so
+        // there is nothing left to render. A rejection means main re-checked
+        // and found a file gone or unreadable since the dialog last asked;
+        // adopting those verdicts is what puts the error under the field and
+        // takes Compare out of the enabled state the stale check left it in.
+        if (result.accepted || !result.checks) return;
+        checks.original = result.checks.original;
+        checks.modified = result.checks.modified;
+        render();
+    })();
 });
 
 cancel_button.addEventListener('click', () => compare_api.cancel());
@@ -129,8 +160,12 @@ document.addEventListener('keydown', (event) => {
         return;
     }
     // Enter submits from either field, the way a native dialog does — but only
-    // when there is something to submit.
-    if (event.key === 'Enter' && !compare_button.disabled) {
+    // when there is something to submit, and only from the fields. A focused
+    // Cancel, Swap or Browse gets Enter natively; submitting as well would
+    // both cancel and compare on one keypress.
+    const focused = document.activeElement;
+    const from_field = focused === inputs.original || focused === inputs.modified;
+    if (event.key === 'Enter' && from_field && !compare_button.disabled) {
         compare_button.click();
     }
 });

@@ -1427,6 +1427,34 @@ export function attach_viewer(
     })();
     disposables.push(refresh_subscription);
 
+    // The coordinator watches the file this panel is attached to, which in a
+    // comparison is only the modified side. The original is just as live —
+    // regenerate it and the window would otherwise keep showing a diff against
+    // bytes that no longer exist — so it gets a watcher of its own here.
+    // `refresh_if_changed` re-stats both sides and rebuilds only on a real
+    // change, so an event that turns out to be noise costs two stats.
+    if (compare_original_uri) {
+        try {
+            const original_watcher = host.refreshWatcherFactory.create(
+                create_resource_identity(compare_original_uri),
+            );
+            const listener = original_watcher.on_event(() => {
+                if (disposed) return;
+                void refresh_if_changed().catch(() => {});
+            });
+            disposables.push({
+                dispose() {
+                    listener.dispose();
+                    original_watcher.dispose();
+                },
+            });
+        } catch (error) {
+            // A missing watcher degrades the window to manual refresh; it must
+            // not take the comparison down with it.
+            log_sanitized_failure('Failed to watch the comparison original', error);
+        }
+    }
+
     function edit_phase(): CsvEditFilePhase {
         return file_edit_state?.phase ?? { type: 'free' };
     }

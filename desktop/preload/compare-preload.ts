@@ -11,6 +11,7 @@ import {
     CHANNEL_THEME_CHANGED,
     type ComparePathCheck,
     type CompareFilesRequest,
+    type CompareSubmitResult,
 } from '../shared/ipc';
 import { titlebar_preload_api, type TitlebarApi } from './titlebar-api';
 import type { ThemePayload } from '../main/theme';
@@ -20,7 +21,7 @@ export interface CompareApi extends TitlebarApi {
     /** Native picker for one side; resolves undefined when cancelled. */
     browse(side: 'original' | 'modified'): Promise<string | undefined>;
     check_path(path: string): Promise<ComparePathCheck>;
-    submit(request: CompareFilesRequest): void;
+    submit(request: CompareFilesRequest): Promise<CompareSubmitResult>;
     cancel(): void;
     get_settings(): Promise<DesktopSettings>;
     get_theme(): ThemePayload;
@@ -32,7 +33,7 @@ const api: CompareApi = {
     ...titlebar_preload_api(),
     browse: (side) => ipcRenderer.invoke(CHANNEL_COMPARE_BROWSE, side),
     check_path: (path) => ipcRenderer.invoke(CHANNEL_COMPARE_CHECK_PATH, path),
-    submit: (request) => ipcRenderer.send(CHANNEL_COMPARE_SUBMIT, request),
+    submit: (request) => ipcRenderer.invoke(CHANNEL_COMPARE_SUBMIT, request),
     cancel: () => ipcRenderer.send(CHANNEL_COMPARE_CANCEL),
     get_settings: () => ipcRenderer.invoke(CHANNEL_PREFS_GET),
     get_theme: () => ipcRenderer.sendSync(CHANNEL_GET_THEME) as ThemePayload,
