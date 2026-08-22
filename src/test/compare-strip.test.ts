@@ -179,7 +179,39 @@ describe('CompareStrip', () => {
 
     it('omits the side strip for a Git diff, whose original is not a path', async () => {
         await strip();
-        expect(text()).not.toContain('Read-only');
+        expect(container!.querySelector('.compare-strip-sides')).toBeNull();
+        // Read-only rides on the counts row, not the side strip, so the one
+        // window that has no side strip still says it cannot be edited.
+        expect(text()).toContain('Read-only');
+    });
+
+    it('omits the side strip when both sides name the same file', async () => {
+        // A Git diff opened on a working-tree file compares two revisions of
+        // one path, so naming it twice tells the reader nothing.
+        await strip({
+            sides: {
+                originalPath: '/Reports/quarterly.xlsx',
+                modifiedPath: '/Reports/quarterly.xlsx',
+            },
+        });
+        expect(container!.querySelector('.compare-strip-sides')).toBeNull();
+        expect(text()).toContain('Read-only');
+    });
+
+    it('keeps the path as one left-to-right run inside the truncating span', async () => {
+        // The span truncates right-to-left to preserve the filename; without
+        // `bdi` the leading separator reorders to the visual end.
+        await strip({
+            sides: {
+                originalPath: '/Reports/a.xlsx',
+                modifiedPath: '/Reports/b.xlsx',
+            },
+        });
+        const paths = container!.querySelectorAll('.compare-strip-side-path');
+        expect(paths).toHaveLength(2);
+        for (const path of paths) {
+            expect(path.firstElementChild?.tagName.toLowerCase()).toBe('bdi');
+        }
     });
 
     it('announces the outcome, without re-reading it when the toggle is pressed', async () => {

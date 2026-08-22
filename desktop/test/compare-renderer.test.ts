@@ -217,7 +217,6 @@ describe('compare dialog renderer', () => {
         // past the 350ms debounce: a fixed delay that clears locally is a CI
         // flake already written, and it costs the run that time on every pass.
         await vi.waitFor(() => expect(api.check_path).toHaveBeenCalledWith('/tmp/me'));
-        await settle();
         expect(input('originalPath').value).toBe('/tmp/me');
 
         compare_button().click();

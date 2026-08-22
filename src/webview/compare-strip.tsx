@@ -66,28 +66,40 @@ export function CompareStrip({
         && counts.movedRows === 0
         && counts.changedCells === 0;
     const unchanged = no_counted_changes && !other_differences;
+    // A Git diff compares two revisions of one file, so both sides carry the
+    // same path and the bar answers a question nobody asked. The paths are the
+    // test rather than a flavour flag: identical paths are precisely the case
+    // where naming them twice communicates nothing.
+    const named_sides = sides !== undefined && sides.originalPath !== sides.modifiedPath
+        ? sides
+        : undefined;
     return (
         <div className="compare-strip">
-            {sides && (
-                // Which file is which, and why nothing can be edited. Two files
-                // under comparison frequently share a basename, and the window
-                // title carries only those, so the full paths belong here.
+            {named_sides && (
+                // Which file is which. Two files under comparison frequently
+                // share a basename, and the window title carries only those, so
+                // the full paths belong here.
                 <div className="compare-strip-sides">
                     <span className="compare-strip-side">
                         <span className="compare-strip-side-mark" aria-hidden="true">−</span>
                         <span className="compare-strip-side-label">Original</span>
-                        <span className="compare-strip-side-path" title={sides.originalPath}>
-                            {sides.originalPath}
+                        <span className="compare-strip-side-path" title={named_sides.originalPath}>
+                            {/* The span truncates right-to-left so a long path
+                              * keeps its filename; `bdi` re-establishes the
+                              * path itself as one left-to-right run, without
+                              * which bidi reordering moves the leading `/` to
+                              * the visual end and the toolbar reads
+                              * `Users/…/x.csv/`. */}
+                            <bdi>{named_sides.originalPath}</bdi>
                         </span>
                     </span>
                     <span className="compare-strip-side">
                         <span className="compare-strip-side-mark" aria-hidden="true">+</span>
                         <span className="compare-strip-side-label">Modified</span>
-                        <span className="compare-strip-side-path" title={sides.modifiedPath}>
-                            {sides.modifiedPath}
+                        <span className="compare-strip-side-path" title={named_sides.modifiedPath}>
+                            <bdi>{named_sides.modifiedPath}</bdi>
                         </span>
                     </span>
-                    <span className="compare-strip-readonly">Read-only</span>
                 </div>
             )}
             {degraded && (
@@ -114,7 +126,11 @@ export function CompareStrip({
             <div className="compare-strip-row">
                 <button
                     type="button"
-                    className={`compare-strip-toggle${only_changed_rows ? ' is-on' : ''}`}
+                    // The toolbar's own toggle palette, not a parallel one:
+                    // a bespoke copy had drifted from it in five ways, the
+                    // worst being an unscoped :hover that replaced the active
+                    // fill while keeping the light-on-dark foreground.
+                    className={`toggle compare-strip-toggle${only_changed_rows ? ' active' : ''}`}
                     aria-pressed={only_changed_rows}
                     // Nothing to filter down to when the rows could not be
                     // matched up, or when no row or cell differs.
@@ -167,6 +183,10 @@ export function CompareStrip({
                             </>
                         )}
                 </div>
+                {/* Read-only lives here rather than with the paths: the paths
+                  * are suppressed for a Git diff, and that window is read-only
+                  * too. */}
+                <span className="compare-strip-readonly">Read-only</span>
             </div>
         </div>
     );

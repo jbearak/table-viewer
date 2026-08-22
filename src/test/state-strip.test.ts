@@ -76,6 +76,37 @@ describe('StateStrip', () => {
         expect(container.innerHTML).toBe('');
     });
 
+    it('stays up for "Only changed rows", so the toggle does not flash the strip', () => {
+        // The strip used to mount only for the duration of the toggle's own
+        // transform: pending true mounted it, pending false unmounted it, and
+        // the grid jumped down and back within a fraction of a second.
+        const { container, rerender } = render_strip({
+            transform: { sort: [], filters: [], onlyChangedRows: true },
+            transform_pending: true,
+        });
+        expect(container.querySelector('.state-strip')).not.toBeNull();
+
+        rerender({ transform_pending: false });
+        expect(container.querySelector('.state-strip')).not.toBeNull();
+        expect(container.textContent).toContain('Only changed rows');
+    });
+
+    it('turns the compare filter off from its chip', () => {
+        const on_transform_change = vi.fn();
+        render_strip({
+            transform: { sort: [], filters: [], onlyChangedRows: true },
+            on_transform_change,
+        });
+        act(() => {
+            get_button('Show all').dispatchEvent(
+                new MouseEvent('click', { bubbles: true }),
+            );
+        });
+        expect(on_transform_change).toHaveBeenCalledWith(
+            expect.objectContaining({ onlyChangedRows: false }),
+        );
+    });
+
     it('appears for a sort alone, and for a filter alone', () => {
         const { container, rerender } = render_strip({
             transform: { sort: [{ colIndex: 1, direction: 'asc' }], filters: [] },

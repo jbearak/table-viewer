@@ -501,8 +501,8 @@ describe('compare mode controller', () => {
         // one used to run to completion — on a large file that is real time
         // spent on a result already thrown away, and its progress reports still
         // reached the renderer, sending the one bar backwards.
-        const big_modified = `h\n${Array.from({ length: 4_000 }, (_, i) => `r${i}`).join('\n')}\n`;
-        const big_original = `h\n${Array.from({ length: 4_000 }, (_, i) => `q${i}`).join('\n')}\n`;
+        const big_modified = `h\n${Array.from({ length: 30_000 }, (_, i) => `r${i}`).join('\n')}\n`;
+        const big_original = `h\n${Array.from({ length: 30_000 }, (_, i) => `q${i}`).join('\n')}\n`;
         vscode_mock.__setStatImplementation(async (uri) =>
             (String(uri.fsPath ?? uri).includes('original')
                 ? { size: big_original.length, mtime: 1 }
@@ -519,6 +519,7 @@ describe('compare mode controller', () => {
         // actually stopped.
         let reads_after_supersede = 0;
         let counting = false;
+        let on_read: (() => void) | undefined;
         const counting_profile: ViewerProfile = {
             ...csv_table_profile(),
             async build_source(raw, file_path, state, extra) {
@@ -529,6 +530,7 @@ describe('compare mode controller', () => {
                         const value = Reflect.get(target, property, receiver);
                         if (property !== 'read_rows' || typeof value !== 'function') return value;
                         return (...args: unknown[]) => {
+                            on_read?.();
                             if (counting) reads_after_supersede++;
                             return (value as (...a: unknown[]) => unknown).apply(target, args);
                         };
@@ -558,7 +560,16 @@ describe('compare mode controller', () => {
                 : revised()));
 
         // Supersede while the alignment is under way, then let both settle.
+        // "Under way" has to be observed, not assumed: `first` yields several
+        // times during source construction, so starting `second` straight after
+        // it can supersede a load that has not reached `align_workbook` at all,
+        // and the test would then pass on a build that only cancels before
+        // alignment begins. The first row read is that observation.
+        let first_read: () => void;
+        const alignment_started = new Promise<void>((resolve) => { first_read = resolve; });
+        on_read = () => first_read();
         const first = controller.refresh_if_changed();
+        await alignment_started;
         revision = 3;
         const second = controller.refresh_if_changed();
         counting = true;
@@ -567,22 +578,18 @@ describe('compare mode controller', () => {
         await vi.waitFor(() =>
             expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThanOrEqual(2));
 
-        // Progress still tracks forward, but it is corroboration, not the
-        // proof: `onProgress` carries a supersede check of its own.
-        const reports = posted(panel, 'compareProgress') as unknown as {
-            scannedRows: number;
-        }[];
-        expect(reports).toHaveLength(2);
+        // One alignment's worth of reads after the supersede, not two. The
+        // superseded one roughly doubles it — 118 against 228 as measured —
+        // because it re-walks every row the live one is already walking. The
+        // bound sits between those and well clear of both; the counts are
+        // fixed by batch size and row count, not by timing.
+        expect(reads_after_supersede).toBeLessThan(170);
 
-        // The real assertion: one alignment's worth of reads after the
-        // supersede, not two. A stale alignment that keeps going doubles this
-        // exactly, because it re-walks the same rows the live one is walking.
-        expect(reads_after_supersede).toBeLessThan(24);
-        let previous = 0;
-        for (const report of reports) {
-            expect(report.scannedRows).toBeGreaterThanOrEqual(previous);
-            previous = report.scannedRows;
-        }
+        // Deliberately NOT asserted: that progress never goes backwards. It
+        // does, legitimately — the superseding load is a new alignment and its
+        // bar restarts from the first batch. Progress cannot answer this
+        // question in any case: `onProgress` fires only while hashing, and the
+        // phases a supersede cuts short report nothing at all.
     });
 
     it('degrades when the original cannot stabilize during validation', async () => {

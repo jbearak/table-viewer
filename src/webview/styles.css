@@ -1683,30 +1683,9 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
     padding: 5px 10px;
 }
 
-.compare-strip-toggle {
-    font: inherit;
-    padding: 3px 9px;
-    border-radius: 4px;
-    border: 1px solid var(--vscode-input-border, #3c3c3c);
-    background: var(--vscode-button-secondaryBackground, #3a3d41);
-    color: var(--vscode-button-secondaryForeground, var(--vscode-foreground, #ccc));
-    cursor: pointer;
-}
-
-.compare-strip-toggle:hover:not(:disabled) {
-    background: var(--vscode-list-hoverBackground, #2a2d2e);
-}
-
-.compare-strip-toggle.is-on {
-    background: var(--vscode-button-background, #0e639c);
-    border-color: var(--vscode-button-background, #0e639c);
-    color: var(--vscode-button-foreground, #fff);
-}
-
-.compare-strip-toggle:disabled {
-    opacity: 0.5;
-    cursor: default;
-}
+/* Deliberately empty of palette: the button carries `.toggle` and takes the
+   toolbar's inactive, hover, active and disabled colours from it. This class
+   is only a hook for tests and for any compare-specific layout. */
 
 .compare-strip-counts {
     margin-left: auto;
@@ -1774,8 +1753,8 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
     background: var(--vscode-list-hoverBackground, #2a2d2e);
 }
 
-/* Which file is which, and why nothing is editable. Above the counts row
-   because it identifies the document rather than describing the findings. */
+/* Which file is which. Above the counts row because it identifies the document
+   rather than describing the findings. */
 .compare-strip-sides {
     display: flex;
     align-items: center;
@@ -1818,8 +1797,10 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
     text-align: left;
 }
 
+/* Sits at the end of the counts row, which `.compare-strip-counts` has already
+   pushed right, so no auto margin of its own — two would split the slack and
+   strand the pill mid-row. */
 .compare-strip-readonly {
-    margin-left: auto;
     padding: 1px 8px;
     border-radius: 10px;
     border: 1px solid var(--vscode-input-border, #3c3c3c);
