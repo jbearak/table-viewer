@@ -3695,6 +3695,14 @@ export function attach_viewer(
                 pairings: adopted.pairings,
                 sheetStatuses: adopted.sheetStatuses,
                 changedColumnNames: adopted.changedColumnNames,
+                ...(compare_original_uri
+                    ? {
+                        sides: {
+                            originalPath: compare_original_uri.fsPath,
+                            modifiedPath: file_path,
+                        },
+                    }
+                    : {}),
                 counts: adopted.change_counts(),
                 degraded: adopted.degraded,
             },

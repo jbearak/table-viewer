@@ -1007,7 +1007,7 @@ describe('git compare mode', () => {
                     sheetStatuses: statuses,
                     changedColumnNames: sheet_names.map(() => []),
                     counts: {
-                        addedRows: 0, deletedRows: 0, changedRows: 0, changedCells: 0,
+                        addedRows: 0, deletedRows: 0, changedCells: 0,
                     },
                     degraded: false,
                 },
@@ -1044,7 +1044,7 @@ describe('git compare mode', () => {
                     sheetStatuses: ['matched'],
                     changedColumnNames: [[{ col: 0, base: 'old name' }]],
                     counts: {
-                        addedRows: 0, deletedRows: 0, changedRows: 0, changedCells: 0,
+                        addedRows: 0, deletedRows: 0, changedCells: 0,
                     },
                     degraded: false,
                 },

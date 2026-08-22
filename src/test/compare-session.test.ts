@@ -234,7 +234,6 @@ describe('CompareDataSource with a content alignment', () => {
         expect(source.change_counts()).toEqual({
             addedRows: 3,      // one row in Kept, two from the whole Fresh sheet
             deletedRows: 0,
-            changedRows: 1,
             changedCells: 1,
         });
     });

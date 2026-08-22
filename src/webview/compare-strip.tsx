@@ -3,11 +3,18 @@ import React from 'react';
 export interface CompareStripCounts {
     readonly addedRows: number;
     readonly deletedRows: number;
-    readonly changedRows: number;
     readonly changedCells: number;
 }
 
+export interface CompareSides {
+    readonly originalPath: string;
+    readonly modifiedPath: string;
+}
+
 export interface CompareStripProps {
+    /** The two files, named so the diff colours have an owner. Absent for a
+     *  Git SCM diff, where the "original" is a revision rather than a path. */
+    readonly sides?: CompareSides;
     readonly counts: CompareStripCounts;
     /** The aligner could not match the rows up and compared by position. */
     readonly degraded: boolean;
@@ -38,6 +45,7 @@ function plural(count: number, noun: string): string {
  * turning it off would leave the modified file, which plain Open already shows.
  */
 export function CompareStrip({
+    sides,
     counts,
     degraded,
     other_differences = false,
@@ -51,6 +59,28 @@ export function CompareStrip({
     const unchanged = no_counted_changes && !other_differences;
     return (
         <div className="compare-strip">
+            {sides && (
+                // Which file is which, and why nothing can be edited. Two files
+                // under comparison frequently share a basename, and the window
+                // title carries only those, so the full paths belong here.
+                <div className="compare-strip-sides">
+                    <span className="compare-strip-side">
+                        <span className="compare-strip-side-mark" aria-hidden="true">−</span>
+                        <span className="compare-strip-side-label">Original</span>
+                        <span className="compare-strip-side-path" title={sides.originalPath}>
+                            {sides.originalPath}
+                        </span>
+                    </span>
+                    <span className="compare-strip-side">
+                        <span className="compare-strip-side-mark" aria-hidden="true">+</span>
+                        <span className="compare-strip-side-label">Modified</span>
+                        <span className="compare-strip-side-path" title={sides.modifiedPath}>
+                            {sides.modifiedPath}
+                        </span>
+                    </span>
+                    <span className="compare-strip-readonly">Read-only</span>
+                </div>
+            )}
             {degraded && (
                 // role="status" rather than "alert": it is a caveat about the
                 // grid the user is about to read, not an interruption.

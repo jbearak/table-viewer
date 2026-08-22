@@ -5,7 +5,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CompareStrip, type CompareStripProps } from '../webview/compare-strip';
 
-const COUNTS = { addedRows: 12, deletedRows: 4, changedRows: 9, changedCells: 37 };
+const COUNTS = { addedRows: 12, deletedRows: 4, changedCells: 37 };
 
 let container: HTMLDivElement | undefined;
 let root: Root | undefined;
@@ -47,7 +47,7 @@ describe('CompareStrip', () => {
 
     it('does not say "1 rows"', async () => {
         await strip({
-            counts: { addedRows: 1, deletedRows: 1, changedRows: 1, changedCells: 1 },
+            counts: { addedRows: 1, deletedRows: 1, changedCells: 1 },
         });
         expect(text()).toMatch(/1 row added/u);
         expect(text()).toMatch(/1 row deleted/u);
@@ -57,7 +57,7 @@ describe('CompareStrip', () => {
 
     it('says so plainly when the files match, and offers nothing to filter', async () => {
         await strip({
-            counts: { addedRows: 0, deletedRows: 0, changedRows: 0, changedCells: 0 },
+            counts: { addedRows: 0, deletedRows: 0, changedCells: 0 },
         });
         expect(text()).toContain('No differences found.');
         expect(toggle().disabled).toBe(true);
@@ -100,7 +100,7 @@ describe('CompareStrip', () => {
         // Header renames and one-sided sheets are annotated in the grid and the
         // tabs but are not rows or cells, so the counts alone cannot answer this.
         await strip({
-            counts: { addedRows: 0, deletedRows: 0, changedRows: 0, changedCells: 0 },
+            counts: { addedRows: 0, deletedRows: 0, changedCells: 0 },
             other_differences: true,
         });
         expect(text()).not.toContain('No differences found.');
@@ -116,6 +116,28 @@ describe('CompareStrip', () => {
     it('waits for transform work in flight', async () => {
         await strip({ filter_pending: true });
         expect(toggle().disabled).toBe(true);
+    });
+
+    it('names both sides with their full paths, and says why it is read-only', async () => {
+        // Basenames alone are not enough: the same report from two quarters
+        // has the same name on both sides, and the window title carries only
+        // those.
+        await strip({
+            sides: {
+                originalPath: '/Reports/2025-Q3/quarterly.xlsx',
+                modifiedPath: '/Reports/2025-Q4/quarterly.xlsx',
+            },
+        });
+        expect(text()).toContain('Original');
+        expect(text()).toContain('/Reports/2025-Q3/quarterly.xlsx');
+        expect(text()).toContain('Modified');
+        expect(text()).toContain('/Reports/2025-Q4/quarterly.xlsx');
+        expect(text()).toContain('Read-only');
+    });
+
+    it('omits the side strip for a Git diff, whose original is not a path', async () => {
+        await strip();
+        expect(text()).not.toContain('Read-only');
     });
 
     it('has no show-changes toggle: the diff is the document', async () => {

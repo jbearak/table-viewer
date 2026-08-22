@@ -78,11 +78,19 @@ export interface WorkbookSnapshotCompare {
     /** Changed promoted column headers per modified sheet, positionally
      *  matching `meta.sheets`; empty for sheets without header changes. */
     readonly changedColumnNames: readonly (readonly { col: number; base: string }[])[];
+    /**
+     * The two sides, for display. Paths rather than names: two files being
+     * compared often share a basename (the same report from two quarters), and
+     * a strip that showed only the names could not tell them apart.
+     */
+    readonly sides?: {
+        readonly originalPath: string;
+        readonly modifiedPath: string;
+    };
     /** Whole-comparison change totals, for the compare window's counts. */
     readonly counts: {
         readonly addedRows: number;
         readonly deletedRows: number;
-        readonly changedRows: number;
         readonly changedCells: number;
     };
     /**

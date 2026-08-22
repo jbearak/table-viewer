@@ -5636,6 +5636,7 @@ export function App(): React.JSX.Element {
     const compare_strip = git_compare
         ? (
             <CompareStrip
+                {...(git_compare.sides ? { sides: git_compare.sides } : {})}
                 counts={git_compare.counts}
                 degraded={git_compare.degraded}
                 other_differences={

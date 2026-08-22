@@ -32,7 +32,7 @@ describe('align_sheet', () => {
         const alignment = await align_sheet(single(rows), single(rows), matched);
         expect(shape(alignment.rows)).toEqual(['0,0', '1,1', '2,2']);
         expect(alignment).toMatchObject({
-            addedRows: 0, deletedRows: 0, changedRows: 0, changedCells: 0, degraded: false,
+            addedRows: 0, deletedRows: 0, changedCells: 0, degraded: false,
         });
     });
 
@@ -45,7 +45,7 @@ describe('align_sheet', () => {
         );
         expect(shape(alignment.rows)).toEqual(['0,0', '-,1', '1,2', '2,3']);
         expect(alignment).toMatchObject({
-            addedRows: 1, deletedRows: 0, changedRows: 0, changedCells: 0,
+            addedRows: 1, deletedRows: 0, changedCells: 0,
         });
     });
 
@@ -56,7 +56,7 @@ describe('align_sheet', () => {
             matched,
         );
         expect(shape(alignment.rows)).toEqual(['0,0', '1,-', '2,1']);
-        expect(alignment).toMatchObject({ addedRows: 0, deletedRows: 1, changedRows: 0 });
+        expect(alignment).toMatchObject({ addedRows: 0, deletedRows: 1 });
     });
 
     it('reports an in-place edit as a changed row, with no add or delete', async () => {
@@ -67,7 +67,7 @@ describe('align_sheet', () => {
         );
         expect(shape(alignment.rows)).toEqual(['0,0', '1,1']);
         expect(alignment).toMatchObject({
-            addedRows: 0, deletedRows: 0, changedRows: 1, changedCells: 1,
+            addedRows: 0, deletedRows: 0, changedCells: 1,
         });
     });
 
@@ -78,7 +78,7 @@ describe('align_sheet', () => {
             matched,
         );
         expect(alignment).toMatchObject({
-            addedRows: 1, deletedRows: 1, changedRows: 0, changedCells: 0,
+            addedRows: 1, deletedRows: 1, changedCells: 0,
         });
     });
 
@@ -91,7 +91,7 @@ describe('align_sheet', () => {
             matched,
         );
         expect(alignment).toMatchObject({
-            addedRows: 2, deletedRows: 0, changedRows: 3, changedCells: 3,
+            addedRows: 2, deletedRows: 0, changedCells: 3,
         });
     });
 
@@ -105,7 +105,7 @@ describe('align_sheet', () => {
             matched,
         );
         expect(alignment).toMatchObject({
-            addedRows: 1, deletedRows: 1, changedRows: 0, changedCells: 0,
+            addedRows: 1, deletedRows: 1, changedCells: 0,
         });
     });
 
@@ -143,7 +143,7 @@ describe('align_sheet', () => {
             single([['a', 'b']]),
             matched,
         );
-        expect(alignment).toMatchObject({ changedRows: 1, changedCells: 1 });
+        expect(alignment).toMatchObject({ changedCells: 1 });
     });
 
     it('compares rows of differing width against the wider column count', async () => {
@@ -152,7 +152,7 @@ describe('align_sheet', () => {
             single([['a', 'extra']]),
             matched,
         );
-        expect(alignment).toMatchObject({ changedRows: 1, changedCells: 1 });
+        expect(alignment).toMatchObject({ changedCells: 1 });
     });
 
     it('degrades to positional when the edit distance exceeds the cap', async () => {
@@ -165,7 +165,7 @@ describe('align_sheet', () => {
         expect(alignment.degraded).toBe(true);
         // Positional fallback: every row pairs by index, so all four are changed.
         expect(shape(alignment.rows)).toEqual(['0,0', '1,1', '2,2', '3,3']);
-        expect(alignment).toMatchObject({ addedRows: 0, deletedRows: 0, changedRows: 4 });
+        expect(alignment).toMatchObject({ addedRows: 0, deletedRows: 0 });
     });
 
     it('aligns two wholly unrelated files without a quadratic-memory blowup', async () => {
@@ -213,7 +213,7 @@ describe('align_sheet', () => {
             maxEditDistance: 16,
         });
         expect(alignment).toMatchObject({
-            addedRows: 1, deletedRows: 0, changedRows: 0, degraded: false,
+            addedRows: 1, deletedRows: 0, degraded: false,
         });
         expect(alignment.rows).toHaveLength(20_001);
     });

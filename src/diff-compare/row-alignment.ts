@@ -32,14 +32,12 @@ export interface SheetAlignment {
     readonly addedRows: number;
     /** Rows present only in the original side. */
     readonly deletedRows: number;
-    /** Paired rows with at least one differing cell. */
-    readonly changedRows: number;
     /**
      * Indexes into `rows` of the paired rows that differ, ascending. Recorded
-     * during the same comparison that produces `changedRows`, so the
-     * "only changed rows" filter costs no extra reads. One-sided rows are not
-     * listed here — a consumer wanting every *interesting* row takes these plus
-     * the rows with an ABSENT side.
+     * during the same pass that counts the cells, so the "only changed rows"
+     * filter costs no extra reads. One-sided rows are not listed here — a
+     * consumer wanting every *interesting* row takes these plus the rows with
+     * an ABSENT side.
      */
     readonly changedRowIndices: readonly number[];
     /** Differing cells across all paired rows. */
@@ -581,7 +579,7 @@ async function count_changes(
     options: AlignSheetOptions,
 ): Promise<Pick<
     SheetAlignment,
-    'addedRows' | 'deletedRows' | 'changedRows' | 'changedCells' | 'changedRowIndices'
+    'addedRows' | 'deletedRows' | 'changedCells' | 'changedRowIndices'
 >> {
     let added = 0;
     let deleted = 0;
@@ -626,7 +624,6 @@ async function count_changes(
     return {
         addedRows: added,
         deletedRows: deleted,
-        changedRows: changed_row_indices.length,
         changedCells: changed_cells,
         changedRowIndices: changed_row_indices,
     };

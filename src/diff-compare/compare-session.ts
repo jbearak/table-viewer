@@ -178,7 +178,6 @@ export class CompareDataSource implements DataSource {
                     ),
                     addedRows: 0,
                     deletedRows: 0,
-                    changedRows: 0,
                     changedCells: 0,
                     changedRowIndices: [],
                     degraded: true,
@@ -249,7 +248,6 @@ export class CompareDataSource implements DataSource {
     change_counts(): {
         addedRows: number;
         deletedRows: number;
-        changedRows: number;
         changedCells: number;
     } {
         let added = 0;
@@ -259,7 +257,6 @@ export class CompareDataSource implements DataSource {
         for (const alignment of this.alignments.values()) {
             added += alignment.addedRows;
             deleted += alignment.deletedRows;
-            changed_rows += alignment.changedRows;
             changed_cells += alignment.changedCells;
         }
         // Sheets present on only one side are whole-sheet changes; their rows
@@ -274,7 +271,6 @@ export class CompareDataSource implements DataSource {
         return {
             addedRows: added,
             deletedRows: deleted,
-            changedRows: changed_rows,
             changedCells: changed_cells,
         };
     }

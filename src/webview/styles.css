@@ -1762,3 +1762,56 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
 .compare-progress-cancel:hover {
     background: var(--vscode-list-hoverBackground, #2a2d2e);
 }
+
+/* Which file is which, and why nothing is editable. Above the counts row
+   because it identifies the document rather than describing the findings. */
+.compare-strip-sides {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 5px 10px;
+    border-bottom: 1px solid var(--vscode-editorWidget-border, #3c3c3c);
+    font-size: 0.95em;
+    min-width: 0;
+}
+
+.compare-strip-side {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    min-width: 0;
+}
+
+.compare-strip-side-mark {
+    font-weight: 600;
+}
+
+.compare-strip-side:first-child .compare-strip-side-mark {
+    color: var(--vscode-gitDecoration-deletedResourceForeground, #c74e39);
+}
+
+.compare-strip-side:nth-child(2) .compare-strip-side-mark {
+    color: var(--vscode-gitDecoration-addedResourceForeground, #587c0c);
+}
+
+.compare-strip-side-label {
+    font-weight: 600;
+}
+
+.compare-strip-side-path {
+    color: var(--vscode-descriptionForeground, #999);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    direction: rtl;
+    text-align: left;
+}
+
+.compare-strip-readonly {
+    margin-left: auto;
+    padding: 1px 8px;
+    border-radius: 10px;
+    border: 1px solid var(--vscode-input-border, #3c3c3c);
+    color: var(--vscode-descriptionForeground, #999);
+    white-space: nowrap;
+}
