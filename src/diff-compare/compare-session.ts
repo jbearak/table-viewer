@@ -18,13 +18,48 @@ import {
 } from '../data-source/interface';
 import {
     diff_column_names,
-    diff_row_window,
-    diff_rows_indexed,
     pair_sheets,
+    type ChangedCell,
     type CompareDiffWindow,
+    type CompareRowStatus,
     type SheetPairing,
     type SheetPairStatus,
 } from './compare-source';
+import { get_raw_cell_text } from '../cell-display';
+import {
+    ABSENT,
+    align_sheet,
+    identity_alignment,
+    type AlignedRow,
+    type AlignSheetOptions,
+    type SheetAlignment,
+} from './row-alignment';
+
+/** Alignments for a compare session, keyed by *modified* sheet index. Sheets
+ *  without a matched original have none: there is nothing to align them to. */
+export type SheetAlignments = ReadonlyMap<number, SheetAlignment>;
+
+/**
+ * Align every matched sheet pair of a workbook. Async, so it happens before the
+ * (synchronous) CompareDataSource is constructed — the source needs its row
+ * mapping fixed at build time, since meta() row counts depend on it.
+ */
+export async function align_workbook(
+    modified: DataSource,
+    original: DataSource,
+    options: AlignSheetOptions = {},
+): Promise<SheetAlignments> {
+    const pairings = pair_sheets(original.meta(), modified.meta());
+    const alignments = new Map<number, SheetAlignment>();
+    for (const pairing of pairings) {
+        if (pairing.status !== 'matched') continue;
+        alignments.set(
+            pairing.modifiedIndex,
+            await align_sheet(original, modified, pairing, options),
+        );
+    }
+    return alignments;
+}
 
 export class CompareDataSource implements DataSource {
     readonly pairings: SheetPairing[];
@@ -54,10 +89,22 @@ export class CompareDataSource implements DataSource {
     private readonly original_meta: WorkbookMeta;
     private static readonly MAX_CACHED_DIFF_PAGES = 64;
     private readonly diff_cache = new Map<string, CompareDiffWindow>();
+    /** Aligned unified rows per *grid* sheet index, for matched sheets. Absent
+     *  for added/deleted sheets, which are one-sided and need no alignment. */
+    private readonly alignments: ReadonlyMap<number, SheetAlignment>;
+    /** True when any matched sheet fell back to positional alignment, so the
+     *  host can say so rather than present an all-changed grid as a finding. */
+    readonly degraded: boolean;
+    /** Grid row -> canonical row, for deleted rows only, per matched sheet. */
+    private readonly deleted_canonical_rows: ReadonlyMap<number, ReadonlyMap<number, number>>;
+    private readonly grid_row_by_modified_cache = new Map<number, ReadonlyMap<number, number>>();
+    /** Deleted rows' grid rows per sheet, in canonical-number order. */
+    private readonly deleted_grid_rows: ReadonlyMap<number, readonly number[]>;
 
     constructor(
         private readonly modified: DataSource,
         private readonly original: DataSource,
+        alignments: SheetAlignments = new Map(),
     ) {
         this.original_meta = original.meta();
         this.modified_meta = modified.meta();
@@ -91,24 +138,52 @@ export class CompareDataSource implements DataSource {
                 status_by_modified_index.get(sheet_index) ?? 'added'),
             ...this.deleted_pairings.map(() => 'deleted' as const),
         ];
+        // Sheets with no supplied alignment fall back to the positional one, so
+        // every matched sheet has an alignment and the rest of this class has a
+        // single row-mapping path rather than two.
+        this.alignments = new Map(
+            [...this.matched_by_modified_index].map(([modified_index, pairing]) => [
+                modified_index,
+                alignments.get(modified_index) ?? {
+                    rows: identity_alignment(
+                        original_sheets[pairing.originalIndex].rowCount,
+                        modified_meta.sheets[modified_index].rowCount,
+                    ),
+                    addedRows: 0,
+                    deletedRows: 0,
+                    changedRows: 0,
+                    changedCells: 0,
+                    changedRowIndices: [],
+                    degraded: true,
+                },
+            ]),
+        );
+        this.degraded = [...this.alignments.values()].some(
+            (alignment) => alignment.degraded);
         this.padded_meta = {
             ...modified_meta,
             sheets: [...modified_meta.sheets.map((sheet, sheet_index) => {
                 const pairing = this.matched_by_modified_index.get(sheet_index);
                 if (!pairing) return sheet;
                 const original_sheet = original_sheets[pairing.originalIndex];
-                const row_count = Math.max(sheet.rowCount, original_sheet.rowCount);
+                // The unified grid is exactly the aligned rows: paired rows plus
+                // one-sided ones, in order. With a positional alignment this is
+                // max(original, modified) — the old padding — and with a content
+                // alignment it interleaves inserts and deletions where they
+                // actually happened.
+                const row_count = this.alignments.get(sheet_index)!.rows.length;
                 const column_count = Math.max(sheet.columnCount, original_sheet.columnCount);
                 return row_count === sheet.rowCount && column_count === sheet.columnCount
                     ? sheet
                     : {
                         ...sheet,
                         rowCount: row_count,
-                        // Padded (deleted-band) rows get their own canonical rows
-                        // appended after the modified side's, so their mapping
-                        // can never collide with a real row's.
-                        sourceRowCount:
-                            sheet.sourceRowCount + (row_count - sheet.rowCount),
+                        // Deleted rows get their own canonical rows appended
+                        // after the modified side's, so their mapping can never
+                        // collide with a real row's.
+                        sourceRowCount: sheet.sourceRowCount
+                            + this.alignments.get(sheet_index)!.rows.filter(
+                                (row) => row.modified === ABSENT).length,
                         columnCount: column_count,
                     };
             }),
@@ -116,6 +191,99 @@ export class CompareDataSource implements DataSource {
                 original_sheets[pairing.originalIndex]),
             ],
         };
+        // Canonical row numbers for deleted rows, assigned once in grid order so
+        // source_row_indices and projected_row_index agree without recomputing.
+        this.deleted_grid_rows = new Map(
+            [...this.alignments].map(([sheet_index, alignment]) => [
+                sheet_index,
+                alignment.rows.flatMap((row, grid_row) =>
+                    row.modified === ABSENT ? [grid_row] : []),
+            ]),
+        );
+        this.deleted_canonical_rows = new Map(
+            [...this.alignments].map(([sheet_index, alignment]) => {
+                const real = modified_meta.sheets[sheet_index];
+                const by_grid_row = new Map<number, number>();
+                let next = real.sourceRowCount;
+                alignment.rows.forEach((row, grid_row) => {
+                    if (row.modified === ABSENT) by_grid_row.set(grid_row, next++);
+                });
+                return [sheet_index, by_grid_row];
+            }),
+        );
+    }
+
+    /** Aligned rows for a matched grid sheet; undefined for one-sided sheets. */
+    private alignment_of(sheet_index: number): readonly AlignedRow[] | undefined {
+        return this.alignments.get(sheet_index)?.rows;
+    }
+
+    /** Per-sheet change totals, for the compare window's counts. */
+    changeCounts(): {
+        addedRows: number;
+        deletedRows: number;
+        changedRows: number;
+        changedCells: number;
+    } {
+        let added = 0;
+        let deleted = 0;
+        let changed_rows = 0;
+        let changed_cells = 0;
+        for (const alignment of this.alignments.values()) {
+            added += alignment.addedRows;
+            deleted += alignment.deletedRows;
+            changed_rows += alignment.changedRows;
+            changed_cells += alignment.changedCells;
+        }
+        // Sheets present on only one side are whole-sheet changes; their rows
+        // are not in any alignment, so they are counted from the meta.
+        this.pairings.forEach((pairing) => {
+            if (pairing.status === 'added') {
+                added += this.modified_meta.sheets[pairing.modifiedIndex].rowCount;
+            } else if (pairing.status === 'deleted') {
+                deleted += this.original_meta.sheets[pairing.originalIndex].rowCount;
+            }
+        });
+        return {
+            addedRows: added,
+            deletedRows: deleted,
+            changedRows: changed_rows,
+            changedCells: changed_cells,
+        };
+    }
+
+    /**
+     * Grid rows that are added, deleted, or have at least one changed cell, in
+     * grid order — the row set behind the "only changed rows" filter. Every row
+     * of a one-sided sheet qualifies.
+     */
+    changedGridRows(sheet_index: number): number[] {
+        const alignment = this.alignments.get(sheet_index);
+        if (!alignment) {
+            const sheet = this.padded_meta.sheets[sheet_index];
+            return sheet
+                ? Array.from({ length: sheet.rowCount }, (_, row) => row)
+                : [];
+        }
+        // Merge the two ascending sources rather than re-diffing: the
+        // alignment pass already compared every paired row.
+        const one_sided: number[] = [];
+        alignment.rows.forEach((row, grid_row) => {
+            if (row.original === ABSENT || row.modified === ABSENT) one_sided.push(grid_row);
+        });
+        const changed = alignment.changedRowIndices;
+        const rows: number[] = [];
+        let left = 0;
+        let right = 0;
+        while (left < one_sided.length || right < changed.length) {
+            if (right >= changed.length || (left < one_sided.length
+                && one_sided[left] < changed[right])) {
+                rows.push(one_sided[left++]);
+            } else {
+                rows.push(changed[right++]);
+            }
+        }
+        return rows;
     }
 
     /** The original-side sheet index a grid sheet reads from, when the grid
@@ -133,16 +301,22 @@ export class CompareDataSource implements DataSource {
     /** Per-page diff for the modified sheet at `sheet_index`; undefined for
      *  sheets with no matched original (added sheets have nothing to diff). */
     diff_page(sheet_index: number, start_row: number, count: number): CompareDiffWindow | undefined {
-        const pairing = this.matched_by_modified_index.get(sheet_index);
-        if (!pairing) return undefined;
-        return diff_row_window(this.original, this.modified, pairing, start_row, count);
+        const alignment = this.alignment_of(sheet_index);
+        if (!alignment) return undefined;
+        const start = Math.max(0, Math.min(start_row, alignment.length));
+        const end = Math.min(alignment.length, start + count);
+        const rows: number[] = [];
+        for (let row = start; row < end; row++) rows.push(row);
+        const window = this.diff_rows(sheet_index, rows);
+        return window ? { ...window, startRow: start } : undefined;
     }
 
     /**
-     * Positional diff for an arbitrary set of grid rows (a transformed page).
-     * `rowStatus[i]`/`changedCells[*].row` name position `i` of `rows`.
-     * LRU-cached by the exact row set, mirroring the core's page cache: a
-     * renderer re-requesting a page must not reread and re-compare both sides.
+     * Diff for an arbitrary set of grid rows. `rowStatus[i]` and
+     * `changedCells[*].row` are positional: they name `rows[i]`, not the
+     * display slot. LRU-cached by the exact row set, mirroring the core's page
+     * cache: a renderer re-requesting a page must not reread and re-compare
+     * both sides.
      */
     diff_rows(sheet_index: number, rows: readonly number[]): CompareDiffWindow | undefined {
         if (this.deleted_original_index(sheet_index) !== undefined) {
@@ -154,8 +328,8 @@ export class CompareDataSource implements DataSource {
                 changedCells: [],
             };
         }
-        const pairing = this.matched_by_modified_index.get(sheet_index);
-        if (!pairing) return undefined;
+        const alignment = this.alignment_of(sheet_index);
+        if (!alignment) return undefined;
         const key = `${sheet_index}:${rows.join(',')}`;
         const cached = this.diff_cache.get(key);
         if (cached !== undefined) {
@@ -163,7 +337,7 @@ export class CompareDataSource implements DataSource {
             this.diff_cache.set(key, cached);
             return cached;
         }
-        const window = diff_rows_indexed(this.original, this.modified, pairing, rows);
+        const window = this.compute_diff(sheet_index, alignment, rows);
         this.diff_cache.set(key, window);
         while (this.diff_cache.size > CompareDataSource.MAX_CACHED_DIFF_PAGES) {
             const oldest = this.diff_cache.keys().next().value;
@@ -174,44 +348,60 @@ export class CompareDataSource implements DataSource {
     }
 
     /**
-     * Original-side rows for a matched sheet's deleted band (padded rows beyond
-     * the modified side's rowCount — positional alignment, so the band row and
-     * the original row share the same index). Undefined when the sheet has no
-     * matched original, whose padded rows can then only render blank.
+     * Compare the two sides of each requested grid row, through the alignment.
+     * Rows present on only one side are added/deleted outright; paired rows are
+     * read from both sides in one batch each and compared cell by cell.
      */
-    private read_original_band(
+    private compute_diff(
         sheet_index: number,
-        start_row: number,
-        count: number,
-    ): RowWindow['rows'] | undefined {
-        const pairing = this.matched_by_modified_index.get(sheet_index);
-        if (!pairing) return undefined;
-        const original_sheet = this.original_meta.sheets[pairing.originalIndex];
-        if (!original_sheet) return undefined;
-        const end = Math.min(start_row + count, original_sheet.rowCount);
-        if (end <= start_row) return undefined;
-        return this.original.read_rows(pairing.originalIndex, start_row, end - start_row).rows;
-    }
-
-    /** Indexed variant of {@link read_original_band}: one batched original-side
-     *  read, positionally matching `rows` (out-of-range rows come back empty). */
-    private read_original_band_indexed(
-        sheet_index: number,
+        alignment: readonly AlignedRow[],
         rows: readonly number[],
-    ): RowWindow['rows'] | undefined {
-        const pairing = this.matched_by_modified_index.get(sheet_index);
-        if (!pairing) return undefined;
+    ): CompareDiffWindow {
+        const pairing = this.matched_by_modified_index.get(sheet_index)!;
         const original_sheet = this.original_meta.sheets[pairing.originalIndex];
-        if (!original_sheet) return undefined;
-        const in_range = rows.filter((row) => row >= 0 && row < original_sheet.rowCount);
-        const batched = in_range.length > 0
-            ? read_source_rows_indexed(this.original, pairing.originalIndex, in_range).rows
-            : [];
-        let batched_position = 0;
-        return rows.map((row) =>
-            row >= 0 && row < original_sheet.rowCount
-                ? batched[batched_position++] ?? []
-                : []);
+        const modified_sheet = this.modified_meta.sheets[sheet_index];
+        const column_count = Math.max(original_sheet.columnCount, modified_sheet.columnCount);
+        const row_status: CompareRowStatus[] = [];
+        const paired_positions: number[] = [];
+        const original_rows: number[] = [];
+        const modified_rows: number[] = [];
+        rows.forEach((grid_row, position) => {
+            const aligned = alignment[grid_row];
+            if (!aligned) {
+                row_status.push('same');
+                return;
+            }
+            if (aligned.modified === ABSENT) {
+                row_status.push('deleted');
+                return;
+            }
+            if (aligned.original === ABSENT) {
+                row_status.push('added');
+                return;
+            }
+            row_status.push('same');
+            paired_positions.push(position);
+            original_rows.push(aligned.original);
+            modified_rows.push(aligned.modified);
+        });
+        const changed_cells: ChangedCell[] = [];
+        if (paired_positions.length > 0) {
+            const original_batch = read_source_rows_indexed(
+                this.original, pairing.originalIndex, original_rows).rows;
+            const modified_batch = read_source_rows_indexed(
+                this.modified, sheet_index, modified_rows).rows;
+            paired_positions.forEach((position, index) => {
+                const original_row = original_batch[index] ?? [];
+                const modified_row = modified_batch[index] ?? [];
+                for (let col = 0; col < column_count; col++) {
+                    const base = get_raw_cell_text(original_row[col]?.raw ?? null);
+                    if (base !== get_raw_cell_text(modified_row[col]?.raw ?? null)) {
+                        changed_cells.push({ row: position, col, base });
+                    }
+                }
+            });
+        }
+        return { startRow: 0, rowStatus: row_status, changedCells: changed_cells };
     }
 
     read_rows(sheet_index: number, start_row: number, count: number): RowWindow {
@@ -219,26 +409,13 @@ export class CompareDataSource implements DataSource {
         if (deleted_index !== undefined) {
             return this.original.read_rows(deleted_index, start_row, count);
         }
-        const real = this.modified_meta.sheets[sheet_index];
         const padded = this.padded_meta.sheets[sheet_index];
-        if (!real || !padded) return this.modified.read_rows(sheet_index, start_row, count);
+        if (!padded) return this.modified.read_rows(sheet_index, start_row, count);
         const start = Math.max(0, Math.min(start_row, padded.rowCount));
         const end = Math.min(padded.rowCount, start + count);
-        const real_end = Math.min(end, real.rowCount);
-        const rows = real_end > start
-            ? this.modified.read_rows(sheet_index, start, real_end - start).rows.slice()
-            : [];
-        // Deleted-band rows (beyond the modified side) carry the *original*
-        // content: the grid, filters, sorting, copy, and auto-fit must all see
-        // the removed text, not blanks under a painted band.
-        const band_start = Math.max(start, real.rowCount);
-        if (end > band_start) {
-            const original_rows = this.read_original_band(sheet_index, band_start, end - band_start);
-            for (let row = band_start; row < end; row++) {
-                rows.push(original_rows?.[row - band_start] ?? []);
-            }
-        }
-        return { startRow: start, rows };
+        const grid_rows: number[] = [];
+        for (let row = start; row < end; row++) grid_rows.push(row);
+        return { startRow: start, rows: this.read_aligned_rows(sheet_index, grid_rows) };
     }
 
     read_rows_indexed(sheet_index: number, row_indices: ArrayLike<number>): IndexedRows {
@@ -246,43 +423,56 @@ export class CompareDataSource implements DataSource {
         if (deleted_index !== undefined) {
             return read_source_rows_indexed(this.original, deleted_index, row_indices);
         }
-        const real = this.modified_meta.sheets[sheet_index];
-        // One batched read per side keeps the underlying sources' indexed
-        // batching; padded (deleted-band) positions read the *original* rows so
-        // transforms and copies see the removed text the grid shows.
-        const in_range: number[] = [];
-        const band_rows: number[] = [];
-        for (let position = 0; position < row_indices.length; position++) {
-            const row = row_indices[position];
-            if (real && row < real.rowCount) in_range.push(row);
-            else band_rows.push(row);
+        return { rows: this.read_aligned_rows(sheet_index, Array.from(row_indices)) };
+    }
+
+    /**
+     * Rows for arbitrary grid rows of a matched sheet, each read from whichever
+     * side holds it: deleted rows carry the *original* content, so the grid,
+     * filters, sorting, copy, and auto-fit all see the removed text rather than
+     * blanks under a painted band.
+     */
+    private read_aligned_rows(
+        sheet_index: number,
+        grid_rows: readonly number[],
+    ): RowWindow['rows'] {
+        const alignment = this.alignment_of(sheet_index);
+        if (!alignment) {
+            return read_source_rows_indexed(this.modified, sheet_index, grid_rows).rows;
         }
-        const batched = in_range.length > 0
-            ? read_source_rows_indexed(this.modified, sheet_index, in_range).rows
+        const pairing = this.matched_by_modified_index.get(sheet_index)!;
+        // One batched read per side, so an interleaved window still costs two
+        // reads rather than two per row.
+        const modified_rows: number[] = [];
+        const original_rows: number[] = [];
+        for (const grid_row of grid_rows) {
+            const aligned = alignment[grid_row];
+            if (!aligned) continue;
+            if (aligned.modified !== ABSENT) modified_rows.push(aligned.modified);
+            else original_rows.push(aligned.original);
+        }
+        const modified_batch = modified_rows.length > 0
+            ? read_source_rows_indexed(this.modified, sheet_index, modified_rows).rows
             : [];
-        const band = band_rows.length > 0
-            ? this.read_original_band_indexed(sheet_index, band_rows)
-            : undefined;
-        const rows: RowWindow['rows'] = [];
-        let batched_position = 0;
-        let band_position = 0;
-        for (let position = 0; position < row_indices.length; position++) {
-            const row = row_indices[position];
-            rows.push(
-                real && row < real.rowCount
-                    ? batched[batched_position++] ?? []
-                    : band?.[band_position++] ?? [],
-            );
-        }
-        return { rows };
+        const original_batch = original_rows.length > 0
+            ? read_source_rows_indexed(this.original, pairing.originalIndex, original_rows).rows
+            : [];
+        let modified_position = 0;
+        let original_position = 0;
+        return grid_rows.map((grid_row) => {
+            const aligned = alignment[grid_row];
+            if (!aligned) return [];
+            return aligned.modified !== ABSENT
+                ? modified_batch[modified_position++] ?? []
+                : original_batch[original_position++] ?? [];
+        });
     }
 
     /**
      * Forward the modified side's projected↔canonical row mapping so wrapping
-     * (e.g.) an ExcelHeaderDataSource keeps header promotion intact. Padded
-     * deleted-band rows map to canonical rows appended after the modified
-     * side's real ones (see the sourceRowCount padding above), so they stay
-     * stable and collision-free.
+     * (e.g.) an ExcelHeaderDataSource keeps header promotion intact. Deleted
+     * rows have no modified-side row, so they map to canonical rows appended
+     * after the modified side's, where they stay stable and collision-free.
      */
     source_row_indices(
         sheet_index: number,
@@ -294,18 +484,20 @@ export class CompareDataSource implements DataSource {
                 ? this.original.source_row_indices(deleted_index, projected_rows)
                 : Uint32Array.from(projected_rows);
         }
-        const real = this.modified_meta.sheets[sheet_index];
-        if (!real) return Uint32Array.from(projected_rows);
+        const alignment = this.alignment_of(sheet_index);
+        if (!alignment) return Uint32Array.from(projected_rows);
+        const canonical = this.deleted_canonical_rows.get(sheet_index);
         const result = new Uint32Array(projected_rows.length);
         const real_positions: number[] = [];
         const real_rows: number[] = [];
         for (let position = 0; position < projected_rows.length; position++) {
-            const row = projected_rows[position];
-            if (row < real.rowCount) {
+            const grid_row = projected_rows[position];
+            const aligned = alignment[grid_row];
+            if (aligned && aligned.modified !== ABSENT) {
                 real_positions.push(position);
-                real_rows.push(row);
+                real_rows.push(aligned.modified);
             } else {
-                result[position] = real.sourceRowCount + (row - real.rowCount);
+                result[position] = canonical?.get(grid_row) ?? grid_row;
             }
         }
         if (real_rows.length > 0) {
@@ -326,16 +518,40 @@ export class CompareDataSource implements DataSource {
                 ? this.original.projected_row_index(deleted_index, source_row)
                 : source_row;
         }
+        const alignment = this.alignment_of(sheet_index);
+        if (!alignment) return source_row;
         const real = this.modified_meta.sheets[sheet_index];
         if (!real) return source_row;
         if (source_row >= real.sourceRowCount) {
-            const padded_row = real.rowCount + (source_row - real.sourceRowCount);
-            const padded = this.padded_meta.sheets[sheet_index];
-            return padded && padded_row < padded.rowCount ? padded_row : undefined;
+            return this.deleted_grid_row(sheet_index, source_row);
         }
-        return this.modified.projected_row_index
+        const modified_row = this.modified.projected_row_index
             ? this.modified.projected_row_index(sheet_index, source_row)
             : source_row;
+        if (modified_row === undefined) return undefined;
+        return this.grid_row_by_modified(sheet_index).get(modified_row);
+    }
+
+    /** Modified-side row -> grid row, built lazily per sheet: only the paths
+     *  that map *back* into the grid need it, and building it eagerly for every
+     *  sheet would cost a map the size of the workbook on open. */
+    private grid_row_by_modified(sheet_index: number): ReadonlyMap<number, number> {
+        const cached = this.grid_row_by_modified_cache.get(sheet_index);
+        if (cached) return cached;
+        const built = new Map<number, number>();
+        this.alignment_of(sheet_index)?.forEach((row, grid_row) => {
+            if (row.modified !== ABSENT) built.set(row.modified, grid_row);
+        });
+        this.grid_row_by_modified_cache.set(sheet_index, built);
+        return built;
+    }
+
+    /** The grid row a deleted row's canonical row belongs to. Canonical numbers
+     *  are assigned contiguously from `sourceRowCount` in grid order, so this is
+     *  an index into the sheet's deleted rows rather than a search. */
+    private deleted_grid_row(sheet_index: number, source_row: number): number | undefined {
+        return this.deleted_grid_rows.get(sheet_index)?.[
+            source_row - this.modified_meta.sheets[sheet_index].sourceRowCount];
     }
 
     close(): void {

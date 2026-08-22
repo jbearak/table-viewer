@@ -34,6 +34,14 @@ export interface SheetAlignment {
     readonly deletedRows: number;
     /** Paired rows with at least one differing cell. */
     readonly changedRows: number;
+    /**
+     * Indexes into `rows` of the paired rows that differ, ascending. Recorded
+     * during the same comparison that produces `changedRows`, so the
+     * "only changed rows" filter costs no extra reads. One-sided rows are not
+     * listed here — a consumer wanting every *interesting* row takes these plus
+     * the rows with an ABSENT side.
+     */
+    readonly changedRowIndices: readonly number[];
     /** Differing cells across all paired rows. */
     readonly changedCells: number;
     /**
@@ -374,25 +382,30 @@ async function count_changes(
     modified_sheet: SheetMeta,
     rows: readonly AlignedRow[],
     options: AlignSheetOptions,
-): Promise<Pick<SheetAlignment, 'addedRows' | 'deletedRows' | 'changedRows' | 'changedCells'>> {
+): Promise<Pick<
+    SheetAlignment,
+    'addedRows' | 'deletedRows' | 'changedRows' | 'changedCells' | 'changedRowIndices'
+>> {
     let added = 0;
     let deleted = 0;
-    let changed_rows = 0;
     let changed_cells = 0;
+    const changed_row_indices: number[] = [];
     const column_count = Math.max(original_sheet.columnCount, modified_sheet.columnCount);
     const checkpoint = options.rowsPerCheckpoint ?? DEFAULT_ROWS_PER_CHECKPOINT;
-    const paired: AlignedRow[] = [];
-    for (const row of rows) {
+    /** Paired rows with the grid row each came from, so a difference can be
+     *  reported against its position in the unified grid. */
+    const paired: { row: AlignedRow; gridRow: number }[] = [];
+    rows.forEach((row, grid_row) => {
         if (row.modified === ABSENT) deleted++;
         else if (row.original === ABSENT) added++;
-        else paired.push(row);
-    }
+        else paired.push({ row, gridRow: grid_row });
+    });
     for (let start = 0; start < paired.length; start += HASH_READ_BATCH) {
         const batch = paired.slice(start, start + HASH_READ_BATCH);
         const original_batch = read_source_rows_indexed(
-            original, pairing.originalIndex, batch.map((row) => row.original)).rows;
+            original, pairing.originalIndex, batch.map((entry) => entry.row.original)).rows;
         const modified_batch = read_source_rows_indexed(
-            modified, pairing.modifiedIndex, batch.map((row) => row.modified)).rows;
+            modified, pairing.modifiedIndex, batch.map((entry) => entry.row.modified)).rows;
         for (let offset = 0; offset < batch.length; offset++) {
             const original_row = original_batch[offset] ?? [];
             const modified_row = modified_batch[offset] ?? [];
@@ -406,7 +419,7 @@ async function count_changes(
                     row_changed = true;
                 }
             }
-            if (row_changed) changed_rows++;
+            if (row_changed) changed_row_indices.push(batch[offset].gridRow);
         }
         if (start % checkpoint === 0) {
             await Promise.resolve();
@@ -416,7 +429,8 @@ async function count_changes(
     return {
         addedRows: added,
         deletedRows: deleted,
-        changedRows: changed_rows,
+        changedRows: changed_row_indices.length,
         changedCells: changed_cells,
+        changedRowIndices: changed_row_indices,
     };
 }

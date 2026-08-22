@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CompareDataSource } from '../diff-compare/compare-session';
+import { CompareDataSource, align_workbook } from '../diff-compare/compare-session';
 import type { DataSource } from '../data-source/interface';
 import { FixtureSource } from './helpers/fixture-source';
 
@@ -157,5 +157,122 @@ describe('CompareDataSource', () => {
         expect(window.rows).toHaveLength(1);
         expect(window.rows[0][0]?.raw).toBe('b');
         expect(source.read_rows(0, 5, 10).rows).toEqual([]);
+    });
+});
+
+describe('CompareDataSource with a content alignment', () => {
+    /** Build a compare source over an aligned pair, the way a host does. */
+    const aligned = async (
+        original_rows: string[][],
+        modified_rows: string[][],
+    ): Promise<CompareDataSource> => {
+        const modified = new FixtureSource([{ name: 'Sheet1', rows: modified_rows }]);
+        const original = new FixtureSource([{ name: 'Sheet1', rows: original_rows }]);
+        return new CompareDataSource(
+            modified,
+            original,
+            await align_workbook(modified, original),
+        );
+    };
+
+    it('reports an inserted row as one addition, not a cascade of changed cells', async () => {
+        // The regression this whole mechanism exists for: positionally, rows
+        // 1..3 all differ, and the grid used to say so.
+        const source = await aligned(
+            [['a'], ['b'], ['c']],
+            [['a'], ['NEW'], ['b'], ['c']],
+        );
+        expect(source.meta().sheets[0].rowCount).toBe(4);
+        const diff = source.diff_page(0, 0, 10);
+        expect(diff?.rowStatus).toEqual(['same', 'added', 'same', 'same']);
+        expect(diff?.changedCells).toEqual([]);
+    });
+
+    it('interleaves a deleted row where it was removed, carrying its content', async () => {
+        const source = await aligned(
+            [['a'], ['GONE'], ['b']],
+            [['a'], ['b']],
+        );
+        const window = source.read_rows(0, 0, 10);
+        expect(window.rows.map((row) => row[0]?.raw)).toEqual(['a', 'GONE', 'b']);
+        expect(source.diff_page(0, 0, 10)?.rowStatus)
+            .toEqual(['same', 'deleted', 'same']);
+    });
+
+    it('still reports a genuine in-place edit as a changed cell', async () => {
+        const source = await aligned([['a', 'x']], [['a', 'y']]);
+        const diff = source.diff_page(0, 0, 10);
+        expect(diff?.rowStatus).toEqual(['same']);
+        expect(diff?.changedCells).toEqual([{ row: 0, col: 1, base: 'x' }]);
+    });
+
+    it('lists added, deleted and changed rows for the changed-rows filter', async () => {
+        const source = await aligned(
+            [['a'], ['b'], ['c'], ['d']],
+            [['a'], ['CHANGED'], ['c'], ['d'], ['NEW']],
+        );
+        expect(source.changedGridRows(0)).toEqual([1, 4]);
+    });
+
+    it('treats every row of a one-sided sheet as changed', async () => {
+        const modified = new FixtureSource([{ name: 'Fresh', rows: [['x'], ['y']] }]);
+        const original = new FixtureSource([{ name: 'Gone', rows: [['z']] }]);
+        const source = new CompareDataSource(
+            modified, original, await align_workbook(modified, original));
+        expect(source.changedGridRows(0)).toEqual([0, 1]);
+        expect(source.changedGridRows(1)).toEqual([0]);
+    });
+
+    it('totals changes across sheets, counting one-sided sheets whole', async () => {
+        const modified = new FixtureSource([
+            { name: 'Kept', rows: [['a'], ['CHANGED'], ['NEW']] },
+            { name: 'Fresh', rows: [['x'], ['y']] },
+        ]);
+        const original = new FixtureSource([{ name: 'Kept', rows: [['a'], ['b']] }]);
+        const source = new CompareDataSource(
+            modified, original, await align_workbook(modified, original));
+        expect(source.changeCounts()).toEqual({
+            addedRows: 3,      // one row in Kept, two from the whole Fresh sheet
+            deletedRows: 0,
+            changedRows: 1,
+            changedCells: 1,
+        });
+    });
+
+    it('maps a deleted row to a canonical row past the modified side', async () => {
+        const source = await aligned([['a'], ['GONE'], ['b']], [['a'], ['b']]);
+        // Grid rows 0 and 2 are the modified side's rows 0 and 1; grid row 1 is
+        // the deleted one, which takes the next canonical number.
+        expect([...source.source_row_indices(0, [0, 1, 2])]).toEqual([0, 2, 1]);
+        expect(source.projected_row_index(0, 2)).toBe(1);
+        expect(source.projected_row_index(0, 0)).toBe(0);
+        expect(source.projected_row_index(0, 1)).toBe(2);
+    });
+
+    it('round-trips every grid row through source_row_indices', async () => {
+        const source = await aligned(
+            [['a'], ['x'], ['b'], ['y'], ['c']],
+            [['a'], ['b'], ['NEW'], ['c']],
+        );
+        const grid_rows = Array.from(
+            { length: source.meta().sheets[0].rowCount }, (_, row) => row);
+        const canonical = source.source_row_indices(0, grid_rows);
+        // A distinct canonical row per grid row, each mapping back to itself.
+        expect(new Set(canonical).size).toBe(grid_rows.length);
+        grid_rows.forEach((grid_row, index) => {
+            expect(source.projected_row_index(0, canonical[index])).toBe(grid_row);
+        });
+    });
+
+    it('flags a degraded alignment so the host can say the rows did not match', async () => {
+        const modified = new FixtureSource([{ name: 'S', rows: [['p'], ['q'], ['r']] }]);
+        const original = new FixtureSource([{ name: 'S', rows: [['x'], ['y'], ['z']] }]);
+        const source = new CompareDataSource(
+            modified, original,
+            await align_workbook(modified, original, { maxEditDistance: 1 }),
+        );
+        expect(source.degraded).toBe(true);
+        // Positional fallback: three rows, all changed, none added or deleted.
+        expect(source.diff_page(0, 0, 10)?.rowStatus).toEqual(['same', 'same', 'same']);
     });
 });
