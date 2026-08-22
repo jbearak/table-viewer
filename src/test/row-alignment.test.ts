@@ -168,6 +168,22 @@ describe('align_sheet', () => {
         expect(alignment).toMatchObject({ addedRows: 0, deletedRows: 0 });
     });
 
+    it('does not conflate cell boundaries with cell text', async () => {
+        // The row hash once used a unit separator between cells, so a cell
+        // whose own text contained one hashed identically to the two cells it
+        // looked like. Prefix trimming pairs rows on hash alone, so this was
+        // not a near-miss: it aligned two structurally different rows and
+        // reported the genuinely unchanged row below as an addition.
+        const alignment = await align_sheet(
+            single([['a\u001fb'], ['tail']]),
+            single([['a', 'b'], ['a\u001fb'], ['tail']]),
+            matched,
+        );
+        expect(alignment).toMatchObject({
+            addedRows: 1, deletedRows: 0, changedCells: 0,
+        });
+    });
+
     it('accepts an edit distance that exactly fills the cap', async () => {
         // The cap bounds the whole comparison, and a parent's distance already
         // covers every edit its children re-find at finer grain. Deducting each

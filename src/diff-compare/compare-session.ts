@@ -252,7 +252,6 @@ export class CompareDataSource implements DataSource {
     } {
         let added = 0;
         let deleted = 0;
-        let changed_rows = 0;
         let changed_cells = 0;
         for (const alignment of this.alignments.values()) {
             added += alignment.addedRows;
@@ -319,19 +318,6 @@ export class CompareDataSource implements DataSource {
 
     meta(): WorkbookMeta {
         return this.padded_meta;
-    }
-
-    /** Per-page diff for the modified sheet at `sheet_index`; undefined for
-     *  sheets with no matched original (added sheets have nothing to diff). */
-    diff_page(sheet_index: number, start_row: number, count: number): CompareDiffWindow | undefined {
-        const alignment = this.alignment_of(sheet_index);
-        if (!alignment) return undefined;
-        const start = Math.max(0, Math.min(start_row, alignment.length));
-        const end = Math.min(alignment.length, start + count);
-        const rows: number[] = [];
-        for (let row = start; row < end; row++) rows.push(row);
-        const window = this.diff_rows(sheet_index, rows);
-        return window ? { ...window, startRow: start } : undefined;
     }
 
     /**

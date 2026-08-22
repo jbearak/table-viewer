@@ -3,6 +3,18 @@ import { CompareDataSource, align_workbook } from '../diff-compare/compare-sessi
 import type { DataSource } from '../data-source/interface';
 import { FixtureSource } from './helpers/fixture-source';
 
+/** The production path serves whole transformed windows via `diff_rows`; these
+ *  tests want a plain leading page, so they name the rows themselves, clamped
+ *  to the sheet the way a served window already is. */
+const diff_page = (
+    source: CompareDataSource,
+    sheet_index: number,
+    count: number,
+) => {
+    const rows = Math.min(count, source.meta().sheets[sheet_index].rowCount);
+    return source.diff_rows(sheet_index, Array.from({ length: rows }, (_, i) => i));
+};
+
 const compare = (
     original_rows: string[][],
     modified_rows: string[][],
@@ -40,9 +52,9 @@ describe('CompareDataSource', () => {
             ]),
             new FixtureSource([{ name: 'Kept', rows: [['z']] }]),
         );
-        const kept = source.diff_page(0, 0, 10);
+        const kept = diff_page(source, 0, 10);
         expect(kept?.changedCells).toEqual([{ row: 0, col: 0, base: 'z' }]);
-        expect(source.diff_page(1, 0, 10)).toBeUndefined();
+        expect(diff_page(source, 1, 10)).toBeUndefined();
     });
 
     it('exposes pairings including added and deleted sheets', () => {
@@ -183,7 +195,7 @@ describe('CompareDataSource with a content alignment', () => {
             [['a'], ['NEW'], ['b'], ['c']],
         );
         expect(source.meta().sheets[0].rowCount).toBe(4);
-        const diff = source.diff_page(0, 0, 10);
+        const diff = diff_page(source, 0, 10);
         expect(diff?.rowStatus).toEqual(['same', 'added', 'same', 'same']);
         expect(diff?.changedCells).toEqual([]);
     });
@@ -195,13 +207,13 @@ describe('CompareDataSource with a content alignment', () => {
         );
         const window = source.read_rows(0, 0, 10);
         expect(window.rows.map((row) => row[0]?.raw)).toEqual(['a', 'GONE', 'b']);
-        expect(source.diff_page(0, 0, 10)?.rowStatus)
+        expect(diff_page(source, 0, 10)?.rowStatus)
             .toEqual(['same', 'deleted', 'same']);
     });
 
     it('still reports a genuine in-place edit as a changed cell', async () => {
         const source = await aligned([['a', 'x']], [['a', 'y']]);
-        const diff = source.diff_page(0, 0, 10);
+        const diff = diff_page(source, 0, 10);
         expect(diff?.rowStatus).toEqual(['same']);
         expect(diff?.changedCells).toEqual([{ row: 0, col: 1, base: 'x' }]);
     });
@@ -272,6 +284,6 @@ describe('CompareDataSource with a content alignment', () => {
         );
         expect(source.degraded).toBe(true);
         // Positional fallback: three rows, all changed, none added or deleted.
-        expect(source.diff_page(0, 0, 10)?.rowStatus).toEqual(['same', 'same', 'same']);
+        expect(diff_page(source, 0, 10)?.rowStatus).toEqual(['same', 'same', 'same']);
     });
 });

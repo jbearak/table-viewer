@@ -55,7 +55,9 @@ export interface AlignSheetOptions {
      * Cap on the diff's edit distance (D in Myers' O(ND)). Exceeding it means
      * the files are too dissimilar to align usefully — two unrelated exports,
      * or one re-sorted — so alignment degrades to positional rather than
-     * spending unbounded time proving they do not match.
+     * spending unbounded time proving they do not match. It bounds the
+     * *search*: a wholly one-sided run costs nothing to align and is allowed
+     * through however long it is.
      */
     readonly maxEditDistance?: number;
     /** Rows hashed between cancellation checks. */
@@ -104,18 +106,34 @@ const HASH_READ_BATCH = 512;
  */
 const DEFAULT_MAX_EDIT_DISTANCE = 20_000;
 
-/** FNV-1a over the row's raw cell text, with a unit separator between cells so
- *  `['ab','c']` and `['a','bc']` cannot collide. */
+/**
+ * FNV-1a over the row's raw cell text, length-prefixed per cell so cell
+ * boundaries cannot be forged.
+ *
+ * A separator byte was the obvious encoding and is wrong: a cell whose text
+ * contains that byte feeds the hash exactly what two cells split at it would,
+ * so `['a\u001fb']` and `['a','b']` collide *deterministically*. Because
+ * prefix/suffix trimming pairs rows on hash alone, that is not a near-miss —
+ * it silently aligns two structurally different rows. Lengths cannot appear in
+ * the text stream, so the encoding is unambiguous.
+ *
+ * Chance collisions between unrelated rows remain possible at 32 bits and are
+ * accepted: confirming a match would mean re-reading both rows' cells, and the
+ * cost of being wrong is a mis-paired row in a diff, not corrupted data.
+ */
 function hash_row(cells: readonly ({ raw: string | null } | null)[]): number {
     let hash = 0x811c9dc5;
+    const mix = (value: number) => {
+        hash ^= value;
+        hash = Math.imul(hash, 0x01000193);
+    };
+    mix(cells.length);
     for (let index = 0; index < cells.length; index++) {
         const text = get_raw_cell_text(cells[index]?.raw ?? null);
+        mix(text.length);
         for (let position = 0; position < text.length; position++) {
-            hash ^= text.charCodeAt(position);
-            hash = Math.imul(hash, 0x01000193);
+            mix(text.charCodeAt(position));
         }
-        hash ^= 0x1f;
-        hash = Math.imul(hash, 0x01000193);
     }
     // >>> 0 so the value is a stable unsigned int rather than a sign-flipped
     // one, since it is stored in a Uint32Array and compared for equality.
@@ -230,6 +248,11 @@ async function myers_diff(
         const n = l1 - l0;
         const m = r1 - r0;
         if (n === 0 && m === 0) continue;
+        // Deliberately not charged against the cap, even though a one-sided
+        // run of 100,000 rows is an edit distance of 100,000. The cap bounds
+        // *search*, and there is nothing to search here — the answer is known
+        // in constant time. Degrading would replace a correct, free answer
+        // with a positional one, which for an empty side is meaningless.
         if (n === 0) { builder.emit('insert', m); continue; }
         if (m === 0) { builder.emit('delete', n); continue; }
 

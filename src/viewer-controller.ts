@@ -1207,8 +1207,8 @@ export function attach_viewer(
      * the exact window `rowData` carried — clamped and transform-projected — so
      * the diff describes the rows the renderer received, keyed by the same
      * display positions. `sourceRows` maps each display row back to the source
-     * row the positional diff is defined over; contiguous source runs are
-     * diffed in one page each.
+     * row the diff is defined over, so an arbitrarily transformed window is
+     * diffed in one batch.
      */
     function post_compare_diff(
         msg: Extract<WebviewMessage, { type: 'requestRows' }>,
