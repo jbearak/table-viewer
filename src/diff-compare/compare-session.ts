@@ -191,6 +191,10 @@ export class CompareDataSource implements DataSource {
     /** Grid row -> canonical row, for deleted rows only, per matched sheet. */
     private readonly deleted_canonical_rows: ReadonlyMap<number, ReadonlyMap<number, number>>;
     private readonly grid_row_by_modified_cache = new Map<number, ReadonlyMap<number, number>>();
+    /** Memoized {@link changed_grid_rows}. Alignments never change after
+     *  construction, but PanelCore asks again on every transform recompute —
+     *  so without this, each sort or filter rescans every row of the sheet. */
+    private readonly changed_grid_rows_cache = new Map<number, readonly number[]>();
     /** Deleted rows' grid rows per sheet, in canonical-number order. */
     private readonly deleted_grid_rows: ReadonlyMap<number, readonly number[]>;
 
@@ -364,7 +368,15 @@ export class CompareDataSource implements DataSource {
      * grid order — the row set behind the "only changed rows" filter. Every row
      * of a one-sided sheet qualifies.
      */
-    changed_grid_rows(sheet_index: number): number[] {
+    changed_grid_rows(sheet_index: number): readonly number[] {
+        const cached = this.changed_grid_rows_cache.get(sheet_index);
+        if (cached) return cached;
+        const computed = this.compute_changed_grid_rows(sheet_index);
+        this.changed_grid_rows_cache.set(sheet_index, computed);
+        return computed;
+    }
+
+    private compute_changed_grid_rows(sheet_index: number): readonly number[] {
         const alignment = this.alignments.get(sheet_index);
         if (!alignment) {
             const sheet = this.padded_meta.sheets[sheet_index];
@@ -372,36 +384,18 @@ export class CompareDataSource implements DataSource {
                 ? Array.from({ length: sheet.rowCount }, (_, row) => row)
                 : [];
         }
-        // Merge the two ascending sources rather than re-diffing: the
-        // alignment pass already compared every paired row.
-        const one_sided: number[] = [];
+        // Collected rather than re-diffed: the alignment pass already compared
+        // every paired row. Moved rows are a third source, and not optional —
+        // a purely moved row is neither one-sided nor in `changedRowIndices`,
+        // so without it the row vanishes from the one view where someone
+        // hunting changes would most expect to find it. The Set also
+        // deduplicates a moved-and-edited row, which is in two of the three.
+        const rows = new Set<number>(alignment.changedRowIndices);
         alignment.rows.forEach((row, grid_row) => {
-            if (row.original === ABSENT || row.modified === ABSENT) one_sided.push(grid_row);
+            if (row.original === ABSENT || row.modified === ABSENT) rows.add(grid_row);
         });
-        // Three ascending sources, not two. A purely-moved row is neither
-        // one-sided nor in `changedRowIndices`, so without this it vanishes
-        // under the filter — in the one view where someone hunting changes
-        // would most expect to find it.
-        const sources = [one_sided, alignment.changedRowIndices, alignment.movedRowIndices];
-        const cursors = sources.map(() => 0);
-        const rows: number[] = [];
-        for (;;) {
-            let next = -1;
-            let from = -1;
-            sources.forEach((source, index) => {
-                const cursor = cursors[index];
-                if (cursor >= source.length) return;
-                if (from === -1 || source[cursor] < next) {
-                    next = source[cursor];
-                    from = index;
-                }
-            });
-            if (from === -1) break;
-            cursors[from]++;
-            // A moved-and-edited row is in two sources; the filter wants it once.
-            if (rows[rows.length - 1] !== next) rows.push(next);
-        }
-        return rows;
+        for (const grid_row of alignment.movedRowIndices) rows.add(grid_row);
+        return [...rows].sort((left, right) => left - right);
     }
 
     /** The original-side sheet index a grid sheet reads from, when the grid

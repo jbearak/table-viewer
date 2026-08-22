@@ -831,7 +831,11 @@ async function detect_moves(
     original_hashes: Uint32Array,
     modified_hashes: Uint32Array,
     options: AlignSheetOptions,
-): Promise<{ rows: AlignedRow[]; movedRowIndices: number[]; moveSearchTruncated: boolean }> {
+): Promise<{
+    rows: readonly AlignedRow[];
+    movedRowIndices: number[];
+    moveSearchTruncated: boolean;
+}> {
     if (options.isCancelled?.()) throw new AlignmentCancelledError();
     const deleted: Leftover[] = [];
     const added: Leftover[] = [];
@@ -840,7 +844,10 @@ async function detect_moves(
         else if (row.original === ABSENT) added.push({ row: row.modified, gridRow: grid_row });
     });
     if (deleted.length === 0 || added.length === 0) {
-        return { rows: [...rows], movedRowIndices: [], moveSearchTruncated: false };
+        // Returned as-is, not copied: the caller treats it as readonly, and on
+        // a million-row sheet with nothing one-sided the copy was the largest
+        // allocation the pass made, to hand back what it was given.
+        return { rows, movedRowIndices: [], moveSearchTruncated: false };
     }
 
     // The pass's verdict, held both ways round. Both directions are needed —
@@ -857,18 +864,22 @@ async function detect_moves(
     // Exact-hash pass. The hashes are already computed, so an identical moved
     // row pairs with no cell reads at all — this is the whole-file re-sort
     // case, and it is why the work cap below does not gate this phase.
-    const by_hash = new Map<number, Leftover[]>();
+    const by_hash = new Map<number, { entries: Leftover[]; next: number }>();
     for (const entry of deleted) {
         const bucket = by_hash.get(original_hashes[entry.row]);
-        if (bucket) bucket.push(entry);
-        else by_hash.set(original_hashes[entry.row], [entry]);
+        if (bucket) bucket.entries.push(entry);
+        else by_hash.set(original_hashes[entry.row], { entries: [entry], next: 0 });
     }
     for (const entry of added) {
-        // Shifted off the front so duplicate identical rows pair in ascending
-        // order on both sides rather than by whatever order a set iterates,
-        // which is what makes repeated runs produce identical output.
-        const source = by_hash.get(modified_hashes[entry.row])?.shift();
-        if (source !== undefined) claim(source.row, entry.row);
+        // Consumed front to back so duplicate identical rows pair in ascending
+        // order on both sides, which is what makes repeated runs produce
+        // identical output. A read cursor rather than shift(), which is
+        // O(bucket) per call: measured no slower at 10,000 duplicates in one
+        // bucket, so this is about not resting on that, not a fix for an
+        // observed cost.
+        const bucket = by_hash.get(modified_hashes[entry.row]);
+        if (bucket === undefined || bucket.next >= bucket.entries.length) continue;
+        claim(bucket.entries[bucket.next++].row, entry.row);
     }
 
     const unmatched_deleted = deleted.filter((entry) => !original_to_modified.has(entry.row));
@@ -889,7 +900,7 @@ async function detect_moves(
     }
 
     if (original_to_modified.size === 0) {
-        return { rows: [...rows], movedRowIndices: [], moveSearchTruncated: truncated };
+        return { rows, movedRowIndices: [], moveSearchTruncated: truncated };
     }
 
     // Rebuild. A moved row is emitted once, at its modified-side slot, with
@@ -992,15 +1003,11 @@ async function score_moves(
                 modifiedRow: destination.row,
                 displacement: Math.abs(source.gridRow - destination.gridRow),
             };
-            if (
-                best.length === MOVE_CANDIDATES_PER_DESTINATION
-                && compare_candidates(candidate, best[best.length - 1]) >= 0
-            ) continue;
-            let position = best.length;
-            while (position > 0 && compare_candidates(candidate, best[position - 1]) < 0) {
-                position--;
-            }
-            best.splice(position, 0, candidate);
+            // Sorted on every insert, which is free at this size and avoids
+            // hand-rolling an ordered container: `best` never exceeds five
+            // entries, so this is a handful of comparisons.
+            best.push(candidate);
+            best.sort(compare_candidates);
             if (best.length > MOVE_CANDIDATES_PER_DESTINATION) best.pop();
         }
         candidates.push(...best);
