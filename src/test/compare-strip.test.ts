@@ -139,12 +139,14 @@ describe('CompareStrip', () => {
         expect(toggle().disabled).toBe(false);
     });
 
-    it('does not mention missed moves when the rows were compared by position', async () => {
-        // A positional comparison never looked for moves, so reporting that
-        // some were missed would imply a search that did not happen.
+    it('shows both caveats at once, because they can be about different sheets', async () => {
+        // Both flags are workbook-wide. In a multi-sheet workbook one sheet can
+        // be compared by position while another aligns fine but has too many
+        // rows to check for moves, so suppressing either would drop a caveat
+        // that is true of a sheet the user is about to read.
         await strip({ degraded: true, move_search_truncated: true });
         expect(text()).toMatch(/compared by position/u);
-        expect(text()).not.toMatch(/only moved/u);
+        expect(text()).toMatch(/only moved/u);
     });
 
     it('says nothing about alignment when the rows did match up', async () => {

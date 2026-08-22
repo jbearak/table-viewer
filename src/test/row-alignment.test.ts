@@ -166,6 +166,54 @@ describe('align_sheet', () => {
         expect(alignment).toMatchObject({ addedRows: 1, deletedRows: 1 });
     });
 
+    it('observes a cancel when every scored pair is rejected on length', async () => {
+        // The scoring loop's checkpoint counted pairs that SURVIVED the size
+        // prefilter, so a run where every pair is rejected never reached one
+        // and could not be cancelled — and rejection is the cheap-per-pair
+        // case, which is where the iteration count runs highest.
+        const size = 400;
+        const original = single([
+            ...Array.from({ length: size }, (_, index) => [`${'x'.repeat(80)}${index}`]),
+            ['anchor'],
+        ]);
+        const modified = single([
+            ['anchor'],
+            ...Array.from({ length: size }, (_, index) => [String(index % 10)]),
+        ]);
+        // Armed by the move pass's own reads, so the cancel becomes visible
+        // only once scoring is under way. Arming it on hashing progress
+        // instead lets the hashing checkpoint catch it, and the test then
+        // passes whether or not the scoring loop yields at all.
+        let armed = false;
+        let reads = 0;
+        const arm_on_move_reads = new Proxy(original, {
+            get(target, property, receiver) {
+                const value = Reflect.get(target, property, receiver);
+                if (property !== 'read_rows' || typeof value !== 'function') return value;
+                return (...args: unknown[]) => {
+                    // Hashing reads this side in one batch; the move pass then
+                    // reads its candidates one scattered row at a time. So the
+                    // second read onwards can only be the move pass.
+                    if (++reads > 1) armed = true;
+                    return (value as (...a: unknown[]) => unknown).apply(target, args);
+                };
+            },
+        });
+        const pending = align_sheet(arm_on_move_reads, modified, matched, {
+            maxMoveSearchRows: size,
+            isCancelled: () => armed,
+        });
+        await expect(pending).rejects.toBeInstanceOf(AlignmentCancelledError);
+        // The error alone proves nothing: `count_changes` runs after the move
+        // pass and has a checkpoint of its own, so an uncancellable scoring
+        // loop still ends in an AlignmentCancelledError — thrown one phase too
+        // late, after the whole quadratic loop has already run. Reads tell the
+        // two apart. `count_changes` reads a third time to compare the paired
+        // `anchor` row; observing the cancel during scoring means it never got
+        // that far.
+        expect(reads).toBe(2);
+    });
+
     it('does not hunt for moves in a degraded alignment', async () => {
         // A degraded alignment is positional and means "these files do not
         // correspond"; decorating it with moves would dress a failed alignment

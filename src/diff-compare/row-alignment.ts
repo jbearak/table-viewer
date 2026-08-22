@@ -984,6 +984,18 @@ async function score_moves(
         // destination to keep 4 of them.
         const best: MoveCandidate[] = [];
         for (let deleted_index = 0; deleted_index < unmatched_deleted.length; deleted_index++) {
+            // Counted before the prefilter, not after. Counting only the pairs
+            // that survive it means a run where every pair is rejected on
+            // length never reaches a checkpoint, so the loop cannot be
+            // cancelled — and rejection is the cheap-per-pair case, which is
+            // exactly where the iteration count runs highest.
+            scored++;
+            if (scored % MOVE_SCORES_PER_CHECKPOINT === 0) {
+                // The loop can run a million iterations with no read between
+                // them, so reads are not sufficient yield points here.
+                await yield_to_event_loop();
+                if (options.isCancelled?.()) throw new AlignmentCancelledError();
+            }
             const source = unmatched_deleted[deleted_index];
             const source_row = sources[deleted_index];
             const max_length = Math.max(source_row.length, destination_row.length);
@@ -992,13 +1004,6 @@ async function score_moves(
             // compare cells to reach a conclusion arithmetic already reached.
             const delta = Math.abs(source_row.length - destination_row.length);
             if (max_length > 0 && !is_at_least_half(max_length - delta, max_length)) continue;
-            scored++;
-            if (scored % MOVE_SCORES_PER_CHECKPOINT === 0) {
-                // The scoring loop can run a million comparisons with no read
-                // between them, so reads are not sufficient yield points here.
-                await yield_to_event_loop();
-                if (options.isCancelled?.()) throw new AlignmentCancelledError();
-            }
             if (!rows_are_similar(source_row, destination_row)) continue;
             // Similarity is a boolean at this point, so displacement is what
             // distinguishes candidates: of two equally similar sources, the one

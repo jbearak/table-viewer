@@ -90,7 +90,7 @@ export function CompareStrip({
                     <span className="compare-strip-readonly">Read-only</span>
                 </div>
             )}
-            {degraded ? (
+            {degraded && (
                 // role="status" rather than "alert": it is a caveat about the
                 // grid the user is about to read, not an interruption.
                 <div className="compare-strip-degraded" role="status">
@@ -98,10 +98,14 @@ export function CompareStrip({
                     compared by position instead. If the rows are in a different order,
                     the differences below will overstate what actually changed.
                 </div>
-            ) : move_search_truncated && (
-                // Not shown alongside the degraded notice: a positional
-                // comparison never looked for moves at all, so saying some were
-                // missed would imply a search that did not happen.
+            )}
+            {move_search_truncated && (
+                // Shown even alongside the degraded notice. Both flags are
+                // workbook-wide, so in a multi-sheet workbook they can describe
+                // *different* sheets — one compared by position, another
+                // aligned fine but with too many rows to check for moves.
+                // Suppressing this one whenever any sheet degraded would drop a
+                // caveat that is true of a sheet the user is about to read.
                 <div className="compare-strip-degraded" role="status">
                     Too many rows differ to check them all for moves, so some rows that
                     only moved are counted as one deleted and one added.
