@@ -110,7 +110,8 @@ describe('CompareStrip', () => {
 
     it('says nothing about alignment when the rows did match up', async () => {
         await strip();
-        expect(container!.querySelector('[role="status"]')).toBeNull();
+        expect(container!.querySelector('.compare-strip-degraded')).toBeNull();
+        expect(text()).not.toMatch(/compared by position/u);
     });
 
     it('waits for transform work in flight', async () => {
@@ -138,6 +139,14 @@ describe('CompareStrip', () => {
     it('omits the side strip for a Git diff, whose original is not a path', async () => {
         await strip();
         expect(text()).not.toContain('Read-only');
+    });
+
+    it('announces the outcome, without re-reading it when the toggle is pressed', async () => {
+        await strip();
+        const counts = container!.querySelector('.compare-strip-counts');
+        expect(counts?.getAttribute('role')).toBe('status');
+        // The control is not inside the live region.
+        expect(counts?.contains(toggle())).toBe(false);
     });
 
     it('has no show-changes toggle: the diff is the document', async () => {

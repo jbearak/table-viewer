@@ -107,7 +107,15 @@ export function CompareStrip({
                 >
                     Only changed rows
                 </button>
-                <div className="compare-strip-counts">
+                {/*
+                  * A polite status, so a screen reader hears the outcome: the
+                  * progress region that was announcing "Comparing…" is gone by
+                  * now, and without this its last word on the comparison is
+                  * that it had started. The toggle is deliberately outside the
+                  * live region — pressing it should announce a control, not
+                  * re-read the totals.
+                  */}
+                <div className="compare-strip-counts" role="status">
                     {degraded
                         // Positional totals are not findings about the files:
                         // a reordered row counts as changed cells it does not

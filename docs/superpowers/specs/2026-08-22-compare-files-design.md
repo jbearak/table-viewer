@@ -87,14 +87,31 @@ reason about, one to test, and the Git panel gets the fix as a side effect.
    Myers is O(ND) in the number of *differences*, which is why two similar
    million-row files align fast.
 4. **Cap the effort.** When D exceeds the cap, stop and return the identity
-   alignment with `degraded: true`. This is mockup 6.
+   alignment with `degraded: true`. This is mockup 6. The cap is charged
+   against the middle-snake search itself rather than checked once a snake
+   completes: checking afterwards made the capped path *slower* than the
+   uncapped one, because it paid the full cost and then discarded the answer.
 5. **Count while walking**, so the counts cost nothing extra.
 
-Measured on in-memory fixtures during step 1: 200,000 rows with ten scattered
-cell edits plus one insert and one delete aligns in **271 ms**; two unrelated
-50,000-row files hit the cap and degrade in **25 ms**. These are recorded here
+The diff is Myers' **linear-space** refinement — recurse on the middle snake —
+not the textbook version that records one frontier per edit distance. That
+distinction is not an optimisation: the textbook trace is O(D²), which at the
+original 100,000 cap works out to tens of gigabytes, so two dissimilar files
+exhausted memory *instead of* reaching the graceful degradation above. Memory
+is now O(N+M). Two unrelated 10,000-row files, which previously needed roughly
+3 GB, align in about 0.5 s with no measurable heap growth.
+
+Reaching the cap costs time quadratic in the cap, so the cap is really a budget
+for the answer "these files do not correspond": two unrelated 50,000-row files
+degrade in about 0.2 s at 10,000 and about 1.6 s at 40,000. The default is
+**20,000** — far past any edit still worth calling a revision, and about half a
+second to say so.
+
+Measured on in-memory fixtures: 200,000 rows with ten scattered cell edits plus
+one insert and one delete aligns in **271 ms**. These figures are recorded here
 rather than asserted in a test — a timing assertion is a CI flake already
-written (CLAUDE.md).
+written (CLAUDE.md). What *is* asserted is that unrelated files complete at
+all, which is the property the rewrite exists for.
 
 Async and cancellable, checkpointing on the same cadence as
 `compute_transform` (`SCAN_ROWS_PER_CHECKPOINT`, `table-transform.ts:25`) so the
@@ -108,6 +125,16 @@ precisely `TransformResult.indices` (`table-transform.ts:36`). So the filter is
 expressed through the existing transform layer and composes with sorting and
 column filters for free, rather than becoming a special case in the grid.
 
+**Not shipped from mockup 7:** preserved source row numbers and the
+"N unchanged rows hidden" gap markers. Riding the shared transform layer is
+what makes the filter compose, and that layer numbers rows by display position
+for every other filter in the viewer — so honouring the mockup here would mean
+either a compare-only fork of the row-marker path or changing how every filter
+in the app numbers its rows. The second is a product decision beyond this
+feature. Worth revisiting: the mockup's argument (a filtered row should stay
+findable in the real file) applies just as well to an ordinary column filter,
+which suggests fixing it once, for everything, rather than here.
+
 ## Host and UI
 
 Because the Git panel now aligns too, `attach_viewer`'s existing compare path
@@ -117,10 +144,10 @@ that step is short, but it is not zero, and it must be cancellable.
 
 | Concern | Where |
 |---|---|
-| Menu item | `desktop/main/main.ts:915`, under `Open…` |
+| Menu item | `desktop/main/main.ts`, under `Open…` |
 | Dialog window | new `desktop/renderer/compare.html` + `compare.ts`, modelled on `prefs.*` |
 | IPC | new `compare:*` channels in `desktop/shared/ipc.ts` |
-| Window creation | `desktop/main/viewer-windows.ts:925` — pass `options.compare` |
+| Window creation | `desktop/main/viewer-windows.ts` (`open_comparison`) — pass `options.compare` |
 | Progress / degraded banner | new snapshot fields beside `gitCompare` |
 
 `editing_supported` is already false whenever `options.compare` is set, so the
