@@ -152,7 +152,7 @@ export class TableViewerEditorProvider
 
     async openCustomDocument(uri: vscode.Uri): Promise<TableViewerDocument> {
         const diff = table_diff_document_uris(uri);
-        if (uri.scheme === TABLE_DIFF_SCHEME && !diff) {
+        if (uri.scheme === TABLE_DIFF_SCHEME && uri.query && !diff) {
             throw new Error('The Table Viewer comparison URI is invalid.');
         }
         return new TableViewerDocument(uri, diff);
