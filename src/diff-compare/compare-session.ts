@@ -195,6 +195,10 @@ export class CompareDataSource implements DataSource {
      *  construction, but PanelCore asks again on every transform recompute —
      *  so without this, each sort or filter rescans every row of the sheet. */
     private readonly changed_grid_rows_cache = new Map<number, readonly number[]>();
+    /** Memoized moved-row membership per sheet. Built once instead of per page
+     *  request: a re-sorted sheet can mark nearly every row moved, and
+     *  `compute_diff` runs on every viewport page that misses its cache. */
+    private readonly moved_row_lookup_cache = new Map<number, ReadonlySet<number>>();
     /** Deleted rows' grid rows per sheet, in canonical-number order. */
     private readonly deleted_grid_rows: ReadonlyMap<number, readonly number[]>;
 
@@ -376,6 +380,15 @@ export class CompareDataSource implements DataSource {
         return computed;
     }
 
+    /** Moved grid rows of a sheet as a membership set, built at most once. */
+    private moved_rows_of(sheet_index: number): ReadonlySet<number> {
+        const cached = this.moved_row_lookup_cache.get(sheet_index);
+        if (cached) return cached;
+        const built = new Set(this.alignments.get(sheet_index)?.movedRowIndices ?? []);
+        this.moved_row_lookup_cache.set(sheet_index, built);
+        return built;
+    }
+
     private compute_changed_grid_rows(sheet_index: number): readonly number[] {
         const alignment = this.alignments.get(sheet_index);
         if (!alignment) {
@@ -465,7 +478,7 @@ export class CompareDataSource implements DataSource {
         const original_sheet = this.original_meta.sheets[pairing.originalIndex];
         const modified_sheet = this.modified_meta.sheets[sheet_index];
         const column_count = Math.max(original_sheet.columnCount, modified_sheet.columnCount);
-        const moved = new Set(this.alignments.get(sheet_index)?.movedRowIndices ?? []);
+        const moved = this.moved_rows_of(sheet_index);
         const row_status: CompareRowStatus[] = [];
         const paired_positions: number[] = [];
         const original_rows: number[] = [];

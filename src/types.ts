@@ -3,6 +3,7 @@ import type {
     WorkbookMeta,
     RenderedCell,
 } from './data-source/interface';
+import type { CompareRowStatus } from './diff-compare/compare-source';
 import type { XlsxCellFormatFields } from './spreadsheet-format';
 import type {
     SnapshotDisposition,
@@ -1847,7 +1848,7 @@ export type HostMessage =
     /** Git compare mode: sparse positional diff for the same page a rowData
      *  answered. `rowStatus[i]` describes row `startRow + i`; `changedCells`
      *  carries only differing cells with the original (`base`) text. */
-    | { type: 'compareDiff'; sheetIndex: number; startRow: number; rowStatus: ('same' | 'added' | 'deleted' | 'moved')[]; changedCells: { row: number; col: number; base: string }[]; requestId: string; generation: number }
+    | { type: 'compareDiff'; sheetIndex: number; startRow: number; rowStatus: CompareRowStatus[]; changedCells: { row: number; col: number; base: string }[]; requestId: string; generation: number }
     | { type: 'scrollToRow'; row: number }
     | { type: 'saveOperationStarted'; lifecycle: ActiveCsvSaveLifecycle }
     | {
