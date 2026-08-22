@@ -78,6 +78,19 @@ export interface WorkbookSnapshotCompare {
     /** Changed promoted column headers per modified sheet, positionally
      *  matching `meta.sheets`; empty for sheets without header changes. */
     readonly changedColumnNames: readonly (readonly { col: number; base: string }[])[];
+    /** Whole-comparison change totals, for the compare window's counts. */
+    readonly counts: {
+        readonly addedRows: number;
+        readonly deletedRows: number;
+        readonly changedRows: number;
+        readonly changedCells: number;
+    };
+    /**
+     * The rows could not be matched up — the aligner hit its effort cap and
+     * compared by position instead. The renderer must say so: an all-changed
+     * grid produced this way is not a finding about the files.
+     */
+    readonly degraded: boolean;
 }
 
 /** Fully explicit configuration and capabilities; absence is not overloaded. */

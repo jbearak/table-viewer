@@ -100,6 +100,49 @@ describe('compare mode controller', () => {
         expect(posted(panel, 'rowData').length).toBeGreaterThan(0);
     });
 
+    it('reports an inserted row as one addition rather than shifting every row', async () => {
+        // The regression content alignment exists for: positionally, inserting
+        // a row near the top makes every row below it look changed.
+        vscode_mock.__setReadFileImplementation(async (uri) =>
+            enc.encode(String(uri.fsPath ?? uri).includes('original')
+                ? 'h\na\nb\nc\n'
+                : 'h\na\nNEW\nb\nc\n'));
+        const panel = open_compare_table();
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThan(0));
+        const { generation } = posted(panel, 'workbookSnapshot')[0]
+            .snapshot as { generation: number };
+        await panel.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 10,
+            requestId: 'r1',
+            generation,
+        });
+        await vi.waitFor(() => expect(posted(panel, 'compareDiff').length).toBeGreaterThan(0));
+        const diff = posted(panel, 'compareDiff')[0];
+        expect(diff.rowStatus).toEqual(['same', 'added', 'same', 'same']);
+        expect(diff.changedCells).toEqual([]);
+    });
+
+    it('reports change counts on the snapshot', async () => {
+        vscode_mock.__setReadFileImplementation(async (uri) =>
+            enc.encode(String(uri.fsPath ?? uri).includes('original')
+                ? 'h\na\nb\n'
+                : 'h\na\nCHANGED\nNEW\n'));
+        const panel = open_compare_table();
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThan(0));
+        const snapshot = posted(panel, 'workbookSnapshot')[0].snapshot as {
+            configuration: { gitCompare?: { counts: unknown; degraded: boolean } };
+        };
+        expect(snapshot.configuration.gitCompare?.counts).toEqual({
+            addedRows: 1, deletedRows: 0, changedRows: 1, changedCells: 1,
+        });
+        expect(snapshot.configuration.gitCompare?.degraded).toBe(false);
+    });
+
     it('degrades to a plain open with a warning when the original is unreadable', async () => {
         vscode_mock.__setReadFileImplementation(async (uri) => {
             if (String(uri.fsPath ?? uri).includes('original')) {

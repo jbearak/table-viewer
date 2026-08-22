@@ -32,7 +32,7 @@ import {
     type ViewerHost,
 } from './host-ports';
 import { create_resource_identity, type ResourceUriLike } from './resource-identity';
-import { CompareDataSource } from './diff-compare/compare-session';
+import { CompareDataSource, align_workbook } from './diff-compare/compare-session';
 import type { WorkbookSnapshotCompare } from './viewer-snapshot';
 import {
     assert_safe_file_size,
@@ -3576,7 +3576,15 @@ export function attach_viewer(
         let comparison_observation: Readonly<PhysicalSourceObservation> | undefined;
         if (original) {
             try {
-                adopted = new CompareDataSource(modified, original.source);
+                // Aligned before the source is built: comparing row N to row N
+                // reports an inserted or moved row as a screenful of changed
+                // cells, and the alignment fixes the row counts meta() reports,
+                // so it cannot be deferred until after construction.
+                adopted = new CompareDataSource(
+                    modified,
+                    original.source,
+                    await align_workbook(modified, original.source),
+                );
                 comparison_observation = original.observation;
             } catch (error) {
                 try {
@@ -3655,6 +3663,8 @@ export function attach_viewer(
                 pairings: adopted.pairings,
                 sheetStatuses: adopted.sheetStatuses,
                 changedColumnNames: adopted.changedColumnNames,
+                counts: adopted.changeCounts(),
+                degraded: adopted.degraded,
             },
         };
     }
