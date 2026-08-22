@@ -23,10 +23,19 @@ afterEach(() => {
     container = undefined;
 });
 
+/**
+ * Render the banner, reusing the root across calls within a test.
+ *
+ * Reused rather than recreated so that a second call is a *rerender* — which is
+ * what the resolving-state case is actually about — instead of mounting a second
+ * copy and leaking the first, which `afterEach` would never unmount.
+ */
 async function banner(props: Partial<LfsBannerProps> = {}): Promise<void> {
-    container = document.createElement('div');
-    document.body.appendChild(container);
-    root = createRoot(container);
+    if (!container || !root) {
+        container = document.createElement('div');
+        document.body.appendChild(container);
+        root = createRoot(container);
+    }
     await act(async () => {
         root!.render(React.createElement(LfsBanner, {
             unresolved: UNRESOLVED,
@@ -47,6 +56,10 @@ describe('LfsBanner', () => {
         expect(text()).toContain('The grid is empty');
         // Decimal units, matching how git-lfs itself quotes object sizes.
         expect(text()).toContain('41.5 MB');
+        // The size describes the *download*, not the file on disk. A pointer is
+        // a fixed ~130 bytes whatever it points at, so calling this figure the
+        // placeholder's size — as this banner once did — was plainly false.
+        expect(text()).not.toContain('placeholder');
         expect(button()?.textContent).toBe('Download contents');
     });
 
@@ -58,6 +71,7 @@ describe('LfsBanner', () => {
         expect(text()).toContain('version being compared against');
         expect(text()).toContain('Differences are not shown');
         expect(text()).not.toContain('The grid is empty');
+        expect(text()).not.toContain('placeholder');
     });
 
     it('drops the button when the host cannot resolve LFS objects', async () => {
@@ -77,6 +91,9 @@ describe('LfsBanner', () => {
         await banner({ resolving: true });
         expect(button()?.textContent).toBe('Downloading…');
         expect(button()?.disabled).toBe(true);
+        // Rerendered in place, not mounted alongside the first copy.
+        expect(container?.querySelectorAll('.lfs-banner')).toHaveLength(1);
+        expect(document.querySelectorAll('.lfs-banner')).toHaveLength(1);
     });
 
     it('offers a retry after a download failure, quoting the reason', async () => {
@@ -111,6 +128,18 @@ describe('LfsBanner', () => {
         expect(text()).toContain('not set up in this repository');
         expect(text()).toContain('git lfs install');
         expect(button()?.textContent).toBe('Try again');
+    });
+
+    it('drops the button when the object is missing from Git LFS', async () => {
+        // The case that most needs saying plainly: the bytes do not exist to be
+        // fetched, so a retry would be a button that cannot ever work — which
+        // is exactly the confusion this banner exists to prevent.
+        await banner({
+            unresolved: { ...UNRESOLVED, failure: { reason: 'objectMissing' } },
+        });
+        expect(text()).toContain('missing from Git LFS');
+        expect(text()).toContain('may not have pushed');
+        expect(button()).toBeNull();
     });
 
     it('explains a file outside a repository without offering a retry', async () => {

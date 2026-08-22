@@ -126,18 +126,50 @@ export const fake_git_lfs = {
     calls: [] as FakeGitLfsCall[],
     pull_outcomes: [] as GitLfsResolveOutcome[],
     smudge_outcomes: [] as GitLfsSmudgeOutcome[],
+    /** Make the next call reject rather than resolve, so the controller's
+     *  handling of a port that throws can be exercised. A real port is not
+     *  supposed to, which is exactly why it is worth a test. */
+    throw_on_next: undefined as Error | undefined,
+    /** Resolve nothing until released, so a second click can be sent while the
+     *  first is genuinely still in flight. */
+    gate: undefined as { release: () => void; entered: Promise<void> } | undefined,
+    open_gate(): void {
+        let release = () => {};
+        let mark_entered = () => {};
+        const entered = new Promise<void>((r) => { mark_entered = () => r(); });
+        const held = new Promise<void>((r) => { release = () => r(); });
+        fake_git_lfs.gate = { release, entered };
+        fake_git_lfs.held = held;
+        fake_git_lfs.mark_entered = mark_entered;
+    },
+    held: undefined as Promise<void> | undefined,
+    mark_entered: (() => {}) as () => void,
     reset(): void {
         fake_git_lfs.calls.length = 0;
         fake_git_lfs.pull_outcomes.length = 0;
         fake_git_lfs.smudge_outcomes.length = 0;
+        fake_git_lfs.throw_on_next = undefined;
+        fake_git_lfs.gate = undefined;
+        fake_git_lfs.held = undefined;
+        fake_git_lfs.mark_entered = () => {};
     },
     port: {
-        pull(resource): Promise<GitLfsResolveOutcome> {
+        async pull(resource): Promise<GitLfsResolveOutcome> {
             fake_git_lfs.calls.push({ operation: 'pull', path: resource.fsPath });
-            return Promise.resolve(
+            const thrown = fake_git_lfs.throw_on_next;
+            if (thrown) {
+                fake_git_lfs.throw_on_next = undefined;
+                throw thrown;
+            }
+            if (fake_git_lfs.held) {
+                fake_git_lfs.mark_entered();
+                await fake_git_lfs.held;
+                fake_git_lfs.held = undefined;
+            }
+            return (
                 fake_git_lfs.pull_outcomes.length > 1
                     ? fake_git_lfs.pull_outcomes.shift()!
-                    : fake_git_lfs.pull_outcomes[0] ?? { type: 'resolved' },
+                    : fake_git_lfs.pull_outcomes[0] ?? { type: 'resolved' }
             );
         },
         smudge(resource, pointer): Promise<GitLfsSmudgeOutcome> {

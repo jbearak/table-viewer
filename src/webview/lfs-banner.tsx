@@ -33,10 +33,19 @@ function headline(side: UnresolvedLfsObject['side']): string {
         : 'The version being compared against is stored in Git LFS and has not been downloaded.';
 }
 
+/**
+ * The second line, and the one place the size has to be described carefully.
+ *
+ * `size` is the *stored object's* length, not the placeholder's — a pointer
+ * file is a fixed ~130 bytes whatever it points at. Calling it "the 733.5 KB
+ * placeholder" was simply false, and misleading in the specific way that
+ * matters here: it made the number look like a description of the useless file
+ * on disk rather than of the download the button is offering to perform.
+ */
 function detail(side: UnresolvedLfsObject['side'], size: number): string {
     return side === 'file'
-        ? `The grid is empty because only the ${format_size(size)} placeholder is available locally.`
-        : `Differences are not shown because only the ${format_size(size)} placeholder of the other version is available locally.`;
+        ? `The grid is empty until the ${format_size(size)} of data behind it is downloaded.`
+        : `Differences are not shown until the ${format_size(size)} of data behind the other version is downloaded.`;
 }
 
 /**
@@ -50,6 +59,8 @@ function failure_copy(failure: NonNullable<UnresolvedLfsObject['failure']>): str
             return 'Git LFS is not installed, so the contents cannot be downloaded from here. Install git-lfs and reopen the file.';
         case 'notARepository':
             return 'This file is not inside a Git repository, so there is nowhere to download the contents from.';
+        case 'objectMissing':
+            return 'The stored contents are missing from Git LFS, so there is nothing to download. Whoever committed this file may not have pushed its contents.';
         case 'filtersNotConfigured':
             return 'Git LFS is not set up in this repository, so the contents were not downloaded. Run “git lfs install” in it, then try again.';
         case 'failed':
@@ -77,6 +88,9 @@ export function LfsBanner({
     const { side, size, resolvable, failure } = unresolved;
     // A retry is worth offering for anything except a git-lfs that is not
     // installed, which no number of clicks will change.
+    // Retry anything that another attempt could plausibly fix. Not a missing
+    // git-lfs, and not a missing object: the bytes do not exist to be fetched,
+    // so a button here would be the "does nothing" trap this banner replaces.
     const retryable = failure === undefined
         || failure.reason === 'failed'
         || failure.reason === 'filtersNotConfigured';

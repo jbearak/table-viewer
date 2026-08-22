@@ -52,6 +52,30 @@ function open_table(options: ViewerControllerOptions = {}, host = fake_viewer_ho
     return panel;
 }
 
+/**
+ * A comparison whose *modified* side is itself a `git:` revision — what a
+ * staged-vs-HEAD diff of an LFS file actually looks like.
+ */
+function open_git_main_compare(host = fake_viewer_host) {
+    const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
+    const controller = attach_viewer(
+        panel as unknown as Parameters<typeof attach_viewer>[0],
+        vscode_mock.Uri.parse(
+            'git:/tmp/data.csv?%7B%22path%22%3A%22/tmp/data.csv%22%7D',
+        ) as unknown as vscode.Uri,
+        with_in_memory_authority_transactions(versioned_state_store().store),
+        csv_table_profile(),
+        host,
+        {
+            compare: {
+                originalUri: vscode_mock.Uri.file('/tmp/original.csv') as unknown as vscode.Uri,
+            },
+        },
+    );
+    panel.onDidDispose(() => controller.dispose());
+    return panel;
+}
+
 function open_compare(host = fake_viewer_host) {
     return open_table({
         compare: {
@@ -66,7 +90,10 @@ function posted(panel: ReturnType<typeof open_table>, type: string): Posted[] {
 
 function snapshots(panel: ReturnType<typeof open_table>) {
     return posted(panel, 'workbookSnapshot').map((message) => message.snapshot as {
-        configuration: { unresolvedLfs?: UnresolvedLfsObject };
+        configuration: {
+            unresolvedLfs?: UnresolvedLfsObject;
+            gitCompare?: unknown;
+        };
         meta: { sheets: { rowCount: number; columnCount: number }[] };
     });
 }
@@ -204,12 +231,141 @@ describe('a working-tree file that is an LFS pointer', () => {
             .toMatchObject({ side: 'file', failure: { reason: 'filtersNotConfigured' } });
     });
 
+    it('reports a failure when the port throws instead of returning one', async () => {
+        // A port is not supposed to throw, which is why this is worth pinning:
+        // an escaping rejection would leave the webview's "Downloading…" state
+        // set with no snapshot to clear it, so the button stays disabled
+        // forever and the user has no way to retry.
+        serve('file');
+        const panel = open_table();
+        await panel.__receive({ type: 'ready' });
+        await latest_lfs(panel, (value) => value !== undefined);
+        fake_git_lfs.throw_on_next = new Error('spawn ENOENT');
+        await panel.__receive({ type: 'resolveLfsObject' });
+        expect(await latest_lfs(panel, (value) => value?.failure !== undefined))
+            .toMatchObject({ side: 'file', failure: { reason: 'failed' } });
+    });
+
+    it('ignores a second click while the first resolve is still running', async () => {
+        // The in-flight guard: a slow download invites an impatient second
+        // click, and two concurrent pulls of the same object is work nobody
+        // asked for.
+        serve('file');
+        const panel = open_table();
+        await panel.__receive({ type: 'ready' });
+        await latest_lfs(panel, (value) => value !== undefined);
+        fake_git_lfs.open_gate();
+        const first = panel.__receive({ type: 'resolveLfsObject' });
+        await fake_git_lfs.gate!.entered;
+        await panel.__receive({ type: 'resolveLfsObject' });
+        expect(fake_git_lfs.calls).toHaveLength(1);
+        serve('none');
+        fake_git_lfs.gate!.release();
+        await first;
+        await latest_lfs(panel, (value) => value === undefined);
+        expect(fake_git_lfs.calls).toHaveLength(1);
+    });
+
+    it('does not restore the banner when the reload it triggered was superseded', async () => {
+        // The bug that made the button look broken on a real file. A successful
+        // `git lfs pull` rewrites the working tree, which wakes the file-refresh
+        // watcher, whose reload supersedes the resolve's own. Supersession makes
+        // `refresh_panel_source` return false exactly as a failure does, so the
+        // handler treated the win as a loss and put the banner back — over the
+        // real table the superseding load had already delivered.
+        serve('file');
+        const panel = open_table();
+        await panel.__receive({ type: 'ready' });
+        await latest_lfs(panel, (value) => value !== undefined);
+        fake_git_lfs.pull_outcomes.push({ type: 'resolved' });
+        // Stand in for git-lfs writing the file: real content from here on, and
+        // a watcher event landing while the resolve is still in flight.
+        serve('none');
+        vscode_mock.__setStatImplementation(async () => ({ size: 99, mtime: 9 }));
+        const resolving = panel.__receive({ type: 'resolveLfsObject' });
+        for (const watcher of vscode_mock.__getWatchers()) await watcher.__fireChange();
+        await resolving;
+        // The file is no longer a pointer, so no banner — whichever load won.
+        await vi.waitFor(() => {
+            const all = snapshots(panel);
+            expect(all[all.length - 1].configuration.unresolvedLfs).toBeUndefined();
+            expect(all[all.length - 1].meta.sheets[0].rowCount).toBeGreaterThan(0);
+        });
+    });
+
     it('ignores a resolve request when nothing is unresolved', async () => {
         const panel = open_table();
         await panel.__receive({ type: 'ready' });
         await vi.waitFor(() => expect(snapshots(panel).length).toBeGreaterThan(0));
         await panel.__receive({ type: 'resolveLfsObject' });
         expect(fake_git_lfs.calls).toEqual([]);
+    });
+});
+
+describe('a comparison whose own modified side is an LFS pointer', () => {
+    it('smudges the main side instead of pulling a file it never reads', async () => {
+        // The bug this covers, reproduced from a real staged-vs-HEAD diff of an
+        // LFS-tracked .xlsx: `pull` repairs the *working tree*, but this panel
+        // reads a `git:` revision. The working-tree file was already smudged,
+        // so `pull` exited 0 and reported success while the next read returned
+        // the pointer again — so the banner came straight back, every click,
+        // forever.
+        serve('file');
+        const panel = open_git_main_compare();
+        await panel.__receive({ type: 'ready' });
+        await latest_lfs(panel, (value) => value !== undefined);
+        fake_git_lfs.smudge_outcomes.push({
+            type: 'resolved',
+            content: enc.encode(RESOLVED_CSV),
+        });
+        await panel.__receive({ type: 'resolveLfsObject' });
+        await latest_lfs(panel, (value) => value === undefined);
+        // Smudge, not pull: nothing on disk needs repairing, and pulling would
+        // "succeed" without changing what this panel reads.
+        expect(fake_git_lfs.calls.map((call) => call.operation)).toEqual(['smudge']);
+        const latest = snapshots(panel)[snapshots(panel).length - 1];
+        expect(latest.meta.sheets[0].rowCount).toBeGreaterThan(0);
+    });
+
+    it('keeps showing the resolved table across a later rebuild', async () => {
+        // A `git:` read returns the pointer blob forever, so the smudged bytes
+        // have to survive in memory or the banner returns on the next refresh.
+        serve('file');
+        const panel = open_git_main_compare();
+        await panel.__receive({ type: 'ready' });
+        await latest_lfs(panel, (value) => value !== undefined);
+        fake_git_lfs.smudge_outcomes.push({
+            type: 'resolved',
+            content: enc.encode(RESOLVED_CSV),
+        });
+        await panel.__receive({ type: 'resolveLfsObject' });
+        await latest_lfs(panel, (value) => value === undefined);
+        vscode_mock.__setStatImplementation(async () => ({ size: 24, mtime: 77 }));
+        for (const watcher of vscode_mock.__getWatchers()) await watcher.__fireChange();
+        // The rebuild may legitimately deduplicate, so what matters is not that
+        // a snapshot arrived but that the banner never came back and no second
+        // download was attempted — the two ways stale bytes would show up.
+        await vi.waitFor(() => {
+            const latest = snapshots(panel)[snapshots(panel).length - 1];
+            expect(latest.configuration.unresolvedLfs).toBeUndefined();
+            expect(latest.meta.sheets[0].rowCount).toBeGreaterThan(0);
+        });
+        expect(fake_git_lfs.calls.filter((c) => c.operation === 'smudge')).toHaveLength(1);
+    });
+
+    it('reports a missing object without offering a retry', async () => {
+        serve('file');
+        const panel = open_git_main_compare();
+        await panel.__receive({ type: 'ready' });
+        await latest_lfs(panel, (value) => value !== undefined);
+        fake_git_lfs.smudge_outcomes.push({
+            type: 'failed',
+            reason: 'objectMissing',
+            detail: 'remote missing object …',
+        });
+        await panel.__receive({ type: 'resolveLfsObject' });
+        expect(await latest_lfs(panel, (value) => value?.failure !== undefined))
+            .toMatchObject({ side: 'file', failure: { reason: 'objectMissing' } });
     });
 });
 
@@ -224,7 +380,12 @@ describe('a compare original that is an LFS pointer', () => {
         // table — only the diff is missing.
         const latest = snapshots(panel)[snapshots(panel).length - 1];
         expect(latest.meta.sheets[0].rowCount).toBeGreaterThan(0);
-        expect(latest.configuration).not.toHaveProperty('gitCompare.counts.changedCells', 1);
+        // Asserted as absence, not as "some other count": `not.toHaveProperty`
+        // with a value passes for *any* other number, so an unintended diff
+        // would have slipped through. Degrading to a plain open is the whole
+        // contract for an unresolved original, so there must be no comparison
+        // at all.
+        expect(latest.configuration.gitCompare).toBeUndefined();
     });
 
     it('smudges rather than pulling, and then produces a real diff', async () => {
@@ -271,6 +432,26 @@ describe('a compare original that is an LFS pointer', () => {
         await panel.__receive({ type: 'resolveLfsObject' });
         expect(fake_git_lfs.calls.filter((call) => call.operation === 'smudge'))
             .toHaveLength(1);
+
+        // The case the cache actually exists for: a genuine rebuild. Changing
+        // the modified side and firing the watcher re-reads the original, which
+        // is still a pointer on disk and always will be — so a rebuild that did
+        // not reuse the cached bytes would either smudge again or put the banner
+        // back. Neither may happen.
+        vscode_mock.__setReadFileImplementation(async (uri) => {
+            const is_original = String(uri.fsPath ?? uri).includes('original');
+            return enc.encode(is_original ? POINTER : 'h\na\nb\nc\n');
+        });
+        vscode_mock.__setStatImplementation(async () => ({ size: 9, mtime: 2 }));
+        const before = snapshots(panel).length;
+        await vscode_mock.__getWatchers()[0].__fireChange();
+        await vi.waitFor(() => {
+            expect(snapshots(panel).length).toBeGreaterThan(before);
+        });
+        expect(fake_git_lfs.calls.filter((call) => call.operation === 'smudge'))
+            .toHaveLength(1);
+        expect(await latest_lfs(panel, (value) => value === undefined))
+            .toBeUndefined();
     });
 
     it('keeps the notice when the smudge fails', async () => {

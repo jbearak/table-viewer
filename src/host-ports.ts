@@ -44,6 +44,16 @@ export type GitLfsFailureReason =
      * in that repository — and retrying without it changes nothing.
      */
     | 'filtersNotConfigured'
+    /**
+     * git-lfs reached its remote and the object is not there. Verified against
+     * git-lfs 3.7.1: `pull` exits 2 with `remote missing object <oid>`.
+     *
+     * Its own reason because it is the one failure that is neither the user's
+     * setup nor transient — the bytes do not exist to be fetched, so clicking
+     * again cannot ever work, and offering a retry is precisely the confusing
+     * "button that does nothing" this feature exists to avoid.
+     */
+    | 'objectMissing'
     /** git-lfs ran and failed: no network, no credentials, object missing. */
     | 'failed';
 
