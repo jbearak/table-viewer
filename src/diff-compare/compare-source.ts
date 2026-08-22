@@ -25,15 +25,61 @@ export type SheetPairing =
     | { readonly status: 'added'; readonly name: string; readonly modifiedIndex: number }
     | { readonly status: 'deleted'; readonly name: string; readonly originalIndex: number };
 
+/** The delimited-vs-workbook case: sheet 0 pairs, the workbook's rest are
+ *  one-sided in whichever direction the workbook sits. */
+function pair_first_sheets(
+    original: WorkbookMeta,
+    modified: WorkbookMeta,
+): SheetPairing[] {
+    const pairings: SheetPairing[] = [{
+        status: 'matched',
+        name: modified.sheets[0].name,
+        modifiedIndex: 0,
+        originalIndex: 0,
+    }];
+    for (let index = 1; index < modified.sheets.length; index++) {
+        pairings.push({
+            status: 'added',
+            name: modified.sheets[index].name,
+            modifiedIndex: index,
+        });
+    }
+    for (let index = 1; index < original.sheets.length; index++) {
+        pairings.push({
+            status: 'deleted',
+            name: original.sheets[index].name,
+            originalIndex: index,
+        });
+    }
+    return pairings;
+}
+
 /**
  * Pair worksheets positionally-independently: by stable `worksheetId` when both
  * sides expose one, otherwise by exact name. Each original sheet is consumed at
  * most once. Modified-only sheets are `added`; original-only sheets `deleted`.
+ *
+ * One exception, for comparing a delimited file against a workbook: a CSV or
+ * TSV is a single unnamed sheet the reader calls `Sheet1`, so name matching
+ * reports it and every worksheet as one-sided unless the workbook happens to
+ * have a sheet by that name. Pairing it with the workbook's first sheet is what
+ * the user asked for by choosing the two files, and what the dialog promises.
  */
 export function pair_sheets(
     original: WorkbookMeta,
     modified: WorkbookMeta,
 ): SheetPairing[] {
+    if (original.sheets.length > 0 && modified.sheets.length > 0) {
+        const single = (meta: WorkbookMeta) => meta.sheets.length === 1
+            && meta.sheets[0].worksheetId === undefined;
+        // Only when exactly one side is a lone anonymous sheet: two such sides
+        // already pair by their shared name, and two workbooks must keep
+        // identity-based pairing or an added first sheet would glue unrelated
+        // worksheets together.
+        if (single(original) !== single(modified)) {
+            return pair_first_sheets(original, modified);
+        }
+    }
     const unclaimed = new Set(original.sheets.map((_, index) => index));
     const by_worksheet_id = new Map<string, number>();
     const by_name = new Map<string, number>();

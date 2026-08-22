@@ -29,10 +29,11 @@ function open_compare_controller(
     options: ViewerControllerOptions = {},
 ) {
     const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
+    const state_store = versioned_state_store();
     const controller = attach_viewer(
         panel as unknown as Parameters<typeof attach_viewer>[0],
         vscode_mock.Uri.file('/tmp/compare.csv') as unknown as vscode.Uri,
-        with_in_memory_authority_transactions(versioned_state_store().store),
+        with_in_memory_authority_transactions(state_store.store),
         profile,
         fake_viewer_host,
         {
@@ -41,7 +42,7 @@ function open_compare_controller(
         },
     );
     panel.onDidDispose(() => controller.dispose());
-    return { controller, panel };
+    return { controller, panel, state_store };
 }
 
 function open_compare_table(original_path = '/tmp/original.csv') {
@@ -77,6 +78,28 @@ describe('compare mode controller', () => {
         expect(snapshot.configuration.gitCompare?.pairings).toEqual([
             { status: 'matched', name: 'Sheet1', modifiedIndex: 0, originalIndex: 0 },
         ]);
+    });
+
+    it('parses each side with its own format', async () => {
+        // The window is attached for the modified file, so its profile is the
+        // modified format's. Reusing it for the original split this TSV on
+        // commas, turning two columns into one — and across csv/xlsx it fed
+        // one parser the other's bytes outright.
+        vscode_mock.__setReadFileImplementation(async (uri) =>
+            enc.encode(String(uri.fsPath ?? uri).includes('original')
+                ? 'h\tk\nA\tB\n'
+                : MODIFIED));
+        const panel = open_compare_table('/tmp/original.tsv');
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThan(0));
+        const snapshot = posted(panel, 'workbookSnapshot')[0].snapshot as {
+            configuration: { gitCompare?: { changedColumnNames: { base: string }[][] } };
+        };
+        // The original's second column is gone from the modified side; if the
+        // tab had not been honoured there would be no second column at all,
+        // and column 0 would read as renamed from 'h\tk'.
+        expect(snapshot.configuration.gitCompare?.changedColumnNames[0])
+            .toEqual([{ col: 1, base: 'k' }]);
     });
 
     it('answers a row request with a compareDiff page beside rowData', async () => {
@@ -188,6 +211,52 @@ describe('compare mode controller', () => {
 
         const off = await set_transform(false, 't2');
         expect(off.view.rowCount).toBe(4);
+    });
+
+    it('does not persist the changed-rows filter as saved view state', async () => {
+        // Session state of this comparison, not a saved view: persisted, a
+        // later plain open of the same file would come back filtered by a
+        // comparison it no longer has, with no control anywhere to clear it.
+        // `clone_transform` is what drops it today; this guards the outcome
+        // end to end rather than that one function.
+        vscode_mock.__setReadFileImplementation(async (uri) =>
+            enc.encode(String(uri.fsPath ?? uri).includes('original')
+                ? 'h\na\nb\nc\n'
+                : 'h\na\nNEW\nb\nc\n'));
+        const { panel, state_store } = open_compare_controller();
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThan(0));
+        const snapshot = posted(panel, 'workbookSnapshot')[0].snapshot as {
+            generation: number;
+            meta: { sheets: readonly Parameters<typeof transform_schema_for_sheet>[0][] };
+        };
+        await panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'p1',
+            intent: 'apply',
+            sourceGeneration: snapshot.generation,
+            state: {
+                sort: [],
+                filters: [],
+                hiddenRows: [1],
+                onlyChangedRows: true,
+                schema: transform_schema_for_sheet(snapshot.meta.sheets[0]),
+            },
+        });
+        await vi.waitFor(() => expect(
+            posted(panel, 'transformInstalled').some((message) => message.requestId === 'p1'),
+        ).toBe(true));
+        const stored = await vi.waitFor(async () => {
+            const state = (await state_store.store.read('/tmp/compare.csv')).state as {
+                transforms?: ({ hiddenRows?: number[]; onlyChangedRows?: boolean } | undefined)[];
+            };
+            expect(state.transforms?.[0]).toBeDefined();
+            return state.transforms![0]!;
+        });
+        // The rest of the transform is genuinely saved view state and stays.
+        expect(stored.hiddenRows).toEqual([1]);
+        expect(stored.onlyChangedRows).toBeUndefined();
     });
 
     it('reports alignment progress before the snapshot exists', async () => {

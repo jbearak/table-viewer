@@ -62,6 +62,49 @@ describe('pair_sheets', () => {
         ]);
     });
 
+    it('pairs a lone unnamed sheet with the workbook\u2019s first', () => {
+        // A CSV is one sheet the reader calls Sheet1. Matching on that name
+        // reported it and every worksheet as one-sided unless the workbook
+        // happened to have a sheet called Sheet1.
+        const original = new FixtureSource([{ name: 'Sheet1', rows: [] }]).meta();
+        const modified = new FixtureSource([
+            { name: 'Sales', worksheetId: 'w1', rows: [] },
+            { name: 'Notes', worksheetId: 'w2', rows: [] },
+        ]).meta();
+        expect(pair_sheets(original, modified)).toEqual([
+            { status: 'matched', name: 'Sales', modifiedIndex: 0, originalIndex: 0 },
+            { status: 'added', name: 'Notes', modifiedIndex: 1 },
+        ]);
+    });
+
+    it('pairs the first sheets with the workbook on the original side', () => {
+        const original = new FixtureSource([
+            { name: 'Sales', worksheetId: 'w1', rows: [] },
+            { name: 'Notes', worksheetId: 'w2', rows: [] },
+        ]).meta();
+        const modified = new FixtureSource([{ name: 'Sheet1', rows: [] }]).meta();
+        expect(pair_sheets(original, modified)).toEqual([
+            { status: 'matched', name: 'Sheet1', modifiedIndex: 0, originalIndex: 0 },
+            { status: 'deleted', name: 'Notes', originalIndex: 1 },
+        ]);
+    });
+
+    it('keeps identity pairing when both sides are workbooks', () => {
+        // Two workbooks must not fall into first-sheet pairing: an inserted
+        // first worksheet would glue unrelated sheets into a bogus cell diff.
+        const original = new FixtureSource([
+            { name: 'Sales', worksheetId: 'w1', rows: [] },
+        ]).meta();
+        const modified = new FixtureSource([
+            { name: 'Cover', worksheetId: 'w9', rows: [] },
+            { name: 'Sales', worksheetId: 'w1', rows: [] },
+        ]).meta();
+        expect(pair_sheets(original, modified)).toEqual([
+            { status: 'added', name: 'Cover', modifiedIndex: 0 },
+            { status: 'matched', name: 'Sales', modifiedIndex: 1, originalIndex: 0 },
+        ]);
+    });
+
     it('never claims the same original sheet twice', () => {
         const original = new FixtureSource([{ name: 'A', rows: [] }]).meta();
         const modified = new FixtureSource([

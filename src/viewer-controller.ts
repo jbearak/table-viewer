@@ -930,6 +930,13 @@ export function csv_table_profile(config?: ConfigPort): ViewerProfile {
     };
 }
 
+/** Whether two paths would take the same parser — the comparison `profile_for`
+ *  makes, without building anything. */
+function same_extension(left: string, right: string): boolean {
+    const extension = (path: string) => path.toLowerCase().slice(path.lastIndexOf('.'));
+    return extension(left) === extension(right);
+}
+
 /** Profile for a path, by extension: csv/tsv → editable table; else Excel viewer. */
 export function profile_for(file_path: string, config?: ConfigPort): ViewerProfile {
     const ext = file_path.toLowerCase();
@@ -3664,12 +3671,23 @@ export function attach_viewer(
             assert_safe_file_size(stat.size, max_mib);
             const original_raw = await host.fs.read_file(compare_original_uri);
             assert_safe_file_size(original_raw.byteLength, max_mib);
+            const original_path = compare_original_uri.fsPath;
             // Mirror the modified side's row cap: uncapping only one side
             // would report every row beyond the other's cap as added/deleted.
+            // The window is attached for the modified file, so its profile
+            // parses the modified format. Feeding the original's bytes to it
+            // is right whenever the two share an extension — and that profile
+            // may be host-supplied (preview, git compare), so it is kept — but
+            // across formats it fed CSV bytes to the XLSX parser, and between
+            // .csv and .tsv split one side on the wrong delimiter. Those are
+            // exactly the pairings the Compare dialog offers.
+            const original_profile = same_extension(original_path, file_path)
+                ? profile
+                : profile_for(original_path, host.config);
             return {
-                source: await profile.build_source(
+                source: await original_profile.build_source(
                     original_raw,
-                    file_path,
+                    original_path,
                     state,
                     load_all_csv_rows ? { loadAllRows: true } : undefined,
                 ),

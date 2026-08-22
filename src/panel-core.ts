@@ -1701,6 +1701,11 @@ function mapping_change_moves_rows(
     return previous !== undefined || next !== undefined;
 }
 
+/** Field-by-field rather than a spread, and deliberately so: this is the value
+ *  handed to the host's durable transform write, and `onlyChangedRows` is
+ *  compare-session state that must not reach it. Persisted, it would reopen a
+ *  plain window filtered by a comparison it no longer has, with no control
+ *  anywhere to clear it. */
 function clone_transform(state: SheetTransformState): SheetTransformState {
     const clone: SheetTransformState = {
         sort: state.sort.map((key) => ({ ...key })),
