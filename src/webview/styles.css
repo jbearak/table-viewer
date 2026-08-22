@@ -1713,3 +1713,52 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
 .compare-strip-deleted {
     color: var(--vscode-gitDecoration-deletedResourceForeground, red);
 }
+
+/* The compare window before it has any rows: alignment is what makes the diff
+   correct, so the grid does not exist yet and this is the whole window. */
+.compare-progress {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    height: 100%;
+    padding: 24px;
+    color: var(--vscode-foreground, #ccc);
+}
+
+.compare-progress-title {
+    font-size: 1.1em;
+}
+
+.compare-progress-track {
+    width: min(320px, 70%);
+    height: 6px;
+    border-radius: 3px;
+    overflow: hidden;
+    background: var(--vscode-editorWidget-border, #3a3d41);
+}
+
+.compare-progress-fill {
+    height: 100%;
+    background: var(--vscode-progressBar-background, #0e70c0);
+    transition: width 120ms linear;
+}
+
+.compare-progress-detail {
+    color: var(--vscode-descriptionForeground, #999);
+}
+
+.compare-progress-cancel {
+    font: inherit;
+    padding: 4px 14px;
+    border-radius: 4px;
+    border: 1px solid var(--vscode-input-border, #3c3c3c);
+    background: var(--vscode-button-secondaryBackground, #3a3d41);
+    color: var(--vscode-button-secondaryForeground, var(--vscode-foreground, #ccc));
+    cursor: pointer;
+}
+
+.compare-progress-cancel:hover {
+    background: var(--vscode-list-hoverBackground, #2a2d2e);
+}

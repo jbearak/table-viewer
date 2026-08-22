@@ -33,6 +33,7 @@ import {
 } from './host-ports';
 import { create_resource_identity, type ResourceUriLike } from './resource-identity';
 import { CompareDataSource, align_workbook } from './diff-compare/compare-session';
+import { AlignmentCancelledError } from './diff-compare/row-alignment';
 import type { WorkbookSnapshotCompare } from './viewer-snapshot';
 import {
     assert_safe_file_size,
@@ -969,6 +970,12 @@ export function attach_viewer(
      */
     const editing_supported = profile.editing && !compare_mode && !options.readOnly;
     let compare_unavailable_warned = false;
+    /**
+     * Set when the renderer asks to abandon a comparison that is still
+     * aligning. Alignment is what makes the diff correct, so there is nothing
+     * useful to show once it is abandoned — the request closes the window.
+     */
+    let compare_alignment_cancelled = false;
     const scheduler: ViewerControllerScheduler = options.scheduler ?? {
         setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
         clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
@@ -3583,7 +3590,16 @@ export function attach_viewer(
                 adopted = new CompareDataSource(
                     modified,
                     original.source,
-                    await align_workbook(modified, original.source),
+                    await align_workbook(modified, original.source, {
+                        isCancelled: () => compare_alignment_cancelled || disposed,
+                        onProgress: (scannedRows, totalRows) => {
+                            void post_to_receiver({
+                                type: 'compareProgress',
+                                scannedRows,
+                                totalRows,
+                            });
+                        },
+                    }),
                 );
                 comparison_observation = original.observation;
             } catch (error) {
@@ -3595,6 +3611,9 @@ export function attach_viewer(
                         close_error,
                     );
                 }
+                // A cancel is the user's own decision, not a failure to report
+                // back to them: the window is on its way out.
+                if (error instanceof AlignmentCancelledError) throw error;
                 warn_compare_unavailable(error);
             }
         }
@@ -4768,6 +4787,12 @@ export function attach_viewer(
                 if (!load_is_current(request.seq, request.refreshEvent)) {
                     return inactive_refresh_result();
                 }
+                // The user cancelled the comparison; the window is closing.
+                // Retrying it, or reporting it as a load failure, would be
+                // arguing with a decision already made.
+                if (error instanceof AlignmentCancelledError) {
+                    return { type: 'completed' };
+                }
                 last_error = error;
             } finally {
                 dispose_unadopted_candidate(candidate);
@@ -4912,6 +4937,7 @@ export function attach_viewer(
             return true;
         } catch (error) {
             if (!load_is_current(request.seq)) return false;
+            if (error instanceof AlignmentCancelledError) return false;
             if (!schedule_local_refresh_retry(
                 request,
                 force,
@@ -7075,6 +7101,12 @@ export function attach_viewer(
             case 'showWarning':
                 host.ui.show_warning(msg.message);
                 return;
+            case 'cancelCompare': {
+                if (!compare_mode || compare_alignment_cancelled) return;
+                compare_alignment_cancelled = true;
+                await options.requestClose?.();
+                return;
+            }
             case 'openExternal': {
                 // Authoritative validation: the webview also validates for UX,
                 // but a compromised or buggy renderer must not be able to hand

@@ -50,13 +50,40 @@ export async function align_workbook(
     options: AlignSheetOptions = {},
 ): Promise<SheetAlignments> {
     const pairings = pair_sheets(original.meta(), modified.meta());
+    const matched = pairings.filter(
+        (pairing): pairing is Extract<SheetPairing, { status: 'matched' }> =>
+            pairing.status === 'matched',
+    );
+    // Progress is reported over the whole workbook, not per sheet: a bar that
+    // restarts at each worksheet reads as though the work were going backwards.
+    const original_meta = original.meta();
+    const modified_meta = modified.meta();
+    const workbook_rows = matched.reduce(
+        (total, pairing) => total
+            + original_meta.sheets[pairing.originalIndex].rowCount
+            + modified_meta.sheets[pairing.modifiedIndex].rowCount,
+        0,
+    );
+    let scanned_before = 0;
     const alignments = new Map<number, SheetAlignment>();
-    for (const pairing of pairings) {
-        if (pairing.status !== 'matched') continue;
+    for (const pairing of matched) {
+        const sheet_rows = original_meta.sheets[pairing.originalIndex].rowCount
+            + modified_meta.sheets[pairing.modifiedIndex].rowCount;
+        const on_progress = options.onProgress;
         alignments.set(
             pairing.modifiedIndex,
-            await align_sheet(original, modified, pairing, options),
+            await align_sheet(original, modified, pairing, {
+                ...options,
+                ...(on_progress
+                    ? {
+                        onProgress: (scanned: number) =>
+                            on_progress(scanned_before + scanned, workbook_rows),
+                    }
+                    : {}),
+            }),
         );
+        scanned_before += sheet_rows;
+        options.onProgress?.(scanned_before, workbook_rows);
     }
     return alignments;
 }

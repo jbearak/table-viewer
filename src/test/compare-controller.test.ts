@@ -190,6 +190,58 @@ describe('compare mode controller', () => {
         expect(off.view.rowCount).toBe(4);
     });
 
+    it('reports alignment progress before the snapshot exists', async () => {
+        const panel = open_compare_table();
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThan(0));
+        const reports = posted(panel, 'compareProgress') as unknown as {
+            scannedRows: number;
+            totalRows: number;
+        }[];
+        expect(reports.length).toBeGreaterThan(0);
+        // Monotonic and bounded: a bar that goes backwards, or past its own
+        // total, reads as a bug in the comparison rather than in the readout.
+        let previous = 0;
+        for (const report of reports) {
+            expect(report.scannedRows).toBeGreaterThanOrEqual(previous);
+            expect(report.scannedRows).toBeLessThanOrEqual(report.totalRows);
+            previous = report.scannedRows;
+        }
+        // Both sides' rows are the work, and the last report accounts for all of it.
+        expect(reports[reports.length - 1].scannedRows)
+            .toBe(reports[reports.length - 1].totalRows);
+    });
+
+    it('closes the window when the alignment is cancelled, without a warning', async () => {
+        const close = vi.fn();
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const { panel } = open_compare_controller(
+            '/tmp/original.csv',
+            csv_table_profile(),
+            { requestClose: close },
+        );
+        await panel.__receive({ type: 'cancelCompare' });
+        expect(close).toHaveBeenCalledTimes(1);
+        // Cancelling is the user's own decision, not a comparison failure.
+        expect(warning).not.toHaveBeenCalled();
+    });
+
+    it('ignores a cancel from a window that is not comparing', async () => {
+        const close = vi.fn();
+        const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
+        const controller = attach_viewer(
+            panel as unknown as Parameters<typeof attach_viewer>[0],
+            vscode_mock.Uri.file('/tmp/plain.csv') as unknown as vscode.Uri,
+            with_in_memory_authority_transactions(versioned_state_store().store),
+            csv_table_profile(),
+            fake_viewer_host,
+            { requestClose: close },
+        );
+        panel.onDidDispose(() => controller.dispose());
+        await panel.__receive({ type: 'cancelCompare' });
+        expect(close).not.toHaveBeenCalled();
+    });
+
     it('degrades to a plain open with a warning when the original is unreadable', async () => {
         vscode_mock.__setReadFileImplementation(async (uri) => {
             if (String(uri.fsPath ?? uri).includes('original')) {

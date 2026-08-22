@@ -1415,8 +1415,9 @@ export class ViewerWindowManager {
 
     private async close_initial_entry(entry: ViewerWindow): Promise<void> {
         if (await this.close_entry(entry) || entry.window.isDestroyed()) return;
-        // The controller requests this only when the initial source was declined,
-        // before any document or edits were adopted. There is therefore nothing to
+        // The controller requests this only when the initial source was declined
+        // or a comparison was cancelled while still aligning — either way before
+        // any document or edits were adopted. There is therefore nothing to
         // preserve if Electron refuses the ordinary durability-aware close.
         entry.window.destroy();
     }

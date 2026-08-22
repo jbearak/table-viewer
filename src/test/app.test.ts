@@ -13800,3 +13800,43 @@ describe('undo and redo, from the keyboard and the desktop menu', () => {
         expect(sent(post_message, 'discardEditSession')).toBeUndefined();
     });
 });
+
+// The compare window's pre-grid state. Alignment runs before the workbook
+// snapshot exists, so this is the only thing the window can show meanwhile.
+describe('compare alignment progress', () => {
+    it('replaces the generic loading text once alignment reports in', async () => {
+        await render_app();
+        expect(container!.textContent).toContain('Loading...');
+        await dispatch_host_message({
+            type: 'compareProgress',
+            scannedRows: 4_000,
+            totalRows: 10_000,
+        });
+        expect(container!.textContent).not.toContain('Loading...');
+        expect(container!.textContent).toContain('Comparing…');
+        expect(container!.textContent).toMatch(/4,000 of 10,000/u);
+    });
+
+    it('gives way to the grid when the snapshot arrives', async () => {
+        await render_app();
+        await dispatch_host_message({
+            type: 'compareProgress',
+            scannedRows: 4_000,
+            totalRows: 10_000,
+        });
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1'])));
+        expect(container!.textContent).not.toContain('Comparing…');
+    });
+
+    it('asks the host to abandon the comparison when Cancel is clicked', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message({
+            type: 'compareProgress',
+            scannedRows: 1,
+            totalRows: 10,
+        });
+        await click_stub_button('.compare-progress-cancel');
+        expect(post_message.mock.calls.map((call) => call[0]?.type))
+            .toContain('cancelCompare');
+    });
+});

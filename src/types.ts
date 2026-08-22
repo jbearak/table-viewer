@@ -1825,6 +1825,12 @@ export function save_lifecycle_correlation(
 /** Messages from extension host to webview. */
 export type HostMessage =
     | { type: 'fontChanged'; fontFamily: string | null; fontSize: number | null }
+    /**
+     * How far the compare window's row alignment has got. Sent only in compare
+     * mode, and only before the workbook snapshot: once the grid exists the
+     * alignment is by definition finished.
+     */
+    | { type: 'compareProgress'; scannedRows: number; totalRows: number }
     /** Select a worksheet after the renderer has acknowledged its workbook snapshot. */
     | { type: 'selectSheet'; sheetIndex: number }
     // Desktop only: the native Edit menu consumes Cmd/Ctrl+C, Cmd/Ctrl+A and
@@ -1967,6 +1973,13 @@ export type HostMessage =
 /** Messages from webview to extension host */
 export type WebviewMessage =
     | { type: 'ready' }
+    /**
+     * Abandon a comparison that is still aligning its rows. The window has
+     * nothing to show yet — alignment is what makes the diff correct, not an
+     * optimisation over it — so cancelling means closing the window rather
+     * than falling back to a positional diff the user did not ask for.
+     */
+    | { type: 'cancelCompare' }
     | { type: 'openCsvRowLimitSetting' }
     | { type: 'loadAllCsvRows' }
     | { type: 'snapshotApplied'; identity: WorkbookSnapshotIdentity; disposition: SnapshotDisposition }

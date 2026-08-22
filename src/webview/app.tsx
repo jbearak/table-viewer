@@ -64,6 +64,7 @@ import {
 } from './transform-ui-model';
 import { SheetTabs, tab_orientation_label, type SheetTabBadge } from './sheet-tabs';
 import { StateStrip } from './state-strip';
+import { CompareProgress } from './compare-progress';
 import { CompareStrip } from './compare-strip';
 import { ContextMenu, type MenuItem } from './context-menu';
 import {
@@ -552,6 +553,11 @@ export function App(): React.JSX.Element {
     const [only_changed_rows, set_only_changed_rows] = useState(false);
     const [git_compare, set_git_compare] =
         useState<WorkbookSnapshotCompare | undefined>(undefined);
+    // Row alignment runs before the workbook snapshot exists, so this is the
+    // only thing the compare window has to show meanwhile. Its arrival is what
+    // tells the renderer a comparison is being aligned at all.
+    const [compare_progress, set_compare_progress] =
+        useState<{ scannedRows: number; totalRows: number } | undefined>(undefined);
     const edit_mode_ref = useRef(false);
     // Passed down as the admission lifetime instead of asking GridShell to derive
     // one during render. React can abandon a child render; only these parent-owned
@@ -4144,6 +4150,10 @@ export function App(): React.JSX.Element {
      * composes with sorting and column filters instead of being a second,
      * parallel notion of "which rows are shown".
      */
+    const handle_cancel_compare = useCallback(() => {
+        host_bridge.postMessage({ type: 'cancelCompare' });
+    }, []);
+
     const handle_toggle_only_changed_rows = useCallback(
         (next: boolean) => {
             // Read from the same refs handle_transform_change validates against,
@@ -4336,6 +4346,12 @@ export function App(): React.JSX.Element {
     useEffect(() => {
         const handler = (event: MessageEvent) => {
             const msg = event.data as HostMessage;
+            if (msg.type === 'compareProgress') {
+                set_compare_progress({
+                    scannedRows: msg.scannedRows,
+                    totalRows: msg.totalRows,
+                });
+            }
             if (msg.type === 'fontChanged') {
                 apply_font_family(msg.fontFamily);
                 apply_font_size(msg.fontSize);
@@ -5135,7 +5151,15 @@ export function App(): React.JSX.Element {
     );
 
     if (!meta) {
-        return <div className="loading">Loading...</div>;
+        return compare_progress
+            ? (
+                <CompareProgress
+                    scannedRows={compare_progress.scannedRows}
+                    totalRows={compare_progress.totalRows}
+                    on_cancel={handle_cancel_compare}
+                />
+            )
+            : <div className="loading">Loading...</div>;
     }
 
     if (!current_sheet) {
