@@ -204,6 +204,33 @@ describe('a working-tree file that is an LFS pointer', () => {
             .toMatchObject({ side: 'file', failure: { reason: 'filtersNotConfigured' } });
     });
 
+    it('does not restore the banner when the reload it triggered was superseded', async () => {
+        // The bug that made the button look broken on a real file. A successful
+        // `git lfs pull` rewrites the working tree, which wakes the file-refresh
+        // watcher, whose reload supersedes the resolve's own. Supersession makes
+        // `refresh_panel_source` return false exactly as a failure does, so the
+        // handler treated the win as a loss and put the banner back — over the
+        // real table the superseding load had already delivered.
+        serve('file');
+        const panel = open_table();
+        await panel.__receive({ type: 'ready' });
+        await latest_lfs(panel, (value) => value !== undefined);
+        fake_git_lfs.pull_outcomes.push({ type: 'resolved' });
+        // Stand in for git-lfs writing the file: real content from here on, and
+        // a watcher event landing while the resolve is still in flight.
+        serve('none');
+        vscode_mock.__setStatImplementation(async () => ({ size: 99, mtime: 9 }));
+        const resolving = panel.__receive({ type: 'resolveLfsObject' });
+        for (const watcher of vscode_mock.__getWatchers()) await watcher.__fireChange();
+        await resolving;
+        // The file is no longer a pointer, so no banner — whichever load won.
+        await vi.waitFor(() => {
+            const all = snapshots(panel);
+            expect(all[all.length - 1].configuration.unresolvedLfs).toBeUndefined();
+            expect(all[all.length - 1].meta.sheets[0].rowCount).toBeGreaterThan(0);
+        });
+    });
+
     it('ignores a resolve request when nothing is unresolved', async () => {
         const panel = open_table();
         await panel.__receive({ type: 'ready' });

@@ -33,10 +33,19 @@ function headline(side: UnresolvedLfsObject['side']): string {
         : 'The version being compared against is stored in Git LFS and has not been downloaded.';
 }
 
+/**
+ * The second line, and the one place the size has to be described carefully.
+ *
+ * `size` is the *stored object's* length, not the placeholder's — a pointer
+ * file is a fixed ~130 bytes whatever it points at. Calling it "the 733.5 KB
+ * placeholder" was simply false, and misleading in the specific way that
+ * matters here: it made the number look like a description of the useless file
+ * on disk rather than of the download the button is offering to perform.
+ */
 function detail(side: UnresolvedLfsObject['side'], size: number): string {
     return side === 'file'
-        ? `The grid is empty because only the ${format_size(size)} placeholder is available locally.`
-        : `Differences are not shown because only the ${format_size(size)} placeholder of the other version is available locally.`;
+        ? `The grid is empty until the ${format_size(size)} of data behind it is downloaded.`
+        : `Differences are not shown until the ${format_size(size)} of data behind the other version is downloaded.`;
 }
 
 /**

@@ -3931,6 +3931,28 @@ export function attach_viewer(
         };
     }
 
+    /**
+     * Whether `target`'s side is *still* an unresolved pointer, read from the
+     * host rather than inferred from a refresh's return value.
+     *
+     * Needed because a refresh reports `false` for a superseded load as
+     * readily as for a failed one, and a resolve reliably races the file
+     * watcher it just woke. Only the `file` side can be re-read cheaply; the
+     * original side is a committed blob that cannot change under us, so its
+     * answer is whatever the smudge said.
+     */
+    async function file_is_still_a_pointer(
+        target: UnresolvedLfsObject,
+    ): Promise<boolean> {
+        if (target.side !== 'file') return true;
+        try {
+            return parse_git_lfs_pointer(await host.fs.read_file(uri)) !== undefined;
+        } catch {
+            // Unreadable is not resolved; keep the banner and the button.
+            return true;
+        }
+    }
+
     /** The snapshot's LFS payload — present exactly while a side is an
      *  unfetched pointer. Spread beside `compare_configuration` so both
      *  controller-owned snapshot facts are projected the same way. */
@@ -7454,10 +7476,23 @@ export function attach_viewer(
                     // a stale failure in place would outlive the retry it
                     // describes.
                     unresolved_lfs = undefined;
-                    if (!await refresh_panel_source(true, 'recovery')) {
-                        // A failed refresh must leave the action retryable, and
-                        // with no banner there is no button. Restoring the
-                        // pointer state is what keeps one on screen.
+                    if (
+                        !await refresh_panel_source(true, 'recovery')
+                        // `false` also means "superseded", not just "failed",
+                        // and conflating the two is what made the button look
+                        // broken on real files. `git lfs pull` rewrites the
+                        // file, which wakes the refresh watcher, whose reload
+                        // supersedes this one — so the resolve reported failure
+                        // and restored the banner *over the real table the
+                        // other load had just delivered*. Re-reading the
+                        // pointer state is the honest test: a build that ran
+                        // since has already set it if the file is still a
+                        // pointer, and left it clear if it is not.
+                        && unresolved_lfs === undefined
+                        && await file_is_still_a_pointer(target)
+                    ) {
+                        // Genuinely still unresolved, so the action has to stay
+                        // retryable: with no banner there is no button.
                         unresolved_lfs = target;
                         if (target.side === 'original') resolved_lfs_original = undefined;
                     }

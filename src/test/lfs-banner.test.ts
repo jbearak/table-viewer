@@ -47,6 +47,10 @@ describe('LfsBanner', () => {
         expect(text()).toContain('The grid is empty');
         // Decimal units, matching how git-lfs itself quotes object sizes.
         expect(text()).toContain('41.5 MB');
+        // The size describes the *download*, not the file on disk. A pointer is
+        // a fixed ~130 bytes whatever it points at, so calling this figure the
+        // placeholder's size — as this banner once did — was plainly false.
+        expect(text()).not.toContain('placeholder');
         expect(button()?.textContent).toBe('Download contents');
     });
 
@@ -58,6 +62,7 @@ describe('LfsBanner', () => {
         expect(text()).toContain('version being compared against');
         expect(text()).toContain('Differences are not shown');
         expect(text()).not.toContain('The grid is empty');
+        expect(text()).not.toContain('placeholder');
     });
 
     it('drops the button when the host cannot resolve LFS objects', async () => {
