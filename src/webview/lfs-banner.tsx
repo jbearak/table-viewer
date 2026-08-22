@@ -86,8 +86,6 @@ export function LfsBanner({
     resolving,
 }: LfsBannerProps): React.JSX.Element {
     const { side, size, resolvable, failure } = unresolved;
-    // A retry is worth offering for anything except a git-lfs that is not
-    // installed, which no number of clicks will change.
     // Retry anything that another attempt could plausibly fix. Not a missing
     // git-lfs, and not a missing object: the bytes do not exist to be fetched,
     // so a button here would be the "does nothing" trap this banner replaces.
