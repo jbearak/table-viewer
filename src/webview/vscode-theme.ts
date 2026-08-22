@@ -183,7 +183,7 @@ export interface GridDiffColors {
 }
 
 /**
- * Purple, and a literal rather than a theme variable.
+ * Purple, and the compare window's own token rather than a theme variable.
  *
  * A purely-moved row has no changed cells, so its band is the *only* thing
  * saying it moved — it has to be unmistakably neither added nor deleted.
@@ -200,6 +200,11 @@ export interface GridDiffColors {
  * Purple is off that axis, and no gitDecoration key is purple. Costless here:
  * GRID_THEME_VARIABLES emits no gitDecoration variables at all, so the desktop
  * window already paints added and deleted from their fallbacks.
+ *
+ * Defined in styles.css as --tv-compare-moved and read back, the same way the
+ * font size is, so the strip's text and the grid's band resolve one value
+ * instead of three copies that can silently disagree. The literal here is the
+ * fallback for a host that has not applied the stylesheet.
  */
 const DIFF_MOVED_FALLBACK = '#9333ea';
 
@@ -218,7 +223,7 @@ export function build_diff_colors_from_vars(get: VarGetter): GridDiffColors {
             '--vscode-gitDecoration-addedResourceForeground',
             DIFF_FALLBACK_COLORS.added,
         ),
-        diffMovedFg: DIFF_MOVED_FALLBACK,
+        diffMovedFg: v('--tv-compare-moved', DIFF_MOVED_FALLBACK),
     };
 }
 

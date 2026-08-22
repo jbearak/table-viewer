@@ -19,6 +19,13 @@
     --tv-font-size-sm: calc(var(--tv-font-size) * 0.85);
     --tv-font-size-md: calc(var(--tv-font-size) * 0.92);
     --tv-font-size-lg: calc(var(--tv-font-size) * 1.08);
+    /* Single resolution point for the compare window's moved-row purple, read
+       back by src/webview/vscode-theme.ts so the DOM label and the canvas band
+       cannot drift apart. Purple because no gitDecoration variable is: the
+       semantically exact one (renamedResourceForeground) defaults to a green
+       too close to added, and amber sits between green and red on the hue
+       circle so it cannot clear both. See DIFF_MOVED_FALLBACK. */
+    --tv-compare-moved: #9333ea;
 }
 
 html, body, #root {
@@ -1714,11 +1721,8 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
     color: var(--vscode-gitDecoration-deletedResourceForeground, red);
 }
 
-/* Purple, and a literal: no gitDecoration variable is purple, and the
-   semantically exact one (renamedResourceForeground) defaults to a green too
-   close to added. Matches the grid's moved band — see DIFF_MOVED_FALLBACK. */
 .compare-strip-moved {
-    color: #9333ea;
+    color: var(--tv-compare-moved);
 }
 
 /* The compare window before it has any rows: alignment is what makes the diff

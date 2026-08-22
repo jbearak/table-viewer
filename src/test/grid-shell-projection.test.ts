@@ -225,9 +225,16 @@ vi.mock('../webview/vscode-theme', () => ({
         highContrast: false,
         dirtyBg: 'rgba(204, 167, 0, 0.16)',
         conflictBg: 'rgba(229, 75, 75, 0.22)',
+        diffDeletedFg: '#c74e39',
+        diffAddedFg: '#81b88b',
+        diffMovedFg: '#9333ea',
     }),
     theme_font_size_px: () => 13,
-    tint_from_color: (_c: string, _a: number, fallback: string) => fallback,
+    // Echoes the color rather than the fallback, which is what the real one
+    // does for any parseable color. Returning the fallback unconditionally
+    // made every band that shares a fallback look identical here.
+    tint_from_color: (color: string, alpha: number, fallback: string) =>
+        (color ? `${color}@${alpha}` : fallback),
 }));
 
 vi.mock('../webview/row-resize-overlay', () => ({

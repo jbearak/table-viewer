@@ -133,8 +133,11 @@ const DEFAULT_MAX_EDIT_DISTANCE = 20_000;
  * same task. Fixed rather than exposed as a setting until it misbehaves on a
  * real file.
  */
-const MOVE_SIMILARITY_NUMERATOR = 1;
-const MOVE_SIMILARITY_DENOMINATOR = 2;
+function is_at_least_half(part: number, whole: number): boolean {
+    // Cross-multiplied rather than divided so the boundary is exact integer
+    // arithmetic that cannot land on the wrong side of the threshold.
+    return part * 2 >= whole;
+}
 
 /** Best candidates retained per destination row, as git's
  *  `NUM_CANDIDATE_PER_DST`. Bounds memory on a file where hundreds of leftover
@@ -189,24 +192,6 @@ function hash_row(cells: readonly ({ raw: string | null } | null)[]): number {
     return hash >>> 0;
 }
 
-/** A side's row hashes alongside each row's raw-text character count, which
- *  the move pass's size prefilter needs and which would otherwise cost a
- *  second full read of both files to recover. */
-interface HashedSide {
-    readonly hashes: Uint32Array;
-    readonly lengths: Float64Array;
-}
-
-/** Total characters of raw cell text in a row — the denominator and the
- *  matched-length unit of the move similarity score. */
-function row_text_length(cells: readonly ({ raw: string | null } | null)[]): number {
-    let total = 0;
-    for (let index = 0; index < cells.length; index++) {
-        total += get_raw_cell_text(cells[index]?.raw ?? null).length;
-    }
-    return total;
-}
-
 async function hash_side(
     source: DataSource,
     sheet_index: number,
@@ -214,21 +199,15 @@ async function hash_side(
     scanned_before: number,
     total_rows: number,
     options: AlignSheetOptions,
-): Promise<HashedSide> {
+): Promise<Uint32Array> {
     const hashes = new Uint32Array(row_count);
-    // Float64, not Uint32: a row's total character count is a sum over cells
-    // and a pathological sheet could carry it past 2^32, where wrapping would
-    // hand the size prefilter a tiny number and let an absurd pair through.
-    const lengths = new Float64Array(row_count);
     const checkpoint = options.rowsPerCheckpoint ?? DEFAULT_ROWS_PER_CHECKPOINT;
     let since_checkpoint = 0;
     for (let start = 0; start < row_count; start += HASH_READ_BATCH) {
         const count = Math.min(HASH_READ_BATCH, row_count - start);
         const { rows } = source.read_rows(sheet_index, start, count);
         for (let offset = 0; offset < count; offset++) {
-            const cells = rows[offset] ?? [];
-            hashes[start + offset] = hash_row(cells);
-            lengths[start + offset] = row_text_length(cells);
+            hashes[start + offset] = hash_row(rows[offset] ?? []);
         }
         since_checkpoint += count;
         if (since_checkpoint >= checkpoint) {
@@ -240,7 +219,7 @@ async function hash_side(
             if (options.isCancelled?.()) throw new AlignmentCancelledError();
         }
     }
-    return { hashes, lengths };
+    return hashes;
 }
 
 /** The positional alignment: row N against row N, each side clamped to its own
@@ -576,12 +555,10 @@ export async function align_sheet(
     const original_rows = original_sheet.rowCount;
     const modified_rows = modified_sheet.rowCount;
     const total_rows = original_rows + modified_rows;
-    const original_side = await hash_side(
+    const original_hashes = await hash_side(
         original, pairing.originalIndex, original_rows, 0, total_rows, options);
-    const modified_side = await hash_side(
+    const modified_hashes = await hash_side(
         modified, pairing.modifiedIndex, modified_rows, original_rows, total_rows, options);
-    const original_hashes = original_side.hashes;
-    const modified_hashes = modified_side.hashes;
 
     // Trim matching ends. Cheap, and on a normal edit it leaves the Myers step
     // a handful of rows regardless of how large the file is.
@@ -622,8 +599,8 @@ export async function align_sheet(
         modified,
         pairing,
         build_rows(script, prefix, suffix, original_rows, modified_rows),
-        original_side,
-        modified_side,
+        original_hashes,
+        modified_hashes,
         options,
     );
 
@@ -773,41 +750,60 @@ interface Leftover {
 }
 
 /**
- * Similarity between two rows, as `matched_chars * 2 >= max_chars`.
+ * A candidate row normalized once: its cells' raw text, and their total length.
  *
- * Length-weighted after git's `src_copied / max_size`, and compared by
- * cross-multiplication so the 50% boundary is exact integer arithmetic rather
- * than a float comparison that could land either side of it.
- *
- * Matching is *whole-cell*: a cell contributes its length only when both sides'
- * text is exactly equal. Cell-*counts* (what xlCompare uses) were rejected
- * because a 3-column row could then only score 0, 33, 67 or 100% — a cliff
- * sitting right on the threshold. The cost is that a row whose content lives in
- * one large edited cell scores near zero and is not detected as a move. That
- * fails safely: an undetected move stays a delete plus an add, which is exactly
- * today's behavior, never a wrong pairing. Catching it would need intra-cell
- * chunk matching — a second diff algorithm with its own effort cap.
+ * Scoring is quadratic in the candidate count, so normalizing inside the
+ * comparison would re-derive the same row's text once per row it is scored
+ * against — O(n*m*columns) string extraction for O(n+m) distinct rows.
  */
-function rows_are_similar(
-    original_cells: readonly ({ raw: string | null } | null)[],
-    modified_cells: readonly ({ raw: string | null } | null)[],
-): boolean {
-    const column_count = Math.max(original_cells.length, modified_cells.length);
-    let matched = 0;
-    let original_total = 0;
-    let modified_total = 0;
+interface CandidateRow {
+    readonly texts: readonly string[];
+    /** Total characters, the similarity denominator. Not an integer risk: a
+     *  sum over cells could exceed 2^32 on a pathological row, and JS numbers
+     *  carry that exactly where a Uint32 would wrap. */
+    readonly length: number;
+}
+
+function normalize_candidate(
+    cells: readonly ({ raw: string | null } | null)[] | undefined,
+    column_count: number,
+): CandidateRow {
+    const texts: string[] = [];
+    let length = 0;
     for (let col = 0; col < column_count; col++) {
-        const original_text = get_raw_cell_text(original_cells[col]?.raw ?? null);
-        const modified_text = get_raw_cell_text(modified_cells[col]?.raw ?? null);
-        original_total += original_text.length;
-        modified_total += modified_text.length;
-        if (original_text === modified_text) matched += original_text.length;
+        const text = get_raw_cell_text(cells?.[col]?.raw ?? null);
+        texts.push(text);
+        length += text.length;
     }
-    const max_total = Math.max(original_total, modified_total);
+    return { texts, length };
+}
+
+/**
+ * Whether two rows are similar enough to call one a move of the other.
+ *
+ * Length-weighted after git's `src_copied / max_size`: the matched characters
+ * must be at least half the longer row's.
+ *
+ * Matching is *whole-cell* — a cell contributes its length only when both
+ * sides' text is exactly equal. Cell *counts* (what xlCompare uses) were
+ * rejected because a 3-column row could then only score 0, 33, 67 or 100%, a
+ * cliff sitting right on the threshold. The cost is that a row whose content
+ * lives in one large edited cell scores near zero and is not detected as a
+ * move. That fails safely: an undetected move stays a delete plus an add,
+ * exactly the behavior before this pass existed, never a wrong pairing.
+ * Catching it would need intra-cell chunk matching — a second diff algorithm
+ * with its own effort cap.
+ */
+function rows_are_similar(left: CandidateRow, right: CandidateRow): boolean {
+    const max_total = Math.max(left.length, right.length);
     // Two empty rows are identical, not undefined. Returning false here would
     // leave a moved blank separator row as a delete plus an add.
     if (max_total === 0) return true;
-    return matched * MOVE_SIMILARITY_DENOMINATOR >= max_total * MOVE_SIMILARITY_NUMERATOR;
+    let matched = 0;
+    for (let col = 0; col < left.texts.length; col++) {
+        if (left.texts[col] === right.texts[col]) matched += left.texts[col].length;
+    }
+    return is_at_least_half(matched, max_total);
 }
 
 /**
@@ -832,8 +828,8 @@ async function detect_moves(
     modified: DataSource,
     pairing: Extract<SheetPairing, { status: 'matched' }>,
     rows: readonly AlignedRow[],
-    original_side: HashedSide,
-    modified_side: HashedSide,
+    original_hashes: Uint32Array,
+    modified_hashes: Uint32Array,
     options: AlignSheetOptions,
 ): Promise<{ rows: AlignedRow[]; movedRowIndices: number[]; moveSearchTruncated: boolean }> {
     if (options.isCancelled?.()) throw new AlignmentCancelledError();
@@ -847,33 +843,36 @@ async function detect_moves(
         return { rows: [...rows], movedRowIndices: [], moveSearchTruncated: false };
     }
 
-    /** original row -> modified row, the pass's verdict. */
-    const matches = new Map<number, number>();
-    const claimed_modified = new Set<number>();
+    // The pass's verdict, held both ways round. Both directions are needed —
+    // forward to decide which original rows to drop, backward to find each
+    // destination's origin during the rebuild — and a single map plus separate
+    // "claimed" sets was the same information in more places to keep in step.
+    const original_to_modified = new Map<number, number>();
+    const modified_to_original = new Map<number, number>();
+    const claim = (original_row: number, modified_row: number) => {
+        original_to_modified.set(original_row, modified_row);
+        modified_to_original.set(modified_row, original_row);
+    };
 
     // Exact-hash pass. The hashes are already computed, so an identical moved
     // row pairs with no cell reads at all — this is the whole-file re-sort
     // case, and it is why the work cap below does not gate this phase.
     const by_hash = new Map<number, Leftover[]>();
     for (const entry of deleted) {
-        const hash = original_side.hashes[entry.row];
-        const bucket = by_hash.get(hash);
+        const bucket = by_hash.get(original_hashes[entry.row]);
         if (bucket) bucket.push(entry);
-        else by_hash.set(hash, [entry]);
+        else by_hash.set(original_hashes[entry.row], [entry]);
     }
     for (const entry of added) {
         // Shifted off the front so duplicate identical rows pair in ascending
         // order on both sides rather than by whatever order a set iterates,
         // which is what makes repeated runs produce identical output.
-        const bucket = by_hash.get(modified_side.hashes[entry.row]);
-        const source = bucket?.shift();
-        if (source === undefined) continue;
-        matches.set(source.row, entry.row);
-        claimed_modified.add(entry.row);
+        const source = by_hash.get(modified_hashes[entry.row])?.shift();
+        if (source !== undefined) claim(source.row, entry.row);
     }
 
-    const unmatched_deleted = deleted.filter((entry) => !matches.has(entry.row));
-    const unmatched_added = added.filter((entry) => !claimed_modified.has(entry.row));
+    const unmatched_deleted = deleted.filter((entry) => !original_to_modified.has(entry.row));
+    const unmatched_added = added.filter((entry) => !modified_to_original.has(entry.row));
     let truncated = false;
     if (unmatched_deleted.length > 0 && unmatched_added.length > 0) {
         const limit = options.maxMoveSearchRows ?? MOVE_SEARCH_LIMIT;
@@ -885,12 +884,11 @@ async function detect_moves(
             truncated = true;
         } else {
             await score_moves(
-                original, modified, pairing, unmatched_deleted, unmatched_added,
-                original_side, modified_side, matches, claimed_modified, options);
+                original, modified, pairing, unmatched_deleted, unmatched_added, claim, options);
         }
     }
 
-    if (matches.size === 0) {
+    if (original_to_modified.size === 0) {
         return { rows: [...rows], movedRowIndices: [], moveSearchTruncated: truncated };
     }
 
@@ -898,32 +896,43 @@ async function detect_moves(
     // both indexes set; the vacated original-side slot is dropped. Everything
     // downstream keys off `modified !== ABSENT`, so a two-index row needs no
     // further handling to read, project, or diff correctly.
-    const moved_modified = new Map<number, number>();
-    for (const [original_row, modified_row] of matches) {
-        moved_modified.set(modified_row, original_row);
-    }
     const rebuilt: AlignedRow[] = [];
     const moved_row_indices: number[] = [];
     for (const row of rows) {
-        if (row.modified === ABSENT && matches.has(row.original)) continue;
-        if (row.original === ABSENT) {
-            const origin = moved_modified.get(row.modified);
-            if (origin !== undefined) {
-                moved_row_indices.push(rebuilt.length);
-                rebuilt.push({ original: origin, modified: row.modified });
-                continue;
-            }
+        if (row.modified === ABSENT && original_to_modified.has(row.original)) continue;
+        const origin = row.original === ABSENT
+            ? modified_to_original.get(row.modified)
+            : undefined;
+        if (origin !== undefined) {
+            moved_row_indices.push(rebuilt.length);
+            rebuilt.push({ original: origin, modified: row.modified });
+            continue;
         }
         rebuilt.push(row);
     }
     return { rows: rebuilt, movedRowIndices: moved_row_indices, moveSearchTruncated: truncated };
 }
 
+/** A source row proposed as the origin of a destination row. */
+interface MoveCandidate {
+    readonly originalRow: number;
+    readonly modifiedRow: number;
+    readonly displacement: number;
+}
+
+/** Order candidates best-first. Every tie is broken down to the row indexes, so
+ *  the result never depends on sort stability and two runs agree exactly. */
+function compare_candidates(left: MoveCandidate, right: MoveCandidate): number {
+    return left.displacement - right.displacement
+        || left.originalRow - right.originalRow
+        || left.modifiedRow - right.modifiedRow;
+}
+
 /**
  * The inexact phase: score surviving leftovers and assign one-to-one.
  *
- * Mutates `matches`/`claimed_modified` in place, so the exact-hash pass's
- * verdicts stay authoritative and are never reconsidered here.
+ * Reports its verdicts through `claim`, so the exact-hash pass's pairings stay
+ * authoritative and are never reconsidered here.
  */
 async function score_moves(
     original: DataSource,
@@ -931,78 +940,81 @@ async function score_moves(
     pairing: Extract<SheetPairing, { status: 'matched' }>,
     unmatched_deleted: readonly Leftover[],
     unmatched_added: readonly Leftover[],
-    original_side: HashedSide,
-    modified_side: HashedSide,
-    matches: Map<number, number>,
-    claimed_modified: Set<number>,
+    claim: (original_row: number, modified_row: number) => void,
     options: AlignSheetOptions,
 ): Promise<void> {
-    // Read once up front. Both sides are capped at MOVE_SEARCH_LIMIT rows, so
-    // this is bounded, and it is far cheaper than re-reading a row for each of
-    // the up-to-1000 candidates it is scored against.
-    const original_cells = read_source_rows_indexed(
-        original, pairing.originalIndex, unmatched_deleted.map((entry) => entry.row)).rows;
-    const modified_cells = read_source_rows_indexed(
-        modified, pairing.modifiedIndex, unmatched_added.map((entry) => entry.row)).rows;
+    // Read and normalize once up front. Both sides are capped at
+    // MOVE_SEARCH_LIMIT rows, so this is bounded, and it is far cheaper than
+    // re-deriving a row's text for each of the up-to-1000 rows it is scored
+    // against.
+    const column_count = Math.max(
+        original.meta().sheets[pairing.originalIndex].columnCount,
+        modified.meta().sheets[pairing.modifiedIndex].columnCount,
+    );
+    const sources = read_source_rows_indexed(
+        original, pairing.originalIndex, unmatched_deleted.map((entry) => entry.row),
+    ).rows.map((cells) => normalize_candidate(cells, column_count));
+    const destinations = read_source_rows_indexed(
+        modified, pairing.modifiedIndex, unmatched_added.map((entry) => entry.row),
+    ).rows.map((cells) => normalize_candidate(cells, column_count));
 
-    interface Candidate {
-        readonly originalRow: number;
-        readonly modifiedRow: number;
-        readonly displacement: number;
-    }
-    const candidates: Candidate[] = [];
+    const candidates: MoveCandidate[] = [];
     let scored = 0;
     for (let added_index = 0; added_index < unmatched_added.length; added_index++) {
         const destination = unmatched_added[added_index];
-        const destination_length = modified_side.lengths[destination.row];
-        const per_destination: Candidate[] = [];
+        const destination_row = destinations[added_index];
+        // Kept ordered and bounded as it is built. Collecting every match and
+        // sorting afterwards would allocate and sort up to 1000 entries per
+        // destination to keep 4 of them.
+        const best: MoveCandidate[] = [];
         for (let deleted_index = 0; deleted_index < unmatched_deleted.length; deleted_index++) {
             const source = unmatched_deleted[deleted_index];
-            const source_length = original_side.lengths[source.row];
-            const max_length = Math.max(source_length, destination_length);
+            const source_row = sources[deleted_index];
+            const max_length = Math.max(source_row.length, destination_row.length);
             // git's size prefilter, restated: the length difference alone
             // already puts the pair under the threshold, so scoring it would
-            // read cells to reach a conclusion arithmetic already reached.
-            const delta = Math.abs(source_length - destination_length);
-            if (
-                max_length > 0
-                && (max_length - delta) * MOVE_SIMILARITY_DENOMINATOR
-                    < max_length * MOVE_SIMILARITY_NUMERATOR
-            ) continue;
+            // compare cells to reach a conclusion arithmetic already reached.
+            const delta = Math.abs(source_row.length - destination_row.length);
+            if (max_length > 0 && !is_at_least_half(max_length - delta, max_length)) continue;
             scored++;
             if (scored % MOVE_SCORES_PER_CHECKPOINT === 0) {
+                // The scoring loop can run a million comparisons with no read
+                // between them, so reads are not sufficient yield points here.
                 await yield_to_event_loop();
                 if (options.isCancelled?.()) throw new AlignmentCancelledError();
             }
-            if (!rows_are_similar(
-                original_cells[deleted_index] ?? [], modified_cells[added_index] ?? [])) continue;
-            per_destination.push({
+            if (!rows_are_similar(source_row, destination_row)) continue;
+            // Similarity is a boolean at this point, so displacement is what
+            // distinguishes candidates: of two equally similar sources, the one
+            // that moved less is the likelier origin.
+            const candidate: MoveCandidate = {
                 originalRow: source.row,
                 modifiedRow: destination.row,
                 displacement: Math.abs(source.gridRow - destination.gridRow),
-            });
+            };
+            if (
+                best.length === MOVE_CANDIDATES_PER_DESTINATION
+                && compare_candidates(candidate, best[best.length - 1]) >= 0
+            ) continue;
+            let position = best.length;
+            while (position > 0 && compare_candidates(candidate, best[position - 1]) < 0) {
+                position--;
+            }
+            best.splice(position, 0, candidate);
+            if (best.length > MOVE_CANDIDATES_PER_DESTINATION) best.pop();
         }
-        // Keep only the nearest few. Similarity is a boolean at this point, so
-        // displacement is what distinguishes them: of two equally similar
-        // sources, the one that moved less is the likelier origin.
-        per_destination.sort((left, right) =>
-            left.displacement - right.displacement || left.originalRow - right.originalRow);
-        candidates.push(...per_destination.slice(0, MOVE_CANDIDATES_PER_DESTINATION));
+        candidates.push(...best);
     }
 
-    // Global ranking, then a greedy one-to-one walk. Every tie is broken on an
-    // explicit key down to the row indexes, so the result never depends on
-    // sort stability and two runs over the same file agree exactly.
-    candidates.sort((left, right) =>
-        left.displacement - right.displacement
-        || left.originalRow - right.originalRow
-        || left.modifiedRow - right.modifiedRow);
+    // Global ranking, then a greedy one-to-one walk.
+    candidates.sort(compare_candidates);
     const claimed_original = new Set<number>();
+    const claimed_modified = new Set<number>();
     for (const candidate of candidates) {
         if (claimed_original.has(candidate.originalRow)) continue;
         if (claimed_modified.has(candidate.modifiedRow)) continue;
         claimed_original.add(candidate.originalRow);
         claimed_modified.add(candidate.modifiedRow);
-        matches.set(candidate.originalRow, candidate.modifiedRow);
+        claim(candidate.originalRow, candidate.modifiedRow);
     }
 }
