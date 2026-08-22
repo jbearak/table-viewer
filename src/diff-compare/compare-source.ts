@@ -1,14 +1,12 @@
-// Pure compare-session core for git table diffs. No vscode imports: everything
+// Pure compare-session core for compare sessions (Git table diffs and
+// file-to-file comparison alike). No vscode imports: everything
 // here operates on DataSource/WorkbookMeta values so it is unit-testable with
 // in-memory fixtures and shareable across hosts.
 import {
-    read_source_rows_indexed,
     type DataSource,
-    type RowWindow,
     type SheetMeta,
     type WorkbookMeta,
 } from '../data-source/interface';
-import { get_raw_cell_text } from '../cell-display';
 
 export type SheetPairStatus = SheetPairing['status'];
 
@@ -27,15 +25,65 @@ export type SheetPairing =
     | { readonly status: 'added'; readonly name: string; readonly modifiedIndex: number }
     | { readonly status: 'deleted'; readonly name: string; readonly originalIndex: number };
 
+/** The delimited-vs-workbook case: sheet 0 pairs, the workbook's rest are
+ *  one-sided in whichever direction the workbook sits. */
+function pair_first_sheets(
+    original: WorkbookMeta,
+    modified: WorkbookMeta,
+): SheetPairing[] {
+    const pairings: SheetPairing[] = [{
+        status: 'matched',
+        name: modified.sheets[0].name,
+        modifiedIndex: 0,
+        originalIndex: 0,
+    }];
+    for (let index = 1; index < modified.sheets.length; index++) {
+        pairings.push({
+            status: 'added',
+            name: modified.sheets[index].name,
+            modifiedIndex: index,
+        });
+    }
+    for (let index = 1; index < original.sheets.length; index++) {
+        pairings.push({
+            status: 'deleted',
+            name: original.sheets[index].name,
+            originalIndex: index,
+        });
+    }
+    return pairings;
+}
+
 /**
  * Pair worksheets positionally-independently: by stable `worksheetId` when both
  * sides expose one, otherwise by exact name. Each original sheet is consumed at
  * most once. Modified-only sheets are `added`; original-only sheets `deleted`.
+ *
+ * One exception, for comparing a delimited file against a workbook: a CSV or
+ * TSV is a single unnamed sheet the reader calls `Sheet1`, so name matching
+ * reports it and every worksheet as one-sided unless the workbook happens to
+ * have a sheet by that name. Pairing it with the workbook's first sheet is what
+ * the user asked for by choosing the two files, and what the dialog promises.
  */
 export function pair_sheets(
     original: WorkbookMeta,
     modified: WorkbookMeta,
 ): SheetPairing[] {
+    if (original.sheets.length > 0 && modified.sheets.length > 0) {
+        // Asked of the source rather than inferred from a missing worksheetId:
+        // .xls exposes no worksheet identity either, so inferring it made a
+        // one-sheet .xls indistinguishable from a CSV and left the two of them
+        // pairing on the placeholder name that started the problem.
+        const delimited = (meta: WorkbookMeta) =>
+            meta.sheets.length === 1 && meta.sheets[0].unnamedSingleSheet === true;
+        // Only when exactly one side is delimited: two delimited sides already
+        // pair by their shared placeholder name, and two workbooks must keep
+        // identity-based pairing or an inserted first sheet would glue
+        // unrelated worksheets together.
+        if (delimited(original) !== delimited(modified)) {
+            return pair_first_sheets(original, modified);
+        }
+    }
     const unclaimed = new Set(original.sheets.map((_, index) => index));
     const by_worksheet_id = new Map<string, number>();
     const by_name = new Map<string, number>();
@@ -86,7 +134,7 @@ export function pair_sheets(
 /**
  * Compare promoted column headers of a matched sheet pair. Both CSV and Excel
  * sources can promote the first row into `columnNames`, taking it out of the
- * grid's row space — so a header-only edit is invisible to `diff_row_window`.
+ * grid's row space — so a header-only edit is invisible to the row comparison.
  * Returns the changed column indexes with the original header text (`''` when
  * the column had no name or did not exist).
  */
@@ -115,13 +163,17 @@ export interface ChangedCell {
     readonly base: string;
 }
 
-export type CompareRowStatus = 'same' | 'added' | 'deleted';
+/** `moved` is a paired row that the aligner re-matched across a change of
+ *  position. It is a *pairing provenance*, not a content verdict: a moved row
+ *  may also carry changed cells, and reports both. */
+export type CompareRowStatus = 'same' | 'added' | 'deleted' | 'moved';
 
 /**
  * Sparse per-page diff. `rowStatus[i]` describes absolute row `startRow + i` of
- * the unified grid (whose row count is `max(original, modified)` row counts):
- * `added` rows exist only in the modified side, `deleted` rows only in the
- * original. `changedCells` carries only differing cells of rows present on both
+ * the unified grid, whose rows follow the sheet alignment rather than
+ * positional padding — interleaved deletions and additions can make it longer
+ * than either side. `added` rows exist only in the modified side, `deleted`
+ * rows only in the original. `changedCells` carries only differing cells of rows present on both
  * sides; `deleted` rows need none — the grid rows themselves carry the original
  * content (see CompareDataSource.read_rows), struck through by row status.
  */
@@ -129,135 +181,4 @@ export interface CompareDiffWindow {
     readonly startRow: number;
     readonly rowStatus: CompareRowStatus[];
     readonly changedCells: ChangedCell[];
-}
-
-/**
- * Positional diff for an arbitrary set of unified-grid rows (a transformed
- * page's `sourceRows`). One batched indexed read per side, so cost stays
- * bounded by the page even when a sort/filter fragments it. `rowStatus[i]`
- * and `changedCells[*].row` are positional: they name `rows[i]`, not the
- * display slot — callers map positions back themselves.
- */
-export function diff_rows_indexed(
-    original: DataSource,
-    modified: DataSource,
-    pairing: SheetPairing,
-    rows: ArrayLike<number>,
-): CompareDiffWindow {
-    if (pairing.status !== 'matched') {
-        throw new Error('diff_rows_indexed requires a matched sheet pairing.');
-    }
-    const original_sheet = original.meta().sheets[pairing.originalIndex];
-    const modified_sheet = modified.meta().sheets[pairing.modifiedIndex];
-    if (!original_sheet || !modified_sheet) {
-        throw new RangeError('sheet pairing indexes a missing sheet');
-    }
-    const read_side = (
-        source: DataSource,
-        sheet_index: number,
-        row_count: number,
-    ): ReadonlyMap<number, RowWindow['rows'][number]> => {
-        const in_range: number[] = [];
-        for (let position = 0; position < rows.length; position++) {
-            const row = rows[position];
-            if (row >= 0 && row < row_count) in_range.push(row);
-        }
-        const side_rows = in_range.length > 0
-            ? read_source_rows_indexed(source, sheet_index, in_range).rows
-            : [];
-        return new Map(in_range.map((row, position) => [row, side_rows[position] ?? []]));
-    };
-    const original_rows = read_side(original, pairing.originalIndex, original_sheet.rowCount);
-    const modified_rows = read_side(modified, pairing.modifiedIndex, modified_sheet.rowCount);
-
-    const row_status: CompareRowStatus[] = [];
-    const changed_cells: ChangedCell[] = [];
-    const column_count = Math.max(original_sheet.columnCount, modified_sheet.columnCount);
-    for (let position = 0; position < rows.length; position++) {
-        const row = rows[position];
-        const in_original = row < original_sheet.rowCount;
-        const in_modified = row < modified_sheet.rowCount;
-        if (!in_original || !in_modified) {
-            row_status.push(in_modified ? 'added' : 'deleted');
-            continue;
-        }
-        row_status.push('same');
-        const original_row = original_rows.get(row) ?? [];
-        const modified_row = modified_rows.get(row) ?? [];
-        for (let col = 0; col < column_count; col++) {
-            const base = raw_text(original_row[col]);
-            if (base !== raw_text(modified_row[col])) {
-                changed_cells.push({ row: position, col, base });
-            }
-        }
-    }
-    return { startRow: 0, rowStatus: row_status, changedCells: changed_cells };
-}
-
-function raw_text(cell: { raw: string | null } | null | undefined): string {
-    return get_raw_cell_text(cell?.raw ?? null);
-}
-
-/**
- * Positionally compare one page of a matched sheet pair (row N vs row N of the
- * two sides' projected row spaces). Lazy: reads only the requested window from
- * each side, so cost is bounded by the page, never the file.
- *
- * Promoted header rows (CSV first row, Excel first-row header) are column
- * names, not grid rows, so header edits are not reported here — callers use
- * `diff_column_names` for those.
- */
-export function diff_row_window(
-    original: DataSource,
-    modified: DataSource,
-    pairing: SheetPairing,
-    start_row: number,
-    count: number,
-): CompareDiffWindow {
-    if (pairing.status !== 'matched') {
-        throw new Error('diff_row_window requires a matched sheet pairing.');
-    }
-    const original_sheet = original.meta().sheets[pairing.originalIndex];
-    const modified_sheet = modified.meta().sheets[pairing.modifiedIndex];
-    if (!original_sheet || !modified_sheet) {
-        throw new RangeError('sheet pairing indexes a missing sheet');
-    }
-    const total_rows = Math.max(original_sheet.rowCount, modified_sheet.rowCount);
-    const first = Math.max(0, start_row);
-    const end = Math.min(total_rows, first + count);
-
-    const read_side = (
-        source: DataSource,
-        sheet_index: number,
-        row_count: number,
-    ) => {
-        const side_end = Math.min(end, row_count);
-        return side_end > first
-            ? source.read_rows(sheet_index, first, side_end - first).rows
-            : [];
-    };
-    const original_rows = read_side(original, pairing.originalIndex, original_sheet.rowCount);
-    const modified_rows = read_side(modified, pairing.modifiedIndex, modified_sheet.rowCount);
-
-    const row_status: CompareRowStatus[] = [];
-    const changed_cells: ChangedCell[] = [];
-    const column_count = Math.max(original_sheet.columnCount, modified_sheet.columnCount);
-    for (let row = first; row < end; row++) {
-        const in_original = row < original_sheet.rowCount;
-        const in_modified = row < modified_sheet.rowCount;
-        if (!in_original || !in_modified) {
-            row_status.push(in_modified ? 'added' : 'deleted');
-            continue;
-        }
-        row_status.push('same');
-        const original_row = original_rows[row - first] ?? [];
-        const modified_row = modified_rows[row - first] ?? [];
-        for (let col = 0; col < column_count; col++) {
-            const base = raw_text(original_row[col]);
-            if (base !== raw_text(modified_row[col])) {
-                changed_cells.push({ row, col, base });
-            }
-        }
-    }
-    return { startRow: first, rowStatus: row_status, changedCells: changed_cells };
 }

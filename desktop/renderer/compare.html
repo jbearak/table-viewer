@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self';">
+<title>Compare Files</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    /* Set from the font settings (desktop/renderer/compare.ts): the font
+       preference applies to the whole app, this window included. */
+    --compare-font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    --compare-font-size: 13px;
+  }
+  body {
+    margin: 0;
+    /* The window is a fixed size, and every dimension here scales with the app
+       font, so a large font must scroll rather than push the buttons off. */
+    box-sizing: border-box;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    font-family: var(--compare-font-family);
+    font-size: var(--compare-font-size);
+    background: var(--compare-bg, #ffffff);
+    color: var(--compare-fg, #3b3b3b);
+    user-select: none;
+  }
+  .body { padding: 18px 22px; overflow-y: auto; flex: 1; }
+  h1 { font-size: calc(var(--compare-font-size) * 1.15); margin: 0 0 4px; }
+  .subtitle { color: var(--compare-muted, #717171); margin: 0 0 16px; }
+  .field { margin-bottom: 14px; display: flex; flex-direction: column; gap: 4px; }
+  label { font-weight: 600; }
+  .hint { color: var(--compare-muted, #717171); font-size: calc(var(--compare-font-size) * 0.92); }
+  .row { display: flex; gap: 8px; align-items: center; }
+  input[type=text] {
+    font: inherit;
+    /* body sets user-select: none for chrome that should not look like a
+       document. It inherits, and these fields hold long paths the user needs
+       to select, edit and copy. */
+    user-select: text;
+    flex: 1;
+    min-width: 0;
+    padding: 5px 8px;
+    border-radius: 5px;
+    border: 1px solid var(--compare-border, #cecece);
+    background: var(--compare-input-bg, #ffffff);
+    color: inherit;
+  }
+  input[type=text].invalid { border-color: var(--compare-error, #ad0707); }
+  button {
+    font: inherit;
+    padding: 5px 14px;
+    border-radius: 5px;
+    border: 1px solid var(--compare-border, #cecece);
+    background: var(--compare-button-bg, #fafafa);
+    color: inherit;
+  }
+  button.primary {
+    background: var(--compare-accent, #005fb8);
+    border-color: var(--compare-accent, #005fb8);
+    color: var(--compare-accent-fg, #ffffff);
+    font-weight: 600;
+  }
+  button:hover:not(:disabled) { background: var(--compare-button-hover-bg, rgba(128, 128, 128, 0.2)); }
+  button.primary:hover:not(:disabled) {
+    background: var(--compare-accent-hover, #0258a8);
+    border-color: var(--compare-accent-hover, #0258a8);
+  }
+  button:disabled { opacity: 0.45; }
+  /* Between the two fields, because it acts on both of them. */
+  .swap { display: flex; justify-content: center; margin: -4px 0 8px; }
+  .swap button { border-radius: 14px; padding: 2px 12px; color: var(--compare-muted, #717171); }
+  .message {
+    display: flex;
+    gap: 8px;
+    border-radius: 6px;
+    padding: 7px 10px;
+    margin-top: 6px;
+    font-size: calc(var(--compare-font-size) * 0.92);
+  }
+  .message.error {
+    background: var(--compare-error-bg, rgba(173, 7, 7, 0.08));
+    border: 1px solid var(--compare-error, #ad0707);
+    color: var(--compare-error, #ad0707);
+  }
+  .message.warning {
+    background: var(--compare-warning-bg, rgba(180, 120, 0, 0.08));
+    border: 1px solid var(--compare-warning, #7a5300);
+    color: var(--compare-warning, #7a5300);
+  }
+  .message[hidden] { display: none; }
+  .foot {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 12px 22px;
+    border-top: 1px solid var(--compare-border, #cecece);
+    background: var(--compare-foot-bg, #f3f3f3);
+  }
+</style>
+</head>
+<body>
+<div class="body">
+  <h1>Compare Files</h1>
+  <p class="subtitle">Opens a read-only window showing the differences between two
+    spreadsheets. Neither file is modified.</p>
+  <div class="field">
+    <label for="originalPath">Original</label>
+    <div class="row">
+      <input id="originalPath" type="text" placeholder="Choose the earlier or baseline file…"
+             spellcheck="false" aria-describedby="originalHint">
+      <button id="browseOriginal" type="button">Browse…</button>
+    </div>
+    <span class="hint" id="originalHint">Shown as the “before” side: its removed rows
+      and old cell values.</span>
+    <div class="message error" id="originalError" role="alert" hidden></div>
+  </div>
+  <div class="swap">
+    <button id="swap" type="button" aria-label="Swap the two files">⇅ Swap</button>
+  </div>
+  <div class="field">
+    <label for="modifiedPath">Modified</label>
+    <div class="row">
+      <input id="modifiedPath" type="text" placeholder="Choose the file to compare against it…"
+             spellcheck="false" aria-describedby="modifiedHint">
+      <button id="browseModified" type="button">Browse…</button>
+    </div>
+    <span class="hint" id="modifiedHint">Shown as the “after” side: added rows and
+      new cell values.</span>
+    <div class="message error" id="modifiedError" role="alert" hidden></div>
+  </div>
+  <div class="message warning" id="warning" role="status" hidden></div>
+</div>
+<div class="foot">
+  <button id="cancel" type="button">Cancel</button>
+  <button id="compare" type="button" class="primary" disabled>Compare</button>
+</div>
+<script type="module" src="compare.js"></script>
+</body>
+</html>

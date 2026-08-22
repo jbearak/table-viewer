@@ -1,7 +1,19 @@
 import { describe, expect, it } from 'vitest';
-import { CompareDataSource } from '../diff-compare/compare-session';
+import { CompareDataSource, align_workbook } from '../diff-compare/compare-session';
 import type { DataSource } from '../data-source/interface';
 import { FixtureSource } from './helpers/fixture-source';
+
+/** The production path serves whole transformed windows via `diff_rows`; these
+ *  tests want a plain leading page, so they name the rows themselves, clamped
+ *  to the sheet the way a served window already is. */
+const diff_page = (
+    source: CompareDataSource,
+    sheet_index: number,
+    count: number,
+) => {
+    const rows = Math.min(count, source.meta().sheets[sheet_index].rowCount);
+    return source.diff_rows(sheet_index, Array.from({ length: rows }, (_, i) => i));
+};
 
 const compare = (
     original_rows: string[][],
@@ -32,7 +44,7 @@ describe('CompareDataSource', () => {
         expect(source.meta().sheets[0].rowCount).toBe(2);
     });
 
-    it('answers diff pages only for matched sheets', () => {
+    it('diffs a matched sheet cell by cell, and a one-sided one as a whole band', () => {
         const source = new CompareDataSource(
             new FixtureSource([
                 { name: 'Kept', rows: [['x']] },
@@ -40,9 +52,14 @@ describe('CompareDataSource', () => {
             ]),
             new FixtureSource([{ name: 'Kept', rows: [['z']] }]),
         );
-        const kept = source.diff_page(0, 0, 10);
+        const kept = diff_page(source, 0, 10);
         expect(kept?.changedCells).toEqual([{ row: 0, col: 0, base: 'z' }]);
-        expect(source.diff_page(1, 0, 10)).toBeUndefined();
+        // There is no original to compare the added sheet against, so it has no
+        // cell-level diff — but it is still all added, and saying nothing left
+        // it painted as unchanged.
+        expect(diff_page(source, 1, 10)).toMatchObject({
+            rowStatus: ['added'], changedCells: [],
+        });
     });
 
     it('exposes pairings including added and deleted sheets', () => {
@@ -88,6 +105,25 @@ describe('CompareDataSource', () => {
         expect(window.rows.map((row) => row[0]?.raw)).toEqual(['g1', 'g2']);
         expect(source.read_rows_indexed(1, [1]).rows[0][0]?.raw).toBe('g2');
         expect(source.diff_rows(1, [0, 1])?.rowStatus).toEqual(['deleted', 'deleted']);
+    });
+
+    it('bands an added sheet the way it bands a deleted one', () => {
+        // An added sheet has no original to align against, so it has no
+        // alignment — and used to fall through to no diff at all, leaving a
+        // wholly new sheet painted as ordinary unchanged rows while its tab
+        // badge and the summary both called it added.
+        const source = new CompareDataSource(
+            new FixtureSource([
+                { name: 'Kept', rows: [['x']] },
+                { name: 'Fresh', rows: [['f1'], ['f2']] },
+            ]),
+            new FixtureSource([{ name: 'Kept', rows: [['x']] }]),
+        );
+        expect(source.sheetStatuses).toEqual(['matched', 'added']);
+        expect(source.diff_rows(1, [0, 1])?.rowStatus).toEqual(['added', 'added']);
+        // And the filter already kept them, which is what made the gap visible:
+        // "only changed rows" showed every row of the sheet, unbanded.
+        expect(source.changed_grid_rows(1)).toEqual([0, 1]);
     });
 
     it('serves repeated diff_rows requests from the cache', () => {
@@ -157,5 +193,255 @@ describe('CompareDataSource', () => {
         expect(window.rows).toHaveLength(1);
         expect(window.rows[0][0]?.raw).toBe('b');
         expect(source.read_rows(0, 5, 10).rows).toEqual([]);
+    });
+});
+
+describe('CompareDataSource with a content alignment', () => {
+    /** Build a compare source over an aligned pair, the way a host does. */
+    const aligned = async (
+        original_rows: string[][],
+        modified_rows: string[][],
+    ): Promise<CompareDataSource> => {
+        const modified = new FixtureSource([{ name: 'Sheet1', rows: modified_rows }]);
+        const original = new FixtureSource([{ name: 'Sheet1', rows: original_rows }]);
+        return new CompareDataSource(
+            modified,
+            original,
+            await align_workbook(modified, original),
+        );
+    };
+
+    it('moves merges into unified-grid row space', async () => {
+        // The unified grid interleaves the deleted row above the merge, so a
+        // block anchored at modified rows 1-2 renders at 2-3. Left unprojected
+        // it covered whatever sat at its old numbers.
+        const modified = new FixtureSource([{
+            name: 'Sheet1',
+            rows: [['a'], ['b'], ['c']],
+            merges: [{ startRow: 1, endRow: 2, startCol: 0, endCol: 0 }],
+        }]);
+        const original = new FixtureSource([{
+            name: 'Sheet1',
+            rows: [['GONE'], ['a'], ['b'], ['c']],
+        }]);
+        const source = new CompareDataSource(
+            modified, original, await align_workbook(modified, original));
+        expect(source.meta().sheets[0].merges)
+            .toEqual([{ startRow: 2, endRow: 3, startCol: 0, endCol: 0 }]);
+    });
+
+    it('drops a merge an interleaved deletion splits apart', async () => {
+        // Stretching it over the gap would swallow a deleted row into a block
+        // that never contained it, which reads as a data change, not a layout
+        // one.
+        const modified = new FixtureSource([{
+            name: 'Sheet1',
+            rows: [['a'], ['b']],
+            merges: [{ startRow: 0, endRow: 1, startCol: 0, endCol: 0 }],
+        }]);
+        const original = new FixtureSource([{
+            name: 'Sheet1',
+            rows: [['a'], ['GONE'], ['b']],
+        }]);
+        const source = new CompareDataSource(
+            modified, original, await align_workbook(modified, original));
+        expect(source.meta().sheets[0].merges).toEqual([]);
+    });
+
+    it('reports formatting when only the original side has it', async () => {
+        // Deleted rows are served from the original, so their cells can be
+        // formatted even when the modified file carries none; a consumer told
+        // the comparison has no formatting would never ask for it.
+        const modified = new FixtureSource([{ name: 'Sheet1', rows: [['a']] }]);
+        const original = new FixtureSource([{
+            name: 'Sheet1',
+            rows: [['GONE'], ['a']],
+            hasFormatting: true,
+        }]);
+        const source = new CompareDataSource(
+            modified, original, await align_workbook(modified, original));
+        expect(source.meta().hasFormatting).toBe(true);
+    });
+
+    it('reports an inserted row as one addition, not a cascade of changed cells', async () => {
+        // The regression this whole mechanism exists for: positionally, rows
+        // 1..3 all differ, and the grid used to say so.
+        const source = await aligned(
+            [['a'], ['b'], ['c']],
+            [['a'], ['NEW'], ['b'], ['c']],
+        );
+        expect(source.meta().sheets[0].rowCount).toBe(4);
+        const diff = diff_page(source, 0, 10);
+        expect(diff?.rowStatus).toEqual(['same', 'added', 'same', 'same']);
+        expect(diff?.changedCells).toEqual([]);
+    });
+
+    it('interleaves a deleted row where it was removed, carrying its content', async () => {
+        const source = await aligned(
+            [['a'], ['GONE'], ['b']],
+            [['a'], ['b']],
+        );
+        const window = source.read_rows(0, 0, 10);
+        expect(window.rows.map((row) => row[0]?.raw)).toEqual(['a', 'GONE', 'b']);
+        expect(diff_page(source, 0, 10)?.rowStatus)
+            .toEqual(['same', 'deleted', 'same']);
+    });
+
+    it('still reports a genuine in-place edit as a changed cell', async () => {
+        const source = await aligned([['a', 'x']], [['a', 'y']]);
+        const diff = diff_page(source, 0, 10);
+        expect(diff?.rowStatus).toEqual(['same']);
+        expect(diff?.changedCells).toEqual([{ row: 0, col: 1, base: 'x' }]);
+    });
+
+    it('lists added, deleted and changed rows for the changed-rows filter', async () => {
+        const source = await aligned(
+            [['a'], ['b'], ['c'], ['d']],
+            [['a'], ['CHANGED'], ['c'], ['d'], ['NEW']],
+        );
+        expect(source.changed_grid_rows(0)).toEqual([1, 4]);
+    });
+
+    it('reports a moved row status, with its edits, end to end', async () => {
+        const source = await aligned(
+            [['Al', 'Eng', '10'], ['Bo', 'Ops', '20'], ['Cy', 'Fin', '30']],
+            [['Al', 'Eng', '10'], ['Cy', 'Fin', '30'], ['Bo', 'Ops', '99']],
+        );
+        const diff = diff_page(source, 0, 10);
+        // Only Bo is 'moved'. Cy also shifted up a row, but Myers paired it as
+        // part of the longest common subsequence, so it was never one-sided and
+        // never reached the move pass. 'moved' means "re-paired across a move",
+        // not "sits at a different row number" — which is the right meaning:
+        // marking every row below an insertion point as moved would be noise.
+        expect(diff?.rowStatus).toEqual(['same', 'same', 'moved']);
+        // The moved row is still diffed cell by cell, which is the whole point:
+        // its edit is reported as an edit rather than left to the eye.
+        expect(diff?.changedCells).toEqual([{ row: 2, col: 2, base: '20' }]);
+        // The summary has to agree with the banding. Asserted here because
+        // every other movedRows assertion in the suite is either zero or a
+        // hand-supplied prop, so a count that never left the aligner would go
+        // unnoticed and a move-only comparison would read as no differences.
+        expect(source.change_counts()).toMatchObject({
+            movedRows: 1, addedRows: 0, deletedRows: 0,
+        });
+    });
+
+    it('reports when a sheet had too many rows to check them all for moves', async () => {
+        // The moved row is also edited, so it needs a similarity score rather
+        // than an exact hash match — the only phase the cap gates.
+        const modified = new FixtureSource([
+            { name: 'S', rows: [['keep'], ['y'], ['Bo', 'Ops', '99']] },
+        ]);
+        const original = new FixtureSource([
+            { name: 'S', rows: [['Bo', 'Ops', '20'], ['keep'], ['y']] },
+        ]);
+        const relaxed = new CompareDataSource(
+            modified, original, await align_workbook(modified, original));
+        expect(relaxed.moveSearchTruncated).toBe(false);
+        const capped = new CompareDataSource(
+            modified,
+            original,
+            await align_workbook(modified, original, { maxMoveSearchRows: 0 }),
+        );
+        expect(capped.moveSearchTruncated).toBe(true);
+    });
+
+    it('keeps a purely moved row under the changed-rows filter', async () => {
+        // It is neither one-sided nor in changedRowIndices, so it would vanish
+        // from the one view a user hunting changes would most expect it in.
+        const source = await aligned(
+            [['a'], ['b'], ['c'], ['d']],
+            [['b'], ['c'], ['d'], ['a']],
+        );
+        expect(source.changed_grid_rows(0)).toEqual([3]);
+    });
+
+    it('treats every row of a one-sided sheet as changed', async () => {
+        const modified = new FixtureSource([{ name: 'Fresh', rows: [['x'], ['y']] }]);
+        const original = new FixtureSource([{ name: 'Gone', rows: [['z']] }]);
+        const source = new CompareDataSource(
+            modified, original, await align_workbook(modified, original));
+        expect(source.changed_grid_rows(0)).toEqual([0, 1]);
+        expect(source.changed_grid_rows(1)).toEqual([0]);
+    });
+
+    it('totals changes across sheets, counting one-sided sheets whole', async () => {
+        const modified = new FixtureSource([
+            { name: 'Kept', rows: [['a'], ['CHANGED'], ['NEW']] },
+            { name: 'Fresh', rows: [['x'], ['y']] },
+        ]);
+        const original = new FixtureSource([{ name: 'Kept', rows: [['a'], ['b']] }]);
+        const source = new CompareDataSource(
+            modified, original, await align_workbook(modified, original));
+        expect(source.change_counts()).toEqual({
+            addedRows: 3,      // one row in Kept, two from the whole Fresh sheet
+            deletedRows: 0,
+            movedRows: 0,
+            changedCells: 1,
+        });
+    });
+
+    it('maps a deleted row to a canonical row past the modified side', async () => {
+        const source = await aligned([['a'], ['GONE'], ['b']], [['a'], ['b']]);
+        // Grid rows 0 and 2 are the modified side's rows 0 and 1; grid row 1 is
+        // the deleted one, which takes the next canonical number.
+        expect([...source.source_row_indices(0, [0, 1, 2])]).toEqual([0, 2, 1]);
+        expect(source.projected_row_index(0, 2)).toBe(1);
+        expect(source.projected_row_index(0, 0)).toBe(0);
+        expect(source.projected_row_index(0, 1)).toBe(2);
+    });
+
+    it('round-trips every grid row through source_row_indices', async () => {
+        const source = await aligned(
+            [['a'], ['x'], ['b'], ['y'], ['c']],
+            [['a'], ['b'], ['NEW'], ['c']],
+        );
+        const grid_rows = Array.from(
+            { length: source.meta().sheets[0].rowCount }, (_, row) => row);
+        const canonical = source.source_row_indices(0, grid_rows);
+        // A distinct canonical row per grid row, each mapping back to itself.
+        expect(new Set(canonical).size).toBe(grid_rows.length);
+        grid_rows.forEach((grid_row, index) => {
+            expect(source.projected_row_index(0, canonical[index])).toBe(grid_row);
+        });
+    });
+
+    it('flags a degraded alignment so the host can say the rows did not match', async () => {
+        const modified = new FixtureSource([{ name: 'S', rows: [['p'], ['q'], ['r']] }]);
+        const original = new FixtureSource([{ name: 'S', rows: [['x'], ['y'], ['z']] }]);
+        const source = new CompareDataSource(
+            modified, original,
+            await align_workbook(modified, original, { maxEditDistance: 1 }),
+        );
+        expect(source.degraded).toBe(true);
+        // Positional fallback: three rows, all changed, none added or deleted.
+        expect(diff_page(source, 0, 10)?.rowStatus).toEqual(['same', 'same', 'same']);
+    });
+    it('withholds the first-row-header capability from every grid sheet', async () => {
+        // The wrapper is deliberately not an ExcelHeaderDataSource, so the
+        // controller refuses every header command it is sent. Reporting the
+        // capability anyway put a live Header Row button in front of the user
+        // whose only outcome was the refusal dialog — and a pending header
+        // request blocks transforms and column visibility until it settles, so
+        // the refusal stalled whatever they tried next.
+        const header = {
+            mode: 'auto', detected: true, active: true, available: true, sourceRow: 0,
+        } as const;
+        const modified = new FixtureSource([
+            { name: 'S', excelFirstRowHeader: header, rows: [['a'], ['b']] },
+            { name: 'Added', excelFirstRowHeader: header, rows: [['n']] },
+        ]);
+        const original = new FixtureSource([
+            { name: 'S', excelFirstRowHeader: header, rows: [['a'], ['b']] },
+            { name: 'Gone', excelFirstRowHeader: header, rows: [['g']] },
+        ]);
+        const source = new CompareDataSource(
+            modified, original, await align_workbook(modified, original),
+        );
+        // Matched, added and deleted sheets alike.
+        expect(source.meta().sheets).toHaveLength(3);
+        for (const sheet of source.meta().sheets) {
+            expect(sheet.excelFirstRowHeader).toBeUndefined();
+        }
     });
 });

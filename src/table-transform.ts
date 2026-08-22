@@ -104,6 +104,10 @@ export async function compute_transform(
     is_cancelled: () => boolean = () => false,
     sort_instrumentation?: TransformSortInstrumentation,
     column_cache?: TransformColumnCache,
+    /** Grid rows `state.onlyChangedRows` keeps, ascending. Supplied by the
+     *  caller because only a compare source can answer it, and this module is
+     *  deliberately ignorant of compare mode. */
+    changed_rows?: readonly number[],
 ): Promise<TransformResult> {
     const sheet = source.meta().sheets[sheet_index];
     if (!sheet) {
@@ -121,6 +125,11 @@ export async function compute_transform(
         }
     }
     await cancellation_checkpoint(is_cancelled);
+    // Applied as a row mask like hidden rows, so it composes with sorting and
+    // filtering instead of being a separate view.
+    const only_changed = state.onlyChangedRows && changed_rows !== undefined
+        ? new Set(changed_rows)
+        : undefined;
     let survivors: Uint32Array | undefined;
     let survivor_mask: Uint8Array | undefined;
     let returned_result = false;
@@ -128,7 +137,7 @@ export async function compute_transform(
         const hidden_rows = new Set(state.hiddenRows ?? []);
         const filter_groups = group_enabled_filters(state.filters);
         let survivor_count = sheet.rowCount;
-        if (hidden_rows.size > 0) {
+        if (hidden_rows.size > 0 || only_changed !== undefined) {
             survivor_mask = allocate_survivor_mask(
                 sheet.rowCount,
                 sort_instrumentation,
@@ -149,7 +158,8 @@ export async function compute_transform(
                     projected_rows,
                 );
                 for (let offset = 0; offset < source_rows.length; offset++) {
-                    const visible = !hidden_rows.has(source_rows[offset]);
+                    const visible = !hidden_rows.has(source_rows[offset])
+                        && (only_changed === undefined || only_changed.has(start + offset));
                     survivor_mask[start + offset] = visible ? 1 : 0;
                     if (visible) survivor_count += 1;
                 }
@@ -165,7 +175,7 @@ export async function compute_transform(
                 );
             }
             survivor_count = 0;
-            let first_group = hidden_rows.size === 0;
+            let first_group = hidden_rows.size === 0 && only_changed === undefined;
             for (const [column_index, filters] of filter_groups) {
                 const column = await acquire_transform_column(
                     source,

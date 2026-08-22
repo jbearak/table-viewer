@@ -49,9 +49,16 @@ export function StateStrip(props: StateStripProps): React.JSX.Element | null {
         on_cancel_transform,
     } = props;
     const hidden_count = props.hidden_rows?.count ?? 0;
+    const only_changed_rows = transform.onlyChangedRows === true;
+    // "Only changed rows" counts as state. Leaving it out made the strip mount
+    // for the duration of the toggle's own transform and unmount the moment it
+    // landed, so switching the filter on flashed a band of chrome and shoved
+    // the grid down and back — and left an installed filter with no
+    // representation anywhere below the tabs.
     const has_state = transform.sort.length > 0
         || transform.filters.length > 0
         || hidden_count > 0
+        || only_changed_rows
         || props.transform_pending
         || props.merges_flattened;
     if (!has_state) return null;
@@ -89,6 +96,22 @@ export function StateStrip(props: StateStripProps): React.JSX.Element | null {
                         }
                     >
                         Unhide all
+                    </button>
+                </div>
+            )}
+            {only_changed_rows && (
+                <div className="filter-chip">
+                    <span className="filter-chip-body">Only changed rows</span>
+                    <button
+                        type="button"
+                        className="toolbar-cancel"
+                        onClick={() => on_transform_change({
+                            ...transform,
+                            onlyChangedRows: false,
+                        })}
+                        disabled={controls_disabled}
+                    >
+                        Show all
                     </button>
                 </div>
             )}

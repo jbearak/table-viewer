@@ -91,7 +91,16 @@ export function sanitize_transform_state(
     row_count = Number.MAX_SAFE_INTEGER,
 ): SheetTransformState | undefined {
     if (!value || typeof value !== 'object') return undefined;
-    const candidate = value as { sort?: unknown; filters?: unknown; hiddenRows?: unknown };
+    const candidate = value as {
+        sort?: unknown;
+        filters?: unknown;
+        hiddenRows?: unknown;
+        onlyChangedRows?: unknown;
+    };
+    // Session state of a compare window, not persisted view state: it is carried
+    // through so a sort or filter applied alongside it does not drop it, but it
+    // is never on its own a reason to call a state non-empty.
+    const only_changed_rows = candidate.onlyChangedRows === true;
     if (!Array.isArray(candidate.sort) || !Array.isArray(candidate.filters)) {
         return undefined;
     }
@@ -134,6 +143,7 @@ export function sanitize_transform_state(
                 filters: [],
                 hiddenRows: hidden_rows,
                 schema: expected_schema,
+                ...(only_changed_rows ? { onlyChangedRows: true } : {}),
             }
             : undefined;
     }
@@ -224,11 +234,17 @@ export function sanitize_transform_state(
         });
     }
 
-    if (sort.length === 0 && filters.length === 0 && hidden_rows.length === 0) {
+    if (
+        sort.length === 0
+        && filters.length === 0
+        && hidden_rows.length === 0
+        && !only_changed_rows
+    ) {
         return undefined;
     }
     const result: SheetTransformState = { sort, filters };
     if (hidden_rows.length > 0) result.hiddenRows = hidden_rows;
+    if (only_changed_rows) result.onlyChangedRows = true;
     if (schema !== undefined) result.schema = schema;
     return result;
 }

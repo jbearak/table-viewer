@@ -2,7 +2,7 @@ import { useCallback, useEffect, useReducer, useRef } from 'react';
 import type { RenderedCell } from '../data-source/interface';
 import type { HostMessage } from '../types';
 import { host_bridge } from './host-bridge';
-import { RowLoader } from './row-loader';
+import { RowLoader, type CompareRowDiff } from './row-loader';
 
 export { RowLoader };
 
@@ -39,8 +39,9 @@ export interface UseRowLoader {
     get_cell_for_source(source_row: number, col: number): RenderedCell | null | undefined;
     /** Whether a canonical source row is currently resident on some cached page. */
     has_source_row(source_row: number): boolean;
-    /** Git-compare band ('added'/'deleted') for a display row, when resident. */
-    get_compare_status(row: number): 'added' | 'deleted' | undefined;
+    /** Git-compare band for a display row, when resident. Derived from
+     *  `CompareRowDiff` rather than restated, so a new status cannot drift. */
+    get_compare_status(row: number): CompareRowDiff['status'] | undefined;
     /** Original-side text of a changed cell in git compare mode, when resident. */
     get_compare_base(row: number, col: number): string | undefined;
     /** Up to `max` resident rows for sampling (column auto-fit). */

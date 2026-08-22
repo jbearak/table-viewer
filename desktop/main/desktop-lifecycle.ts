@@ -177,7 +177,13 @@ export type DesktopWindowRequest =
     /** This launch's own argv, replayed once the backend is open. */
     | { readonly kind: 'startup'; readonly files: readonly string[] }
     /** File → New Window. */
-    | { readonly kind: 'new-window' };
+    | { readonly kind: 'new-window' }
+    /** File → Compare Files…, once the dialog has both paths. */
+    | {
+        readonly kind: 'compare-files';
+        readonly originalPath: string;
+        readonly modifiedPath: string;
+    };
 
 /** What is on screen at the moment a request is routed. Launchers count as
  *  document windows for `activate`; Preferences and About deliberately do not —
@@ -191,6 +197,11 @@ export interface DesktopWindowState {
 export type DesktopWindowAction =
     | { readonly kind: 'open-files'; readonly files: readonly string[] }
     | { readonly kind: 'show-launcher'; readonly focus: boolean }
+    | {
+        readonly kind: 'compare-files';
+        readonly originalPath: string;
+        readonly modifiedPath: string;
+    }
     /** The request is satisfied by what is already on screen. Note that being
      *  *dropped* for phase reasons is not this: that is the lifecycle gate's
      *  job, and the router is never reached at all in that case. */
@@ -237,6 +248,14 @@ export function route_desktop_window_request(
             // Always a new one: several launchers may be open at once, and the
             // command's whole purpose is to add one.
             return { kind: 'show-launcher', focus: false };
+        case 'compare-files':
+            // Unconditional: the user named two specific files, so what is
+            // already on screen has no bearing on it.
+            return {
+                kind: 'compare-files',
+                originalPath: request.originalPath,
+                modifiedPath: request.modifiedPath,
+            };
     }
 }
 

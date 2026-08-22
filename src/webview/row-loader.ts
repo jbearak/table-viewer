@@ -331,11 +331,18 @@ export class RowLoader {
         const page = this.pages.get(msg.startRow);
         if (page === undefined || page.request_id !== msg.requestId) return false;
         if (!Array.isArray(msg.rowStatus) || !Array.isArray(msg.changedCells)) return false;
-        const records: ({ status?: 'added' | 'deleted'; bases?: Map<number, string> } | undefined)[] =
+        const records: (
+            { status?: CompareRowDiff['status']; bases?: Map<number, string> } | undefined
+        )[] =
             new Array<undefined>(page.rows.length);
         for (let offset = 0; offset < msg.rowStatus.length && offset < page.rows.length; offset++) {
             const status = msg.rowStatus[offset];
-            if (status === 'added' || status === 'deleted') records[offset] = { status };
+            // 'same' carries no band, so it is retained as absent rather than
+            // stored. Anything else is dropped: an unknown status from a newer
+            // host must not paint an arbitrary band.
+            if (status === 'added' || status === 'deleted' || status === 'moved') {
+                records[offset] = { status };
+            }
         }
         for (const cell of msg.changedCells) {
             const offset = cell.row - msg.startRow;

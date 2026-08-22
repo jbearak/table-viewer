@@ -336,6 +336,7 @@ const COMPARE_BAND_ALPHA = 0.12;
  *  (named colors) — conventional diff green/red at the band alpha. */
 const COMPARE_ADDED_BG_FALLBACK = `rgba(76, 175, 80, ${COMPARE_BAND_ALPHA})`;
 const COMPARE_DELETED_BG_FALLBACK = `rgba(229, 75, 75, ${COMPARE_BAND_ALPHA})`;
+
 import { host_bridge, pending_edit_durability } from './host-bridge';
 import { scroll_preview_to_row } from './preview-scroll';
 import './glide-data-grid/styles.css';
@@ -699,6 +700,7 @@ export function GridShell({
         conflictBg: conflict_bg,
         diffDeletedFg: diff_deleted_fg,
         diffAddedFg: diff_added_fg,
+        diffMovedFg: diff_moved_fg,
     } = use_vscode_theme();
     // Stable object for build_grid_cell / the paint closure's dep array.
     const diff_colors = useMemo(
@@ -712,8 +714,11 @@ export function GridShell({
             added: tint_from_color(diff_added_fg, COMPARE_BAND_ALPHA, COMPARE_ADDED_BG_FALLBACK),
             deleted: tint_from_color(
                 diff_deleted_fg, COMPARE_BAND_ALPHA, COMPARE_DELETED_BG_FALLBACK),
+            // No separate literal fallback: diff_moved_fg is itself already a
+            // resolved color rather than a theme variable that may be missing.
+            moved: tint_from_color(diff_moved_fg, COMPARE_BAND_ALPHA, diff_moved_fg),
         }),
-        [diff_added_fg, diff_deleted_fg],
+        [diff_added_fg, diff_deleted_fg, diff_moved_fg],
     );
     // The configured font size, resolved once from the theme so cell painting,
     // canvas measurement, and default row heights all agree.

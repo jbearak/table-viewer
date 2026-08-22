@@ -3,6 +3,7 @@ import type {
     WorkbookMeta,
     RenderedCell,
 } from './data-source/interface';
+import type { CompareRowStatus } from './diff-compare/compare-source';
 import type { XlsxCellFormatFields } from './spreadsheet-format';
 import type {
     SnapshotDisposition,
@@ -129,6 +130,13 @@ export interface SheetTransformState {
     /** Fingerprint of sheet identity + available column names. Prevents a saved
      *  transform from silently attaching to a reordered/replaced sheet. */
     schema?: string;
+    /** Compare mode: keep only rows that are added, deleted, moved, or have a
+     *  changed cell. A purely moved row has no changed cell and is not
+     *  one-sided, so it has to be included deliberately — it is precisely the
+     *  kind of row someone using this filter is looking for. Which rows those
+     *  are is the compare source's answer, supplied to the transform rather
+     *  than derived here — see PanelCore. */
+    onlyChangedRows?: boolean;
 }
 
 /**
@@ -385,6 +393,7 @@ export function transform_is_active(state: SheetTransformState | undefined): boo
         state.sort.length > 0
         || state.filters.some((entry) => entry.enabled)
         || (state.hiddenRows?.length ?? 0) > 0
+        || state.onlyChangedRows === true
     );
 }
 
@@ -393,6 +402,7 @@ export function transform_has_entries(state: SheetTransformState | undefined): b
         state.sort.length > 0
         || state.filters.length > 0
         || (state.hiddenRows?.length ?? 0) > 0
+        || state.onlyChangedRows === true
     );
 }
 
@@ -1819,6 +1829,12 @@ export function save_lifecycle_correlation(
 /** Messages from extension host to webview. */
 export type HostMessage =
     | { type: 'fontChanged'; fontFamily: string | null; fontSize: number | null }
+    /**
+     * How far the compare window's row alignment has got. Sent only in compare
+     * mode, and only before the workbook snapshot: once the grid exists the
+     * alignment is by definition finished.
+     */
+    | { type: 'compareProgress'; scannedRows: number; totalRows: number }
     /** Select a worksheet after the renderer has acknowledged its workbook snapshot. */
     | { type: 'selectSheet'; sheetIndex: number }
     // Desktop only: the native Edit menu consumes Cmd/Ctrl+C, Cmd/Ctrl+A and
@@ -1832,7 +1848,7 @@ export type HostMessage =
     /** Git compare mode: sparse positional diff for the same page a rowData
      *  answered. `rowStatus[i]` describes row `startRow + i`; `changedCells`
      *  carries only differing cells with the original (`base`) text. */
-    | { type: 'compareDiff'; sheetIndex: number; startRow: number; rowStatus: ('same' | 'added' | 'deleted')[]; changedCells: { row: number; col: number; base: string }[]; requestId: string; generation: number }
+    | { type: 'compareDiff'; sheetIndex: number; startRow: number; rowStatus: CompareRowStatus[]; changedCells: { row: number; col: number; base: string }[]; requestId: string; generation: number }
     | { type: 'scrollToRow'; row: number }
     | { type: 'saveOperationStarted'; lifecycle: ActiveCsvSaveLifecycle }
     | {
@@ -1961,6 +1977,13 @@ export type HostMessage =
 /** Messages from webview to extension host */
 export type WebviewMessage =
     | { type: 'ready' }
+    /**
+     * Abandon a comparison that is still aligning its rows. The window has
+     * nothing to show yet — alignment is what makes the diff correct, not an
+     * optimisation over it — so cancelling means closing the window rather
+     * than falling back to a positional diff the user did not ask for.
+     */
+    | { type: 'cancelCompare' }
     | { type: 'openCsvRowLimitSetting' }
     | { type: 'loadAllCsvRows' }
     | { type: 'snapshotApplied'; identity: WorkbookSnapshotIdentity; disposition: SnapshotDisposition }

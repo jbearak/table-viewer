@@ -70,6 +70,8 @@ const ERR_ABORTED = -3;
 interface ViewerWindow {
     readonly filePath: string;
     readonly fileKey: string;
+    /** The original side, when this window is a comparison rather than a file. */
+    readonly comparePath?: string;
     readonly window: BrowserWindow;
     readonly panel: DesktopViewerPanel;
     readonly controller: ViewerController;
@@ -363,6 +365,14 @@ export class ViewerWindowManager {
     open_file_paths(): string[] {
         return this.windows
             .filter((entry) => !entry.window.isDestroyed())
+            // Comparisons are left out rather than reduced to their modified
+            // side. The restoration record holds bare paths, so a comparison
+            // written into it came back as an ordinary — and editable — window
+            // on the modified file, which is not what was open and quietly
+            // drops the read-only guarantee. Omitting it restores nothing,
+            // which is the honest of the two wrong answers; restoring the pair
+            // needs a format that can carry both sides.
+            .filter((entry) => entry.comparePath === undefined)
             .map((entry) => entry.filePath);
     }
     /** Source of `ViewerWindow.resize_seq`; monotonic across all windows. */
@@ -400,18 +410,35 @@ export class ViewerWindowManager {
     }
 
     /**
+     * Show a read-only comparison of two files in its own window, or focus the
+     * window already comparing exactly that pair. The modified side is the
+     * window's file; the original is the side it is compared against.
+     */
+    open_comparison(original_path: string, modified_path: string): BrowserWindow | undefined {
+        return this.open_file(modified_path, { originalPath: original_path });
+    }
+
+    /**
      * Show `file_path` in its own window, or focus the window already showing
      * it. Returns the window either way, or nothing once admission has stopped
      * (see `stop_admission`) — a file opened during shutdown is dropped rather
      * than attached to a backend that is already draining.
      */
-    open_file(file_path: string): BrowserWindow | undefined {
+    open_file(
+        file_path: string,
+        compare?: { readonly originalPath: string },
+    ): BrowserWindow | undefined {
         // Checked before the existing-window lookup as well: during the draining
         // phase even re-focusing is refused, because the OS can deliver an
         // open-file event at any moment and the answer has to be "not now"
         // uniformly rather than depending on which files happen to be open.
         if (!this.admitting) return undefined;
-        const file_key = canonical_file_key(file_path);
+        // A comparison is keyed by both of its sides: the same working file may
+        // legitimately be open plainly *and* compared against two different
+        // originals, and those are three different windows, not one.
+        const file_key = compare
+            ? `${canonical_file_key(compare.originalPath)}\u0000${canonical_file_key(file_path)}`
+            : canonical_file_key(file_path);
         const existing = this.windows.find((entry) => entry.fileKey === file_key);
         if (existing) {
             const window = existing.window;
@@ -421,7 +448,9 @@ export class ViewerWindowManager {
             return window;
         }
 
-        const title = path.basename(file_path);
+        const title = compare
+            ? `${path.basename(compare.originalPath)} ↔ ${path.basename(file_path)}`
+            : path.basename(file_path);
         const window = new BrowserWindow({
             ...this.bounds_for_new_window(),
             minWidth: MIN_WINDOW_WIDTH,
@@ -445,7 +474,11 @@ export class ViewerWindowManager {
             },
         });
         const web_contents = window.webContents;
-        if (process.platform === 'darwin') window.setRepresentedFilename(file_path);
+        // Not for a comparison: the proxy icon stands for *the* document the
+        // window edits, and a compare window edits neither of its two.
+        if (process.platform === 'darwin' && !compare) {
+            window.setRepresentedFilename(file_path);
+        }
 
         // Unsaved CSV edits accepted by the current state backend are tracked per file;
         // this indicator only makes them visible: macOS puts a dot in an edited document's
@@ -934,6 +967,9 @@ export class ViewerWindowManager {
                         console.error('Failed to close the initial viewer window', error);
                     });
                 },
+                ...(compare
+                    ? { compare: { originalUri: compare.originalPath } }
+                    : {}),
             },
         );
 
@@ -955,6 +991,7 @@ export class ViewerWindowManager {
         entry = {
             filePath: file_path,
             fileKey: file_key,
+            ...(compare ? { comparePath: compare.originalPath } : {}),
             window,
             panel,
             controller,
@@ -1389,8 +1426,9 @@ export class ViewerWindowManager {
 
     private async close_initial_entry(entry: ViewerWindow): Promise<void> {
         if (await this.close_entry(entry) || entry.window.isDestroyed()) return;
-        // The controller requests this only when the initial source was declined,
-        // before any document or edits were adopted. There is therefore nothing to
+        // The controller requests this only when the initial source was declined
+        // or a comparison was cancelled while still aligning — either way before
+        // any document or edits were adopted. There is therefore nothing to
         // preserve if Electron refuses the ordinary durability-aware close.
         entry.window.destroy();
     }

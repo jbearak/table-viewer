@@ -85,6 +85,48 @@ export const CHANNEL_PREFS_SET_SYNC = 'prefs:setSync';
  *  the app chrome can follow the configured font. */
 export const CHANNEL_SETTINGS_CHANGED = 'settings:changed';
 
+/** Compare Files dialog (File → Compare Files…). */
+export interface CompareFilesRequest {
+    readonly originalPath: string;
+    readonly modifiedPath: string;
+}
+/** What the dialog knows about one chosen path, so it can enable Compare and
+ *  warn about a cross-format pair without reaching into the filesystem itself. */
+export interface ComparePathCheck {
+    readonly exists: boolean;
+    readonly supported: boolean;
+    /** Lower-case extension without the dot, for the cross-format warning. */
+    readonly extension: string;
+    /** The path names an existing directory. Not an error to report: someone
+     *  typing `~/repos/` is on their way somewhere, not naming a missing file. */
+    readonly isDirectory?: boolean;
+    /** The single existing path this text is a proper prefix of, when there is
+     *  exactly one. Offered as a completion rather than applied by main, so the
+     *  dialog decides when to take it (on blur, or on Compare). */
+    readonly completion?: string;
+}
+/** Renderer → main: show a native picker, and report what was chosen. */
+export const CHANNEL_COMPARE_BROWSE = 'compare:browse';
+/** Renderer → main: does this typed path exist and can it be opened? */
+export const CHANNEL_COMPARE_CHECK_PATH = 'compare:checkPath';
+/** Renderer → main: open the compare window for these two files. Answers rather
+ *  than fires and forgets: main re-validates both paths at this boundary, and a
+ *  file that vanished between the check and the click has to be reported, or the
+ *  dialog sits there with Compare enabled and clicks doing nothing. */
+export const CHANNEL_COMPARE_SUBMIT = 'compare:submit';
+
+/** Main's answer to a submit: which side failed re-validation, if either. */
+export interface CompareSubmitResult {
+    readonly accepted: boolean;
+    /** Fresh verdicts for the paths that were re-checked, by side. */
+    readonly checks?: {
+        readonly original: ComparePathCheck;
+        readonly modified: ComparePathCheck;
+    };
+}
+/** Renderer → main: close the dialog without comparing. */
+export const CHANNEL_COMPARE_CANCEL = 'compare:cancel';
+
 /** Non-modal application-update window channels. */
 export const CHANNEL_APP_UPDATE_GET_STATE = 'appUpdate:getState';
 export const CHANNEL_APP_UPDATE_STATE_CHANGED = 'appUpdate:stateChanged';

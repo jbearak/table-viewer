@@ -64,6 +64,8 @@ import {
 } from './transform-ui-model';
 import { SheetTabs, tab_orientation_label, type SheetTabBadge } from './sheet-tabs';
 import { StateStrip } from './state-strip';
+import { CompareProgress } from './compare-progress';
+import { CompareStrip } from './compare-strip';
 import { ContextMenu, type MenuItem } from './context-menu';
 import {
     pending_sheet_action_to_run,
@@ -340,6 +342,10 @@ export function transforms_semantically_equal(
 ): boolean {
     if (!transform_has_entries(left) && !transform_has_entries(right)) return true;
     if (!left || !right) return false;
+    // Session state, but a semantic difference like any other: without this a
+    // toggle of "only changed rows" over an existing sort compared equal to the
+    // sort alone, and handle_transform_change dropped the request as a no-op.
+    if ((left.onlyChangedRows === true) !== (right.onlyChangedRows === true)) return false;
     if (JSON.stringify(left.sort) !== JSON.stringify(right.sort)) return false;
     const left_hidden = [...(left.hiddenRows ?? [])].sort((a, b) => a - b);
     const right_hidden = [...(right.hiddenRows ?? [])].sort((a, b) => a - b);
@@ -383,6 +389,31 @@ export function transforms_semantically_equal(
         .sort((a, b) => a.colIndex - b.colIndex);
     return JSON.stringify(semantic_filters(left.filters))
         === JSON.stringify(semantic_filters(right.filters));
+}
+
+/**
+ * The durable rules to reconcile against, with the compare window's session
+ * filter carried over from the installed view.
+ *
+ * "Only changed rows" is session state: the host strips it at the durable
+ * write, so it is never in the record read back here. Without carrying it over,
+ * every reconciliation — including the one the filter's own install triggers —
+ * read the durable record as "no filter" and immediately asked for the filter
+ * to be turned back off. That is what made the toggle flash the worksheet and
+ * change nothing.
+ */
+export function reconciliation_intent(
+    durable: SheetTransformState | undefined,
+    installed: SheetViewRecord | undefined,
+    schema: string,
+): SheetTransformState | undefined {
+    const only_changed_rows = installed?.permuted === true
+        && installed.rules.onlyChangedRows === true;
+    if (!only_changed_rows) return durable;
+    return {
+        ...(durable ?? { ...EMPTY_TRANSFORM, schema }),
+        onlyChangedRows: true,
+    };
 }
 
 function transform_reconciliation_required(
@@ -550,6 +581,11 @@ export function App(): React.JSX.Element {
     // the git original, read-only. Snapshot-delivered like the capabilities.
     const [git_compare, set_git_compare] =
         useState<WorkbookSnapshotCompare | undefined>(undefined);
+    // Row alignment runs before the workbook snapshot exists, so this is the
+    // only thing the compare window has to show meanwhile. Its arrival is what
+    // tells the renderer a comparison is being aligned at all.
+    const [compare_progress, set_compare_progress] =
+        useState<{ scannedRows: number; totalRows: number } | undefined>(undefined);
     const edit_mode_ref = useRef(false);
     // Passed down as the admission lifetime instead of asking GridShell to derive
     // one during render. React can abandon a child render; only these parent-owned
@@ -3121,13 +3157,17 @@ export function App(): React.JSX.Element {
         ) {
             return;
         }
-        const state = sanitize_transform_state(
-            state_ref.current.transforms?.[active_sheet_index],
-            sheet.columnCount,
-            transform_schema_for_sheet(sheet),
-            sheet.sourceRowCount,
-        );
         const installed = sheet_views[active_sheet_index];
+        const state = reconciliation_intent(
+            sanitize_transform_state(
+                state_ref.current.transforms?.[active_sheet_index],
+                sheet.columnCount,
+                transform_schema_for_sheet(sheet),
+                sheet.sourceRowCount,
+            ),
+            installed,
+            transform_schema_for_sheet(sheet),
+        );
         // One comparison, both directions, one request. An install branch with no
         // else was how a sibling's cleared sort came to leave the rows permuted
         // under a toolbar showing no rules: only the host can un-permute the loader,
@@ -4137,6 +4177,30 @@ export function App(): React.JSX.Element {
         [handle_transform_change],
     );
 
+    const handle_cancel_compare = useCallback(() => {
+        host_bridge.postMessage({ type: 'cancelCompare' });
+    }, []);
+
+    /**
+     * Compare mode's changed-rows filter. Expressed as a transform so it
+     * composes with sorting and column filters instead of being a second,
+     * parallel notion of "which rows are shown" — which is also why the button
+     * reads its state back off the installed transform rather than keeping its
+     * own copy: a refusal, a rollback, or a sheet switch would desync a copy.
+     */
+    const handle_toggle_only_changed_rows = useCallback(
+        (next: boolean) => {
+            // Read from the same refs handle_transform_change validates against,
+            // so the toggle rides whatever sort and filters are current rather
+            // than a render-time copy that may be a beat behind.
+            const current = pending_transform_states_ref.current[active_sheet_index]
+                ?? state_ref.current.transforms?.[active_sheet_index]
+                ?? EMPTY_TRANSFORM;
+            handle_transform_change({ ...current, onlyChangedRows: next }, 'toolbar');
+        },
+        [handle_transform_change, active_sheet_index],
+    );
+
     const open_filter_editor = useCallback((
         column_index: number,
         anchor: { left: number; top: number },
@@ -4309,6 +4373,12 @@ export function App(): React.JSX.Element {
     useEffect(() => {
         const handler = (event: MessageEvent) => {
             const msg = event.data as HostMessage;
+            if (msg.type === 'compareProgress') {
+                set_compare_progress({
+                    scannedRows: msg.scannedRows,
+                    totalRows: msg.totalRows,
+                });
+            }
             if (msg.type === 'fontChanged') {
                 apply_font_family(msg.fontFamily);
                 apply_font_size(msg.fontSize);
@@ -5108,7 +5178,15 @@ export function App(): React.JSX.Element {
     );
 
     if (!meta) {
-        return <div className="loading">Loading...</div>;
+        return compare_progress
+            ? (
+                <CompareProgress
+                    scannedRows={compare_progress.scannedRows}
+                    totalRows={compare_progress.totalRows}
+                    on_cancel={handle_cancel_compare}
+                />
+            )
+            : <div className="loading">Loading...</div>;
     }
 
     if (!current_sheet) {
@@ -5586,6 +5664,26 @@ export function App(): React.JSX.Element {
         />
     );
 
+    // What the comparison found, and the filter that acts on it. Workbook state —
+    // the totals span every sheet — so it sits above the tabs, unlike StateStrip.
+    const compare_strip = git_compare
+        ? (
+            <CompareStrip
+                {...(git_compare.sides ? { sides: git_compare.sides } : {})}
+                counts={git_compare.counts}
+                degraded={git_compare.degraded}
+                move_search_truncated={git_compare.moveSearchTruncated}
+                other_differences={
+                    git_compare.changedColumnNames.some((columns) => columns.length > 0)
+                    || git_compare.sheetStatuses.some((status) => status !== 'matched')
+                }
+                only_changed_rows={visible_transform.onlyChangedRows === true}
+                on_toggle_only_changed_rows={handle_toggle_only_changed_rows}
+                filter_pending={transform_pending}
+            />
+        )
+        : null;
+
     // Sort, filter, row hiding and the merge notice — worksheet state, so it sits
     // with the worksheet's pane below the tabs rather than in the workbook chrome
     // above them (#154). Renders nothing when the view is untransformed.
@@ -5841,6 +5939,8 @@ export function App(): React.JSX.Element {
                     </div>
                 </div>
             )}
+            {/* Above the tabs, because the comparison spans the whole workbook. */}
+            {compare_strip}
             {/*
               * The tabs come first in both arrangements and the pane follows, so the
               * state strip is always below them: vertically the rail runs the full

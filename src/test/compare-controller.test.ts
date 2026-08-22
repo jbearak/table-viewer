@@ -12,6 +12,7 @@ import {
     type ViewerControllerOptions,
     type ViewerProfile,
 } from '../viewer-controller';
+import { transform_schema_for_sheet } from '../types';
 import { with_in_memory_authority_transactions } from '../state-authority';
 import { versioned_state_store } from './helpers/versioned-state-store';
 import * as vscode_mock from './mocks/vscode';
@@ -28,10 +29,11 @@ function open_compare_controller(
     options: ViewerControllerOptions = {},
 ) {
     const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
+    const state_store = versioned_state_store();
     const controller = attach_viewer(
         panel as unknown as Parameters<typeof attach_viewer>[0],
         vscode_mock.Uri.file('/tmp/compare.csv') as unknown as vscode.Uri,
-        with_in_memory_authority_transactions(versioned_state_store().store),
+        with_in_memory_authority_transactions(state_store.store),
         profile,
         fake_viewer_host,
         {
@@ -40,7 +42,7 @@ function open_compare_controller(
         },
     );
     panel.onDidDispose(() => controller.dispose());
-    return { controller, panel };
+    return { controller, panel, state_store };
 }
 
 function open_compare_table(original_path = '/tmp/original.csv') {
@@ -78,6 +80,28 @@ describe('compare mode controller', () => {
         ]);
     });
 
+    it('parses each side with its own format', async () => {
+        // The window is attached for the modified file, so its profile is the
+        // modified format's. Reusing it for the original split this TSV on
+        // commas, turning two columns into one — and across csv/xlsx it fed
+        // one parser the other's bytes outright.
+        vscode_mock.__setReadFileImplementation(async (uri) =>
+            enc.encode(String(uri.fsPath ?? uri).includes('original')
+                ? 'h\tk\nA\tB\n'
+                : MODIFIED));
+        const panel = open_compare_table('/tmp/original.tsv');
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThan(0));
+        const snapshot = posted(panel, 'workbookSnapshot')[0].snapshot as {
+            configuration: { gitCompare?: { changedColumnNames: { base: string }[][] } };
+        };
+        // The original's second column is gone from the modified side; if the
+        // tab had not been honoured there would be no second column at all,
+        // and column 0 would read as renamed from 'h\tk'.
+        expect(snapshot.configuration.gitCompare?.changedColumnNames[0])
+            .toEqual([{ col: 1, base: 'k' }]);
+    });
+
     it('answers a row request with a compareDiff page beside rowData', async () => {
         const panel = open_compare_table();
         await panel.__receive({ type: 'ready' });
@@ -98,6 +122,221 @@ describe('compare mode controller', () => {
         expect(diff.rowStatus).toEqual(['same', 'added']);
         expect(diff.changedCells).toEqual([{ row: 0, col: 0, base: 'A' }]);
         expect(posted(panel, 'rowData').length).toBeGreaterThan(0);
+    });
+
+    it('reports an inserted row as one addition rather than shifting every row', async () => {
+        // The regression content alignment exists for: positionally, inserting
+        // a row near the top makes every row below it look changed.
+        vscode_mock.__setReadFileImplementation(async (uri) =>
+            enc.encode(String(uri.fsPath ?? uri).includes('original')
+                ? 'h\na\nb\nc\n'
+                : 'h\na\nNEW\nb\nc\n'));
+        const panel = open_compare_table();
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThan(0));
+        const { generation } = posted(panel, 'workbookSnapshot')[0]
+            .snapshot as { generation: number };
+        await panel.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 10,
+            requestId: 'r1',
+            generation,
+        });
+        await vi.waitFor(() => expect(posted(panel, 'compareDiff').length).toBeGreaterThan(0));
+        const diff = posted(panel, 'compareDiff')[0];
+        expect(diff.rowStatus).toEqual(['same', 'added', 'same', 'same']);
+        expect(diff.changedCells).toEqual([]);
+    });
+
+    it('reports change counts on the snapshot', async () => {
+        vscode_mock.__setReadFileImplementation(async (uri) =>
+            enc.encode(String(uri.fsPath ?? uri).includes('original')
+                ? 'h\na\nb\n'
+                : 'h\na\nCHANGED\nNEW\n'));
+        const panel = open_compare_table();
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThan(0));
+        const snapshot = posted(panel, 'workbookSnapshot')[0].snapshot as {
+            configuration: {
+                gitCompare?: {
+                    counts: unknown;
+                    degraded: boolean;
+                    moveSearchTruncated: boolean;
+                };
+            };
+        };
+        expect(snapshot.configuration.gitCompare?.counts).toEqual({
+            addedRows: 1, deletedRows: 0, movedRows: 0, changedCells: 1,
+        });
+        expect(snapshot.configuration.gitCompare?.degraded).toBe(false);
+        // Carried on the snapshot, not just the session: the strip's caveat is
+        // rendered from this and would otherwise never be reachable.
+        expect(snapshot.configuration.gitCompare?.moveSearchTruncated).toBe(false);
+    });
+
+    it('filters the grid to the changed rows and back', async () => {
+        // The compare window's "Only changed rows" toggle, end to end: the
+        // controller is the only place that knows which grid rows changed.
+        vscode_mock.__setReadFileImplementation(async (uri) =>
+            enc.encode(String(uri.fsPath ?? uri).includes('original')
+                ? 'h\na\nb\nc\n'
+                : 'h\na\nNEW\nb\nc\n'));
+        const panel = open_compare_table();
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThan(0));
+        const snapshot = posted(panel, 'workbookSnapshot')[0].snapshot as {
+            generation: number;
+            meta: { sheets: readonly Parameters<typeof transform_schema_for_sheet>[0][] };
+        };
+        const schema = transform_schema_for_sheet(snapshot.meta.sheets[0]);
+        const set_transform = async (onlyChangedRows: boolean, requestId: string) => {
+            await panel.__receive({
+                type: 'setTransform',
+                sheetIndex: 0,
+                requestId,
+                intent: 'apply',
+                sourceGeneration: snapshot.generation,
+                state: {
+                    sort: [],
+                    filters: [],
+                    onlyChangedRows,
+                    schema,
+                },
+            });
+            return await vi.waitFor(() => {
+                const install = posted(panel, 'transformInstalled')
+                    .find((message) => message.requestId === requestId);
+                expect(install).toBeDefined();
+                return install as Posted & {
+                    view: { rowCount: number; permuted: boolean };
+                    rules?: unknown;
+                };
+            });
+        };
+
+        // Four grid rows past the header; only the inserted one changed.
+        const on = await set_transform(true, 't1');
+        expect(on.view.permuted).toBe(true);
+        expect(on.view.rowCount).toBe(1);
+        // The ack has to say the filter is on. The renderer replaces its
+        // transform state with these rules and the toggle reads its position
+        // back off them, so an ack that omitted the field left the button
+        // showing "off" while the grid stayed filtered — every later click
+        // then asked to enable it again and nothing could turn it off.
+        expect((on.rules as { onlyChangedRows?: boolean } | undefined)?.onlyChangedRows)
+            .toBe(true);
+
+        const off = await set_transform(false, 't2');
+        expect(off.view.rowCount).toBe(4);
+        expect((off.rules as { onlyChangedRows?: boolean } | undefined)?.onlyChangedRows)
+            .toBeUndefined();
+    });
+
+    it('does not persist the changed-rows filter as saved view state', async () => {
+        // Session state of this comparison, not a saved view: persisted, a
+        // later plain open of the same file would come back filtered by a
+        // comparison it no longer has, with no control anywhere to clear it.
+        // The strip lives at the durable write in `persist_transform_commit`,
+        // and only there: the core and the renderer both need the field, since
+        // it is how the toggle knows it is on.
+        vscode_mock.__setReadFileImplementation(async (uri) =>
+            enc.encode(String(uri.fsPath ?? uri).includes('original')
+                ? 'h\na\nb\nc\n'
+                : 'h\na\nNEW\nb\nc\n'));
+        const { panel, state_store } = open_compare_controller();
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThan(0));
+        const snapshot = posted(panel, 'workbookSnapshot')[0].snapshot as {
+            generation: number;
+            meta: { sheets: readonly Parameters<typeof transform_schema_for_sheet>[0][] };
+        };
+        await panel.__receive({
+            type: 'setTransform',
+            sheetIndex: 0,
+            requestId: 'p1',
+            intent: 'apply',
+            sourceGeneration: snapshot.generation,
+            state: {
+                sort: [],
+                filters: [],
+                hiddenRows: [1],
+                onlyChangedRows: true,
+                schema: transform_schema_for_sheet(snapshot.meta.sheets[0]),
+            },
+        });
+        await vi.waitFor(() => expect(
+            posted(panel, 'transformInstalled').some((message) => message.requestId === 'p1'),
+        ).toBe(true));
+        const stored = await vi.waitFor(async () => {
+            const state = (await state_store.store.read('/tmp/compare.csv')).state as {
+                transforms?: ({ hiddenRows?: number[]; onlyChangedRows?: boolean } | undefined)[];
+            };
+            expect(state.transforms?.[0]).toBeDefined();
+            return state.transforms![0]!;
+        });
+        // The rest of the transform is genuinely saved view state and stays.
+        expect(stored.hiddenRows).toEqual([1]);
+        expect(stored.onlyChangedRows).toBeUndefined();
+    });
+
+    it('reports alignment progress before the snapshot exists', async () => {
+        const panel = open_compare_table();
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThan(0));
+        const reports = posted(panel, 'compareProgress') as unknown as {
+            scannedRows: number;
+            totalRows: number;
+        }[];
+        expect(reports.length).toBeGreaterThan(0);
+        // "Before" is the whole claim, so it is asserted by position rather
+        // than by the two message kinds merely both being present: a bar that
+        // only appears once the snapshot is ready has nothing left to report.
+        const types = (panel.__messages as { type: string }[]).map((message) => message.type);
+        expect(types.indexOf('compareProgress'))
+            .toBeLessThan(types.indexOf('workbookSnapshot'));
+        // Monotonic and bounded: a bar that goes backwards, or past its own
+        // total, reads as a bug in the comparison rather than in the readout.
+        let previous = 0;
+        for (const report of reports) {
+            expect(report.scannedRows).toBeGreaterThanOrEqual(previous);
+            expect(report.scannedRows).toBeLessThanOrEqual(report.totalRows);
+            previous = report.scannedRows;
+        }
+        // Both sides' rows are the work, and the last report accounts for all of it.
+        expect(reports[reports.length - 1].scannedRows)
+            .toBe(reports[reports.length - 1].totalRows);
+    });
+
+    it('closes the window when the alignment is cancelled, without a warning', async () => {
+        const close = vi.fn();
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const { panel } = open_compare_controller(
+            '/tmp/original.csv',
+            csv_table_profile(),
+            { requestClose: close },
+        );
+        await panel.__receive({ type: 'cancelCompare' });
+        expect(close).toHaveBeenCalledTimes(1);
+        // Cancelling is the user's own decision, not a comparison failure.
+        expect(warning).not.toHaveBeenCalled();
+    });
+
+    it('ignores a cancel from a window that is not comparing', async () => {
+        const close = vi.fn();
+        const panel = vscode_mock.window.createWebviewPanel('tableViewer.editor', 'table');
+        const controller = attach_viewer(
+            panel as unknown as Parameters<typeof attach_viewer>[0],
+            vscode_mock.Uri.file('/tmp/plain.csv') as unknown as vscode.Uri,
+            with_in_memory_authority_transactions(versioned_state_store().store),
+            csv_table_profile(),
+            fake_viewer_host,
+            { requestClose: close },
+        );
+        panel.onDidDispose(() => controller.dispose());
+        await panel.__receive({ type: 'cancelCompare' });
+        expect(close).not.toHaveBeenCalled();
     });
 
     it('degrades to a plain open with a warning when the original is unreadable', async () => {
@@ -254,6 +493,103 @@ describe('compare mode controller', () => {
             'Failed to close unused table source',
             { code: 'UNKNOWN' },
         );
+    });
+
+    it('stops an alignment a refresh has already superseded', async () => {
+        // Two alignments can be in flight over one window: a refresh replaces
+        // the load, and the original side has a watcher of its own. The stale
+        // one used to run to completion — on a large file that is real time
+        // spent on a result already thrown away, and its progress reports still
+        // reached the renderer, sending the one bar backwards.
+        const big_modified = `h\n${Array.from({ length: 30_000 }, (_, i) => `r${i}`).join('\n')}\n`;
+        const big_original = `h\n${Array.from({ length: 30_000 }, (_, i) => `q${i}`).join('\n')}\n`;
+        vscode_mock.__setStatImplementation(async (uri) =>
+            (String(uri.fsPath ?? uri).includes('original')
+                ? { size: big_original.length, mtime: 1 }
+                : { size: big_modified.length, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async (uri) =>
+            enc.encode(String(uri.fsPath ?? uri).includes('original')
+                ? big_original
+                : big_modified));
+
+        // Counting the aligner's own work, which is what "stops" has to mean.
+        // Progress messages cannot answer it: `onProgress` carries a supersede
+        // check of its own, so a stale alignment that runs to completion goes
+        // quiet either way and the count stays the same whether or not it
+        // actually stopped.
+        let reads_after_supersede = 0;
+        let counting = false;
+        let on_read: (() => void) | undefined;
+        const counting_profile: ViewerProfile = {
+            ...csv_table_profile(),
+            async build_source(raw, file_path, state, extra) {
+                const source = await csv_table_profile()
+                    .build_source(raw, file_path, state, extra);
+                return new Proxy(source, {
+                    get(target, property, receiver) {
+                        const value = Reflect.get(target, property, receiver);
+                        if (property !== 'read_rows' || typeof value !== 'function') return value;
+                        return (...args: unknown[]) => {
+                            on_read?.();
+                            if (counting) reads_after_supersede++;
+                            return (value as (...a: unknown[]) => unknown).apply(target, args);
+                        };
+                    },
+                });
+            },
+        };
+
+        const { controller, panel } = open_compare_controller(
+            '/tmp/original.csv',
+            counting_profile,
+        );
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot')).toHaveLength(1));
+
+        // A real change on the modified side — new bytes, new size, new mtime —
+        // so the refresh genuinely rebuilds and realigns rather than no-opping.
+        let revision = 2;
+        const revised = () => `${big_modified}extra${revision}\n`;
+        vscode_mock.__setStatImplementation(async (uri) =>
+            (String(uri.fsPath ?? uri).includes('original')
+                ? { size: big_original.length, mtime: 1 }
+                : { size: revised().length, mtime: revision }));
+        vscode_mock.__setReadFileImplementation(async (uri) =>
+            enc.encode(String(uri.fsPath ?? uri).includes('original')
+                ? big_original
+                : revised()));
+
+        // Supersede while the alignment is under way, then let both settle.
+        // "Under way" has to be observed, not assumed: `first` yields several
+        // times during source construction, so starting `second` straight after
+        // it can supersede a load that has not reached `align_workbook` at all,
+        // and the test would then pass on a build that only cancels before
+        // alignment begins. The first row read is that observation.
+        let first_read: () => void;
+        const alignment_started = new Promise<void>((resolve) => { first_read = resolve; });
+        on_read = () => first_read();
+        const first = controller.refresh_if_changed();
+        await alignment_started;
+        revision = 3;
+        const second = controller.refresh_if_changed();
+        counting = true;
+        await Promise.all([first, second]);
+        counting = false;
+        await vi.waitFor(() =>
+            expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThanOrEqual(2));
+
+        // One alignment's worth of reads after the supersede, not two. The
+        // superseded one roughly doubles it — 118 against 228 as measured —
+        // because it re-walks every row the live one is already walking. The
+        // bound sits between those and well clear of both; the counts are
+        // fixed by batch size and row count, not by timing.
+        expect(reads_after_supersede).toBeLessThan(170);
+
+        // Deliberately NOT asserted: that progress never goes backwards. It
+        // does, legitimately — the superseding load is a new alignment and its
+        // bar restarts from the first batch. Progress cannot answer this
+        // question in any case: `onProgress` fires only while hashing, and the
+        // phases a supersede cuts short report nothing at all.
     });
 
     it('degrades when the original cannot stabilize during validation', async () => {

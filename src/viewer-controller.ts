@@ -32,7 +32,8 @@ import {
     type ViewerHost,
 } from './host-ports';
 import { create_resource_identity, type ResourceUriLike } from './resource-identity';
-import { CompareDataSource } from './diff-compare/compare-session';
+import { CompareDataSource, align_workbook } from './diff-compare/compare-session';
+import { AlignmentCancelledError } from './diff-compare/row-alignment';
 import type { WorkbookSnapshotCompare } from './viewer-snapshot';
 import {
     assert_safe_file_size,
@@ -929,6 +930,13 @@ export function csv_table_profile(config?: ConfigPort): ViewerProfile {
     };
 }
 
+/** Whether two paths would take the same parser — the comparison `profile_for`
+ *  makes, without building anything. */
+function same_extension(left: string, right: string): boolean {
+    const extension = (path: string) => path.toLowerCase().slice(path.lastIndexOf('.'));
+    return extension(left) === extension(right);
+}
+
 /** Profile for a path, by extension: csv/tsv → editable table; else Excel viewer. */
 export function profile_for(file_path: string, config?: ConfigPort): ViewerProfile {
     const ext = file_path.toLowerCase();
@@ -969,6 +977,12 @@ export function attach_viewer(
      */
     const editing_supported = profile.editing && !compare_mode && !options.readOnly;
     let compare_unavailable_warned = false;
+    /**
+     * Set when the renderer asks to abandon a comparison that is still
+     * aligning. Alignment is what makes the diff correct, so there is nothing
+     * useful to show once it is abandoned — the request closes the window.
+     */
+    let compare_alignment_cancelled = false;
     const scheduler: ViewerControllerScheduler = options.scheduler ?? {
         setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
         clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
@@ -1200,8 +1214,8 @@ export function attach_viewer(
      * the exact window `rowData` carried — clamped and transform-projected — so
      * the diff describes the rows the renderer received, keyed by the same
      * display positions. `sourceRows` maps each display row back to the source
-     * row the positional diff is defined over; contiguous source runs are
-     * diffed in one page each.
+     * row the diff is defined over, so an arbitrarily transformed window is
+     * diffed in one batch.
      */
     function post_compare_diff(
         msg: Extract<WebviewMessage, { type: 'requestRows' }>,
@@ -1412,6 +1426,34 @@ export function attach_viewer(
         }
     })();
     disposables.push(refresh_subscription);
+
+    // The coordinator watches the file this panel is attached to, which in a
+    // comparison is only the modified side. The original is just as live —
+    // regenerate it and the window would otherwise keep showing a diff against
+    // bytes that no longer exist — so it gets a watcher of its own here.
+    // `refresh_if_changed` re-stats both sides and rebuilds only on a real
+    // change, so an event that turns out to be noise costs two stats.
+    if (compare_original_uri) {
+        try {
+            const original_watcher = host.refreshWatcherFactory.create(
+                create_resource_identity(compare_original_uri),
+            );
+            const listener = original_watcher.on_event(() => {
+                if (disposed) return;
+                void refresh_if_changed().catch(() => {});
+            });
+            disposables.push({
+                dispose() {
+                    listener.dispose();
+                    original_watcher.dispose();
+                },
+            });
+        } catch (error) {
+            // A missing watcher degrades the window to manual refresh; it must
+            // not take the comparison down with it.
+            log_sanitized_failure('Failed to watch the comparison original', error);
+        }
+    }
 
     function edit_phase(): CsvEditFilePhase {
         return file_edit_state?.phase ?? { type: 'free' };
@@ -3282,12 +3324,33 @@ export function attach_viewer(
                 snapshot.state,
                 sheets,
             );
-            const transforms = sheets.map((sheet, index) => sanitize_transform_state(
-                durable.transforms?.[index],
-                sheet.columnCount,
-                transform_schema_for_sheet(sheet),
-                sheet.sourceRowCount,
-            ));
+            const transforms = sheets.map((sheet, index) => {
+                const state = sanitize_transform_state(
+                    durable.transforms?.[index],
+                    sheet.columnCount,
+                    transform_schema_for_sheet(sheet),
+                    sheet.sourceRowCount,
+                );
+                // The compare window's changed-rows filter is session state and is
+                // stripped at the durable write, so it is absent from what was just
+                // read back. Reconciling against that alone un-installed the filter
+                // one generation after it installed — the commit that persisted it
+                // is what triggers this very reconciliation — so the rows sprang
+                // back and the toggle appeared to do nothing. Carried over from
+                // what this core actually has installed, which is the live answer.
+                if (
+                    reconciliation_core.installed_transform_state(index)
+                        ?.onlyChangedRows !== true
+                ) return state;
+                return {
+                    ...(state ?? {
+                        sort: [],
+                        filters: [],
+                        schema: transform_schema_for_sheet(sheet),
+                    }),
+                    onlyChangedRows: true as const,
+                };
+            });
             const prepared = await reconciliation_core.prepare_transform_reconciliation(
                 transforms,
                 () => !transform_authority_is_current(message, authority)
@@ -3361,13 +3424,16 @@ export function attach_viewer(
             }
 
             const transforms = [...(current.transforms ?? [])];
-            transforms[error.sheetIndex] = transform_has_entries(error.retainedState)
+            // Session state stops at the durable boundary here too; see the
+            // matching strip in `persist_transform_commit`.
+            const { onlyChangedRows: _retained_session, ...retained } = error.retainedState;
+            transforms[error.sheetIndex] = transform_has_entries(retained)
                 ? {
-                    ...error.retainedState,
-                    sort: error.retainedState.sort.map((key) => ({ ...key })),
-                    filters: error.retainedState.filters.map(clone_filter_entry),
-                    ...(error.retainedState.hiddenRows
-                        ? { hiddenRows: [...error.retainedState.hiddenRows] }
+                    ...retained,
+                    sort: retained.sort.map((key) => ({ ...key })),
+                    filters: retained.filters.map(clone_filter_entry),
+                    ...(retained.hiddenRows
+                        ? { hiddenRows: [...retained.hiddenRows] }
                         : {}),
                 }
                 : undefined;
@@ -3481,12 +3547,18 @@ export function attach_viewer(
                 return current;
             }
             const transforms = [...(current.transforms ?? [])];
-            transforms[message.sheetIndex] = transform_has_entries(state)
+            // `onlyChangedRows` is compare-session state and stops here. The
+            // renderer and the core both need it — it is how the toggle knows
+            // it is on — but persisted it would reopen a plain window filtered
+            // by a comparison it no longer has, with no control to clear it.
+            // This durable write is the one boundary it must not cross.
+            const { onlyChangedRows: _session_only, ...durable } = state;
+            transforms[message.sheetIndex] = transform_has_entries(durable)
                 ? {
-                    ...state,
-                    sort: state.sort.map((key) => ({ ...key })),
-                    filters: state.filters.map(clone_filter_entry),
-                    ...(state.hiddenRows ? { hiddenRows: [...state.hiddenRows] } : {}),
+                    ...durable,
+                    sort: durable.sort.map((key) => ({ ...key })),
+                    filters: durable.filters.map(clone_filter_entry),
+                    ...(durable.hiddenRows ? { hiddenRows: [...durable.hiddenRows] } : {}),
                 }
                 : undefined;
             return { ...current, transforms };
@@ -3537,10 +3609,19 @@ export function attach_viewer(
         {
             bypassFileSizeLimit = false,
             includeCompareOriginal = true,
+            load: load_request,
         }: {
             bypassFileSizeLimit?: boolean;
             includeCompareOriginal?: boolean;
-        } = {},
+            /**
+             * The load this build serves, so a superseded alignment can stop.
+             *
+             * Required, not optional: omitting it would silently opt that build
+             * out of supersede cancellation, which is the failure this
+             * parameter exists to prevent. Every caller has a request in hand.
+             */
+            load: Pick<PanelLoadRequest, 'seq' | 'refreshEvent'>;
+        },
     ): Promise<SourceCandidate> {
         const state = (await read_file_state()).state as PerFileState;
         const stat = await host.fs.stat(uri);
@@ -3552,6 +3633,9 @@ export function attach_viewer(
             fingerprint: `${stat.mtime}:${stat.size}`,
             digest: content_digest(raw),
         };
+        // Captured before any await, so it names the receiver this build began
+        // for rather than whichever one is current when progress is reported.
+        const receiver_epoch = session.current_receiver_epoch;
         // The original side builds concurrently with the modified parse; both
         // are independent reads of already-committed bytes.
         const original_promise = includeCompareOriginal
@@ -3576,7 +3660,50 @@ export function attach_viewer(
         let comparison_observation: Readonly<PhysicalSourceObservation> | undefined;
         if (original) {
             try {
-                adopted = new CompareDataSource(modified, original.source);
+                // Aligned before the source is built: comparing row N to row N
+                // reports an inserted or moved row as a screenful of changed
+                // cells, and the alignment fixes the row counts meta() reports,
+                // so it cannot be deferred until after construction.
+                adopted = new CompareDataSource(
+                    modified,
+                    original.source,
+                    await align_workbook(modified, original.source, {
+                        // Superseded counts as cancelled. A refresh replaces the
+                        // load this alignment is for, and the original side has a
+                        // watcher of its own, so two alignments can be in flight
+                        // over the same window; without this the outdated one runs
+                        // to completion on a large file for a result already thrown
+                        // away.
+                        isCancelled: () => compare_alignment_cancelled
+                            || disposed
+                            || !load_is_current(
+                                load_request.seq, load_request.refreshEvent),
+                        onProgress: (scannedRows, totalRows) => {
+                            // Superseded is checked here too, not left to
+                            // `isCancelled`: the aligner reports progress at the
+                            // top of a checkpoint and tests for cancellation at
+                            // the bottom, so an alignment superseded between
+                            // checkpoints gets one more report out first — into
+                            // the bar its replacement is now driving, which is
+                            // how a bar moves backwards. Narrow enough that no
+                            // test pins the interleaving; the cancel below is
+                            // what the regression test covers.
+                            if (!load_is_current(
+                                load_request.seq, load_request.refreshEvent)) return;
+                            // Epoch-gated so a webview that reloaded mid-align is
+                            // not driven by the bar of the load it replaced.
+                            // Defensive, and matching what every other epoch-aware
+                            // post here does: no test drives it, because a reload
+                            // supersedes the load as well and the cancel above
+                            // wins the race in practice.
+                            void post_to_receiver({
+                                type: 'compareProgress',
+                                scannedRows,
+                                totalRows,
+                            }, receiver_epoch);
+                        },
+                    }),
+                );
                 comparison_observation = original.observation;
             } catch (error) {
                 try {
@@ -3586,6 +3713,23 @@ export function attach_viewer(
                         'Failed to close unavailable comparison source',
                         close_error,
                     );
+                }
+                // A cancel is either the user's own decision — the window is on
+                // its way out — or a refresh superseding this load, and neither
+                // is a failure to report back. Nothing is adopted on this path
+                // either way, so the modified side has no other owner and is
+                // closed here, unlike an alignment *failure*, where it survives
+                // as the plain-file fallback.
+                if (error instanceof AlignmentCancelledError) {
+                    try {
+                        modified.close();
+                    } catch (close_error) {
+                        log_sanitized_failure(
+                            'Failed to close a cancelled comparison source',
+                            close_error,
+                        );
+                    }
+                    throw error;
                 }
                 warn_compare_unavailable(error);
             }
@@ -3624,12 +3768,23 @@ export function attach_viewer(
             assert_safe_file_size(stat.size, max_mib);
             const original_raw = await host.fs.read_file(compare_original_uri);
             assert_safe_file_size(original_raw.byteLength, max_mib);
+            const original_path = compare_original_uri.fsPath;
             // Mirror the modified side's row cap: uncapping only one side
             // would report every row beyond the other's cap as added/deleted.
+            // The window is attached for the modified file, so its profile
+            // parses the modified format. Feeding the original's bytes to it
+            // is right whenever the two share an extension — and that profile
+            // may be host-supplied (preview, git compare), so it is kept — but
+            // across formats it fed CSV bytes to the XLSX parser, and between
+            // .csv and .tsv split one side on the wrong delimiter. Those are
+            // exactly the pairings the Compare dialog offers.
+            const original_profile = same_extension(original_path, file_path)
+                ? profile
+                : profile_for(original_path, host.config);
             return {
-                source: await profile.build_source(
+                source: await original_profile.build_source(
                     original_raw,
-                    file_path,
+                    original_path,
                     state,
                     load_all_csv_rows ? { loadAllRows: true } : undefined,
                 ),
@@ -3655,6 +3810,17 @@ export function attach_viewer(
                 pairings: adopted.pairings,
                 sheetStatuses: adopted.sheetStatuses,
                 changedColumnNames: adopted.changedColumnNames,
+                ...(compare_original_uri
+                    ? {
+                        sides: {
+                            originalPath: compare_original_uri.fsPath,
+                            modifiedPath: file_path,
+                        },
+                    }
+                    : {}),
+                counts: adopted.change_counts(),
+                degraded: adopted.degraded,
+                moveSearchTruncated: adopted.moveSearchTruncated,
             },
         };
     }
@@ -3683,6 +3849,7 @@ export function attach_viewer(
                 type: 'candidate',
                 candidate: await build_source({
                     includeCompareOriginal: include_compare_original,
+                    load: request,
                 }),
             };
         } catch (error) {
@@ -3699,6 +3866,7 @@ export function attach_viewer(
                     candidate: await build_source({
                         bypassFileSizeLimit: true,
                         includeCompareOriginal: include_compare_original,
+                        load: request,
                     }),
                 };
             }
@@ -4758,6 +4926,15 @@ export function attach_viewer(
                 if (!load_is_current(request.seq, request.refreshEvent)) {
                     return inactive_refresh_result();
                 }
+                // The user cancelled the comparison, and the window is closing:
+                // retrying it, or reporting it as a load failure, would argue
+                // with a decision already made. A *superseded* alignment also
+                // throws this, but never reaches here — the currency check
+                // above returns first, leaving the retry to the newer load that
+                // superseded it.
+                if (error instanceof AlignmentCancelledError) {
+                    return { type: 'completed' };
+                }
                 last_error = error;
             } finally {
                 dispose_unadopted_candidate(candidate);
@@ -4902,6 +5079,7 @@ export function attach_viewer(
             return true;
         } catch (error) {
             if (!load_is_current(request.seq)) return false;
+            if (error instanceof AlignmentCancelledError) return false;
             if (!schedule_local_refresh_retry(
                 request,
                 force,
@@ -7065,6 +7243,12 @@ export function attach_viewer(
             case 'showWarning':
                 host.ui.show_warning(msg.message);
                 return;
+            case 'cancelCompare': {
+                if (!compare_mode || compare_alignment_cancelled) return;
+                compare_alignment_cancelled = true;
+                await options.requestClose?.();
+                return;
+            }
             case 'openExternal': {
                 // Authoritative validation: the webview also validates for UX,
                 // but a compromised or buggy renderer must not be able to hand

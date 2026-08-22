@@ -178,7 +178,35 @@ export interface GridDiffColors {
     diffDeletedFg: string;
     /** Text color for the "after" side of a Diff-mode cell. */
     diffAddedFg: string;
+    /** Band color for a row the compare aligner matched across a move. */
+    diffMovedFg: string;
 }
+
+/**
+ * Purple, and the compare window's own token rather than a theme variable.
+ *
+ * A purely-moved row has no changed cells, so its band is the *only* thing
+ * saying it moved — it has to be unmistakably neither added nor deleted.
+ * Measured as CIELAB distance from the added and deleted bands at
+ * COMPARE_BAND_ALPHA, with added-vs-deleted (11.3 dark / 11.5 light) as the
+ * bar for "legibly different", this scores 17.2 and 11.8.
+ *
+ * `gitDecoration.renamedResourceForeground` is the semantically exact variable
+ * and is wrong: VS Code's default for it is a *green* (#73C991), 5-ish from the
+ * added band, so a moved row would read as an added one. Amber
+ * (`modifiedResourceForeground`) fails for a structural reason rather than a
+ * fixable one — it sits between green and red on the hue circle, so every amber
+ * tried scored under 6 against its nearer neighbour in at least one mode.
+ * Purple is off that axis, and no gitDecoration key is purple. Costless here:
+ * GRID_THEME_VARIABLES emits no gitDecoration variables at all, so the desktop
+ * window already paints added and deleted from their fallbacks.
+ *
+ * Defined in styles.css as --tv-compare-moved and read back, the same way the
+ * font size is, so the strip's text and the grid's band resolve one value
+ * instead of three copies that can silently disagree. The literal here is the
+ * fallback for a host that has not applied the stylesheet.
+ */
+const DIFF_MOVED_FALLBACK = '#9333ea';
 
 /** Diff mode paints text, not tint, so these are the theme's foregrounds read
  *  verbatim — no alpha re-emission (same injected-getter shape as the tints,
@@ -195,6 +223,7 @@ export function build_diff_colors_from_vars(get: VarGetter): GridDiffColors {
             '--vscode-gitDecoration-addedResourceForeground',
             DIFF_FALLBACK_COLORS.added,
         ),
+        diffMovedFg: v('--tv-compare-moved', DIFF_MOVED_FALLBACK),
     };
 }
 

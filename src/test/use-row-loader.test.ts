@@ -818,6 +818,20 @@ describe('RowLoader', () => {
             return { loader, post };
         }
 
+        it('retains a moved status rather than dropping it as unknown', () => {
+            // The loader whitelists status strings, so a new one that is not
+            // added here is silently discarded and the band never paints.
+            const { loader, post } = loaded_loader();
+            expect(loader.on_compare_diff(compare_diff(
+                0,
+                last_request(post, 0).requestId,
+                ['moved', 'same'],
+                [],
+            ))).toBe(true);
+            expect(loader.get_compare_status(0)).toBe('moved');
+            expect(loader.get_compare_status(1)).toBeUndefined();
+        });
+
         it('answers row status and cell bases from an ingested sidecar', () => {
             const { loader, post } = loaded_loader();
             expect(loader.on_compare_diff(compare_diff(

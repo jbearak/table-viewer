@@ -19,6 +19,13 @@
     --tv-font-size-sm: calc(var(--tv-font-size) * 0.85);
     --tv-font-size-md: calc(var(--tv-font-size) * 0.92);
     --tv-font-size-lg: calc(var(--tv-font-size) * 1.08);
+    /* Single resolution point for the compare window's moved-row purple, read
+       back by src/webview/vscode-theme.ts so the DOM label and the canvas band
+       cannot drift apart. Purple because no gitDecoration variable is: the
+       semantically exact one (renamedResourceForeground) defaults to a green
+       too close to added, and amber sits between green and red on the hue
+       circle so it cannot clear both. See DIFF_MOVED_FALLBACK. */
+    --tv-compare-moved: #9333ea;
 }
 
 html, body, #root {
@@ -1650,4 +1657,153 @@ body.vscode-high-contrast-light .toolbar-split-caret.open {
 .hyperlink-dialog-hint {
     color: var(--vscode-errorForeground, #f48771);
     font-size: var(--tv-font-size-sm);
+}
+
+/* Compare window: what the comparison found, and the one control acting on it.
+   Above the sheet tabs, because the totals span the whole workbook. */
+.compare-strip {
+    flex-shrink: 0;
+    border-bottom: 1px solid var(--vscode-panel-border, #444);
+    background: var(--vscode-editorGroupHeader-tabsBackground, #252526);
+    font-size: var(--tv-font-size-md);
+}
+
+.compare-strip-degraded {
+    padding: 7px 10px;
+    line-height: 1.35;
+    background: var(--vscode-editorWarning-background, rgba(180, 120, 0, 0.1));
+    color: var(--vscode-editorWarning-foreground, var(--vscode-foreground, #ccc));
+    border-bottom: 1px solid var(--vscode-panel-border, #444);
+}
+
+.compare-strip-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 5px 10px;
+}
+
+/* Deliberately empty of palette: the button carries `.toggle` and takes the
+   toolbar's inactive, hover, active and disabled colours from it. This class
+   is only a hook for tests and for any compare-specific layout. */
+
+.compare-strip-counts {
+    margin-left: auto;
+    color: var(--vscode-descriptionForeground, #999);
+}
+
+.compare-strip-added {
+    color: var(--vscode-gitDecoration-addedResourceForeground, green);
+}
+
+.compare-strip-deleted {
+    color: var(--vscode-gitDecoration-deletedResourceForeground, red);
+}
+
+.compare-strip-moved {
+    color: var(--tv-compare-moved);
+}
+
+/* The compare window before it has any rows: alignment is what makes the diff
+   correct, so the grid does not exist yet and this is the whole window. */
+.compare-progress {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    height: 100%;
+    padding: 24px;
+    color: var(--vscode-foreground, #ccc);
+}
+
+.compare-progress-title {
+    font-size: 1.1em;
+}
+
+.compare-progress-track {
+    width: min(320px, 70%);
+    height: 6px;
+    border-radius: 3px;
+    overflow: hidden;
+    background: var(--vscode-editorWidget-border, #3a3d41);
+}
+
+.compare-progress-fill {
+    height: 100%;
+    background: var(--vscode-progressBar-background, #0e70c0);
+    transition: width 120ms linear;
+}
+
+.compare-progress-detail {
+    color: var(--vscode-descriptionForeground, #999);
+}
+
+.compare-progress-cancel {
+    font: inherit;
+    padding: 4px 14px;
+    border-radius: 4px;
+    border: 1px solid var(--vscode-input-border, #3c3c3c);
+    background: var(--vscode-button-secondaryBackground, #3a3d41);
+    color: var(--vscode-button-secondaryForeground, var(--vscode-foreground, #ccc));
+    cursor: pointer;
+}
+
+.compare-progress-cancel:hover {
+    background: var(--vscode-list-hoverBackground, #2a2d2e);
+}
+
+/* Which file is which. Above the counts row because it identifies the document
+   rather than describing the findings. */
+.compare-strip-sides {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 5px 10px;
+    border-bottom: 1px solid var(--vscode-editorWidget-border, #3c3c3c);
+    font-size: 0.95em;
+    min-width: 0;
+}
+
+.compare-strip-side {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    min-width: 0;
+}
+
+.compare-strip-side-mark {
+    font-weight: 600;
+}
+
+.compare-strip-side:first-child .compare-strip-side-mark {
+    color: var(--vscode-gitDecoration-deletedResourceForeground, #c74e39);
+}
+
+.compare-strip-side:nth-child(2) .compare-strip-side-mark {
+    color: var(--vscode-gitDecoration-addedResourceForeground, #587c0c);
+}
+
+.compare-strip-side-label {
+    font-weight: 600;
+}
+
+.compare-strip-side-path {
+    color: var(--vscode-descriptionForeground, #999);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    direction: rtl;
+    text-align: left;
+}
+
+/* Sits at the end of the counts row, which `.compare-strip-counts` has already
+   pushed right, so no auto margin of its own — two would split the slack and
+   strand the pill mid-row. */
+.compare-strip-readonly {
+    padding: 1px 8px;
+    border-radius: 10px;
+    border: 1px solid var(--vscode-input-border, #3c3c3c);
+    color: var(--vscode-descriptionForeground, #999);
+    white-space: nowrap;
 }

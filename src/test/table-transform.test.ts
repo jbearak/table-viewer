@@ -1382,3 +1382,97 @@ describe('table transforms', () => {
         })).rejects.toThrow('column index 10 out of range');
     });
 });
+
+// The compare window's "Only changed rows" filter. It rides the same row mask
+// as hidden rows so it composes with sorting and column filters rather than
+// standing up a second view.
+describe('compute_transform with onlyChangedRows', () => {
+    const source = (): Source => new Source([
+        [cell('a')],
+        [cell('b')],
+        [cell('c')],
+        [cell('d')],
+    ]);
+    const only_changed = (): SheetTransformState => ({
+        sort: [],
+        filters: [],
+        onlyChangedRows: true,
+    });
+
+    it('keeps the changed grid rows, in order', async () => {
+        const result = await compute_transform(
+            source(), 0, only_changed(), undefined, undefined, undefined, [1, 3],
+        );
+        expect(Array.from(result.indices ?? [])).toEqual([1, 3]);
+        expect(result.rowCount).toBe(2);
+    });
+
+    it('shows an empty grid when nothing changed, rather than everything', async () => {
+        const result = await compute_transform(
+            source(), 0, only_changed(), undefined, undefined, undefined, [],
+        );
+        expect(Array.from(result.indices ?? [])).toEqual([]);
+        expect(result.rowCount).toBe(0);
+    });
+
+    it('does nothing on a source that cannot say what changed', async () => {
+        // A non-compare source supplies no changed rows. Filtering to "changed"
+        // would then mean filtering to nothing, which would look like data loss.
+        const result = await compute_transform(source(), 0, only_changed());
+        expect(Array.from(result.indices ?? [])).toEqual([0, 1, 2, 3]);
+        expect(result.rowCount).toBe(4);
+    });
+
+    it('ignores the changed rows when the toggle is off', async () => {
+        const result = await compute_transform(
+            source(),
+            0,
+            { sort: [], filters: [] },
+            undefined,
+            undefined,
+            undefined,
+            [1, 3],
+        );
+        expect(result.indices).toBeUndefined();
+        expect(result.rowCount).toBe(4);
+    });
+
+    it('intersects with a column filter instead of replacing it', async () => {
+        const result = await compute_transform(
+            source(),
+            0,
+            { ...only_changed(), filters: [filter('equals', 'd')] },
+            undefined,
+            undefined,
+            undefined,
+            [1, 3],
+        );
+        expect(Array.from(result.indices ?? [])).toEqual([3]);
+    });
+
+    it('intersects with hidden rows', async () => {
+        const result = await compute_transform(
+            source(),
+            0,
+            { ...only_changed(), hiddenRows: [1] },
+            undefined,
+            undefined,
+            undefined,
+            [1, 3],
+        );
+        expect(Array.from(result.indices ?? [])).toEqual([3]);
+    });
+
+    it('sorts what it kept', async () => {
+        const result = await compute_transform(
+            source(),
+            0,
+            { ...only_changed(), sort: [{ colIndex: 0, direction: 'desc' }] },
+            undefined,
+            undefined,
+            undefined,
+            [0, 1, 2],
+        );
+        expect(Array.from(result.indices ?? [])).toEqual([2, 1, 0]);
+    });
+});

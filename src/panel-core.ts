@@ -4,6 +4,7 @@ import {
     read_source_row_indices,
 } from './data-source/interface';
 import { parse_cell_highlight_key } from './cell-highlights';
+import { CompareDataSource } from './diff-compare/compare-session';
 import { clamp_row_height } from './webview/row-heights';
 import { deep_clone_and_freeze } from './immutable';
 import { compute_column_histogram, type ColumnHistogram } from './histograms';
@@ -781,6 +782,22 @@ export class ViewerPanelCore {
         }
     }
 
+    /**
+     * The grid rows an `onlyChangedRows` transform keeps, or undefined when the
+     * request does not ask for one. Only a compare source can answer this, which
+     * is why the transform takes it as an argument rather than deriving it.
+     */
+    private changed_grid_rows(
+        sheet_index: number,
+        state: SheetTransformState,
+    ): readonly number[] | undefined {
+        if (!state.onlyChangedRows) return undefined;
+        const source = this.source;
+        return source instanceof CompareDataSource
+            ? source.changed_grid_rows(sheet_index)
+            : undefined;
+    }
+
     /** Prepare host-owned transform state without changing the installed view. */
     async prepare_transform_reconciliation(
         states: readonly (SheetTransformState | undefined)[],
@@ -810,6 +827,7 @@ export class ViewerPanelCore {
                         || is_cancelled(),
                     undefined,
                     this.transform_column_cache,
+                    this.changed_grid_rows(sheet_index, state),
                 );
             } catch (error) {
                 if (
@@ -1438,6 +1456,7 @@ export class ViewerPanelCore {
                 compute_is_cancelled,
                 undefined,
                 this.transform_column_cache,
+                this.changed_grid_rows(msg.sheetIndex, msg.state),
             );
             if (compute_is_cancelled()) return;
 
@@ -1688,6 +1707,7 @@ function clone_transform(state: SheetTransformState): SheetTransformState {
         filters: state.filters.map(clone_filter_entry),
     };
     if (state.hiddenRows) clone.hiddenRows = [...state.hiddenRows];
+    if (state.onlyChangedRows) clone.onlyChangedRows = true;
     if (state.schema !== undefined) clone.schema = state.schema;
     return clone;
 }
@@ -1749,11 +1769,14 @@ export function transform_states_equal(
         left.sort.length === 0
         && left.filters.length === 0
         && (left.hiddenRows?.length ?? 0) === 0
+        && left.onlyChangedRows !== true
         && right.sort.length === 0
         && right.filters.length === 0
         && (right.hiddenRows?.length ?? 0) === 0
+        && right.onlyChangedRows !== true
     ) return true;
     return left.schema === right.schema
+        && (left.onlyChangedRows === true) === (right.onlyChangedRows === true)
         && left.sort.length === right.sort.length
         && left.sort.every((key, index) => (
             key.colIndex === right.sort[index].colIndex
