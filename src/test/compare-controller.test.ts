@@ -200,7 +200,10 @@ describe('compare mode controller', () => {
                 const install = posted(panel, 'transformInstalled')
                     .find((message) => message.requestId === requestId);
                 expect(install).toBeDefined();
-                return install as Posted & { view: { rowCount: number; permuted: boolean } };
+                return install as Posted & {
+                    view: { rowCount: number; permuted: boolean };
+                    rules?: unknown;
+                };
             });
         };
 
@@ -208,17 +211,27 @@ describe('compare mode controller', () => {
         const on = await set_transform(true, 't1');
         expect(on.view.permuted).toBe(true);
         expect(on.view.rowCount).toBe(1);
+        // The ack has to say the filter is on. The renderer replaces its
+        // transform state with these rules and the toggle reads its position
+        // back off them, so an ack that omitted the field left the button
+        // showing "off" while the grid stayed filtered — every later click
+        // then asked to enable it again and nothing could turn it off.
+        expect((on.rules as { onlyChangedRows?: boolean } | undefined)?.onlyChangedRows)
+            .toBe(true);
 
         const off = await set_transform(false, 't2');
         expect(off.view.rowCount).toBe(4);
+        expect((off.rules as { onlyChangedRows?: boolean } | undefined)?.onlyChangedRows)
+            .toBeUndefined();
     });
 
     it('does not persist the changed-rows filter as saved view state', async () => {
         // Session state of this comparison, not a saved view: persisted, a
         // later plain open of the same file would come back filtered by a
         // comparison it no longer has, with no control anywhere to clear it.
-        // `clone_transform` is what drops it today; this guards the outcome
-        // end to end rather than that one function.
+        // The strip lives at the durable write in `persist_transform_commit`,
+        // and only there: the core and the renderer both need the field, since
+        // it is how the toggle knows it is on.
         vscode_mock.__setReadFileImplementation(async (uri) =>
             enc.encode(String(uri.fsPath ?? uri).includes('original')
                 ? 'h\na\nb\nc\n'

@@ -1701,17 +1701,13 @@ function mapping_change_moves_rows(
     return previous !== undefined || next !== undefined;
 }
 
-/** Field-by-field rather than a spread, and deliberately so: this is the value
- *  handed to the host's durable transform write, and `onlyChangedRows` is
- *  compare-session state that must not reach it. Persisted, it would reopen a
- *  plain window filtered by a comparison it no longer has, with no control
- *  anywhere to clear it. */
 function clone_transform(state: SheetTransformState): SheetTransformState {
     const clone: SheetTransformState = {
         sort: state.sort.map((key) => ({ ...key })),
         filters: state.filters.map(clone_filter_entry),
     };
     if (state.hiddenRows) clone.hiddenRows = [...state.hiddenRows];
+    if (state.onlyChangedRows) clone.onlyChangedRows = true;
     if (state.schema !== undefined) clone.schema = state.schema;
     return clone;
 }
@@ -1773,11 +1769,14 @@ export function transform_states_equal(
         left.sort.length === 0
         && left.filters.length === 0
         && (left.hiddenRows?.length ?? 0) === 0
+        && left.onlyChangedRows !== true
         && right.sort.length === 0
         && right.filters.length === 0
         && (right.hiddenRows?.length ?? 0) === 0
+        && right.onlyChangedRows !== true
     ) return true;
     return left.schema === right.schema
+        && (left.onlyChangedRows === true) === (right.onlyChangedRows === true)
         && left.sort.length === right.sort.length
         && left.sort.every((key, index) => (
             key.colIndex === right.sort[index].colIndex

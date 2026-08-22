@@ -3375,13 +3375,16 @@ export function attach_viewer(
             }
 
             const transforms = [...(current.transforms ?? [])];
-            transforms[error.sheetIndex] = transform_has_entries(error.retainedState)
+            // Session state stops at the durable boundary here too; see the
+            // matching strip in `persist_transform_commit`.
+            const { onlyChangedRows: _retained_session, ...retained } = error.retainedState;
+            transforms[error.sheetIndex] = transform_has_entries(retained)
                 ? {
-                    ...error.retainedState,
-                    sort: error.retainedState.sort.map((key) => ({ ...key })),
-                    filters: error.retainedState.filters.map(clone_filter_entry),
-                    ...(error.retainedState.hiddenRows
-                        ? { hiddenRows: [...error.retainedState.hiddenRows] }
+                    ...retained,
+                    sort: retained.sort.map((key) => ({ ...key })),
+                    filters: retained.filters.map(clone_filter_entry),
+                    ...(retained.hiddenRows
+                        ? { hiddenRows: [...retained.hiddenRows] }
                         : {}),
                 }
                 : undefined;
@@ -3495,12 +3498,18 @@ export function attach_viewer(
                 return current;
             }
             const transforms = [...(current.transforms ?? [])];
-            transforms[message.sheetIndex] = transform_has_entries(state)
+            // `onlyChangedRows` is compare-session state and stops here. The
+            // renderer and the core both need it — it is how the toggle knows
+            // it is on — but persisted it would reopen a plain window filtered
+            // by a comparison it no longer has, with no control to clear it.
+            // This durable write is the one boundary it must not cross.
+            const { onlyChangedRows: _session_only, ...durable } = state;
+            transforms[message.sheetIndex] = transform_has_entries(durable)
                 ? {
-                    ...state,
-                    sort: state.sort.map((key) => ({ ...key })),
-                    filters: state.filters.map(clone_filter_entry),
-                    ...(state.hiddenRows ? { hiddenRows: [...state.hiddenRows] } : {}),
+                    ...durable,
+                    sort: durable.sort.map((key) => ({ ...key })),
+                    filters: durable.filters.map(clone_filter_entry),
+                    ...(durable.hiddenRows ? { hiddenRows: [...durable.hiddenRows] } : {}),
                 }
                 : undefined;
             return { ...current, transforms };
