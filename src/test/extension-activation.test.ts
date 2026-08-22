@@ -113,6 +113,7 @@ import {
     table_diff_document_uri,
     table_diff_document_uris,
     table_diff_uris,
+    table_diff_uris_from_unordered_pair,
     table_diff_working_tree_uri,
 } from '../table-diff-uris';
 
@@ -121,6 +122,19 @@ function git_uri(path: string, ref: string): vscode.Uri {
         scheme: 'git',
         query: JSON.stringify({ path, ref }),
     }) as unknown as vscode.Uri;
+}
+
+function set_git_merge_base(
+    get_merge_base: (first: string, second: string) => Promise<string | undefined>,
+): void {
+    vscode_mock.__setExtension('vscode.git', {
+        isActive: true,
+        exports: {
+            getAPI: () => ({
+                getRepository: () => ({ getMergeBase: get_merge_base }),
+            }),
+        },
+    });
 }
 
 function context(): vscode.ExtensionContext {
@@ -182,6 +196,95 @@ describe('table_diff_uris', () => {
         expect(table_diff_uris(staged_original, staged_modified)).toEqual({
             original: staged_original,
             modified: staged_modified,
+        });
+    });
+
+    it.each(['csv', 'TSV', 'xls', 'XLSX'])(
+        'recognizes a Source Control Graph %s commit diff',
+        (extension) => {
+            const file_path = `/repo/tables/data.${extension}`;
+            const original = git_uri(file_path, 'a'.repeat(40));
+            const modified = git_uri(file_path, 'b'.repeat(40));
+
+            expect(table_diff_uris(original, modified)).toEqual({ original, modified });
+        },
+    );
+
+    it('orients uppercase Git revisions from a canonical merge base in both orders', async () => {
+        const file_path = '/repo/data.csv';
+        const ancestor = 'A'.repeat(40);
+        const descendant = 'C'.repeat(40);
+        const get_merge_base = vi.fn(async () => ancestor.toLowerCase());
+        set_git_merge_base(get_merge_base);
+        const original = git_uri(file_path, ancestor);
+        const modified = git_uri(file_path, descendant);
+
+        await expect(Promise.all([
+            table_diff_uris_from_unordered_pair(original, modified),
+            table_diff_uris_from_unordered_pair(modified, original),
+        ])).resolves.toEqual([
+            { original, modified },
+            { original, modified },
+        ]);
+        expect(get_merge_base).toHaveBeenNthCalledWith(1, ancestor, descendant);
+        expect(get_merge_base).toHaveBeenNthCalledWith(2, descendant, ancestor);
+    });
+
+    it('leaves diverged Source Control Graph revisions unoriented in both orders', async () => {
+        const file_path = '/repo/data.csv';
+        const common_ancestor = 'a'.repeat(40);
+        const left = git_uri(file_path, 'b'.repeat(40));
+        const right = git_uri(file_path, 'c'.repeat(40));
+        set_git_merge_base(async () => common_ancestor);
+
+        await expect(Promise.all([
+            table_diff_uris_from_unordered_pair(left, right),
+            table_diff_uris_from_unordered_pair(right, left),
+        ])).resolves.toEqual([undefined, undefined]);
+    });
+
+    it('rejects non-object and mismatched Git history revisions', () => {
+        const file_path = '/repo/data.csv';
+        const parent = 'a'.repeat(40);
+        const commit = 'b'.repeat(40);
+        const original = git_uri(file_path, parent);
+        const modified = git_uri(file_path, commit);
+
+        expect(table_diff_uris(git_uri(file_path, parent.slice(0, 7)), modified))
+            .toBeUndefined();
+        expect(table_diff_uris(git_uri(file_path, 'HEAD'), modified)).toBeUndefined();
+        expect(table_diff_uris(original, git_uri(file_path, parent))).toBeUndefined();
+        expect(table_diff_uris(
+            original,
+            git_uri('/repo/other.csv', commit).with({ path: file_path }) as vscode.Uri,
+        )).toBeUndefined();
+        expect(table_diff_uris(
+            original.with({
+                query: JSON.stringify({ path: '/repo/other.csv', ref: parent }),
+            }) as vscode.Uri,
+            modified,
+        )).toBeUndefined();
+    });
+
+    it('round-trips Source Control Graph revisions and derives the working-tree file', () => {
+        const diff = {
+            original: git_uri('/repo/nested/data.csv', 'c'.repeat(40)),
+            modified: git_uri('/repo/nested/data.csv', 'd'.repeat(40)),
+        };
+
+        const document = table_diff_document_uri(diff);
+        const decoded = table_diff_document_uris(document);
+
+        expect(decoded).toMatchObject({
+            original: expect.objectContaining({ scheme: 'git' }),
+            modified: expect.objectContaining({ scheme: 'git' }),
+        });
+        expect(table_diff_document_uri(decoded!).toString()).toBe(document.toString());
+        expect(table_diff_working_tree_uri(decoded!)).toMatchObject({
+            scheme: 'file',
+            path: '/repo/nested/data.csv',
+            query: '',
+            fragment: '',
         });
     });
 
@@ -436,6 +539,11 @@ describe('VS Code activation', () => {
             name: 'staged',
             original: git_uri('/repo/data.csv', 'HEAD'),
             modified: git_uri('/repo/data.csv', ''),
+        },
+        {
+            name: 'Source Control Graph history',
+            original: git_uri('/repo/data.csv', 'd'.repeat(40)),
+            modified: git_uri('/repo/data.csv', 'e'.repeat(40)),
         },
     ])('replaces a native $name diff tab with one Table Viewer comparison', async ({
         original,

@@ -8,6 +8,7 @@ import {
     table_diff_document_uri,
     table_diff_document_uris,
     table_diff_uris,
+    table_diff_uris_from_unordered_pair,
     table_diff_working_tree_uri,
     type TableDiffUris,
 } from './table-diff-uris';
@@ -248,7 +249,7 @@ export class TableViewerEditorProvider
         );
     }
 
-    #observe_native_diff(uri: vscode.Uri, panel: vscode.WebviewPanel): void {
+    async #observe_native_diff(uri: vscode.Uri, panel: vscode.WebviewPanel): Promise<void> {
         const replace = this.options.replaceNativeDiff;
         const group = panel.viewColumn === undefined
             ? undefined
@@ -261,8 +262,17 @@ export class TableViewerEditorProvider
 
         const prior = this.#native_diff_candidates.get(tab);
         if (prior && prior.panel !== panel) {
-            const diff = table_diff_uris(prior.uri, uri) ?? table_diff_uris(uri, prior.uri);
-            if (diff) {
+            const input = tab.input;
+            const explicit = input instanceof vscode.TabInputTextDiff
+                ? table_diff_uris(input.original, input.modified)
+                : undefined;
+            const diff = explicit
+                ?? await table_diff_uris_from_unordered_pair(prior.uri, uri);
+            if (
+                diff
+                && this.#native_diff_candidates.get(tab) === prior
+                && this.#tab_is_open(tab)
+            ) {
                 this.#native_diff_candidates.delete(tab);
                 replace(tab, diff);
                 return;
@@ -298,7 +308,7 @@ export class TableViewerEditorProvider
         if (document.diff) {
             this.#compare_documents.set(controller, document.uri.toString());
         } else {
-            this.#observe_native_diff(source_uri, webview_panel);
+            await this.#observe_native_diff(source_uri, webview_panel);
         }
     }
 

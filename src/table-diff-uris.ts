@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 
 export const TABLE_DIFF_SCHEME = 'table-viewer-diff';
 export const TABLE_FILE_EXTENSION_PATTERN = /\.(csv|tsv|xlsx|xls)$/iu;
+const GIT_OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu;
 
 interface GitUriQuery {
     readonly path: string;
@@ -53,12 +54,61 @@ export function table_diff_uris(
     }
     const modified_query = git_uri_query(modified);
     if (
+        original_query
+        && modified_query
+        && GIT_OBJECT_ID_PATTERN.test(original_query.ref)
+        && GIT_OBJECT_ID_PATTERN.test(modified_query.ref)
+        && original_query.ref !== modified_query.ref
+        && same_git_resource(original_query, modified)
+        && same_git_resource(modified_query, modified)
+    ) {
+        return { original, modified };
+    }
+    if (
         original_query?.ref === 'HEAD'
         && modified_query?.ref === ''
         && same_git_resource(original_query, modified)
         && same_git_resource(modified_query, modified)
     ) {
         return { original, modified };
+    }
+    return undefined;
+}
+
+/** Orient two child resources from an opaque native diff. Most SCM pairs are
+ * directional by shape; two history revisions require the repository's ancestry
+ * metadata because either URI order is otherwise syntactically valid. */
+export async function table_diff_uris_from_unordered_pair(
+    first: vscode.Uri,
+    second: vscode.Uri,
+): Promise<TableDiffUris | undefined> {
+    const forward = table_diff_uris(first, second);
+    const reverse = table_diff_uris(second, first);
+    if (!forward || !reverse) return forward ?? reverse;
+
+    const first_query = git_uri_query(first);
+    const second_query = git_uri_query(second);
+    if (!first_query || !second_query) return undefined;
+    try {
+        const extension = vscode.extensions.getExtension<{
+            getAPI(version: 1): {
+                getRepository(uri: vscode.Uri): {
+                    getMergeBase(ref1: string, ref2: string): Promise<string | undefined>;
+                } | null;
+            };
+        }>('vscode.git');
+        if (!extension) return undefined;
+        const exports = extension.isActive ? extension.exports : await extension.activate();
+        const repository = exports.getAPI(1).getRepository(vscode.Uri.file(first_query.path));
+        if (!repository) return undefined;
+        const common_ancestor = (await repository.getMergeBase(
+            first_query.ref,
+            second_query.ref,
+        ))?.toLowerCase();
+        if (common_ancestor === first_query.ref.toLowerCase()) return forward;
+        if (common_ancestor === second_query.ref.toLowerCase()) return reverse;
+    } catch {
+        // Keep the native diff when repository metadata is unavailable.
     }
     return undefined;
 }
