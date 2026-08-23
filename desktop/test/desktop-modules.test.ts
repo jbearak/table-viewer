@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import yaml from 'js-yaml';
 import {
     DEFAULT_SETTINGS,
     DesktopConfigStore,
@@ -98,10 +99,99 @@ describe('portable Windows file associations', () => {
             'utf8',
         );
         const installed_associations = [...installer.matchAll(
-            /TV_REGISTER_TYPE "([^"]+)"\s+"[^"]+"\s+"([^"]+)"/g,
-        )].map((match) => ({ extension: match[1], description: match[2] }));
+            /TV_REGISTER_TYPE "([^"]+)"\s+"([^"]+)"/g,
+        )].map((match) => ({
+            extension: match[1],
+            prog_id: `TableViewer.${match[1]}`,
+            description: match[2],
+        }));
+        const expected_associations = WINDOWS_FILE_ASSOCIATIONS.map(
+            ({ extension, description }) => ({
+                extension,
+                prog_id: `TableViewer.${extension}`,
+                description,
+            }),
+        );
 
-        expect(installed_associations).toEqual(WINDOWS_FILE_ASSOCIATIONS);
+        expect(installed_associations).toEqual(expected_associations);
+        const uninstalled_associations = [...installer.matchAll(
+            /TV_UNREGISTER_TYPE "([^"]+)"/g,
+        )].map((match) => ({
+            extension: match[1],
+            prog_id: `TableViewer.${match[1]}`,
+        }));
+        expect(uninstalled_associations).toEqual(installed_associations.map(
+            ({ extension, prog_id }) => ({ extension, prog_id }),
+        ));
+    });
+
+    it('keeps macOS associations consistent with the desktop format registry', () => {
+        const config = yaml.load(fs.readFileSync(
+            path.join(__dirname, '..', 'electron-builder.yml'),
+            'utf8',
+        )) as {
+            mac?: { fileAssociations?: Array<{
+                ext: string;
+                description: string;
+                role: string;
+                rank: string;
+            }> };
+        };
+        const expected_roles: Record<string, string> = {
+            csv: 'Editor',
+            tsv: 'Editor',
+            xlsx: 'Viewer',
+            xls: 'Viewer',
+            dta: 'Viewer',
+        };
+        const expected_associations = Object.fromEntries(
+            WINDOWS_FILE_ASSOCIATIONS.map(({ extension, description }) => [
+                extension,
+                { description, role: expected_roles[extension], rank: 'Alternate' },
+            ]),
+        );
+        const associations = config.mac?.fileAssociations ?? [];
+        const mac_associations = Object.fromEntries(associations.map(
+            ({ ext, description, role, rank }) => [
+                ext,
+                { description, role, rank },
+            ],
+        ));
+
+        expect(associations).toHaveLength(WINDOWS_FILE_ASSOCIATIONS.length);
+        expect(mac_associations).toEqual(expected_associations);
+    });
+
+    it('keeps desktop and VS Code supported formats consistent', () => {
+        const manifest = JSON.parse(fs.readFileSync(
+            path.join(__dirname, '..', '..', 'package.json'),
+            'utf8',
+        )) as {
+            contributes?: { customEditors?: Array<{
+                selector?: Array<{ filenamePattern?: string }>;
+            }> };
+        };
+        const selector = manifest.contributes?.customEditors?.[0]?.selector?.[0]
+            ?.filenamePattern ?? '';
+        const extensions = selector
+            .replace(/^\*\.\{|\}$/gu, '')
+            .split(',')
+            .map((extension) => extension.replace(
+                /\[(.)(.)\]/gu,
+                (_, lower: string) => lower,
+            ));
+
+        expect(new Set(extensions)).toEqual(new Set(SUPPORTED_FILE_EXTENSIONS));
+    });
+
+    it('keeps the Preferences file-size hint consistent with supported formats', () => {
+        const preferences = fs.readFileSync(
+            path.join(__dirname, '..', 'renderer', 'prefs.html'),
+            'utf8',
+        );
+        const hint = preferences.match(/Larger files \(([^)]+)\) require confirmation/)?.[1];
+
+        expect(new Set(hint?.split(', '))).toEqual(new Set(SUPPORTED_FILE_EXTENSIONS));
     });
 
     it('attempts every write and reports a partial registration failure', async () => {

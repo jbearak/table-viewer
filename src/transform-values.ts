@@ -9,6 +9,14 @@ export function raw_value(cell: RenderedCell | null | undefined): string | null 
         : raw;
 }
 
+export function stata_missing_rank(value: string): number | undefined {
+    if (value.charCodeAt(0) !== 46) return undefined; // '.'
+    if (value.length === 1) return 0;
+    if (value.length !== 2) return undefined;
+    const tag = value.charCodeAt(1) - 96;
+    return tag >= 1 && tag <= 26 ? tag : undefined;
+}
+
 export function canonical_numeric_string(value: string): boolean {
     if (value.trim() !== value) return false;
     if (!/^[+-]?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(value)) {
@@ -29,7 +37,9 @@ export function cell_can_be_numeric(
     if (raw === null || cell?.rawType === 'boolean' || cell?.rawType === 'date') {
         return false;
     }
-    if (cell?.rawType === 'number') return Number.isFinite(Number(raw));
+    if (cell?.rawType === 'number') {
+        return Number.isFinite(Number(raw)) || stata_missing_rank(raw) !== undefined;
+    }
     // CSV marks every cell as string; still treat pure canonical number text
     // as numeric, matching acquire_transform_column.
     return canonical_numeric_string(raw);

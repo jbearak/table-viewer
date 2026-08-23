@@ -126,6 +126,22 @@ describe('compute_column_histogram', () => {
         expect(histogram.bins.reduce((total, bin) => total + bin.count, 0)).toBe(2);
     });
 
+    it('keeps Stata missing tags in numeric columns without binning them', async () => {
+        const histogram = await compute_column_histogram(
+            new HistogramSource([
+                { raw: '1', rawType: 'number' },
+                { raw: '.a', rawType: 'number' },
+                { raw: '2', rawType: 'number' },
+            ]),
+            0,
+            0,
+            () => false,
+        );
+        expect(histogram.columnKind).toBe('numeric');
+        expect(histogram.bins.reduce((total, bin) => total + bin.count, 0)).toBe(2);
+        expect(histogram.distinctValues).toEqual(['1', '.a', '2']);
+    });
+
     it('classifies mixed numeric/text and leading-zero identifiers as text', async () => {
         await expect(compute_column_histogram(
             new HistogramSource(['02139', '10001']), 0, 0, () => false,

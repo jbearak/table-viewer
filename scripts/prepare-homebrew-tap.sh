@@ -22,6 +22,8 @@ VERSION="${VERSION#v}"
   || { echo "ERROR: dmg filename does not match version $VERSION: $(basename "$DMG")" >&2; exit 1; }
 git -C "$TAP_DIR" rev-parse --is-inside-work-tree >/dev/null
 
+# Update mode intentionally changes only release metadata. Keep descriptive
+# cask fields in the checked-out tap synchronized with .github/homebrew-tap.
 MODE=update
 if [[ ! -f "$TAP_DIR/Casks/table-viewer.rb" ]]; then
   # The known pre-seed repository contains only its placeholder README. Refuse

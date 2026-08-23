@@ -143,9 +143,9 @@ describe('dialog_state', () => {
         expect(state.warning).not.toMatch(/single sheet/u);
     });
 
-    it('does not warn about csv against tsv beyond the format note', () => {
-        // Both are single-sheet delimited files, so the sheet caveat is wrong.
-        const state = dialog_state(ok('/a.csv', 'csv'), ok('/b.tsv', 'tsv'));
-        expect(state.warning).not.toMatch(/single sheet/u);
+    it('does not warn about pairs of single-table formats beyond the format note', () => {
+        // Neither side can have unmatched worksheets, so the sheet caveat is wrong.
+        expect(dialog_state(ok('/a.csv', 'csv'), ok('/b.tsv', 'tsv')).warning)
+            .not.toMatch(/single sheet/u);
     });
 });
