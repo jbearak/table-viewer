@@ -68,6 +68,23 @@ export const CHANNEL_TITLEBAR_ACTIVE_CHANGED = 'tableViewer:titlebarActiveChange
 /** Welcome (launcher) window channels. */
 export const CHANNEL_WELCOME_OPEN_FILES = 'welcome:openFiles';
 export const CHANNEL_WELCOME_OPEN_PREFERENCES = 'welcome:openPreferences';
+/** Renderer → main: show the Compare Files dialog, sourced at this launcher so
+ *  it can step aside once the comparison is up — the same courtesy Open… gets. */
+export const CHANNEL_WELCOME_OPEN_COMPARE = 'welcome:openCompare';
+/** Renderer → main: open these dropped paths. Separate from
+ *  `CHANNEL_WELCOME_OPEN_FILES`, which asks for a picker rather than naming
+ *  anything; a drop already knows its paths and must not raise a dialog. */
+export const CHANNEL_WELCOME_OPEN_DROPPED = 'welcome:openDropped';
+/** Renderer → main: reopen one Recent entry. */
+export const CHANNEL_WELCOME_OPEN_RECENT = 'welcome:openRecent';
+/** Renderer → main: forget the Recent list. */
+export const CHANNEL_WELCOME_CLEAR_RECENT = 'welcome:clearRecent';
+/** Renderer → main: the displayable Recent rows, freshly filtered. */
+export const CHANNEL_WELCOME_GET_RECENT = 'welcome:getRecent';
+/** Main → every launcher: the Recent list changed. Pushed rather than polled
+ *  because a file opened from *this* launcher lands in a viewer window, and any
+ *  other launcher still on screen would otherwise show a stale list. */
+export const CHANNEL_WELCOME_RECENT_CHANGED = 'welcome:recentChanged';
 
 /** Preferences window channels. */
 export type PreferencesTarget = Extract<
