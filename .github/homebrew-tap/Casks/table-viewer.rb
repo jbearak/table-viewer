@@ -7,7 +7,7 @@ cask "table-viewer" do
   url "https://github.com/jbearak/table-viewer/releases/download/v#{version}/table-viewer-#{version}-arm64.dmg",
       verified: "github.com/jbearak/table-viewer/"
   name "Table Viewer"
-  desc "Fast viewer for Excel, CSV and TSV files"
+  desc "Read, edit, and diff Excel, CSV, and TSV tables"
   homepage "https://github.com/jbearak/table-viewer"
 
   livecheck do

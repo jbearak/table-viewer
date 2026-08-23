@@ -1,7 +1,7 @@
 # homebrew-table-viewer
 
 Homebrew tap for the standalone [Table Viewer](https://github.com/jbearak/table-viewer)
-macOS app, a fast viewer for Excel, CSV and TSV files.
+macOS app for reading, editing, and diffing Excel, CSV, and TSV tables.
 
 ## Install
 
