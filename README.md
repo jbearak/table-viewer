@@ -1,6 +1,8 @@
 # Table Viewer
 
-Read, edit, and diff Excel, CSV, and TSV tables. Table Viewer supports editing modern Excel (`.xlsx`), `.csv`, and `.tsv` files, plus read-only viewing and diffing of legacy Excel (`.xls`) workbooks. It is built for reviewing, exploring, comparing, and annotating tables. Available as a standalone desktop app and a VS Code extension.
+Read, edit, and diff Excel, CSV, and TSV tables.
+
+Table Viewer supports editing modern Excel (`.xlsx`), `.csv`, and `.tsv` files, plus read-only viewing and diffing of legacy Excel (`.xls`) workbooks. It is built for reviewing, exploring, comparing, and annotating tables. Available as a standalone desktop app and a VS Code extension.
 
 What you do while reviewing a table — sorting, filtering, hiding columns, resizing, highlighting cells — is stored alongside the file rather than inside it, so the file on disk is untouched and your sorts, filters, and highlights are still there the next time you open it, even if the file was regenerated in the meantime. Table Viewer also reloads on its own when the file changes on disk. Cell contents change only when you enter edit mode and save.
 
