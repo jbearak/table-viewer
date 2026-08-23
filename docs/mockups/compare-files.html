@@ -4,8 +4,8 @@
 :root{
   --bg:#ffffff; --bgAlt:#f3f3f3; --bgElev:#ffffff; --fg:#3b3b3b; --muted:#717171;
   --subtle:#a0a0a0; --border:#cecece; --accent:#005fb8; --accentFg:#ffffff;
-  --hover:#e8e8e8; --added:#587c0c; --deleted:#ad0707;
-  --addedBand:rgba(88,124,12,.12); --deletedBand:rgba(173,7,7,.12);
+  --hover:#e8e8e8; --added:#587c0c; --deleted:#ad0707; --moved:#9333ea;
+  --addedBand:rgba(88,124,12,.12); --deletedBand:rgba(173,7,7,.12); --movedBand:rgba(147,51,234,.12);
   --font:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
 }
 body{margin:0;padding:32px;background:#e9ecef;font-family:var(--font);font-size:13px;color:var(--fg)}
@@ -52,7 +52,7 @@ button:disabled{opacity:.45}
 .tog{border:1px solid var(--border);border-radius:5px;padding:3px 9px;background:#fafafa}
 .tog.on{background:var(--accent);color:#fff;border-color:var(--accent)}
 .counts{margin-left:auto;color:var(--muted)}
-.counts b.a{color:var(--added)}.counts b.d{color:var(--deleted)}
+.counts b.a{color:var(--added)}.counts b.d{color:var(--deleted)}.counts b.m{color:var(--moved)}
 .scan{display:flex;align-items:center;gap:8px;color:var(--muted)}
 .bar{width:120px;height:5px;border-radius:3px;background:var(--hover);overflow:hidden}
 .bar i{display:block;height:100%;width:46%;background:var(--accent)}
@@ -64,6 +64,7 @@ th.chg{box-shadow:inset 0 -2px 0 var(--accent)}
 td.rn{background:var(--bgAlt);color:var(--muted);text-align:right;font-family:var(--font)}
 tr.add td{background:var(--addedBand)}
 tr.del td{background:var(--deletedBand);text-decoration:line-through;color:var(--deleted)}
+tr.mov td{background:var(--movedBand)}
 tr.add td.rn::after{content:'+';color:var(--added);float:left;font-weight:700}
 tr.del td.rn::after{content:'−';color:var(--deleted);float:left;font-weight:700}
 del{color:var(--deleted);text-decoration:line-through;margin-right:5px}
@@ -116,10 +117,10 @@ ins{color:var(--added);text-decoration:none;font-weight:600}
   <div class="tb"><div class="lights"><i class="l1"></i><i class="l2"></i><i class="l3"></i></div><div class="ttl">Compare Files</div></div>
   <div class="body">
     <div class="field"><label>Original</label>
-      <div class="row"><input type="text" value="~/Reports/2025-Q3/quarterly.xlsx"><button>Browse…</button></div></div>
+      <div class="row"><input type="text" value="~/Recipes/spring/garden-recipes.xlsx"><button>Browse…</button></div></div>
     <div class="swap"><button>⇅&nbsp; Swap</button></div>
     <div class="field" style="margin-bottom:0"><label>Modified</label>
-      <div class="row"><input type="text" value="~/Reports/2025-Q4/quarterly.xlsx"><button>Browse…</button></div></div>
+      <div class="row"><input type="text" value="~/Recipes/summer/garden-recipes.xlsx"><button>Browse…</button></div></div>
   </div>
   <div class="foot"><button>Cancel</button><button class="primary">Compare</button></div>
 </div>
@@ -149,43 +150,43 @@ ins{color:var(--added);text-decoration:none;font-weight:600}
 </div>
 
 <h2>4 · The compare window</h2>
-<p class="cap">One grid, not two panes — the unified view the existing engine already produces. Title is <code>old ↔ new</code>. A header strip names both sides with the diff colors they own; a Read-only pill states why nothing is editable. Deleted rows keep the original's content, struck through; changed cells show <del>before</del> <ins>after</ins>; changed column headers get an accent underline; sheet tabs carry added/deleted badges.</p>
+<p class="cap">One grid, not two panes — the unified view the existing engine already produces. Title is <code>old ↔ new</code>. A header strip names both sides with the diff colors they own; a Read-only pill states why nothing is editable. Deleted rows keep the original's content, struck through; added rows are green; moved rows are purple; changed cells show <del>before</del> <ins>after</ins>; changed column headers get an accent underline.</p>
 <div class="frame" style="width:880px">
-  <div class="tb"><div class="lights"><i class="l1"></i><i class="l2"></i><i class="l3"></i></div><div class="ttl">quarterly.xlsx (Q3) ↔ quarterly.xlsx (Q4)</div></div>
+  <div class="tb"><div class="lights"><i class="l1"></i><i class="l2"></i><i class="l3"></i></div><div class="ttl">garden-recipes.xlsx (spring) ↔ garden-recipes.xlsx (summer)</div></div>
   <div class="strip">
-    <span class="pill o">− Original</span><span class="path">~/Reports/2025-Q3/quarterly.xlsx</span>
-    <span class="pill m" style="margin-left:14px">+ Modified</span><span class="path">~/Reports/2025-Q4/quarterly.xlsx</span>
+    <span class="pill o">− Original</span><span class="path">~/Recipes/spring/garden-recipes.xlsx</span>
+    <span class="pill m" style="margin-left:14px">+ Modified</span><span class="path">~/Recipes/summer/garden-recipes.xlsx</span>
     <span class="ro">🔒 Read-only</span>
   </div>
   <div class="tools">
     <span class="tog">Only changed rows</span><span class="tog">Formatted values</span>
-    <span class="counts"><b class="a">+12 added</b> · <b class="d">−4 deleted</b> · 37 changed cells</span>
+    <span class="counts"><b class="a">+1 row added</b> · <b class="d">−1 row deleted</b> · <b class="m">1 row moved</b> · 2 changed cells</span>
   </div>
   <table>
-    <tr><th style="width:36px"></th><th>Region</th><th>Product</th><th class="chg">Net revenue</th><th>Units</th><th>Owner</th></tr>
-    <tr><td class="rn">1</td><td>North</td><td>Widget A</td><td><del>142,300</del> <ins>151,900</ins></td><td>1,204</td><td>Ada L.</td></tr>
-    <tr><td class="rn">2</td><td>North</td><td>Widget B</td><td>88,750</td><td>612</td><td>Ada L.</td></tr>
-    <tr class="del"><td class="rn">3</td><td>South</td><td>Widget C</td><td>31,020</td><td>288</td><td>Grace H.</td></tr>
-    <tr class="add"><td class="rn">4</td><td>South</td><td>Widget C2</td><td>44,610</td><td>331</td><td>Grace H.</td></tr>
-    <tr class="add"><td class="rn">5</td><td>South</td><td>Widget D</td><td>19,880</td><td>147</td><td>Grace H.</td></tr>
-    <tr><td class="rn">6</td><td>East</td><td>Widget A</td><td><del>97,400</del> <ins>97,410</ins></td><td><del>803</del> <ins>804</ins></td><td>Alan T.</td></tr>
-    <tr><td class="rn">7</td><td>West</td><td>Widget B</td><td>120,065</td><td>975</td><td>Alan T.</td></tr>
+    <tr><th style="width:36px"></th><th>Recipe</th><th>Main produce</th><th class="chg">Prep time</th><th class="chg">Serves</th><th>Season</th></tr>
+    <tr><td class="rn">1</td><td>Strawberry Spinach Salad</td><td>Strawberry, spinach</td><td><del>15 min</del> <ins>12 min</ins></td><td>4</td><td>Spring</td></tr>
+    <tr class="mov"><td class="rn">2</td><td>Roasted Tomato Soup</td><td>Tomato, basil</td><td>45 min</td><td>6</td><td>Summer</td></tr>
+    <tr><td class="rn">3</td><td>Peach Caprese</td><td>Peach, tomato</td><td>20 min</td><td>4</td><td>Summer</td></tr>
+    <tr class="del"><td class="rn">4</td><td>Apple Fennel Slaw</td><td>Apple, fennel</td><td>25 min</td><td>6</td><td>Autumn</td></tr>
+    <tr class="add"><td class="rn">5</td><td>Carrot Mango Slaw</td><td>Carrot, mango</td><td>20 min</td><td>6</td><td>Summer</td></tr>
+    <tr><td class="rn">6</td><td>Zucchini Corn Fritters</td><td>Zucchini, corn</td><td>35 min</td><td><del>4</del> <ins>6</ins></td><td>Summer</td></tr>
+    <tr><td class="rn">7</td><td>Blueberry Beet Salad</td><td>Blueberry, beet</td><td>30 min</td><td>4</td><td>Summer</td></tr>
   </table>
   <div class="tabs">
-    <div class="tab sel">Summary</div>
-    <div class="tab">Detail</div>
-    <div class="tab">Forecast <span class="badge a">added</span></div>
-    <div class="tab">Archive <span class="badge d">deleted</span></div>
+    <div class="tab sel">Recipes</div>
+    <div class="tab">Ingredients</div>
+    <div class="tab">Desserts <span class="badge a">added</span></div>
+    <div class="tab">Winter <span class="badge d">deleted</span></div>
   </div>
 </div>
 
 <h2>5 · Aligning, before any rows are shown</h2>
 <p class="cap">The alignment pass is not an optimisation — it is what makes the diff correct. Comparing row&nbsp;N to row&nbsp;N (what the Git path does today) reports every row below an inserted one as changed, so no rows are shown until the two sides have been aligned. The window opens immediately into this state, with a Cancel that closes it.</p>
 <div class="frame" style="width:880px">
-  <div class="tb"><div class="lights"><i class="l1"></i><i class="l2"></i><i class="l3"></i></div><div class="ttl">quarterly.xlsx (Q3) ↔ quarterly.xlsx (Q4)</div></div>
+  <div class="tb"><div class="lights"><i class="l1"></i><i class="l2"></i><i class="l3"></i></div><div class="ttl">garden-recipes.xlsx (spring) ↔ garden-recipes.xlsx (summer)</div></div>
   <div class="strip">
-    <span class="pill o">− Original</span><span class="path">~/Reports/2025-Q3/quarterly.xlsx</span>
-    <span class="pill m" style="margin-left:14px">+ Modified</span><span class="path">~/Reports/2025-Q4/quarterly.xlsx</span>
+    <span class="pill o">− Original</span><span class="path">~/Recipes/spring/garden-recipes.xlsx</span>
+    <span class="pill m" style="margin-left:14px">+ Modified</span><span class="path">~/Recipes/summer/garden-recipes.xlsx</span>
     <span class="ro">🔒 Read-only</span>
   </div>
   <div style="height:300px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px">
@@ -215,19 +216,19 @@ ins{color:var(--added);text-decoration:none;font-weight:600}
 <h2>7 · Only changed rows, on</h2>
 <p class="cap">Unchanged rows drop out; the original row numbers are kept so a row stays findable in the real file, and a gap marker states what was skipped. Same grid, same paint rules — this is a filter over the diff, expressed through the transform layer the viewer already uses for sorts and filters.</p>
 <div class="frame" style="width:880px">
-  <div class="tb"><div class="lights"><i class="l1"></i><i class="l2"></i><i class="l3"></i></div><div class="ttl">quarterly.xlsx (Q3) ↔ quarterly.xlsx (Q4)</div></div>
+  <div class="tb"><div class="lights"><i class="l1"></i><i class="l2"></i><i class="l3"></i></div><div class="ttl">garden-recipes.xlsx (spring) ↔ garden-recipes.xlsx (summer)</div></div>
   <div class="tools">
     <span class="tog on">Only changed rows</span><span class="tog">Formatted values</span>
-    <span class="counts"><b class="a">+12 added</b> · <b class="d">−4 deleted</b> · 37 changed cells</span>
+    <span class="counts"><b class="a">+1 row added</b> · <b class="d">−1 row deleted</b> · <b class="m">1 row moved</b> · 2 changed cells</span>
   </div>
   <table>
-    <tr><th style="width:36px"></th><th>Region</th><th>Product</th><th class="chg">Net revenue</th><th>Units</th><th>Owner</th></tr>
-    <tr><td class="rn">1</td><td>North</td><td>Widget A</td><td><del>142,300</del> <ins>151,900</ins></td><td>1,204</td><td>Ada L.</td></tr>
+    <tr><th style="width:36px"></th><th>Recipe</th><th>Main produce</th><th class="chg">Prep time</th><th class="chg">Serves</th><th>Season</th></tr>
+    <tr><td class="rn">1</td><td>Strawberry Spinach Salad</td><td>Strawberry, spinach</td><td><del>15 min</del> <ins>12 min</ins></td><td>4</td><td>Spring</td></tr>
+    <tr class="mov"><td class="rn">2</td><td>Roasted Tomato Soup</td><td>Tomato, basil</td><td>45 min</td><td>6</td><td>Summer</td></tr>
     <tr><td colspan="6" style="background:var(--bgAlt);color:var(--muted);font-family:var(--font);text-align:center">1 unchanged row hidden</td></tr>
-    <tr class="del"><td class="rn">3</td><td>South</td><td>Widget C</td><td>31,020</td><td>288</td><td>Grace H.</td></tr>
-    <tr class="add"><td class="rn">4</td><td>South</td><td>Widget C2</td><td>44,610</td><td>331</td><td>Grace H.</td></tr>
-    <tr class="add"><td class="rn">5</td><td>South</td><td>Widget D</td><td>19,880</td><td>147</td><td>Grace H.</td></tr>
-    <tr><td class="rn">6</td><td>East</td><td>Widget A</td><td><del>97,400</del> <ins>97,410</ins></td><td><del>803</del> <ins>804</ins></td><td>Alan T.</td></tr>
+    <tr class="del"><td class="rn">4</td><td>Apple Fennel Slaw</td><td>Apple, fennel</td><td>25 min</td><td>6</td><td>Autumn</td></tr>
+    <tr class="add"><td class="rn">5</td><td>Carrot Mango Slaw</td><td>Carrot, mango</td><td>20 min</td><td>6</td><td>Summer</td></tr>
+    <tr><td class="rn">6</td><td>Zucchini Corn Fritters</td><td>Zucchini, corn</td><td>35 min</td><td><del>4</del> <ins>6</ins></td><td>Summer</td></tr>
     <tr><td colspan="6" style="background:var(--bgAlt);color:var(--muted);font-family:var(--font);text-align:center">1 unchanged row hidden</td></tr>
   </table>
 </div>
