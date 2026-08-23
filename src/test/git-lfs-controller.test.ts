@@ -308,6 +308,28 @@ describe('a working-tree file that is an LFS pointer', () => {
         });
     });
 
+    it('still delivers when the download succeeds but the reload cannot', async () => {
+        // The download really did finish, so the banner must stop saying
+        // "Downloading…" even though what should have replaced it will not
+        // load. Only a delivered snapshot clears that flag in the webview, so
+        // falling out of the handler silently leaves a spinner forever.
+        serve('file');
+        const panel = open_table();
+        await panel.__receive({ type: 'ready' });
+        await latest_lfs(panel, (value) => value !== undefined);
+        fake_git_lfs.pull_outcomes.push({ type: 'resolved' });
+        // Real bytes on disk now, but the file has grown past what the panel
+        // will open — the rebuild fails outright rather than being superseded.
+        serve('none');
+        vscode_mock.__setStatImplementation(async () => ({
+            size: 4096 * 1024 * 1024,
+            mtime: 9,
+        }));
+        const before = snapshots(panel).length;
+        await panel.__receive({ type: 'resolveLfsObject' });
+        await vi.waitFor(() => expect(snapshots(panel).length).toBeGreaterThan(before));
+    });
+
     it('ignores a resolve request when nothing is unresolved', async () => {
         const panel = open_table();
         await panel.__receive({ type: 'ready' });
@@ -401,6 +423,7 @@ describe('a comparison with a pointer on both sides', () => {
             { type: 'resolved', content: enc.encode(RESOLVED_CSV) },
             { type: 'resolved', content: enc.encode(RESOLVED_OTHER_CSV) },
         );
+        const before = snapshots(panel).length;
         await panel.__receive({ type: 'resolveLfsObject' });
         await latest_lfs(panel, (value) => value === undefined);
         // Both objects fetched, and each by its own oid — one click.
@@ -412,6 +435,14 @@ describe('a comparison with a pointer on both sides', () => {
             // comparison, not just a populated grid.
             expect(latest.configuration.gitCompare).toBeDefined();
         });
+        // And one delivery, too: nothing between the click and the comparison
+        // mentions a pointer. The modified side used to be fetched, the panel
+        // rebuilt to discover the second pointer, and that rebuild delivered —
+        // so the window flashed through an undiffed file carrying a second
+        // Download button on the way to the comparison the user asked for.
+        for (const snapshot of snapshots(panel).slice(before)) {
+            expect(snapshot.configuration.unresolvedLfs).toBeUndefined();
+        }
     });
 
     it('stops at the side that fails rather than looping', async () => {
