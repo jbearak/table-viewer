@@ -1,6 +1,8 @@
 # Table Viewer
 
-Read, edit, and diff Excel, CSV, and TSV tables. Table Viewer supports editing modern Excel (`.xlsx`), `.csv`, and `.tsv` files, plus read-only viewing and diffing of legacy Excel (`.xls`) workbooks. It is built for reviewing, exploring, comparing, and annotating tables. Available as a standalone desktop app and a VS Code extension.
+Read, edit, and diff Excel, CSV, and TSV tables.
+
+Table Viewer supports editing modern Excel (`.xlsx`), `.csv`, and `.tsv` files, plus read-only viewing and diffing of legacy Excel (`.xls`) workbooks. It is built for reviewing, exploring, comparing, and annotating tables. Available as a standalone desktop app and a VS Code extension.
 
 What you do while reviewing a table — sorting, filtering, hiding columns, resizing, highlighting cells — is stored alongside the file rather than inside it, so the file on disk is untouched and your sorts, filters, and highlights are still there the next time you open it, even if the file was regenerated in the meantime. Table Viewer also reloads on its own when the file changes on disk. Cell contents change only when you enter edit mode and save.
 
@@ -20,20 +22,20 @@ It also removes other friction from reading tables:
 - **You can't easily control how files open.** Typeface, font size, colors — Table Viewer lets you set all of these in Preferences once, and every sheet you ever open respects them, so files are legible the moment they open.
 - **Formatting can obscure the value you're auditing.** Switch between the workbook's formatted display and the underlying raw cell values without changing the workbook.
 - **Overflowing cells mean resizing rows and columns**, often in ways that make the table awkward. Table Viewer shows the full displayed value in a tooltip on hover.
-- **Highlighting a cell takes a trip through formatting menus.** Here you right-click a cell and pick a color. Highlights are annotations, not formatting: they survive saves, reloads, and file replacement without modifying the file.
+- **Highlighting a cell takes a trip through formatting menus.** Here you right-click a cell and pick a color. Highlights are annotations, not formatting: they survive saves, reloads, and file replacement.
 - **Many-sheet workbooks are painful**: when tabs overflow Excel's bottom bar you can't even scroll — you click left/right buttons to expose tabs. Table Viewer's sheet tabs scroll, and can be laid out vertically.
 - **Remote files must be downloaded first.** As a VS Code extension, Table Viewer works the same over SSH as locally, and uses your editor's theme and font.
+- **Diffing a spreadsheet in Git shows you a wall of text.** Click a changed `.xlsx`, `.csv`, or `.tsv` file in VS Code's Source Control or Timeline view and Table Viewer opens the comparison as a table: added and deleted rows banded, changed cells showing before and after in place. The desktop app also compares any two files.
 - **Comparing a Git LFS file shows you the pointer, not the table.** An LFS-tracked file is stored in Git as a small pointer naming the real object, so the version you want to compare against is often not on your machine at all. Table Viewer recognizes the pointer on either side of a comparison and offers to download the object.
-- **Diffing a spreadsheet in Git shows you a wall of text, or nothing at all.** Click a changed `.xlsx`, `.csv`, or `.tsv` file in VS Code's Source Control or Timeline view and Table Viewer opens the comparison as a table: added and deleted rows banded, changed cells showing before and after in place. The desktop app also compares any two files.
 
-The flip side is that Table Viewer is deliberately *not* a full spreadsheet editor. You can't create files or sheets, add cells beyond the file's existing bounds, or change formatting. Editing `.xlsx`, CSV, and TSV files is limited to the cells the file already has; legacy `.xls` workbooks are read-only. That constraint is the point: you can hand it any output file and explore it freely, knowing the file will only change if you explicitly edit and save it.
+The flip side is that Table Viewer is deliberately *not* a full spreadsheet editor. You can't create files or sheets, add cells beyond the file's existing bounds, or change formatting. Editing `.xlsx`, CSV, and TSV files is limited to the cells the file already has; legacy `.xls` workbooks are read-only. That constraint is intentional: you can hand it any output file and explore it freely, knowing the file will only change if you explicitly edit and save it.
 
 ## Features
 
 **Viewing**
 - Opens `.xlsx`, `.xls`, `.csv`, and `.tsv` files
 - Multi-sheet workbooks with horizontal or vertical tab orientation
-- Merged cells with correct colspan/rowspan rendering
+- Merged cells with colspan/rowspan rendering
 - `.xlsx` rich-text runs and whole-cell bold, italic, underline, and strikethrough styling
 - `.xlsx` hyperlinks, with destination information on hover and open/copy actions for external links
 - Conservatively detects Excel column-name rows, with remembered per-sheet controls for promoting the first non-hidden row or a chosen row, including column names inherited from simple two-row vertical merges
@@ -51,7 +53,7 @@ The flip side is that Table Viewer is deliberately *not* a full spreadsheet edit
 - Select contiguous or discontiguous rows by their row numbers, then drag a selected row boundary to resize them together
 - Select multiple columns to resize them together or auto-fit the selection
 - Use the searchable **Columns** menu to show, hide, restore, or hide all columns
-- Column visibility and sizing are persisted per file and sheet across VS Code sessions
+- Column visibility and sizing are persisted per file and sheet
 
 **Formatting toggle**
 - Switch between formatted and raw cell values with one click
@@ -74,7 +76,7 @@ The flip side is that Table Viewer is deliberately *not* a full spreadsheet edit
 
 **Selection and copy**
 - Click, drag, or shift-click to select cells
-- Arrow keys and `h`/`j`/`k`/`l` to navigate
+- Arrow keys, and, outside Edit mode, `h`/`j`/`k`/`l` to navigate
 - `Ctrl+C` / `Cmd+C` to copy selected cells as tab-separated text
 - Right-click context menus for copying, selecting or hiding rows and columns, and choosing an Excel row as the header
 
@@ -126,7 +128,9 @@ The flip side is that Table Viewer is deliberately *not* a full spreadsheet edit
 
 In the desktop app, choose **File → Compare Files…** and select an original (before) file and a modified (after) file. The comparison is read-only and neither file is changed.
 
-In VS Code, click a changed Excel, CSV, or TSV file in the Source Control or Timeline view and Table Viewer opens the comparison as a table.
+In VS Code, click a changed Excel, CSV, or TSV file in the Source Control or Timeline view and Table Viewer opens the comparison.
+
+Added rows are banded in green, deleted rows in red, and moved rows in purple. Within a changed row, each changed cell shows its original value in red and the new value in green. The green and red follow your theme's Git decoration colors, so they match the added and deleted files in the Source Control view.
 
 ## Usage
 

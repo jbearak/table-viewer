@@ -2,6 +2,16 @@
   "name": "table-viewer",
   "displayName": "Table Viewer",
   "description": "Read, edit, and diff Excel, CSV, and TSV tables",
+  "keywords": [
+    "excel",
+    "xlsx",
+    "csv",
+    "tsv",
+    "spreadsheet",
+    "diff",
+    "compare",
+    "git"
+  ],
   "version": "0.15.0",
   "publisher": "jbearak",
   "icon": "media/icon-128.png",
