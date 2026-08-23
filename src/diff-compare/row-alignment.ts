@@ -11,7 +11,7 @@ import {
     type DataSource,
     type SheetMeta,
 } from '../data-source/interface';
-import { get_raw_cell_text } from '../cell-display';
+import { get_cell_comparison_text } from '../cell-display';
 import type { SheetPairing } from './compare-source';
 
 /** Absent from one side. Exactly one of a row's indexes may be this. */
@@ -182,7 +182,7 @@ function hash_row(cells: readonly ({ raw: string | null } | null)[]): number {
     };
     mix(cells.length);
     for (let index = 0; index < cells.length; index++) {
-        const text = get_raw_cell_text(cells[index]?.raw ?? null);
+        const text = get_cell_comparison_text(cells[index]);
         mix(text.length);
         for (let position = 0; position < text.length; position++) {
             mix(text.charCodeAt(position));
@@ -720,8 +720,8 @@ async function count_changes(
             let row_changed = false;
             for (let col = 0; col < column_count; col++) {
                 if (
-                    get_raw_cell_text(original_row[col]?.raw ?? null)
-                    !== get_raw_cell_text(modified_row[col]?.raw ?? null)
+                    get_cell_comparison_text(original_row[col])
+                    !== get_cell_comparison_text(modified_row[col])
                 ) {
                     changed_cells++;
                     row_changed = true;
@@ -772,7 +772,7 @@ function normalize_candidate(
     const texts: string[] = [];
     let length = 0;
     for (let col = 0; col < column_count; col++) {
-        const text = get_raw_cell_text(cells?.[col]?.raw ?? null);
+        const text = get_cell_comparison_text(cells?.[col]);
         texts.push(text);
         length += text.length;
     }

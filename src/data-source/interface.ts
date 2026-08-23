@@ -14,9 +14,11 @@ export interface RenderedCell extends RichCellFields, XlsxCellFormatFields {
     italic: boolean;
     /** Original scalar category retained for correct numeric sorting. */
     rawType?: 'string' | 'number' | 'boolean' | 'date' | 'empty';
+    /** Internal identity used by comparisons when display-safe `raw` is lossy. */
+    comparisonKey?: string;
 }
 
-export type RawCell = Pick<RenderedCell, 'raw' | 'rawType'>;
+export type RawCell = Pick<RenderedCell, 'raw' | 'rawType' | 'comparisonKey'>;
 
 export interface RowWindow {
     startRow: number;                 // 0-based, absolute

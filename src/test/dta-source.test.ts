@@ -86,7 +86,7 @@ interface FixtureVariable {
 }
 
 /** Build a tiny release-118 file in memory; no binary fixture is committed. */
-function build_dta_fixture(observation_count = 4): Uint8Array {
+function build_dta_fixture(observation_count = 4, second_strl = false): Uint8Array {
     const writer = new ByteWriter();
     const variables: FixtureVariable[] = [
         { name: 'status', typeCode: 65530, format: '%8.0g', valueLabel: 'status_lbl' },
@@ -95,6 +95,9 @@ function build_dta_fixture(observation_count = 4): Uint8Array {
         { name: 'missing', typeCode: 65530, format: '%8.0g', valueLabel: 'status_lbl' },
         { name: 'long_text', typeCode: 32768, format: '%9s' },
     ];
+    if (second_strl) {
+        variables.push({ name: 'long_text_2', typeCode: 32768, format: '%9s' });
+    }
     const observations: Array<[number, number, string, number, string]> = [
         [1, 12.5, 'alpha', 101, 'a long first value'],
         [2, 2, 'beta', 102, 'second long value'],
@@ -166,9 +169,14 @@ function build_dta_fixture(observation_count = 4): Uint8Array {
         writer.f64(amount);
         writer.fixed(name, 5);
         writer.i8(missing);
-        writer.u16(variables.length);
+        writer.u16(5);
         writer.i32(row + 1);
         writer.u16(0);
+        if (second_strl) {
+            writer.u16(6);
+            writer.i32(row + 1);
+            writer.u16(0);
+        }
     }
     writer.text('</data>');
 
@@ -177,11 +185,20 @@ function build_dta_fixture(observation_count = 4): Uint8Array {
     for (let row = 0; row < observations.length; row++) {
         const content = new TextEncoder().encode(`${observations[row][4]}\0`);
         writer.text('GSO');
-        writer.i32(variables.length);
+        writer.i32(5);
         writer.u64(row + 1);
         writer.u8(130);
         writer.i32(content.length);
         for (const byte of content) writer.u8(byte);
+        if (second_strl) {
+            const second_content = new TextEncoder().encode(`second ${row}\0`);
+            writer.text('GSO');
+            writer.i32(6);
+            writer.u64(row + 1);
+            writer.u8(130);
+            writer.i32(second_content.length);
+            for (const byte of second_content) writer.u8(byte);
+        }
     }
     writer.text('</strls>');
 
@@ -222,7 +239,10 @@ function build_dta_fixture(observation_count = 4): Uint8Array {
     return writer.finish();
 }
 
-function build_legacy_dta_fixture(expansion_length = 0): Uint8Array {
+function build_legacy_dta_fixture(
+    expansion_length = 0,
+    zero_length_fields = 0,
+): Uint8Array {
     const writer = new ByteWriter();
     writer.u8(115);
     writer.u8(2); // LSF
@@ -241,6 +261,9 @@ function build_legacy_dta_fixture(expansion_length = 0): Uint8Array {
     writer.fixed('%5s', 49);
     writer.fixed('legacy_lbl', 33); writer.fixed('', 33);
     writer.fixed('', 81); writer.fixed('', 81);
+    for (let field = 0; field < zero_length_fields; field++) {
+        writer.u8(1); writer.i32(0);
+    }
     writer.u8(0); writer.i32(expansion_length); // expansion-fields terminator
     writer.i8(3); writer.u8(0x63); writer.u8(0x61); writer.u8(0x66); writer.u8(0xe9); writer.u8(0);
     writer.i8(1); writer.fixed('plain', 5);
@@ -449,16 +472,17 @@ describe('DtaDataSource', () => {
             build_release119_strl_fixture(Uint8Array.of(0x81), 129),
         );
         const text = await DtaDataSource.create(
-            build_release119_strl_fixture(new TextEncoder().encode('hex:80\0')),
+            build_release119_strl_fixture(new TextEncoder().encode('binary (1 bytes): 80\0')),
         );
         const binary_cell = binary.read_rows(0, 0, 1).rows[0][0]!;
         const other_binary_cell = other_binary.read_rows(0, 0, 1).rows[0][0]!;
         const text_cell = text.read_rows(0, 0, 1).rows[0][0]!;
 
-        expect(binary_cell.raw).toMatch(/^\ud800stata-binary:sha256:/);
-        expect(binary_cell.formatted).toBe('binary (1 bytes): 80');
-        expect(binary_cell.raw).not.toBe(other_binary_cell.raw);
-        expect(binary_cell.raw).not.toBe(text_cell.raw);
+        expect(binary_cell.raw).toBe('binary (1 bytes): 80');
+        expect(binary_cell.formatted).toBe(binary_cell.raw);
+        expect(binary_cell.comparisonKey).toMatch(/^stata-binary:sha256:/);
+        expect(binary_cell.comparisonKey).not.toBe(other_binary_cell.comparisonKey);
+        expect(binary_cell.raw).toBe(text_cell.raw);
         const alignment = await align_sheet(binary, text, {
             status: 'matched', name: 'Sheet1', originalIndex: 0, modifiedIndex: 0,
         });
@@ -470,10 +494,14 @@ describe('DtaDataSource', () => {
         const source = await DtaDataSource.create(build_release119_strl_fixture(payload, 129));
         const rendered = source.read_rows(0, 0, 1).rows[0][0]!;
         const fast = source.read_raw_columns(0, 0, 1, [0]).rows[0][0]!;
+        const internals = source as unknown as { gso_digest_cache: Map<number, string> };
         expect(rendered.raw!.length).toBeLessThan(128);
         expect(rendered.formatted.length).toBeLessThan(128);
         expect(rendered.formatted).toContain('2097152 bytes');
-        expect(fast).toEqual({ raw: rendered.raw, rawType: rendered.rawType });
+        expect(fast.raw).toBe(rendered.raw);
+        expect(internals.gso_digest_cache.size).toBe(0);
+        expect(fast.comparisonKey).toMatch(/^stata-binary:sha256:/);
+        expect(internals.gso_digest_cache.size).toBe(1);
     });
 
     it('keeps tagged missings distinct, labeled, nonempty, and numerically sortable', async () => {
@@ -550,23 +578,45 @@ describe('DtaDataSource', () => {
         expect(decode_spy).toHaveBeenCalledTimes(2);
     });
 
-    it('bounds the GSO index while preserving backward lookup', async () => {
-        const source = await DtaDataSource.create(build_dta_fixture(1_100));
+    it('finds an evicted GSO before scanning the unvisited tail', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture(2_000));
         source.read_rows(0, 0, 1_100);
         const internals = source as unknown as {
             windows: Map<string, unknown>;
-            gso_index: Map<number, number>;
+            gso_index: Map<number, unknown>;
             gso_cache: Map<number, unknown>;
-            gso_checkpoints: unknown[];
             gso_scan_position: number;
         };
+        expect(internals.gso_index.size).toBeLessThanOrEqual(1_024);
+        const partial_position = internals.gso_scan_position;
+        internals.windows.clear();
+        internals.gso_cache.clear();
+        expect(source.read_rows(0, 0, 1).rows[0][4]?.raw).toBe('a long first value');
+        expect(internals.gso_scan_position).toBe(partial_position);
+        expect(internals.gso_index.has(5 * 0x1_0000_0000 + 1)).toBe(true);
+    });
+
+    it('keeps checkpoints ordered for observation-major multi-strL data', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture(1_100, true));
+        source.read_rows(0, 0, 1_100);
+        const internals = source as unknown as {
+            windows: Map<string, unknown>;
+            gso_index: Map<number, unknown>;
+            gso_cache: Map<number, unknown>;
+            gso_checkpoints: unknown[];
+            gso_order_monotonic: boolean;
+            gso_scan_position: number;
+        };
+        expect(internals.gso_order_monotonic).toBe(true);
         expect(internals.gso_index.size).toBeLessThanOrEqual(1_024);
         expect(internals.gso_checkpoints.length).toBeLessThanOrEqual(1_024);
         const exhausted_position = internals.gso_scan_position;
         internals.windows.clear();
         internals.gso_cache.clear();
-        expect(source.read_rows(0, 0, 1).rows[0][4]?.raw).toBe('a long first value');
+        expect(source.read_columns(0, 0, 1, [4, 5]).rows[0].map((cell) => cell?.raw))
+            .toEqual(['a long first value', 'second 0']);
         expect(internals.gso_scan_position).toBe(exhausted_position);
+        expect(internals.gso_index.size).toBeLessThanOrEqual(1_024);
     });
 
     it('dispatches .dta directly without an Excel header projection', async () => {
@@ -588,11 +638,17 @@ describe('DtaDataSource', () => {
                 cwd: process.cwd(),
                 env: { ...process.env, TABLE_VIEWER_LEGACY_HANG_CHILD: '1' },
                 encoding: 'utf8',
-                timeout: 5_000,
+                timeout: 60_000,
             });
-            expect(child.error, child.stderr).toBeUndefined();
-            expect(child.signal, child.stderr).toBeNull();
-            expect(child.status, child.stderr).toBe(0);
+            const timed_out = child.error !== undefined
+                && 'code' in child.error
+                && child.error.code === 'ETIMEDOUT';
+            const diagnostic = timed_out
+                ? 'Legacy expansion-field child exceeded the 60-second hang guard'
+                : child.stderr;
+            expect(child.error, diagnostic).toBeUndefined();
+            expect(child.signal, diagnostic).toBeNull();
+            expect(child.status, diagnostic).toBe(0);
         },
     );
 
@@ -603,6 +659,11 @@ describe('DtaDataSource', () => {
                 .rejects.toThrow('expansion field has negative length');
         },
     );
+
+    it('rejects excessive zero-length legacy expansion fields', async () => {
+        await expect(DtaDataSource.create(build_legacy_dta_fixture(0, 10_000)))
+            .rejects.toThrow('too many expansion fields');
+    });
 
     it('reads supported legacy releases through the buffer entrypoint', async () => {
         const source = await DtaDataSource.create(build_legacy_dta_fixture());

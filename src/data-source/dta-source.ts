@@ -38,9 +38,11 @@ const MAX_DECODED_CELLS = DECODE_WINDOW_ROWS * MAX_SHEET_COLUMNS;
 const MAX_GSO_CACHE_ENTRIES = 256;
 const MAX_GSO_INDEX_ENTRIES = 1_024;
 const MAX_GSO_CHECKPOINTS = 1_024;
+const MAX_GSO_DIGEST_CACHE_ENTRIES = 4_096;
+const MAX_LEGACY_EXPANSION_FIELDS = 10_000;
 const INITIAL_GSO_CHECKPOINT_STRIDE = 64;
 const BINARY_GSO_PREVIEW_BYTES = 32;
-const BINARY_GSO_RAW_PREFIX = '\ud800stata-binary:sha256:';
+const BINARY_GSO_COMPARISON_PREFIX = 'stata-binary:sha256:';
 const GSO_KEY_OBSERVATION_RANGE = 0x1_0000_0000;
 const STRLS_TAG_LENGTH = '<strls>'.length;
 const VALUE_LABELS_TAG_LENGTH = '<value_labels>'.length;
@@ -71,19 +73,24 @@ type ValueLabelTables = Map<string, Map<number, string>>;
 
 interface BinaryGso {
     readonly kind: 'binary-gso';
-    readonly raw: string;
+    readonly contentOffset: number;
+    readonly contentLength: number;
     readonly formatted: string;
 }
 
 type DecodedGso = string | BinaryGso;
 type ResolvedStataCell = RowCell | BinaryGso;
 
-interface GsoCheckpoint {
-    readonly key: number;
+interface GsoOrder {
+    readonly observation: number;
+    readonly variable: number;
+}
+
+interface GsoCheckpoint extends GsoOrder {
     readonly position: number;
 }
 
-interface ScannedGso {
+interface ScannedGso extends GsoOrder {
     readonly key: number;
     readonly value: GsoEntry;
     readonly nextPosition: number;
@@ -95,13 +102,38 @@ interface CachedWindow {
 }
 
 /** Canonical raw representation shared by display and scan reads. */
-function canonicalize_stata_raw(cell: ResolvedStataCell): RawCell {
-    if (is_binary_gso(cell)) return { raw: cell.raw, rawType: 'string' };
+function canonicalize_stata_raw(
+    cell: ResolvedStataCell,
+    binary_comparison_key: (cell: BinaryGso) => string,
+): RawCell {
+    if (is_binary_gso(cell)) {
+        const raw_cell: RawCell = { raw: cell.formatted, rawType: 'string' };
+        Object.defineProperty(raw_cell, 'comparisonKey', {
+            enumerable: false,
+            get: () => binary_comparison_key(cell),
+        });
+        return raw_cell;
+    }
     if (is_missing_value_object(cell)) {
         return { raw: cell.missing_type, rawType: 'number' };
     }
     if (typeof cell === 'string') return { raw: cell, rawType: 'string' };
     return { raw: String(cell), rawType: 'number' };
+}
+
+function rendered_stata_cell(raw_cell: RawCell, formatted: string): RenderedCell {
+    const rendered: RenderedCell = {
+        raw: raw_cell.raw,
+        rawType: raw_cell.rawType,
+        formatted,
+        bold: false,
+        italic: false,
+    };
+    const comparison_key = Object.getOwnPropertyDescriptor(raw_cell, 'comparisonKey');
+    if (comparison_key !== undefined) {
+        Object.defineProperty(rendered, 'comparisonKey', comparison_key);
+    }
+    return rendered;
 }
 
 /** Read-only, buffer-backed Stata source with bounded lazy row decoding. */
@@ -115,13 +147,14 @@ export class DtaDataSource implements DataSource {
     private readonly pre_unicode_utf8_decoder = new TextDecoder('utf-8', { fatal: true });
     private readonly pre_unicode_fallback_decoder = new TextDecoder('windows-1252');
     private value_label_tables?: ValueLabelTables;
-    private readonly gso_index = new Map<number, number>();
+    private readonly gso_index = new Map<number, GsoEntry>();
     private readonly gso_cache = new Map<number, DecodedGso>();
+    private readonly gso_digest_cache = new Map<number, string>();
     private gso_checkpoints: GsoCheckpoint[] = [];
     private gso_checkpoint_stride = INITIAL_GSO_CHECKPOINT_STRIDE;
     private gso_entries_scanned = 0;
-    private gso_keys_monotonic = true;
-    private gso_last_key = -1;
+    private gso_order_monotonic = true;
+    private gso_last_order?: GsoOrder;
     private readonly gso_start_position: number;
     private gso_scan_position: number;
     private gso_scan_exhausted = false;
@@ -296,6 +329,7 @@ export class DtaDataSource implements DataSource {
         this.value_label_tables = undefined;
         this.gso_index.clear();
         this.gso_cache.clear();
+        this.gso_digest_cache.clear();
         this.gso_checkpoints = [];
         this.gso_scan_exhausted = true;
         this.view = undefined;
@@ -333,11 +367,14 @@ export class DtaDataSource implements DataSource {
             const count = Math.min(DECODE_WINDOW_ROWS, end - row);
             const decoded = this.decode_columns(row, count, columns);
             rows.push(...decoded.map((values, row_offset) => values.map((cell, index) =>
-                canonicalize_stata_raw(this.resolve_cell(
-                    cell,
-                    this.metadata.variables[columns[index]],
-                    row + row_offset,
-                )),
+                canonicalize_stata_raw(
+                    this.resolve_cell(
+                        cell,
+                        this.metadata.variables[columns[index]],
+                        row + row_offset,
+                    ),
+                    (binary) => this.binary_comparison_key(binary),
+                ),
             )));
             row += count;
         }
@@ -416,47 +453,36 @@ export class DtaDataSource implements DataSource {
         row: number,
     ): RenderedCell {
         const resolved = this.resolve_cell(cell, variable, row);
-        const raw_cell = canonicalize_stata_raw(resolved);
+        const raw_cell = canonicalize_stata_raw(
+            resolved,
+            (binary) => this.binary_comparison_key(binary),
+        );
         if (is_missing_value_object(resolved)) {
             const labels = variable.value_label_name
                 ? this.value_labels().get(variable.value_label_name)
                 : undefined;
-            return {
-                ...raw_cell,
-                formatted: labels?.get(missing_type_to_label_key(resolved.missing_type))
+            return rendered_stata_cell(
+                raw_cell,
+                labels?.get(missing_type_to_label_key(resolved.missing_type))
                     ?? resolved.missing_type,
-                bold: false,
-                italic: false,
-            };
+            );
         }
-        if (is_binary_gso(resolved)) {
-            return {
-                ...raw_cell,
-                formatted: resolved.formatted,
-                bold: false,
-                italic: false,
-            };
-        }
-        if (typeof resolved === 'string') {
-            return {
-                ...raw_cell,
-                formatted: resolved,
-                bold: false,
-                italic: false,
-            };
+        if (is_binary_gso(resolved) || typeof resolved === 'string') {
+            return rendered_stata_cell(
+                raw_cell,
+                is_binary_gso(resolved) ? resolved.formatted : resolved,
+            );
         }
 
         const labels = variable.value_label_name
             ? this.value_labels().get(variable.value_label_name)
             : undefined;
-        return {
-            ...raw_cell,
-            formatted: labels?.get(resolved)
+        return rendered_stata_cell(
+            raw_cell,
+            labels?.get(resolved)
                 ?? apply_display_format(resolved, variable.format)
                 ?? raw_cell.raw!,
-            bold: false,
-            italic: false,
-        };
+        );
     }
 
     private resolve_cell(
@@ -504,32 +530,36 @@ export class DtaDataSource implements DataSource {
             this.gso_cache.set(key, cached);
             return cached;
         }
-        const indexed_content_offset = this.gso_index.get(key);
-        if (indexed_content_offset !== undefined) {
-            this.gso_index.delete(key);
-            this.gso_index.set(key, indexed_content_offset);
-            return this.decode_and_cache_gso(
-                key,
-                bytes,
-                this.gso_entry_at(bytes, view, indexed_content_offset),
-            );
+        const indexed = this.gso_index.get(key);
+        if (indexed !== undefined) {
+            this.cache_gso_entry(key, indexed);
+            return this.decode_and_cache_gso(key, bytes, indexed);
+        }
+
+        const target_order = { observation: pointer.o, variable: pointer.v };
+        const target_was_scanned = !this.gso_order_monotonic
+            || (this.gso_last_order !== undefined
+                && compare_gso_order(target_order, this.gso_last_order) <= 0);
+        if (target_was_scanned) {
+            const entry = this.find_scanned_gso(bytes, view, key, target_order);
+            if (entry !== null) {
+                this.cache_gso_entry(key, entry);
+                return this.decode_and_cache_gso(key, bytes, entry);
+            }
+            if (this.gso_order_monotonic) return null;
         }
 
         while (!this.gso_scan_exhausted) {
-            const entry = this.scan_next_gso(bytes, view);
-            if (entry === null) break;
-            if (entry.key === key) {
-                return this.decode_and_cache_gso(key, bytes, entry.value);
+            const scanned = this.scan_next_gso(bytes, view);
+            if (scanned === null) break;
+            if (scanned.key === key) {
+                return this.decode_and_cache_gso(key, bytes, scanned.value);
             }
         }
-        const entry = this.find_scanned_gso(bytes, view, key);
-        return entry === null ? null : this.decode_and_cache_gso(key, bytes, entry);
+        return null;
     }
 
-    private scan_next_gso(
-        bytes: Uint8Array,
-        view: DataView,
-    ): { key: number; value: GsoEntry } | null {
+    private scan_next_gso(bytes: Uint8Array, view: DataView): ScannedGso | null {
         const position = this.gso_scan_position;
         const scanned = this.read_gso_at(bytes, view, position);
         if (scanned === null) {
@@ -537,8 +567,8 @@ export class DtaDataSource implements DataSource {
             return null;
         }
         this.gso_scan_position = scanned.nextPosition;
-        this.remember_gso(scanned.key, scanned.value.content_offset, position);
-        return { key: scanned.key, value: scanned.value };
+        this.remember_gso(scanned, position);
+        return scanned;
     }
 
     private read_gso_at(
@@ -584,20 +614,23 @@ export class DtaDataSource implements DataSource {
         }
         return {
             key: gso_key(variable, observation),
+            observation,
+            variable,
             value: { content_offset: position, content_length, type },
             nextPosition: content_end,
         };
     }
 
-    private remember_gso(key: number, content_offset: number, position: number): void {
-        this.gso_index.set(key, content_offset);
-        if (this.gso_index.size > MAX_GSO_INDEX_ENTRIES) {
-            this.gso_index.delete(this.gso_index.keys().next().value!);
-        }
-        if (key < this.gso_last_key) this.gso_keys_monotonic = false;
-        this.gso_last_key = key;
+    private remember_gso(scanned: ScannedGso, position: number): void {
+        this.cache_gso_entry(scanned.key, scanned.value);
+        const order = { observation: scanned.observation, variable: scanned.variable };
+        if (
+            this.gso_last_order !== undefined
+            && compare_gso_order(order, this.gso_last_order) < 0
+        ) this.gso_order_monotonic = false;
+        this.gso_last_order = order;
         if (this.gso_entries_scanned % this.gso_checkpoint_stride === 0) {
-            this.gso_checkpoints.push({ key, position });
+            this.gso_checkpoints.push({ ...order, position });
             if (this.gso_checkpoints.length > MAX_GSO_CHECKPOINTS) {
                 this.gso_checkpoints = this.gso_checkpoints.filter((_, index) => index % 2 === 0);
                 this.gso_checkpoint_stride *= 2;
@@ -606,19 +639,31 @@ export class DtaDataSource implements DataSource {
         this.gso_entries_scanned += 1;
     }
 
+    private cache_gso_entry(key: number, entry: GsoEntry): void {
+        this.gso_index.delete(key);
+        this.gso_index.set(key, entry);
+        if (this.gso_index.size > MAX_GSO_INDEX_ENTRIES) {
+            this.gso_index.delete(this.gso_index.keys().next().value!);
+        }
+    }
+
     private find_scanned_gso(
         bytes: Uint8Array,
         view: DataView,
         key: number,
+        target_order: GsoOrder,
     ): GsoEntry | null {
         let position = this.gso_start_position;
-        if (this.gso_keys_monotonic && this.gso_checkpoints.length > 0) {
+        if (this.gso_order_monotonic && this.gso_checkpoints.length > 0) {
             let low = 0;
             let high = this.gso_checkpoints.length;
             while (low < high) {
                 const middle = Math.floor((low + high) / 2);
-                if (this.gso_checkpoints[middle].key <= key) low = middle + 1;
-                else high = middle;
+                if (compare_gso_order(this.gso_checkpoints[middle], target_order) <= 0) {
+                    low = middle + 1;
+                } else {
+                    high = middle;
+                }
             }
             if (low > 0) position = this.gso_checkpoints[low - 1].position;
         }
@@ -626,25 +671,13 @@ export class DtaDataSource implements DataSource {
             const scanned = this.read_gso_at(bytes, view, position);
             if (scanned === null) return null;
             if (scanned.key === key) return scanned.value;
-            if (this.gso_keys_monotonic && scanned.key > key) return null;
+            if (
+                this.gso_order_monotonic
+                && compare_gso_order(scanned, target_order) > 0
+            ) return null;
             position = scanned.nextPosition;
         }
         return null;
-    }
-
-    private gso_entry_at(
-        bytes: Uint8Array,
-        view: DataView,
-        content_offset: number,
-    ): GsoEntry {
-        return {
-            content_offset,
-            content_length: view.getUint32(
-                content_offset - 4,
-                this.metadata.byte_order === 'LSF',
-            ),
-            type: bytes[content_offset - 5],
-        };
     }
 
     private decode_and_cache_gso(
@@ -661,9 +694,7 @@ export class DtaDataSource implements DataSource {
     }
 
     private decode_gso(bytes: Uint8Array, entry: GsoEntry): DecodedGso {
-        if (entry.type === 129) {
-            return encode_binary_gso(bytes, entry);
-        }
+        if (entry.type === 129) return encode_binary_gso(bytes, entry);
         if (this.metadata.format_version >= 118 || entry.type !== 130) {
             return decode_gso_entry(bytes, entry);
         }
@@ -677,6 +708,22 @@ export class DtaDataSource implements DataSource {
             this.pre_unicode_utf8_decoder,
             this.pre_unicode_fallback_decoder,
         );
+    }
+
+    private binary_comparison_key(binary: BinaryGso): string {
+        let digest = this.gso_digest_cache.get(binary.contentOffset);
+        if (digest === undefined) {
+            const content = this.open_bytes().subarray(
+                binary.contentOffset,
+                binary.contentOffset + binary.contentLength,
+            );
+            digest = createHash('sha256').update(content).digest('hex');
+            this.gso_digest_cache.set(binary.contentOffset, digest);
+            if (this.gso_digest_cache.size > MAX_GSO_DIGEST_CACHE_ENTRIES) {
+                this.gso_digest_cache.delete(this.gso_digest_cache.keys().next().value!);
+            }
+        }
+        return `${BINARY_GSO_COMPARISON_PREFIX}${digest}:${binary.contentLength}`;
     }
 
     private open_buffer(): ArrayBuffer {
@@ -735,22 +782,22 @@ export class DtaDataSource implements DataSource {
 }
 
 function encode_binary_gso(bytes: Uint8Array, entry: GsoEntry): BinaryGso {
-    const content = bytes.subarray(
-        entry.content_offset,
-        entry.content_offset + entry.content_length,
-    );
-    const digest = createHash('sha256').update(content).digest('hex');
-    const preview_length = Math.min(content.length, BINARY_GSO_PREVIEW_BYTES);
+    const preview_length = Math.min(entry.content_length, BINARY_GSO_PREVIEW_BYTES);
     let preview = '';
     for (let offset = 0; offset < preview_length; offset++) {
-        preview += content[offset].toString(16).padStart(2, '0');
+        preview += bytes[entry.content_offset + offset].toString(16).padStart(2, '0');
     }
-    const suffix = content.length > preview_length ? '…' : '';
+    const suffix = entry.content_length > preview_length ? '…' : '';
     return {
         kind: 'binary-gso',
-        raw: `${BINARY_GSO_RAW_PREFIX}${digest}:${content.length}`,
-        formatted: `binary (${content.length} bytes): ${preview}${suffix}`,
+        contentOffset: entry.content_offset,
+        contentLength: entry.content_length,
+        formatted: `binary (${entry.content_length} bytes): ${preview}${suffix}`,
     };
+}
+
+function compare_gso_order(left: GsoOrder, right: GsoOrder): number {
+    return left.observation - right.observation || left.variable - right.variable;
 }
 
 function is_binary_gso(cell: ResolvedStataCell): cell is BinaryGso {
@@ -774,7 +821,10 @@ function validate_legacy_expansion_fields(buffer: ArrayBuffer): void {
         + nvar * format_width
         + nvar * 33
         + nvar * 81;
-    while (true) {
+    for (let field = 0; field <= MAX_LEGACY_EXPANSION_FIELDS; field++) {
+        if (field === MAX_LEGACY_EXPANSION_FIELDS) {
+            throw new Error('Corrupt .dta file: too many expansion fields');
+        }
         if (!Number.isSafeInteger(position) || position + 5 > buffer.byteLength) {
             throw new Error('Corrupt .dta file: expansion fields are truncated');
         }
