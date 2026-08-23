@@ -23,10 +23,19 @@ afterEach(() => {
     container = undefined;
 });
 
+/**
+ * Render the banner, reusing the root across calls within a test.
+ *
+ * Reused rather than recreated so that a second call is a *rerender* — which is
+ * what the resolving-state case is actually about — instead of mounting a second
+ * copy and leaking the first, which `afterEach` would never unmount.
+ */
 async function banner(props: Partial<LfsBannerProps> = {}): Promise<void> {
-    container = document.createElement('div');
-    document.body.appendChild(container);
-    root = createRoot(container);
+    if (!container || !root) {
+        container = document.createElement('div');
+        document.body.appendChild(container);
+        root = createRoot(container);
+    }
     await act(async () => {
         root!.render(React.createElement(LfsBanner, {
             unresolved: UNRESOLVED,
@@ -82,6 +91,9 @@ describe('LfsBanner', () => {
         await banner({ resolving: true });
         expect(button()?.textContent).toBe('Downloading…');
         expect(button()?.disabled).toBe(true);
+        // Rerendered in place, not mounted alongside the first copy.
+        expect(container?.querySelectorAll('.lfs-banner')).toHaveLength(1);
+        expect(document.querySelectorAll('.lfs-banner')).toHaveLength(1);
     });
 
     it('offers a retry after a download failure, quoting the reason', async () => {
@@ -116,6 +128,29 @@ describe('LfsBanner', () => {
         expect(text()).toContain('not set up in this repository');
         expect(text()).toContain('git lfs install');
         expect(button()?.textContent).toBe('Try again');
+    });
+
+    it('drops the button when the object is missing from Git LFS', async () => {
+        // The case that most needs saying plainly: the bytes do not exist to be
+        // fetched, so a retry would be a button that cannot ever work — which
+        // is exactly the confusion this banner exists to prevent.
+        await banner({
+            unresolved: { ...UNRESOLVED, failure: { reason: 'objectMissing' } },
+        });
+        expect(text()).toContain('missing from Git LFS');
+        expect(text()).toContain('may not have pushed');
+        expect(button()).toBeNull();
+    });
+
+    it('drops the button when the name defeats --include', async () => {
+        // Deterministic for the filename, so a retry cannot ever work. The copy
+        // points at the one thing that does: pulling the whole repository.
+        await banner({
+            unresolved: { ...UNRESOLVED, failure: { reason: 'pathNotExpressible' } },
+        });
+        expect(text()).toContain('comma in its name');
+        expect(text()).toContain('git lfs pull');
+        expect(button()).toBeNull();
     });
 
     it('explains a file outside a repository without offering a retry', async () => {

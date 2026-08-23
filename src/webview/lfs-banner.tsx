@@ -59,6 +59,10 @@ function failure_copy(failure: NonNullable<UnresolvedLfsObject['failure']>): str
             return 'Git LFS is not installed, so the contents cannot be downloaded from here. Install git-lfs and reopen the file.';
         case 'notARepository':
             return 'This file is not inside a Git repository, so there is nowhere to download the contents from.';
+        case 'pathNotExpressible':
+            return 'Git LFS cannot download this file on its own because of a comma in its name. Run “git lfs pull” in the repository to fetch it.';
+        case 'objectMissing':
+            return 'The stored contents are missing from Git LFS, so there is nothing to download. Whoever committed this file may not have pushed its contents.';
         case 'filtersNotConfigured':
             return 'Git LFS is not set up in this repository, so the contents were not downloaded. Run “git lfs install” in it, then try again.';
         case 'failed':
@@ -84,8 +88,9 @@ export function LfsBanner({
     resolving,
 }: LfsBannerProps): React.JSX.Element {
     const { side, size, resolvable, failure } = unresolved;
-    // A retry is worth offering for anything except a git-lfs that is not
-    // installed, which no number of clicks will change.
+    // Retry anything that another attempt could plausibly fix. Not a missing
+    // git-lfs, and not a missing object: the bytes do not exist to be fetched,
+    // so a button here would be the "does nothing" trap this banner replaces.
     const retryable = failure === undefined
         || failure.reason === 'failed'
         || failure.reason === 'filtersNotConfigured';

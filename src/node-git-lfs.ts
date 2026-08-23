@@ -71,6 +71,15 @@ interface RunOptions {
     readonly maxStdout: number;
 }
 
+/**
+ * Run `git` and resolve with its outcome, never rejecting.
+ *
+ * Bounded on every axis a hung or hostile child could exploit: a timeout that
+ * escalates to SIGKILL, a stdout cap that kills rather than buffers without
+ * limit, and stdin always closed so a subcommand expecting a terminal cannot
+ * block forever. A spawn failure is reported in the result rather than thrown,
+ * so "git is missing" and "git said no" are handled on the same path.
+ */
 function run_git({ cwd, args, stdin, maxStdout }: RunOptions): Promise<CommandResult> {
     return new Promise((resolve) => {
         const child = spawn('git', [...args], {
@@ -197,6 +206,34 @@ export function sanitized_detail(stderr: string): string | undefined {
 }
 
 /**
+ * A repository-relative path spelled so `git lfs pull --include=` matches that
+ * one file and nothing else.
+ *
+ * `--include` takes `.gitignore`-style glob patterns, not literal paths, so a
+ * filename containing a metacharacter is silently a *pattern*. Verified against
+ * git-lfs 3.7.1: `--include=data[1].csv` reads `[1]` as a character class,
+ * matches nothing, and `pull` still exits 0 — the file is left a pointer while
+ * the command reports success. Escaping is exact rather than broad: pulling
+ * `data\[1\].csv` fetches that file and leaves its neighbours untouched.
+ *
+ * `\` goes first so the backslashes this adds are not themselves re-escaped.
+ */
+export function escaped_include_pattern(relative: string): string {
+    return relative.replace(/[\\[\]*?]/gu, (character) => `\\${character}`);
+}
+
+/**
+ * A comma cannot be expressed at all: git-lfs splits the `--include` value on
+ * commas before pattern matching, and a backslash does not escape the
+ * separator (confirmed against 3.7.1 — `with\,comma.csv` matches nothing and
+ * exits 0). Such a file is refused up front rather than pulled with a pattern
+ * that cannot mean what it says.
+ */
+function include_pattern_can_express(relative: string): boolean {
+    return !relative.includes(',');
+}
+
+/**
  * Which failure this was. A `git` that ran but does not know the `lfs`
  * subcommand reports it on stderr rather than with a distinct exit status, so
  * that text is the only signal available — and getting it right matters,
@@ -212,9 +249,21 @@ function failure_reason(result: CommandResult): GitLfsFailureReason {
         || stderr.includes('git: \'lfs\' is not')
     ) return 'lfsNotInstalled';
     if (stderr.includes('not a git repository')) return 'notARepository';
+    // Observed against git-lfs 3.7.1, which exits 2 with this wording for both
+    // `pull` and `smudge`. Distinguished from a transient transfer failure
+    // because no retry can conjure bytes the remote does not have.
+    if (
+        stderr.includes('remote missing object')
+        || stderr.includes('object does not exist')
+        || stderr.includes('missing object')
+    ) return 'objectMissing';
     return 'failed';
 }
 
+/**
+ * The absolute working-tree path this resource names, or undefined when it does
+ * not name one usable as a `cwd`.
+ */
 function file_path_of(resource: ResourceUriLike): string | undefined {
     // A `git:`-scheme resource still carries the working-tree path in
     // `fsPath`, which is exactly what locates the repository — but only a real
@@ -324,9 +373,23 @@ export const node_git_lfs_port: GitLfsPort = {
             };
         }
         const relative = located.relative;
+        // Better an honest refusal than a pull that exits 0 having matched
+        // nothing, which the smudge check below would then report as
+        // `filtersNotConfigured` — sending the user to run `git lfs install`
+        // for a problem that has nothing to do with their filters.
+        if (!include_pattern_can_express(relative)) {
+            return {
+                type: 'failed',
+                // Its own reason rather than a generic failure: this is
+                // deterministic for the name, so a retry offer would be a
+                // button that cannot ever work.
+                reason: 'pathNotExpressible',
+                detail: 'Git LFS cannot fetch a single file whose name contains a comma.',
+            };
+        }
         const result = await run_git({
             cwd: path.dirname(file_path),
-            args: ['lfs', 'pull', `--include=${relative}`],
+            args: ['lfs', 'pull', `--include=${escaped_include_pattern(relative)}`],
             // `git lfs pull` writes progress, not content.
             maxStdout: 64 * 1024,
         });
