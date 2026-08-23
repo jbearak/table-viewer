@@ -940,7 +940,7 @@ function same_extension(left: string, right: string): boolean {
     return extension(left) === extension(right);
 }
 
-/** Profile for a path, by extension: csv/tsv → editable table; else Excel viewer. */
+/** Profile for a path: CSV/TSV are editable; all other registered formats are read-only unless their profile opts into editing. */
 export function profile_for(file_path: string, config?: ConfigPort): ViewerProfile {
     const ext = file_path.toLowerCase();
     return ext.endsWith('.csv') || ext.endsWith('.tsv')
