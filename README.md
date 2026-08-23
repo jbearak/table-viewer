@@ -8,6 +8,8 @@ Table Viewer supports editing modern Excel (`.xlsx`), `.csv`, and `.tsv` files, 
 
 What you do while reviewing a table — sorting, filtering, hiding columns, resizing, highlighting cells — is stored alongside the file rather than inside it, so the file on disk is untouched and your sorts, filters, and highlights are still there the next time you open it, even if the file was regenerated in the meantime. Table Viewer also reloads on its own when the file changes on disk. Cell contents change only when you enter edit mode and save.
 
+<img src="docs/images/app-column-header-menu-hero.png" alt="The Roast column's context menu in Table Viewer, with sorting, filtering, copying, and hiding actions" width="751">
+
 Follow the [setup and 10-minute try-out guide](docs/setup-guide.md) to choose the standalone app or VS Code extension, install it, try two sample workbooks, and see Table Viewer preserve a saved view when a file is replaced.
 
 ## Installation
