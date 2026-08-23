@@ -128,7 +128,9 @@ The flip side is that Table Viewer is deliberately *not* a full spreadsheet edit
 
 In the desktop app, choose **File → Compare Files…** and select an original (before) file and a modified (after) file. The comparison is read-only and neither file is changed.
 
-In VS Code, click a changed Excel, CSV, or TSV file in the Source Control or Timeline view and Table Viewer opens the comparison as a table.
+In VS Code, click a changed Excel, CSV, or TSV file in the Source Control or Timeline view and Table Viewer opens the comparison.
+
+Added rows are banded in green, deleted rows in red, and moved rows in purple. Within a changed row, each changed cell shows its original value in red and the new value in green. The green and red follow your theme's Git decoration colors, so they match the added and deleted files in the Source Control view.
 
 ## Usage
 
