@@ -31,6 +31,30 @@ describe('escaped_include_pattern', () => {
 const git = (cwd: string, ...args: string[]) =>
     execFileSync('git', args, { cwd, encoding: 'utf8' });
 
+/**
+ * The branch these fixtures commit and push to, named explicitly everywhere.
+ *
+ * Nothing here may lean on the ambient `init.defaultBranch`. A bare repository
+ * initialised where that is `master` has its HEAD at `refs/heads/master`, so a
+ * push to `refs/heads/main` leaves HEAD pointing at an unborn branch — and the
+ * clone below then warns "remote HEAD refers to nonexistent ref" and checks out
+ * nothing at all. Every later `statSync` fails with ENOENT, which reads as a
+ * missing fixture rather than as the branch mismatch it is. Passes on a machine
+ * configured for `main`, fails on one configured for `master`.
+ */
+const BRANCH = 'main';
+
+/** Commit with an identity of our own, so the ambient one is never required. */
+const commit_all = (cwd: string): void => {
+    git(cwd, 'add', '-A');
+    git(
+        cwd,
+        '-c', 'user.email=table-viewer-test@example.invalid',
+        '-c', 'user.name=Table Viewer Test',
+        'commit', '-qm', 'fixture',
+    );
+};
+
 const NAMES = ['data[1].csv', 'star*name.csv', 'what?.csv', 'plain.csv'];
 /** Committed so the refusal test names a file that really exists. */
 const COMMA_NAME = 'with,comma.csv';
@@ -47,7 +71,7 @@ beforeAll(() => {
         return;
     }
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'lfs-glob-'));
-    git(root, 'init', '-q', '--bare', 'origin.git');
+    git(root, 'init', '-q', '--bare', `--initial-branch=${BRANCH}`, 'origin.git');
     const origin = path.join(root, 'origin.git');
     git(root, 'clone', '-q', origin, 'src');
     const src = path.join(root, 'src');
@@ -61,9 +85,9 @@ beforeAll(() => {
     for (const name of [...NAMES, COMMA_NAME]) {
         fs.writeFileSync(path.join(src, name), body);
     }
-    git(src, 'add', '-A');
-    git(src, '-c', 'user.email=a@b', '-c', 'user.name=a', 'commit', '-qm', 'x');
-    git(src, 'push', '-q', 'origin', 'HEAD:refs/heads/main');
+    git(src, 'checkout', '-q', '-B', BRANCH);
+    commit_all(src);
+    git(src, 'push', '-q', 'origin', `HEAD:refs/heads/${BRANCH}`);
     repo = path.join(root, 'ptr');
     execFileSync('git', ['clone', '-q', origin, 'ptr'],
         { cwd: root, env: { ...process.env, GIT_LFS_SKIP_SMUDGE: '1' } });
@@ -88,7 +112,7 @@ describe('an object that is missing from the remote', () => {
         // Built in its own origin so deleting the LFS store cannot affect the
         // other cases in this file, which share the fixture above.
         const iso = fs.mkdtempSync(path.join(os.tmpdir(), 'lfs-gone-'));
-        git(iso, 'init', '-q', '--bare', 'origin.git');
+        git(iso, 'init', '-q', '--bare', `--initial-branch=${BRANCH}`, 'origin.git');
         const iso_origin = path.join(iso, 'origin.git');
         git(iso, 'clone', '-q', iso_origin, 'src');
         const iso_src = path.join(iso, 'src');
@@ -96,9 +120,9 @@ describe('an object that is missing from the remote', () => {
         fs.writeFileSync(path.join(iso_src, '.gitattributes'),
             '*.csv filter=lfs diff=lfs merge=lfs -text\n');
         fs.writeFileSync(path.join(iso_src, 'plain.csv'), 'a,b\n1,2\n');
-        git(iso_src, 'add', '-A');
-        git(iso_src, '-c', 'user.email=a@b', '-c', 'user.name=a', 'commit', '-qm', 'x');
-        git(iso_src, 'push', '-q', 'origin', 'HEAD:refs/heads/main');
+        git(iso_src, 'checkout', '-q', '-B', BRANCH);
+        commit_all(iso_src);
+        git(iso_src, 'push', '-q', 'origin', `HEAD:refs/heads/${BRANCH}`);
         execFileSync('git', ['clone', '-q', iso_origin, 'gone'],
             { cwd: iso, env: { ...process.env, GIT_LFS_SKIP_SMUDGE: '1' } });
         const fresh = path.join(iso, 'gone');

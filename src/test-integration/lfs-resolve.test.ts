@@ -30,8 +30,12 @@ describe('git-lfs resolve visibility through the VS Code filesystem', () => {
         }
         const git = (cwd: string, ...args: string[]) =>
             execFileSync('git', args, { cwd, encoding: 'utf8' });
+        // `--initial-branch` and the explicit checkout below keep this off the
+        // ambient `init.defaultBranch`: where that is `master`, a bare repo's
+        // HEAD points at `refs/heads/master` while the push targets `main`, so
+        // the clone checks out nothing and every later read fails with ENOENT.
         root = fs.mkdtempSync(path.join(os.tmpdir(), 'lfs-vsc-'));
-        git(root, 'init', '-q', '--bare', 'origin.git');
+        git(root, 'init', '-q', '--bare', '--initial-branch=main', 'origin.git');
         const origin = path.join(root, 'origin.git');
         git(root, 'clone', '-q', origin, 'src');
         const src = path.join(root, 'src');
@@ -41,8 +45,14 @@ describe('git-lfs resolve visibility through the VS Code filesystem', () => {
         const rows = ['a,b'];
         for (let i = 0; i < 400; i += 1) rows.push(`${i},v${i}`);
         fs.writeFileSync(path.join(src, 'data.csv'), `${rows.join('\n')}\n`);
+        git(src, 'checkout', '-q', '-B', 'main');
         git(src, 'add', '-A');
-        git(src, '-c', 'user.email=a@b', '-c', 'user.name=a', 'commit', '-qm', 'x');
+        git(
+            src,
+            '-c', 'user.email=table-viewer-test@example.invalid',
+            '-c', 'user.name=Table Viewer Test',
+            'commit', '-qm', 'fixture',
+        );
         git(src, 'push', '-q', 'origin', 'HEAD:refs/heads/main');
         execFileSync('git', ['clone', '-q', origin, 'ptr'],
             { cwd: root, env: { ...process.env, GIT_LFS_SKIP_SMUDGE: '1' } });
