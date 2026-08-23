@@ -5,7 +5,6 @@ import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import {
-    TABLE_DIFF_SCHEME,
     table_diff_document_uris,
     table_diff_uris_from_unordered_pair,
 } from '../table-diff-uris';
@@ -50,6 +49,20 @@ function initialize_repository(directory: string): vscode.Uri {
 
 async function read_text(uri: vscode.Uri): Promise<string> {
     return Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+}
+
+/**
+ * Whether this tab holds a Table Viewer comparison.
+ *
+ * The scheme cannot answer this. A comparison document is deliberately a `file:`
+ * URI so VS Code's file-scoped services (Git Timeline) recognize it, so a
+ * comparison and a plain file are indistinguishable by scheme — comparing
+ * against that scheme matches every custom tab, including the working
+ * file. The encoded query is the discriminator, and decoding it is the check.
+ */
+function is_table_diff_tab(tab: vscode.Tab): boolean {
+    return tab.input instanceof vscode.TabInputCustom
+        && table_diff_document_uris(tab.input.uri) !== undefined;
 }
 
 function tab_diagnostics(): string {
@@ -121,7 +134,9 @@ describe('custom editor diffs', () => {
         await expect_one_table_diff();
         const comparison_tab = all_tabs()[0];
         assert.ok(comparison_tab.input instanceof vscode.TabInputCustom);
-        assert.strictEqual(comparison_tab.input.uri.scheme, TABLE_DIFF_SCHEME);
+        // Decoded, not scheme-compared: a comparison document is a `file:` URI,
+        // so the scheme alone would hold for a plain file tab too.
+        assert.ok(table_diff_document_uris(comparison_tab.input.uri));
 
         await vscode.commands.executeCommand('tableViewer.openWorkingTreeFile');
         const file_open = await wait_for(() => {
@@ -148,11 +163,9 @@ describe('custom editor diffs', () => {
             `expected Open Changes to reveal the retained comparison; tabs=${tab_diagnostics()}`,
         );
         assert.strictEqual(
-            all_tabs().filter((tab) => (
-                tab.input instanceof vscode.TabInputCustom
-                && tab.input.uri.scheme === TABLE_DIFF_SCHEME
-            )).length,
+            all_tabs().filter(is_table_diff_tab).length,
             1,
+            `expected exactly one comparison tab; tabs=${tab_diagnostics()}`,
         );
     });
 
@@ -175,7 +188,9 @@ describe('custom editor diffs', () => {
         await expect_one_table_diff();
         const comparison_tab = all_tabs()[0];
         assert.ok(comparison_tab.input instanceof vscode.TabInputCustom);
-        assert.strictEqual(comparison_tab.input.uri.scheme, TABLE_DIFF_SCHEME);
+        // Decoded, not scheme-compared: a comparison document is a `file:` URI,
+        // so the scheme alone would hold for a plain file tab too.
+        assert.ok(table_diff_document_uris(comparison_tab.input.uri));
 
         await vscode.commands.executeCommand('tableViewer.openWorkingTreeFile');
         const file_open = await wait_for(() => {
