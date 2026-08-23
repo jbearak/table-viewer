@@ -8,6 +8,44 @@ What you do while reviewing a table — sorting, filtering, hiding columns, resi
 
 Follow the [setup and 10-minute try-out guide](docs/setup-guide.md) to choose the standalone app or VS Code extension, install it, try two sample workbooks, and see Table Viewer preserve a saved view when a file is replaced.
 
+## Installation
+
+### Visual Studio Code extension
+
+Install Table Viewer from the extension registry used by your editor:
+
+- **Visual Studio Code:** open [Table Viewer in the Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=jbearak.table-viewer) and click **Install**.
+- **Editors that use Open VSX:** open [Table Viewer on Open VSX](https://open-vsx.org/extension/jbearak/table-viewer) and click **Install**.
+
+You can also open your editor's **Extensions** view and search for the exact extension ID `jbearak.table-viewer`. After installation, open an `.xlsx`, `.xls`, `.csv`, or `.tsv` file; Table Viewer registers itself as an editor for those file types.
+
+### macOS desktop app
+
+The desktop app requires an Apple Silicon Mac (M1 or newer) running macOS 12 or later. Install it with Homebrew:
+
+```sh
+brew install --cask jbearak/table-viewer/table-viewer
+```
+
+Or install it from a disk image:
+
+1. Open the [latest release](https://github.com/jbearak/table-viewer/releases/latest) and expand **Assets**.
+2. Download `table-viewer-<version>-arm64.dmg`. This is the macOS installer; the similarly named `.zip` and `latest-mac.yml` files are used by the automatic updater.
+3. Open the DMG and drag **Table Viewer** into **Applications**, then launch it from Applications or Spotlight.
+
+### Windows desktop app
+
+The desktop app requires Windows 10 or 11. Open the [latest release](https://github.com/jbearak/table-viewer/releases/latest), expand **Assets**, and download one of these four files. The no-install version is a single `.exe` that runs directly without an installer:
+
+| Your PC | Standard installer | No-install version |
+|---|---|---|
+| Most Intel or AMD PCs | `table-viewer-<version>-x64-setup.exe` | `table-viewer-<version>-x64-portable.exe` |
+| Arm-based PCs, such as Snapdragon laptops | `table-viewer-<version>-arm64-setup.exe` | `table-viewer-<version>-arm64-portable.exe` |
+
+Choose the `setup.exe` unless you specifically need the no-install version. The setup wizard creates a Start Menu entry, registers **Open with** handlers, and defaults to a per-user installation that does not require administrator access. The no-install `.exe` creates no Start Menu or uninstaller entry, although it does store your Table Viewer settings and register per-user **Open with** handlers. If you are unsure which architecture you have, open **Settings → System → About** and check **System type**.
+
+Run the downloaded `.exe`. Windows builds are unsigned, so SmartScreen may show **Windows protected your PC** the first time; click **More info**, confirm that the app is Table Viewer, then click **Run anyway**. The `.blockmap` and `.yml` assets on the release are updater metadata, not installers. The `.sha256` files are optional checksums for verifying downloads.
+
 ## Why
 
 When I make tables, I make them in code — R, Stata, Python — and refine them by rerunning the script. The rest of my time with tables is spent reading them: reviewing output that I or colleagues generate programmatically, or sheets someone sent me. Excel and Numbers are built for authoring spreadsheets by hand, and for both of these workflows they add friction at every step.
@@ -167,19 +205,7 @@ Table Viewer uses VS Code's editor font (`editor.fontFamily` and `editor.fontSiz
 
 Table Viewer also runs as a standalone Electron desktop app that reuses the same viewer, grid, and persistence code — no VS Code required. See [desktop/README.md](desktop/README.md) for build, run, packaging, and testing instructions.
 
-On macOS (Apple Silicon, macOS 12+) download `table-viewer-<version>-arm64.dmg` from the [latest release](https://github.com/jbearak/table-viewer/releases/latest), or install it with Homebrew:
-
-```sh
-brew install --cask jbearak/table-viewer/table-viewer
-```
-
-Official macOS releases are Developer ID signed. They are also notarized when the release credentials are complete; otherwise Gatekeeper may warn on first launch and the cask prints how to approve it. See [docs/homebrew-tap.md](docs/homebrew-tap.md) for the tap and release plumbing.
-
-On Windows, download the setup or portable executable for your architecture from
-the [latest release](https://github.com/jbearak/table-viewer/releases/latest).
-Windows builds are unsigned, so SmartScreen displays its first-run warning; see
-the [desktop setup guide](docs/setup-guide-desktop-app.md) for installation and
-checksum-verification instructions.
+See [Installation](#installation) above for the exact macOS and Windows downloads. The [desktop setup guide](docs/setup-guide-desktop-app.md) has a longer walkthrough, update behavior, checksum verification, and troubleshooting. Release maintainers can find the Homebrew tap and release plumbing in the [Homebrew tap guide](docs/homebrew-tap.md).
 
 ## Development
 
