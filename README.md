@@ -53,7 +53,7 @@ The flip side is that Table Viewer is deliberately *not* a full spreadsheet edit
 - Select contiguous or discontiguous rows by their row numbers, then drag a selected row boundary to resize them together
 - Select multiple columns to resize them together or auto-fit the selection
 - Use the searchable **Columns** menu to show, hide, restore, or hide all columns
-- Column visibility and sizing are persisted per file and sheet across VS Code sessions
+- Column visibility and sizing are persisted per file and sheet
 
 **Formatting toggle**
 - Switch between formatted and raw cell values with one click
