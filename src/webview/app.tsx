@@ -590,9 +590,22 @@ export function App(): React.JSX.Element {
         useState<UnresolvedLfsObject | undefined>(undefined);
     // A resolve is in flight. Local rather than snapshot-delivered: the host
     // sends no message while the download runs, and the button has to reflect
-    // the click immediately. Cleared by the snapshot that ends the operation —
-    // either the resolved table, or the same pointer carrying a failure.
+    // the click immediately. Cleared only by the `lfsResolveEnded` that
+    // matches the pending request — NOT by snapshots, which describe what the
+    // panel shows rather than acknowledging actions. What the resolve
+    // produced (the real table, or the pointer again with a failure) still
+    // arrives by snapshot; this flag only says whether the host is still
+    // working on it.
     const [lfs_resolving, set_lfs_resolving] = useState(false);
+    const lfs_resolve_request_seq_ref = useRef(0);
+    const lfs_resolve_request_prefix_ref = useRef(
+        Array.from(crypto.getRandomValues(new Uint32Array(2)), (value) =>
+            value.toString(36)).join('-'),
+    );
+    // The one resolve this renderer is waiting on. A ref rather than state:
+    // the click handler needs a synchronous duplicate-click fence, and the
+    // ending handler needs the id without re-rendering on it.
+    const pending_lfs_resolve_request_ref = useRef<string | null>(null);
     // Row alignment runs before the workbook snapshot exists, so this is the
     // only thing the compare window has to show meanwhile. Its arrival is what
     // tells the renderer a comparison is being aligned at all.
@@ -2083,11 +2096,11 @@ export function App(): React.JSX.Element {
                     preview_mode_ref.current = snapshot.configuration.previewMode;
                     set_preview_mode(snapshot.configuration.previewMode);
                     set_git_compare(snapshot.configuration.gitCompare);
+                    // Deliberately NOT the end of a resolve: a snapshot says
+                    // what the panel shows, and an unrelated refresh can land
+                    // mid-download. Only the matching `lfsResolveEnded` clears
+                    // `lfs_resolving`.
                     set_unresolved_lfs(snapshot.configuration.unresolvedLfs);
-                    // Any snapshot is the end of a resolve: it is either the
-                    // real table or the pointer again with a failure attached,
-                    // and in both cases the download is no longer running.
-                    set_lfs_resolving(false);
                     meta_ref.current = snapshot.meta;
                     set_meta(snapshot.meta);
                     set_filter_editor(null);
@@ -4406,6 +4419,14 @@ export function App(): React.JSX.Element {
             if (msg.type === 'editCommand') {
                 run_edit_command(msg.command);
             }
+            if (msg.type === 'lfsResolveEnded') {
+                // Matched, not merely received: a stale ending — a duplicate
+                // request's, or one from before a reload — must not clear a
+                // resolve that is still running.
+                if (pending_lfs_resolve_request_ref.current !== msg.requestId) return;
+                pending_lfs_resolve_request_ref.current = null;
+                set_lfs_resolving(false);
+            }
             if (msg.type === 'editSessionResult') {
                 if (pending_edit_request_ref.current !== msg.requestId) return;
                 pending_edit_request_ref.current = null;
@@ -5861,8 +5882,21 @@ export function App(): React.JSX.Element {
                     unresolved={unresolved_lfs}
                     resolving={lfs_resolving}
                     on_resolve={() => {
+                        // Synchronous fence: React disables the button on the
+                        // next render, but a double-click lands before it.
+                        if (pending_lfs_resolve_request_ref.current !== null) return;
+                        lfs_resolve_request_seq_ref.current += 1;
+                        const request_id = [
+                            'lfs',
+                            lfs_resolve_request_prefix_ref.current,
+                            lfs_resolve_request_seq_ref.current,
+                        ].join(':');
+                        pending_lfs_resolve_request_ref.current = request_id;
                         set_lfs_resolving(true);
-                        host_bridge.postMessage({ type: 'resolveLfsObject' });
+                        host_bridge.postMessage({
+                            type: 'resolveLfsObject',
+                            requestId: request_id,
+                        });
                     }}
                 />
             )}

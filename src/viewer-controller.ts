@@ -7493,25 +7493,42 @@ export function attach_viewer(
                 // changes what the next build will read, then re-runs the
                 // ordinary load path so the real table arrives through the
                 // same currency checks as any other refresh.
-                if (!unresolved_lfs || lfs_resolve_in_flight) return;
-                const lfs = host.gitLfs;
-                if (!lfs) return;
-                lfs_resolve_in_flight = true;
-                // One click, both sides — and one delivery. A comparison has
-                // two pointers, the modified side and the version it is
-                // compared against, and each is a separate object with its own
-                // fetch. Resolving only the one the banner happens to name
-                // leaves the user looking at a second, differently-worded
-                // banner, which reads as the first download having half-failed
-                // rather than as there being two.
                 //
-                // Both objects are discovered up front, by reading what each
-                // side reads, rather than by rebuilding between fetches. A
-                // rebuild delivers a snapshot, and a snapshot delivered
-                // half-resolved flashes the window through an undiffed file
-                // carrying a second Download button on the way to the
-                // comparison the user actually asked for.
+                // Every received request is settled with `lfsResolveEnded`,
+                // including the ones refused at the door: the renderer set its
+                // "Downloading…" state when it asked, and this response — not
+                // a snapshot — is what clears it. Captured before the first
+                // await and epoch-gated so a webview that reloaded mid-resolve
+                // is not handed an acknowledgement for a request its
+                // replacement never made.
+                const resolve_receiver_epoch = session.current_receiver_epoch;
                 try {
+                    if (!unresolved_lfs || lfs_resolve_in_flight) return;
+                    const lfs = host.gitLfs;
+                    if (!lfs) return;
+                    lfs_resolve_in_flight = true;
+                    // One click, both sides — and one delivery. A comparison
+                    // has two pointers, the modified side and the version it
+                    // is compared against, and each is a separate object with
+                    // its own fetch. Resolving only the one the banner happens
+                    // to name leaves the user looking at a second,
+                    // differently-worded banner, which reads as the first
+                    // download having half-failed rather than as there being
+                    // two.
+                    //
+                    // Both objects are discovered up front, by reading what
+                    // each side reads, rather than by rebuilding between
+                    // fetches. A rebuild delivers a snapshot, and a snapshot
+                    // delivered half-resolved flashes the window through an
+                    // undiffed file carrying a second Download button on the
+                    // way to the comparison the user actually asked for.
+                    //
+                    // The inner `finally` clears only the in-flight flag, and
+                    // only for the resolve that set it: a refused duplicate
+                    // returned above, before the flag, so its settlement in
+                    // the outer `finally` cannot release a resolve it never
+                    // owned.
+                    try {
                     const targets = await lfs_resolve_targets(unresolved_lfs);
                     if (disposed) return;
                     /** Whether the panel has moved on to an object this resolve
@@ -7555,11 +7572,9 @@ export function attach_viewer(
                         // diff of an LFS file made this button appear to do
                         // nothing, over and over.
                         // A port that throws rather than returning a failure
-                        // would otherwise escape past the `finally` below with
-                        // the banner still showing "Downloading…" and no way
-                        // back to a button: the state that says a resolve is
-                        // running lives in the webview, and only a delivered
-                        // snapshot clears it.
+                        // would otherwise skip the failure delivery below,
+                        // leaving a banner with no explanation and no way back
+                        // to a retry button.
                         try {
                             if (target.side === 'file' && main_reads_working_tree) {
                                 outcome = await lfs.pull(uri);
@@ -7596,11 +7611,11 @@ export function attach_viewer(
                             // rather than on it.
                             //
                             // A refresh that adopts no source delivers no
-                            // snapshot, and it is a snapshot that both carries
-                            // the failure and clears the webview's "resolving"
-                            // flag. Without this the one case that most needs
+                            // snapshot, and the failure just attached is real
+                            // viewer material only a snapshot can carry.
+                            // Without this the one case that most needs
                             // explaining — a cancelled file-size prompt, say —
-                            // leaves a disabled button and no message.
+                            // leaves a button and no message.
                             if (!await refresh_panel_source(true, 'recovery')) {
                                 session.recapture_current_projection({ deliver: true });
                             }
@@ -7640,21 +7655,32 @@ export function attach_viewer(
                         unresolved_lfs = target;
                         if (target.side === 'original') resolved_lfs_original = undefined;
                         else resolved_lfs_main = undefined;
-                        // As above: restoring the banner is pointless if no
-                        // snapshot carries it back to the webview.
+                        // Restoring the banner is pointless if no snapshot
+                        // carries it back to the webview — the restored target
+                        // is viewer material, like the failure above.
                         session.recapture_current_projection({ deliver: true });
                         return;
                     }
-                    // Every object fetched, nothing left pointing — and yet the
-                    // rebuild delivered nothing, because it failed outright
-                    // (an oversized file, an unreadable side). Falling out here
-                    // silently would leave the webview's "Downloading…" flag
-                    // set forever, since only a delivered snapshot clears it:
-                    // the download did finish, so the banner must stop claiming
-                    // otherwise even when what replaced it cannot be shown.
-                    session.recapture_current_projection({ deliver: true });
+                    // Every object fetched, nothing left pointing — and yet
+                    // the rebuild delivered nothing, because it failed
+                    // outright (an oversized file, an unreadable side). No
+                    // snapshot is owed here: nothing the panel shows has
+                    // changed, and the `lfsResolveEnded` below is what tells
+                    // the renderer the download is over. Manufacturing a
+                    // delivery just to say so is exactly the coupling this
+                    // response exists to remove.
+                    } finally {
+                        lfs_resolve_in_flight = false;
+                    }
                 } finally {
-                    lfs_resolve_in_flight = false;
+                    // Settle the request on every terminal path — success,
+                    // failure, supersession, refusal at the door, or a throw —
+                    // so the renderer's "Downloading…" state cannot outlive
+                    // the operation it describes.
+                    await post_to_receiver({
+                        type: 'lfsResolveEnded',
+                        requestId: msg.requestId,
+                    }, resolve_receiver_epoch);
                 }
                 return;
             }

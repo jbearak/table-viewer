@@ -13840,3 +13840,69 @@ describe('compare alignment progress', () => {
             .toContain('cancelCompare');
     });
 });
+
+describe('the Git LFS resolve lifecycle', () => {
+    const UNRESOLVED = {
+        side: 'file' as const,
+        oid: 'b'.repeat(64),
+        size: 24,
+        resolvable: true,
+    };
+
+    it('settles "Downloading…" only from the matching lifecycle response', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {
+            configuration: { unresolvedLfs: UNRESOLVED },
+        }));
+        await click_button('Download contents');
+        const request = post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .find((message): message is Extract<
+                WebviewMessage,
+                { type: 'resolveLfsObject' }
+            > => message.type === 'resolveLfsObject');
+        expect(request).toBeDefined();
+        expect(request!.requestId).toEqual(expect.any(String));
+        expect(get_button('Downloading…').disabled).toBe(true);
+
+        // A snapshot is not an acknowledgement: an unrelated refresh landing
+        // mid-download — same pointer, nothing resolved — must not re-enable
+        // the button while the host is still working.
+        await dispatch_host_message(refresh_snapshot_message(make_meta(['Sheet1']), {
+            configuration: { unresolvedLfs: UNRESOLVED },
+        }));
+        expect(get_button('Downloading…').disabled).toBe(true);
+
+        // Nor is someone else's ending: only the id this click minted counts.
+        await dispatch_host_message({
+            type: 'lfsResolveEnded',
+            requestId: `${request!.requestId}-not-mine`,
+        });
+        expect(get_button('Downloading…').disabled).toBe(true);
+
+        await dispatch_host_message({
+            type: 'lfsResolveEnded',
+            requestId: request!.requestId,
+        });
+        expect(get_button('Download contents').disabled).toBe(false);
+    });
+
+    it('sends one request per settled click, not per render', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(make_meta(['Sheet1']), {
+            configuration: { unresolvedLfs: UNRESOLVED },
+        }));
+        // Two synchronous clicks: React has not re-rendered the disabled
+        // button between them, so only the pending-request fence stops the
+        // duplicate.
+        const button = get_button('Download contents');
+        await act(async () => {
+            button.click();
+            button.click();
+        });
+        const requests = post_message.mock.calls
+            .map((call) => call[0] as WebviewMessage)
+            .filter((message) => message.type === 'resolveLfsObject');
+        expect(requests).toHaveLength(1);
+    });
+});
