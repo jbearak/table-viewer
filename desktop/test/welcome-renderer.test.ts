@@ -54,6 +54,10 @@ async function mount(entries: readonly RecentEntry[] = []): Promise<Harness> {
     document.body.className = '';
 
     let recent_listener: ((entries: readonly RecentEntry[]) => void) | undefined;
+    // Settles when the renderer's initial read does, so `mount` can wait on the
+    // same promise the render is chained onto rather than on a timer.
+    let recent_read: () => void;
+    const recent_settled = new Promise<void>((resolve) => { recent_read = resolve; });
     const api = {
         open_files: vi.fn(),
         open_compare: vi.fn(),
@@ -61,7 +65,12 @@ async function mount(entries: readonly RecentEntry[] = []): Promise<Harness> {
         open_dropped: vi.fn(),
         open_recent: vi.fn(),
         clear_recent: vi.fn(),
-        get_recent: vi.fn(async () => entries),
+        get_recent: vi.fn(async () => {
+            // Resolved after the return value is handed over, so awaiting this
+            // in `mount` cannot outrun the renderer's own `.then`.
+            queueMicrotask(() => recent_read());
+            return entries;
+        }),
     };
     Object.defineProperty(window, 'welcomeApi', {
         configurable: true,
@@ -83,13 +92,39 @@ async function mount(entries: readonly RecentEntry[] = []): Promise<Harness> {
     });
     vi.resetModules();
     await import('../renderer/welcome');
-    // The initial list arrives on a promise.
-    await new Promise((resolve) => { setTimeout(resolve, 0); });
+    // The initial list arrives on a promise, and `mount` must not return until
+    // it has rendered — a fixed delay would pass or fail on timing rather than
+    // on the result.
+    //
+    // Two steps, because neither alone is enough. Waiting for the stub's own
+    // promise establishes that the renderer *read* the list, which is the part
+    // an empty list gives no observable signal of: it renders zero rows, which
+    // is also what the DOM shows before the renderer has run at all. Polling
+    // then covers however many turns the render takes to land, which awaiting
+    // a fixed number of microtasks would not.
+    await recent_settled;
+    await vi.waitFor(() => {
+        expect(document.querySelectorAll('.recent-entry')).toHaveLength(entries.length);
+        expect(element('recent').hidden).toBe(entries.length === 0);
+    });
     return {
         ...api,
         emit_recent: (next) => recent_listener?.(next),
     };
 }
+
+/**
+ * Let every already-queued continuation run.
+ *
+ * For asserting that something did *not* happen, where polling is the wrong
+ * tool: a poll for the desired state is satisfied by that state still standing
+ * at the first attempt, and so passes whether or not the write that would
+ * clobber it is already queued. Draining first makes the assertion about the
+ * settled result. Not a fixed delay — a macrotask boundary is a position in the
+ * queue, not an amount of time, and the queue is deterministic here because
+ * every promise involved is one this test resolved.
+ */
+const flush_microtasks = () => new Promise((resolve) => { setTimeout(resolve, 0); });
 
 /** A drag event jsdom will carry a DataTransfer-shaped payload on. */
 function drag_event(type: string, files: readonly unknown[] = []): Event {
@@ -287,5 +322,118 @@ describe('drag and drop', () => {
         expect(document.body.classList.contains('dragging')).toBe(true);
         document.dispatchEvent(drag_event('dragleave'));
         expect(document.body.classList.contains('dragging')).toBe(false);
+    });
+});
+
+// The initial read and the pushed updates are two sources for one rail, and
+// they can land in either order. These mount the renderer directly rather than
+// through `mount`, which waits for the initial render and so cannot express a
+// list still being in flight.
+describe('the initial Recent read', () => {
+    /**
+     * Mount with a `get_recent` whose promise this test resolves by hand.
+     *
+     * Returns the resolver and the pushed-update listener, so a broadcast can
+     * be delivered while the initial read is still pending.
+     */
+    async function mount_with_pending_read(): Promise<{
+        resolve_read: (entries: readonly RecentEntry[]) => void;
+        reject_read: (reason: unknown) => void;
+        push: (entries: readonly RecentEntry[]) => void;
+    }> {
+        const markup = fs.readFileSync(
+            path.join(__dirname, '..', 'renderer', 'welcome.html'),
+            'utf8',
+        );
+        document.documentElement.innerHTML = markup
+            .replace(/^[\s\S]*?<body>/, '')
+            .replace(/<script[\s\S]*$/, '');
+
+        let resolve_read: (entries: readonly RecentEntry[]) => void = () => {};
+        let reject_read: (reason: unknown) => void = () => {};
+        const pending = new Promise<readonly RecentEntry[]>((resolve, reject) => {
+            resolve_read = resolve;
+            reject_read = reject;
+        });
+        let listener: ((entries: readonly RecentEntry[]) => void) | undefined;
+        Object.defineProperty(window, 'welcomeApi', {
+            configurable: true,
+            value: {
+                open_files: vi.fn(),
+                open_compare: vi.fn(),
+                open_preferences: vi.fn(),
+                open_dropped: vi.fn(),
+                open_recent: vi.fn(),
+                clear_recent: vi.fn(),
+                get_recent: () => pending,
+                on_recent_changed: (next: (entries: readonly RecentEntry[]) => void) => {
+                    listener = next;
+                },
+                titlebar_inset: 0,
+                titlebar_active: () => true,
+                on_titlebar_active: () => {},
+                titlebar_zoom: () => 1,
+                on_titlebar_zoom: () => {},
+                get_theme: () => theme_payload('light'),
+                on_theme_changed: () => {},
+                get_settings: async () => DEFAULT_SETTINGS,
+                on_settings_changed: () => {},
+            },
+        });
+        vi.resetModules();
+        await import('../renderer/welcome');
+        return {
+            resolve_read,
+            reject_read,
+            push: (entries) => listener?.(entries),
+        };
+    }
+
+    // The pushed list is the newer truth: it was sent after the read was
+    // already in flight. Letting the read's answer land second would leave the
+    // rail showing the older list until whatever the next broadcast happens to
+    // be — which, for a launcher sitting idle beside a viewer window, is never.
+    it('does not let a slow read overwrite a list pushed while it was pending', async () => {
+        const { resolve_read, push } = await mount_with_pending_read();
+
+        push([file('/data/pushed.csv')]);
+        expect(row_text().map(([name]) => name)).toEqual(['pushed.csv']);
+
+        // The read finally answers with what was true before the push. Its
+        // handler has to be given the chance to run before this is checked: a
+        // poll would otherwise be satisfied by the correct state that is still
+        // standing at the instant of the first attempt, and pass whether or not
+        // the stale render is about to overwrite it.
+        resolve_read([file('/data/stale.csv')]);
+        await flush_microtasks();
+
+        expect(row_text().map(([name]) => name)).toEqual(['pushed.csv']);
+    });
+
+    // A later push must still win after the read has landed: the guard is about
+    // ordering, not about ignoring the channel once it has fired.
+    it('still accepts pushes after the read has rendered', async () => {
+        const { resolve_read, push } = await mount_with_pending_read();
+
+        resolve_read([file('/data/first.csv')]);
+        await vi.waitFor(() => {
+            expect(rows()).toHaveLength(1);
+        });
+
+        push([file('/data/second.csv'), file('/data/first.csv')]);
+        expect(row_text().map(([name]) => name)).toEqual(['second.csv', 'first.csv']);
+    });
+
+    // An unhandled rejection here would be noise from a window whose other half
+    // still works, so the failure has to be absorbed into an empty rail.
+    it('renders an empty rail when the read fails', async () => {
+        const { reject_read } = await mount_with_pending_read();
+
+        reject_read(new Error('no userData'));
+
+        await vi.waitFor(() => {
+            expect(element('recent').hidden).toBe(true);
+        });
+        expect(rows()).toHaveLength(0);
     });
 });

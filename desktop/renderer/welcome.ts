@@ -99,8 +99,27 @@ function render_recent(entries: readonly RecentEntry[]): void {
     }
 }
 
-welcome_api.on_recent_changed(render_recent);
-void welcome_api.get_recent().then(render_recent);
+// A push always wins over the initial read, however the two interleave: the
+// pushed list is the newer truth, and the read was in flight before it. Without
+// the flag, a broadcast that lands while the invoke is pending renders first and
+// is then overwritten by the staler answer, leaving the rail wrong until
+// whatever the next broadcast happens to be.
+let pushed_list_rendered = false;
+welcome_api.on_recent_changed((entries) => {
+    pushed_list_rendered = true;
+    render_recent(entries);
+});
+void welcome_api.get_recent().then(
+    (entries) => {
+        if (!pushed_list_rendered) render_recent(entries);
+    },
+    () => {
+        // Nothing to show, and nothing to say about it: the rail is a
+        // convenience, and an unhandled rejection here would be noise in a
+        // window whose other half still works.
+        render_recent([]);
+    },
+);
 
 // Drag and drop. The listeners are on the document rather than on a drop zone
 // element: the whole window is the target, and the hint in the actions column
