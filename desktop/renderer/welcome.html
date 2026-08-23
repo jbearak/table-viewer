@@ -25,19 +25,18 @@
   main {
     height: 100%;
     display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 14px;
   }
-  h1 {
-    margin: 0;
-    font-size: calc(var(--welcome-font-size) * 1.6);
-    font-weight: 600;
-  }
+  /* Actions on the left, Recent on the right. The rail is last in the DOM so
+     the actions come first for a keyboard and a screen reader both. */
   #actions {
+    flex: 1;
+    min-width: 0;
     display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: flex-start;
     gap: 8px;
+    padding: 0 28px 0 40px;
   }
   button {
     font: inherit;
@@ -49,16 +48,143 @@
     cursor: pointer;
   }
   button:hover { background: var(--welcome-hover-bg, rgba(128,128,128,0.25)); }
+  /* The three actions are one column of equal-width buttons rather than a row:
+     a left-aligned stack reads as a list of things to do, and the labels differ
+     enough in length that a row would look ragged. */
+  #actions button {
+    width: 15.5em;
+    max-width: 100%;
+    text-align: left;
+  }
+  /* Set apart from the buttons rather than spaced like one of them: at the
+     stack's own 8px gap this read as a fourth, unclickable menu item. In `em`
+     so the separation survives the font-size preference — a fixed gap closes
+     back up at 20px text, which is where the hint also wraps to two lines and
+     needs the room most. */
+  #drop-hint {
+    color: var(--welcome-muted-fg, #767676);
+    margin-top: 1.5em;
+    /* The stack is content-width; the hint may wrap, so hold it to the same
+       measure instead of letting it run to the column's padding. */
+    max-width: 21em;
+    line-height: 1.45;
+  }
+  /* Shown only while a drag is over the window, so the drop target is visible
+     at the moment it matters and is silent the rest of the time. */
+  #drop-overlay {
+    position: fixed;
+    inset: 8px;
+    border: 2px dashed var(--welcome-accent, #0a64c8);
+    border-radius: 10px;
+    background: var(--welcome-bg, #ffffff);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    /* Above the page, and transparent to the drag events themselves: the
+       listeners are on the document, and an overlay that swallowed dragleave
+       would latch itself on permanently. */
+    pointer-events: none;
+    z-index: 1;
+  }
+  body.dragging #drop-overlay { display: flex; }
+
+  #recent {
+    width: 19em;
+    flex: none;
+    border-left: 1px solid var(--welcome-border, #d0d0d0);
+    padding: 24px 12px 24px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    overflow-y: auto;
+  }
+  /* Nothing opened yet: the rail would be an empty bordered column, which reads
+     as a rendering failure. Hidden until it has something to say. */
+  #recent[hidden] { display: none; }
+  #recent-heading {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 0.85em;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--welcome-muted-fg, #767676);
+    margin-bottom: 6px;
+  }
+  /* Not uppercased or letter-spaced like the heading beside it: it is a control,
+     not a second label, and matching the heading made the two compete. */
+  #clear-recent {
+    border: 0;
+    background: none;
+    padding: 2px 5px;
+    border-radius: 4px;
+    font-size: inherit;
+    letter-spacing: normal;
+    text-transform: none;
+    color: inherit;
+  }
+  .recent-entry {
+    display: block;
+    width: 100%;
+    text-align: left;
+    border: 0;
+    background: none;
+    padding: 5px 8px;
+    border-radius: 5px;
+    color: inherit;
+  }
+  .recent-entry .name {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .recent-entry .location {
+    display: block;
+    font-size: 0.85em;
+    color: var(--welcome-muted-fg, #767676);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* The rail's controls are borderless, so hover is the only thing that makes
+     them look pressable at all. */
+  .recent-entry:hover, #clear-recent:hover {
+    background: var(--welcome-hover-bg, rgba(128,128,128,0.25));
+    cursor: pointer;
+  }
+  /* Focus must stay visible on the borderless controls too: the default ring is
+     drawn against the button's own background, which here is the page. */
+  .recent-entry:focus-visible, #clear-recent:focus-visible {
+    outline: 2px solid var(--welcome-accent, #0a64c8);
+    outline-offset: -2px;
+  }
 </style>
 </head>
 <body>
 <main>
-  <h1>Table Viewer</h1>
   <div id="actions">
     <button id="open">Open File…</button>
+    <button id="compare">Compare Files…</button>
     <button id="preferences">Preferences…</button>
+    <!-- Names the extensions rather than saying "a table": the word describes
+         what the app is for, not what it will accept, and the four types are
+         the actual question someone has at this point. Kept in step with
+         SUPPORTED_FILE_EXTENSIONS by a test in desktop/test/welcome-renderer.test.ts. -->
+    <div id="drop-hint">…or drop an .xlsx, .xls, .csv, or .tsv file here.</div>
   </div>
+  <!-- Populated by the renderer; a region so its updates are reachable rather
+       than announced, since the list changes when the user acts elsewhere. -->
+  <aside id="recent" hidden aria-labelledby="recent-label">
+    <div id="recent-heading">
+      <span id="recent-label">Recent</span>
+      <button id="clear-recent" title="Forget the recent list">Clear</button>
+    </div>
+    <div id="recent-list"></div>
+  </aside>
 </main>
+<div id="drop-overlay">Drop to open</div>
 <script src="./welcome.js"></script>
 </body>
 </html>

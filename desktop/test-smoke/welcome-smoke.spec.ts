@@ -35,7 +35,11 @@ test.afterAll(async () => {
 test('launching with no file shows the launcher', async () => {
     const page = welcome_pages()[0];
     await expect(page.getByRole('button', { name: 'Open File…' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Compare Files…' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Preferences…' })).toBeVisible();
+    // Nothing has been opened under this isolated userData directory, so the
+    // Recent rail has nothing to show and must stay out of the way.
+    await expect(page.locator('#recent')).toBeHidden();
     expect(app.windows()).toHaveLength(1);
 
     // The buttons are static markup, so their presence alone would also pass with
@@ -67,6 +71,90 @@ test('the launcher opens Preferences', async () => {
             ?.close();
     });
     await expect.poll(() => app.windows().length, { timeout: 15_000 }).toBe(1);
+});
+
+// Compare Files… is why the launcher has a Recent rail and a third button at
+// all: the feature was previously reachable only from the File menu. Its dialog
+// is observable without a native file picker, exactly as Preferences is.
+test('the launcher opens the Compare Files dialog', async () => {
+    const page = welcome_pages()[0];
+    await page.getByRole('button', { name: 'Compare Files…' }).click();
+    await expect
+        .poll(() => app.windows().filter((entry) => entry.url().endsWith('compare.html')).length,
+            { timeout: 15_000 })
+        .toBe(1);
+
+    await app.evaluate(({ BrowserWindow }) => {
+        BrowserWindow.getAllWindows()
+            .find((window) => window.getTitle().includes('Compare'))
+            ?.close();
+    });
+    // The launcher is still there: only the dialog went away. It steps aside
+    // when a comparison actually opens, which is not what happened here.
+    await expect.poll(() => app.windows().length, { timeout: 15_000 }).toBe(1);
+});
+
+// The Recent rail, end to end: opening a file has to reach the store, and a
+// launcher opened afterwards has to render it. Its own app with its own
+// userData, because every other test in this file asserts against an empty
+// rail and a shared launcher window.
+test('the Recent rail lists a file this app opened', async () => {
+    const own_user_data = isolated_user_data('tv-recent-smoke-');
+    const work_dir = fs.mkdtempSync(path.join(own_user_data, 'files-'));
+    const csv_path = path.join(work_dir, 'survey.csv');
+    fs.writeFileSync(csv_path, 'Region,Units\nNorth,10\n');
+    const own_app = await launch_app(own_user_data, [csv_path]);
+    try {
+        // The file's own viewer window, which is what writes the entry.
+        await expect
+            .poll(
+                () => own_app.windows().filter((page) => page.url().startsWith('tv-app://viewer'))
+                    .length,
+                { timeout: 30_000 },
+            )
+            .toBe(1);
+        // The store is written by the open, not by the launcher's render.
+        await expect
+            .poll(
+                () => {
+                    const file = path.join(own_user_data, 'recent-documents.json');
+                    if (!fs.existsSync(file)) return null;
+                    return JSON.parse(fs.readFileSync(file, 'utf8'));
+                },
+                { timeout: 30_000 },
+            )
+            .toEqual([{ kind: 'file', path: csv_path, openedAt: expect.any(Number) }]);
+
+        await click_menu_item(own_app, 'File', 'New Window');
+        let launcher: import('@playwright/test').Page | undefined;
+        await expect.poll(
+            () => (launcher = own_app.windows()
+                .find((page) => page.url().endsWith('welcome.html'))),
+            { timeout: 15_000 },
+        ).toBeTruthy();
+
+        const rail = launcher!.locator('#recent');
+        await expect(rail).toBeVisible();
+        await expect(rail.locator('.recent-entry')).toHaveCount(1);
+        await expect(rail.locator('.recent-entry .name')).toHaveText('survey.csv');
+        // The row is the real thing, not a label: clicking it routes through the
+        // same open path as everything else, so the launcher steps aside. This
+        // file is already open, so that path focuses the window it is in rather
+        // than making a second one — the launcher closing is the signal.
+        await rail.locator('.recent-entry').click();
+        await expect
+            .poll(
+                () => own_app.windows().filter((page) => page.url().endsWith('welcome.html'))
+                    .length,
+                { timeout: 15_000 },
+            )
+            .toBe(0);
+    } finally {
+        await own_app.close().catch(() => {
+            // Already gone.
+        });
+        fs.rmSync(own_user_data, { recursive: true, force: true });
+    }
 });
 
 // The new-window-size mode is the one preference whose two states change what

@@ -78,6 +78,13 @@ import {
     unique_completion,
 } from './compare-path-complete';
 import { save_open_window_paths, take_open_window_paths } from './window-restoration';
+import {
+    clear_recent_entries,
+    read_recent_entries,
+    record_recent_entry,
+    usable_recent_entries,
+    type RecentEntry,
+} from './recent-documents';
 import { REPOSITORY_URL, about_link_url } from './about-links';
 import {
     create_app_update_coordinator,
@@ -135,8 +142,14 @@ import {
     CHANNEL_TITLEBAR_ACTIVE_CHANGED,
     CHANNEL_TITLEBAR_ZOOM,
     CHANNEL_TITLEBAR_ZOOM_CHANGED,
+    CHANNEL_WELCOME_CLEAR_RECENT,
+    CHANNEL_WELCOME_GET_RECENT,
+    CHANNEL_WELCOME_OPEN_COMPARE,
+    CHANNEL_WELCOME_OPEN_DROPPED,
     CHANNEL_WELCOME_OPEN_FILES,
     CHANNEL_WELCOME_OPEN_PREFERENCES,
+    CHANNEL_WELCOME_OPEN_RECENT,
+    CHANNEL_WELCOME_RECENT_CHANGED,
     type ComparePathCheck,
     type CompareSubmitResult,
     type CompareFilesRequest,
@@ -631,7 +644,20 @@ function submit_window_request(request: DesktopWindowRequest, source?: BrowserWi
         }
         if (!viewer_windows) return;
         if (action.kind === 'compare-files') {
-            viewer_windows.open_comparison(action.originalPath, action.modifiedPath);
+            const comparison = viewer_windows.open_comparison(
+                action.originalPath,
+                action.modifiedPath,
+            );
+            // Only a comparison that actually reached the screen is worth
+            // offering again from the launcher.
+            if (comparison) {
+                remember_recent({
+                    kind: 'comparison',
+                    originalPath: action.originalPath,
+                    modifiedPath: action.modifiedPath,
+                    openedAt: Date.now(),
+                });
+            }
             // The dialog is done the moment the comparison is on screen.
             close_compare_window();
             const launcher = source && welcome_windows.has(source) ? source : undefined;
@@ -646,6 +672,9 @@ function submit_window_request(request: DesktopWindowRequest, source?: BrowserWi
                 if (process.platform === 'darwin' || process.platform === 'win32') {
                     app.addRecentDocument(file);
                 }
+                // The launcher's own list, which the OS list cannot be read back
+                // into — see desktop/main/recent-documents.ts.
+                remember_recent({ kind: 'file', path: file, openedAt: Date.now() });
                 opened_any = true;
             }
         }
@@ -683,8 +712,13 @@ function apply_zoom(delta: number | 'reset', window: Electron.BaseWindow | undef
  *  be open at once; each is independent. */
 function show_welcome_window(): BrowserWindow {
     const window = new BrowserWindow({
-        width: 520,
-        height: 300,
+        // Wide enough for the actions column and the Recent rail beside it, and
+        // tall enough that the rail's display limit fits without scrolling at
+        // the default font size. Still fixed: the launcher has no content that
+        // benefits from more room, and a resizable window whose two columns are
+        // both content-sized would only ever grow its empty middle.
+        width: 720,
+        height: 420,
         resizable: false,
         maximizable: false,
         fullscreenable: false,
@@ -703,6 +737,70 @@ function show_welcome_window(): BrowserWindow {
     window.once('closed', () => welcome_windows.delete(window));
     void window.loadFile(path.join(DESKTOP_DIST_DIR, 'welcome.html'));
     return window;
+}
+
+/** The Recent rows worth showing: stored entries whose files are still openable
+ *  now, capped at the display limit. Filtered here rather than in the renderer,
+ *  which cannot reach the filesystem. */
+function displayable_recent_entries(): RecentEntry[] {
+    return usable_recent_entries(
+        read_recent_entries(app.getPath('userData')),
+        can_restore_file,
+    );
+}
+
+/**
+ * What a launcher's Recent click is asking for, or nothing.
+ *
+ * The renderer sends back the entry it was given, so this re-checks both the
+ * shape and the files: an entry is only actionable if its paths are still
+ * openable, and the round trip through a renderer is a trust boundary
+ * regardless of where the value originally came from.
+ */
+function welcome_recent_request(
+    value: unknown,
+): { kind: 'file'; path: string }
+    | { kind: 'comparison'; originalPath: string; modifiedPath: string }
+    | undefined {
+    if (typeof value !== 'object' || value === null) return undefined;
+    const entry = value as Record<string, unknown>;
+    if (entry.kind === 'file') {
+        return typeof entry.path === 'string' && can_restore_file(entry.path)
+            ? { kind: 'file', path: entry.path }
+            : undefined;
+    }
+    if (entry.kind === 'comparison') {
+        const { originalPath, modifiedPath } = entry;
+        return typeof originalPath === 'string' && typeof modifiedPath === 'string'
+            && can_restore_file(originalPath) && can_restore_file(modifiedPath)
+            ? { kind: 'comparison', originalPath, modifiedPath }
+            : undefined;
+    }
+    return undefined;
+}
+
+/** Tell every launcher on screen that the list changed. */
+function broadcast_recent_entries(): void {
+    const entries = displayable_recent_entries();
+    for (const window of welcome_windows) {
+        if (!window.isDestroyed() && !window.webContents.isDestroyed()) {
+            window.webContents.send(CHANNEL_WELCOME_RECENT_CHANGED, entries);
+        }
+    }
+}
+
+/** Record one opened document in the launcher's list and refresh any launcher
+ *  still on screen. Never allowed to fail the open it is reporting: the list is
+ *  a convenience, and an unwritable userData directory is not a reason to
+ *  refuse to show a file. */
+function remember_recent(entry: RecentEntry): void {
+    try {
+        record_recent_entry(app.getPath('userData'), entry);
+    } catch {
+        // Best effort; the document is already open.
+        return;
+    }
+    broadcast_recent_entries();
 }
 
 async function show_open_dialog(source?: BrowserWindow): Promise<void> {
@@ -1210,6 +1308,46 @@ function register_ipc(): void {
         void show_open_dialog(BrowserWindow.fromWebContents(event.sender) ?? undefined);
     });
     ipcMain.on(CHANNEL_WELCOME_OPEN_PREFERENCES, () => show_preferences_window());
+    ipcMain.on(CHANNEL_WELCOME_OPEN_COMPARE, (event) => {
+        show_compare_window(BrowserWindow.fromWebContents(event.sender) ?? undefined);
+    });
+    ipcMain.on(CHANNEL_WELCOME_OPEN_DROPPED, (event, paths: unknown) => {
+        if (!Array.isArray(paths)) return;
+        open_files(
+            paths.filter((entry): entry is string => typeof entry === 'string'),
+            BrowserWindow.fromWebContents(event.sender) ?? undefined,
+        );
+    });
+    ipcMain.on(CHANNEL_WELCOME_OPEN_RECENT, (event, entry: unknown) => {
+        const source = BrowserWindow.fromWebContents(event.sender) ?? undefined;
+        // Re-validated here rather than trusted: the row was rendered from a
+        // list read at some earlier point, and the file may have moved since.
+        // A vanished entry leaves the launcher up with the row still there —
+        // the next refresh drops it, and refusing silently beats closing the
+        // launcher to show nothing.
+        const request = welcome_recent_request(entry);
+        if (!request) return;
+        if (request.kind === 'file') {
+            open_files([request.path], source);
+            return;
+        }
+        submit_window_request(
+            {
+                kind: 'compare-files',
+                originalPath: request.originalPath,
+                modifiedPath: request.modifiedPath,
+            },
+            source,
+        );
+    });
+    ipcMain.on(CHANNEL_WELCOME_CLEAR_RECENT, () => {
+        clear_recent_entries(app.getPath('userData'));
+        // Both lists, so the launcher and the dock menu cannot disagree about
+        // what the app remembers.
+        app.clearRecentDocuments();
+        broadcast_recent_entries();
+    });
+    ipcMain.handle(CHANNEL_WELCOME_GET_RECENT, () => displayable_recent_entries());
     ipcMain.on(CHANNEL_APP_UPDATE_GET_STATE, (event) => {
         event.returnValue = BrowserWindow.fromWebContents(event.sender) === app_update_window
             ? app_update_presenter.state
