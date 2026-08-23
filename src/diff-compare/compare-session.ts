@@ -26,7 +26,7 @@ import {
     type SheetPairing,
     type SheetPairStatus,
 } from './compare-source';
-import { get_cell_comparison_text } from '../cell-display';
+import { get_cell_comparison_text, get_raw_cell_text } from '../cell-display';
 import type { MergeRange } from '../types';
 import {
     ABSENT,
@@ -527,8 +527,13 @@ export class CompareDataSource implements DataSource {
                 const original_row = original_batch[index] ?? [];
                 const modified_row = modified_batch[index] ?? [];
                 for (let col = 0; col < column_count; col++) {
-                    const base = get_cell_comparison_text(original_row[col]);
-                    if (base !== get_cell_comparison_text(modified_row[col])) {
+                    // Compare on identity, which is lossless for binary strLs,
+                    // but report the display text: `base` is shown to the user.
+                    if (
+                        get_cell_comparison_text(original_row[col])
+                        !== get_cell_comparison_text(modified_row[col])
+                    ) {
+                        const base = get_raw_cell_text(original_row[col]?.raw ?? null);
                         changed_cells.push({ row: position, col, base });
                     }
                 }

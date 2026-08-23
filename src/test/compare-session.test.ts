@@ -1,7 +1,33 @@
 import { describe, expect, it } from 'vitest';
 import { CompareDataSource, align_workbook } from '../diff-compare/compare-session';
-import type { DataSource } from '../data-source/interface';
+import type { DataSource, RenderedCell, WorkbookMeta } from '../data-source/interface';
 import { FixtureSource } from './helpers/fixture-source';
+
+/** Serves cells verbatim, unlike FixtureSource's string rows, so a test can
+ *  give a cell the `comparisonKey` a Stata binary strL carries. */
+class StubSource implements DataSource {
+    constructor(private readonly rows: RenderedCell[][]) {}
+
+    meta(): WorkbookMeta {
+        return {
+            hasFormatting: false,
+            sheets: [{
+                name: 'Sheet1',
+                rowCount: this.rows.length,
+                sourceRowCount: this.rows.length,
+                columnCount: this.rows.reduce((w, r) => Math.max(w, r.length), 0),
+                merges: [],
+                hasFormatting: false,
+            }],
+        };
+    }
+
+    read_rows(_sheet: number, start_row: number, count: number) {
+        return { startRow: start_row, rows: this.rows.slice(start_row, start_row + count) };
+    }
+
+    close(): void {}
+}
 
 /** The production path serves whole transformed windows via `diff_rows`; these
  *  tests want a plain leading page, so they name the rows themselves, clamped
@@ -60,6 +86,36 @@ describe('CompareDataSource', () => {
         expect(diff_page(source, 1, 10)).toMatchObject({
             rowStatus: ['added'], changedCells: [],
         });
+    });
+
+    // A Stata binary strL renders a bounded preview, so two different payloads
+    // can share `raw`. Comparison has to use the lossless `comparisonKey`, but
+    // `base` is shown to the user and must stay the readable preview — never
+    // the digest, and never an internal `raw:`/`comparison:` tag.
+    it('compares on identity but reports the display text as the base', () => {
+        const preview = 'binary (33 bytes): 0102030405…';
+        const binary = (digest: string): RenderedCell => ({
+            raw: preview,
+            formatted: preview,
+            bold: false,
+            italic: false,
+            rawType: 'string',
+            comparisonKey: `stata-binary:sha256:${digest}:33`,
+        });
+        const source = new CompareDataSource(
+            new StubSource([[binary('bbbb')]]),
+            new StubSource([[binary('aaaa')]]),
+        );
+        // Same preview, different payloads: caught only via comparisonKey.
+        expect(source.diff_rows(0, [0])?.changedCells)
+            .toEqual([{ row: 0, col: 0, base: preview }]);
+
+        // Identical payloads must stay unchanged rather than diffing on the tag.
+        const unchanged = new CompareDataSource(
+            new StubSource([[binary('aaaa')]]),
+            new StubSource([[binary('aaaa')]]),
+        );
+        expect(unchanged.diff_rows(0, [0])?.changedCells).toEqual([]);
     });
 
     it('exposes pairings including added and deleted sheets', () => {
