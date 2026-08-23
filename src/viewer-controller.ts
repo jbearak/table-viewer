@@ -36,7 +36,7 @@ import { CompareDataSource, align_workbook } from './diff-compare/compare-sessio
 import { AlignmentCancelledError } from './diff-compare/row-alignment';
 import type { UnresolvedLfsObject, WorkbookSnapshotCompare } from './viewer-snapshot';
 import type { GitLfsResolveOutcome } from './host-ports';
-import { parse_git_lfs_pointer } from './git-lfs-pointer';
+import { MAX_POINTER_BYTES, parse_git_lfs_pointer } from './git-lfs-pointer';
 import { UnresolvedLfsDataSource } from './data-source/unresolved-lfs-source';
 import {
     assert_safe_file_size,
@@ -3958,6 +3958,59 @@ export function attach_viewer(
     }
 
     /**
+     * Every unfetched pointer this panel would have to download to show what it
+     * was asked to show, starting from the one the banner names.
+     *
+     * Only one side can ever need discovering, and it is always the original.
+     * The sides are read in order: the original is reached only once the
+     * modified side has parsed, so a banner naming the *original* already
+     * proves the modified side is real bytes, and a banner naming the *file*
+     * means the build returned before the original was read at all. So the
+     * second pointer is looked for in exactly that one case.
+     *
+     * Discovering it here rather than after a rebuild is the whole point: a
+     * comparison's second pointer used to become visible only once the panel
+     * was rebuilt, and a rebuild delivers a snapshot — so the window flashed
+     * through an undiffed grid carrying a second Download button before the
+     * comparison arrived.
+     *
+     * A side whose bytes are already cached is not a target — its oid is
+     * matched, so a refresh that moved to a different revision still reports
+     * the pointer it actually found. Neither is an unreadable side: there is
+     * nothing to fetch for a URI that cannot be read, and the ordinary load
+     * path is what reports that.
+     */
+    async function lfs_resolve_targets(
+        named: UnresolvedLfsObject,
+    ): Promise<readonly UnresolvedLfsObject[]> {
+        if (named.side !== 'file' || !compare_original_uri) return [named];
+        try {
+            // Sized before it is read. This side may be the real table — a
+            // hundred megabytes of committed `.xlsx` — and the only question
+            // asked of it is whether it is a pointer, which the spec caps at a
+            // kilobyte. Pulling the whole blob into memory to answer that is
+            // exactly the cost the ordinary load path already pays once; paying
+            // it a second time here is avoidable.
+            const stat = await host.fs.stat(compare_original_uri);
+            if (stat.size > MAX_POINTER_BYTES) return [named];
+            const pointer = parse_git_lfs_pointer(
+                await host.fs.read_file(compare_original_uri),
+            );
+            if (!pointer || resolved_lfs_original?.oid === pointer.oid) return [named];
+            // `resolvable` is true by construction: the handler established
+            // that the host has a git-lfs port before asking for targets.
+            return [named, {
+                side: 'original',
+                oid: pointer.oid,
+                size: pointer.size,
+                resolvable: true,
+            }];
+        } catch {
+            return [named];
+        }
+    }
+
+    /**
      * Whether `target`'s side is *still* an unresolved pointer, read from the
      * host rather than inferred from a refresh's return value.
      *
@@ -7444,132 +7497,130 @@ export function attach_viewer(
                 const lfs = host.gitLfs;
                 if (!lfs) return;
                 lfs_resolve_in_flight = true;
-                // One click, both sides. A comparison has two pointers — the
-                // modified side and the version it is compared against — and
-                // each is a separate object with its own fetch. Resolving only
-                // the one the banner happens to name leaves the user looking at
-                // a second, differently-worded banner, which reads as the first
-                // download having half-failed rather than as there being two.
+                // One click, both sides — and one delivery. A comparison has
+                // two pointers, the modified side and the version it is
+                // compared against, and each is a separate object with its own
+                // fetch. Resolving only the one the banner happens to name
+                // leaves the user looking at a second, differently-worded
+                // banner, which reads as the first download having half-failed
+                // rather than as there being two.
                 //
-                // Bounded by the objects already attempted rather than by a
-                // count: the loop advances only to a pointer it has not fetched,
-                // so a side that stays unresolved ends it instead of retrying
-                // forever.
-                const attempted = new Set<string>();
+                // Both objects are discovered up front, by reading what each
+                // side reads, rather than by rebuilding between fetches. A
+                // rebuild delivers a snapshot, and a snapshot delivered
+                // half-resolved flashes the window through an undiffed file
+                // carrying a second Download button on the way to the
+                // comparison the user actually asked for.
                 try {
-                    for (;;) {
-                    const target = unresolved_lfs;
-                    if (!target) return;
-                    const attempt_key = `${target.side}:${target.oid}`;
-                    if (attempted.has(attempt_key)) return;
-                    attempted.add(attempt_key);
-                    // Which side decides the operation, and they are not
-                    // interchangeable. A working-tree pointer is fixed on disk
-                    // by `pull`; the original side has no disk state to fix, so
-                    // its object is smudged into memory for this comparison.
-                    // The fetched bytes are carried out of the branch rather
-                    // than read off the outcome afterwards, because only the
-                    // smudge outcome has any — the side and the shape of the
-                    // result correspond, and this keeps that visible.
-                    let fetched: Uint8Array | undefined;
-                    let outcome: GitLfsResolveOutcome;
-                    // Which operation repairs *this* side's read. `pull`
-                    // rewrites the working tree, so it only helps a side that
-                    // reads the working tree. A comparison's modified side can
-                    // itself be a `git:` revision, and then `pull` "succeeds"
-                    // against a working-tree file the panel never reads while
-                    // the next read returns the pointer again — which is
-                    // exactly how a real staged-vs-HEAD diff of an LFS file
-                    // made this button appear to do nothing, over and over.
-                    const main_reads_working_tree = uri.scheme === 'file';
-                    // A port that throws rather than returning a failure would
-                    // otherwise escape past the `finally` below with the banner
-                    // still showing "Downloading…" and no way back to a button:
-                    // the state that says a resolve is running lives in the
-                    // webview, and only a delivered snapshot clears it.
-                    try {
-                        if (target.side === 'file' && main_reads_working_tree) {
-                            outcome = await lfs.pull(uri);
-                        } else if (target.side === 'file') {
-                            const smudged = await lfs.smudge(uri, {
-                                oid: target.oid,
-                                size: target.size,
-                            });
-                            if (smudged.type === 'resolved') fetched = smudged.content;
-                            outcome = smudged.type === 'resolved'
-                                ? { type: 'resolved' }
-                                : smudged;
-                        } else {
-                            const smudged = await lfs.smudge(compare_original_uri ?? uri, {
-                                oid: target.oid,
-                                size: target.size,
-                            });
-                            if (smudged.type === 'resolved') fetched = smudged.content;
-                            outcome = smudged.type === 'resolved'
-                                ? { type: 'resolved' }
-                                : smudged;
-                        }
-                    } catch (error) {
-                        log_sanitized_failure('Git LFS resolve failed', error);
-                        outcome = { type: 'failed', reason: 'failed' };
-                    }
+                    const targets = await lfs_resolve_targets(unresolved_lfs);
                     if (disposed) return;
-                    // The panel may have moved on to a different pointer — or to
-                    // no pointer at all — while the fetch was in flight. Landing
-                    // this outcome on whatever is current now would attach a
-                    // failure to the wrong object.
-                    //
-                    // Compared by side and oid rather than by identity: an
-                    // intervening delivery rebuilds the source and records the
-                    // same pointer as a fresh object, so identity would reject
-                    // every outcome for the compare-original side, whose record
-                    // is rewritten on every build.
-                    const current = unresolved_lfs;
-                    if (
-                        current === undefined
-                        || current.side !== target.side
-                        || current.oid !== target.oid
-                    ) return;
-                    if (outcome.type === 'failed') {
-                        unresolved_lfs = {
-                            ...target,
-                            failure: {
-                                reason: outcome.reason,
-                                ...(outcome.detail === undefined
-                                    ? {}
-                                    : { detail: outcome.detail }),
-                            },
-                        };
-                        // Re-deliver so the banner can explain the failure. The
-                        // source has not changed, which is exactly why this
-                        // state lives on the controller rather than on it.
-                        //
-                        // A refresh that adopts no source delivers no snapshot,
-                        // and it is a snapshot that both carries the failure and
-                        // clears the webview's "resolving" flag. Without this the
-                        // one case that most needs explaining — a cancelled
-                        // file-size prompt, say — leaves a disabled button and no
-                        // message. Projecting directly is safe precisely because
-                        // nothing about the source changed.
-                        if (!await refresh_panel_source(true, 'recovery')) {
-                            session.recapture_current_projection({ deliver: true });
+                    /** Whether the panel has moved on to an object this resolve
+                     *  never set out to fetch — landing an outcome on it would
+                     *  attach the failure to the wrong pointer. Compared by
+                     *  side and oid rather than by identity, because an
+                     *  intervening delivery rebuilds the source and records the
+                     *  same pointer as a fresh object, so identity would reject
+                     *  every outcome for the compare-original side, whose
+                     *  record is rewritten on every build. */
+                    const superseded = (): boolean => {
+                        const current = unresolved_lfs;
+                        return current !== undefined && !targets.some(
+                            (candidate) => candidate.side === current.side
+                                && candidate.oid === current.oid,
+                        );
+                    };
+                    // Panel-level policy, not per-target: which operation a
+                    // side needs depends on what *this panel* reads.
+                    const main_reads_working_tree = uri.scheme === 'file';
+                    for (const target of targets) {
+                        if (disposed || superseded()) return;
+                        // Which side decides the operation, and they are not
+                        // interchangeable. A working-tree pointer is fixed on
+                        // disk by `pull`; the original side has no disk state
+                        // to fix, so its object is smudged into memory for this
+                        // comparison. The fetched bytes are carried out of the
+                        // branch rather than read off the outcome afterwards,
+                        // because only the smudge outcome has any — the side
+                        // and the shape of the result correspond, and this
+                        // keeps that visible.
+                        let fetched: Uint8Array | undefined;
+                        let outcome: GitLfsResolveOutcome;
+                        // Which operation repairs *this* side's read. `pull`
+                        // rewrites the working tree, so it only helps a side
+                        // that reads the working tree. A comparison's modified
+                        // side can itself be a `git:` revision, and then `pull`
+                        // "succeeds" against a working-tree file the panel
+                        // never reads while the next read returns the pointer
+                        // again — which is exactly how a real staged-vs-HEAD
+                        // diff of an LFS file made this button appear to do
+                        // nothing, over and over.
+                        // A port that throws rather than returning a failure
+                        // would otherwise escape past the `finally` below with
+                        // the banner still showing "Downloading…" and no way
+                        // back to a button: the state that says a resolve is
+                        // running lives in the webview, and only a delivered
+                        // snapshot clears it.
+                        try {
+                            if (target.side === 'file' && main_reads_working_tree) {
+                                outcome = await lfs.pull(uri);
+                            } else {
+                                const smudged = await lfs.smudge(
+                                    target.side === 'file'
+                                        ? uri
+                                        : compare_original_uri ?? uri,
+                                    { oid: target.oid, size: target.size },
+                                );
+                                if (smudged.type === 'resolved') fetched = smudged.content;
+                                outcome = smudged.type === 'resolved'
+                                    ? { type: 'resolved' }
+                                    : smudged;
+                            }
+                        } catch (error) {
+                            log_sanitized_failure('Git LFS resolve failed', error);
+                            outcome = { type: 'failed', reason: 'failed' };
                         }
-                        return;
-                    }
-                    if (fetched) {
-                        if (target.side === 'file') {
-                            resolved_lfs_main = { oid: target.oid, content: fetched };
-                        } else {
-                            resolved_lfs_original = { oid: target.oid, content: fetched };
+                        if (disposed || superseded()) return;
+                        if (outcome.type === 'failed') {
+                            unresolved_lfs = {
+                                ...target,
+                                failure: {
+                                    reason: outcome.reason,
+                                    ...(outcome.detail === undefined
+                                        ? {}
+                                        : { detail: outcome.detail }),
+                                },
+                            };
+                            // Re-deliver so the banner can explain the failure.
+                            // The source has not changed for this side, which is
+                            // exactly why this state lives on the controller
+                            // rather than on it.
+                            //
+                            // A refresh that adopts no source delivers no
+                            // snapshot, and it is a snapshot that both carries
+                            // the failure and clears the webview's "resolving"
+                            // flag. Without this the one case that most needs
+                            // explaining — a cancelled file-size prompt, say —
+                            // leaves a disabled button and no message.
+                            if (!await refresh_panel_source(true, 'recovery')) {
+                                session.recapture_current_projection({ deliver: true });
+                            }
+                            return;
+                        }
+                        if (fetched) {
+                            if (target.side === 'file') {
+                                resolved_lfs_main = { oid: target.oid, content: fetched };
+                            } else {
+                                resolved_lfs_original = { oid: target.oid, content: fetched };
+                            }
                         }
                     }
                     // Cleared before the rebuild rather than after: the build
-                    // sets it again if the side is still a pointer, and leaving
-                    // a stale failure in place would outlive the retry it
+                    // sets it again if a side is still a pointer, and leaving a
+                    // stale failure in place would outlive the retry it
                     // describes.
                     unresolved_lfs = undefined;
                     if (
-                        !await refresh_panel_source(true, 'recovery')
+                        await refresh_panel_source(true, 'recovery')
                         // `false` also means "superseded", not just "failed",
                         // and conflating the two is what made the button look
                         // broken on real files. `git lfs pull` rewrites the
@@ -7578,11 +7629,12 @@ export function attach_viewer(
                         // and restored the banner *over the real table the
                         // other load had just delivered*. Re-reading the
                         // pointer state is the honest test: a build that ran
-                        // since has already set it if the file is still a
+                        // since has already set it if a side is still a
                         // pointer, and left it clear if it is not.
-                        && unresolved_lfs === undefined
-                        && await file_is_still_a_pointer(target)
-                    ) {
+                        || unresolved_lfs !== undefined
+                    ) return;
+                    for (const target of targets) {
+                        if (!await file_is_still_a_pointer(target)) continue;
                         // Genuinely still unresolved, so the action has to stay
                         // retryable: with no banner there is no button.
                         unresolved_lfs = target;
@@ -7593,12 +7645,14 @@ export function attach_viewer(
                         session.recapture_current_projection({ deliver: true });
                         return;
                     }
-                    // Round again. The rebuild that just ran reads the side
-                    // this fetch repaired, and a comparison's *other* side is
-                    // only reached once the first one parses — so the second
-                    // pointer becomes visible here and nowhere earlier. If
-                    // there is none, the loop's own guard ends it.
-                    }
+                    // Every object fetched, nothing left pointing — and yet the
+                    // rebuild delivered nothing, because it failed outright
+                    // (an oversized file, an unreadable side). Falling out here
+                    // silently would leave the webview's "Downloading…" flag
+                    // set forever, since only a delivered snapshot clears it:
+                    // the download did finish, so the banner must stop claiming
+                    // otherwise even when what replaced it cannot be shown.
+                    session.recapture_current_projection({ deliver: true });
                 } finally {
                     lfs_resolve_in_flight = false;
                 }

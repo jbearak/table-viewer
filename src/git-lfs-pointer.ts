@@ -31,8 +31,14 @@
  * before a single byte is decoded.
  */
 
-/** The spec's hard limit on a pointer file, in bytes. */
-const MAX_POINTER_BYTES = 1024;
+/**
+ * The spec's hard limit on a pointer file, in bytes.
+ *
+ * Exported so a caller that has a file's *size* but not yet its bytes can rule
+ * a pointer out without reading it — worth doing when the file may be large and
+ * the only question is whether it is a pointer.
+ */
+export const MAX_POINTER_BYTES = 1024;
 
 const VERSION_LINE = 'version https://git-lfs.github.com/spec/v1';
 const OID_PATTERN = /^sha256:([0-9a-f]{64})$/u;
