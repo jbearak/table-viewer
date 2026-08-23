@@ -46,7 +46,7 @@ You can also right-click a supported file in Finder or File Explorer and choose 
 
 The workbook has a welcome sheet followed by fruit, vegetable, coffee, berry, citrus, herb, and tea sheets. Click **Coffee Shelf** to get oriented.
 
-![The Coffee Shelf sheet open in the standalone Table Viewer app with vertical sheet tabs](images/app-sample-workbook.png)
+<img src="images/app-sample-workbook.png" alt="The Coffee Shelf sheet open in the standalone Table Viewer app with vertical sheet tabs" width="751">
 
 ## 3. Try the main viewing tools
 
@@ -61,7 +61,7 @@ Nothing in this section touches the `.xlsx` file. Sorts, filters, hidden columns
 
 Right-clicking a column header is the quickest way to find its sort, filter, copy, and hide actions.
 
-![The Roast column's right-click menu in the standalone app with ascending and descending sort, filter, copy, and hide actions](images/app-column-header-menu.png)
+<img src="images/app-column-header-menu.png" alt="The Roast column's right-click menu in the standalone app with ascending and descending sort, filter, copy, and hide actions" width="751">
 
 Active sorts and filters appear as controls above the table, where you can edit, disable, reverse, reorder, or remove them.
 
@@ -72,9 +72,9 @@ Active sorts and filters appear as controls above the table, where you can edit,
 > - To hide a column without opening **Columns**, right-click its header and choose **Hide column**.
 > - To give several adjacent columns the same width, click one column header, then hold **Shift** and click another. Every column between them is selected, inclusive. Drag a border on any selected column to resize them together.
 
-![A cell's right-click menu in the standalone app with four one-click highlight colors](images/app-cell-context-menu.png)
+<img src="images/app-cell-context-menu.png" alt="A cell's right-click menu in the standalone app with four one-click highlight colors" width="751">
 
-![The Coffee Shelf sheet in the standalone app with a sort, filter, highlight, vertical tabs, and the Columns menu](images/app-explore-workbook.png)
+<img src="images/app-explore-workbook.png" alt="The Coffee Shelf sheet in the standalone app with a sort, filter, highlight, vertical tabs, and the Columns menu" width="751">
 
 ## 4. See the persistence behavior
 

@@ -27,7 +27,7 @@ The Marketplace is the simplest option:
 
 The screenshot below shows the exact-ID search in VS Code, which returns only Table Viewer.
 
-![Table Viewer in the VS Code Marketplace search with its Install button visible](images/install-from-marketplace.png)
+<img src="images/install-from-marketplace.png" alt="Table Viewer in the VS Code Marketplace search with its Install button visible" width="1129">
 
 Installing a downloaded extension is equally fine. Open the [latest Table Viewer release](https://github.com/jbearak/table-viewer/releases/latest), download the `table-viewer-…vsix` file, then open the **…** menu at the top of the Extensions view and choose **Install from VSIX…**. Select the downloaded file and click **Install**.
 
@@ -40,7 +40,7 @@ Download the [sample workbook](https://github.com/jbearak/table-viewer/raw/refs/
 
 The workbook has a welcome sheet followed by fruit, vegetable, coffee, berry, citrus, herb, and tea sheets. Click **Coffee Shelf** to get oriented.
 
-![The Coffee Shelf sheet open in Table Viewer with vertical sheet tabs](images/sample-workbook.png)
+<img src="images/sample-workbook.png" alt="The Coffee Shelf sheet open in Table Viewer with vertical sheet tabs" width="1060">
 
 ## 4. Try the main viewing tools
 
@@ -55,7 +55,7 @@ Nothing in this section edits the `.xlsx` file, so feel free to poke around.
 
 Right-clicking a column header is the quickest way to find its sort, filter, copy, and hide actions.
 
-![The Roast column's right-click menu with ascending and descending sort, filter, copy, and hide actions](images/column-header-menu.png)
+<img src="images/column-header-menu.png" alt="The Roast column's right-click menu with ascending and descending sort, filter, copy, and hide actions" width="1129">
 
 Active sorts and filters appear as controls above the table, where you can edit, disable, reverse, reorder, or remove them.
 
@@ -66,9 +66,9 @@ Active sorts and filters appear as controls above the table, where you can edit,
 > - To hide a column without opening **Columns**, right-click its header and choose **Hide column**.
 > - To give several adjacent columns the same width, click one column header, then hold **Shift** and click another. Every column between them is selected, inclusive. Drag a border on any selected column to resize them together.
 
-![A cell's right-click menu with four one-click highlight colors](images/cell-context-menu.png)
+<img src="images/cell-context-menu.png" alt="A cell's right-click menu with four one-click highlight colors" width="1129">
 
-![The Coffee Shelf sheet with a sort, filter, highlight, vertical tabs, and the Columns menu](images/explore-workbook.png)
+<img src="images/explore-workbook.png" alt="The Coffee Shelf sheet with a sort, filter, highlight, vertical tabs, and the Columns menu" width="1129">
 
 ## 5. See the persistence behavior
 
