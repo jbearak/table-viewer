@@ -436,4 +436,19 @@ describe('the initial Recent read', () => {
         });
         expect(rows()).toHaveLength(0);
     });
+
+    // A failed read says nothing about a list that already arrived by push.
+    // Clearing the rail here would discard the newer, working answer on the
+    // strength of the older, broken one — and leave a launcher that had a
+    // perfectly good list showing nothing.
+    it('keeps a pushed list when the read fails afterwards', async () => {
+        const { reject_read, push } = await mount_with_pending_read();
+
+        push([file('/data/pushed.csv')]);
+        reject_read(new Error('no userData'));
+        await flush_microtasks();
+
+        expect(row_text().map(([name]) => name)).toEqual(['pushed.csv']);
+        expect(element('recent').hidden).toBe(false);
+    });
 });

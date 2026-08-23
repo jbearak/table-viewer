@@ -117,7 +117,12 @@ void welcome_api.get_recent().then(
         // Nothing to show, and nothing to say about it: the rail is a
         // convenience, and an unhandled rejection here would be noise in a
         // window whose other half still works.
-        render_recent([]);
+        //
+        // Guarded like the resolved path, and for the same reason: a read that
+        // fails says nothing about a list that has already arrived by push.
+        // Clearing here would throw away the newer, working answer on the
+        // strength of the older, broken one.
+        if (!pushed_list_rendered) render_recent([]);
     },
 );
 
