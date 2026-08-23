@@ -172,17 +172,29 @@ export const fake_git_lfs = {
                     : fake_git_lfs.pull_outcomes[0] ?? { type: 'resolved' }
             );
         },
-        smudge(resource, pointer): Promise<GitLfsSmudgeOutcome> {
+        async smudge(resource, pointer): Promise<GitLfsSmudgeOutcome> {
             fake_git_lfs.calls.push({
                 operation: 'smudge',
                 path: resource.fsPath,
                 oid: pointer.oid,
             });
-            return Promise.resolve(
+            const thrown = fake_git_lfs.throw_on_next;
+            if (thrown) {
+                fake_git_lfs.throw_on_next = undefined;
+                throw thrown;
+            }
+            // Honours the gate as `pull` does, so a test can land a superseding
+            // refresh while a smudge is still in flight.
+            if (fake_git_lfs.held) {
+                fake_git_lfs.mark_entered();
+                await fake_git_lfs.held;
+                fake_git_lfs.held = undefined;
+            }
+            return (
                 fake_git_lfs.smudge_outcomes.length > 1
                     ? fake_git_lfs.smudge_outcomes.shift()!
                     : fake_git_lfs.smudge_outcomes[0]
-                        ?? { type: 'failed', reason: 'failed' },
+                        ?? { type: 'failed', reason: 'failed' }
             );
         },
     } satisfies GitLfsPort,

@@ -478,6 +478,47 @@ describe('a compare original that is an LFS pointer', () => {
         expect(latest.configuration.gitCompare).toBeDefined();
     });
 
+    it('keeps the smudged bytes when the rebuild after them reports failure', async () => {
+        // The original side has no disk state to consult, so the pointer check
+        // has to answer from the cache. When the rebuild that follows a
+        // successful smudge returns `false` — a superseded load, or a transient
+        // read failure as staged here — a check that ignored the cache would
+        // call the side unresolved, throw the fetched bytes away, and download
+        // the same object again on the next click.
+        serve('original');
+        const panel = open_compare();
+        await panel.__receive({ type: 'ready' });
+        await latest_lfs(panel, (value) => value !== undefined);
+        fake_git_lfs.smudge_outcomes.push({
+            type: 'resolved',
+            content: enc.encode(RESOLVED_CSV),
+        });
+        // Fails the rebuild the resolve itself kicks off, so the handler reaches
+        // its "did that actually work?" guard.
+        let fail_next_read = true;
+        vscode_mock.__setReadFileImplementation(async (uri) => {
+            if (fail_next_read) {
+                fail_next_read = false;
+                throw new Error('EBUSY');
+            }
+            const is_original = String(uri.fsPath ?? uri).includes('original');
+            return enc.encode(is_original ? POINTER : MODIFIED);
+        });
+        await panel.__receive({ type: 'resolveLfsObject' });
+        // The bytes are in hand, so the banner must not come back...
+        await latest_lfs(panel, (value) => value === undefined);
+        // ...and they must not have been discarded: a later rebuild finds the
+        // same pointer on disk and has to reuse them rather than re-download.
+        vscode_mock.__setStatImplementation(async () => ({ size: 9, mtime: 6 }));
+        await vscode_mock.__getWatchers()[0].__fireChange();
+        await vi.waitFor(() => {
+            const latest = snapshots(panel)[snapshots(panel).length - 1];
+            expect(latest.configuration.unresolvedLfs).toBeUndefined();
+        });
+        expect(fake_git_lfs.calls.filter((call) => call.operation === 'smudge'))
+            .toHaveLength(1);
+    });
+
     it('reuses the smudged bytes across a refresh instead of downloading again', async () => {
         serve('original');
         const panel = open_compare();

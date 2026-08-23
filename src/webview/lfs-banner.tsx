@@ -59,6 +59,8 @@ function failure_copy(failure: NonNullable<UnresolvedLfsObject['failure']>): str
             return 'Git LFS is not installed, so the contents cannot be downloaded from here. Install git-lfs and reopen the file.';
         case 'notARepository':
             return 'This file is not inside a Git repository, so there is nowhere to download the contents from.';
+        case 'pathNotExpressible':
+            return 'Git LFS cannot download this file on its own because of a comma in its name. Run “git lfs pull” in the repository to fetch it.';
         case 'objectMissing':
             return 'The stored contents are missing from Git LFS, so there is nothing to download. Whoever committed this file may not have pushed its contents.';
         case 'filtersNotConfigured':

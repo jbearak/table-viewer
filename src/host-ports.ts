@@ -54,6 +54,17 @@ export type GitLfsFailureReason =
      * "button that does nothing" this feature exists to avoid.
      */
     | 'objectMissing'
+    /**
+     * The file's own name defeats `--include`. git-lfs splits that value on
+     * commas before matching and no escape restores the literal, so a single
+     * file whose name contains one cannot be named at all.
+     *
+     * Non-retryable for the same reason as `objectMissing`, arrived at from the
+     * opposite direction: the object is presumably fine, but nothing about
+     * clicking again changes the filename, so a retry is a button that cannot
+     * work.
+     */
+    | 'pathNotExpressible'
     /** git-lfs ran and failed: no network, no credentials, object missing. */
     | 'failed';
 

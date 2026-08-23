@@ -142,6 +142,17 @@ describe('LfsBanner', () => {
         expect(button()).toBeNull();
     });
 
+    it('drops the button when the name defeats --include', async () => {
+        // Deterministic for the filename, so a retry cannot ever work. The copy
+        // points at the one thing that does: pulling the whole repository.
+        await banner({
+            unresolved: { ...UNRESOLVED, failure: { reason: 'pathNotExpressible' } },
+        });
+        expect(text()).toContain('comma in its name');
+        expect(text()).toContain('git lfs pull');
+        expect(button()).toBeNull();
+    });
+
     it('explains a file outside a repository without offering a retry', async () => {
         await banner({
             unresolved: { ...UNRESOLVED, failure: { reason: 'notARepository' } },

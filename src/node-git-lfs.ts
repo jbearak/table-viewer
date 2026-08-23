@@ -380,7 +380,10 @@ export const node_git_lfs_port: GitLfsPort = {
         if (!include_pattern_can_express(relative)) {
             return {
                 type: 'failed',
-                reason: 'failed',
+                // Its own reason rather than a generic failure: this is
+                // deterministic for the name, so a retry offer would be a
+                // button that cannot ever work.
+                reason: 'pathNotExpressible',
                 detail: 'Git LFS cannot fetch a single file whose name contains a comma.',
             };
         }

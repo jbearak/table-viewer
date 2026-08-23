@@ -3963,17 +3963,20 @@ export function attach_viewer(
      *
      * Needed because a refresh reports `false` for a superseded load as
      * readily as for a failed one, and a resolve reliably races the file
-     * watcher it just woke. Only the `file` side can be re-read cheaply; the
-     * original side is a committed blob that cannot change under us, so its
-     * answer is whatever the smudge said.
+     * watcher it just woke. A side already smudged into memory answers from
+     * that cache; only an unresolved working-tree file is worth a read.
      */
     async function file_is_still_a_pointer(
         target: UnresolvedLfsObject,
     ): Promise<boolean> {
-        if (target.side !== 'file') return true;
-        // A smudged main side is resolved in memory, not on disk: re-reading a
-        // `git:` revision returns the pointer forever, so the read below would
-        // report "still unresolved" about bytes we are already showing.
+        // Neither side has disk state to consult once it has been smudged: the
+        // bytes live in memory, and re-reading a `git:` revision returns the
+        // committed pointer forever. So the cache is the answer, and without
+        // consulting it a superseding watcher refresh makes the caller discard
+        // bytes already fetched and download the same object again.
+        if (target.side === 'original') {
+            return resolved_lfs_original?.oid !== target.oid;
+        }
         if (resolved_lfs_main?.oid === target.oid) return false;
         try {
             return parse_git_lfs_pointer(await host.fs.read_file(uri)) !== undefined;

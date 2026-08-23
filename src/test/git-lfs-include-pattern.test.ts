@@ -137,7 +137,9 @@ describe('pulling a file whose name contains glob metacharacters', () => {
         // the separator, so this file cannot be named in the argument at all.
         // Saying so beats a pull that exits 0 having matched nothing.
         const outcome = await node_git_lfs_port.pull(uri_for(COMMA_NAME));
-        expect(outcome).toMatchObject({ type: 'failed', reason: 'failed' });
+        // Its own reason, not a generic failure: the refusal is deterministic
+        // for this name, and the banner offers a retry for `failed`.
+        expect(outcome).toMatchObject({ type: 'failed', reason: 'pathNotExpressible' });
         expect((outcome as { detail?: string }).detail).toContain('comma');
     }, 60_000);
 });
