@@ -78,7 +78,7 @@ describe('extension runtime manifest', () => {
             type: 'number',
             default: 256,
             minimum: 1,
-            description: 'File-size threshold in MiB above which Table Viewer asks for confirmation before opening an xlsx, xls, csv, tsv, parquet, or dta file.',
+            description: 'File-size threshold in MiB above which Table Viewer asks for confirmation before opening an xlsx, xls, csv, tsv, or dta file.',
         });
     });
 

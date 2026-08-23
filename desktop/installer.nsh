@@ -50,7 +50,6 @@
   !insertmacro TV_REGISTER_TYPE "tsv"     "Tab-separated values"
   !insertmacro TV_REGISTER_TYPE "xlsx"    "Excel workbook"
   !insertmacro TV_REGISTER_TYPE "xls"     "Legacy Excel workbook"
-  !insertmacro TV_REGISTER_TYPE "parquet" "Apache Parquet file"
   !insertmacro TV_REGISTER_TYPE "dta"     "Stata dataset"
   ; Tell the shell to reload associations so "Open with…" is correct without a
   ; sign-out. SHCNE_ASSOCCHANGED | SHCNF_FLUSH.
@@ -62,7 +61,6 @@
   !insertmacro TV_UNREGISTER_TYPE "tsv"
   !insertmacro TV_UNREGISTER_TYPE "xlsx"
   !insertmacro TV_UNREGISTER_TYPE "xls"
-  !insertmacro TV_UNREGISTER_TYPE "parquet"
   !insertmacro TV_UNREGISTER_TYPE "dta"
   System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0x1000, i 0, i 0)'
 !macroend

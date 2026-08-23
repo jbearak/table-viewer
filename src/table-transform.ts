@@ -18,6 +18,7 @@ import {
     canonical_numeric_string,
     cell_can_be_numeric,
     raw_value,
+    stata_missing_rank,
 } from './transform-values';
 
 // Keep each synchronous source read bounded so cancellation can interrupt a
@@ -375,6 +376,7 @@ async function acquire_transform_column(
                     || (
                         source_cell?.rawType === 'number'
                         && !Number.isFinite(Number(raw))
+                        && stata_missing_rank(raw) === undefined
                     )
                     || (
                         source_cell?.rawType !== 'number'
@@ -593,7 +595,7 @@ export class InvalidNumericFilterOperandError extends Error {
         readonly operator: FilterEntry['operator'],
         readonly operand: 'value' | 'secondValue',
     ) {
-        super('Numeric filter values must be finite numbers.');
+        super('Numeric filter values must be finite numbers or Stata missing tags.');
         this.name = 'InvalidNumericFilterOperandError';
     }
 }
@@ -869,7 +871,9 @@ function numeric_operand_is_usable(
     value: string,
     strict: boolean,
 ): boolean {
-    return strict ? finite_number_text(value) : Number.isFinite(Number(value));
+    return strict
+        ? numeric_operand_text(value)
+        : Number.isFinite(Number(value)) || stata_missing_rank(value) !== undefined;
 }
 
 function compile_numeric_filter_operand(
@@ -955,6 +959,14 @@ function validate_column(col: number, count: number): void {
 }
 
 function compare_numeric_text(a: string, b: string): number {
+    const a_missing = stata_missing_rank(a);
+    const b_missing = stata_missing_rank(b);
+    if (a_missing !== undefined || b_missing !== undefined) {
+        if (a_missing !== undefined && b_missing !== undefined) {
+            return a_missing - b_missing;
+        }
+        return a_missing !== undefined ? 1 : -1;
+    }
     const a_decimal = parse_canonical_decimal(a);
     const b_decimal = parse_canonical_decimal(b);
     if (a_decimal && b_decimal) {
@@ -971,7 +983,11 @@ interface ExactDecimal {
     readonly magnitude: bigint;
 }
 
-type NumericSortKey = ExactDecimal;
+interface StataMissingSortKey {
+    readonly stataMissingRank: number;
+}
+
+type NumericSortKey = ExactDecimal | StataMissingSortKey;
 
 /**
  * Reuses exact keys for repeated raw values without retaining an entry for
@@ -1050,6 +1066,8 @@ function parse_canonical_decimal(value: string): ExactDecimal | undefined {
 }
 
 function build_numeric_sort_key(value: string): NumericSortKey {
+    const missing_rank = stata_missing_rank(value);
+    if (missing_rank !== undefined) return { stataMissingRank: missing_rank };
     const exact = parse_canonical_decimal(value);
     if (exact) return exact;
 
@@ -1060,6 +1078,12 @@ function build_numeric_sort_key(value: string): NumericSortKey {
 }
 
 function compare_numeric_sort_keys(a: NumericSortKey, b: NumericSortKey): number {
+    const a_missing = 'stataMissingRank' in a;
+    const b_missing = 'stataMissingRank' in b;
+    if (a_missing || b_missing) {
+        if (a_missing && b_missing) return a.stataMissingRank - b.stataMissingRank;
+        return a_missing ? 1 : -1;
+    }
     return compare_exact_decimals(a, b);
 }
 
@@ -1092,7 +1116,7 @@ function validate_filter_operands(
     if (!numeric_column) return;
     for (const entry of filters) {
         if (!NUMERIC_FILTER_OPERATORS.has(entry.operator)) continue;
-        if (!finite_number_text(entry.value)) {
+        if (!numeric_operand_text(entry.value)) {
             throw new InvalidNumericFilterOperandError(
                 entry.id,
                 entry.operator,
@@ -1101,7 +1125,7 @@ function validate_filter_operands(
         }
         if (
             is_range_filter_operator(entry.operator)
-            && !finite_number_text(entry.secondValue)
+            && !numeric_operand_text(entry.secondValue)
         ) {
             throw new InvalidNumericFilterOperandError(
                 entry.id,
@@ -1112,10 +1136,12 @@ function validate_filter_operands(
     }
 }
 
-function finite_number_text(value: string | undefined): boolean {
+function numeric_operand_text(value: string | undefined): boolean {
     return value !== undefined
-        && value.trim() !== ''
-        && Number.isFinite(Number(value));
+        && (
+            stata_missing_rank(value) !== undefined
+            || (value.trim() !== '' && Number.isFinite(Number(value)))
+        );
 }
 
 async function cooperative_stable_sort(

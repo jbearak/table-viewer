@@ -142,7 +142,6 @@ describe('portable Windows file associations', () => {
             tsv: 'Editor',
             xlsx: 'Viewer',
             xls: 'Viewer',
-            parquet: 'Editor',
             dta: 'Viewer',
         };
         const expected_associations = Object.fromEntries(

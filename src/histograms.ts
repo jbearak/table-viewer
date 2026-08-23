@@ -5,6 +5,7 @@ import { FILTER_DISTINCT_VALUE_LIMIT } from './types';
 import {
     canonical_numeric_string,
     raw_value,
+    stata_missing_rank,
 } from './transform-values';
 
 const BIN_COUNT = 50;
@@ -35,7 +36,7 @@ function iso_date_string(value: string): boolean {
 }
 
 type ClassifiedValue =
-    | { kind: 'numeric'; numericValue: number }
+    | { kind: 'numeric'; numericValue?: number }
     | { kind: 'orderedText' | 'text' }
     | undefined;
 
@@ -50,8 +51,9 @@ function classify_value(
     if (cell?.rawType === 'boolean') return { kind: 'text' };
     if (cell?.rawType === 'number') {
         const numericValue = Number(raw);
-        return Number.isFinite(numericValue)
-            ? { kind: 'numeric', numericValue }
+        if (Number.isFinite(numericValue)) return { kind: 'numeric', numericValue };
+        return stata_missing_rank(raw) !== undefined
+            ? { kind: 'numeric' }
             : { kind: 'text' };
     }
     if (canonical_numeric_string(raw)) {
@@ -126,7 +128,10 @@ export async function compute_column_histogram(
             if (columnKind === 'text' && distinct === null) {
                 return distinct_result([], columnKind, null);
             }
-            if (classified.kind !== 'numeric') continue;
+            if (
+                classified.kind !== 'numeric'
+                || classified.numericValue === undefined
+            ) continue;
             const value = classified.numericValue;
             min = Math.min(min, value);
             max = Math.max(max, value);

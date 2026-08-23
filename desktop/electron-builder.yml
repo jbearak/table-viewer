@@ -90,11 +90,6 @@ mac:
       description: Legacy Excel workbook
       role: Viewer
       rank: Alternate
-    - ext: parquet
-      name: Apache Parquet
-      description: Apache Parquet file
-      role: Editor
-      rank: Alternate
     - ext: dta
       name: Stata Dataset
       description: Stata dataset

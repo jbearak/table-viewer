@@ -7,7 +7,7 @@ cask "table-viewer" do
   url "https://github.com/jbearak/table-viewer/releases/download/v#{version}/table-viewer-#{version}-arm64.dmg",
       verified: "github.com/jbearak/table-viewer/"
   name "Table Viewer"
-  desc "View and diff Excel, Parquet, Stata, CSV, and TSV tables"
+  desc "View and diff Excel, Stata, CSV, and TSV tables"
   homepage "https://github.com/jbearak/table-viewer"
 
   livecheck do

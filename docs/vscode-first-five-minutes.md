@@ -32,7 +32,7 @@ You can open one file at a time. There is no need to choose **Open Folder** or c
 
 Use whichever route feels most familiar:
 
-- In VS Code, choose **File → Open File…**, select an `.xlsx`, `.xls`, `.csv`, `.tsv`, `.parquet`, or `.dta` file, and click **Open**.
+- In VS Code, choose **File → Open File…**, select an `.xlsx`, `.xls`, `.csv`, `.tsv`, or `.dta` file, and click **Open**.
 - In Finder on macOS or File Explorer on Windows, right-click a supported file and choose **Open With → Visual Studio Code**. The exact wording can vary slightly by operating-system version.
 - Drag the file from Finder or File Explorer onto an empty VS Code window.
 
@@ -41,7 +41,7 @@ Use whichever route feels most familiar:
 >
 > Table Viewer shows an Excel workbook's worksheets, merged cells, number and date formats, and bold or italic text. `.csv` and `.tsv` files are single unformatted tables; in exchange, you can reopen one in VS Code's text editor and use Table Viewer's synchronized side-by-side preview.
 >
-> `.xlsx`, `.parquet`, `.csv`, and `.tsv` files are editable. Legacy `.xls` workbooks and `.dta` datasets are read-only.
+> `.xlsx`, `.csv`, and `.tsv` files are editable. Legacy `.xls` workbooks and `.dta` datasets are read-only.
 
 VS Code remembers open files when you close and reopen it. A file may therefore still be waiting in its tab the next time you start the app.
 

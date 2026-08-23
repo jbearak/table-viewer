@@ -1,6 +1,6 @@
 # Desktop app setup and 10-minute try-out
 
-The standalone Table Viewer app opens Excel (`.xlsx` or `.xls`) workbooks, Apache Parquet (`.parquet`) files, Stata (`.dta`) datasets, comma-separated (`.csv`) files, and tab-delimited (`.tsv`) files, and remembers how you like to look at them. Sorting, filters, hidden columns, column widths, highlights, the active sheet, and other viewing choices are stored in Table Viewer's own database rather than in the file, so opening a file never changes it. The contents of a cell — the text or numbers inside it — change only when you enter edit mode, change a cell, and save.
+The standalone Table Viewer app opens Excel (`.xlsx` or `.xls`) workbooks, Stata (`.dta`) datasets, comma-separated (`.csv`) files, and tab-delimited (`.tsv`) files, and remembers how you like to look at them. Sorting, filters, hidden columns, column widths, highlights, the active sheet, and other viewing choices are stored in Table Viewer's own database rather than in the file, so opening a file never changes it. The contents of a cell — the text or numbers inside it — change only when you enter edit mode, change a cell, and save.
 
 You can simply read through the guide—the screenshots show the main flow. If you would like to try it yourself, install Table Viewer and download these two small, cheerful workbooks so you can experiment:
 
@@ -92,7 +92,7 @@ You can repeat the replacement while keeping the file open—handy when a script
 
 ## 5. A few useful details
 
-- Modern `.xlsx` workbooks and `.parquet`, `.csv`, and `.tsv` files have an optional edit mode; legacy `.xls` workbooks and `.dta` datasets are read-only. Edit mode changes only the contents of cells, and only once you save. The app never writes your sorts, filters, widths, hidden columns, or highlights into any format.
+- Modern `.xlsx` workbooks, `.csv` files, and `.tsv` files have an optional edit mode; legacy `.xls` workbooks and `.dta` datasets are read-only. Edit mode changes only the contents of cells, and only once you save. The app never writes your sorts, filters, widths, hidden columns, or highlights into any format.
 - Edit mode also doubles as a place for annotations that outlive a new version of the file. Until you save them, your changes stay as pending edits in Table Viewer's database, so they come back with the file the same way your highlights and layout do.
 - View choices are remembered per file and worksheet in the app's local storage. The desktop app and VS Code extension do not currently share saved views.
 - Each open file gets its own window. Opening a file that is already open focuses its existing window.

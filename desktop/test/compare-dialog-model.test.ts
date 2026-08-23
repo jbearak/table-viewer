@@ -147,9 +147,5 @@ describe('dialog_state', () => {
         // Neither side can have unmatched worksheets, so the sheet caveat is wrong.
         expect(dialog_state(ok('/a.csv', 'csv'), ok('/b.tsv', 'tsv')).warning)
             .not.toMatch(/single sheet/u);
-        expect(dialog_state(ok('/a.csv', 'csv'), ok('/b.parquet', 'parquet')).warning)
-            .not.toMatch(/single sheet/u);
-        expect(dialog_state(ok('/a.parquet', 'parquet'), ok('/b.csv', 'csv')).warning)
-            .not.toMatch(/single sheet/u);
     });
 });

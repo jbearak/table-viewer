@@ -1031,6 +1031,31 @@ describe('table transforms', () => {
         )).toBe(true);
     });
 
+    it('filters and directly compares Stata missing tags numerically', async () => {
+        const source = new Source([
+            [cell('1', 'number')],
+            [cell('.', 'number')],
+            [cell('.a', 'number')],
+            [cell('.z', 'number')],
+        ]);
+        const apply = (entry: FilterEntry) => compute_transform(source, 0, {
+            sort: [],
+            filters: [entry],
+        });
+
+        await expect(apply(filter('equals', '.a')))
+            .resolves.toMatchObject({ indices: Uint32Array.from([2]) });
+        await expect(apply(filter('greaterThan', '100')))
+            .resolves.toMatchObject({ indices: Uint32Array.from([1, 2, 3]) });
+        await expect(apply({
+            ...filter('between', '.a'),
+            secondValue: '.z',
+        })).resolves.toMatchObject({ indices: Uint32Array.from([2, 3]) });
+        expect(matches_filter(cell('.a', 'number'), filter('greaterThan', '.'))).toBe(true);
+        expect(compare_cells(cell('.a', 'number'), cell('100', 'number'), 'asc'))
+            .toBeGreaterThan(0);
+    });
+
     it('excludes exact raw values with isOneOf and passes everything else', async () => {
         const exclusion = (
             excluded: (string | null)[],

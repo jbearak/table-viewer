@@ -1,12 +1,19 @@
+import { Buffer } from 'node:buffer';
 import { describe, expect, it, vi } from 'vitest';
 import { displayed_text } from '../webview/cell-renderer';
 import { compute_transform } from '../table-transform';
+import { align_sheet } from '../diff-compare/row-alignment';
 
 const decode_spy = vi.hoisted(() => vi.fn());
+const gso_index_spy = vi.hoisted(() => vi.fn());
 vi.mock('@jbearak/dta-parser', async (import_original) => {
     const actual = await import_original<typeof import('@jbearak/dta-parser')>();
     return {
         ...actual,
+        build_gso_index: (...args: Parameters<typeof actual.build_gso_index>) => {
+            gso_index_spy(...args);
+            return actual.build_gso_index(...args);
+        },
         read_rows_from_buffer: (...args: Parameters<typeof actual.read_rows_from_buffer>) => {
             decode_spy(...args);
             return actual.read_rows_from_buffer(...args);
@@ -83,7 +90,7 @@ function build_dta_fixture(): Uint8Array {
         { name: 'status', typeCode: 65530, format: '%8.0g', valueLabel: 'status_lbl' },
         { name: 'amount', typeCode: 65526, format: '%9.2f' },
         { name: 'name', typeCode: 5, format: '%-5s' },
-        { name: 'missing', typeCode: 65530, format: '%8.0g' },
+        { name: 'missing', typeCode: 65530, format: '%8.0g', valueLabel: 'status_lbl' },
         { name: 'long_text', typeCode: 32768, format: '%9s' },
     ];
     const observations: Array<[number, number, string, number, string]> = [
@@ -174,7 +181,12 @@ function build_dta_fixture(): Uint8Array {
 
     mark('value_labels');
     writer.text('<value_labels><lbl>');
-    const labels = [new TextEncoder().encode('Zulu\0'), new TextEncoder().encode('Alpha\0')];
+    const labels = [
+        new TextEncoder().encode('Zulu\0'),
+        new TextEncoder().encode('Alpha\0'),
+        new TextEncoder().encode('Refused\0'),
+    ];
+    const label_values = [1, 2, 2147483622]; // .a's value-label key
     const text_length = labels.reduce((total, label) => total + label.length, 0);
     const payload_length = 129 + 3 + 8 + labels.length * 8 + text_length;
     writer.i32(payload_length);
@@ -187,7 +199,7 @@ function build_dta_fixture(): Uint8Array {
         writer.i32(label_offset);
         label_offset += label.length;
     }
-    writer.i32(1); writer.i32(2);
+    for (const value of label_values) writer.i32(value);
     for (const label of labels) for (const byte of label) writer.u8(byte);
     writer.text('</lbl></value_labels>');
 
@@ -221,13 +233,129 @@ function build_legacy_dta_fixture(): Uint8Array {
     writer.u16(0); writer.u16(0); writer.u16(0);
     writer.fixed('%8.0g', 49);
     writer.fixed('%5s', 49);
-    writer.fixed('', 33); writer.fixed('', 33);
+    writer.fixed('legacy_lbl', 33); writer.fixed('', 33);
     writer.fixed('', 81); writer.fixed('', 81);
     writer.u8(0); writer.i32(0); // expansion-fields terminator
     writer.i8(3); writer.u8(0x63); writer.u8(0x61); writer.u8(0x66); writer.u8(0xe9); writer.u8(0);
     writer.i8(1); writer.fixed('plain', 5);
     writer.i8(2); writer.fixed('text', 5);
+    const label = Uint8Array.of(0x43, 0x61, 0x66, 0xe9, 0);
+    writer.i32(33 + 3 + 8 + 8 + label.length);
+    writer.fixed('legacy_lbl', 33);
+    writer.u8(0); writer.u8(0); writer.u8(0);
+    writer.i32(1);
+    writer.i32(label.length);
+    writer.i32(0);
+    writer.i32(3);
+    for (const byte of label) writer.u8(byte);
     return writer.finish();
+}
+
+function build_release117_fixture(): Uint8Array {
+    const writer = new ByteWriter();
+    const offsets = new Map<string, number>();
+    const mark = (name: string) => offsets.set(name, writer.length);
+    mark('stata_data');
+    writer.text('<stata_dta><header><release>117</release><byteorder>LSF</byteorder><K>');
+    writer.u16(2);
+    writer.text('</K><N>'); writer.i32(1);
+    writer.text('</N><label>'); writer.u8(0);
+    writer.text('</label><timestamp>'); writer.u8(0);
+    writer.text('</timestamp></header>');
+    mark('map'); writer.text('<map>');
+    const map_offset = writer.length;
+    for (let index = 0; index < 14; index++) writer.u64(0);
+    writer.text('</map>');
+    mark('variable_types'); writer.text('<variable_types>'); writer.u16(5); writer.u16(32768);
+    writer.text('</variable_types>');
+    mark('varnames'); writer.text('<varnames>');
+    writer.fixed('text', 33); writer.fixed('long_text', 33); writer.text('</varnames>');
+    mark('sortlist'); writer.text('<sortlist>');
+    writer.u16(0); writer.u16(0); writer.u16(0); writer.text('</sortlist>');
+    mark('formats'); writer.text('<formats>');
+    writer.fixed('%5s', 49); writer.fixed('%9s', 49); writer.text('</formats>');
+    mark('value_label_names'); writer.text('<value_label_names>');
+    writer.fixed('', 33); writer.fixed('', 33); writer.text('</value_label_names>');
+    mark('variable_labels'); writer.text('<variable_labels>');
+    writer.fixed('', 81); writer.fixed('', 81); writer.text('</variable_labels>');
+    mark('characteristics'); writer.text('<characteristics></characteristics>');
+    mark('data'); writer.text('<data>');
+    writer.u8(0x63); writer.u8(0x61); writer.u8(0x66); writer.u8(0xe9); writer.u8(0);
+    writer.i32(2); writer.i32(1);
+    writer.text('</data>');
+    mark('strls'); writer.text('<strls>GSO');
+    writer.i32(2); writer.i32(1); writer.u8(130); writer.i32(5);
+    writer.u8(0x63); writer.u8(0x61); writer.u8(0x66); writer.u8(0xe9); writer.u8(0);
+    writer.text('</strls>');
+    mark('value_labels'); writer.text('<value_labels></value_labels>');
+    mark('stata_data_close'); writer.text('</stata_dta>');
+    mark('end_of_file');
+    const names = [
+        'stata_data', 'map', 'variable_types', 'varnames', 'sortlist', 'formats',
+        'value_label_names', 'variable_labels', 'characteristics', 'data', 'strls',
+        'value_labels', 'stata_data_close', 'end_of_file',
+    ];
+    names.forEach((name, index) => writer.patch_u64(map_offset + index * 8, offsets.get(name)!));
+    return writer.finish();
+}
+
+function build_release119_strl_fixture(): Uint8Array {
+    const writer = new ByteWriter();
+    const offsets = new Map<string, number>();
+    const mark = (name: string) => offsets.set(name, writer.length);
+    mark('stata_data');
+    writer.text('<stata_dta><header><release>119</release><byteorder>LSF</byteorder><K>');
+    writer.i32(1);
+    writer.text('</K><N>'); writer.u64(1);
+    writer.text('</N><label>'); writer.u16(0);
+    writer.text('</label><timestamp>'); writer.u8(0);
+    writer.text('</timestamp></header>');
+    mark('map'); writer.text('<map>');
+    const map_offset = writer.length;
+    for (let index = 0; index < 14; index++) writer.u64(0);
+    writer.text('</map>');
+    mark('variable_types'); writer.text('<variable_types>'); writer.u16(32768);
+    writer.text('</variable_types>');
+    mark('varnames'); writer.text('<varnames>'); writer.fixed('long_text', 129);
+    writer.text('</varnames>');
+    mark('sortlist'); writer.text('<sortlist>'); writer.i32(0); writer.i32(0);
+    writer.text('</sortlist>');
+    mark('formats'); writer.text('<formats>'); writer.fixed('%9s', 57);
+    writer.text('</formats>');
+    mark('value_label_names'); writer.text('<value_label_names>'); writer.fixed('', 129);
+    writer.text('</value_label_names>');
+    mark('variable_labels'); writer.text('<variable_labels>'); writer.fixed('', 321);
+    writer.text('</variable_labels>');
+    mark('characteristics'); writer.text('<characteristics></characteristics>');
+    mark('data'); writer.text('<data>');
+    // Release 119 packs v into 3 bytes and o into 5 bytes.
+    writer.u8(1); writer.u8(0); writer.u8(0);
+    writer.i32(1); writer.u8(0);
+    writer.text('</data>');
+    mark('strls'); writer.text('<strls>GSO');
+    writer.i32(1); writer.u64(1); writer.u8(130); writer.i32(6);
+    writer.text('hello'); writer.u8(0);
+    writer.text('</strls>');
+    mark('value_labels'); writer.text('<value_labels></value_labels>');
+    mark('stata_data_close'); writer.text('</stata_dta>');
+    mark('end_of_file');
+    const names = [
+        'stata_data', 'map', 'variable_types', 'varnames', 'sortlist', 'formats',
+        'value_label_names', 'variable_labels', 'characteristics', 'data', 'strls',
+        'value_labels', 'stata_data_close', 'end_of_file',
+    ];
+    names.forEach((name, index) => writer.patch_u64(map_offset + index * 8, offsets.get(name)!));
+    return writer.finish();
+}
+
+function find_tag_end(bytes: Uint8Array, tag: string): number {
+    const encoded = new TextEncoder().encode(tag);
+    for (let offset = 0; offset <= bytes.length - encoded.length; offset++) {
+        if (encoded.every((byte, index) => bytes[offset + index] === byte)) {
+            return offset + encoded.length;
+        }
+    }
+    throw new Error(`fixture is missing ${tag}`);
 }
 
 function texts(rows: ReturnType<DtaDataSource['read_rows']>['rows']) {
@@ -255,6 +383,7 @@ describe('DtaDataSource', () => {
     });
 
     it('keeps raw numbers while formatting labels and display formats', async () => {
+        gso_index_spy.mockClear();
         const source = await DtaDataSource.create(build_dta_fixture());
         const row = source.read_rows(0, 0, 1).rows[0];
         expect(row[0]).toMatchObject({ raw: '1', formatted: 'Zulu', rawType: 'number' });
@@ -267,6 +396,7 @@ describe('DtaDataSource', () => {
         });
         expect(displayed_text(row[0], false, undefined)).toBe('1');
         expect(displayed_text(row[0], true, undefined)).toBe('Zulu');
+        expect(gso_index_spy).not.toHaveBeenCalled();
 
         const sorted = await compute_transform(source, 0, {
             sort: [{ colIndex: 0, direction: 'asc' }],
@@ -275,15 +405,67 @@ describe('DtaDataSource', () => {
         expect([...sorted.indices!]).toEqual([0, 2, 1, 3]);
     });
 
-    it('preserves each Stata missing-value tag', async () => {
+    it('preserves binary strL payloads as distinct hexadecimal raw values', async () => {
+        const original_fixture = build_dta_fixture();
+        const modified_fixture = build_dta_fixture();
+        const original_gso = find_tag_end(original_fixture, '<strls>');
+        const modified_gso = find_tag_end(modified_fixture, '<strls>');
+        const type_offset = 3 + 4 + 8;
+        const content_offset = type_offset + 1 + 4;
+        original_fixture[original_gso + type_offset] = 129;
+        modified_fixture[modified_gso + type_offset] = 129;
+        original_fixture[original_gso + content_offset] = 0x80;
+        modified_fixture[modified_gso + content_offset] = 0x81;
+
+        const original = await DtaDataSource.create(original_fixture);
+        const modified = await DtaDataSource.create(modified_fixture);
+        const original_raw = original.read_rows(0, 0, 1).rows[0][4]?.raw;
+        const modified_raw = modified.read_rows(0, 0, 1).rows[0][4]?.raw;
+        expect(original_raw).toMatch(/^hex:80/);
+        expect(modified_raw).toMatch(/^hex:81/);
+        expect(original_raw).not.toBe(modified_raw);
+        const alignment = await align_sheet(original, modified, {
+            status: 'matched', name: 'Sheet1', originalIndex: 0, modifiedIndex: 0,
+        });
+        expect(alignment.changedCells).toBe(1);
+    });
+
+    it('keeps tagged missings distinct, labeled, nonempty, and numerically sortable', async () => {
         const source = await DtaDataSource.create(build_dta_fixture());
         const rows = source.read_columns(0, 0, 4, [3]).rows;
         expect(rows.map((row) => row[0])).toEqual([
-            expect.objectContaining({ raw: null, formatted: '.', rawType: 'empty' }),
-            expect.objectContaining({ raw: null, formatted: '.a', rawType: 'empty' }),
-            expect.objectContaining({ raw: null, formatted: '.b', rawType: 'empty' }),
-            expect.objectContaining({ raw: null, formatted: '.z', rawType: 'empty' }),
+            expect.objectContaining({ raw: '.', formatted: '.', rawType: 'number' }),
+            expect.objectContaining({ raw: '.a', formatted: 'Refused', rawType: 'number' }),
+            expect.objectContaining({ raw: '.b', formatted: '.b', rawType: 'number' }),
+            expect.objectContaining({ raw: '.z', formatted: '.z', rawType: 'number' }),
         ]);
+        expect(displayed_text(rows[1][0], false, undefined)).toBe('.a');
+        expect(displayed_text(rows[1][0], true, undefined)).toBe('Refused');
+        expect(new Set(rows.map((row) => row[0]?.raw)).size).toBe(4);
+
+        const modified_fixture = build_dta_fixture();
+        const data_start = find_tag_end(modified_fixture, '<data>');
+        // Row 1's missing byte follows byte + double + str5 within a 23-byte row.
+        modified_fixture[data_start + 23 + 14] = 103; // .a -> .b
+        const modified = await DtaDataSource.create(modified_fixture);
+        const alignment = await align_sheet(source, modified, {
+            status: 'matched', name: 'Sheet1', originalIndex: 0, modifiedIndex: 0,
+        });
+        expect(alignment.changedCells).toBe(1);
+
+        const empty = await compute_transform(source, 0, {
+            sort: [],
+            filters: [{
+                id: 'empty', colIndex: 3, operator: 'isEmpty',
+                caseSensitive: false, enabled: true,
+            }],
+        });
+        expect(empty.rowCount).toBe(0);
+        const sorted = await compute_transform(source, 0, {
+            sort: [{ colIndex: 3, direction: 'asc' }],
+            filters: [],
+        });
+        expect([...sorted.indices!]).toEqual([0, 1, 2, 3]);
     });
 
     it('clamps row windows that overshoot the end', async () => {
@@ -322,6 +504,23 @@ describe('DtaDataSource', () => {
         expect(decode_spy).toHaveBeenCalledTimes(2);
     });
 
+    it('reuses indexed GSO offsets instead of rescanning old strL entries', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture());
+        source.read_rows(0, 0, 4);
+        const internals = source as unknown as {
+            windows: Map<string, unknown>;
+            gso_index: Map<number, number>;
+            gso_cache: Map<number, string>;
+            gso_scan_position: number;
+        };
+        expect(internals.gso_index.size).toBe(4);
+        const exhausted_position = internals.gso_scan_position;
+        internals.windows.clear();
+        internals.gso_cache.clear();
+        source.read_rows(0, 0, 1);
+        expect(internals.gso_scan_position).toBe(exhausted_position);
+    });
+
     it('dispatches .dta directly without an Excel header projection', async () => {
         const source = await build_source_from_buffer(build_dta_fixture(), '/tmp/example.dta');
         expect(source).toBeInstanceOf(DtaDataSource);
@@ -337,22 +536,76 @@ describe('DtaDataSource', () => {
         const rows = source.read_rows(0, 0, 3).rows;
         expect(rows.map((row) => row[0]?.raw)).toEqual(['3', '1', '2']);
         expect(rows[0][1]?.raw).toBe('café');
+        expect(rows[0][0]?.formatted).toBe('Café');
+    });
+
+    it('decodes release 119 strL pointers with the 3+5-byte layout', async () => {
+        const source = await DtaDataSource.create(build_release119_strl_fixture());
+        expect(source.read_rows(0, 0, 1).rows[0][0]?.raw).toBe('hello');
+    });
+
+    it('decodes release 117 fixed and strL strings as Windows-1252', async () => {
+        const source = await DtaDataSource.create(build_release117_fixture());
+        const row = source.read_rows(0, 0, 1).rows[0];
+        expect(row[0]?.raw).toBe('café');
+        expect(row[1]?.raw).toBe('café');
     });
 
     it('rejects metadata-complete files with truncated observations', async () => {
         const fixture = build_dta_fixture();
-        const data_tag = new TextEncoder().encode('<data>');
-        let data_start = -1;
-        for (let offset = 0; offset <= fixture.length - data_tag.length; offset++) {
-            if (data_tag.every((byte, index) => fixture[offset + index] === byte)) {
-                data_start = offset + data_tag.length;
-                break;
-            }
-        }
-        expect(data_start).toBeGreaterThan(0);
+        const data_start = find_tag_end(fixture, '<data>');
         await expect(DtaDataSource.create(fixture.slice(0, data_start + 1))).rejects.toThrow(
             /observation data is truncated/,
         );
+    });
+
+    it('copies nonzero-offset Node Buffer views before parsing', async () => {
+        const fixture = Buffer.from(build_dta_fixture());
+        const pooled = Buffer.concat([Buffer.from('unrelated-prefix'), fixture]);
+        const view = pooled.subarray(pooled.length - fixture.length);
+        const source = await DtaDataSource.create(view);
+        expect(source.meta().sheets[0].rowCount).toBe(4);
+    });
+
+    it('releases the file bytes on close', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture());
+        source.close();
+        expect((source as unknown as { bytes?: Uint8Array }).bytes).toBeUndefined();
+        expect(() => source.read_rows(0, 0, 1)).toThrow(/closed/);
+    });
+
+    it('rejects section offsets that do not point at their declared tags', async () => {
+        const corrupt = build_dta_fixture();
+        const map = find_tag_end(corrupt, '<map>');
+        const view = new DataView(corrupt.buffer);
+        const data_entry = map + 9 * 8;
+        view.setBigUint64(data_entry, view.getBigUint64(data_entry, true) + 1n, true);
+        await expect(DtaDataSource.create(corrupt)).rejects.toThrow(
+            /invalid data section tag/,
+        );
+    });
+
+    it('rejects declared section offsets beyond the file', async () => {
+        const fixture = build_dta_fixture();
+        const map = find_tag_end(fixture, '<map>');
+        const corrupt = fixture.slice();
+        new DataView(corrupt.buffer).setBigUint64(
+            map + 13 * 8,
+            BigInt(corrupt.length + 1),
+            true,
+        );
+        await expect(DtaDataSource.create(corrupt)).rejects.toThrow(
+            /invalid end_of_file section offset/,
+        );
+    });
+
+    it('rejects pre-Unicode value-label payloads beyond their declared entry length', async () => {
+        const corrupt = build_legacy_dta_fixture();
+        // The final table starts after three 6-byte observations.
+        const table_length_offset = corrupt.length - (4 + 33 + 3 + 8 + 8 + 5);
+        new DataView(corrupt.buffer).setInt32(table_length_offset, 1, true);
+        const source = await DtaDataSource.create(corrupt);
+        expect(() => source.read_rows(0, 0, 1)).toThrow(/truncated header/);
     });
 
     it('surfaces rejected releases as a clean open error', async () => {
