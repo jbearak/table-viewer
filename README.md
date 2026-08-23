@@ -185,6 +185,8 @@ To choose a different header row, right-click its row number and select **Use ro
 - The **preview icon** opens a read-only synced side-by-side preview (alt-click opens it in the same tab)
 - The **table icon** opens the file again as an editable table view
 
+**Parquet and Stata files** open automatically as single tables. Parquet (`.parquet`) files are editable; Stata (`.dta`) datasets are read-only.
+
 ## Default editor behavior
 
 Table Viewer registers as the default editor for Excel (`.xlsx`, `.xls`), Parquet (`.parquet`), Stata (`.dta`), CSV, and TSV files. `.xlsx`, `.parquet`, CSV, and TSV files are editable; legacy `.xls` workbooks and `.dta` datasets are read-only. If another viewer is registered for one of these formats, VS Code may ask which editor you'd like to use.

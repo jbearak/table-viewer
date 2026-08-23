@@ -37,7 +37,7 @@ Use whichever route feels most familiar:
 - Drag the file from Finder or File Explorer onto an empty VS Code window.
 
 > [!NOTE]
-> `.xlsx`, `.xls`, `.csv`, `.tsv`, `.parquet`, and `.dta` files all open directly in Table Viewer by default.
+> Supported table files open directly in Table Viewer by default.
 >
 > Table Viewer shows an Excel workbook's worksheets, merged cells, number and date formats, and bold or italic text. `.csv` and `.tsv` files are single unformatted tables; in exchange, you can reopen one in VS Code's text editor and use Table Viewer's synchronized side-by-side preview.
 >

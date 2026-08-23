@@ -102,16 +102,17 @@ export function dialog_state(
         };
     }
     if (original.extension !== modified.extension) {
-        const csv_like = (extension: string) => extension === 'csv' || extension === 'tsv';
-        const original_is_delimited = csv_like(original.extension);
-        const modified_is_delimited = csv_like(modified.extension);
+        const single_table = (extension: string) =>
+            ['csv', 'tsv', 'parquet', 'dta'].includes(extension);
+        const original_is_single_table = single_table(original.extension);
+        const modified_is_single_table = single_table(modified.extension);
         let warning = 'These files are in different formats.';
-        // A delimited file is one sheet, so pairing it with a workbook compares
-        // it against that workbook's first sheet and reports the rest as
-        // one-sided. Which side the workbook is on decides whether those sheets
-        // read as added or deleted, so the warning has to name it.
-        if (original_is_delimited !== modified_is_delimited) {
-            warning = original_is_delimited
+        // A single-table file is treated as one sheet, so pairing it with a
+        // workbook compares it against that workbook's first sheet and reports
+        // the rest as one-sided. Which side the workbook is on decides whether
+        // those sheets read as added or deleted, so the warning has to name it.
+        if (original_is_single_table !== modified_is_single_table) {
+            warning = original_is_single_table
                 ? 'Different formats. The original is compared as a single sheet; '
                     + 'the modified workbook\u2019s other sheets will show as added.'
                 : 'Different formats. The modified file is compared as a single sheet; '

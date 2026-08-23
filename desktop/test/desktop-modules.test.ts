@@ -99,15 +99,29 @@ describe('portable Windows file associations', () => {
             'utf8',
         );
         const installed_associations = [...installer.matchAll(
-            /TV_REGISTER_TYPE "([^"]+)"\s+"[^"]+"\s+"([^"]+)"/g,
-        )].map((match) => ({ extension: match[1], description: match[2] }));
+            /TV_REGISTER_TYPE "([^"]+)"\s+"([^"]+)"/g,
+        )].map((match) => ({
+            extension: match[1],
+            prog_id: `TableViewer.${match[1]}`,
+            description: match[2],
+        }));
+        const expected_associations = WINDOWS_FILE_ASSOCIATIONS.map(
+            ({ extension, description }) => ({
+                extension,
+                prog_id: `TableViewer.${extension}`,
+                description,
+            }),
+        );
 
-        expect(installed_associations).toEqual(WINDOWS_FILE_ASSOCIATIONS);
+        expect(installed_associations).toEqual(expected_associations);
         const uninstalled_associations = [...installer.matchAll(
-            /TV_UNREGISTER_TYPE "([^"]+)"\s+"([^"]+)"/g,
-        )].map((match) => ({ extension: match[1], prog_id: match[2] }));
-        expect(uninstalled_associations).toEqual(SUPPORTED_FILE_EXTENSIONS.map(
-            (extension) => ({ extension, prog_id: `TableViewer.${extension}` }),
+            /TV_UNREGISTER_TYPE "([^"]+)"/g,
+        )].map((match) => ({
+            extension: match[1],
+            prog_id: `TableViewer.${match[1]}`,
+        }));
+        expect(uninstalled_associations).toEqual(installed_associations.map(
+            ({ extension, prog_id }) => ({ extension, prog_id }),
         ));
     });
 
@@ -123,31 +137,30 @@ describe('portable Windows file associations', () => {
                 rank: string;
             }> };
         };
-        const expected_roles = new Map<string, string>([
-            ['csv', 'Editor'],
-            ['tsv', 'Editor'],
-            ['xlsx', 'Viewer'],
-            ['xls', 'Viewer'],
-            ['parquet', 'Editor'],
-            ['dta', 'Viewer'],
-        ]);
-        const mac_associations = config.mac?.fileAssociations?.map(
-            ({ ext, description, role, rank }) => ({
-                extension: ext,
-                description,
-                role,
-                rank,
-            }),
-        );
-
-        expect(mac_associations).toEqual(WINDOWS_FILE_ASSOCIATIONS.map(
-            ({ extension, description }) => ({
+        const expected_roles: Record<string, string> = {
+            csv: 'Editor',
+            tsv: 'Editor',
+            xlsx: 'Viewer',
+            xls: 'Viewer',
+            parquet: 'Editor',
+            dta: 'Viewer',
+        };
+        const expected_associations = Object.fromEntries(
+            WINDOWS_FILE_ASSOCIATIONS.map(({ extension, description }) => [
                 extension,
-                description,
-                role: expected_roles.get(extension),
-                rank: 'Alternate',
-            }),
+                { description, role: expected_roles[extension], rank: 'Alternate' },
+            ]),
+        );
+        const associations = config.mac?.fileAssociations ?? [];
+        const mac_associations = Object.fromEntries(associations.map(
+            ({ ext, description, role, rank }) => [
+                ext,
+                { description, role, rank },
+            ],
         ));
+
+        expect(associations).toHaveLength(WINDOWS_FILE_ASSOCIATIONS.length);
+        expect(mac_associations).toEqual(expected_associations);
     });
 
     it('keeps desktop and VS Code supported formats consistent', () => {

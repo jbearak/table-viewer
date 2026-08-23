@@ -54,6 +54,10 @@ describe('open supported formats', () => {
             ['basic.xls', 'selector.XlS'],
             ['basic.csv', 'selector.CsV'],
             ['basic.tsv', 'selector.TsV'],
+            // Selector discovery is host-level: borrowed fixture bytes are
+            // enough here, so Stage 1 does not need Parquet or Stata parsers.
+            ['basic.csv', 'selector.PaRqUeT'],
+            ['basic.csv', 'selector.DtA'],
         ] as const;
 
         try {
