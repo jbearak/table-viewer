@@ -1972,7 +1972,24 @@ export type HostMessage =
     | { type: 'historyReplayPrepared'; prepared: HistoryReplayPrepared }
     | { type: 'historyReplayPrepareRefused'; refusal: HistoryReplayPrepareRefused }
     | { type: 'historyReplayCommitted'; committed: HistoryReplayCommitted }
-    | { type: 'historyReplayCommitRefused'; refusal: HistoryReplayCommitRefused };
+    | { type: 'historyReplayCommitRefused'; refusal: HistoryReplayCommitRefused }
+    /**
+     * The Git LFS resolve identified by `requestId` has reached a terminal
+     * path: the host is no longer downloading anything for it.
+     *
+     * This is a lifecycle settlement, not an outcome report — deliberately.
+     * What the resolve *produced* is viewer material and travels where viewer
+     * material always travels, in a snapshot: the real table, or the pointer
+     * again with a failure attached. A richer payload here would duplicate
+     * refresh semantics that are genuinely ambiguous ("fetched, but a watcher
+     * reload superseded ours") and that the snapshot already settles honestly.
+     *
+     * Sent on EVERY terminal path, including requests refused at the door
+     * (nothing unresolved, no LFS port, another resolve in flight): the
+     * renderer set its "Downloading…" state when it asked, and only this
+     * message clears it. Snapshots no longer double as that acknowledgement.
+     */
+    | { type: 'lfsResolveEnded'; requestId: string };
 
 /** Messages from webview to extension host */
 export type WebviewMessage =
@@ -1986,10 +2003,12 @@ export type WebviewMessage =
     | { type: 'cancelCompare' }
     | { type: 'openCsvRowLimitSetting' }
     | { type: 'loadAllCsvRows' }
-    /** The LFS banner's Resolve button. Carries nothing: which object and
-     *  which side are the host's own state, and a renderer-supplied oid would
-     *  be a stale identity the host would have to re-validate anyway. */
-    | { type: 'resolveLfsObject' }
+    /** The LFS banner's Resolve button. Which object and which side are the
+     *  host's own state — a renderer-supplied oid would be a stale identity
+     *  the host would have to re-validate anyway. `requestId` identifies the
+     *  request itself, so the `lfsResolveEnded` that settles it can be matched
+     *  and a stale or duplicate ending cannot clear a newer resolve. */
+    | { type: 'resolveLfsObject'; requestId: string }
     | { type: 'snapshotApplied'; identity: WorkbookSnapshotIdentity; disposition: SnapshotDisposition }
     | { type: 'requestRows'; sheetIndex: number; startRow: number; count: number; requestId: string; generation: number }
     | { type: 'stateChanged'; state: PerFileState; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity }

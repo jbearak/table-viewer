@@ -99,6 +99,31 @@ function posted(panel: ReturnType<typeof open_table>, type: string): Posted[] {
     return (panel.__messages as Posted[]).filter((message) => message.type === type);
 }
 
+let resolve_request_seq = 0;
+
+/** A resolve request with a fresh id, so its `lfsResolveEnded` can be matched. */
+function resolve_request(): { type: 'resolveLfsObject'; requestId: string } {
+    resolve_request_seq += 1;
+    return { type: 'resolveLfsObject', requestId: `req-${resolve_request_seq}` };
+}
+
+/** The requestIds of every `lfsResolveEnded` posted so far, in order. */
+function resolve_endings(panel: ReturnType<typeof open_table>): string[] {
+    return posted(panel, 'lfsResolveEnded').map((m) => m.requestId as string);
+}
+
+/** Send a resolve request and wait for its own lifecycle settlement. */
+async function resolve(panel: ReturnType<typeof open_table>): Promise<string> {
+    const request = resolve_request();
+    await panel.__receive(request);
+    // The handler settles in a `finally` whose post may still be in flight
+    // when `__receive` returns; every terminal path must produce it.
+    await vi.waitFor(() => {
+        expect(resolve_endings(panel)).toContain(request.requestId);
+    });
+    return request.requestId;
+}
+
 function snapshots(panel: ReturnType<typeof open_table>) {
     return posted(panel, 'workbookSnapshot').map((message) => message.snapshot as {
         configuration: {
@@ -185,7 +210,7 @@ describe('a working-tree file that is an LFS pointer', () => {
         // real content — which is exactly what the fake filesystem models here.
         fake_git_lfs.pull_outcomes.push({ type: 'resolved' });
         serve('none');
-        await panel.__receive({ type: 'resolveLfsObject' });
+        await resolve(panel);
         await latest_lfs(panel, (value) => value === undefined);
         expect(fake_git_lfs.calls).toEqual([
             { operation: 'pull', path: '/tmp/data.csv' },
@@ -204,7 +229,7 @@ describe('a working-tree file that is an LFS pointer', () => {
             reason: 'failed',
             detail: 'Object does not exist on the remote',
         });
-        await panel.__receive({ type: 'resolveLfsObject' });
+        await resolve(panel);
         // The banner has to be able to say *why*: a silent no-op on the second
         // click is the failure mode this replaces.
         expect(await latest_lfs(panel, (value) => value?.failure !== undefined))
@@ -220,7 +245,7 @@ describe('a working-tree file that is an LFS pointer', () => {
         await panel.__receive({ type: 'ready' });
         await latest_lfs(panel, (value) => value !== undefined);
         fake_git_lfs.pull_outcomes.push({ type: 'failed', reason: 'lfsNotInstalled' });
-        await panel.__receive({ type: 'resolveLfsObject' });
+        await resolve(panel);
         // Distinct because it is the one failure where retrying is pointless,
         // and the banner drops the button for it.
         expect((await latest_lfs(panel, (value) => value?.failure !== undefined))
@@ -241,44 +266,58 @@ describe('a working-tree file that is an LFS pointer', () => {
             type: 'failed',
             reason: 'filtersNotConfigured',
         });
-        await panel.__receive({ type: 'resolveLfsObject' });
+        await resolve(panel);
         expect(await latest_lfs(panel, (value) => value?.failure !== undefined))
             .toMatchObject({ side: 'file', failure: { reason: 'filtersNotConfigured' } });
     });
 
     it('reports a failure when the port throws instead of returning one', async () => {
         // A port is not supposed to throw, which is why this is worth pinning:
-        // an escaping rejection would leave the webview's "Downloading…" state
-        // set with no snapshot to clear it, so the button stays disabled
-        // forever and the user has no way to retry.
+        // an escaping rejection would skip the failure delivery, leaving a
+        // banner with nothing to explain itself and no reason to retry.
         serve('file');
         const panel = open_table();
         await panel.__receive({ type: 'ready' });
         await latest_lfs(panel, (value) => value !== undefined);
         fake_git_lfs.throw_on_next = new Error('spawn ENOENT');
-        await panel.__receive({ type: 'resolveLfsObject' });
+        await resolve(panel);
         expect(await latest_lfs(panel, (value) => value?.failure !== undefined))
             .toMatchObject({ side: 'file', failure: { reason: 'failed' } });
     });
 
-    it('ignores a second click while the first resolve is still running', async () => {
+    it('refuses a second click while the first resolve is still running', async () => {
         // The in-flight guard: a slow download invites an impatient second
         // click, and two concurrent pulls of the same object is work nobody
-        // asked for.
+        // asked for. The refused duplicate still settles — with its OWN
+        // ending, immediately — and that settlement must not release the
+        // in-flight guard the admitted resolve is holding, or a third click
+        // would start the concurrent pull the guard exists to prevent.
         serve('file');
         const panel = open_table();
         await panel.__receive({ type: 'ready' });
         await latest_lfs(panel, (value) => value !== undefined);
         fake_git_lfs.open_gate();
-        const first = panel.__receive({ type: 'resolveLfsObject' });
+        const first_request = resolve_request();
+        const first = panel.__receive(first_request);
         await fake_git_lfs.gate!.entered;
-        await panel.__receive({ type: 'resolveLfsObject' });
+        const duplicate_id = await resolve(panel);
+        // The duplicate settled while the first is still gated: its ending
+        // arrived, the first's has not, and no second download started.
+        expect(resolve_endings(panel)).toEqual([duplicate_id]);
+        expect(fake_git_lfs.calls).toHaveLength(1);
+        // Nor did the duplicate's settlement clear the guard: a third click
+        // is refused the same way rather than admitted.
+        await resolve(panel);
         expect(fake_git_lfs.calls).toHaveLength(1);
         serve('none');
         fake_git_lfs.gate!.release();
         await first;
         await latest_lfs(panel, (value) => value === undefined);
         expect(fake_git_lfs.calls).toHaveLength(1);
+        // The admitted resolve settles once its work actually ends.
+        await vi.waitFor(() => {
+            expect(resolve_endings(panel)).toContain(first_request.requestId);
+        });
     });
 
     it('does not restore the banner when the reload it triggered was superseded', async () => {
@@ -297,7 +336,7 @@ describe('a working-tree file that is an LFS pointer', () => {
         // a watcher event landing while the resolve is still in flight.
         serve('none');
         vscode_mock.__setStatImplementation(async () => ({ size: 99, mtime: 9 }));
-        const resolving = panel.__receive({ type: 'resolveLfsObject' });
+        const resolving = panel.__receive(resolve_request());
         for (const watcher of vscode_mock.__getWatchers()) await watcher.__fireChange();
         await resolving;
         // The file is no longer a pointer, so no banner — whichever load won.
@@ -308,11 +347,13 @@ describe('a working-tree file that is an LFS pointer', () => {
         });
     });
 
-    it('still delivers when the download succeeds but the reload cannot', async () => {
-        // The download really did finish, so the banner must stop saying
-        // "Downloading…" even though what should have replaced it will not
-        // load. Only a delivered snapshot clears that flag in the webview, so
-        // falling out of the handler silently leaves a spinner forever.
+    it('ends the resolve without manufacturing a snapshot when the reload cannot load', async () => {
+        // The download really did finish, so "Downloading…" must end even
+        // though what should have replaced the pointer will not load. That
+        // ending is `lfsResolveEnded`, not a snapshot: nothing the panel
+        // shows changed here, so delivering one would be a snapshot standing
+        // in for an action acknowledgement — the coupling the lifecycle
+        // response exists to remove.
         serve('file');
         const panel = open_table();
         await panel.__receive({ type: 'ready' });
@@ -326,16 +367,55 @@ describe('a working-tree file that is an LFS pointer', () => {
             mtime: 9,
         }));
         const before = snapshots(panel).length;
-        await panel.__receive({ type: 'resolveLfsObject' });
-        await vi.waitFor(() => expect(snapshots(panel).length).toBeGreaterThan(before));
+        await resolve(panel);
+        expect(fake_git_lfs.calls).toHaveLength(1);
+        expect(snapshots(panel).length).toBe(before);
     });
 
-    it('ignores a resolve request when nothing is unresolved', async () => {
+    it('ends a resolve request when nothing is unresolved', async () => {
+        // The button is not shown in this state, but a stale renderer can
+        // still ask — and it set "Downloading…" when it did, so even a
+        // request refused at the door must be settled.
         const panel = open_table();
         await panel.__receive({ type: 'ready' });
         await vi.waitFor(() => expect(snapshots(panel).length).toBeGreaterThan(0));
-        await panel.__receive({ type: 'resolveLfsObject' });
+        await resolve(panel);
         expect(fake_git_lfs.calls).toEqual([]);
+    });
+
+    it('ends a resolve request on a host with no git-lfs port', async () => {
+        // `resolvable: false` hides the button, but the guard cannot rely on
+        // that: an unsettled request is a spinner that never stops.
+        serve('file');
+        const panel = open_table({}, fake_viewer_host_without_lfs);
+        await panel.__receive({ type: 'ready' });
+        await latest_lfs(panel, (value) => value !== undefined);
+        await resolve(panel);
+        expect(fake_git_lfs.calls).toEqual([]);
+    });
+
+    it('does not settle a resolve into a receiver that replaced the requester', async () => {
+        // A webview that reloads mid-resolve starts over with fresh local
+        // state and a request it never made. Settling the old request into it
+        // would be harmless today only by accident of id matching; the epoch
+        // gate makes it structural.
+        serve('file');
+        const panel = open_table();
+        await panel.__receive({ type: 'ready' });
+        await latest_lfs(panel, (value) => value !== undefined);
+        fake_git_lfs.open_gate();
+        const request = resolve_request();
+        const resolving = panel.__receive(request);
+        await fake_git_lfs.gate!.entered;
+        // The webview reloads: a new `ready` begins a new receiver epoch.
+        await panel.__receive({ type: 'ready' });
+        serve('none');
+        fake_git_lfs.gate!.release();
+        await resolving;
+        // The resolve ran to completion — the pull happened — but its
+        // settlement was epoch-rejected rather than posted to the newcomer.
+        await latest_lfs(panel, (value) => value === undefined);
+        expect(resolve_endings(panel)).not.toContain(request.requestId);
     });
 });
 
@@ -355,7 +435,7 @@ describe('a comparison whose own modified side is an LFS pointer', () => {
             type: 'resolved',
             content: enc.encode(RESOLVED_CSV),
         });
-        await panel.__receive({ type: 'resolveLfsObject' });
+        await resolve(panel);
         await latest_lfs(panel, (value) => value === undefined);
         // Smudge, not pull: nothing on disk needs repairing, and pulling would
         // "succeed" without changing what this panel reads.
@@ -375,7 +455,7 @@ describe('a comparison whose own modified side is an LFS pointer', () => {
             type: 'resolved',
             content: enc.encode(RESOLVED_CSV),
         });
-        await panel.__receive({ type: 'resolveLfsObject' });
+        await resolve(panel);
         await latest_lfs(panel, (value) => value === undefined);
         vscode_mock.__setStatImplementation(async () => ({ size: 24, mtime: 77 }));
         for (const watcher of vscode_mock.__getWatchers()) await watcher.__fireChange();
@@ -400,7 +480,7 @@ describe('a comparison whose own modified side is an LFS pointer', () => {
             reason: 'objectMissing',
             detail: 'remote missing object …',
         });
-        await panel.__receive({ type: 'resolveLfsObject' });
+        await resolve(panel);
         expect(await latest_lfs(panel, (value) => value?.failure !== undefined))
             .toMatchObject({ side: 'file', failure: { reason: 'objectMissing' } });
     });
@@ -424,7 +504,7 @@ describe('a comparison with a pointer on both sides', () => {
             { type: 'resolved', content: enc.encode(RESOLVED_OTHER_CSV) },
         );
         const before = snapshots(panel).length;
-        await panel.__receive({ type: 'resolveLfsObject' });
+        await resolve(panel);
         await latest_lfs(panel, (value) => value === undefined);
         // Both objects fetched, and each by its own oid — one click.
         expect(fake_git_lfs.calls.map((call) => call.oid)).toEqual([OID, OID_OTHER]);
@@ -457,7 +537,7 @@ describe('a comparison with a pointer on both sides', () => {
             { type: 'resolved', content: enc.encode(RESOLVED_CSV) },
             { type: 'failed', reason: 'objectMissing', detail: 'remote missing object …' },
         );
-        await panel.__receive({ type: 'resolveLfsObject' });
+        await resolve(panel);
         expect(await latest_lfs(panel, (value) => value?.failure !== undefined))
             .toMatchObject({
                 side: 'original',
@@ -496,7 +576,7 @@ describe('a compare original that is an LFS pointer', () => {
             type: 'resolved',
             content: enc.encode(RESOLVED_CSV),
         });
-        await panel.__receive({ type: 'resolveLfsObject' });
+        await resolve(panel);
         await latest_lfs(panel, (value) => value === undefined);
         // Smudge, not pull: there is no working-tree file behind a `git:`
         // revision to repair, and pulling would fix the wrong thing.
@@ -535,7 +615,7 @@ describe('a compare original that is an LFS pointer', () => {
             const is_original = String(uri.fsPath ?? uri).includes('original');
             return enc.encode(is_original ? POINTER : MODIFIED);
         });
-        await panel.__receive({ type: 'resolveLfsObject' });
+        await resolve(panel);
         // The bytes are in hand, so the banner must not come back...
         await latest_lfs(panel, (value) => value === undefined);
         // ...and they must not have been discarded: a later rebuild finds the
@@ -559,7 +639,7 @@ describe('a compare original that is an LFS pointer', () => {
             type: 'resolved',
             content: enc.encode(RESOLVED_CSV),
         });
-        await panel.__receive({ type: 'resolveLfsObject' });
+        await resolve(panel);
         await latest_lfs(panel, (value) => value === undefined);
         // A `git:` read returns the pointer blob forever, so without the cache
         // a second click — or any later rebuild — would download it again. The
@@ -569,7 +649,7 @@ describe('a compare original that is an LFS pointer', () => {
             .toHaveLength(1);
         // And a redundant request now does nothing, because nothing is
         // unresolved any more.
-        await panel.__receive({ type: 'resolveLfsObject' });
+        await resolve(panel);
         expect(fake_git_lfs.calls.filter((call) => call.operation === 'smudge'))
             .toHaveLength(1);
 
@@ -600,7 +680,7 @@ describe('a compare original that is an LFS pointer', () => {
         await panel.__receive({ type: 'ready' });
         await latest_lfs(panel, (value) => value !== undefined);
         fake_git_lfs.smudge_outcomes.push({ type: 'failed', reason: 'failed' });
-        await panel.__receive({ type: 'resolveLfsObject' });
+        await resolve(panel);
         expect(await latest_lfs(panel, (value) => value?.failure !== undefined))
             .toMatchObject({ side: 'original', failure: { reason: 'failed' } });
     });
@@ -617,7 +697,7 @@ describe('both sides at once', () => {
         expect(await latest_lfs(panel, (value) => value !== undefined))
             .toMatchObject({ side: 'file' });
         fake_git_lfs.pull_outcomes.push({ type: 'resolved' });
-        await panel.__receive({ type: 'resolveLfsObject' });
+        await resolve(panel);
         await vi.waitFor(() => expect(fake_git_lfs.calls.length).toBeGreaterThan(0));
         expect(fake_git_lfs.calls[0].operation).toBe('pull');
     });
