@@ -1,5 +1,5 @@
-import type { DataSource, RenderedCell } from './data-source/interface';
-import { read_source_columns } from './data-source/interface';
+import type { DataSource, RawCell } from './data-source/interface';
+import { read_source_raw_columns } from './data-source/interface';
 import type { FilterColumnKind, HistogramBin } from './types';
 import { FILTER_DISTINCT_VALUE_LIMIT } from './types';
 import {
@@ -20,7 +20,7 @@ export interface ColumnHistogram {
     distinctValuesExceeded: boolean;
 }
 
-function finite_numeric_value(cell: RenderedCell | null | undefined): number | undefined {
+function finite_numeric_value(cell: RawCell | null | undefined): number | undefined {
     const raw = cell?.raw;
     if (raw === null || raw === undefined || raw.trim().length === 0) return undefined;
     const value = Number(raw);
@@ -41,7 +41,7 @@ type ClassifiedValue =
     | undefined;
 
 function classify_value(
-    cell: RenderedCell | null | undefined,
+    cell: RawCell | null | undefined,
 ): ClassifiedValue {
     const raw = raw_value(cell);
     if (raw === null) return undefined;
@@ -105,7 +105,7 @@ export async function compute_column_histogram(
     let distinct: Set<string | null> | null = new Set();
     for (let start = 0; start < sheet.rowCount; start += ROW_BATCH_SIZE) {
         if (is_cancelled()) throw abort_error();
-        const window = read_source_columns(
+        const window = read_source_raw_columns(
             source,
             sheet_index,
             start,
@@ -162,7 +162,7 @@ export async function compute_column_histogram(
     }));
     for (let start = 0; start < sheet.rowCount; start += ROW_BATCH_SIZE) {
         if (is_cancelled()) throw abort_error();
-        const window = read_source_columns(
+        const window = read_source_raw_columns(
             source,
             sheet_index,
             start,

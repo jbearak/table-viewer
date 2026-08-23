@@ -16,6 +16,8 @@ export interface RenderedCell extends RichCellFields, XlsxCellFormatFields {
     rawType?: 'string' | 'number' | 'boolean' | 'date' | 'empty';
 }
 
+export type RawCell = Pick<RenderedCell, 'raw' | 'rawType'>;
+
 export interface RowWindow {
     startRow: number;                 // 0-based, absolute
     rows: (RenderedCell | null)[][];  // rows[i][col]; outer length <= requested count
@@ -30,6 +32,11 @@ export interface IndexedRows {
 /** A compact projection of a row window onto caller-selected columns.
  * `rows[i][j]` is the cell from `column_indices[j]`; cells from other columns
  * are never materialized. */
+export interface RawColumnWindow {
+    startRow: number;
+    rows: (RawCell | null)[][];
+}
+
 export interface ColumnWindow {
     startRow: number;
     rows: (RenderedCell | null)[][];
@@ -109,6 +116,15 @@ export interface DataSource {
         count: number,
         column_indices: readonly number[],
     ): ColumnWindow;
+    /** Materialize only raw values for the requested columns. Optional for
+     * third-party/test sources; callers use read_source_raw_columns for a
+     * compatibility fallback through the fully rendered read path. */
+    read_raw_columns?(
+        sheet_index: number,
+        start_row: number,
+        count: number,
+        column_indices: readonly number[],
+    ): RawColumnWindow;
     /** Release buffers/handles. */
     close(): void;
 
@@ -183,6 +199,42 @@ export function projected_row_for_source(
     return projected;
 }
 
+function validate_row_indices(
+    source: DataSource,
+    sheet_index: number,
+    row_indices: ArrayLike<number>,
+): SheetMeta {
+    const sheet = source.meta().sheets[sheet_index];
+    if (!sheet) throw new RangeError(`sheet index ${sheet_index} out of range`);
+    for (let position = 0; position < row_indices.length; position++) {
+        const row = row_indices[position];
+        if (!Number.isInteger(row) || row < 0 || row >= sheet.rowCount) {
+            throw new RangeError(`row index ${row} out of range (${sheet.rowCount} rows)`);
+        }
+    }
+    return sheet;
+}
+
+function read_adjacent_row_runs<Cell>(
+    row_indices: ArrayLike<number>,
+    read_run: (start: number, count: number) => (Cell | null)[][],
+): (Cell | null)[][] {
+    const rows: (Cell | null)[][] = [];
+    let position = 0;
+    while (position < row_indices.length) {
+        const start = row_indices[position];
+        let count = 1;
+        while (
+            position + count < row_indices.length
+            && row_indices[position + count] === start + count
+        ) count += 1;
+        const run = read_run(start, count);
+        for (let offset = 0; offset < count; offset++) rows.push(run[offset] ?? []);
+        position += count;
+    }
+    return rows;
+}
+
 /** Read arbitrary rows in requested order. Legacy sources are read as adjacent
  * ascending runs: this may make several small read_rows calls, but never reads
  * across gaps merely to reduce the call count. */
@@ -191,39 +243,17 @@ export function read_source_rows_indexed(
     sheet_index: number,
     row_indices: ArrayLike<number>,
 ): IndexedRows {
-    const sheet = source.meta().sheets[sheet_index];
-    if (!sheet) {
-        throw new RangeError(`sheet index ${sheet_index} out of range`);
-    }
-    for (let position = 0; position < row_indices.length; position++) {
-        const row = row_indices[position];
-        if (!Number.isInteger(row) || row < 0 || row >= sheet.rowCount) {
-            throw new RangeError(`row index ${row} out of range (${sheet.rowCount} rows)`);
-        }
-    }
+    validate_row_indices(source, sheet_index, row_indices);
     if (row_indices.length === 0) return { rows: [] };
     if (source.read_rows_indexed) {
         return source.read_rows_indexed(sheet_index, row_indices);
     }
-
-    const rows: (RenderedCell | null)[][] = [];
-    let position = 0;
-    while (position < row_indices.length) {
-        const source_start = row_indices[position];
-        let run_length = 1;
-        while (
-            position + run_length < row_indices.length
-            && row_indices[position + run_length] === source_start + run_length
-        ) {
-            run_length += 1;
-        }
-        const run = source.read_rows(sheet_index, source_start, run_length).rows;
-        for (let offset = 0; offset < run_length; offset++) {
-            rows.push(run[offset] ?? []);
-        }
-        position += run_length;
-    }
-    return { rows };
+    return {
+        rows: read_adjacent_row_runs(
+            row_indices,
+            (start, count) => source.read_rows(sheet_index, start, count).rows,
+        ),
+    };
 }
 
 /** Read a compact column projection, falling back to full rows for legacy
@@ -249,4 +279,80 @@ export function read_source_columns(
         startRow: window.startRow,
         rows: window.rows.map((row) => column_indices.map((column) => row[column] ?? null)),
     };
+}
+
+/** Read raw values for a compact column projection. Sources may bypass display
+ * formatting; legacy implementations fall back to their fully rendered cells. */
+export function read_source_raw_columns(
+    source: DataSource,
+    sheet_index: number,
+    start_row: number,
+    count: number,
+    column_indices: readonly number[],
+): RawColumnWindow {
+    if (source.read_raw_columns) {
+        return source.read_raw_columns(
+            sheet_index,
+            start_row,
+            count,
+            column_indices,
+        );
+    }
+    const window = read_source_columns(
+        source,
+        sheet_index,
+        start_row,
+        count,
+        column_indices,
+    );
+    return window;
+}
+
+/** Read full rows as raw values while preserving each source row's width. */
+export function read_source_raw_rows(
+    source: DataSource,
+    sheet_index: number,
+    start_row: number,
+    count: number,
+): RawColumnWindow {
+    if (source.read_raw_columns) {
+        const sheet = source.meta().sheets[sheet_index];
+        if (!sheet) throw new RangeError(`sheet index ${sheet_index} out of range`);
+        return source.read_raw_columns(
+            sheet_index,
+            start_row,
+            count,
+            Array.from({ length: sheet.columnCount }, (_, index) => index),
+        );
+    }
+    const window = source.read_rows(sheet_index, start_row, count);
+    return window;
+}
+
+/** Read arbitrary rows as raw values. Adjacent requested rows share one range
+ * read; sparse gaps and repeated rows retain the indexed-reader semantics. */
+export function read_source_raw_rows_indexed(
+    source: DataSource,
+    sheet_index: number,
+    row_indices: ArrayLike<number>,
+): { rows: (RawCell | null)[][] } {
+    validate_row_indices(source, sheet_index, row_indices);
+    if (row_indices.length === 0) return { rows: [] };
+    if (!source.read_raw_columns) {
+        return read_source_rows_indexed(source, sheet_index, row_indices);
+    }
+    const requested = Array.from(row_indices);
+    const materialized = new Map<number, (RawCell | null)[]>();
+    const unique = [...new Set(requested)].sort((a, b) => a - b);
+    const rows = read_adjacent_row_runs(
+        unique,
+        (start, count) => read_source_raw_rows(
+            source,
+            sheet_index,
+            start,
+            count,
+        ).rows,
+    );
+    unique.forEach((row, index) => materialized.set(row, rows[index]));
+    return { rows: requested.map((row) => materialized.get(row)!) };
 }

@@ -1,6 +1,11 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import type { RenderedCell, RowWindow, SheetMeta, WorkbookMeta, DataSource } from '../data-source/interface';
-import { read_source_columns, read_source_rows_indexed } from '../data-source/interface';
+import {
+    read_source_columns,
+    read_source_raw_columns,
+    read_source_raw_rows_indexed,
+    read_source_rows_indexed,
+} from '../data-source/interface';
 
 describe('data-source interface shapes', () => {
     it('RenderedCell allows null raw and string formatted', () => {
@@ -49,6 +54,67 @@ describe('data-source interface shapes', () => {
             ]],
         });
     });
+    it('projects raw cells through full-render fallbacks for legacy sources', () => {
+        const rich_cell = {
+            raw: '7', formatted: 'Seven', bold: true, italic: false,
+            rawType: 'number' as const, hyperlink: { kind: 'external' as const, target: 'https://example.com' },
+        };
+        const ds: DataSource = {
+            meta: () => ({
+                hasFormatting: true,
+                sheets: [{
+                    name: 'Sheet1', rowCount: 2, sourceRowCount: 2,
+                    columnCount: 1, merges: [], hasFormatting: true,
+                }],
+            }),
+            read_rows: (_sheet, start, count) => ({
+                startRow: start,
+                rows: Array.from({ length: count }, () => [rich_cell]),
+            }),
+            close: () => {},
+        };
+        expect(read_source_raw_columns(ds, 0, 0, 1, [0])).toEqual({
+            startRow: 0,
+            rows: [[rich_cell]],
+        });
+        expect(read_source_raw_rows_indexed(ds, 0, [1, 0]).rows).toEqual([
+            [rich_cell],
+            [rich_cell],
+        ]);
+    });
+
+    it('uses an optional raw reader without materializing rendered cells', () => {
+        const read_rows = vi.fn(() => ({ startRow: 0, rows: [] }));
+        const read_raw_columns = vi.fn((
+            _sheet: number, start: number, count: number, columns: readonly number[],
+        ) => ({
+            startRow: start,
+            rows: Array.from({ length: count }, (_, row) => columns.map((column) => ({
+                raw: `${start + row}:${column}`,
+                rawType: 'string' as const,
+            }))),
+        }));
+        const ds: DataSource = {
+            meta: () => ({
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1', rowCount: 4, sourceRowCount: 4,
+                    columnCount: 2, merges: [], hasFormatting: false,
+                }],
+            }),
+            read_rows,
+            read_raw_columns,
+            close: () => {},
+        };
+        expect(read_source_raw_rows_indexed(ds, 0, [2, 3, 1]).rows).toEqual([
+            [{ raw: '2:0', rawType: 'string' }, { raw: '2:1', rawType: 'string' }],
+            [{ raw: '3:0', rawType: 'string' }, { raw: '3:1', rawType: 'string' }],
+            [{ raw: '1:0', rawType: 'string' }, { raw: '1:1', rawType: 'string' }],
+        ]);
+        expect(read_raw_columns).toHaveBeenCalledTimes(1);
+        expect(read_rows).not.toHaveBeenCalled();
+    });
+
     it('reads legacy indexed rows as adjacent runs without spanning sparse gaps', () => {
         const calls: Array<{ start: number; count: number }> = [];
         const ds: DataSource = {

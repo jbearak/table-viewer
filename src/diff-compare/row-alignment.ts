@@ -6,7 +6,8 @@
 // insertion point shifts. Aligning the two sides first is what makes
 // added/deleted mean what they say.
 import {
-    read_source_rows_indexed,
+    read_source_raw_rows,
+    read_source_raw_rows_indexed,
     type DataSource,
     type SheetMeta,
 } from '../data-source/interface';
@@ -205,7 +206,7 @@ async function hash_side(
     let since_checkpoint = 0;
     for (let start = 0; start < row_count; start += HASH_READ_BATCH) {
         const count = Math.min(HASH_READ_BATCH, row_count - start);
-        const { rows } = source.read_rows(sheet_index, start, count);
+        const { rows } = read_source_raw_rows(source, sheet_index, start, count);
         for (let offset = 0; offset < count; offset++) {
             hashes[start + offset] = hash_row(rows[offset] ?? []);
         }
@@ -709,9 +710,9 @@ async function count_changes(
     });
     for (let start = 0; start < paired.length; start += HASH_READ_BATCH) {
         const batch = paired.slice(start, start + HASH_READ_BATCH);
-        const original_batch = read_source_rows_indexed(
+        const original_batch = read_source_raw_rows_indexed(
             original, pairing.originalIndex, batch.map((entry) => entry.row.original)).rows;
-        const modified_batch = read_source_rows_indexed(
+        const modified_batch = read_source_raw_rows_indexed(
             modified, pairing.modifiedIndex, batch.map((entry) => entry.row.modified)).rows;
         for (let offset = 0; offset < batch.length; offset++) {
             const original_row = original_batch[offset] ?? [];
@@ -974,10 +975,10 @@ async function score_moves(
         original.meta().sheets[pairing.originalIndex].columnCount,
         modified.meta().sheets[pairing.modifiedIndex].columnCount,
     );
-    const sources = read_source_rows_indexed(
+    const sources = read_source_raw_rows_indexed(
         original, pairing.originalIndex, unmatched_deleted.map((entry) => entry.row),
     ).rows.map((cells) => normalize_candidate(cells, column_count));
-    const destinations = read_source_rows_indexed(
+    const destinations = read_source_raw_rows_indexed(
         modified, pairing.modifiedIndex, unmatched_added.map((entry) => entry.row),
     ).rows.map((cells) => normalize_candidate(cells, column_count));
 

@@ -1,6 +1,6 @@
 import type { DataSource, RenderedCell } from './data-source/interface';
 import {
-    read_source_columns,
+    read_source_raw_columns,
     read_source_row_indices,
     read_source_rows_indexed,
 } from './data-source/interface';
@@ -358,7 +358,7 @@ async function acquire_transform_column(
         foundValue: false,
     };
     for (let start = 0; start < row_count; start += SCAN_ROWS_PER_CHECKPOINT) {
-        const rows = read_source_columns(
+        const rows = read_source_raw_columns(
             source,
             sheet_index,
             start,

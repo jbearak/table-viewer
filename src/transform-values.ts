@@ -1,6 +1,6 @@
-import type { RenderedCell } from './data-source/interface';
+import type { RawCell } from './data-source/interface';
 
-export function raw_value(cell: RenderedCell | null | undefined): string | null {
+export function raw_value(cell: RawCell | null | undefined): string | null {
     const raw = cell?.raw;
     // Whitespace-only cells are empty (not text) for both histogram and
     // sort/filter classification, matching common CSV export padding.
@@ -31,7 +31,7 @@ export function canonical_numeric_string(value: string): boolean {
  * Dates are never numeric here; classify_value maps them to orderedText.
  */
 export function cell_can_be_numeric(
-    cell: RenderedCell | null | undefined,
+    cell: RawCell | null | undefined,
 ): boolean {
     const raw = raw_value(cell);
     if (raw === null || cell?.rawType === 'boolean' || cell?.rawType === 'date') {
