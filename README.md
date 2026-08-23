@@ -22,7 +22,7 @@ It also removes other friction from reading tables:
 - **You can't easily control how files open.** Typeface, font size, colors — Table Viewer lets you set all of these in Preferences once, and every sheet you ever open respects them, so files are legible the moment they open.
 - **Formatting can obscure the value you're auditing.** Switch between the workbook's formatted display and the underlying raw cell values without changing the workbook.
 - **Overflowing cells mean resizing rows and columns**, often in ways that make the table awkward. Table Viewer shows the full displayed value in a tooltip on hover.
-- **Highlighting a cell takes a trip through formatting menus.** Here you right-click a cell and pick a color. Highlights are annotations, not formatting: they survive saves, reloads, and file replacement without modifying the file.
+- **Highlighting a cell takes a trip through formatting menus.** Here you right-click a cell and pick a color. Highlights are annotations, not formatting: they survive saves, reloads, and file replacement.
 - **Many-sheet workbooks are painful**: when tabs overflow Excel's bottom bar you can't even scroll — you click left/right buttons to expose tabs. Table Viewer's sheet tabs scroll, and can be laid out vertically.
 - **Remote files must be downloaded first.** As a VS Code extension, Table Viewer works the same over SSH as locally, and uses your editor's theme and font.
 - **Comparing a Git LFS file shows you the pointer, not the table.** An LFS-tracked file is stored in Git as a small pointer naming the real object, so the version you want to compare against is often not on your machine at all. Table Viewer recognizes the pointer on either side of a comparison and offers to download the object.
