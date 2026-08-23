@@ -76,7 +76,7 @@ The flip side is that Table Viewer is deliberately *not* a full spreadsheet edit
 
 **Selection and copy**
 - Click, drag, or shift-click to select cells
-- Arrow keys and `h`/`j`/`k`/`l` to navigate
+- Arrow keys, and, outside Edit mode, `h`/`j`/`k`/`l` to navigate
 - `Ctrl+C` / `Cmd+C` to copy selected cells as tab-separated text
 - Right-click context menus for copying, selecting or hiding rows and columns, and choosing an Excel row as the header
 
