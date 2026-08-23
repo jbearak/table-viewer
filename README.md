@@ -1,10 +1,10 @@
 # Table Viewer
 
-Read, edit, and diff Excel, CSV, and TSV tables.
+View and diff Excel, Parquet, Stata, CSV, and TSV tables; edit XLSX, Parquet, CSV, and TSV.
 
 ![Table Viewer comparing two recipe tables, with added, deleted, moved, and changed rows](docs/images/app-recipe-diff.png)
 
-Table Viewer supports editing modern Excel (`.xlsx`), `.csv`, and `.tsv` files, plus read-only viewing and diffing of legacy Excel (`.xls`) workbooks. It is built for reviewing, exploring, comparing, and annotating tables. Available as a standalone desktop app and a VS Code extension.
+Table Viewer supports editing modern Excel (`.xlsx`), Apache Parquet (`.parquet`), `.csv`, and `.tsv` files, plus read-only viewing and diffing of legacy Excel (`.xls`) workbooks and Stata (`.dta`) datasets. It is built for reviewing, exploring, comparing, and annotating tables. Available as a standalone desktop app and a VS Code extension.
 
 What you do while reviewing a table — sorting, filtering, hiding columns, resizing, highlighting cells — is stored alongside the file rather than inside it, so the file on disk is untouched and your sorts, filters, and highlights are still there the next time you open it, even if the file was regenerated in the meantime. Table Viewer also reloads on its own when the file changes on disk. Cell contents change only when you enter edit mode and save.
 
@@ -21,7 +21,7 @@ Install Table Viewer from the extension registry used by your editor:
 - **Visual Studio Code:** open [Table Viewer in the Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=jbearak.table-viewer) and click **Install**.
 - **Editors that use Open VSX:** open [Table Viewer on Open VSX](https://open-vsx.org/extension/jbearak/table-viewer) and click **Install**.
 
-You can also open your editor's **Extensions** view and search for the exact extension ID `jbearak.table-viewer`. After installation, open an `.xlsx`, `.xls`, `.csv`, or `.tsv` file; Table Viewer registers itself as an editor for those file types.
+You can also open your editor's **Extensions** view and search for the exact extension ID `jbearak.table-viewer`. After installation, open an `.xlsx`, `.xls`, `.csv`, `.tsv`, `.parquet`, or `.dta` file; Table Viewer registers itself as an editor for those file types.
 
 ### macOS desktop app
 
@@ -67,15 +67,15 @@ It also removes other friction from reading tables:
 - **Highlighting a cell takes a trip through formatting menus.** Here you right-click a cell and pick a color. Highlights are annotations, not formatting: they survive saves, reloads, and file replacement.
 - **Many-sheet workbooks are painful**: when tabs overflow Excel's bottom bar you can't even scroll — you click left/right buttons to expose tabs. Table Viewer's sheet tabs scroll, and can be laid out vertically.
 - **Remote files must be downloaded first.** As a VS Code extension, Table Viewer works the same over SSH as locally, and uses your editor's theme and font.
-- **Diffing a spreadsheet in Git shows you a wall of text.** Click a changed `.xlsx`, `.csv`, or `.tsv` file in VS Code's Source Control or Timeline view and Table Viewer opens the comparison as a table: added and deleted rows banded, changed cells showing before and after in place. The desktop app also compares any two files.
+- **Diffing a spreadsheet in Git shows you a wall of text.** Click a changed `.xlsx`, `.xls`, `.csv`, `.tsv`, `.parquet`, or `.dta` file in VS Code's Source Control or Timeline view and Table Viewer opens the comparison as a table: added and deleted rows banded, changed cells showing before and after in place. The desktop app also compares any two files.
 - **Comparing a Git LFS file shows you the pointer, not the table.** An LFS-tracked file is stored in Git as a small pointer naming the real object, so the version you want to compare against is often not on your machine at all. Table Viewer recognizes the pointer on either side of a comparison and offers to download the object.
 
-The flip side is that Table Viewer is deliberately *not* a full spreadsheet editor. You can't create files or sheets, add cells beyond the file's existing bounds, or change formatting. Editing `.xlsx`, CSV, and TSV files is limited to the cells the file already has; legacy `.xls` workbooks are read-only. That constraint is intentional: you can hand it any output file and explore it freely, knowing the file will only change if you explicitly edit and save it.
+The flip side is that Table Viewer is deliberately *not* a full spreadsheet editor. You can't create files or sheets, add cells beyond the file's existing bounds, or change formatting. Editing `.xlsx`, `.parquet`, CSV, and TSV files is limited to the cells the file already has; legacy `.xls` workbooks and `.dta` datasets are read-only. That constraint is intentional: you can hand it any output file and explore it freely, knowing the file will only change if you explicitly edit and save it.
 
 ## Features
 
 **Viewing**
-- Opens `.xlsx`, `.xls`, `.csv`, and `.tsv` files
+- Opens `.xlsx`, `.xls`, `.csv`, `.tsv`, `.parquet`, and `.dta` files
 - Multi-sheet workbooks with horizontal or vertical tab orientation
 - Merged cells with colspan/rowspan rendering
 - `.xlsx` rich-text runs and whole-cell bold, italic, underline, and strikethrough styling
@@ -102,7 +102,7 @@ The flip side is that Table Viewer is deliberately *not* a full spreadsheet edit
 - Useful for inspecting the exact number behind a formatted display
 
 **Table diffs**
-- Compare two Excel, CSV, or TSV files in a read-only table view — neither file is modified
+- Compare two Excel, Parquet, Stata, CSV, or TSV files in a read-only table view — neither file is modified
 - See added, deleted, moved, and changed rows, with before-and-after values highlighted within changed cells
 - Aligns inserted, deleted, and moved rows so one structural change does not make every later row look modified
 - An optional **Only changed rows** toggle hides rows that are the same in both files
@@ -151,7 +151,7 @@ The flip side is that Table Viewer is deliberately *not* a full spreadsheet edit
 - When a sorted, filtered, or column-hidden sheet contains merged cells, the view temporarily shows them unmerged. Only the original top-left cell contains the merged value; covered cells remain empty. Restoring the natural rows and all columns restores the exact merge layout.
 - Sorting, filtering, and row-hiding work alongside edit mode in both directions: you can sort or filter while editing, and you can start editing a sheet that is already sorted or filtered. Either way the displayed order stays put while you edit, so rows stay where you left them, and the view reflects your new values once you save and the file reloads. While one tab is editing a file, it is the tab that can change that file's view; another tab showing the same file can change it again once the edit session ends. They are unavailable in synchronized preview panes, which always show rows in source order. Column visibility remains available in every mode
 
-**Editing (`.xlsx`, CSV, and TSV)**
+**Editing (`.xlsx`, `.parquet`, CSV, and TSV)**
 - Click the **Edit** button in the toolbar to enter edit mode
 - Double-click a cell, press **Enter**, or choose **Edit cell** from the right-click menu to edit its value
 - **Enter** confirms and moves to the cell below; **Tab** moves right
@@ -170,7 +170,7 @@ The flip side is that Table Viewer is deliberately *not* a full spreadsheet edit
 
 In the desktop app, choose **File → Compare Files…** and select an original (before) file and a modified (after) file. The comparison is read-only and neither file is changed.
 
-In VS Code, click a changed Excel, CSV, or TSV file in the Source Control or Timeline view and Table Viewer opens the comparison.
+In VS Code, click a changed Excel, Parquet, Stata, CSV, or TSV file in the Source Control or Timeline view and Table Viewer opens the comparison.
 
 Added rows are banded in green, deleted rows in red, and moved rows in purple. Within a changed row, each changed cell shows its original value in red and the new value in green. The green and red follow your theme's Git decoration colors, so they match the added and deleted files in the Source Control view.
 
@@ -187,7 +187,7 @@ To choose a different header row, right-click its row number and select **Use ro
 
 ## Default editor behavior
 
-Table Viewer registers as the default editor for Excel (`.xlsx`, `.xls`), CSV, and TSV files. `.xlsx`, CSV, and TSV files are editable; legacy `.xls` workbooks are read-only. If another viewer is registered for one of these formats, VS Code may ask which editor you'd like to use.
+Table Viewer registers as the default editor for Excel (`.xlsx`, `.xls`), Parquet (`.parquet`), Stata (`.dta`), CSV, and TSV files. `.xlsx`, `.parquet`, CSV, and TSV files are editable; legacy `.xls` workbooks and `.dta` datasets are read-only. If another viewer is registered for one of these formats, VS Code may ask which editor you'd like to use.
 
 To open a CSV/TSV file as plain text, use **Open in Text Editor** in the table editor's title bar, or right-click its tab and choose **Reopen Editor With… → Text Editor**. To change the default for a file type, choose **Configure Default Editor** from the same editor picker.
 

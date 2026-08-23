@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import yaml from 'js-yaml';
 import {
     DEFAULT_SETTINGS,
     DesktopConfigStore,
@@ -102,6 +103,83 @@ describe('portable Windows file associations', () => {
         )].map((match) => ({ extension: match[1], description: match[2] }));
 
         expect(installed_associations).toEqual(WINDOWS_FILE_ASSOCIATIONS);
+        const uninstalled_associations = [...installer.matchAll(
+            /TV_UNREGISTER_TYPE "([^"]+)"\s+"([^"]+)"/g,
+        )].map((match) => ({ extension: match[1], prog_id: match[2] }));
+        expect(uninstalled_associations).toEqual(SUPPORTED_FILE_EXTENSIONS.map(
+            (extension) => ({ extension, prog_id: `TableViewer.${extension}` }),
+        ));
+    });
+
+    it('keeps macOS associations consistent with the desktop format registry', () => {
+        const config = yaml.load(fs.readFileSync(
+            path.join(__dirname, '..', 'electron-builder.yml'),
+            'utf8',
+        )) as {
+            mac?: { fileAssociations?: Array<{
+                ext: string;
+                description: string;
+                role: string;
+                rank: string;
+            }> };
+        };
+        const expected_roles = new Map<string, string>([
+            ['csv', 'Editor'],
+            ['tsv', 'Editor'],
+            ['xlsx', 'Viewer'],
+            ['xls', 'Viewer'],
+            ['parquet', 'Editor'],
+            ['dta', 'Viewer'],
+        ]);
+        const mac_associations = config.mac?.fileAssociations?.map(
+            ({ ext, description, role, rank }) => ({
+                extension: ext,
+                description,
+                role,
+                rank,
+            }),
+        );
+
+        expect(mac_associations).toEqual(WINDOWS_FILE_ASSOCIATIONS.map(
+            ({ extension, description }) => ({
+                extension,
+                description,
+                role: expected_roles.get(extension),
+                rank: 'Alternate',
+            }),
+        ));
+    });
+
+    it('keeps desktop and VS Code supported formats consistent', () => {
+        const manifest = JSON.parse(fs.readFileSync(
+            path.join(__dirname, '..', '..', 'package.json'),
+            'utf8',
+        )) as {
+            contributes?: { customEditors?: Array<{
+                selector?: Array<{ filenamePattern?: string }>;
+            }> };
+        };
+        const selector = manifest.contributes?.customEditors?.[0]?.selector?.[0]
+            ?.filenamePattern ?? '';
+        const extensions = selector
+            .replace(/^\*\.\{|\}$/gu, '')
+            .split(',')
+            .map((extension) => extension.replace(
+                /\[(.)(.)\]/gu,
+                (_, lower: string) => lower,
+            ));
+
+        expect(new Set(extensions)).toEqual(new Set(SUPPORTED_FILE_EXTENSIONS));
+    });
+
+    it('keeps the Preferences file-size hint consistent with supported formats', () => {
+        const preferences = fs.readFileSync(
+            path.join(__dirname, '..', 'renderer', 'prefs.html'),
+            'utf8',
+        );
+        const hint = preferences.match(/Larger files \(([^)]+)\) require confirmation/)?.[1];
+
+        expect(new Set(hint?.split(', '))).toEqual(new Set(SUPPORTED_FILE_EXTENSIONS));
     });
 
     it('attempts every write and reports a partial registration failure', async () => {

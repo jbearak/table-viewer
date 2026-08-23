@@ -90,6 +90,16 @@ mac:
       description: Legacy Excel workbook
       role: Viewer
       rank: Alternate
+    - ext: parquet
+      name: Apache Parquet
+      description: Apache Parquet file
+      role: Editor
+      rank: Alternate
+    - ext: dta
+      name: Stata Dataset
+      description: Stata dataset
+      role: Viewer
+      rank: Alternate
   # 1024x1024 master; electron-builder generates the .icns slices at package
   # time. This is also the auto-detected default path — explicit for clarity.
   icon: build/icon.png

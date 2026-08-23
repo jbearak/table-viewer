@@ -1,7 +1,7 @@
 # homebrew-table-viewer
 
 Homebrew tap for the standalone [Table Viewer](https://github.com/jbearak/table-viewer)
-macOS app for reading, editing, and diffing Excel, CSV, and TSV tables.
+macOS app for viewing and diffing Excel, Parquet, Stata, CSV, and TSV tables, with editing for XLSX, Parquet, CSV, and TSV.
 
 ## Install
 

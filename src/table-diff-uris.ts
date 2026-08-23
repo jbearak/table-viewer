@@ -4,7 +4,7 @@ import * as vscode from 'vscode';
 // services (notably Git Timeline) recognize the resource. The encoded query
 // remains the discriminator between a comparison and a normal file URI.
 export const TABLE_DIFF_SCHEME = 'file';
-export const TABLE_FILE_EXTENSION_PATTERN = /\.(csv|tsv|xlsx|xls)$/iu;
+export const TABLE_FILE_EXTENSION_PATTERN = /\.(csv|tsv|xlsx|xls|parquet|dta)$/iu;
 const GIT_OBJECT_ID_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu;
 
 interface GitUriQuery {

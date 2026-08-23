@@ -78,7 +78,7 @@ describe('extension runtime manifest', () => {
             type: 'number',
             default: 256,
             minimum: 1,
-            description: 'File-size threshold in MiB above which Table Viewer asks for confirmation before opening an xlsx, xls, csv, or tsv file.',
+            description: 'File-size threshold in MiB above which Table Viewer asks for confirmation before opening an xlsx, xls, csv, tsv, parquet, or dta file.',
         });
     });
 
@@ -155,9 +155,11 @@ describe('extension runtime manifest', () => {
             .map((extension) =>
                 extension.replace(/\[(.)(.)\]/gu, (_, lower: string) => lower));
         expect(supported_extensions.length).toBeGreaterThan(0);
-        for (const extension of supported_extensions) {
-            expect(TABLE_FILE_EXTENSION_PATTERN.test(`table.${extension}`)).toBe(true);
-        }
+        const supported_extension_set = new Set(supported_extensions);
+        const diff_extensions = TABLE_FILE_EXTENSION_PATTERN.source
+            .match(/^\\\.\(([^)]+)\)\$$/u)?.[1]
+            .split('|');
+        expect(new Set(diff_extensions)).toEqual(supported_extension_set);
         const entries = (manifest.contributes?.menus as Record<string, unknown[]>)[
             'scm/resourceState/context'
         ] as { command: string; when: string; group: string }[];
@@ -181,14 +183,10 @@ describe('extension runtime manifest', () => {
             );
             // The alternation must match the extension proper, dot included —
             // without the `\.` an unrelated extension like `.mycsv` matches.
-            expect(entry.when).toContain('resourceExtname =~ /\\.(');
-            for (const extension of supported_extensions) {
-                // The full alternation token, not the bare text — `csv` alone
-                // would also match inside an unrelated part of the clause.
-                expect(entry.when).toMatch(
-                    new RegExp(`[(|]${extension}[)|]`, 'u'),
-                );
-            }
+            const menu_extensions = entry.when
+                .match(/resourceExtname =~ \/\\\.\(([^)]+)\)\$\/i/u)?.[1]
+                .split('|');
+            expect(new Set(menu_extensions)).toEqual(supported_extension_set);
         }
     });
 
@@ -223,7 +221,7 @@ describe('extension custom-editor manifest', () => {
         expect(editor.selector).toEqual([
             {
                 filenamePattern:
-                    '*.{[xX][lL][sS][xX],[xX][lL][sS],[cC][sS][vV],[tT][sS][vV]}',
+                    '*.{[xX][lL][sS][xX],[xX][lL][sS],[cC][sS][vV],[tT][sS][vV],[pP][aA][rR][qQ][uU][eE][tT],[dD][tT][aA]}',
             },
         ]);
         expect(custom_editors).toHaveLength(1);
