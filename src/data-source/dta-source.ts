@@ -24,6 +24,8 @@ import type {
     ColumnWindow,
     DataSource,
     IndexedRows,
+    RawCell,
+    RawColumnWindow,
     RenderedCell,
     RowWindow,
     WorkbookMeta,
@@ -64,6 +66,15 @@ type ValueLabelTables = Map<string, Map<number, string>>;
 interface CachedWindow {
     readonly rows: (RenderedCell | null)[][];
     readonly cellCount: number;
+}
+
+/** Canonical raw representation shared by display and scan reads. */
+function canonicalize_stata_raw(cell: RowCell): RawCell {
+    if (is_missing_value_object(cell)) {
+        return { raw: cell.missing_type, rawType: 'number' };
+    }
+    if (typeof cell === 'string') return { raw: cell, rawType: 'string' };
+    return { raw: String(cell), rawType: 'number' };
 }
 
 /** Read-only, buffer-backed Stata source with bounded lazy row decoding. */
@@ -190,6 +201,37 @@ export class DtaDataSource implements DataSource {
         count: number,
         column_indices: readonly number[],
     ): ColumnWindow {
+        return this.read_column_projection(
+            sheet_index,
+            start_row,
+            count,
+            column_indices,
+            (start, end, columns) => this.read_range(start, end, columns),
+        );
+    }
+
+    read_raw_columns(
+        sheet_index: number,
+        start_row: number,
+        count: number,
+        column_indices: readonly number[],
+    ): RawColumnWindow {
+        return this.read_column_projection(
+            sheet_index,
+            start_row,
+            count,
+            column_indices,
+            (start, end, columns) => this.read_raw_range(start, end, columns),
+        );
+    }
+
+    private read_column_projection<Cell>(
+        sheet_index: number,
+        start_row: number,
+        count: number,
+        column_indices: readonly number[],
+        read_range: (start: number, end: number, columns: readonly number[]) => (Cell | null)[][],
+    ): { startRow: number; rows: (Cell | null)[][] } {
         this.assert_sheet(sheet_index);
         for (const column of column_indices) this.assert_column(column);
         const start = this.clamp_start(start_row);
@@ -198,9 +240,16 @@ export class DtaDataSource implements DataSource {
             return { startRow: start, rows: Array.from({ length: end - start }, () => []) };
         }
 
-        const columns = [...new Set(column_indices)].sort((a, b) => a - b);
+        const already_ordered = column_indices.every(
+            (column, index) => index === 0 || column > column_indices[index - 1],
+        );
+        const columns = already_ordered
+            ? column_indices
+            : [...new Set(column_indices)].sort((a, b) => a - b);
+        const rows = read_range(start, end, columns);
+        if (already_ordered) return { startRow: start, rows };
+
         const positions = new Map(columns.map((column, index) => [column, index]));
-        const rows = this.read_range(start, end, columns);
         return {
             startRow: start,
             rows: rows.map((row) => column_indices.map((column) => row[positions.get(column)!])),
@@ -234,6 +283,27 @@ export class DtaDataSource implements DataSource {
             const take = Math.min(window.rows.length - offset, end - row);
             rows.push(...window.rows.slice(offset, offset + take));
             row += take;
+        }
+        return rows;
+    }
+
+    private read_raw_range(
+        start: number,
+        end: number,
+        columns: readonly number[],
+    ): (RawCell | null)[][] {
+        const rows: (RawCell | null)[][] = [];
+        for (let row = start; row < end;) {
+            const count = Math.min(DECODE_WINDOW_ROWS, end - row);
+            const decoded = this.decode_columns(row, count, columns);
+            rows.push(...decoded.map((values, row_offset) => values.map((cell, index) =>
+                canonicalize_stata_raw(this.resolve_cell(
+                    cell,
+                    this.metadata.variables[columns[index]],
+                    row + row_offset,
+                )),
+            )));
+            row += count;
         }
         return rows;
     }
@@ -309,6 +379,47 @@ export class DtaDataSource implements DataSource {
         variable: VariableInfo,
         row: number,
     ): RenderedCell {
+        const resolved = this.resolve_cell(cell, variable, row);
+        const raw_cell = canonicalize_stata_raw(resolved);
+        if (is_missing_value_object(resolved)) {
+            const labels = variable.value_label_name
+                ? this.value_labels().get(variable.value_label_name)
+                : undefined;
+            return {
+                ...raw_cell,
+                formatted: labels?.get(missing_type_to_label_key(resolved.missing_type))
+                    ?? resolved.missing_type,
+                bold: false,
+                italic: false,
+            };
+        }
+        if (typeof resolved === 'string') {
+            return {
+                ...raw_cell,
+                formatted: resolved,
+                bold: false,
+                italic: false,
+            };
+        }
+
+        const labels = variable.value_label_name
+            ? this.value_labels().get(variable.value_label_name)
+            : undefined;
+        return {
+            ...raw_cell,
+            formatted: labels?.get(resolved)
+                ?? apply_display_format(resolved, variable.format)
+                ?? raw_cell.raw!,
+            bold: false,
+            italic: false,
+        };
+    }
+
+    private resolve_cell(
+        cell: RowCell,
+        variable: VariableInfo,
+        row: number,
+    ): RowCell {
         if (variable.type === 'strL') {
             const pointer_offset = this.data_start
                 + row * this.metadata.obs_length
@@ -317,17 +428,16 @@ export class DtaDataSource implements DataSource {
             if (resolved === null) {
                 throw new Error(`Stata strL cell at row ${row} has a dangling reference`);
             }
-            cell = resolved;
+            return resolved;
         }
         if (
             typeof cell === 'string'
-            && variable.type !== 'strL'
             && this.metadata.format_version < 118
         ) {
             const offset = this.data_start
                 + row * this.metadata.obs_length
                 + variable.byte_offset;
-            cell = decode_fixed(
+            return decode_fixed(
                 this.open_bytes(),
                 offset,
                 variable.byte_width,
@@ -335,43 +445,7 @@ export class DtaDataSource implements DataSource {
                 this.pre_unicode_fallback_decoder,
             );
         }
-        if (is_missing_value_object(cell)) {
-            const tag = cell.missing_type;
-            const labels = variable.value_label_name
-                ? this.value_labels().get(variable.value_label_name)
-                : undefined;
-            return {
-                // Null remains reserved for genuinely empty cells. The tag is
-                // stable in the raw channel for diffs and filters, and number
-                // typing keeps mixed numeric/missing columns on numeric sorts.
-                raw: tag,
-                formatted: labels?.get(missing_type_to_label_key(tag)) ?? tag,
-                bold: false,
-                italic: false,
-                rawType: 'number',
-            };
-        }
-        if (typeof cell === 'string') {
-            return {
-                raw: cell,
-                formatted: cell,
-                bold: false,
-                italic: false,
-                rawType: 'string',
-            };
-        }
-
-        const raw = String(cell);
-        const labels = variable.value_label_name
-            ? this.value_labels().get(variable.value_label_name)
-            : undefined;
-        return {
-            raw,
-            formatted: labels?.get(cell) ?? apply_display_format(cell, variable.format) ?? raw,
-            bold: false,
-            italic: false,
-            rawType: 'number',
-        };
+        return cell;
     }
 
     private resolve_strl(pointer_offset: number): string | null {

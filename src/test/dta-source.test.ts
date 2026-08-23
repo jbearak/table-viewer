@@ -405,6 +405,33 @@ describe('DtaDataSource', () => {
         expect([...sorted.indices!]).toEqual([0, 2, 1, 3]);
     });
 
+    it('returns identical canonical raw values from fast and rendered paths', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture());
+        const fast = source.read_raw_columns(0, 0, 4, [0, 1, 2, 3, 4]).rows;
+        expect((source as unknown as { value_label_tables?: unknown }).value_label_tables)
+            .toBeUndefined();
+        const rendered = source.read_rows(0, 0, 4).rows;
+        expect(fast).toEqual(rendered.map((row) => row.map((cell) =>
+            cell === null
+                ? null
+                : { raw: cell.raw, rawType: cell.rawType },
+        )));
+        expect(fast.map((row) => row[3])).toEqual([
+            { raw: '.', rawType: 'number' },
+            { raw: '.a', rawType: 'number' },
+            { raw: '.b', rawType: 'number' },
+            { raw: '.z', rawType: 'number' },
+        ]);
+        expect(fast[0]).toEqual([
+            { raw: '1', rawType: 'number' },
+            { raw: '12.5', rawType: 'number' },
+            { raw: 'alpha', rawType: 'string' },
+            { raw: '.', rawType: 'number' },
+            { raw: 'a long first value', rawType: 'string' },
+        ]);
+        expect(rendered[0][0]?.formatted).toBe('Zulu');
+    });
+
     it('preserves binary strL payloads as distinct hexadecimal raw values', async () => {
         const original_fixture = build_dta_fixture();
         const modified_fixture = build_dta_fixture();
