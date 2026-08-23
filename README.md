@@ -35,7 +35,7 @@ The flip side is that Table Viewer is deliberately *not* a full spreadsheet edit
 **Viewing**
 - Opens `.xlsx`, `.xls`, `.csv`, and `.tsv` files
 - Multi-sheet workbooks with horizontal or vertical tab orientation
-- Merged cells with correct colspan/rowspan rendering
+- Merged cells with colspan/rowspan rendering
 - `.xlsx` rich-text runs and whole-cell bold, italic, underline, and strikethrough styling
 - `.xlsx` hyperlinks, with destination information on hover and open/copy actions for external links
 - Conservatively detects Excel column-name rows, with remembered per-sheet controls for promoting the first non-hidden row or a chosen row, including column names inherited from simple two-row vertical merges
