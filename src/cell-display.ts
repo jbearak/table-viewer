@@ -84,9 +84,6 @@ export function cells_exactly_equal(
     const right_text = right_key === undefined
         ? right_deferred!.resolveKey(is_cancelled)
         : right_key;
-    if (typeof left_text === 'string' && typeof right_text === 'string') {
-        return left_text === right_text;
-    }
     return Promise.all([left_text, right_text]).then(([resolved_left, resolved_right]) =>
         resolved_left === resolved_right);
 }

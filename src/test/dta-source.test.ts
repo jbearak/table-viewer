@@ -772,6 +772,8 @@ describe('DtaDataSource', () => {
         expect(Object.keys(fast)).toEqual(['raw', 'rawType', 'rawByteLength']);
         expect(JSON.stringify(fast)).not.toContain('sha256');
         expect(binary_comparison_identity(fast)).toBe(binary_filter_identity(fast));
+        const reread = source.read_raw_columns(0, 0, 1, [0]).rows[0][0]!;
+        expect(binary_comparison_identity(reread)).toBe(binary_comparison_identity(fast));
         expect(internals.gso_digest_cache.size).toBe(0);
         expect(internals.binary_digest_computations).toBe(0);
 

@@ -6,7 +6,7 @@ import {
     type RenderedCell,
     type WorkbookMeta,
 } from '../data-source/interface';
-import { FixtureSource } from './helpers/fixture-source';
+import { cell, FixtureSource } from './helpers/fixture-source';
 
 /** Serves cells verbatim, unlike FixtureSource's string rows, so a test can
  *  give a cell the deferred identity a Stata binary strL carries. */
@@ -102,13 +102,7 @@ describe('CompareDataSource', () => {
     it('compares on identity but reports the display text as the base', async () => {
         const preview = 'binary (33 bytes): 0102030405…';
         const binary = (digest: string): RenderedCell => {
-            const rendered: RenderedCell = {
-                raw: preview,
-                formatted: preview,
-                bold: false,
-                italic: false,
-                rawType: 'string',
-            };
+            const rendered = cell(preview);
             Object.defineProperty(rendered, DEFERRED_COMPARISON_IDENTITY, {
                 value: {
                     cachedKey: () => undefined,

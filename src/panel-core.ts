@@ -127,6 +127,11 @@ type DurableRowHeightsProvider = (sheet_names: readonly string[]) => {
     readonly heights: readonly (Record<number, number> | undefined)[];
 };
 
+type RowWindowServed = (
+    msg: Extract<WebviewMessage, { type: 'requestRows' }>,
+    window: TransformedRowWindow,
+) => void | Promise<void>;
+
 type TransformOperationToken = number;
 let next_transform_operation_token = 0;
 
@@ -255,10 +260,7 @@ export class ViewerPanelCore {
     private readonly on_invalid_restore?: InvalidRestoreCleanup;
     private readonly durable_pending_edit_keys?: (sheet_index: number) => readonly string[];
     private readonly durable_row_heights?: DurableRowHeightsProvider;
-    private readonly on_row_window_served?: (
-        msg: Extract<WebviewMessage, { type: 'requestRows' }>,
-        window: TransformedRowWindow,
-    ) => void | Promise<void>;
+    private readonly on_row_window_served?: RowWindowServed;
     /**
      * The last computed display-keyed projection, with the facts it is a function of.
      * See `row_height_projection_by_sheet` for why each is needed and why a memo is
@@ -324,10 +326,7 @@ export class ViewerPanelCore {
              * so an augmenting sidecar (git compare's `compareDiff`) describes
              * exactly the rows the renderer received, not the raw request.
              */
-            onRowWindowServed?: (
-                msg: Extract<WebviewMessage, { type: 'requestRows' }>,
-                window: TransformedRowWindow,
-            ) => void | Promise<void>;
+            onRowWindowServed?: RowWindowServed;
         },
     ) {
         this.max_cached_pages = opts?.maxCachedPages ?? DEFAULT_MAX_CACHED_PAGES;
@@ -1742,10 +1741,7 @@ export function adopt_source_into_core(
         onInvalidRestore?: InvalidRestoreCleanup;
         durablePendingEditKeys?: (sheet_index: number) => readonly string[];
         durableRowHeights?: DurableRowHeightsProvider;
-        onRowWindowServed?: (
-            msg: Extract<WebviewMessage, { type: 'requestRows' }>,
-            window: TransformedRowWindow,
-        ) => void | Promise<void>;
+        onRowWindowServed?: RowWindowServed;
     },
     on_installed?: (installed: ViewerPanelCore) => void,
 ): AdoptSourceIntoCoreResult {

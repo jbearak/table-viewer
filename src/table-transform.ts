@@ -18,6 +18,7 @@ import {
     canonical_numeric_string,
     cell_can_be_numeric,
     filter_value,
+    peek_filter_value,
     raw_value,
     resolve_filter_value,
     stata_missing_rank,
@@ -66,7 +67,6 @@ type TransformColumn = CachedTransformColumn;
 interface MutableTransformColumn {
     values: (string | null | undefined)[];
     filterValues?: (string | null | undefined)[];
-    filterIdentityComplete: boolean;
     numeric: boolean;
     foundValue: boolean;
 }
@@ -191,7 +191,7 @@ export async function compute_transform(
                     sheet_index,
                     column_index,
                     sheet.rowCount,
-                    filters_need_identity(filters),
+                    filters.some(filter_uses_identity),
                     column_cache,
                     is_cancelled,
                     sort_instrumentation,
@@ -336,10 +336,9 @@ export async function compute_transform(
     }
 }
 
-function filters_need_identity(filters: readonly FilterEntry[]): boolean {
-    return filters.some((entry) =>
-        entry.operator === 'isOneOf'
-        && entry.excludedValues?.some((value) => value !== null) === true);
+function filter_uses_identity(entry: FilterEntry): boolean {
+    return entry.operator === 'isOneOf'
+        && entry.excludedValues?.some((value) => value !== null) === true;
 }
 
 function group_enabled_filters(
@@ -375,10 +374,10 @@ async function acquire_transform_column(
     await cancellation_checkpoint(is_cancelled);
     const mutable: MutableTransformColumn = {
         values: new Array(row_count),
-        filterIdentityComplete: include_filter_identity,
         numeric: true,
         foundValue: false,
     };
+    let filter_identity_complete = true;
     for (let start = 0; start < row_count; start += SCAN_ROWS_PER_CHECKPOINT) {
         const rows = (await read_source_raw_columns_async(
             source,
@@ -393,17 +392,21 @@ async function acquire_transform_column(
             const source_cell = rows[offset]?.[0] ?? null;
             const raw = raw_value(source_cell);
             mutable.values[row] = raw;
-            if (include_filter_identity) {
-                const identity_value = resolve_filter_value(source_cell, is_cancelled);
-                const identity = typeof identity_value === 'object' && identity_value !== null
-                    ? await identity_value
-                    : identity_value;
-                if (identity !== raw) {
-                    mutable.filterValues ??= mutable.values.slice();
-                    mutable.filterValues[row] = identity;
-                } else if (mutable.filterValues !== undefined) {
-                    mutable.filterValues[row] = raw;
-                }
+            let identity = peek_filter_value(source_cell);
+            if (identity === undefined && include_filter_identity) {
+                const resolved = resolve_filter_value(source_cell, is_cancelled);
+                identity = typeof resolved === 'object' && resolved !== null
+                    ? await resolved
+                    : resolved;
+            }
+            if (identity === undefined) {
+                filter_identity_complete = false;
+                if (mutable.filterValues !== undefined) mutable.filterValues[row] = raw;
+            } else if (identity !== raw) {
+                mutable.filterValues ??= mutable.values.slice();
+                mutable.filterValues[row] = identity;
+            } else if (mutable.filterValues !== undefined) {
+                mutable.filterValues[row] = raw;
             }
             if (raw !== null) {
                 mutable.foundValue = true;
@@ -431,7 +434,7 @@ async function acquire_transform_column(
         ...(mutable.filterValues === undefined
             ? {}
             : { filterValues: Object.freeze(mutable.filterValues) }),
-        filterIdentityComplete: mutable.filterIdentityComplete,
+        filterIdentityComplete: filter_identity_complete,
         numeric: mutable.numeric,
         foundValue: mutable.foundValue,
     });
@@ -704,7 +707,7 @@ function compile_filter(
         const excluded = new Set(entry.excludedValues ?? []);
         return {
             needsNumericKey: false,
-            usesFilterIdentity: [...excluded].some((value) => value !== null),
+            usesFilterIdentity: filter_uses_identity(entry),
             matches: (raw) => !excluded.has(raw),
         };
     }

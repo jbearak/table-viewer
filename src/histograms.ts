@@ -1,8 +1,7 @@
-import {
-    DEFERRED_FILTER_IDENTITY,
-    type ColumnFilterMetadata,
-    type DataSource,
-    type RawCell,
+import type {
+    ColumnFilterMetadata,
+    DataSource,
+    RawCell,
 } from './data-source/interface';
 import { read_source_raw_columns_async } from './data-source/interface';
 import type { FilterColumnKind, FilterValueOption, HistogramBin } from './types';
@@ -12,6 +11,7 @@ import {
 } from './types';
 import {
     cell_can_be_numeric,
+    peek_filter_value,
     raw_value,
     resolve_filter_value,
 } from './transform-values';
@@ -111,10 +111,7 @@ function add_distinct_value(
     // source value whose actual identity cannot fit in the transfer budget.
     if (bytes > FILTER_DISTINCT_VALUE_BYTE_LIMIT) return false;
 
-    const deferred = cell?.[DEFERRED_FILTER_IDENTITY];
-    const known_identity = raw === null
-        ? null
-        : cell?.filterKey ?? deferred?.cachedKey() ?? (deferred === undefined ? raw : undefined);
+    const known_identity = peek_filter_value(cell);
     if (known_identity !== undefined && distinct.entries.has(known_identity)) return true;
     // Check both caps before starting deferred identity work. This is deliberately
     // conservative for a repeated lossy preview: proving it is a duplicate would

@@ -669,6 +669,16 @@ describe('table transforms', () => {
 
         expect(source.read_calls).toBe(first_read_count);
         expect(stored.size).toBe(1);
+        expect(stored.get('0:0')?.filterIdentityComplete).toBe(true);
+
+        await compute_transform(source, 0, {
+            filters: [{
+                ...filter('isOneOf'),
+                excludedValues: ['0'],
+            }],
+            sort: [],
+        }, undefined, undefined, cache);
+        expect(source.read_calls).toBe(first_read_count);
     });
 
     it('resolves identity only for isOneOf and upgrades a raw-only cached column', async () => {

@@ -173,6 +173,32 @@ const MOVE_SEARCH_LIMIT = 1000;
  *  not sufficient yield points here. */
 const MOVE_SCORES_PER_CHECKPOINT = 20_000;
 
+type ComparisonCell = { raw: string | null } | null | undefined;
+
+/** Visit comparison text synchronously until the first deferred identity, then
+ * resume through promises without imposing a microtask on ordinary rows. */
+function visit_materialized_comparison_cells(
+    cell_count: number,
+    cell_at: (index: number) => ComparisonCell,
+    is_cancelled: () => boolean,
+    visit: (text: string) => void,
+): void | Promise<void> {
+    const continue_at = (start: number): void | Promise<void> => {
+        for (let index = start; index < cell_count; index++) {
+            const text = materialize_cell_comparison_text(cell_at(index), is_cancelled);
+            if (typeof text === 'string') {
+                visit(text);
+                continue;
+            }
+            return text.then((resolved) => {
+                visit(resolved);
+                return continue_at(index + 1);
+            });
+        }
+    };
+    return continue_at(0);
+}
+
 /**
  * FNV-1a over the row's raw cell text, length-prefixed per cell so cell
  * boundaries cannot be forged.
@@ -203,24 +229,19 @@ function hash_row(
             mix(text.charCodeAt(position));
         }
     };
-    const continue_at = (start: number): number | Promise<number> => {
-        for (let index = start; index < cells.length; index++) {
-            const text = materialize_cell_comparison_text(cells[index], is_cancelled);
-            if (typeof text === 'string') {
-                mix_text(text);
-                continue;
-            }
-            return text.then((resolved) => {
-                mix_text(resolved);
-                return continue_at(index + 1);
-            });
-        }
+    mix(cells.length);
+    const materialized = visit_materialized_comparison_cells(
+        cells.length,
+        (index) => cells[index],
+        is_cancelled,
+        mix_text,
+    );
+    const finish = () => {
         // >>> 0 so the value is a stable unsigned int rather than a sign-flipped
         // one, since it is stored in a Uint32Array and compared for equality.
         return hash >>> 0;
     };
-    mix(cells.length);
-    return continue_at(0);
+    return materialized === undefined ? finish() : materialized.then(finish);
 }
 
 async function hash_side(
@@ -830,23 +851,17 @@ function normalize_candidate(
 ): CandidateRow | Promise<CandidateRow> {
     const texts: string[] = [];
     let length = 0;
-    const continue_at = (start: number): CandidateRow | Promise<CandidateRow> => {
-        for (let col = start; col < column_count; col++) {
-            const text = materialize_cell_comparison_text(cells?.[col], is_cancelled);
-            if (typeof text === 'string') {
-                texts.push(text);
-                length += text.length;
-                continue;
-            }
-            return text.then((resolved) => {
-                texts.push(resolved);
-                length += resolved.length;
-                return continue_at(col + 1);
-            });
-        }
-        return { texts, length };
-    };
-    return continue_at(0);
+    const materialized = visit_materialized_comparison_cells(
+        column_count,
+        (column) => cells?.[column],
+        is_cancelled,
+        (text) => {
+            texts.push(text);
+            length += text.length;
+        },
+    );
+    const finish = (): CandidateRow => ({ texts, length });
+    return materialized === undefined ? finish() : materialized.then(finish);
 }
 
 async function normalize_candidates(

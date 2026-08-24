@@ -12,18 +12,25 @@ export function raw_value(cell: RawCell | null | undefined): string | null {
         : raw;
 }
 
-/** Exact categorical matching identity. Most values use their raw text; sources
- * with a bounded display preview may provide a separate lossless key. Throws for
- * an unresolved deferred identity so synchronous callers cannot match a preview. */
-export function filter_value(cell: RawCell | null | undefined): string | null {
+/** Return a known categorical identity without starting deferred work.
+ * `undefined` means a deferred identity still needs to be resolved. */
+export function peek_filter_value(
+    cell: RawCell | null | undefined,
+): string | null | undefined {
     const raw = raw_value(cell);
     if (raw === null) return null;
     const concrete = cell?.filterKey;
     if (concrete !== undefined) return concrete;
     const deferred = cell?.[DEFERRED_FILTER_IDENTITY];
-    if (deferred === undefined) return raw;
-    const cached = deferred.cachedKey();
-    if (cached !== undefined) return cached;
+    return deferred === undefined ? raw : deferred.cachedKey();
+}
+
+/** Exact categorical matching identity. Most values use their raw text; sources
+ * with a bounded display preview may provide a separate lossless key. Throws for
+ * an unresolved deferred identity so synchronous callers cannot match a preview. */
+export function filter_value(cell: RawCell | null | undefined): string | null {
+    const known = peek_filter_value(cell);
+    if (known !== undefined) return known;
     throw new Error('Deferred filter identity must be resolved asynchronously.');
 }
 
@@ -33,14 +40,9 @@ export function resolve_filter_value(
     cell: RawCell | null | undefined,
     is_cancelled: () => boolean,
 ): string | null | Promise<string> {
-    const raw = raw_value(cell);
-    if (raw === null) return null;
-    const concrete = cell?.filterKey;
-    if (concrete !== undefined) return concrete;
-    const deferred = cell?.[DEFERRED_FILTER_IDENTITY];
-    if (deferred === undefined) return raw;
-    const cached = deferred.cachedKey();
-    return cached ?? deferred.resolveKey(is_cancelled);
+    const known = peek_filter_value(cell);
+    if (known !== undefined) return known;
+    return cell![DEFERRED_FILTER_IDENTITY]!.resolveKey(is_cancelled);
 }
 
 export function stata_missing_rank(value: string): number | undefined {

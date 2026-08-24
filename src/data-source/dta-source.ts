@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
 import {
     apply_display_format,
@@ -155,18 +156,7 @@ interface BinaryIdentityWaiter {
 interface PendingBinaryIdentity {
     readonly binary: BinaryGso;
     readonly waiters: Set<BinaryIdentityWaiter>;
-    stopped: boolean;
 }
-
-interface DtaBinaryIdentityDescriptor {
-    readonly source: DtaDataSource;
-    readonly binary: BinaryGso;
-}
-
-const binary_identity_descriptors = new WeakMap<
-    DeferredCellIdentity,
-    DtaBinaryIdentityDescriptor
->();
 
 type DecodedGso = string | BinaryGso;
 type ResolvedStataCell = RowCell | BinaryGso;
@@ -260,6 +250,7 @@ export class DtaDataSource implements DataSource {
     private gso_digest_cache_byte_limit = MAX_GSO_DIGEST_CACHE_BYTES;
     private binary_identity_chunk_bytes = BINARY_IDENTITY_CHUNK_BYTES;
     private binary_digest_computations = 0;
+    private readonly binary_identities = new WeakMap<BinaryGso, DtaBinaryIdentity>();
     private readonly pending_binary_identities = new Map<number, PendingBinaryIdentity>();
     private gso_checkpoints: GsoCheckpoint[] = [];
     private gso_checkpoint_stride = INITIAL_GSO_CHECKPOINT_STRIDE;
@@ -506,7 +497,6 @@ export class DtaDataSource implements DataSource {
         this.gso_digest_cache.clear();
         this.gso_digest_cache_bytes = 0;
         for (const job of this.pending_binary_identities.values()) {
-            job.stopped = true;
             const error = source_abort_error();
             for (const waiter of job.waiters) waiter.reject(error);
             job.waiters.clear();
@@ -547,22 +537,11 @@ export class DtaDataSource implements DataSource {
                 rawType: 'string',
                 rawByteLength: cell.contentLength,
             };
-            const identity: DeferredCellIdentity = {
-                cachedKey: () => this.cached_binary_comparison_key(cell),
-                resolveKey: (is_cancelled) =>
-                    this.resolve_binary_comparison_key(cell, is_cancelled),
-                exactlyEquals: (other, is_cancelled) => {
-                    const descriptor = binary_identity_descriptors.get(other);
-                    if (descriptor === undefined) return undefined;
-                    return this.binary_exactly_equals(
-                        cell,
-                        descriptor.source,
-                        descriptor.binary,
-                        is_cancelled,
-                    );
-                },
-            };
-            binary_identity_descriptors.set(identity, { source: this, binary: cell });
+            let identity = this.binary_identities.get(cell);
+            if (identity === undefined) {
+                identity = new DtaBinaryIdentity(this, cell);
+                this.binary_identities.set(cell, identity);
+            }
             Object.defineProperties(raw_cell, {
                 [DEFERRED_COMPARISON_IDENTITY]: { value: identity },
                 [DEFERRED_FILTER_IDENTITY]: { value: identity },
@@ -1127,7 +1106,8 @@ export class DtaDataSource implements DataSource {
         );
     }
 
-    private cached_binary_comparison_key(binary: BinaryGso): string | undefined {
+    /** @internal Used only by the module-private DtaBinaryIdentity capability. */
+    cached_binary_comparison_key(binary: BinaryGso): string | undefined {
         const cached = this.gso_digest_cache.get(binary.contentOffset);
         if (cached === undefined) return undefined;
         this.gso_digest_cache.delete(binary.contentOffset);
@@ -1176,7 +1156,8 @@ export class DtaDataSource implements DataSource {
         }
     }
 
-    private resolve_binary_comparison_key(
+    /** @internal Used only by the module-private DtaBinaryIdentity capability. */
+    resolve_binary_comparison_key(
         binary: BinaryGso,
         is_cancelled: () => boolean,
     ): Promise<string> {
@@ -1187,7 +1168,7 @@ export class DtaDataSource implements DataSource {
         let job = this.pending_binary_identities.get(binary.contentOffset);
         let start_job = false;
         if (job === undefined) {
-            job = { binary, waiters: new Set(), stopped: false };
+            job = { binary, waiters: new Set() };
             this.pending_binary_identities.set(binary.contentOffset, job);
             start_job = true;
         }
@@ -1205,7 +1186,6 @@ export class DtaDataSource implements DataSource {
             this.binary_digest_computations += 1;
             let hashed = 0;
             while (hashed < job.binary.contentLength) {
-                if (job.stopped) return;
                 this.reject_cancelled_binary_waiters(job);
                 if (job.waiters.size === 0) {
                     this.pending_binary_identities.delete(job.binary.contentOffset);
@@ -1221,7 +1201,6 @@ export class DtaDataSource implements DataSource {
                 if (hashed < job.binary.contentLength) await yield_to_event_loop();
             }
 
-            if (job.stopped) return;
             this.reject_cancelled_binary_waiters(job);
             if (job.waiters.size === 0) {
                 this.pending_binary_identities.delete(job.binary.contentOffset);
@@ -1242,7 +1221,8 @@ export class DtaDataSource implements DataSource {
         }
     }
 
-    private binary_exactly_equals(
+    /** @internal Used only by the module-private DtaBinaryIdentity capability. */
+    binary_exactly_equals(
         binary: BinaryGso,
         other_source: DtaDataSource,
         other_binary: BinaryGso,
@@ -1275,9 +1255,10 @@ export class DtaDataSource implements DataSource {
             const count = Math.min(chunk_bytes, binary.contentLength - compared);
             const left_start = binary.contentOffset + compared;
             const right_start = other_binary.contentOffset + compared;
-            for (let offset = 0; offset < count; offset++) {
-                if (bytes[left_start + offset] !== other_bytes[right_start + offset]) return false;
-            }
+            if (Buffer.compare(
+                bytes.subarray(left_start, left_start + count),
+                other_bytes.subarray(right_start, right_start + count),
+            ) !== 0) return false;
             compared += count;
             if (compared < binary.contentLength) await yield_to_event_loop();
         }
@@ -1401,6 +1382,36 @@ export class DtaDataSource implements DataSource {
         if (!Number.isInteger(column) || column < 0 || column >= this.metadata.nvar) {
             throw new RangeError(`column index ${column} out of range (${this.metadata.nvar} columns)`);
         }
+    }
+}
+
+/** Shared-prototype identity capability, weakly interned by the decoded GSO so
+ * repeated cell materialization does not allocate another closure bundle. */
+class DtaBinaryIdentity implements DeferredCellIdentity {
+    constructor(
+        private readonly source: DtaDataSource,
+        private readonly binary: BinaryGso,
+    ) {}
+
+    cachedKey(): string | undefined {
+        return this.source.cached_binary_comparison_key(this.binary);
+    }
+
+    resolveKey(is_cancelled: () => boolean): Promise<string> {
+        return this.source.resolve_binary_comparison_key(this.binary, is_cancelled);
+    }
+
+    exactlyEquals(
+        other: DeferredCellIdentity,
+        is_cancelled: () => boolean,
+    ): boolean | Promise<boolean> | undefined {
+        if (!(other instanceof DtaBinaryIdentity)) return undefined;
+        return this.source.binary_exactly_equals(
+            this.binary,
+            other.source,
+            other.binary,
+            is_cancelled,
+        );
     }
 }
 
