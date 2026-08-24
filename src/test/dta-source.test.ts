@@ -596,6 +596,34 @@ describe('DtaDataSource', () => {
         expect(internals.gso_index.has('5:1')).toBe(true);
     });
 
+    it('resolves an evicted strL window in one ordered scan with per-cell parity', async () => {
+        const fixture = build_dta_fixture(2_000);
+        const batched = await DtaDataSource.create(fixture);
+        batched.read_rows(0, 0, 2_000);
+        const internals = batched as unknown as {
+            windows: Map<string, unknown>;
+            gso_index: Map<string, unknown>;
+            gso_cache: Map<string, unknown>;
+            read_gso_at: (...args: unknown[]) => unknown;
+        };
+        internals.windows.clear();
+        internals.gso_index.clear();
+        internals.gso_cache.clear();
+        const original_read_gso_at = internals.read_gso_at.bind(batched);
+        let headers_read = 0;
+        internals.read_gso_at = (...args) => {
+            headers_read += 1;
+            return original_read_gso_at(...args);
+        };
+
+        const batch_values = batched.read_raw_columns(0, 0, 256, [4]).rows;
+        const per_cell = await DtaDataSource.create(fixture);
+        const per_cell_values = Array.from({ length: 256 }, (_, row) =>
+            per_cell.read_raw_columns(0, row, 1, [4]).rows[0]);
+        expect(batch_values).toEqual(per_cell_values);
+        expect(headers_read).toBeLessThanOrEqual(320);
+    });
+
     it('keeps checkpoints ordered for observation-major multi-strL data', async () => {
         const source = await DtaDataSource.create(build_dta_fixture(1_100, true));
         source.read_rows(0, 0, 1_100);
@@ -698,6 +726,65 @@ describe('DtaDataSource', () => {
         expect(() => source.read_rows(0, 0, 1)).toThrow(
             /Corrupt \.dta file: strL pointer id .* is outside the dataset range/,
         );
+    });
+
+    it('falls back to a linear scan for physically out-of-order strL objects', async () => {
+        const fixture = build_dta_fixture();
+        const first_gso = find_tag_end(fixture, '<strls>');
+        const view = new DataView(fixture.buffer);
+        const first_end = first_gso + 20 + view.getUint32(first_gso + 16, true);
+        const second_end = first_end + 20 + view.getUint32(first_end + 16, true);
+        const first = fixture.slice(first_gso, first_end);
+        const second = fixture.slice(first_end, second_end);
+        fixture.set(second, first_gso);
+        fixture.set(first, first_gso + second.length);
+
+        const source = await DtaDataSource.create(fixture);
+        expect(source.read_raw_columns(0, 0, 1, [4]).rows[0][0]?.raw)
+            .toBe('a long first value');
+        expect((source as unknown as { gso_order_monotonic: boolean }).gso_order_monotonic)
+            .toBe(false);
+    });
+
+    it('continues forward in batches after detecting out-of-order strL objects', async () => {
+        const fixture = build_dta_fixture(2_000);
+        const first_gso = find_tag_end(fixture, '<strls>');
+        const view = new DataView(fixture.buffer);
+        const first_end = first_gso + 20 + view.getUint32(first_gso + 16, true);
+        const second_end = first_end + 20 + view.getUint32(first_end + 16, true);
+        const first = fixture.slice(first_gso, first_end);
+        const second = fixture.slice(first_end, second_end);
+        fixture.set(second, first_gso);
+        fixture.set(first, first_gso + second.length);
+
+        const source = await DtaDataSource.create(fixture);
+        source.read_raw_columns(0, 0, 256, [4]);
+        const internals = source as unknown as {
+            gso_order_monotonic: boolean;
+            read_gso_at: (...args: unknown[]) => unknown;
+        };
+        expect(internals.gso_order_monotonic).toBe(false);
+        const original_read_gso_at = internals.read_gso_at.bind(source);
+        let headers_read = 0;
+        internals.read_gso_at = (...args) => {
+            headers_read += 1;
+            return original_read_gso_at(...args);
+        };
+        const rows = source.read_raw_columns(0, 256, 256, [4]).rows;
+        expect(rows[0][0]?.raw).toBe('long value 256');
+        expect(rows[255][0]?.raw).toBe('long value 511');
+        expect(headers_read).toBeLessThanOrEqual(320);
+    });
+
+    it('stops a resolved strL batch before an unrelated corrupt object', async () => {
+        const fixture = build_dta_fixture();
+        const first_gso = find_tag_end(fixture, '<strls>');
+        const first_content_length = new DataView(fixture.buffer).getUint32(first_gso + 16, true);
+        const second_gso_variable = first_gso + 20 + first_content_length + 3;
+        new DataView(fixture.buffer).setUint32(second_gso_variable, 6, true);
+        const source = await DtaDataSource.create(fixture);
+        expect(source.read_raw_columns(0, 0, 1, [4]).rows[0][0]?.raw)
+            .toBe('a long first value');
     });
 
     it('rejects out-of-range ids in scanned strL objects', async () => {

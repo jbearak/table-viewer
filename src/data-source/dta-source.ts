@@ -95,6 +95,11 @@ interface ScannedGso extends GsoOrder {
     readonly nextPosition: number;
 }
 
+interface GsoBatchTarget extends GsoOrder {
+    readonly key: string;
+    readonly pointerOffsets: number[];
+}
+
 interface CachedWindow {
     readonly rows: (RenderedCell | null)[][];
     readonly cellCount: number;
@@ -364,14 +369,14 @@ export class DtaDataSource implements DataSource {
         const rows: (RawCell | null)[][] = [];
         for (let row = start; row < end;) {
             const count = Math.min(DECODE_WINDOW_ROWS, end - row);
-            const decoded = this.decode_columns(row, count, columns);
-            rows.push(...decoded.map((values, row_offset) => values.map((cell, index) =>
+            const decoded = this.resolve_columns(
+                this.decode_columns(row, count, columns),
+                row,
+                columns,
+            );
+            rows.push(...decoded.map((values) => values.map((cell) =>
                 canonicalize_stata_raw(
-                    this.resolve_cell(
-                        cell,
-                        this.metadata.variables[columns[index]],
-                        row + row_offset,
-                    ),
+                    cell,
                     (binary) => this.binary_comparison_key(binary),
                 ),
             )));
@@ -393,14 +398,14 @@ export class DtaDataSource implements DataSource {
             return cached;
         }
 
-        const raw_rows = this.decode_columns(start, count, columns);
+        const raw_rows = this.resolve_columns(
+            this.decode_columns(start, count, columns),
+            start,
+            columns,
+        );
         const window: CachedWindow = {
-            rows: raw_rows.map((row, row_offset) => row.map((cell, index) =>
-                this.render_cell(
-                    cell,
-                    this.metadata.variables[columns[index]],
-                    start + row_offset,
-                ))),
+            rows: raw_rows.map((row) => row.map((cell, index) =>
+                this.render_cell(cell, this.metadata.variables[columns[index]]))),
             cellCount: count * columns.length,
         };
         this.windows.set(key, window);
@@ -447,11 +452,9 @@ export class DtaDataSource implements DataSource {
     }
 
     private render_cell(
-        cell: RowCell,
+        resolved: ResolvedStataCell,
         variable: VariableInfo,
-        row: number,
     ): RenderedCell {
-        const resolved = this.resolve_cell(cell, variable, row);
         const raw_cell = canonicalize_stata_raw(
             resolved,
             (binary) => this.binary_comparison_key(binary),
@@ -484,17 +487,33 @@ export class DtaDataSource implements DataSource {
         );
     }
 
+    private resolve_columns(
+        rows: Row[],
+        start: number,
+        columns: readonly number[],
+    ): ResolvedStataCell[][] {
+        const resolved_strls = this.resolve_strl_batch(start, rows.length, columns);
+        return rows.map((row, row_offset) => row.map((cell, index) =>
+            this.resolve_cell(
+                cell,
+                this.metadata.variables[columns[index]],
+                start + row_offset,
+                resolved_strls,
+            )));
+    }
+
     private resolve_cell(
         cell: RowCell,
         variable: VariableInfo,
         row: number,
+        resolved_strls: ReadonlyMap<number, DecodedGso>,
     ): ResolvedStataCell {
         if (variable.type === 'strL') {
             const pointer_offset = this.data_start
                 + row * this.metadata.obs_length
                 + variable.byte_offset;
-            const resolved = this.resolve_strl(pointer_offset);
-            if (resolved === null) {
+            const resolved = resolved_strls.get(pointer_offset);
+            if (resolved === undefined) {
                 throw new Error(`Stata strL cell at row ${row} has a dangling reference`);
             }
             return resolved;
@@ -517,46 +536,117 @@ export class DtaDataSource implements DataSource {
         return cell;
     }
 
-    private resolve_strl(pointer_offset: number): DecodedGso | null {
-        const bytes = this.open_bytes();
+    private resolve_strl_batch(
+        start: number,
+        count: number,
+        columns: readonly number[],
+    ): ReadonlyMap<number, DecodedGso> {
+        const strl_columns = columns.filter(
+            (column) => this.metadata.variables[column].type === 'strL',
+        );
+        if (strl_columns.length === 0) return new Map();
         const view = this.open_view();
-        const pointer = read_strl_cell_pointer(view, this.metadata, pointer_offset);
-        if (pointer === null) return '';
-        validate_gso_identifier(pointer.v, pointer.o, this.metadata, 'strL pointer');
-        const key = gso_key(pointer.v, pointer.o);
-        const cached = this.gso_cache.get(key);
-        if (cached !== undefined) {
-            this.gso_cache.delete(key);
-            this.gso_cache.set(key, cached);
-            return cached;
-        }
-        const indexed = this.gso_index.get(key);
-        if (indexed !== undefined) {
-            this.cache_gso_entry(key, indexed);
-            return this.decode_and_cache_gso(key, bytes, indexed);
-        }
-
-        const target_order = { observation: pointer.o, variable: pointer.v };
-        const target_was_scanned = !this.gso_order_monotonic
-            || (this.gso_last_order !== undefined
-                && compare_gso_order(target_order, this.gso_last_order) <= 0);
-        if (target_was_scanned) {
-            const entry = this.find_scanned_gso(bytes, view, key, target_order);
-            if (entry !== null) {
-                this.cache_gso_entry(key, entry);
-                return this.decode_and_cache_gso(key, bytes, entry);
-            }
-            if (this.gso_order_monotonic) return null;
-        }
-
-        while (!this.gso_scan_exhausted) {
-            const scanned = this.scan_next_gso(bytes, view);
-            if (scanned === null) break;
-            if (scanned.key === key) {
-                return this.decode_and_cache_gso(key, bytes, scanned.value);
+        const resolved = new Map<number, DecodedGso>();
+        const targets = new Map<string, GsoBatchTarget>();
+        for (let row_offset = 0; row_offset < count; row_offset++) {
+            for (const column of strl_columns) {
+                const variable = this.metadata.variables[column];
+                const pointer_offset = this.data_start
+                    + (start + row_offset) * this.metadata.obs_length
+                    + variable.byte_offset;
+                const pointer = read_strl_cell_pointer(view, this.metadata, pointer_offset);
+                if (pointer === null) {
+                    resolved.set(pointer_offset, '');
+                    continue;
+                }
+                validate_gso_identifier(pointer.v, pointer.o, this.metadata, 'strL pointer');
+                const key = gso_key(pointer.v, pointer.o);
+                const target = targets.get(key);
+                if (target === undefined) {
+                    targets.set(key, {
+                        key,
+                        observation: pointer.o,
+                        variable: pointer.v,
+                        pointerOffsets: [pointer_offset],
+                    });
+                } else {
+                    target.pointerOffsets.push(pointer_offset);
+                }
             }
         }
-        return null;
+        if (targets.size === 0) return resolved;
+
+        const values = new Map<string, DecodedGso>();
+        const unresolved: GsoBatchTarget[] = [];
+        const bytes = this.open_bytes();
+        for (const target of targets.values()) {
+            const cached = this.find_cached_gso(target.key, bytes);
+            if (cached === undefined) unresolved.push(target);
+            else values.set(target.key, cached);
+        }
+        if (unresolved.length > 0) {
+            this.resolve_gso_batch(bytes, view, unresolved, values);
+        }
+        for (const target of targets.values()) {
+            const value = values.get(target.key);
+            if (value === undefined) continue;
+            for (const pointer_offset of target.pointerOffsets) {
+                resolved.set(pointer_offset, value);
+            }
+        }
+        return resolved;
+    }
+
+    private resolve_gso_batch(
+        bytes: Uint8Array,
+        view: DataView,
+        targets: GsoBatchTarget[],
+        values: Map<string, DecodedGso>,
+    ): void {
+        const ordered = this.gso_order_monotonic;
+        const first = targets.reduce((minimum, target) =>
+            compare_gso_order(target, minimum) < 0 ? target : minimum);
+        let position = this.gso_start_position;
+        if (ordered) {
+            if (
+                !this.gso_scan_exhausted
+                && this.gso_last_order !== undefined
+                && compare_gso_order(this.gso_last_order, first) < 0
+            ) {
+                position = this.gso_scan_position;
+            } else {
+                position = this.gso_checkpoint_position(first);
+            }
+        }
+
+        const requested = new Set(targets.map((target) => target.key));
+        const initial_frontier = this.gso_scan_position;
+        const scan_ranges = !ordered && !this.gso_scan_exhausted
+            && initial_frontier > this.gso_start_position
+            ? [
+                { start: initial_frontier, end: this.metadata.section_offsets.value_labels },
+                { start: this.gso_start_position, end: initial_frontier },
+            ]
+            : [{ start: position, end: this.metadata.section_offsets.value_labels }];
+        for (const range of scan_ranges) {
+            position = range.start;
+            while (position < range.end) {
+                const historical = position < this.gso_scan_position;
+                const scanned = historical
+                    ? this.read_gso_at(bytes, view, position)
+                    : this.scan_next_gso(bytes, view);
+                if (scanned === null) break;
+                if (requested.delete(scanned.key)) {
+                    if (historical) this.cache_gso_entry(scanned.key, scanned.value);
+                    values.set(
+                        scanned.key,
+                        this.decode_and_cache_gso(scanned.key, bytes, scanned.value),
+                    );
+                    if (requested.size === 0) return;
+                }
+                position = scanned.nextPosition;
+            }
+        }
     }
 
     private scan_next_gso(bytes: Uint8Array, view: DataView): ScannedGso | null {
@@ -648,37 +738,33 @@ export class DtaDataSource implements DataSource {
         }
     }
 
-    private find_scanned_gso(
-        bytes: Uint8Array,
-        view: DataView,
-        key: string,
-        target_order: GsoOrder,
-    ): GsoEntry | null {
-        let position = this.gso_start_position;
-        if (this.gso_order_monotonic && this.gso_checkpoints.length > 0) {
-            let low = 0;
-            let high = this.gso_checkpoints.length;
-            while (low < high) {
-                const middle = Math.floor((low + high) / 2);
-                if (compare_gso_order(this.gso_checkpoints[middle], target_order) <= 0) {
-                    low = middle + 1;
-                } else {
-                    high = middle;
-                }
+    private find_cached_gso(key: string, bytes: Uint8Array): DecodedGso | undefined {
+        const cached = this.gso_cache.get(key);
+        if (cached !== undefined) {
+            this.gso_cache.delete(key);
+            this.gso_cache.set(key, cached);
+            return cached;
+        }
+        const indexed = this.gso_index.get(key);
+        if (indexed === undefined) return undefined;
+        this.cache_gso_entry(key, indexed);
+        return this.decode_and_cache_gso(key, bytes, indexed);
+    }
+
+    private gso_checkpoint_position(target_order: GsoOrder): number {
+        let low = 0;
+        let high = this.gso_checkpoints.length;
+        while (low < high) {
+            const middle = Math.floor((low + high) / 2);
+            if (compare_gso_order(this.gso_checkpoints[middle], target_order) <= 0) {
+                low = middle + 1;
+            } else {
+                high = middle;
             }
-            if (low > 0) position = this.gso_checkpoints[low - 1].position;
         }
-        while (position < this.gso_scan_position) {
-            const scanned = this.read_gso_at(bytes, view, position);
-            if (scanned === null) return null;
-            if (scanned.key === key) return scanned.value;
-            if (
-                this.gso_order_monotonic
-                && compare_gso_order(scanned, target_order) > 0
-            ) return null;
-            position = scanned.nextPosition;
-        }
-        return null;
+        return low > 0
+            ? this.gso_checkpoints[low - 1].position
+            : this.gso_start_position;
     }
 
     private decode_and_cache_gso(
