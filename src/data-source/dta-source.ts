@@ -47,11 +47,14 @@ const MAX_GSO_CHECKPOINTS = 1_024;
 const MAX_GSO_DIGEST_CACHE_ENTRIES = 4_096;
 const MAX_GSO_DIGEST_CACHE_BYTES = 1024 * 1024;
 const BINARY_IDENTITY_CHUNK_BYTES = 256 * 1024;
+const BINARY_IDENTITY_WORK_BYTES_PER_TURN = BINARY_IDENTITY_CHUNK_BYTES;
+const BINARY_IDENTITY_JOBS_PER_TURN = 64;
 const MAX_VALUE_LABEL_TABLE_BYTES = 16 * 1024 * 1024;
 const MAX_VALUE_LABEL_TABLE_ENTRIES = 65_536;
 const MAX_VALUE_LABEL_TABLE_DECODED_BYTES = 16 * 1024 * 1024;
 const MAX_VALUE_LABEL_CACHE_ENTRIES = 64;
 const MAX_VALUE_LABEL_CACHE_BYTES = 16 * 1024 * 1024;
+const VALUE_LABEL_CACHE_BYTES_PER_ENTRY = 64;
 const MAX_LEGACY_EXPANSION_FIELDS = 10_000;
 const INITIAL_GSO_CHECKPOINT_STRIDE = 64;
 const GSO_SCAN_ENTRIES_PER_YIELD = 256;
@@ -86,7 +89,10 @@ const MODERN_SECTION_TAGS: readonly [
 
 interface DecodedValueLabelTable {
     readonly labels: Map<number, string>;
+    /** Unique decoded UTF-16 text, used only for parser safety. */
     readonly decodedBytes: number;
+    /** Conservative retained cache charge, including labels Map entries. */
+    readonly cacheBytes: number;
 }
 
 type DecodedValueLabelTables = Map<string, DecodedValueLabelTable>;
@@ -248,6 +254,11 @@ export class DtaDataSource implements DataSource {
     private gso_digest_cache_entry_limit = MAX_GSO_DIGEST_CACHE_ENTRIES;
     private gso_digest_cache_byte_limit = MAX_GSO_DIGEST_CACHE_BYTES;
     private binary_identity_chunk_bytes = BINARY_IDENTITY_CHUNK_BYTES;
+    private binary_identity_work_byte_limit = BINARY_IDENTITY_WORK_BYTES_PER_TURN;
+    private binary_identity_work_job_limit = BINARY_IDENTITY_JOBS_PER_TURN;
+    private binary_identity_work_bytes = 0;
+    private binary_identity_work_jobs = 0;
+    private binary_identity_work_yield?: Promise<void>;
     private binary_digest_computations = 0;
     private readonly binary_identities = new WeakMap<BinaryGso, DtaBinaryIdentity>();
     private readonly pending_binary_identities = new Map<number, PendingBinaryIdentity>();
@@ -510,6 +521,9 @@ export class DtaDataSource implements DataSource {
         this.gso_cache_bytes = 0;
         this.gso_digest_cache.clear();
         this.gso_digest_cache_bytes = 0;
+        this.binary_identity_work_bytes = 0;
+        this.binary_identity_work_jobs = 0;
+        this.binary_identity_work_yield = undefined;
         for (const job of this.pending_binary_identities.values()) {
             const error = source_abort_error();
             for (const waiter of job.waiters) waiter.reject(error);
@@ -1231,10 +1245,44 @@ export class DtaDataSource implements DataSource {
         return promise;
     }
 
+    /** Share one source-owned macrotask gate across jobs so neither payload bytes
+     * nor a burst of tiny digest setups can grow without yielding. */
+    private yield_binary_identity_work(): Promise<void> {
+        const existing = this.binary_identity_work_yield;
+        if (existing !== undefined) return existing;
+        const yielding = yield_to_event_loop();
+        this.binary_identity_work_yield = yielding;
+        void yielding.then(() => {
+            if (this.binary_identity_work_yield !== yielding) return;
+            this.binary_identity_work_bytes = 0;
+            this.binary_identity_work_jobs = 0;
+            this.binary_identity_work_yield = undefined;
+        });
+        return yielding;
+    }
+
+    private schedule_binary_identity_work(
+        byte_count: number,
+        starts_job: boolean,
+    ): Promise<void> | undefined {
+        if (this.binary_identity_work_yield !== undefined) {
+            return this.binary_identity_work_yield;
+        }
+        const byte_limit = Math.max(1, this.binary_identity_work_byte_limit);
+        const job_limit = Math.max(1, this.binary_identity_work_job_limit);
+        if (
+            (this.binary_identity_work_bytes > 0
+                && byte_count > byte_limit - this.binary_identity_work_bytes)
+            || (starts_job && this.binary_identity_work_jobs >= job_limit)
+        ) return this.yield_binary_identity_work();
+        this.binary_identity_work_bytes += byte_count;
+        if (starts_job) this.binary_identity_work_jobs += 1;
+        return undefined;
+    }
+
     private async run_binary_identity_job(job: PendingBinaryIdentity): Promise<void> {
         try {
-            const hash = createHash('sha256');
-            this.binary_digest_computations += 1;
+            let hash: ReturnType<typeof createHash> | undefined;
             let hashed = 0;
             while (hashed < job.binary.contentLength) {
                 this.reject_cancelled_binary_waiters(job);
@@ -1244,18 +1292,44 @@ export class DtaDataSource implements DataSource {
                 }
                 const count = Math.min(
                     Math.max(1, this.binary_identity_chunk_bytes),
+                    Math.max(1, this.binary_identity_work_byte_limit),
                     job.binary.contentLength - hashed,
                 );
+                const scheduled = this.schedule_binary_identity_work(count, hash === undefined);
+                if (scheduled !== undefined) {
+                    await scheduled;
+                    continue;
+                }
+                if (hash === undefined) {
+                    hash = createHash('sha256');
+                    this.binary_digest_computations += 1;
+                }
                 const start = job.binary.contentOffset + hashed;
                 hash.update(this.open_bytes().subarray(start, start + count));
                 hashed += count;
-                if (hashed < job.binary.contentLength) await yield_to_event_loop();
+                if (hashed < job.binary.contentLength) {
+                    await this.yield_binary_identity_work();
+                }
             }
 
             this.reject_cancelled_binary_waiters(job);
             if (job.waiters.size === 0) {
                 this.pending_binary_identities.delete(job.binary.contentOffset);
                 return;
+            }
+            while (hash === undefined) {
+                const scheduled = this.schedule_binary_identity_work(0, true);
+                if (scheduled === undefined) {
+                    hash = createHash('sha256');
+                    this.binary_digest_computations += 1;
+                    break;
+                }
+                await scheduled;
+                this.reject_cancelled_binary_waiters(job);
+                if (job.waiters.size === 0) {
+                    this.pending_binary_identities.delete(job.binary.contentOffset);
+                    return;
+                }
             }
             const key = `${BINARY_GSO_COMPARISON_PREFIX}${hash.digest('hex')}`
                 + `:${job.binary.contentLength}`;
@@ -1399,7 +1473,7 @@ export class DtaDataSource implements DataSource {
     private cache_value_label_table(name: string, table: DecodedValueLabelTable): void {
         if (
             this.value_label_cache_entry_limit < 1
-            || table.decodedBytes > this.value_label_cache_byte_limit
+            || table.cacheBytes > this.value_label_cache_byte_limit
         ) return;
         if (this.decoded_value_label_tables.size === 0) {
             this.decoded_value_label_cache_bytes = 0;
@@ -1407,10 +1481,10 @@ export class DtaDataSource implements DataSource {
         const previous = this.decoded_value_label_tables.get(name);
         if (previous !== undefined) {
             this.decoded_value_label_tables.delete(name);
-            this.decoded_value_label_cache_bytes -= previous.decodedBytes;
+            this.decoded_value_label_cache_bytes -= previous.cacheBytes;
         }
         this.decoded_value_label_tables.set(name, table);
-        this.decoded_value_label_cache_bytes += table.decodedBytes;
+        this.decoded_value_label_cache_bytes += table.cacheBytes;
         while (
             this.decoded_value_label_tables.size > this.value_label_cache_entry_limit
             || this.decoded_value_label_cache_bytes > this.value_label_cache_byte_limit
@@ -1418,7 +1492,7 @@ export class DtaDataSource implements DataSource {
             const oldest_name = this.decoded_value_label_tables.keys().next().value!;
             const oldest = this.decoded_value_label_tables.get(oldest_name)!;
             this.decoded_value_label_tables.delete(oldest_name);
-            this.decoded_value_label_cache_bytes -= oldest.decodedBytes;
+            this.decoded_value_label_cache_bytes -= oldest.cacheBytes;
         }
     }
 
@@ -1969,7 +2043,8 @@ function value_label_payload_reader(
     };
 }
 
-interface ValueLabelDecodeState extends DecodedValueLabelTable {
+interface ValueLabelDecodeState {
+    readonly labels: Map<number, string>;
     readonly decodedTextByOffset: Map<number, string>;
     decodedBytes: number;
 }
@@ -1983,7 +2058,12 @@ function create_value_label_decode_state(): ValueLabelDecodeState {
 }
 
 function decoded_value_label_table(state: ValueLabelDecodeState): DecodedValueLabelTable {
-    return { labels: state.labels, decodedBytes: state.decodedBytes };
+    return {
+        labels: state.labels,
+        decodedBytes: state.decodedBytes,
+        cacheBytes: state.decodedBytes
+            + state.labels.size * VALUE_LABEL_CACHE_BYTES_PER_ENTRY,
+    };
 }
 
 function decode_value_label_table(

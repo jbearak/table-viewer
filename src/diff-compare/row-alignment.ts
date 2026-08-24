@@ -6,9 +6,11 @@
 // insertion point shifts. Aligning the two sides first is what makes
 // added/deleted mean what they say.
 import {
+    DEFERRED_COMPARISON_IDENTITY,
     read_source_raw_rows_async,
     read_source_raw_rows_indexed_async,
     type DataSource,
+    type RawCell,
     type SheetMeta,
 } from '../data-source/interface';
 import {
@@ -173,7 +175,7 @@ const MOVE_SEARCH_LIMIT = 1000;
  *  not sufficient yield points here. */
 const MOVE_SCORES_PER_CHECKPOINT = 20_000;
 
-type ComparisonCell = { raw: string | null } | null | undefined;
+type ComparisonCell = RawCell | null | undefined;
 
 /** Visit comparison text synchronously until the first deferred identity, then
  * resume through promises without imposing a microtask on ordinary rows. */
@@ -181,17 +183,17 @@ function visit_materialized_comparison_cells(
     cell_count: number,
     cell_at: (index: number) => ComparisonCell,
     is_cancelled: () => boolean,
-    visit: (text: string) => void,
+    visit: (text: string, index: number) => void,
 ): void | Promise<void> {
     const continue_at = (start: number): void | Promise<void> => {
         for (let index = start; index < cell_count; index++) {
             const text = materialize_cell_comparison_text(cell_at(index), is_cancelled);
             if (typeof text === 'string') {
-                visit(text);
+                visit(text, index);
                 continue;
             }
             return text.then((resolved) => {
-                visit(resolved);
+                visit(resolved, index);
                 return continue_at(index + 1);
             });
         }
@@ -215,7 +217,8 @@ function visit_materialized_comparison_cells(
  * cost of being wrong is a mis-paired row in a diff, not corrupted data.
  */
 function hash_row(
-    cells: readonly ({ raw: string | null } | null)[],
+    cells: readonly (RawCell | null)[],
+    column_count: number,
     is_cancelled: () => boolean,
 ): number | Promise<number> {
     let hash = 0x811c9dc5;
@@ -229,9 +232,9 @@ function hash_row(
             mix(text.charCodeAt(position));
         }
     };
-    mix(cells.length);
+    mix(column_count);
     const materialized = visit_materialized_comparison_cells(
-        cells.length,
+        column_count,
         (index) => cells[index],
         is_cancelled,
         mix_text,
@@ -248,6 +251,7 @@ async function hash_side(
     source: DataSource,
     sheet_index: number,
     row_count: number,
+    column_count: number,
     scanned_before: number,
     total_rows: number,
     options: AlignSheetOptions,
@@ -268,6 +272,7 @@ async function hash_side(
         for (let offset = 0; offset < count; offset++) {
             const hash = hash_row(
                 rows[offset] ?? [],
+                column_count,
                 options.isCancelled ?? (() => false),
             );
             hashes[start + offset] = typeof hash === 'number'
@@ -619,11 +624,19 @@ export async function align_sheet(
     if (options.isCancelled?.()) throw new AlignmentCancelledError();
     const original_rows = original_sheet.rowCount;
     const modified_rows = modified_sheet.rowCount;
+    const column_count = Math.max(original_sheet.columnCount, modified_sheet.columnCount);
     const total_rows = original_rows + modified_rows;
     const original_hashes = await hash_side(
-        original, pairing.originalIndex, original_rows, 0, total_rows, options);
+        original, pairing.originalIndex, original_rows, column_count, 0, total_rows, options);
     const modified_hashes = await hash_side(
-        modified, pairing.modifiedIndex, modified_rows, original_rows, total_rows, options);
+        modified,
+        pairing.modifiedIndex,
+        modified_rows,
+        column_count,
+        original_rows,
+        total_rows,
+        options,
+    );
 
     // Trim matching ends. Cheap, and on a normal edit it leaves the Myers step
     // a handful of rows regardless of how large the file is.
@@ -764,6 +777,7 @@ async function count_changes(
     const changed_row_indices: number[] = [];
     const column_count = Math.max(original_sheet.columnCount, modified_sheet.columnCount);
     const checkpoint = options.rowsPerCheckpoint ?? DEFAULT_ROWS_PER_CHECKPOINT;
+    let since_checkpoint = 0;
     /** Paired rows with the grid row each came from, so a difference can be
      *  reported against its position in the unified grid. */
     const paired: { row: AlignedRow; gridRow: number }[] = [];
@@ -807,10 +821,12 @@ async function count_changes(
                 }
             }
             if (row_changed) changed_row_indices.push(batch[offset].gridRow);
-        }
-        if (start % checkpoint === 0) {
-            await yield_to_event_loop();
-            if (options.isCancelled?.()) throw new AlignmentCancelledError();
+            since_checkpoint += 1;
+            if (since_checkpoint >= checkpoint) {
+                since_checkpoint -= checkpoint;
+                await yield_to_event_loop();
+                if (options.isCancelled?.()) throw new AlignmentCancelledError();
+            }
         }
     }
     return {
@@ -830,7 +846,7 @@ interface Leftover {
 }
 
 /**
- * A candidate row normalized once: its cells' raw text, and their total length.
+ * A candidate row normalized once: exact comparison text and move-score weight.
  *
  * Scoring is quadratic in the candidate count, so normalizing inside the
  * comparison would re-derive the same row's text once per row it is scored
@@ -838,34 +854,45 @@ interface Leftover {
  */
 interface CandidateRow {
     readonly texts: readonly string[];
-    /** Total characters, the similarity denominator. Not an integer risk: a
-     *  sum over cells could exceed 2^32 on a pathological row, and JS numbers
+    readonly weights: readonly number[];
+    /** Total comparison weight, the similarity denominator. Not an integer risk:
+     *  a sum over cells could exceed 2^32 on a pathological row, and JS numbers
      *  carry that exactly where a Uint32 would wrap. */
     readonly length: number;
 }
 
+function comparison_cell_weight(cell: ComparisonCell, text: string): number {
+    return cell?.[DEFERRED_COMPARISON_IDENTITY] !== undefined
+        && cell.rawByteLength !== undefined
+        ? cell.rawByteLength
+        : text.length;
+}
+
 function normalize_candidate(
-    cells: readonly ({ raw: string | null } | null)[] | undefined,
+    cells: readonly (RawCell | null)[] | undefined,
     column_count: number,
     is_cancelled: () => boolean,
 ): CandidateRow | Promise<CandidateRow> {
     const texts: string[] = [];
+    const weights: number[] = [];
     let length = 0;
     const materialized = visit_materialized_comparison_cells(
         column_count,
         (column) => cells?.[column],
         is_cancelled,
-        (text) => {
+        (text, column) => {
+            const weight = comparison_cell_weight(cells?.[column], text);
             texts.push(text);
-            length += text.length;
+            weights.push(weight);
+            length += weight;
         },
     );
-    const finish = (): CandidateRow => ({ texts, length });
+    const finish = (): CandidateRow => ({ texts, weights, length });
     return materialized === undefined ? finish() : materialized.then(finish);
 }
 
 async function normalize_candidates(
-    rows: readonly (readonly ({ raw: string | null } | null)[])[],
+    rows: readonly (readonly (RawCell | null)[])[],
     column_count: number,
     is_cancelled: () => boolean,
 ): Promise<CandidateRow[]> {
@@ -883,9 +910,10 @@ async function normalize_candidates(
  * How strongly two rows resemble each other, or 0 if not enough to call one a
  * move of the other.
  *
- * Length-weighted after git's `src_copied / max_size`: the matched characters
- * must be at least half the longer row's. The ratio is returned rather than a
- * verdict because it also ranks candidates against one another.
+ * Length-weighted after git's `src_copied / max_size`: matched ordinary text
+ * uses characters, while a deferred binary uses its source byte length. The
+ * matched weight must be at least half the longer row's. The ratio is returned
+ * rather than a verdict because it also ranks candidates against one another.
  *
  * Matching is *whole-cell* — a cell contributes its length only when both
  * sides' text is exactly equal. Cell *counts* (what xlCompare uses) were
@@ -905,7 +933,7 @@ function similarity_of(left: CandidateRow, right: CandidateRow): number {
     let matched = 0;
     for (let col = 0; col < left.texts.length; col++) {
         if (left.texts[col] !== right.texts[col]) continue;
-        matched += left.texts[col].length;
+        matched += Math.min(left.weights[col], right.weights[col]);
     }
     // Every column is scored, with no early exit once the threshold is
     // cleared: the score also ranks candidates against each other, so
@@ -1037,7 +1065,7 @@ async function detect_moves(
 interface MoveCandidate {
     readonly originalRow: number;
     readonly modifiedRow: number;
-    /** Matched characters over the longer row's, as git ranks renames. */
+    /** Matched weight over the longer row's, as git ranks renames. */
     readonly similarity: number;
     readonly displacement: number;
 }

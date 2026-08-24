@@ -7,10 +7,72 @@ import {
     type AlignedRow,
 } from '../diff-compare/row-alignment';
 import type { SheetPairing } from '../diff-compare/compare-source';
+import {
+    DEFERRED_COMPARISON_IDENTITY,
+    type DataSource,
+    type DeferredCellIdentity,
+    type RawCell,
+    type RowWindow,
+    type WorkbookMeta,
+} from '../data-source/interface';
 import { FixtureSource } from './helpers/fixture-source';
 
 const single = (rows: string[][]): FixtureSource =>
     new FixtureSource([{ name: 'Sheet1', rows }]);
+
+const raw_cell = (raw: string): RawCell => ({ raw, rawType: 'string' });
+
+class RawFixtureSource implements DataSource {
+    constructor(private readonly fixture_rows: readonly (readonly (RawCell | null)[])[]) {}
+
+    meta(): WorkbookMeta {
+        return {
+            hasFormatting: false,
+            sheets: [{
+                name: 'Sheet1',
+                rowCount: this.fixture_rows.length,
+                sourceRowCount: this.fixture_rows.length,
+                columnCount: this.fixture_rows.reduce(
+                    (widest, row) => Math.max(widest, row.length),
+                    0,
+                ),
+                merges: [],
+                hasFormatting: false,
+            }],
+        };
+    }
+
+    read_rows(_sheet_index: number, start_row: number, count: number): RowWindow {
+        const start = Math.max(0, Math.min(start_row, this.fixture_rows.length));
+        return {
+            startRow: start,
+            rows: this.fixture_rows.slice(start, start + count).map((row) => row.map((cell) =>
+                cell === null
+                    ? null
+                    : Object.assign(cell, {
+                        formatted: cell.raw ?? '',
+                        bold: false,
+                        italic: false,
+                    }))),
+        };
+    }
+
+    close(): void {}
+}
+
+function deferred_binary_cell(key: string, raw_byte_length: number): RawCell {
+    const identity: DeferredCellIdentity = {
+        cachedKey: () => key,
+        resolveKey: async () => key,
+    };
+    const cell: RawCell = {
+        raw: `binary (${raw_byte_length} bytes)`,
+        rawType: 'string',
+        rawByteLength: raw_byte_length,
+    };
+    Object.defineProperty(cell, DEFERRED_COMPARISON_IDENTITY, { value: identity });
+    return cell;
+}
 
 const matched: SheetPairing = {
     status: 'matched',
@@ -99,6 +161,29 @@ describe('align_sheet', () => {
         expect(alignment).toMatchObject({
             addedRows: 0, deletedRows: 0,
             changedCells: 1, changedRowIndices: [2], movedRowIndices: [2],
+        });
+    });
+
+    it('weights an unchanged deferred binary by source bytes when scoring a move', async () => {
+        const key = `stata-binary:sha256:${'a'.repeat(64)}:1024`;
+        const original = new RawFixtureSource([
+            [deferred_binary_cell(key, 1024), raw_cell('x'.repeat(200))],
+            [raw_cell('anchor')],
+        ]);
+        const modified = new RawFixtureSource([
+            [raw_cell('anchor')],
+            [deferred_binary_cell(key, 1024), raw_cell('y'.repeat(200))],
+        ]);
+
+        const alignment = await align_sheet(original, modified, matched);
+
+        expect(shape(alignment.rows)).toEqual(['1,0', '0,1']);
+        expect(alignment).toMatchObject({
+            addedRows: 0,
+            deletedRows: 0,
+            changedCells: 1,
+            movedRowIndices: [1],
+            changedRowIndices: [1],
         });
     });
 
@@ -340,6 +425,31 @@ describe('align_sheet', () => {
         expect(alignment).toMatchObject({ changedCells: 1 });
     });
 
+    it('hashes trailing absent, null, and empty cells at the shared width', async () => {
+        const original = new RawFixtureSource([
+            [raw_cell('a')],
+            [raw_cell('b'), null],
+            [raw_cell('c'), raw_cell('')],
+        ]);
+        const modified = new RawFixtureSource([
+            [raw_cell('a'), null],
+            [raw_cell('b'), raw_cell('')],
+            [raw_cell('c')],
+        ]);
+
+        const alignment = await align_sheet(original, modified, matched, {
+            maxEditDistance: 0,
+        });
+
+        expect(shape(alignment.rows)).toEqual(['0,0', '1,1', '2,2']);
+        expect(alignment).toMatchObject({
+            addedRows: 0,
+            deletedRows: 0,
+            changedCells: 0,
+            degraded: false,
+        });
+    });
+
     it('compares rows of differing width against the wider column count', async () => {
         const alignment = await align_sheet(
             single([['a']]),
@@ -477,6 +587,32 @@ describe('align_sheet', () => {
             rowsPerCheckpoint: 100,
             isCancelled: () => true,
         })).rejects.toBeInstanceOf(AlignmentCancelledError);
+    });
+
+    it('checks change-count cancellation at a non-dividing row checkpoint', async () => {
+        const rows = rows_of(...Array.from({ length: 1_200 }, (_, index) => `r${index}`));
+        const original = single(rows);
+        let original_reads = 0;
+        let counting_changes = false;
+        const observed = new Proxy(original, {
+            get(target, property, receiver) {
+                const value = Reflect.get(target, property, receiver);
+                if (property !== 'read_rows' || typeof value !== 'function') return value;
+                return (...args: unknown[]) => {
+                    original_reads += 1;
+                    // Hashing uses three 512-row reads. The fourth starts change
+                    // counting; a 700-row checkpoint is reached in its next batch.
+                    if (original_reads > 3) counting_changes = true;
+                    return (value as (...a: unknown[]) => unknown).apply(target, args);
+                };
+            },
+        });
+
+        await expect(align_sheet(observed, single(rows), matched, {
+            rowsPerCheckpoint: 700,
+            isCancelled: () => counting_changes,
+        })).rejects.toBeInstanceOf(AlignmentCancelledError);
+        expect(original_reads).toBe(5);
     });
 
     it('throws when cancelled before a sheet too small to checkpoint', async () => {

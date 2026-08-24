@@ -1,5 +1,6 @@
 import { Buffer } from 'node:buffer';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { cells_exactly_equal } from '../cell-display';
@@ -626,6 +627,7 @@ describe('DtaDataSource', () => {
             decoded_value_label_tables: Map<string, {
                 labels: Map<number, string>;
                 decodedBytes: number;
+                cacheBytes: number;
             }>;
             decoded_value_label_cache_bytes: number;
         };
@@ -640,7 +642,45 @@ describe('DtaDataSource', () => {
         const cached = internals.decoded_value_label_tables.get('status_lbl')!;
         expect(cached.labels.size).toBe(3);
         expect(cached.decodedBytes).toBe(shared_label.length * 2);
-        expect(internals.decoded_value_label_cache_bytes).toBe(shared_label.length * 2);
+        expect(cached.cacheBytes).toBe(shared_label.length * 2 + 3 * 64);
+        expect(internals.decoded_value_label_cache_bytes).toBe(cached.cacheBytes);
+    });
+
+    it('charges retained value-label entries even when decoded text is empty', async () => {
+        const fixture = build_dta_fixture(4, false, {
+            statusLabels: [
+                { value: 1, label: '', textKey: 'empty' },
+                { value: 2, label: '', textKey: 'empty' },
+            ],
+        });
+        type LabelCacheInternals = {
+            value_label_table_decoded_byte_limit: number;
+            value_label_cache_byte_limit: number;
+            decoded_value_label_cache_bytes: number;
+            decoded_value_label_tables: Map<string, {
+                labels: Map<number, string>;
+                decodedBytes: number;
+                cacheBytes: number;
+            }>;
+        };
+
+        const admitted = await DtaDataSource.create(fixture);
+        const admitted_internals = admitted as unknown as LabelCacheInternals;
+        admitted_internals.value_label_table_decoded_byte_limit = 0;
+        admitted_internals.value_label_cache_byte_limit = 2 * 64;
+        expect(admitted.column_filter_metadata(0, 0)?.valueLabel?.('1')).toBe('');
+        const cached = admitted_internals.decoded_value_label_tables.get('status_lbl')!;
+        expect(cached.decodedBytes).toBe(0);
+        expect(cached.cacheBytes).toBe(2 * 64);
+        expect(admitted_internals.decoded_value_label_cache_bytes).toBe(2 * 64);
+
+        const rejected = await DtaDataSource.create(fixture);
+        const rejected_internals = rejected as unknown as LabelCacheInternals;
+        rejected_internals.value_label_table_decoded_byte_limit = 0;
+        rejected_internals.value_label_cache_byte_limit = 2 * 64 - 1;
+        expect(rejected.column_filter_metadata(0, 0)?.valueLabel?.('2')).toBe('');
+        expect(rejected_internals.decoded_value_label_tables.size).toBe(0);
+        expect(rejected_internals.decoded_value_label_cache_bytes).toBe(0);
     });
 
     it('rejects value-label tables above the entry limit without caching a partial table', async () => {
@@ -690,17 +730,17 @@ describe('DtaDataSource', () => {
             decoded_value_label_tables: Map<string, unknown>;
             value_labels: (name: string) => Map<number, string> | undefined;
         };
-        internals.value_label_cache_byte_limit = 40;
+        internals.value_label_cache_byte_limit = 300;
 
         expect(internals.value_labels('status_lbl')?.get(1)).toBe('Zulu');
         expect(internals.value_labels('missing_lbl')?.get(2147483622)).toBe('Refused');
-        expect(internals.decoded_value_label_cache_bytes).toBe(40);
+        expect(internals.decoded_value_label_cache_bytes).toBe(296);
         expect(internals.value_labels('status_lbl')?.get(2)).toBe('Alpha');
         expect(internals.value_labels('tiny_lbl')?.get(1)).toBe('X');
 
         expect([...internals.decoded_value_label_tables.keys()])
             .toEqual(['status_lbl', 'tiny_lbl']);
-        expect(internals.decoded_value_label_cache_bytes).toBe(28);
+        expect(internals.decoded_value_label_cache_bytes).toBe(284);
     });
 
     it('checks cancellation while decoding a requested value-label table', async () => {
@@ -853,6 +893,42 @@ describe('DtaDataSource', () => {
         await expect(resolving).resolves.toMatch(
             /^stata-binary:sha256:[0-9a-f]{64}:17825792$/,
         );
+    });
+
+    it('yields between cumulative one-chunk binary identity jobs', async () => {
+        const contents = Array.from(
+            { length: 6 },
+            (_, index) => new Uint8Array(8).fill(index + 1),
+        );
+        const source = await DtaDataSource.create(
+            build_release119_strl_rows_fixture(contents),
+        );
+        const cells = source.read_raw_columns(0, 0, contents.length, [0]).rows
+            .map((row) => row[0]!);
+        const internals = source as unknown as {
+            binary_identity_chunk_bytes: number;
+            binary_identity_work_byte_limit: number;
+            binary_identity_work_job_limit: number;
+            gso_digest_cache: Map<number, string>;
+            pending_binary_identities: Map<number, unknown>;
+        };
+        internals.binary_identity_chunk_bytes = 64;
+        internals.binary_identity_work_byte_limit = 10_000;
+        internals.binary_identity_work_job_limit = 2;
+        let event_loop_turn_observed = false;
+        setImmediate(() => { event_loop_turn_observed = true; });
+
+        const resolving = cells.map((cell) =>
+            binary_comparison_identity(cell).resolveKey(() => false));
+        expect(internals.gso_digest_cache.size).toBe(2);
+        expect(internals.pending_binary_identities.size).toBe(4);
+
+        const keys = await Promise.all(resolving);
+        expect(event_loop_turn_observed).toBe(true);
+        expect(keys).toEqual(contents.map((content) =>
+            `stata-binary:sha256:${createHash('sha256').update(content).digest('hex')}:8`));
+        expect(internals.gso_digest_cache.size).toBe(contents.length);
+        expect(internals.pending_binary_identities.size).toBe(0);
     });
 
     it('cancels chunked hashing without caching partial work and retries cleanly', async () => {
@@ -1467,9 +1543,18 @@ describe('DtaDataSource', () => {
 
     it('releases the file bytes on idempotent close and rejects post-close entry points', async () => {
         const source = await DtaDataSource.create(build_dta_fixture());
+        const internals = source as unknown as {
+            bytes?: Uint8Array;
+            decoded_value_label_tables: Map<string, unknown>;
+            decoded_value_label_cache_bytes: number;
+        };
+        source.column_filter_metadata(0, 0);
+        expect(internals.decoded_value_label_cache_bytes).toBeGreaterThan(0);
         source.close();
         source.close();
-        expect((source as unknown as { bytes?: Uint8Array }).bytes).toBeUndefined();
+        expect(internals.bytes).toBeUndefined();
+        expect(internals.decoded_value_label_tables.size).toBe(0);
+        expect(internals.decoded_value_label_cache_bytes).toBe(0);
         expect(() => source.read_rows(0, 0, 1)).toThrow(/closed/);
         expect(() => source.read_raw_columns(0, 0, 0, [])).toThrow(/closed/);
         expect(() => source.column_filter_metadata(0, 1)).toThrow(/closed/);
