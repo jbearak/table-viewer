@@ -78,6 +78,29 @@ interface InFlightDiff {
     promise?: Promise<CompareDiffWindow>;
 }
 
+function all_diff_waiters_cancelled(waiters: ReadonlySet<DiffWaiter>): boolean {
+    for (const waiter of waiters) {
+        if (!waiter.isCancelled()) return false;
+    }
+    return true;
+}
+
+function sorted_number_array_includes(
+    values: readonly number[],
+    target: number,
+): boolean {
+    let low = 0;
+    let high = values.length;
+    while (low < high) {
+        const middle = low + Math.floor((high - low) / 2);
+        const value = values[middle];
+        if (value < target) low = middle + 1;
+        else if (value > target) high = middle;
+        else return true;
+    }
+    return false;
+}
+
 function without_header_capability(sheet: SheetMeta): SheetMeta {
     if (sheet.excelFirstRowHeader === undefined) return sheet;
     const { excelFirstRowHeader: _withheld, ...rest } = sheet;
@@ -214,7 +237,6 @@ export class CompareDataSource implements DataSource {
     /** Only caller-supplied alignments have authoritative changed-row sets. The
      *  positional fallback uses an empty synthetic set even when cells differ. */
     private readonly supplied_alignment_sheets: ReadonlySet<number>;
-    private readonly alignment_changed_row_lookup_cache = new Map<number, ReadonlySet<number>>();
     /** True when any matched sheet fell back to positional alignment, so the
      *  host can say so rather than present an all-changed grid as a finding. */
     readonly degraded: boolean;
@@ -230,10 +252,6 @@ export class CompareDataSource implements DataSource {
      *  construction, but PanelCore asks again on every transform recompute —
      *  so without this, each sort or filter rescans every row of the sheet. */
     private readonly changed_grid_rows_cache = new Map<number, readonly number[]>();
-    /** Memoized moved-row membership per sheet. Built once instead of per page
-     *  request: a re-sorted sheet can mark nearly every row moved, and
-     *  `compute_diff` runs on every viewport page that misses its cache. */
-    private readonly moved_row_lookup_cache = new Map<number, ReadonlySet<number>>();
     /** Deleted rows' grid rows per sheet, in canonical-number order. */
     private readonly deleted_grid_rows: ReadonlyMap<number, readonly number[]>;
 
@@ -421,24 +439,17 @@ export class CompareDataSource implements DataSource {
         return computed;
     }
 
-    /** Moved grid rows of a sheet as a membership set, built at most once. */
-    private moved_rows_of(sheet_index: number): ReadonlySet<number> {
-        const cached = this.moved_row_lookup_cache.get(sheet_index);
-        if (cached) return cached;
-        const built = new Set(this.alignments.get(sheet_index)?.movedRowIndices ?? []);
-        this.moved_row_lookup_cache.set(sheet_index, built);
-        return built;
+    /** Moved grid rows, kept in the alignment's ascending compact array. */
+    private moved_rows_of(sheet_index: number): readonly number[] {
+        return this.alignments.get(sheet_index)?.movedRowIndices ?? [];
     }
 
     /** Paired rows a caller-supplied alignment proved changed. Undefined means
      *  the positional fallback must still compare every paired row. */
-    private proven_changed_rows_of(sheet_index: number): ReadonlySet<number> | undefined {
-        if (!this.supplied_alignment_sheets.has(sheet_index)) return undefined;
-        const cached = this.alignment_changed_row_lookup_cache.get(sheet_index);
-        if (cached) return cached;
-        const built = new Set(this.alignments.get(sheet_index)?.changedRowIndices ?? []);
-        this.alignment_changed_row_lookup_cache.set(sheet_index, built);
-        return built;
+    private proven_changed_rows_of(sheet_index: number): readonly number[] | undefined {
+        return this.supplied_alignment_sheets.has(sheet_index)
+            ? this.alignments.get(sheet_index)?.changedRowIndices ?? []
+            : undefined;
     }
 
     private compute_changed_grid_rows(sheet_index: number): readonly number[] {
@@ -662,8 +673,7 @@ export class CompareDataSource implements DataSource {
         if (operation.cancelled) return true;
         const cancelled = this.closed
             || this.lifecycle_epoch !== operation.epoch
-            || operation.waiters.size === 0
-            || [...operation.waiters].every((waiter) => waiter.isCancelled());
+            || all_diff_waiters_cancelled(operation.waiters);
         if (cancelled) {
             operation.cancelled = true;
             operation.terminal = true;
@@ -719,8 +729,13 @@ export class CompareDataSource implements DataSource {
             }
             // A moved row is an ordinary two-index row. A supplied alignment has
             // already compared it and may prove it unchanged; a fallback has not.
-            row_status.push(moved.has(grid_row) ? 'moved' : 'same');
-            if (proven_changed !== undefined && !proven_changed.has(grid_row)) return;
+            row_status.push(
+                sorted_number_array_includes(moved, grid_row) ? 'moved' : 'same',
+            );
+            if (
+                proven_changed !== undefined
+                && !sorted_number_array_includes(proven_changed, grid_row)
+            ) return;
             paired_positions.push(position);
             original_rows.push(aligned.original);
             modified_rows.push(aligned.modified);

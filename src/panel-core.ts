@@ -129,7 +129,7 @@ type DurableRowHeightsProvider = (sheet_names: readonly string[]) => {
 
 type RowWindowServed = (
     msg: Extract<WebviewMessage, { type: 'requestRows' }>,
-    window: TransformedRowWindow,
+    window: Pick<TransformedRowWindow, 'startRow' | 'sourceRows'>,
     receiver_epoch: number,
 ) => void | Promise<void>;
 
@@ -1669,7 +1669,10 @@ export class ViewerPanelCore {
             generation: this._generation,
         }, receiver_epoch);
         if (!posted || this.disposed || this.receiver_epoch !== receiver_epoch) return;
-        await this.on_row_window_served?.(msg, window, receiver_epoch);
+        await this.on_row_window_served?.(msg, {
+            startRow: window.startRow,
+            sourceRows: window.sourceRows,
+        }, receiver_epoch);
     }
 
     private evict_excess(): void {

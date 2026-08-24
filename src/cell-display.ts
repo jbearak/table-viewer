@@ -29,15 +29,6 @@ function tagged_comparison_key(key: string): string {
     return `comparison:${key}`;
 }
 
-export function get_cell_comparison_text(
-    cell: RawCell | null | undefined,
-): string {
-    const comparison_key = concrete_comparison_key(cell);
-    return comparison_key === undefined
-        ? tagged_raw_text(cell)
-        : tagged_comparison_key(comparison_key);
-}
-
 /** Materialize a lossless comparison identity only when the source has deferred
  * one. Ordinary cells and already-cached identities stay synchronous. */
 export function materialize_cell_comparison_text(

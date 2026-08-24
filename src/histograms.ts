@@ -65,8 +65,8 @@ type ClassifiedValue =
 
 function classify_value(
     cell: RawCell | null | undefined,
+    raw = raw_value(cell),
 ): ClassifiedValue {
-    const raw = raw_value(cell);
     if (raw === null) return undefined;
     if (cell?.rawType === 'date' || iso_date_string(raw)) {
         return { kind: 'orderedText' };
@@ -120,35 +120,41 @@ function serialized_option_bytes(
     );
 }
 
+function retain_distinct_value(
+    distinct: DistinctValues,
+    identity: string | null,
+    raw: string | null,
+): boolean {
+    // Resolving a new GSO offset is allowed at the distinct cap: its identity
+    // may duplicate an entry already retained. Only a genuinely new option
+    // spends serialized bytes or fails the distinct-entry cap.
+    if (distinct.entries.has(identity)) return true;
+    if (distinct.entries.size === FILTER_DISTINCT_VALUE_LIMIT) return false;
+    const option_bytes = serialized_option_bytes(identity, raw);
+    if (
+        distinct.serializedByteCount + option_bytes
+        > FILTER_DISTINCT_VALUE_BYTE_LIMIT
+    ) return false;
+    distinct.entries.set(identity, raw);
+    distinct.serializedByteCount += option_bytes;
+    return true;
+}
+
 function add_distinct_value(
     distinct: DistinctValues,
     cell: RawCell | null | undefined,
+    raw: string | null,
     is_cancelled: () => boolean,
 ): boolean | Promise<boolean> {
-    const raw = raw_value(cell);
     const raw_bytes = raw_storage_bytes(cell, raw);
     // A bounded preview must not trick the checklist into hashing or retaining a
     // source value whose actual identity cannot fit in the transfer budget.
     if (raw_bytes > FILTER_DISTINCT_VALUE_BYTE_LIMIT) return false;
 
-    const retain = (identity: string | null): boolean => {
-        // Resolving a new GSO offset is allowed at the distinct cap: its identity
-        // may duplicate an entry already retained. Only a genuinely new option
-        // spends serialized bytes or fails the distinct-entry cap.
-        if (distinct.entries.has(identity)) return true;
-        if (distinct.entries.size === FILTER_DISTINCT_VALUE_LIMIT) return false;
-        const option_bytes = serialized_option_bytes(identity, raw);
-        if (
-            distinct.serializedByteCount + option_bytes
-            > FILTER_DISTINCT_VALUE_BYTE_LIMIT
-        ) return false;
-        distinct.entries.set(identity, raw);
-        distinct.serializedByteCount += option_bytes;
-        return true;
-    };
-
-    const known_identity = peek_filter_value(cell);
-    if (known_identity !== undefined) return retain(known_identity);
+    const known_identity = peek_filter_value(cell, raw);
+    if (known_identity !== undefined) {
+        return retain_distinct_value(distinct, known_identity, raw);
+    }
 
     // Distinct-entry and transfer caps cannot bound repeated deferred duplicates,
     // because those may never grow the retained set. Charge every resolution by
@@ -161,10 +167,10 @@ function add_distinct_value(
     distinct.identityResolutionCount += 1;
     distinct.identityResolutionRawBytes += raw_bytes;
 
-    const identity = resolve_filter_value(cell, is_cancelled);
+    const identity = resolve_filter_value(cell, is_cancelled, raw);
     return typeof identity === 'object' && identity !== null
-        ? identity.then(retain)
-        : retain(identity);
+        ? identity.then((resolved) => retain_distinct_value(distinct, resolved, raw))
+        : retain_distinct_value(distinct, identity, raw);
 }
 
 /**
@@ -205,14 +211,20 @@ export async function compute_column_histogram(
             is_cancelled,
         );
         for (const row of window.rows) {
+            const raw = raw_value(row[0]);
             if (distinct !== null) {
-                const added = add_distinct_value(distinct, row[0], is_cancelled);
+                const added = add_distinct_value(
+                    distinct,
+                    row[0],
+                    raw,
+                    is_cancelled,
+                );
                 if (!(typeof added === 'boolean' ? added : await added)) {
                     // Release retained strings; a partial list is never sent.
                     distinct = null;
                 }
             }
-            const classified = classify_value(row[0]);
+            const classified = classify_value(row[0], raw);
             if (classified === undefined) continue;
             columnKind = combine_kind(columnKind, classified.kind);
             // A text column has no bins; once the distinct list has also

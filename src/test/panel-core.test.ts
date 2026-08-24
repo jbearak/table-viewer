@@ -260,6 +260,7 @@ describe('ViewerPanelCore', () => {
 
         await core.handle_message({ ...request, requestId: 'accepted' });
         expect(served).toHaveBeenCalledOnce();
+        expect(served.mock.calls[0][1]).toEqual({ startRow: 0, sourceRows: [0] });
         expect(served.mock.calls[0][2]).toBe(7);
 
         postMessage.mockResolvedValueOnce(false);

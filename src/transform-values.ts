@@ -17,8 +17,8 @@ export function raw_value(cell: RawCell | null | undefined): string | null {
  * `undefined` means a deferred identity still needs to be resolved. */
 export function peek_filter_value(
     cell: RawCell | null | undefined,
+    raw = raw_value(cell),
 ): string | null | undefined {
-    const raw = raw_value(cell);
     if (raw === null) return null;
     const concrete = cell?.filterKey;
     if (concrete !== undefined) return concrete;
@@ -42,8 +42,9 @@ export function filter_value(cell: RawCell | null | undefined): string | null {
 export function resolve_filter_value(
     cell: RawCell | null | undefined,
     is_cancelled: () => boolean,
+    raw = raw_value(cell),
 ): string | null | Promise<string> {
-    const known = peek_filter_value(cell);
+    const known = peek_filter_value(cell, raw);
     if (known !== undefined) return known;
     return cell![DEFERRED_FILTER_IDENTITY]!.resolveKey(is_cancelled);
 }

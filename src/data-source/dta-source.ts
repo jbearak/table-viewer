@@ -201,11 +201,11 @@ interface CollectedStrlBatch {
 }
 
 function rendered_stata_cell(raw_cell: RawCell, formatted: string): RenderedCell {
-    const rendered = raw_cell as RenderedCell;
-    rendered.formatted = formatted;
-    rendered.bold = false;
-    rendered.italic = false;
-    return rendered;
+    return Object.assign(raw_cell, {
+        formatted,
+        bold: false,
+        italic: false,
+    });
 }
 
 function decoded_gso_byte_count(value: DecodedGso): number {
@@ -653,8 +653,16 @@ export class DtaDataSource implements DataSource {
             start,
             columns,
         );
-        const rows = raw_rows.map((row) => row.map((cell, index) =>
-            this.render_cell(cell, this.metadata.variables[columns[index]])));
+        const rows: RenderedCell[][] = raw_rows.map(() => []);
+        columns.forEach((column, index) => {
+            const variable = this.metadata.variables[column];
+            const labels = variable.value_label_name
+                ? this.value_labels(variable.value_label_name)
+                : undefined;
+            raw_rows.forEach((row, row_index) => {
+                rows[row_index].push(this.render_cell(row[index], variable, labels));
+            });
+        });
         const window: CachedWindow = {
             rows,
             cellCount: count * columns.length,
@@ -714,6 +722,7 @@ export class DtaDataSource implements DataSource {
     private render_cell(
         resolved: ResolvedStataCell,
         variable: VariableInfo,
+        labels: ReadonlyMap<number, string> | undefined,
     ): RenderedCell {
         const raw_cell = this.canonicalize_stata_raw(resolved);
         if (is_binary_gso(resolved) || typeof resolved === 'string') {
@@ -723,9 +732,6 @@ export class DtaDataSource implements DataSource {
             );
         }
 
-        const labels = variable.value_label_name
-            ? this.value_labels(variable.value_label_name)
-            : undefined;
         const label = labels === undefined
             ? undefined
             : stata_value_label(labels, raw_cell.raw!);
@@ -778,6 +784,9 @@ export class DtaDataSource implements DataSource {
         columns: readonly number[],
         resolved_strls: readonly StrlBatchCell[],
     ): ResolvedStataCell[][] {
+        if (resolved_strls.length === 0 && this.metadata.format_version >= 118) {
+            return rows;
+        }
         return rows.map((row, row_offset) => row.map((cell, index) =>
             this.resolve_cell(
                 cell,
@@ -825,15 +834,19 @@ export class DtaDataSource implements DataSource {
         count: number,
         columns: readonly number[],
     ): CollectedStrlBatch {
-        const view = this.open_view();
-        const bytes = this.open_bytes();
-        const cells = new Array<StrlBatchCell>(count * columns.length);
-        const targets = new Map<string, GsoBatchTarget>();
         const strl_columns: Array<{ index: number; variable: VariableInfo }> = [];
         columns.forEach((column, index) => {
             const variable = this.metadata.variables[column];
             if (variable.type === 'strL') strl_columns.push({ index, variable });
         });
+        if (strl_columns.length === 0) {
+            return { cells: [], targets: new Map() };
+        }
+
+        const view = this.open_view();
+        const bytes = this.open_bytes();
+        const cells = new Array<StrlBatchCell>(count * columns.length);
+        const targets = new Map<string, GsoBatchTarget>();
         for (let row_offset = 0; row_offset < count; row_offset++) {
             const row_base = this.data_start
                 + (start + row_offset) * this.metadata.obs_length;

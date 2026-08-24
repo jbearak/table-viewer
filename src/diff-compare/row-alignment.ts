@@ -109,6 +109,7 @@ async function alignment_source_read<T>(read: () => Promise<T>): Promise<T> {
 }
 
 const DEFAULT_ROWS_PER_CHECKPOINT = 4096;
+const NEVER_CANCELLED = () => false;
 /** Divide-and-conquer steps between cancellation checks in the Myers walk. */
 const MYERS_STEPS_PER_CHECKPOINT = 256;
 
@@ -258,6 +259,7 @@ async function hash_side(
 ): Promise<Uint32Array> {
     const hashes = new Uint32Array(row_count);
     const checkpoint = options.rowsPerCheckpoint ?? DEFAULT_ROWS_PER_CHECKPOINT;
+    const is_cancelled = options.isCancelled ?? NEVER_CANCELLED;
     let since_checkpoint = 0;
     for (let start = 0; start < row_count; start += HASH_READ_BATCH) {
         const count = Math.min(HASH_READ_BATCH, row_count - start);
@@ -267,13 +269,13 @@ async function hash_side(
                 sheet_index,
                 start,
                 count,
-                options.isCancelled ?? (() => false),
+                is_cancelled,
             ));
         for (let offset = 0; offset < count; offset++) {
             const hash = hash_row(
                 rows[offset] ?? [],
                 column_count,
-                options.isCancelled ?? (() => false),
+                is_cancelled,
             );
             hashes[start + offset] = typeof hash === 'number'
                 ? hash
@@ -777,6 +779,7 @@ async function count_changes(
     const changed_row_indices: number[] = [];
     const column_count = Math.max(original_sheet.columnCount, modified_sheet.columnCount);
     const checkpoint = options.rowsPerCheckpoint ?? DEFAULT_ROWS_PER_CHECKPOINT;
+    const is_cancelled = options.isCancelled ?? NEVER_CANCELLED;
     let since_checkpoint = 0;
     /** Paired rows with the grid row each came from, so a difference can be
      *  reported against its position in the unified grid. */
@@ -793,14 +796,14 @@ async function count_changes(
                 original,
                 pairing.originalIndex,
                 batch.map((entry) => entry.row.original),
-                options.isCancelled ?? (() => false),
+                is_cancelled,
             ))).rows;
         const modified_batch = (await alignment_source_read(() =>
             read_source_raw_rows_indexed_async(
                 modified,
                 pairing.modifiedIndex,
                 batch.map((entry) => entry.row.modified),
-                options.isCancelled ?? (() => false),
+                is_cancelled,
             ))).rows;
         for (let offset = 0; offset < batch.length; offset++) {
             const original_row = original_batch[offset] ?? [];
@@ -810,7 +813,7 @@ async function count_changes(
                 const equal = cells_exactly_equal(
                     original_row[col],
                     modified_row[col],
-                    options.isCancelled ?? (() => false),
+                    is_cancelled,
                 );
                 const exactly_equal = typeof equal === 'boolean'
                     ? equal
@@ -1103,7 +1106,7 @@ async function score_moves(
         original.meta().sheets[pairing.originalIndex].columnCount,
         modified.meta().sheets[pairing.modifiedIndex].columnCount,
     );
-    const is_cancelled = options.isCancelled ?? (() => false);
+    const is_cancelled = options.isCancelled ?? NEVER_CANCELLED;
     const sources = await normalize_candidates(
         (await alignment_source_read(() =>
             read_source_raw_rows_indexed_async(
