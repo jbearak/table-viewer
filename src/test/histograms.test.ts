@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type {
+    ColumnFilterMetadata,
     ColumnWindow,
     DataSource,
     RowWindow,
@@ -11,7 +12,11 @@ type HistogramCell = string | null | { raw: string; rawType?: 'string' | 'number
 
 class HistogramSource implements DataSource {
     readonly selected_columns: number[][] = [];
-    constructor(private readonly values: HistogramCell[]) {}
+    filter_metadata_requests = 0;
+    constructor(
+        private readonly values: HistogramCell[],
+        private readonly filter_metadata?: ColumnFilterMetadata,
+    ) {}
     meta(): WorkbookMeta {
         return {
             hasFormatting: false,
@@ -52,6 +57,10 @@ class HistogramSource implements DataSource {
         });
         return { startRow: start, rows };
     }
+    column_filter_metadata(): ColumnFilterMetadata | undefined {
+        this.filter_metadata_requests += 1;
+        return this.filter_metadata;
+    }
     close(): void {}
 }
 
@@ -80,7 +89,8 @@ describe('compute_column_histogram', () => {
         )).resolves.toEqual({
             bins: [{ lo: 4, hi: 4, count: 2 }],
             columnKind: 'numeric',
-            distinctValues: ['4', null],
+            defaultCategorical: false,
+            distinctValues: [{ value: '4' }, { value: null }],
             distinctValuesExceeded: false,
         });
         await expect(compute_column_histogram(
@@ -88,7 +98,8 @@ describe('compute_column_histogram', () => {
         )).resolves.toEqual({
             bins: [],
             columnKind: 'text',
-            distinctValues: ['text', null],
+            defaultCategorical: false,
+            distinctValues: [{ value: 'text' }, { value: null }],
             distinctValuesExceeded: false,
         });
     });
@@ -139,7 +150,43 @@ describe('compute_column_histogram', () => {
         );
         expect(histogram.columnKind).toBe('numeric');
         expect(histogram.bins.reduce((total, bin) => total + bin.count, 0)).toBe(2);
-        expect(histogram.distinctValues).toEqual(['1', '.a', '2']);
+        expect(histogram.distinctValues).toEqual([
+            { value: '1' },
+            { value: '.a' },
+            { value: '2' },
+        ]);
+    });
+
+    it('plumbs generic source labels beside raw filter identities in one scan path', async () => {
+        const labels = new Map([
+            ['1', 'First'],
+            ['2', 'Second'],
+            ['3', 'First'],
+        ]);
+        const source = new HistogramSource(
+            [
+                { raw: '1', rawType: 'number' },
+                { raw: '2', rawType: 'number' },
+                { raw: '3', rawType: 'number' },
+            ],
+            {
+                categoricalCodes: true,
+                valueLabel: (raw) => labels.get(raw),
+            },
+        );
+        const histogram = await compute_column_histogram(source, 0, 0, () => false);
+
+        expect(histogram).toMatchObject({
+            columnKind: 'numeric',
+            defaultCategorical: true,
+            distinctValues: [
+                { value: '1', label: 'First' },
+                { value: '2', label: 'Second' },
+                { value: '3', label: 'First' },
+            ],
+        });
+        expect(source.selected_columns).toEqual([[0], [0]]);
+        expect(source.filter_metadata_requests).toBe(1);
     });
 
     it('classifies mixed numeric/text and leading-zero identifiers as text', async () => {
@@ -162,12 +209,15 @@ describe('compute_column_histogram', () => {
         )).resolves.toEqual({
             bins: [],
             columnKind: 'text',
+            defaultCategorical: false,
             distinctValues: [],
             distinctValuesExceeded: true,
         });
         // A complete distinct list requires the second batch; the remaining
-        // two batches are skipped once both facts are final.
+        // two batches are skipped once both facts are final. Source metadata is
+        // also skipped because there is no complete option list to label.
         expect(source.selected_columns).toEqual([[0], [0]]);
+        expect(source.filter_metadata_requests).toBe(0);
     });
 
     it('keeps a complete distinct list for text columns under the cap', async () => {
@@ -179,9 +229,15 @@ describe('compute_column_histogram', () => {
         )).resolves.toEqual({
             bins: [],
             columnKind: 'text',
+            defaultCategorical: false,
             // Exact raw values in first-seen order; whitespace-only collapses
             // to the single blank (null) entry, "a " stays distinct from "a".
-            distinctValues: ['b', 'a', null, 'a '],
+            distinctValues: [
+                { value: 'b' },
+                { value: 'a' },
+                { value: null },
+                { value: 'a ' },
+            ],
             distinctValuesExceeded: false,
         });
     });
@@ -226,7 +282,11 @@ describe('compute_column_histogram', () => {
         expect(histogram.columnKind).toBe('numeric');
         expect(histogram.bins.length).toBeGreaterThan(0);
         // Distinct values stay exact raw strings: '2' and '2.0' differ.
-        expect(histogram.distinctValues).toEqual(['1', '2', '2.0']);
+        expect(histogram.distinctValues).toEqual([
+            { value: '1' },
+            { value: '2' },
+            { value: '2.0' },
+        ]);
     });
 
     it('classifies raw and ISO date columns as ordered text', async () => {
@@ -238,7 +298,8 @@ describe('compute_column_histogram', () => {
         )).resolves.toEqual({
             bins: [],
             columnKind: 'orderedText',
-            distinctValues: ['2026-07-21'],
+            defaultCategorical: false,
+            distinctValues: [{ value: '2026-07-21' }],
             distinctValuesExceeded: false,
         });
         await expect(compute_column_histogram(
@@ -249,7 +310,11 @@ describe('compute_column_histogram', () => {
         )).resolves.toEqual({
             bins: [],
             columnKind: 'orderedText',
-            distinctValues: ['2026-07-21', '2026-07-22'],
+            defaultCategorical: false,
+            distinctValues: [
+                { value: '2026-07-21' },
+                { value: '2026-07-22' },
+            ],
             distinctValuesExceeded: false,
         });
     });

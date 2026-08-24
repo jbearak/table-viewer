@@ -754,6 +754,7 @@ export class ViewerPanelCore {
                 columnIndex: msg.columnIndex,
                 bins: histogram.bins,
                 columnKind: histogram.columnKind,
+                defaultCategorical: histogram.defaultCategorical,
                 distinctValues: histogram.distinctValues,
                 distinctValuesExceeded: histogram.distinctValuesExceeded,
                 requestId: msg.requestId,

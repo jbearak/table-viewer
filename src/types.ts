@@ -101,21 +101,31 @@ export interface FilterEntry {
     operator: FilterOperator;
     value?: string;
     secondValue?: string;
-    /** `isOneOf` only: exact raw values that must NOT match. `null` excludes
-     *  blanks. Storing exclusions keeps values that appear later visible. */
+    /** `isOneOf` only: exact canonical identities that must NOT match. `null`
+     * excludes blanks. Ordinary scalar identities are their raw values. */
     excludedValues?: (string | null)[];
     caseSensitive: boolean;
     enabled: boolean;
 }
 
-/** Checklist entries above this cap are never offered; a partial value list
+/** Checklist entries above either cap are never offered; a partial value list
  *  must not masquerade as complete. Blanks count as one entry. */
 export const FILTER_DISTINCT_VALUE_LIMIT = 1_000;
+export const FILTER_DISTINCT_VALUE_BYTE_LIMIT = 1024 * 1024;
 
 export interface HistogramBin {
     lo: number;
     hi: number;
     count: number;
+}
+
+/** One categorical filter option. `value` is the canonical matching identity.
+ * `rawValue` is a display-only raw preview when that identity is not safe to
+ * show directly; `label` is source formatting and may duplicate another label. */
+export interface FilterValueOption {
+    value: string | null;
+    rawValue?: string;
+    label?: string;
 }
 
 export type FilterColumnKind = 'numeric' | 'orderedText' | 'text' | 'unknown';
@@ -1847,8 +1857,8 @@ export type HostMessage =
     | { type: 'rowData'; sheetIndex: number; startRow: number; rows: (RenderedCell | null)[][]; sourceRows: number[]; requestId: string; generation: number }
     /** Git compare mode: sparse positional diff for the same page a rowData
      *  answered. `rowStatus[i]` describes row `startRow + i`; `changedCells`
-     *  carries only differing cells with the original (`base`) text. */
-    | { type: 'compareDiff'; sheetIndex: number; startRow: number; rowStatus: CompareRowStatus[]; changedCells: { row: number; col: number; base: string }[]; requestId: string; generation: number }
+     *  carries original raw (`base`) and formatted text for differing cells. */
+    | { type: 'compareDiff'; sheetIndex: number; startRow: number; rowStatus: CompareRowStatus[]; changedCells: { row: number; col: number; base: string; formattedBase?: string }[]; requestId: string; generation: number }
     | { type: 'scrollToRow'; row: number }
     | { type: 'saveOperationStarted'; lifecycle: ActiveCsvSaveLifecycle }
     | {
@@ -1884,7 +1894,7 @@ export type HostMessage =
     | { type: 'pendingEditsAcknowledged'; editSessionId: string; sequence: number }
     /** Stop accepting edits and report the highest full-map sequence produced. */
     | { type: 'requestPendingEditsFlush'; requestId: string }
-    | { type: 'filterHistogram'; sheetIndex: number; columnIndex: number; bins: HistogramBin[]; columnKind?: FilterColumnKind; distinctValues: (string | null)[]; distinctValuesExceeded: boolean; requestId: string; generation: number; sourceGeneration: number; error?: string }
+    | { type: 'filterHistogram'; sheetIndex: number; columnIndex: number; bins: HistogramBin[]; columnKind?: FilterColumnKind; defaultCategorical?: boolean; distinctValues: FilterValueOption[]; distinctValuesExceeded: boolean; requestId: string; generation: number; sourceGeneration: number; error?: string }
     /**
      * `deltas` is the gesture's own change set, and is present ONLY on the
      * successful answer to a request this receiver made. Computed by the host at

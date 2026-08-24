@@ -7,7 +7,6 @@ import {
     missing_type_to_label_key,
     parse_legacy_metadata,
     parse_metadata,
-    parse_value_labels,
     read_strl_pointer,
     read_rows_from_buffer,
     type DtaMetadata,
@@ -22,6 +21,7 @@ import {
     MAX_SHEET_COLUMNS,
 } from '../spreadsheet-safety';
 import type {
+    ColumnFilterMetadata,
     ColumnWindow,
     DataSource,
     IndexedRows,
@@ -35,12 +35,18 @@ import type {
 const DECODE_WINDOW_ROWS = 256;
 const MAX_DECODED_WINDOWS = 8;
 const MAX_DECODED_CELLS = DECODE_WINDOW_ROWS * MAX_SHEET_COLUMNS;
+const MAX_DECODED_CACHE_BYTES = 16 * 1024 * 1024;
 const MAX_GSO_CACHE_ENTRIES = 256;
+const MAX_GSO_CACHE_BYTES = 16 * 1024 * 1024;
 const MAX_GSO_INDEX_ENTRIES = 1_024;
 const MAX_GSO_CHECKPOINTS = 1_024;
 const MAX_GSO_DIGEST_CACHE_ENTRIES = 4_096;
+const MAX_SYNC_BINARY_HASH_BYTES = 16 * 1024 * 1024;
+const MAX_VALUE_LABEL_TABLE_BYTES = 16 * 1024 * 1024;
 const MAX_LEGACY_EXPANSION_FIELDS = 10_000;
 const INITIAL_GSO_CHECKPOINT_STRIDE = 64;
+const GSO_SCAN_ENTRIES_PER_YIELD = 256;
+const VALUE_LABEL_ENTRIES_PER_YIELD = 256;
 const BINARY_GSO_PREVIEW_BYTES = 32;
 const BINARY_GSO_COMPARISON_PREFIX = 'stata-binary:sha256:';
 const STRLS_TAG_LENGTH = '<strls>'.length;
@@ -48,6 +54,7 @@ const VALUE_LABELS_TAG_LENGTH = '<value_labels>'.length;
 const LBL_OPEN_TAG_LENGTH = '<lbl>'.length;
 const LBL_CLOSE_TAG_LENGTH = '</lbl>'.length;
 const LEGACY_LABEL_NAME_WIDTH = 33;
+const UNICODE_LABEL_NAME_WIDTH = 129;
 const LABEL_PADDING_BYTES = 3;
 const MODERN_SECTION_TAGS: readonly [
     keyof DtaMetadata['section_offsets'],
@@ -69,6 +76,55 @@ const MODERN_SECTION_TAGS: readonly [
 ];
 
 type ValueLabelTables = Map<string, Map<number, string>>;
+type StataMissingType = Parameters<typeof missing_type_to_label_key>[0];
+
+const STATA_MISSING_TYPES: readonly StataMissingType[] = [
+    '.',
+    ...Array.from(
+        { length: 26 },
+        (_, index) => `.${String.fromCharCode('a'.charCodeAt(0) + index)}` as StataMissingType,
+    ),
+];
+const STATA_MISSING_LABEL_KEY_BY_TYPE = new Map<string, number>(
+    STATA_MISSING_TYPES.map((missing) => [missing, missing_type_to_label_key(missing)]),
+);
+const STATA_MISSING_LABEL_KEYS = new Set(STATA_MISSING_LABEL_KEY_BY_TYPE.values());
+
+function stata_value_label(
+    labels: ReadonlyMap<number, string>,
+    raw: string,
+): string | undefined {
+    const missing_key = STATA_MISSING_LABEL_KEY_BY_TYPE.get(raw);
+    if (missing_key !== undefined) return labels.get(missing_key);
+    const numeric = Number(raw);
+    return Number.isFinite(numeric) ? labels.get(numeric) : undefined;
+}
+
+function filter_metadata_from_labels(
+    labels: Map<number, string> | undefined,
+): ColumnFilterMetadata | undefined {
+    if (!labels || labels.size === 0) return undefined;
+    let categorical_codes = false;
+    for (const value of labels.keys()) {
+        if (STATA_MISSING_LABEL_KEYS.has(value)) continue;
+        categorical_codes = true;
+        break;
+    }
+    return {
+        categoricalCodes: categorical_codes,
+        valueLabel: (raw) => stata_value_label(labels, raw),
+    };
+}
+
+function source_abort_error(): Error {
+    const error = new Error('Stata source read was cancelled.');
+    error.name = 'AbortError';
+    return error;
+}
+
+async function yield_to_event_loop(): Promise<void> {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+}
 
 interface BinaryGso {
     readonly kind: 'binary-gso';
@@ -96,48 +152,47 @@ interface ScannedGso extends GsoOrder {
 }
 
 interface GsoBatchTarget extends GsoOrder {
-    readonly key: string;
-    readonly pointerOffsets: number[];
+    readonly kind: 'gso-target';
+    value?: DecodedGso;
 }
+
+type StrlBatchCell = DecodedGso | GsoBatchTarget | undefined;
 
 interface CachedWindow {
     readonly rows: (RenderedCell | null)[][];
     readonly cellCount: number;
+    readonly byteCount: number;
 }
 
-/** Canonical raw representation shared by display and scan reads. */
-function canonicalize_stata_raw(
-    cell: ResolvedStataCell,
-    binary_comparison_key: (cell: BinaryGso) => string,
-): RawCell {
-    if (is_binary_gso(cell)) {
-        const raw_cell: RawCell = { raw: cell.formatted, rawType: 'string' };
-        Object.defineProperty(raw_cell, 'comparisonKey', {
-            enumerable: false,
-            get: () => binary_comparison_key(cell),
-        });
-        return raw_cell;
-    }
-    if (is_missing_value_object(cell)) {
-        return { raw: cell.missing_type, rawType: 'number' };
-    }
-    if (typeof cell === 'string') return { raw: cell, rawType: 'string' };
-    return { raw: String(cell), rawType: 'number' };
+interface CollectedStrlBatch {
+    readonly bytes: Uint8Array;
+    readonly view: DataView;
+    readonly cells: StrlBatchCell[];
+    readonly targets: Map<string, GsoBatchTarget>;
 }
 
 function rendered_stata_cell(raw_cell: RawCell, formatted: string): RenderedCell {
-    const rendered: RenderedCell = {
-        raw: raw_cell.raw,
-        rawType: raw_cell.rawType,
-        formatted,
-        bold: false,
-        italic: false,
-    };
-    const comparison_key = Object.getOwnPropertyDescriptor(raw_cell, 'comparisonKey');
-    if (comparison_key !== undefined) {
-        Object.defineProperty(rendered, 'comparisonKey', comparison_key);
-    }
+    const rendered = raw_cell as RenderedCell;
+    rendered.formatted = formatted;
+    rendered.bold = false;
+    rendered.italic = false;
     return rendered;
+}
+
+function decoded_gso_byte_count(value: DecodedGso): number {
+    return typeof value === 'string' ? value.length * 2 : 64;
+}
+
+function rendered_rows_byte_count(rows: readonly (RenderedCell | null)[][]): number {
+    let bytes = 0;
+    for (const row of rows) {
+        for (const cell of row) {
+            if (cell === null) continue;
+            bytes += (cell.raw?.length ?? 0) * 2;
+            if (cell.formatted !== cell.raw) bytes += cell.formatted.length * 2;
+        }
+    }
+    return bytes;
 }
 
 /** Read-only, buffer-backed Stata source with bounded lazy row decoding. */
@@ -150,9 +205,14 @@ export class DtaDataSource implements DataSource {
     private view?: DataView;
     private readonly pre_unicode_utf8_decoder = new TextDecoder('utf-8', { fatal: true });
     private readonly pre_unicode_fallback_decoder = new TextDecoder('windows-1252');
-    private value_label_tables?: ValueLabelTables;
+    private readonly unicode_decoder = new TextDecoder('utf-8');
+    private readonly value_label_tables: ValueLabelTables = new Map();
+    private readonly missing_value_label_tables = new Set<string>();
+    private window_cache_cells = 0;
+    private window_cache_bytes = 0;
     private readonly gso_index = new Map<string, GsoEntry>();
     private readonly gso_cache = new Map<string, DecodedGso>();
+    private gso_cache_bytes = 0;
     private readonly gso_digest_cache = new Map<number, string>();
     private gso_checkpoints: GsoCheckpoint[] = [];
     private gso_checkpoint_stride = INITIAL_GSO_CHECKPOINT_STRIDE;
@@ -297,6 +357,65 @@ export class DtaDataSource implements DataSource {
         );
     }
 
+    async read_raw_columns_async(
+        sheet_index: number,
+        start_row: number,
+        count: number,
+        column_indices: readonly number[],
+        is_cancelled: () => boolean,
+    ): Promise<RawColumnWindow> {
+        this.assert_sheet(sheet_index);
+        for (const column of column_indices) this.assert_column(column);
+        const start = this.clamp_start(start_row);
+        const end = Math.min(start + Math.max(0, count), this.metadata.nobs);
+        if (start >= end || column_indices.length === 0) {
+            return { startRow: start, rows: Array.from({ length: end - start }, () => []) };
+        }
+        const already_ordered = column_indices.every(
+            (column, index) => index === 0 || column > column_indices[index - 1],
+        );
+        const columns = already_ordered
+            ? column_indices
+            : [...new Set(column_indices)].sort((a, b) => a - b);
+        const rows = await this.read_raw_range_async(
+            start,
+            end,
+            columns,
+            is_cancelled,
+        );
+        if (already_ordered) return { startRow: start, rows };
+        const positions = new Map(columns.map((column, index) => [column, index]));
+        return {
+            startRow: start,
+            rows: rows.map((row) => column_indices.map((column) => row[positions.get(column)!])),
+        };
+    }
+
+    column_filter_metadata(
+        sheet_index: number,
+        column_index: number,
+    ): ColumnFilterMetadata | undefined {
+        this.assert_sheet(sheet_index);
+        this.assert_column(column_index);
+        const label_name = this.metadata.variables[column_index].value_label_name;
+        if (!label_name) return undefined;
+        return filter_metadata_from_labels(this.value_labels(label_name));
+    }
+
+    async column_filter_metadata_async(
+        sheet_index: number,
+        column_index: number,
+        is_cancelled: () => boolean,
+    ): Promise<ColumnFilterMetadata | undefined> {
+        this.assert_sheet(sheet_index);
+        this.assert_column(column_index);
+        const label_name = this.metadata.variables[column_index].value_label_name;
+        if (!label_name) return undefined;
+        return filter_metadata_from_labels(
+            await this.value_labels_async(label_name, is_cancelled),
+        );
+    }
+
     private read_column_projection<Cell>(
         sheet_index: number,
         start_row: number,
@@ -330,9 +449,13 @@ export class DtaDataSource implements DataSource {
 
     close(): void {
         this.windows.clear();
-        this.value_label_tables = undefined;
+        this.window_cache_cells = 0;
+        this.window_cache_bytes = 0;
+        this.value_label_tables.clear();
+        this.missing_value_label_tables.clear();
         this.gso_index.clear();
         this.gso_cache.clear();
+        this.gso_cache_bytes = 0;
         this.gso_digest_cache.clear();
         this.gso_checkpoints = [];
         this.gso_scan_exhausted = true;
@@ -361,6 +484,28 @@ export class DtaDataSource implements DataSource {
         return rows;
     }
 
+    /** Canonical raw representation shared by rendered and raw-only reads. */
+    private canonicalize_stata_raw(cell: ResolvedStataCell): RawCell {
+        if (is_binary_gso(cell)) {
+            const raw_cell: RawCell = {
+                raw: cell.formatted,
+                rawType: 'string',
+                rawByteLength: cell.contentLength,
+            };
+            const identity = () => this.binary_comparison_key(cell);
+            Object.defineProperties(raw_cell, {
+                comparisonKey: { enumerable: false, get: identity },
+                filterKey: { enumerable: false, get: identity },
+            });
+            return raw_cell;
+        }
+        if (is_missing_value_object(cell)) {
+            return { raw: cell.missing_type, rawType: 'number' };
+        }
+        if (typeof cell === 'string') return { raw: cell, rawType: 'string' };
+        return { raw: String(cell), rawType: 'number' };
+    }
+
     private read_raw_range(
         start: number,
         end: number,
@@ -375,10 +520,31 @@ export class DtaDataSource implements DataSource {
                 columns,
             );
             rows.push(...decoded.map((values) => values.map((cell) =>
-                canonicalize_stata_raw(
-                    cell,
-                    (binary) => this.binary_comparison_key(binary),
-                ),
+                this.canonicalize_stata_raw(cell),
+            )));
+            row += count;
+        }
+        return rows;
+    }
+
+    private async read_raw_range_async(
+        start: number,
+        end: number,
+        columns: readonly number[],
+        is_cancelled: () => boolean,
+    ): Promise<(RawCell | null)[][]> {
+        const rows: (RawCell | null)[][] = [];
+        for (let row = start; row < end;) {
+            if (is_cancelled()) throw source_abort_error();
+            const count = Math.min(DECODE_WINDOW_ROWS, end - row);
+            const decoded = await this.resolve_columns_async(
+                this.decode_columns(row, count, columns),
+                row,
+                columns,
+                is_cancelled,
+            );
+            rows.push(...decoded.map((values) => values.map((cell) =>
+                this.canonicalize_stata_raw(cell),
             )));
             row += count;
         }
@@ -403,25 +569,35 @@ export class DtaDataSource implements DataSource {
             start,
             columns,
         );
+        const rows = raw_rows.map((row) => row.map((cell, index) =>
+            this.render_cell(cell, this.metadata.variables[columns[index]])));
         const window: CachedWindow = {
-            rows: raw_rows.map((row) => row.map((cell, index) =>
-                this.render_cell(cell, this.metadata.variables[columns[index]]))),
+            rows,
             cellCount: count * columns.length,
+            byteCount: rendered_rows_byte_count(rows),
         };
-        this.windows.set(key, window);
-        let cached_cells = [...this.windows.values()]
-            .reduce((total, entry) => total + entry.cellCount, 0);
-        while (
-            this.windows.size > 1
-            && (
-                this.windows.size > MAX_DECODED_WINDOWS
-                || cached_cells > MAX_DECODED_CELLS
-            )
+        if (
+            window.cellCount <= MAX_DECODED_CELLS
+            && window.byteCount <= MAX_DECODED_CACHE_BYTES
         ) {
-            const oldest_key = this.windows.keys().next().value!;
-            const oldest = this.windows.get(oldest_key)!;
-            this.windows.delete(oldest_key);
-            cached_cells -= oldest.cellCount;
+            if (this.windows.size === 0) {
+                this.window_cache_cells = 0;
+                this.window_cache_bytes = 0;
+            }
+            this.windows.set(key, window);
+            this.window_cache_cells += window.cellCount;
+            this.window_cache_bytes += window.byteCount;
+            while (
+                this.windows.size > MAX_DECODED_WINDOWS
+                || this.window_cache_cells > MAX_DECODED_CELLS
+                || this.window_cache_bytes > MAX_DECODED_CACHE_BYTES
+            ) {
+                const oldest_key = this.windows.keys().next().value!;
+                const oldest = this.windows.get(oldest_key)!;
+                this.windows.delete(oldest_key);
+                this.window_cache_cells -= oldest.cellCount;
+                this.window_cache_bytes -= oldest.byteCount;
+            }
         }
         return window;
     }
@@ -455,20 +631,7 @@ export class DtaDataSource implements DataSource {
         resolved: ResolvedStataCell,
         variable: VariableInfo,
     ): RenderedCell {
-        const raw_cell = canonicalize_stata_raw(
-            resolved,
-            (binary) => this.binary_comparison_key(binary),
-        );
-        if (is_missing_value_object(resolved)) {
-            const labels = variable.value_label_name
-                ? this.value_labels().get(variable.value_label_name)
-                : undefined;
-            return rendered_stata_cell(
-                raw_cell,
-                labels?.get(missing_type_to_label_key(resolved.missing_type))
-                    ?? resolved.missing_type,
-            );
-        }
+        const raw_cell = this.canonicalize_stata_raw(resolved);
         if (is_binary_gso(resolved) || typeof resolved === 'string') {
             return rendered_stata_cell(
                 raw_cell,
@@ -477,11 +640,17 @@ export class DtaDataSource implements DataSource {
         }
 
         const labels = variable.value_label_name
-            ? this.value_labels().get(variable.value_label_name)
+            ? this.value_labels(variable.value_label_name)
             : undefined;
+        const label = labels === undefined
+            ? undefined
+            : stata_value_label(labels, raw_cell.raw!);
+        if (is_missing_value_object(resolved)) {
+            return rendered_stata_cell(raw_cell, label ?? resolved.missing_type);
+        }
         return rendered_stata_cell(
             raw_cell,
-            labels?.get(resolved)
+            label
                 ?? apply_display_format(resolved, variable.format)
                 ?? raw_cell.raw!,
         );
@@ -492,13 +661,43 @@ export class DtaDataSource implements DataSource {
         start: number,
         columns: readonly number[],
     ): ResolvedStataCell[][] {
-        const resolved_strls = this.resolve_strl_batch(start, rows.length, columns);
+        const batch = this.collect_strl_batch(start, rows.length, columns);
+        if (batch.targets.size > 0) {
+            this.resolve_gso_batch(batch.bytes, batch.view, batch.targets);
+        }
+        return this.materialize_resolved_columns(rows, start, columns, batch.cells);
+    }
+
+    private async resolve_columns_async(
+        rows: Row[],
+        start: number,
+        columns: readonly number[],
+        is_cancelled: () => boolean,
+    ): Promise<ResolvedStataCell[][]> {
+        const batch = this.collect_strl_batch(start, rows.length, columns);
+        if (batch.targets.size > 0) {
+            await this.resolve_gso_batch_async(
+                batch.bytes,
+                batch.view,
+                batch.targets,
+                is_cancelled,
+            );
+        }
+        return this.materialize_resolved_columns(rows, start, columns, batch.cells);
+    }
+
+    private materialize_resolved_columns(
+        rows: Row[],
+        start: number,
+        columns: readonly number[],
+        resolved_strls: readonly StrlBatchCell[],
+    ): ResolvedStataCell[][] {
         return rows.map((row, row_offset) => row.map((cell, index) =>
             this.resolve_cell(
                 cell,
                 this.metadata.variables[columns[index]],
                 start + row_offset,
-                resolved_strls,
+                resolved_strls[row_offset * columns.length + index],
             )));
     }
 
@@ -506,13 +705,12 @@ export class DtaDataSource implements DataSource {
         cell: RowCell,
         variable: VariableInfo,
         row: number,
-        resolved_strls: ReadonlyMap<number, DecodedGso>,
+        strl_cell: StrlBatchCell,
     ): ResolvedStataCell {
         if (variable.type === 'strL') {
-            const pointer_offset = this.data_start
-                + row * this.metadata.obs_length
-                + variable.byte_offset;
-            const resolved = resolved_strls.get(pointer_offset);
+            const resolved = is_gso_batch_target(strl_cell)
+                ? strl_cell.value
+                : strl_cell;
             if (resolved === undefined) {
                 throw new Error(`Stata strL cell at row ${row} has a dangling reference`);
             }
@@ -536,76 +734,71 @@ export class DtaDataSource implements DataSource {
         return cell;
     }
 
-    private resolve_strl_batch(
+    private collect_strl_batch(
         start: number,
         count: number,
         columns: readonly number[],
-    ): ReadonlyMap<number, DecodedGso> {
-        const strl_columns = columns.filter(
-            (column) => this.metadata.variables[column].type === 'strL',
-        );
-        if (strl_columns.length === 0) return new Map();
+    ): CollectedStrlBatch {
         const view = this.open_view();
-        const resolved = new Map<number, DecodedGso>();
+        const bytes = this.open_bytes();
+        const cells = new Array<StrlBatchCell>(count * columns.length);
         const targets = new Map<string, GsoBatchTarget>();
+        const strl_columns: Array<{ index: number; variable: VariableInfo }> = [];
+        columns.forEach((column, index) => {
+            const variable = this.metadata.variables[column];
+            if (variable.type === 'strL') strl_columns.push({ index, variable });
+        });
         for (let row_offset = 0; row_offset < count; row_offset++) {
-            for (const column of strl_columns) {
-                const variable = this.metadata.variables[column];
-                const pointer_offset = this.data_start
-                    + (start + row_offset) * this.metadata.obs_length
-                    + variable.byte_offset;
-                const pointer = read_strl_cell_pointer(view, this.metadata, pointer_offset);
+            const row_base = this.data_start
+                + (start + row_offset) * this.metadata.obs_length;
+            const cell_base = row_offset * columns.length;
+            for (const { index, variable } of strl_columns) {
+                const cell_index = cell_base + index;
+                const pointer = read_strl_cell_pointer(
+                    view,
+                    this.metadata,
+                    row_base + variable.byte_offset,
+                );
                 if (pointer === null) {
-                    resolved.set(pointer_offset, '');
+                    cells[cell_index] = '';
                     continue;
                 }
                 validate_gso_identifier(pointer.v, pointer.o, this.metadata, 'strL pointer');
                 const key = gso_key(pointer.v, pointer.o);
-                const target = targets.get(key);
+                let target = targets.get(key);
                 if (target === undefined) {
-                    targets.set(key, {
-                        key,
+                    target = {
+                        kind: 'gso-target',
                         observation: pointer.o,
                         variable: pointer.v,
-                        pointerOffsets: [pointer_offset],
-                    });
-                } else {
-                    target.pointerOffsets.push(pointer_offset);
+                    };
+                    targets.set(key, target);
                 }
+                cells[cell_index] = target;
             }
         }
-        if (targets.size === 0) return resolved;
-
-        const values = new Map<string, DecodedGso>();
-        const unresolved: GsoBatchTarget[] = [];
-        const bytes = this.open_bytes();
-        for (const target of targets.values()) {
-            const cached = this.find_cached_gso(target.key, bytes);
-            if (cached === undefined) unresolved.push(target);
-            else values.set(target.key, cached);
+        for (const [key, target] of targets) {
+            const cached = this.find_cached_gso(key, bytes);
+            if (cached === undefined) continue;
+            target.value = cached;
+            targets.delete(key);
         }
-        if (unresolved.length > 0) {
-            this.resolve_gso_batch(bytes, view, unresolved, values);
-        }
-        for (const target of targets.values()) {
-            const value = values.get(target.key);
-            if (value === undefined) continue;
-            for (const pointer_offset of target.pointerOffsets) {
-                resolved.set(pointer_offset, value);
-            }
-        }
-        return resolved;
+        return { bytes, view, cells, targets };
     }
 
     private resolve_gso_batch(
         bytes: Uint8Array,
         view: DataView,
-        targets: GsoBatchTarget[],
-        values: Map<string, DecodedGso>,
+        targets: Map<string, GsoBatchTarget>,
     ): void {
         const ordered = this.gso_order_monotonic;
-        const first = targets.reduce((minimum, target) =>
-            compare_gso_order(target, minimum) < 0 ? target : minimum);
+        let first: GsoBatchTarget | undefined;
+        for (const target of targets.values()) {
+            if (first === undefined || compare_gso_order(target, first) < 0) {
+                first = target;
+            }
+        }
+        if (first === undefined) return;
         let position = this.gso_start_position;
         if (ordered) {
             if (
@@ -619,13 +812,14 @@ export class DtaDataSource implements DataSource {
             }
         }
 
-        const requested = new Set(targets.map((target) => target.key));
         const initial_frontier = this.gso_scan_position;
         const scan_ranges = !ordered && !this.gso_scan_exhausted
             && initial_frontier > this.gso_start_position
             ? [
-                { start: initial_frontier, end: this.metadata.section_offsets.value_labels },
+                // Resolve historical targets before touching an unrelated
+                // unvisited successor that may itself be corrupt.
                 { start: this.gso_start_position, end: initial_frontier },
+                { start: initial_frontier, end: this.metadata.section_offsets.value_labels },
             ]
             : [{ start: position, end: this.metadata.section_offsets.value_labels }];
         for (const range of scan_ranges) {
@@ -636,15 +830,85 @@ export class DtaDataSource implements DataSource {
                     ? this.read_gso_at(bytes, view, position)
                     : this.scan_next_gso(bytes, view);
                 if (scanned === null) break;
-                if (requested.delete(scanned.key)) {
+                const target = targets.get(scanned.key);
+                if (target !== undefined) {
                     if (historical) this.cache_gso_entry(scanned.key, scanned.value);
-                    values.set(
+                    target.value = this.decode_and_cache_gso(
                         scanned.key,
-                        this.decode_and_cache_gso(scanned.key, bytes, scanned.value),
+                        bytes,
+                        scanned.value,
                     );
-                    if (requested.size === 0) return;
+                    targets.delete(scanned.key);
+                    if (targets.size === 0) return;
                 }
                 position = scanned.nextPosition;
+            }
+        }
+    }
+
+    private async resolve_gso_batch_async(
+        bytes: Uint8Array,
+        view: DataView,
+        targets: Map<string, GsoBatchTarget>,
+        is_cancelled: () => boolean,
+    ): Promise<void> {
+        if (is_cancelled()) throw source_abort_error();
+        const ordered = this.gso_order_monotonic;
+        let first: GsoBatchTarget | undefined;
+        for (const target of targets.values()) {
+            if (first === undefined || compare_gso_order(target, first) < 0) {
+                first = target;
+            }
+        }
+        if (first === undefined) return;
+        let position = this.gso_start_position;
+        if (ordered) {
+            if (
+                !this.gso_scan_exhausted
+                && this.gso_last_order !== undefined
+                && compare_gso_order(this.gso_last_order, first) < 0
+            ) {
+                position = this.gso_scan_position;
+            } else {
+                position = this.gso_checkpoint_position(first);
+            }
+        }
+
+        const initial_frontier = this.gso_scan_position;
+        const scan_ranges = !ordered && !this.gso_scan_exhausted
+            && initial_frontier > this.gso_start_position
+            ? [
+                { start: this.gso_start_position, end: initial_frontier },
+                { start: initial_frontier, end: this.metadata.section_offsets.value_labels },
+            ]
+            : [{ start: position, end: this.metadata.section_offsets.value_labels }];
+        let scanned_since_yield = 0;
+        for (const range of scan_ranges) {
+            position = range.start;
+            while (position < range.end) {
+                const historical = position < this.gso_scan_position;
+                const scanned = historical
+                    ? this.read_gso_at(bytes, view, position)
+                    : this.scan_next_gso(bytes, view);
+                if (scanned === null) break;
+                const target = targets.get(scanned.key);
+                if (target !== undefined) {
+                    if (historical) this.cache_gso_entry(scanned.key, scanned.value);
+                    target.value = this.decode_and_cache_gso(
+                        scanned.key,
+                        bytes,
+                        scanned.value,
+                    );
+                    targets.delete(scanned.key);
+                    if (targets.size === 0) return;
+                }
+                position = scanned.nextPosition;
+                scanned_since_yield += 1;
+                if (scanned_since_yield >= GSO_SCAN_ENTRIES_PER_YIELD) {
+                    scanned_since_yield = 0;
+                    await yield_to_event_loop();
+                    if (is_cancelled()) throw source_abort_error();
+                }
             }
         }
     }
@@ -713,15 +977,38 @@ export class DtaDataSource implements DataSource {
     }
 
     private remember_gso(scanned: ScannedGso, position: number): void {
+        if (!this.gso_order_monotonic) {
+            if (this.gso_index.has(scanned.key)) {
+                throw new Error(
+                    `Corrupt .dta file: duplicate strL object id ${scanned.key}`,
+                );
+            }
+            this.cache_gso_entry(scanned.key, scanned.value);
+            return;
+        }
+        if (this.gso_last_order !== undefined) {
+            const order = compare_gso_order(scanned, this.gso_last_order);
+            if (order === 0) {
+                throw new Error(
+                    `Corrupt .dta file: duplicate strL object id ${scanned.key}`,
+                );
+            }
+            if (order < 0) {
+                this.gso_order_monotonic = false;
+                this.gso_last_order = undefined;
+                this.gso_checkpoints = [];
+                this.cache_gso_entry(scanned.key, scanned.value);
+                return;
+            }
+        }
+        this.gso_last_order = scanned;
         this.cache_gso_entry(scanned.key, scanned.value);
-        const order = { observation: scanned.observation, variable: scanned.variable };
-        if (
-            this.gso_last_order !== undefined
-            && compare_gso_order(order, this.gso_last_order) < 0
-        ) this.gso_order_monotonic = false;
-        this.gso_last_order = order;
         if (this.gso_entries_scanned % this.gso_checkpoint_stride === 0) {
-            this.gso_checkpoints.push({ ...order, position });
+            this.gso_checkpoints.push({
+                observation: scanned.observation,
+                variable: scanned.variable,
+                position,
+            });
             if (this.gso_checkpoints.length > MAX_GSO_CHECKPOINTS) {
                 this.gso_checkpoints = this.gso_checkpoints.filter((_, index) => index % 2 === 0);
                 this.gso_checkpoint_stride *= 2;
@@ -773,9 +1060,25 @@ export class DtaDataSource implements DataSource {
         entry: GsoEntry,
     ): DecodedGso {
         const decoded = this.decode_gso(bytes, entry);
-        this.gso_cache.set(key, decoded);
-        if (this.gso_cache.size > MAX_GSO_CACHE_ENTRIES) {
-            this.gso_cache.delete(this.gso_cache.keys().next().value!);
+        const decoded_bytes = decoded_gso_byte_count(decoded);
+        if (decoded_bytes <= MAX_GSO_CACHE_BYTES) {
+            if (this.gso_cache.size === 0) this.gso_cache_bytes = 0;
+            const previous = this.gso_cache.get(key);
+            if (previous !== undefined) {
+                this.gso_cache_bytes -= decoded_gso_byte_count(previous);
+                this.gso_cache.delete(key);
+            }
+            this.gso_cache.set(key, decoded);
+            this.gso_cache_bytes += decoded_bytes;
+            while (
+                this.gso_cache.size > MAX_GSO_CACHE_ENTRIES
+                || this.gso_cache_bytes > MAX_GSO_CACHE_BYTES
+            ) {
+                const oldest_key = this.gso_cache.keys().next().value!;
+                const oldest = this.gso_cache.get(oldest_key)!;
+                this.gso_cache.delete(oldest_key);
+                this.gso_cache_bytes -= decoded_gso_byte_count(oldest);
+            }
         }
         return decoded;
     }
@@ -799,7 +1102,16 @@ export class DtaDataSource implements DataSource {
 
     private binary_comparison_key(binary: BinaryGso): string {
         let digest = this.gso_digest_cache.get(binary.contentOffset);
-        if (digest === undefined) {
+        if (digest !== undefined) {
+            this.gso_digest_cache.delete(binary.contentOffset);
+            this.gso_digest_cache.set(binary.contentOffset, digest);
+        } else {
+            if (binary.contentLength > MAX_SYNC_BINARY_HASH_BYTES) {
+                throw new Error(
+                    `Stata binary strL is too large to compare exactly without blocking `
+                    + `(max ${MAX_SYNC_BINARY_HASH_BYTES} bytes)`,
+                );
+            }
             const content = this.open_bytes().subarray(
                 binary.contentOffset,
                 binary.contentOffset + binary.contentLength,
@@ -829,16 +1141,42 @@ export class DtaDataSource implements DataSource {
         return this.view;
     }
 
-    private value_labels(): ValueLabelTables {
-        this.value_label_tables ??= this.metadata.format_version < 118
-            ? parse_pre_unicode_value_labels(
-                this.open_buffer(),
-                this.metadata,
-                this.pre_unicode_utf8_decoder,
-                this.pre_unicode_fallback_decoder,
-            )
-            : parse_value_labels(this.open_buffer(), this.metadata);
-        return this.value_label_tables;
+    private value_labels(name: string): Map<number, string> | undefined {
+        const cached = this.value_label_tables.get(name);
+        if (cached !== undefined) return cached;
+        if (this.missing_value_label_tables.has(name)) return undefined;
+        const labels = parse_value_label_table(
+            this.open_buffer(),
+            this.metadata,
+            name,
+            this.unicode_decoder,
+            this.pre_unicode_utf8_decoder,
+            this.pre_unicode_fallback_decoder,
+        );
+        if (labels === undefined) this.missing_value_label_tables.add(name);
+        else this.value_label_tables.set(name, labels);
+        return labels;
+    }
+
+    private async value_labels_async(
+        name: string,
+        is_cancelled: () => boolean,
+    ): Promise<Map<number, string> | undefined> {
+        const cached = this.value_label_tables.get(name);
+        if (cached !== undefined) return cached;
+        if (this.missing_value_label_tables.has(name)) return undefined;
+        const labels = await parse_value_label_table_async(
+            this.open_buffer(),
+            this.metadata,
+            name,
+            this.unicode_decoder,
+            this.pre_unicode_utf8_decoder,
+            this.pre_unicode_fallback_decoder,
+            is_cancelled,
+        );
+        if (labels === undefined) this.missing_value_label_tables.add(name);
+        else this.value_label_tables.set(name, labels);
+        return labels;
     }
 
     private window_start(row: number): number {
@@ -892,6 +1230,10 @@ function is_binary_gso(cell: ResolvedStataCell): cell is BinaryGso {
         && cell.kind === 'binary-gso';
 }
 
+function is_gso_batch_target(cell: StrlBatchCell): cell is GsoBatchTarget {
+    return typeof cell === 'object' && cell !== null && cell.kind === 'gso-target';
+}
+
 function validate_legacy_expansion_fields(buffer: ArrayBuffer): void {
     const bytes = new Uint8Array(buffer);
     const version = bytes[0];
@@ -908,10 +1250,8 @@ function validate_legacy_expansion_fields(buffer: ArrayBuffer): void {
         + nvar * format_width
         + nvar * 33
         + nvar * 81;
-    for (let field = 0; field <= MAX_LEGACY_EXPANSION_FIELDS; field++) {
-        if (field === MAX_LEGACY_EXPANSION_FIELDS) {
-            throw new Error('Corrupt .dta file: too many expansion fields');
-        }
+    let field_count = 0;
+    while (true) {
         if (!Number.isSafeInteger(position) || position + 5 > buffer.byteLength) {
             throw new Error('Corrupt .dta file: expansion fields are truncated');
         }
@@ -925,6 +1265,10 @@ function validate_legacy_expansion_fields(buffer: ArrayBuffer): void {
             throw new Error('Corrupt .dta file: expansion field is truncated');
         }
         if (type === 0 && length === 0) return;
+        field_count += 1;
+        if (field_count > MAX_LEGACY_EXPANSION_FIELDS) {
+            throw new Error('Corrupt .dta file: too many expansion fields');
+        }
         position = next;
     }
 }
@@ -1017,20 +1361,33 @@ function validate_section_offsets(metadata: DtaMetadata, bytes: Uint8Array): voi
     }
 }
 
-function parse_pre_unicode_value_labels(
+interface ValueLabelTableEntry {
+    readonly name: string;
+    readonly tableLength: number;
+    readonly payloadStart: number;
+    readonly entryEnd: number;
+}
+
+/** Local until @jbearak/dta-parser exposes a single-table, declared-length-bounded
+ * parser with a pre-Unicode decoder hook. Version 0.3.0 parses every table and
+ * lets modern payload reads cross the current <lbl>'s declared boundary. */
+function* scan_value_label_tables(
     buffer: ArrayBuffer,
     metadata: DtaMetadata,
-    utf8_decoder: TextDecoder,
-    fallback_decoder: TextDecoder,
-): ValueLabelTables {
+    unicode_decoder: TextDecoder,
+    pre_unicode_utf8_decoder: TextDecoder,
+    pre_unicode_fallback_decoder: TextDecoder,
+): Generator<ValueLabelTableEntry> {
     const bytes = new Uint8Array(buffer);
     const view = new DataView(buffer);
     const little_endian = metadata.byte_order === 'LSF';
     const legacy = is_legacy_format(metadata.format_version);
+    const name_width = metadata.format_version >= 118
+        ? UNICODE_LABEL_NAME_WIDTH
+        : LEGACY_LABEL_NAME_WIDTH;
     const section_end = metadata.section_offsets.stata_data_close;
     let position = metadata.section_offsets.value_labels
         + (legacy ? 0 : VALUE_LABELS_TAG_LENGTH);
-    const result: ValueLabelTables = new Map();
 
     while (position < section_end) {
         let table_length: number;
@@ -1055,47 +1412,26 @@ function parse_pre_unicode_value_labels(
         if (!Number.isSafeInteger(entry_end) || entry_end > section_end) {
             throw new Error('Corrupt value label table: entry exceeds section bounds');
         }
-        const name = decode_fixed(
+        if (position + name_width + LABEL_PADDING_BYTES > entry_end) {
+            throw new Error('Corrupt value label table: truncated name');
+        }
+        const name = decode_value_label_text(
             bytes,
             position,
-            LEGACY_LABEL_NAME_WIDTH,
-            utf8_decoder,
-            fallback_decoder,
+            position + name_width,
+            metadata,
+            unicode_decoder,
+            pre_unicode_utf8_decoder,
+            pre_unicode_fallback_decoder,
+            true,
         );
-        position += LEGACY_LABEL_NAME_WIDTH + LABEL_PADDING_BYTES;
-        if (position + 8 > entry_end) {
-            throw new Error('Corrupt value label table: truncated header');
-        }
-        const count = view.getInt32(position, little_endian);
-        const text_length = view.getInt32(position + 4, little_endian);
-        position += 8;
-        if (count < 0 || text_length < 0) {
-            throw new Error('Corrupt value label table: negative count or text length');
-        }
-        const payload_end = position + count * 8 + text_length;
-        if (!Number.isSafeInteger(payload_end) || payload_end > entry_end) {
-            throw new Error('Corrupt value label table: payload exceeds entry bounds');
-        }
-        const offsets_start = position;
-        const values_start = offsets_start + count * 4;
-        const text_start = values_start + count * 4;
-        const labels = new Map<number, string>();
-        for (let index = 0; index < count; index++) {
-            const offset = view.getInt32(offsets_start + index * 4, little_endian);
-            if (offset < 0 || offset >= text_length) continue;
-            const start = text_start + offset;
-            let end = start;
-            while (end < text_start + text_length && bytes[end] !== 0) end += 1;
-            const value = view.getInt32(values_start + index * 4, little_endian);
-            labels.set(value, decode_pre_unicode(
-                bytes,
-                start,
-                end,
-                utf8_decoder,
-                fallback_decoder,
-            ));
-        }
-        result.set(name, labels);
+        const payload_start = position + name_width + LABEL_PADDING_BYTES;
+        yield {
+            name,
+            tableLength: table_length,
+            payloadStart: payload_start,
+            entryEnd: entry_end,
+        };
         position = entry_end;
         if (!legacy) {
             if (!matches_ascii(bytes, position, '</lbl>')) {
@@ -1104,7 +1440,236 @@ function parse_pre_unicode_value_labels(
             position += LBL_CLOSE_TAG_LENGTH;
         }
     }
-    return result;
+}
+
+function parse_value_label_table(
+    buffer: ArrayBuffer,
+    metadata: DtaMetadata,
+    wanted_name: string,
+    unicode_decoder: TextDecoder,
+    pre_unicode_utf8_decoder: TextDecoder,
+    pre_unicode_fallback_decoder: TextDecoder,
+): Map<number, string> | undefined {
+    for (const entry of scan_value_label_tables(
+        buffer,
+        metadata,
+        unicode_decoder,
+        pre_unicode_utf8_decoder,
+        pre_unicode_fallback_decoder,
+    )) {
+        if (entry.name !== wanted_name) continue;
+        return decode_value_label_table(
+            buffer,
+            metadata,
+            entry,
+            unicode_decoder,
+            pre_unicode_utf8_decoder,
+            pre_unicode_fallback_decoder,
+        );
+    }
+    return undefined;
+}
+
+async function parse_value_label_table_async(
+    buffer: ArrayBuffer,
+    metadata: DtaMetadata,
+    wanted_name: string,
+    unicode_decoder: TextDecoder,
+    pre_unicode_utf8_decoder: TextDecoder,
+    pre_unicode_fallback_decoder: TextDecoder,
+    is_cancelled: () => boolean,
+): Promise<Map<number, string> | undefined> {
+    let tables_scanned = 0;
+    for (const entry of scan_value_label_tables(
+        buffer,
+        metadata,
+        unicode_decoder,
+        pre_unicode_utf8_decoder,
+        pre_unicode_fallback_decoder,
+    )) {
+        if (is_cancelled()) throw source_abort_error();
+        if (entry.name === wanted_name) {
+            return decode_value_label_table_async(
+                buffer,
+                metadata,
+                entry,
+                unicode_decoder,
+                pre_unicode_utf8_decoder,
+                pre_unicode_fallback_decoder,
+                is_cancelled,
+            );
+        }
+        tables_scanned += 1;
+        if (tables_scanned >= VALUE_LABEL_ENTRIES_PER_YIELD) {
+            tables_scanned = 0;
+            await yield_to_event_loop();
+        }
+    }
+    if (is_cancelled()) throw source_abort_error();
+    return undefined;
+}
+
+function value_label_payload_layout(
+    buffer: ArrayBuffer,
+    metadata: DtaMetadata,
+    entry: ValueLabelTableEntry,
+): {
+    bytes: Uint8Array;
+    view: DataView;
+    littleEndian: boolean;
+    count: number;
+    textLength: number;
+    offsetsStart: number;
+    valuesStart: number;
+    textStart: number;
+} {
+    if (entry.tableLength > MAX_VALUE_LABEL_TABLE_BYTES) {
+        throw new Error(
+            `Value label table is too large to decode safely `
+            + `(max ${MAX_VALUE_LABEL_TABLE_BYTES} bytes)`,
+        );
+    }
+    const bytes = new Uint8Array(buffer);
+    const view = new DataView(buffer);
+    const little_endian = metadata.byte_order === 'LSF';
+    if (entry.payloadStart + 8 > entry.entryEnd) {
+        throw new Error('Corrupt value label table: truncated header');
+    }
+    const count = view.getInt32(entry.payloadStart, little_endian);
+    const text_length = view.getInt32(entry.payloadStart + 4, little_endian);
+    if (count < 0 || text_length < 0) {
+        throw new Error('Corrupt value label table: negative count or text length');
+    }
+    const offsets_start = entry.payloadStart + 8;
+    const values_start = offsets_start + count * 4;
+    const text_start = values_start + count * 4;
+    const payload_end = text_start + text_length;
+    if (!Number.isSafeInteger(payload_end) || payload_end > entry.entryEnd) {
+        throw new Error('Corrupt value label table: payload exceeds entry bounds');
+    }
+    return {
+        bytes,
+        view,
+        littleEndian: little_endian,
+        count,
+        textLength: text_length,
+        offsetsStart: offsets_start,
+        valuesStart: values_start,
+        textStart: text_start,
+    };
+}
+
+function decode_value_label_table(
+    buffer: ArrayBuffer,
+    metadata: DtaMetadata,
+    entry: ValueLabelTableEntry,
+    unicode_decoder: TextDecoder,
+    pre_unicode_utf8_decoder: TextDecoder,
+    pre_unicode_fallback_decoder: TextDecoder,
+): Map<number, string> {
+    const layout = value_label_payload_layout(buffer, metadata, entry);
+    const labels = new Map<number, string>();
+    for (let index = 0; index < layout.count; index++) {
+        add_value_label(
+            labels,
+            metadata,
+            layout,
+            index,
+            unicode_decoder,
+            pre_unicode_utf8_decoder,
+            pre_unicode_fallback_decoder,
+        );
+    }
+    return labels;
+}
+
+async function decode_value_label_table_async(
+    buffer: ArrayBuffer,
+    metadata: DtaMetadata,
+    entry: ValueLabelTableEntry,
+    unicode_decoder: TextDecoder,
+    pre_unicode_utf8_decoder: TextDecoder,
+    pre_unicode_fallback_decoder: TextDecoder,
+    is_cancelled: () => boolean,
+): Promise<Map<number, string>> {
+    const layout = value_label_payload_layout(buffer, metadata, entry);
+    const labels = new Map<number, string>();
+    for (let index = 0; index < layout.count; index++) {
+        add_value_label(
+            labels,
+            metadata,
+            layout,
+            index,
+            unicode_decoder,
+            pre_unicode_utf8_decoder,
+            pre_unicode_fallback_decoder,
+        );
+        if ((index + 1) % VALUE_LABEL_ENTRIES_PER_YIELD === 0) {
+            await yield_to_event_loop();
+            if (is_cancelled()) throw source_abort_error();
+        }
+    }
+    if (is_cancelled()) throw source_abort_error();
+    return labels;
+}
+
+function add_value_label(
+    labels: Map<number, string>,
+    metadata: DtaMetadata,
+    layout: ReturnType<typeof value_label_payload_layout>,
+    index: number,
+    unicode_decoder: TextDecoder,
+    pre_unicode_utf8_decoder: TextDecoder,
+    pre_unicode_fallback_decoder: TextDecoder,
+): void {
+    const offset = layout.view.getInt32(
+        layout.offsetsStart + index * 4,
+        layout.littleEndian,
+    );
+    if (offset < 0 || offset >= layout.textLength) return;
+    const start = layout.textStart + offset;
+    let end = start;
+    while (end < layout.textStart + layout.textLength && layout.bytes[end] !== 0) end += 1;
+    const value = layout.view.getInt32(
+        layout.valuesStart + index * 4,
+        layout.littleEndian,
+    );
+    labels.set(value, decode_value_label_text(
+        layout.bytes,
+        start,
+        end,
+        metadata,
+        unicode_decoder,
+        pre_unicode_utf8_decoder,
+        pre_unicode_fallback_decoder,
+        false,
+    ));
+}
+
+function decode_value_label_text(
+    bytes: Uint8Array,
+    start: number,
+    end: number,
+    metadata: DtaMetadata,
+    unicode_decoder: TextDecoder,
+    pre_unicode_utf8_decoder: TextDecoder,
+    pre_unicode_fallback_decoder: TextDecoder,
+    fixed_width: boolean,
+): string {
+    let actual_end = end;
+    if (fixed_width) {
+        actual_end = start;
+        while (actual_end < end && bytes[actual_end] !== 0) actual_end += 1;
+    }
+    return metadata.format_version >= 118
+        ? unicode_decoder.decode(bytes.subarray(start, actual_end))
+        : decode_pre_unicode(
+            bytes,
+            start,
+            actual_end,
+            pre_unicode_utf8_decoder,
+            pre_unicode_fallback_decoder,
+        );
 }
 
 function decode_fixed(

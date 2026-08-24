@@ -1,11 +1,18 @@
-import type { DataSource, RawCell } from './data-source/interface';
-import { read_source_raw_columns } from './data-source/interface';
-import type { FilterColumnKind, HistogramBin } from './types';
-import { FILTER_DISTINCT_VALUE_LIMIT } from './types';
+import type {
+    ColumnFilterMetadata,
+    DataSource,
+    RawCell,
+} from './data-source/interface';
+import { read_source_raw_columns_async } from './data-source/interface';
+import type { FilterColumnKind, FilterValueOption, HistogramBin } from './types';
 import {
-    canonical_numeric_string,
+    FILTER_DISTINCT_VALUE_BYTE_LIMIT,
+    FILTER_DISTINCT_VALUE_LIMIT,
+} from './types';
+import {
+    cell_can_be_numeric,
+    filter_value,
     raw_value,
-    stata_missing_rank,
 } from './transform-values';
 
 const BIN_COUNT = 50;
@@ -14,10 +21,19 @@ const ROW_BATCH_SIZE = 1_000;
 export interface ColumnHistogram {
     bins: HistogramBin[];
     columnKind: FilterColumnKind;
-    /** Exact raw values in first-seen source order; `null` is the blank
-     *  category. Empty when the column exceeds the distinct-value cap. */
-    distinctValues: (string | null)[];
+    /** Semantic source metadata may prefer the categorical checklist even when
+     *  storage is numeric. This is independent of the Formatting toggle. */
+    defaultCategorical: boolean;
+    /** Exact canonical identities in first-seen source order, paired with
+     * display-only raw previews and labels. Empty when either distinct cap is hit. */
+    distinctValues: FilterValueOption[];
     distinctValuesExceeded: boolean;
+}
+
+interface DistinctValues {
+    /** Identity -> display-safe raw value. Ordinary values map to themselves. */
+    readonly entries: Map<string | null, string | null>;
+    byteCount: number;
 }
 
 function finite_numeric_value(cell: RawCell | null | undefined): number | undefined {
@@ -48,16 +64,11 @@ function classify_value(
     if (cell?.rawType === 'date' || iso_date_string(raw)) {
         return { kind: 'orderedText' };
     }
-    if (cell?.rawType === 'boolean') return { kind: 'text' };
-    if (cell?.rawType === 'number') {
+    if (cell_can_be_numeric(cell)) {
         const numericValue = Number(raw);
-        if (Number.isFinite(numericValue)) return { kind: 'numeric', numericValue };
-        return stata_missing_rank(raw) !== undefined
-            ? { kind: 'numeric' }
-            : { kind: 'text' };
-    }
-    if (canonical_numeric_string(raw)) {
-        return { kind: 'numeric', numericValue: Number(raw) };
+        return Number.isFinite(numericValue)
+            ? { kind: 'numeric', numericValue }
+            : { kind: 'numeric' };
     }
     return { kind: 'text' };
 }
@@ -80,6 +91,34 @@ function abort_error(): Error {
     return error;
 }
 
+function raw_storage_bytes(
+    cell: RawCell | null | undefined,
+    raw: string | null,
+): number {
+    if (raw === null) return 0;
+    return cell?.rawByteLength ?? raw.length * 2;
+}
+
+function add_distinct_value(
+    distinct: DistinctValues,
+    cell: RawCell | null | undefined,
+): boolean {
+    const raw = raw_value(cell);
+    const bytes = raw_storage_bytes(cell, raw);
+    // A bounded preview must not trick the checklist into hashing or retaining a
+    // source value whose actual identity cannot fit in the transfer budget.
+    if (bytes > FILTER_DISTINCT_VALUE_BYTE_LIMIT) return false;
+    const identity = filter_value(cell);
+    if (distinct.entries.has(identity)) return true;
+    if (
+        distinct.entries.size === FILTER_DISTINCT_VALUE_LIMIT
+        || distinct.byteCount + bytes > FILTER_DISTINCT_VALUE_BYTE_LIMIT
+    ) return false;
+    distinct.entries.set(identity, raw);
+    distinct.byteCount += bytes;
+    return true;
+}
+
 /**
  * Build a bounded, uniform-width histogram for one source column.
  *
@@ -97,28 +136,25 @@ export async function compute_column_histogram(
     if (!sheet || column_index < 0 || column_index >= sheet.columnCount) {
         throw new RangeError('Histogram column is out of range.');
     }
-
     let min = Number.POSITIVE_INFINITY;
     let max = Number.NEGATIVE_INFINITY;
     let count = 0;
     let columnKind: FilterColumnKind = 'unknown';
-    let distinct: Set<string | null> | null = new Set();
+    let distinct: DistinctValues | null = { entries: new Map(), byteCount: 0 };
     for (let start = 0; start < sheet.rowCount; start += ROW_BATCH_SIZE) {
         if (is_cancelled()) throw abort_error();
-        const window = read_source_raw_columns(
+        const window = await read_source_raw_columns_async(
             source,
             sheet_index,
             start,
             Math.min(ROW_BATCH_SIZE, sheet.rowCount - start),
             [column_index],
+            is_cancelled,
         );
         for (const row of window.rows) {
-            if (distinct !== null) {
-                distinct.add(raw_value(row[0]));
-                if (distinct.size > FILTER_DISTINCT_VALUE_LIMIT) {
-                    // Release retained strings; a partial list is never sent.
-                    distinct = null;
-                }
+            if (distinct !== null && !add_distinct_value(distinct, row[0])) {
+                // Release retained strings; a partial list is never sent.
+                distinct = null;
             }
             const classified = classify_value(row[0]);
             if (classified === undefined) continue;
@@ -126,7 +162,15 @@ export async function compute_column_histogram(
             // A text column has no bins; once the distinct list has also
             // overflowed nothing further can change, so stop scanning.
             if (columnKind === 'text' && distinct === null) {
-                return distinct_result([], columnKind, null);
+                return build_result(
+                    [],
+                    columnKind,
+                    null,
+                    source,
+                    sheet_index,
+                    column_index,
+                    is_cancelled,
+                );
             }
             if (
                 classified.kind !== 'numeric'
@@ -142,10 +186,26 @@ export async function compute_column_histogram(
 
     if (is_cancelled()) throw abort_error();
     if (columnKind !== 'numeric' || count === 0) {
-        return distinct_result([], columnKind, distinct);
+        return build_result(
+            [],
+            columnKind,
+            distinct,
+            source,
+            sheet_index,
+            column_index,
+            is_cancelled,
+        );
     }
     if (min === max) {
-        return distinct_result([{ lo: min, hi: max, count }], columnKind, distinct);
+        return build_result(
+            [{ lo: min, hi: max, count }],
+            columnKind,
+            distinct,
+            source,
+            sheet_index,
+            column_index,
+            is_cancelled,
+        );
     }
 
     const span = max - min;
@@ -162,12 +222,13 @@ export async function compute_column_histogram(
     }));
     for (let start = 0; start < sheet.rowCount; start += ROW_BATCH_SIZE) {
         if (is_cancelled()) throw abort_error();
-        const window = read_source_raw_columns(
+        const window = await read_source_raw_columns_async(
             source,
             sheet_index,
             start,
             Math.min(ROW_BATCH_SIZE, sheet.rowCount - start),
             [column_index],
+            is_cancelled,
         );
         for (const row of window.rows) {
             const value = finite_numeric_value(row[0]);
@@ -184,18 +245,66 @@ export async function compute_column_histogram(
         await yield_to_host();
     }
     if (is_cancelled()) throw abort_error();
-    return distinct_result(bins, columnKind, distinct);
+    return build_result(
+        bins,
+        columnKind,
+        distinct,
+        source,
+        sheet_index,
+        column_index,
+        is_cancelled,
+    );
 }
 
-function distinct_result(
+async function build_result(
     bins: HistogramBin[],
     columnKind: FilterColumnKind,
-    distinct: Set<string | null> | null,
-): ColumnHistogram {
+    distinct: DistinctValues | null,
+    source: DataSource,
+    sheet_index: number,
+    column_index: number,
+    is_cancelled: () => boolean,
+): Promise<ColumnHistogram> {
+    const metadata: ColumnFilterMetadata | undefined = distinct === null
+        ? undefined
+        : source.column_filter_metadata_async
+            ? await source.column_filter_metadata_async(
+                sheet_index,
+                column_index,
+                is_cancelled,
+            )
+            : source.column_filter_metadata?.(sheet_index, column_index);
+    if (is_cancelled()) throw abort_error();
+
+    let options: FilterValueOption[] = [];
+    let exceeded = distinct === null;
+    if (distinct !== null) {
+        let serialized_bytes = distinct.byteCount;
+        for (const [value, raw] of distinct.entries) {
+            if (value === null) {
+                options.push({ value });
+                continue;
+            }
+            const option: FilterValueOption = { value };
+            if (raw !== value && raw !== null) option.rawValue = raw;
+            const label = raw === null ? undefined : metadata?.valueLabel?.(raw);
+            if (label !== undefined) {
+                serialized_bytes += label.length * 2;
+                option.label = label;
+            }
+            if (serialized_bytes > FILTER_DISTINCT_VALUE_BYTE_LIMIT) {
+                options = [];
+                exceeded = true;
+                break;
+            }
+            options.push(option);
+        }
+    }
     return {
         bins,
         columnKind,
-        distinctValues: distinct === null ? [] : [...distinct],
-        distinctValuesExceeded: distinct === null,
+        defaultCategorical: metadata?.categoricalCodes === true,
+        distinctValues: options,
+        distinctValuesExceeded: exceeded,
     };
 }

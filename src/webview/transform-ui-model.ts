@@ -2,6 +2,7 @@ import type {
     FilterColumnKind,
     FilterEntry,
     FilterOperator,
+    FilterValueOption,
     SheetTransformState,
     SortDirection,
     SortKey,
@@ -132,7 +133,8 @@ export function operator_supports_case_sensitive(
 export interface FilterHistogramReady {
     bins: readonly { lo: number; hi: number; count: number }[];
     columnKind?: FilterColumnKind;
-    distinctValues?: readonly (string | null)[];
+    defaultCategorical?: boolean;
+    distinctValues?: readonly FilterValueOption[];
     distinctValuesExceeded?: boolean;
 }
 

@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { displayed_text } from '../webview/cell-renderer';
+import { compute_column_histogram } from '../histograms';
 import { compute_transform } from '../table-transform';
 import { align_sheet } from '../diff-compare/row-alignment';
 
@@ -92,7 +93,7 @@ function build_dta_fixture(observation_count = 4, second_strl = false): Uint8Arr
         { name: 'status', typeCode: 65530, format: '%8.0g', valueLabel: 'status_lbl' },
         { name: 'amount', typeCode: 65526, format: '%9.2f' },
         { name: 'name', typeCode: 5, format: '%-5s' },
-        { name: 'missing', typeCode: 65530, format: '%8.0g', valueLabel: 'status_lbl' },
+        { name: 'missing', typeCode: 65530, format: '%8.0g', valueLabel: 'missing_lbl' },
         { name: 'long_text', typeCode: 32768, format: '%9s' },
     ];
     if (second_strl) {
@@ -203,28 +204,38 @@ function build_dta_fixture(observation_count = 4, second_strl = false): Uint8Arr
     writer.text('</strls>');
 
     mark('value_labels');
-    writer.text('<value_labels><lbl>');
-    const labels = [
-        new TextEncoder().encode('Zulu\0'),
-        new TextEncoder().encode('Alpha\0'),
-        new TextEncoder().encode('Refused\0'),
-    ];
-    const label_values = [1, 2, 2147483622]; // .a's value-label key
-    const text_length = labels.reduce((total, label) => total + label.length, 0);
-    const payload_length = 129 + 3 + 8 + labels.length * 8 + text_length;
-    writer.i32(payload_length);
-    writer.fixed('status_lbl', 129);
-    writer.u8(0); writer.u8(0); writer.u8(0);
-    writer.i32(labels.length);
-    writer.i32(text_length);
-    let label_offset = 0;
-    for (const label of labels) {
-        writer.i32(label_offset);
-        label_offset += label.length;
-    }
-    for (const value of label_values) writer.i32(value);
-    for (const label of labels) for (const byte of label) writer.u8(byte);
-    writer.text('</lbl></value_labels>');
+    writer.text('<value_labels>');
+    const write_value_label_table = (
+        name: string,
+        entries: readonly { value: number; label: string }[],
+    ) => {
+        writer.text('<lbl>');
+        const labels = entries.map(({ label }) => new TextEncoder().encode(`${label}\0`));
+        const text_length = labels.reduce((total, label) => total + label.length, 0);
+        const payload_length = 129 + 3 + 8 + labels.length * 8 + text_length;
+        writer.i32(payload_length);
+        writer.fixed(name, 129);
+        writer.u8(0); writer.u8(0); writer.u8(0);
+        writer.i32(labels.length);
+        writer.i32(text_length);
+        let label_offset = 0;
+        for (const label of labels) {
+            writer.i32(label_offset);
+            label_offset += label.length;
+        }
+        for (const { value } of entries) writer.i32(value);
+        for (const label of labels) for (const byte of label) writer.u8(byte);
+        writer.text('</lbl>');
+    };
+    write_value_label_table('status_lbl', [
+        { value: 1, label: 'Zulu' },
+        { value: 2, label: 'Alpha' },
+        { value: 3, label: 'Zulu' },
+    ]);
+    write_value_label_table('missing_lbl', [
+        { value: 2147483622, label: 'Refused' }, // .a's value-label key
+    ]);
+    writer.text('</value_labels>');
 
     mark('stata_data_close');
     writer.text('</stata_dta>');
@@ -462,6 +473,50 @@ describe('DtaDataSource', () => {
             { raw: 'a long first value', rawType: 'string' },
         ]);
         expect(rendered[0][0]?.formatted).toBe('Zulu');
+    });
+
+    it('keeps Stata filter labels display-only and categorical by label semantics', async () => {
+        const fixture = build_dta_fixture();
+        const data_start = find_tag_end(fixture, '<data>');
+        fixture[data_start + 3 * 23] = 3;
+        const source = await DtaDataSource.create(fixture);
+
+        const status = await compute_column_histogram(source, 0, 0, () => false);
+        expect(status).toMatchObject({
+            columnKind: 'numeric',
+            defaultCategorical: true,
+            distinctValues: [
+                { value: '1', label: 'Zulu' },
+                { value: '2', label: 'Alpha' },
+                { value: '3', label: 'Zulu' },
+            ],
+        });
+        const missing = await compute_column_histogram(source, 0, 3, () => false);
+        expect(missing.defaultCategorical).toBe(false);
+        expect(missing.distinctValues).toEqual([
+            { value: '.' },
+            { value: '.a', label: 'Refused' },
+            { value: '.b' },
+            { value: '.z' },
+        ]);
+
+        const selected_duplicate_label = await compute_transform(source, 0, {
+            sort: [],
+            filters: [{
+                id: 'status-code-3',
+                colIndex: 0,
+                operator: 'isOneOf',
+                excludedValues: ['1', '2'],
+                caseSensitive: false,
+                enabled: true,
+            }],
+        });
+        expect([...selected_duplicate_label.indices!]).toEqual([3]);
+        const sorted = await compute_transform(source, 0, {
+            sort: [{ colIndex: 0, direction: 'asc' }],
+            filters: [],
+        });
+        expect([...sorted.indices!]).toEqual([0, 2, 1, 3]);
     });
 
     it('keeps binary strLs distinct from text and from other binary payloads', async () => {

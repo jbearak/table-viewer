@@ -5,7 +5,12 @@ import { resolve } from 'node:path';
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { FilterEntry, HistogramBin, SheetTransformState } from '../types';
+import type {
+    FilterEntry,
+    FilterValueOption,
+    HistogramBin,
+    SheetTransformState,
+} from '../types';
 import { FilterPopover } from '../webview/filter-popover';
 
 let root: Root | null = null;
@@ -34,10 +39,12 @@ function render_popover(
             status: 'ready';
             bins: readonly HistogramBin[];
             columnKind?: import('../types').FilterColumnKind;
-            distinctValues?: readonly (string | null)[];
+            defaultCategorical?: boolean;
+            distinctValues?: readonly FilterValueOption[];
             distinctValuesExceeded?: boolean;
         }
         | { status: 'error'; message: string },
+    show_formatting = true,
 ) {
     const on_apply = vi.fn();
     const on_cancel = vi.fn();
@@ -50,6 +57,7 @@ function render_popover(
         column_name: 'Value',
         filters,
         histogram,
+        show_formatting,
         anchor: { left: 10_000, top: 10_000 },
         on_apply,
         on_cancel,
@@ -758,7 +766,30 @@ describe('FilterPopover value checklist (isOneOf)', () => {
         status: 'ready',
         bins: [],
         columnKind: 'text',
-        distinctValues: ['alpha', 'beta', null],
+        distinctValues: [{ value: 'alpha' }, { value: 'beta' }, { value: null }],
+        distinctValuesExceeded: false,
+    } as const;
+    const LABELED_NUMERIC_READY = {
+        status: 'ready',
+        bins: READY_BINS,
+        columnKind: 'numeric',
+        defaultCategorical: true,
+        distinctValues: [
+            { value: '1', label: 'First' },
+            { value: '2', label: 'Second' },
+            { value: '3', label: 'First' },
+        ],
+        distinctValuesExceeded: false,
+    } as const;
+    const MISSING_ONLY_LABELS_READY = {
+        status: 'ready',
+        bins: READY_BINS,
+        columnKind: 'numeric',
+        defaultCategorical: false,
+        distinctValues: [
+            { value: '.' },
+            { value: '.a', label: 'Refused' },
+        ],
         distinctValuesExceeded: false,
     } as const;
 
@@ -810,6 +841,56 @@ describe('FilterPopover value checklist (isOneOf)', () => {
             (option) => (option as HTMLOptionElement).value,
         );
         expect(options.slice(0, 3)).toEqual(['contains', 'isOneOf', 'notContains']);
+    });
+
+    it('uses display labels for labeled numeric options while preserving raw identities', () => {
+        const { on_apply } = render_popover([], LABELED_NUMERIC_READY, true);
+        expect((document.querySelector('select') as HTMLSelectElement).value).toBe('isOneOf');
+        expect(checkbox_labels()).toEqual(['First', 'Second', 'First']);
+        const boxes = Array.from(
+            document.querySelectorAll('.filter-value-item input'),
+        ) as HTMLInputElement[];
+        expect(boxes).toHaveLength(3);
+        expect(boxes[0].getAttribute('aria-label')).toContain('raw value 1');
+        expect(boxes[2].getAttribute('aria-label')).toContain('raw value 3');
+
+        act(() => boxes[2].click());
+        act(() => (document.querySelector(
+            '.filter-popover-btn-primary',
+        ) as HTMLButtonElement).click());
+        expect(on_apply).toHaveBeenCalledWith(expect.objectContaining({
+            operator: 'isOneOf',
+            excludedValues: ['3'],
+        }));
+    });
+
+    it('shows raw codes with Formatting off without changing the categorical default', () => {
+        render_popover([], LABELED_NUMERIC_READY, false);
+        expect((document.querySelector('select') as HTMLSelectElement).value).toBe('isOneOf');
+        expect(checkbox_labels()).toEqual(['1', '2', '3']);
+    });
+
+    it('does not force numeric columns categorical when only missing codes have labels', () => {
+        render_popover([], MISSING_ONLY_LABELS_READY, true);
+        expect((document.querySelector('select') as HTMLSelectElement).value).toBe('between');
+        select_is_one_of();
+        expect(checkbox_labels()).toEqual(['.', 'Refused']);
+        act(() => root!.unmount());
+
+        root = createRoot(container!);
+        act(() => root!.render(React.createElement(FilterPopover, {
+            column_index: 1,
+            column_name: 'Value',
+            filters: [],
+            histogram: MISSING_ONLY_LABELS_READY,
+            show_formatting: false,
+            anchor: { left: 10, top: 10 },
+            on_apply: vi.fn(),
+            on_cancel: vi.fn(),
+            on_remove: vi.fn(),
+        })));
+        select_is_one_of();
+        expect(checkbox_labels()).toEqual(['.', '.a']);
     });
 
     it('promotes a pristine Contains draft to Is one of when the value list settles', async () => {
@@ -992,7 +1073,7 @@ describe('FilterPopover value checklist (isOneOf)', () => {
     it('distinguishes a real "(Blanks)" text value from the blank entry', () => {
         render_popover([], {
             status: 'ready', bins: [], columnKind: 'text',
-            distinctValues: ['(Blanks)', null], distinctValuesExceeded: false,
+            distinctValues: [{ value: '(Blanks)' }, { value: null }], distinctValuesExceeded: false,
         });
         select_is_one_of();
         expect(checkbox_labels()).toEqual(['(Blanks) (text value)', '(Blanks)']);

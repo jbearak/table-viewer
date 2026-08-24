@@ -10,9 +10,13 @@
 // policy; mutating the wrapped modified source afterwards would invalidate
 // the padding and pairings computed here at construction.
 import {
+    read_source_raw_columns_async,
     read_source_rows_indexed,
+    type ColumnFilterMetadata,
     type DataSource,
     type IndexedRows,
+    type RawCell,
+    type RawColumnWindow,
     type RowWindow,
     type SheetMeta,
     type WorkbookMeta,
@@ -428,6 +432,77 @@ export class CompareDataSource implements DataSource {
         return this.padded_meta;
     }
 
+    column_filter_metadata(
+        sheet_index: number,
+        column_index: number,
+    ): ColumnFilterMetadata | undefined {
+        const deleted_index = this.deleted_original_index(sheet_index);
+        if (deleted_index !== undefined) {
+            const sheet = this.original_meta.sheets[deleted_index];
+            return column_index < sheet.columnCount
+                ? this.original.column_filter_metadata?.(deleted_index, column_index)
+                : undefined;
+        }
+        const modified_sheet = this.modified_meta.sheets[sheet_index];
+        const modified = modified_sheet && column_index < modified_sheet.columnCount
+            ? this.modified.column_filter_metadata?.(sheet_index, column_index)
+            : undefined;
+        if (modified !== undefined) return modified;
+        const pairing = this.matched_by_modified_index.get(sheet_index);
+        if (pairing === undefined) return undefined;
+        const original_sheet = this.original_meta.sheets[pairing.originalIndex];
+        return column_index < original_sheet.columnCount
+            ? this.original.column_filter_metadata?.(
+                pairing.originalIndex,
+                column_index,
+            )
+            : undefined;
+    }
+
+    async column_filter_metadata_async(
+        sheet_index: number,
+        column_index: number,
+        is_cancelled: () => boolean,
+    ): Promise<ColumnFilterMetadata | undefined> {
+        const deleted_index = this.deleted_original_index(sheet_index);
+        if (deleted_index !== undefined) {
+            const sheet = this.original_meta.sheets[deleted_index];
+            if (column_index >= sheet.columnCount) return undefined;
+            return this.original.column_filter_metadata_async
+                ? this.original.column_filter_metadata_async(
+                    deleted_index,
+                    column_index,
+                    is_cancelled,
+                )
+                : this.original.column_filter_metadata?.(deleted_index, column_index);
+        }
+        const modified_sheet = this.modified_meta.sheets[sheet_index];
+        const modified = modified_sheet && column_index < modified_sheet.columnCount
+            ? this.modified.column_filter_metadata_async
+                ? await this.modified.column_filter_metadata_async(
+                    sheet_index,
+                    column_index,
+                    is_cancelled,
+                )
+                : this.modified.column_filter_metadata?.(sheet_index, column_index)
+            : undefined;
+        if (modified !== undefined || is_cancelled()) return modified;
+        const pairing = this.matched_by_modified_index.get(sheet_index);
+        if (pairing === undefined) return undefined;
+        const original_sheet = this.original_meta.sheets[pairing.originalIndex];
+        if (column_index >= original_sheet.columnCount) return undefined;
+        return this.original.column_filter_metadata_async
+            ? this.original.column_filter_metadata_async(
+                pairing.originalIndex,
+                column_index,
+                is_cancelled,
+            )
+            : this.original.column_filter_metadata?.(
+                pairing.originalIndex,
+                column_index,
+            );
+    }
+
     /**
      * Diff for an arbitrary set of grid rows. `rowStatus[i]` and
      * `changedCells[*].row` are positional: they name `rows[i]`, not the
@@ -528,13 +603,20 @@ export class CompareDataSource implements DataSource {
                 const modified_row = modified_batch[index] ?? [];
                 for (let col = 0; col < column_count; col++) {
                     // Compare on identity, which is lossless for binary strLs,
-                    // but report the display text: `base` is shown to the user.
+                    // but report both original spellings so the renderer can honor
+                    // Formatting without ever exposing that internal identity.
                     if (
                         get_cell_comparison_text(original_row[col])
                         !== get_cell_comparison_text(modified_row[col])
                     ) {
-                        const base = get_raw_cell_text(original_row[col]?.raw ?? null);
-                        changed_cells.push({ row: position, col, base });
+                        const original_cell = original_row[col];
+                        const base = get_raw_cell_text(original_cell?.raw ?? null);
+                        changed_cells.push({
+                            row: position,
+                            col,
+                            base,
+                            formattedBase: original_cell?.formatted ?? base,
+                        });
                     }
                 }
             });
@@ -562,6 +644,141 @@ export class CompareDataSource implements DataSource {
             return read_source_rows_indexed(this.original, deleted_index, row_indices);
         }
         return { rows: this.read_aligned_rows(sheet_index, Array.from(row_indices)) };
+    }
+
+    async read_raw_columns_async(
+        sheet_index: number,
+        start_row: number,
+        count: number,
+        column_indices: readonly number[],
+        is_cancelled: () => boolean,
+    ): Promise<RawColumnWindow> {
+        const sheet = this.padded_meta.sheets[sheet_index];
+        if (!sheet) throw new RangeError(`sheet index ${sheet_index} out of range`);
+        for (const column of column_indices) {
+            if (!Number.isInteger(column) || column < 0 || column >= sheet.columnCount) {
+                throw new RangeError(
+                    `column index ${column} out of range (${sheet.columnCount} columns)`,
+                );
+            }
+        }
+        const start = Math.max(0, Math.min(start_row, sheet.rowCount));
+        const end = Math.min(sheet.rowCount, start + Math.max(0, count));
+        const deleted_index = this.deleted_original_index(sheet_index);
+        if (deleted_index !== undefined) {
+            return read_source_raw_columns_async(
+                this.original,
+                deleted_index,
+                start,
+                end - start,
+                column_indices,
+                is_cancelled,
+            );
+        }
+        const alignment = this.alignment_of(sheet_index);
+        if (!alignment) {
+            return read_source_raw_columns_async(
+                this.modified,
+                sheet_index,
+                start,
+                end - start,
+                column_indices,
+                is_cancelled,
+            );
+        }
+
+        const pairing = this.matched_by_modified_index.get(sheet_index)!;
+        const modified_rows: number[] = [];
+        const original_rows: number[] = [];
+        for (let row = start; row < end; row++) {
+            const aligned = alignment[row];
+            if (!aligned) continue;
+            if (aligned.modified !== ABSENT) modified_rows.push(aligned.modified);
+            else original_rows.push(aligned.original);
+        }
+        const [modified_batch, original_batch] = await Promise.all([
+            this.read_side_raw_columns(
+                this.modified,
+                sheet_index,
+                modified_rows,
+                column_indices,
+                is_cancelled,
+            ),
+            this.read_side_raw_columns(
+                this.original,
+                pairing.originalIndex,
+                original_rows,
+                column_indices,
+                is_cancelled,
+            ),
+        ]);
+        let modified_position = 0;
+        let original_position = 0;
+        const rows: (RawCell | null)[][] = [];
+        for (let row = start; row < end; row++) {
+            const aligned = alignment[row];
+            if (!aligned) {
+                rows.push(column_indices.map(() => null));
+            } else if (aligned.modified !== ABSENT) {
+                rows.push(modified_batch[modified_position++] ?? []);
+            } else {
+                rows.push(original_batch[original_position++] ?? []);
+            }
+        }
+        return { startRow: start, rows };
+    }
+
+    /** Read arbitrary rows from one side while retaining a compact column
+     * projection and filling columns that exist only on the other side. */
+    private async read_side_raw_columns(
+        source: DataSource,
+        sheet_index: number,
+        row_indices: readonly number[],
+        column_indices: readonly number[],
+        is_cancelled: () => boolean,
+    ): Promise<(RawCell | null)[][]> {
+        if (row_indices.length === 0) return [];
+        const column_count = source.meta().sheets[sheet_index].columnCount;
+        const valid_columns: number[] = [];
+        const result_positions: number[] = [];
+        column_indices.forEach((column, position) => {
+            if (column < column_count) {
+                valid_columns.push(column);
+                result_positions.push(position);
+            }
+        });
+        if (valid_columns.length === 0) {
+            return row_indices.map(() => column_indices.map(() => null));
+        }
+
+        const materialized = new Map<number, (RawCell | null)[]>();
+        const unique = [...new Set(row_indices)].sort((left, right) => left - right);
+        let position = 0;
+        while (position < unique.length) {
+            const start = unique[position];
+            let run_length = 1;
+            while (
+                position + run_length < unique.length
+                && unique[position + run_length] === start + run_length
+            ) run_length += 1;
+            const window = await read_source_raw_columns_async(
+                source,
+                sheet_index,
+                start,
+                run_length,
+                valid_columns,
+                is_cancelled,
+            );
+            window.rows.forEach((row, offset) => {
+                const projected = column_indices.map((): RawCell | null => null);
+                result_positions.forEach((result_position, index) => {
+                    projected[result_position] = row[index] ?? null;
+                });
+                materialized.set(start + offset, projected);
+            });
+            position += run_length;
+        }
+        return row_indices.map((row) => materialized.get(row)!);
     }
 
     /**

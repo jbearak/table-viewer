@@ -16,9 +16,28 @@ export interface RenderedCell extends RichCellFields, XlsxCellFormatFields {
     rawType?: 'string' | 'number' | 'boolean' | 'date' | 'empty';
     /** Internal identity used by comparisons when display-safe `raw` is lossy. */
     comparisonKey?: string;
+    /** Canonical filter identity when display-safe `raw` is lossy. Matching and
+     * persistence use this value; the raw preview remains user-facing text. */
+    filterKey?: string;
+    /** Source byte size of the canonical raw value when its display preview is
+     * bounded. Filter analysis uses this before materializing a large identity. */
+    rawByteLength?: number;
 }
 
-export type RawCell = Pick<RenderedCell, 'raw' | 'rawType' | 'comparisonKey'>;
+export type RawCell = Pick<
+    RenderedCell,
+    'raw' | 'rawType' | 'comparisonKey' | 'filterKey' | 'rawByteLength'
+>;
+
+/** Optional source semantics for one filter column. The histogram scan owns raw
+ * identity; a source may add labels and a categorical default without changing
+ * sorting or matching away from those canonical raw values. */
+export interface ColumnFilterMetadata {
+    /** Raw values are source-defined category codes rather than measurements. */
+    categoricalCodes?: boolean;
+    /** User-facing label for one canonical nonblank raw value, when attached. */
+    valueLabel?(raw: string): string | undefined;
+}
 
 export interface RowWindow {
     startRow: number;                 // 0-based, absolute
@@ -127,6 +146,28 @@ export interface DataSource {
         count: number,
         column_indices: readonly number[],
     ): RawColumnWindow;
+    /** Async raw projection for sources whose lazy decode may traverse a large
+     * backing section. Implementations must check cancellation during bounded
+     * work, not merely before and after one synchronous full-section scan. */
+    read_raw_columns_async?(
+        sheet_index: number,
+        start_row: number,
+        count: number,
+        column_indices: readonly number[],
+        is_cancelled: () => boolean,
+    ): Promise<RawColumnWindow>;
+    /** Optional source semantics used by filter analysis. This must not change
+     * raw identity: labels are display-only and category codes remain raw keys. */
+    column_filter_metadata?(
+        sheet_index: number,
+        column_index: number,
+    ): ColumnFilterMetadata | undefined;
+    /** Cancellable metadata path for sources that lazily scan a backing section. */
+    column_filter_metadata_async?(
+        sheet_index: number,
+        column_index: number,
+        is_cancelled: () => boolean,
+    ): Promise<ColumnFilterMetadata | undefined>;
     /** Release buffers/handles. */
     close(): void;
 
@@ -310,6 +351,35 @@ export function read_source_raw_columns(
     return window;
 }
 
+/** Prefer a source's cancellable lazy-decode path, falling back to the ordinary
+ * synchronous projection for sources whose reads are already bounded. Callers
+ * own checkpoints around bounded reads; async implementations own checkpoints
+ * inside otherwise-unbounded lazy traversal. */
+export async function read_source_raw_columns_async(
+    source: DataSource,
+    sheet_index: number,
+    start_row: number,
+    count: number,
+    column_indices: readonly number[],
+    is_cancelled: () => boolean,
+): Promise<RawColumnWindow> {
+    return source.read_raw_columns_async
+        ? source.read_raw_columns_async(
+            sheet_index,
+            start_row,
+            count,
+            column_indices,
+            is_cancelled,
+        )
+        : read_source_raw_columns(
+            source,
+            sheet_index,
+            start_row,
+            count,
+            column_indices,
+        );
+}
+
 /** Read full rows as raw values while preserving each source row's width. */
 export function read_source_raw_rows(
     source: DataSource,
@@ -329,6 +399,28 @@ export function read_source_raw_rows(
     }
     const window = source.read_rows(sheet_index, start_row, count);
     return window;
+}
+
+export async function read_source_raw_rows_async(
+    source: DataSource,
+    sheet_index: number,
+    start_row: number,
+    count: number,
+    is_cancelled: () => boolean,
+): Promise<RawColumnWindow> {
+    const sheet = source.meta().sheets[sheet_index];
+    if (!sheet) throw new RangeError(`sheet index ${sheet_index} out of range`);
+    if (!source.read_raw_columns_async) {
+        return read_source_raw_rows(source, sheet_index, start_row, count);
+    }
+    return read_source_raw_columns_async(
+        source,
+        sheet_index,
+        start_row,
+        count,
+        Array.from({ length: sheet.columnCount }, (_, index) => index),
+        is_cancelled,
+    );
 }
 
 /** Read arbitrary rows as raw values. Adjacent requested rows share one range
@@ -356,5 +448,43 @@ export function read_source_raw_rows_indexed(
         ).rows,
     );
     unique.forEach((row, index) => materialized.set(row, rows[index]));
+    return { rows: requested.map((row) => materialized.get(row)!) };
+}
+
+export async function read_source_raw_rows_indexed_async(
+    source: DataSource,
+    sheet_index: number,
+    row_indices: ArrayLike<number>,
+    is_cancelled: () => boolean,
+): Promise<{ rows: (RawCell | null)[][] }> {
+    validate_row_indices(source, sheet_index, row_indices);
+    if (row_indices.length === 0) return { rows: [] };
+    if (!source.read_raw_columns_async) {
+        return read_source_raw_rows_indexed(source, sheet_index, row_indices);
+    }
+
+    const requested = Array.from(row_indices);
+    const materialized = new Map<number, (RawCell | null)[]>();
+    const unique = [...new Set(requested)].sort((a, b) => a - b);
+    let position = 0;
+    while (position < unique.length) {
+        const start = unique[position];
+        let count = 1;
+        while (
+            position + count < unique.length
+            && unique[position + count] === start + count
+        ) count += 1;
+        const rows = (await read_source_raw_rows_async(
+            source,
+            sheet_index,
+            start,
+            count,
+            is_cancelled,
+        )).rows;
+        for (let offset = 0; offset < count; offset++) {
+            materialized.set(start + offset, rows[offset] ?? []);
+        }
+        position += count;
+    }
     return { rows: requested.map((row) => materialized.get(row)!) };
 }

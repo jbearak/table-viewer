@@ -1,6 +1,6 @@
 import type { DataSource, RenderedCell } from './data-source/interface';
 import {
-    read_source_raw_columns,
+    read_source_raw_columns_async,
     read_source_row_indices,
     read_source_rows_indexed,
 } from './data-source/interface';
@@ -17,6 +17,7 @@ import {
 import {
     canonical_numeric_string,
     cell_can_be_numeric,
+    filter_value,
     raw_value,
     stata_missing_rank,
 } from './transform-values';
@@ -42,6 +43,8 @@ export interface TransformResult {
 
 export interface CachedTransformColumn {
     readonly values: readonly (string | null | undefined)[];
+    /** Present only when at least one row has a lossy display preview. */
+    readonly filterValues?: readonly (string | null | undefined)[];
     readonly numeric: boolean;
     readonly foundValue: boolean;
 }
@@ -59,6 +62,7 @@ type TransformColumn = CachedTransformColumn;
 
 interface MutableTransformColumn {
     values: (string | null | undefined)[];
+    filterValues?: (string | null | undefined)[];
     numeric: boolean;
     foundValue: boolean;
 }
@@ -198,6 +202,7 @@ export async function compute_transform(
                     for (let row = 0; row < sheet.rowCount; row++) {
                         if (first_group || survivor_mask[row] === 1) {
                             const raw = column.values[row] ?? null;
+                            const identity = column.filterValues?.[row] ?? raw;
                             let numeric_key: NumericSortKey | undefined;
                             let matches = true;
                             for (const predicate of compiled.predicates) {
@@ -211,7 +216,10 @@ export async function compute_transform(
                                         sort_instrumentation,
                                     );
                                 }
-                                if (!predicate.matches(raw, numeric_key)) {
+                                if (!predicate.matches(
+                                    predicate.usesFilterIdentity ? identity : raw,
+                                    numeric_key,
+                                )) {
                                     matches = false;
                                     break;
                                 }
@@ -358,17 +366,26 @@ async function acquire_transform_column(
         foundValue: false,
     };
     for (let start = 0; start < row_count; start += SCAN_ROWS_PER_CHECKPOINT) {
-        const rows = read_source_raw_columns(
+        const rows = (await read_source_raw_columns_async(
             source,
             sheet_index,
             start,
             Math.min(SCAN_ROWS_PER_CHECKPOINT, row_count - start),
             [column_index],
-        ).rows;
+            is_cancelled,
+        )).rows;
         for (let offset = 0; offset < rows.length; offset++) {
+            const row = start + offset;
             const source_cell = rows[offset]?.[0] ?? null;
             const raw = raw_value(source_cell);
-            mutable.values[start + offset] = raw;
+            const identity = filter_value(source_cell);
+            mutable.values[row] = raw;
+            if (identity !== raw) {
+                mutable.filterValues ??= mutable.values.slice();
+                mutable.filterValues[row] = identity;
+            } else if (mutable.filterValues !== undefined) {
+                mutable.filterValues[row] = raw;
+            }
             if (raw !== null) {
                 mutable.foundValue = true;
                 if (
@@ -392,6 +409,9 @@ async function acquire_transform_column(
     // retains published columns across requests and owns its separate bound.
     const published: CachedTransformColumn = Object.freeze({
         values: Object.freeze(mutable.values),
+        ...(mutable.filterValues === undefined
+            ? {}
+            : { filterValues: Object.freeze(mutable.filterValues) }),
         numeric: mutable.numeric,
         foundValue: mutable.foundValue,
     });
@@ -407,7 +427,7 @@ function track_transform_column(
 ): void {
     if (!instrumentation) return;
     instrumentation.transformColumnValueSlots =
-        (instrumentation.transformColumnValueSlots ?? 0) + column.values.length;
+        (instrumentation.transformColumnValueSlots ?? 0) + column.values.length + (column.filterValues?.length ?? 0);
     instrumentation.peakTransformColumnValueSlots = Math.max(
         instrumentation.peakTransformColumnValueSlots ?? 0,
         instrumentation.transformColumnValueSlots,
@@ -420,7 +440,9 @@ function release_transform_column(
 ): void {
     if (!instrumentation) return;
     instrumentation.transformColumnValueSlots =
-        (instrumentation.transformColumnValueSlots ?? 0) - column.values.length;
+        (instrumentation.transformColumnValueSlots ?? 0)
+        - column.values.length
+        - (column.filterValues?.length ?? 0);
 }
 
 interface NumericColumnKeys {
@@ -569,11 +591,15 @@ export function matches_filter(
     const numeric_key = raw !== null && predicate.needsNumericKey
         ? build_numeric_filter_row_key(raw)
         : undefined;
-    return predicate.matches(raw, numeric_key);
+    return predicate.matches(
+        predicate.usesFilterIdentity ? filter_value(cell) : raw,
+        numeric_key,
+    );
 }
 
 interface CompiledFilterPredicate {
     readonly needsNumericKey: boolean;
+    readonly usesFilterIdentity: boolean;
     readonly matches: (
         raw: string | null,
         numeric_key: NumericSortKey | undefined,
@@ -639,6 +665,7 @@ function compile_filter(
     if (entry.operator === 'isEmpty') {
         return {
             needsNumericKey: false,
+            usesFilterIdentity: false,
             matches: (raw) => raw === null,
         };
     }
@@ -646,16 +673,18 @@ function compile_filter(
         // Sight's correction to Raven's stale include-missing bug.
         return {
             needsNumericKey: false,
+            usesFilterIdentity: false,
             matches: (raw) => raw !== null,
         };
     }
     if (entry.operator === 'isOneOf') {
-        // Exact raw-value exclusion: no case folding, no numeric
+        // Exact canonical-identity exclusion: no case folding or numeric
         // canonicalization. Values absent from the set — including values that
         // appear in the file later — always pass. `null` excludes blanks.
         const excluded = new Set(entry.excludedValues ?? []);
         return {
             needsNumericKey: false,
+            usesFilterIdentity: true,
             matches: (raw) => !excluded.has(raw),
         };
     }
@@ -688,6 +717,7 @@ function compile_filter(
         return {
             needsNumericKey: lower.numeric !== undefined
                 || upper.numeric !== undefined,
+            usesFilterIdentity: false,
             matches: (raw, numeric_key) => {
                 if (raw === null) return false;
                 const in_range =
@@ -710,6 +740,7 @@ function compile_filter(
         const compare = numeric_comparison(entry.operator);
         return {
             needsNumericKey: true,
+            usesFilterIdentity: false,
             matches: (raw, numeric_key) => raw !== null
                 && compare(compare_numeric_sort_keys(
                     numeric_key!,
@@ -831,7 +862,7 @@ function text_relational_filter(
 function text_filter(
     matches: CompiledFilterPredicate['matches'],
 ): CompiledFilterPredicate {
-    return { needsNumericKey: false, matches };
+    return { needsNumericKey: false, usesFilterIdentity: false, matches };
 }
 
 interface CompiledComparisonOperand {

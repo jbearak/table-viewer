@@ -42,7 +42,12 @@ describe('paginated protocol message shapes', () => {
             sourceGeneration: 5,
             bins: [{ lo: 0, hi: 1, count: 3 }],
             columnKind: 'numeric',
-            distinctValues: ['1', '2', null],
+            defaultCategorical: true,
+            distinctValues: [
+                { value: '1', label: 'First' },
+                { value: '2', label: 'Second' },
+                { value: null },
+            ],
             distinctValuesExceeded: false,
         };
         const cancel: WebviewMessage = {

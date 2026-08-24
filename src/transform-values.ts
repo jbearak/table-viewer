@@ -9,6 +9,13 @@ export function raw_value(cell: RawCell | null | undefined): string | null {
         : raw;
 }
 
+/** Exact categorical matching identity. Most values use their raw text; sources
+ * with a bounded display preview may provide a separate lossless key. */
+export function filter_value(cell: RawCell | null | undefined): string | null {
+    const raw = raw_value(cell);
+    return raw === null ? null : cell?.filterKey ?? raw;
+}
+
 export function stata_missing_rank(value: string): number | undefined {
     if (value.charCodeAt(0) !== 46) return undefined; // '.'
     if (value.length === 1) return 0;
