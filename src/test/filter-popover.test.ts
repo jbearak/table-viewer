@@ -846,7 +846,7 @@ describe('FilterPopover value checklist (isOneOf)', () => {
     it('uses display labels for labeled numeric options while preserving raw identities', () => {
         const { on_apply } = render_popover([], LABELED_NUMERIC_READY, true);
         expect((document.querySelector('select') as HTMLSelectElement).value).toBe('isOneOf');
-        expect(checkbox_labels()).toEqual(['First', 'Second', 'First']);
+        expect(checkbox_labels()).toEqual(['First (1)', 'Second', 'First (3)']);
         const boxes = Array.from(
             document.querySelectorAll('.filter-value-item input'),
         ) as HTMLInputElement[];
@@ -909,9 +909,8 @@ describe('FilterPopover value checklist (isOneOf)', () => {
             ...props, histogram: TEXT_READY,
         })));
         expect((document.querySelector('select') as HTMLSelectElement).value).toBe('isOneOf');
-        // Focus is deferred with a zero-delay timer until the checklist mounts.
-        await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
-        expect(document.activeElement?.className).toBe('filter-value-search');
+        await vi.waitFor(() => expect(document.activeElement?.className)
+            .toBe('filter-value-search'));
     });
 
     it('keeps Contains when the distinct list is over cap or empty', () => {
