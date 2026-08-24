@@ -75,7 +75,7 @@ const MODERN_SECTION_TAGS: readonly [
     ['stata_data_close', '</stata_dta>'],
 ];
 
-type ValueLabelTables = Map<string, Map<number, string>>;
+type DecodedValueLabelTables = Map<string, Map<number, string>>;
 type StataMissingType = Parameters<typeof missing_type_to_label_key>[0];
 
 const STATA_MISSING_TYPES: readonly StataMissingType[] = [
@@ -206,8 +206,8 @@ export class DtaDataSource implements DataSource {
     private readonly pre_unicode_utf8_decoder = new TextDecoder('utf-8', { fatal: true });
     private readonly pre_unicode_fallback_decoder = new TextDecoder('windows-1252');
     private readonly unicode_decoder = new TextDecoder('utf-8');
-    private readonly value_label_tables: ValueLabelTables = new Map();
-    private readonly missing_value_label_tables = new Set<string>();
+    private readonly decoded_value_label_tables: DecodedValueLabelTables = new Map();
+    private readonly missing_value_label_table_names = new Set<string>();
     private window_cache_cells = 0;
     private window_cache_bytes = 0;
     private readonly gso_index = new Map<string, GsoEntry>();
@@ -217,7 +217,6 @@ export class DtaDataSource implements DataSource {
     private gso_checkpoints: GsoCheckpoint[] = [];
     private gso_checkpoint_stride = INITIAL_GSO_CHECKPOINT_STRIDE;
     private gso_entries_scanned = 0;
-    private gso_order_monotonic = true;
     private gso_last_order?: GsoOrder;
     private readonly gso_start_position: number;
     private gso_scan_position: number;
@@ -451,8 +450,8 @@ export class DtaDataSource implements DataSource {
         this.windows.clear();
         this.window_cache_cells = 0;
         this.window_cache_bytes = 0;
-        this.value_label_tables.clear();
-        this.missing_value_label_tables.clear();
+        this.decoded_value_label_tables.clear();
+        this.missing_value_label_table_names.clear();
         this.gso_index.clear();
         this.gso_cache.clear();
         this.gso_cache_bytes = 0;
@@ -791,7 +790,6 @@ export class DtaDataSource implements DataSource {
         view: DataView,
         targets: Map<string, GsoBatchTarget>,
     ): void {
-        const ordered = this.gso_order_monotonic;
         let first: GsoBatchTarget | undefined;
         for (const target of targets.values()) {
             if (first === undefined || compare_gso_order(target, first) < 0) {
@@ -799,50 +797,31 @@ export class DtaDataSource implements DataSource {
             }
         }
         if (first === undefined) return;
-        let position = this.gso_start_position;
-        if (ordered) {
-            if (
-                !this.gso_scan_exhausted
-                && this.gso_last_order !== undefined
-                && compare_gso_order(this.gso_last_order, first) < 0
-            ) {
-                position = this.gso_scan_position;
-            } else {
-                position = this.gso_checkpoint_position(first);
-            }
-        }
+        let position = !this.gso_scan_exhausted
+            && this.gso_last_order !== undefined
+            && compare_gso_order(this.gso_last_order, first) < 0
+            ? this.gso_scan_position
+            : this.gso_checkpoint_position(first);
 
-        const initial_frontier = this.gso_scan_position;
-        const scan_ranges = !ordered && !this.gso_scan_exhausted
-            && initial_frontier > this.gso_start_position
-            ? [
-                // Resolve historical targets before touching an unrelated
-                // unvisited successor that may itself be corrupt.
-                { start: this.gso_start_position, end: initial_frontier },
-                { start: initial_frontier, end: this.metadata.section_offsets.value_labels },
-            ]
-            : [{ start: position, end: this.metadata.section_offsets.value_labels }];
-        for (const range of scan_ranges) {
-            position = range.start;
-            while (position < range.end) {
-                const historical = position < this.gso_scan_position;
-                const scanned = historical
-                    ? this.read_gso_at(bytes, view, position)
-                    : this.scan_next_gso(bytes, view);
-                if (scanned === null) break;
-                const target = targets.get(scanned.key);
-                if (target !== undefined) {
-                    if (historical) this.cache_gso_entry(scanned.key, scanned.value);
-                    target.value = this.decode_and_cache_gso(
-                        scanned.key,
-                        bytes,
-                        scanned.value,
-                    );
-                    targets.delete(scanned.key);
-                    if (targets.size === 0) return;
-                }
-                position = scanned.nextPosition;
+        const section_end = this.metadata.section_offsets.value_labels;
+        while (position < section_end) {
+            const historical = position < this.gso_scan_position;
+            const scanned = historical
+                ? this.read_gso_at(bytes, view, position)
+                : this.scan_next_gso(bytes, view);
+            if (scanned === null) break;
+            const target = targets.get(scanned.key);
+            if (target !== undefined) {
+                if (historical) this.cache_gso_entry(scanned.key, scanned.value);
+                target.value = this.decode_and_cache_gso(
+                    scanned.key,
+                    bytes,
+                    scanned.value,
+                );
+                targets.delete(scanned.key);
+                if (targets.size === 0) return;
             }
+            position = scanned.nextPosition;
         }
     }
 
@@ -853,7 +832,6 @@ export class DtaDataSource implements DataSource {
         is_cancelled: () => boolean,
     ): Promise<void> {
         if (is_cancelled()) throw source_abort_error();
-        const ordered = this.gso_order_monotonic;
         let first: GsoBatchTarget | undefined;
         for (const target of targets.values()) {
             if (first === undefined || compare_gso_order(target, first) < 0) {
@@ -861,54 +839,37 @@ export class DtaDataSource implements DataSource {
             }
         }
         if (first === undefined) return;
-        let position = this.gso_start_position;
-        if (ordered) {
-            if (
-                !this.gso_scan_exhausted
-                && this.gso_last_order !== undefined
-                && compare_gso_order(this.gso_last_order, first) < 0
-            ) {
-                position = this.gso_scan_position;
-            } else {
-                position = this.gso_checkpoint_position(first);
-            }
-        }
+        let position = !this.gso_scan_exhausted
+            && this.gso_last_order !== undefined
+            && compare_gso_order(this.gso_last_order, first) < 0
+            ? this.gso_scan_position
+            : this.gso_checkpoint_position(first);
 
-        const initial_frontier = this.gso_scan_position;
-        const scan_ranges = !ordered && !this.gso_scan_exhausted
-            && initial_frontier > this.gso_start_position
-            ? [
-                { start: this.gso_start_position, end: initial_frontier },
-                { start: initial_frontier, end: this.metadata.section_offsets.value_labels },
-            ]
-            : [{ start: position, end: this.metadata.section_offsets.value_labels }];
+        const section_end = this.metadata.section_offsets.value_labels;
         let scanned_since_yield = 0;
-        for (const range of scan_ranges) {
-            position = range.start;
-            while (position < range.end) {
-                const historical = position < this.gso_scan_position;
-                const scanned = historical
-                    ? this.read_gso_at(bytes, view, position)
-                    : this.scan_next_gso(bytes, view);
-                if (scanned === null) break;
-                const target = targets.get(scanned.key);
-                if (target !== undefined) {
-                    if (historical) this.cache_gso_entry(scanned.key, scanned.value);
-                    target.value = this.decode_and_cache_gso(
-                        scanned.key,
-                        bytes,
-                        scanned.value,
-                    );
-                    targets.delete(scanned.key);
-                    if (targets.size === 0) return;
-                }
-                position = scanned.nextPosition;
-                scanned_since_yield += 1;
-                if (scanned_since_yield >= GSO_SCAN_ENTRIES_PER_YIELD) {
-                    scanned_since_yield = 0;
-                    await yield_to_event_loop();
-                    if (is_cancelled()) throw source_abort_error();
-                }
+        while (position < section_end) {
+            const historical = position < this.gso_scan_position;
+            const scanned = historical
+                ? this.read_gso_at(bytes, view, position)
+                : this.scan_next_gso(bytes, view);
+            if (scanned === null) break;
+            const target = targets.get(scanned.key);
+            if (target !== undefined) {
+                if (historical) this.cache_gso_entry(scanned.key, scanned.value);
+                target.value = this.decode_and_cache_gso(
+                    scanned.key,
+                    bytes,
+                    scanned.value,
+                );
+                targets.delete(scanned.key);
+                if (targets.size === 0) return;
+            }
+            position = scanned.nextPosition;
+            scanned_since_yield += 1;
+            if (scanned_since_yield >= GSO_SCAN_ENTRIES_PER_YIELD) {
+                scanned_since_yield = 0;
+                await yield_to_event_loop();
+                if (is_cancelled()) throw source_abort_error();
             }
         }
     }
@@ -920,8 +881,8 @@ export class DtaDataSource implements DataSource {
             this.gso_scan_exhausted = true;
             return null;
         }
-        this.gso_scan_position = scanned.nextPosition;
         this.remember_gso(scanned, position);
+        this.gso_scan_position = scanned.nextPosition;
         return scanned;
     }
 
@@ -977,15 +938,6 @@ export class DtaDataSource implements DataSource {
     }
 
     private remember_gso(scanned: ScannedGso, position: number): void {
-        if (!this.gso_order_monotonic) {
-            if (this.gso_index.has(scanned.key)) {
-                throw new Error(
-                    `Corrupt .dta file: duplicate strL object id ${scanned.key}`,
-                );
-            }
-            this.cache_gso_entry(scanned.key, scanned.value);
-            return;
-        }
         if (this.gso_last_order !== undefined) {
             const order = compare_gso_order(scanned, this.gso_last_order);
             if (order === 0) {
@@ -994,11 +946,9 @@ export class DtaDataSource implements DataSource {
                 );
             }
             if (order < 0) {
-                this.gso_order_monotonic = false;
-                this.gso_last_order = undefined;
-                this.gso_checkpoints = [];
-                this.cache_gso_entry(scanned.key, scanned.value);
-                return;
+                throw new Error(
+                    'Corrupt .dta file: strL objects are out of observation-major order',
+                );
             }
         }
         this.gso_last_order = scanned;
@@ -1142,9 +1092,9 @@ export class DtaDataSource implements DataSource {
     }
 
     private value_labels(name: string): Map<number, string> | undefined {
-        const cached = this.value_label_tables.get(name);
+        const cached = this.decoded_value_label_tables.get(name);
         if (cached !== undefined) return cached;
-        if (this.missing_value_label_tables.has(name)) return undefined;
+        if (this.missing_value_label_table_names.has(name)) return undefined;
         const labels = parse_value_label_table(
             this.open_buffer(),
             this.metadata,
@@ -1153,8 +1103,8 @@ export class DtaDataSource implements DataSource {
             this.pre_unicode_utf8_decoder,
             this.pre_unicode_fallback_decoder,
         );
-        if (labels === undefined) this.missing_value_label_tables.add(name);
-        else this.value_label_tables.set(name, labels);
+        if (labels === undefined) this.missing_value_label_table_names.add(name);
+        else this.decoded_value_label_tables.set(name, labels);
         return labels;
     }
 
@@ -1162,9 +1112,9 @@ export class DtaDataSource implements DataSource {
         name: string,
         is_cancelled: () => boolean,
     ): Promise<Map<number, string> | undefined> {
-        const cached = this.value_label_tables.get(name);
+        const cached = this.decoded_value_label_tables.get(name);
         if (cached !== undefined) return cached;
-        if (this.missing_value_label_tables.has(name)) return undefined;
+        if (this.missing_value_label_table_names.has(name)) return undefined;
         const labels = await parse_value_label_table_async(
             this.open_buffer(),
             this.metadata,
@@ -1174,8 +1124,8 @@ export class DtaDataSource implements DataSource {
             this.pre_unicode_fallback_decoder,
             is_cancelled,
         );
-        if (labels === undefined) this.missing_value_label_tables.add(name);
-        else this.value_label_tables.set(name, labels);
+        if (labels === undefined) this.missing_value_label_table_names.add(name);
+        else this.decoded_value_label_tables.set(name, labels);
         return labels;
     }
 

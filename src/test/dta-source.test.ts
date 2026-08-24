@@ -451,9 +451,13 @@ describe('DtaDataSource', () => {
     it('returns identical canonical raw values from fast and rendered paths', async () => {
         const source = await DtaDataSource.create(build_dta_fixture());
         const fast = source.read_raw_columns(0, 0, 4, [0, 1, 2, 3, 4]).rows;
-        expect((source as unknown as { value_label_tables?: unknown }).value_label_tables)
-            .toBeUndefined();
+        const internals = source as unknown as {
+            decoded_value_label_tables: Map<string, Map<number, string>>;
+        };
+        expect(internals.decoded_value_label_tables.size).toBe(0);
         const rendered = source.read_rows(0, 0, 4).rows;
+        expect([...internals.decoded_value_label_tables.keys()])
+            .toEqual(['status_lbl', 'missing_lbl']);
         expect(fast).toEqual(rendered.map((row) => row.map((cell) =>
             cell === null
                 ? null
@@ -687,10 +691,8 @@ describe('DtaDataSource', () => {
             gso_index: Map<string, unknown>;
             gso_cache: Map<string, unknown>;
             gso_checkpoints: unknown[];
-            gso_order_monotonic: boolean;
             gso_scan_position: number;
         };
-        expect(internals.gso_order_monotonic).toBe(true);
         expect(internals.gso_index.size).toBeLessThanOrEqual(1_024);
         expect(internals.gso_checkpoints.length).toBeLessThanOrEqual(1_024);
         const exhausted_position = internals.gso_scan_position;
@@ -743,8 +745,13 @@ describe('DtaDataSource', () => {
         },
     );
 
+    it('allows exactly 10,000 zero-length legacy expansion fields', async () => {
+        const source = await DtaDataSource.create(build_legacy_dta_fixture(0, 10_000));
+        expect(source.meta().sheets[0].rowCount).toBe(3);
+    });
+
     it('rejects excessive zero-length legacy expansion fields', async () => {
-        await expect(DtaDataSource.create(build_legacy_dta_fixture(0, 10_000)))
+        await expect(DtaDataSource.create(build_legacy_dta_fixture(0, 10_001)))
             .rejects.toThrow('too many expansion fields');
     });
 
@@ -783,7 +790,7 @@ describe('DtaDataSource', () => {
         );
     });
 
-    it('falls back to a linear scan for physically out-of-order strL objects', async () => {
+    it('rejects physically out-of-order strL objects', async () => {
         const fixture = build_dta_fixture();
         const first_gso = find_tag_end(fixture, '<strls>');
         const view = new DataView(fixture.buffer);
@@ -795,13 +802,12 @@ describe('DtaDataSource', () => {
         fixture.set(first, first_gso + second.length);
 
         const source = await DtaDataSource.create(fixture);
-        expect(source.read_raw_columns(0, 0, 1, [4]).rows[0][0]?.raw)
-            .toBe('a long first value');
-        expect((source as unknown as { gso_order_monotonic: boolean }).gso_order_monotonic)
-            .toBe(false);
+        expect(() => source.read_raw_columns(0, 0, 1, [4])).toThrow(
+            'Corrupt .dta file: strL objects are out of observation-major order',
+        );
     });
 
-    it('continues forward in batches after detecting out-of-order strL objects', async () => {
+    it('rejects an out-of-order strL batch without a recovery rescan', async () => {
         const fixture = build_dta_fixture(2_000);
         const first_gso = find_tag_end(fixture, '<strls>');
         const view = new DataView(fixture.buffer);
@@ -813,22 +819,20 @@ describe('DtaDataSource', () => {
         fixture.set(first, first_gso + second.length);
 
         const source = await DtaDataSource.create(fixture);
-        source.read_raw_columns(0, 0, 256, [4]);
         const internals = source as unknown as {
-            gso_order_monotonic: boolean;
             read_gso_at: (...args: unknown[]) => unknown;
         };
-        expect(internals.gso_order_monotonic).toBe(false);
         const original_read_gso_at = internals.read_gso_at.bind(source);
         let headers_read = 0;
         internals.read_gso_at = (...args) => {
             headers_read += 1;
             return original_read_gso_at(...args);
         };
-        const rows = source.read_raw_columns(0, 256, 256, [4]).rows;
-        expect(rows[0][0]?.raw).toBe('long value 256');
-        expect(rows[255][0]?.raw).toBe('long value 511');
-        expect(headers_read).toBeLessThanOrEqual(320);
+        await expect(source.read_raw_columns_async(0, 0, 256, [4], () => false))
+            .rejects.toThrow(
+                'Corrupt .dta file: strL objects are out of observation-major order',
+            );
+        expect(headers_read).toBe(2);
     });
 
     it('stops a resolved strL batch before an unrelated corrupt object', async () => {
@@ -850,6 +854,35 @@ describe('DtaDataSource', () => {
         expect(() => source.read_rows(0, 0, 1)).toThrow(
             /Corrupt \.dta file: strL object id .* is outside the dataset range/,
         );
+    });
+
+    it('rejects duplicate strL ids before mutating the cache or index', async () => {
+        const fixture = build_dta_fixture();
+        const first_gso = find_tag_end(fixture, '<strls>');
+        const view = new DataView(fixture.buffer);
+        const second_gso = first_gso + 20 + view.getUint32(first_gso + 16, true);
+        view.setBigUint64(second_gso + 7, 1n, true);
+        const source = await DtaDataSource.create(fixture);
+        const internals = source as unknown as {
+            gso_index: Map<string, { content_offset: number }>;
+            gso_cache: Map<string, string>;
+            gso_entries_scanned: number;
+            gso_scan_position: number;
+        };
+        expect(source.read_raw_columns(0, 0, 1, [4]).rows[0][0]?.raw)
+            .toBe('a long first value');
+        const indexed_first = internals.gso_index.get('5:1');
+        const cached_before_duplicate = [...internals.gso_cache];
+
+        expect(() => source.read_raw_columns(0, 1, 1, [4])).toThrow(
+            'Corrupt .dta file: duplicate strL object id 5:1',
+        );
+        expect(internals.gso_index.size).toBe(1);
+        expect(internals.gso_index.get('5:1')).toBe(indexed_first);
+        expect(indexed_first?.content_offset).toBe(first_gso + 20);
+        expect([...internals.gso_cache]).toEqual(cached_before_duplicate);
+        expect(internals.gso_entries_scanned).toBe(1);
+        expect(internals.gso_scan_position).toBe(second_gso);
     });
 
     it('decodes release 119 strL pointers with the 3+5-byte layout', async () => {
@@ -914,11 +947,17 @@ describe('DtaDataSource', () => {
 
     it('rejects pre-Unicode value-label payloads beyond their declared entry length', async () => {
         const corrupt = build_legacy_dta_fixture();
-        // The final table starts after three 6-byte observations.
         const table_length_offset = corrupt.length - (4 + 33 + 3 + 8 + 8 + 5);
-        new DataView(corrupt.buffer).setInt32(table_length_offset, 1, true);
+        const declared_length_without_text = 33 + 3 + 8 + 8;
+        new DataView(corrupt.buffer).setInt32(
+            table_length_offset,
+            declared_length_without_text,
+            true,
+        );
         const source = await DtaDataSource.create(corrupt);
-        expect(() => source.read_rows(0, 0, 1)).toThrow(/truncated header/);
+        expect(() => source.read_rows(0, 0, 1)).toThrow(
+            'Corrupt value label table: payload exceeds entry bounds',
+        );
     });
 
     it('surfaces rejected releases as a clean open error', async () => {
