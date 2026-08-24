@@ -3,7 +3,9 @@ import type { RenderedCell, RowWindow, SheetMeta, WorkbookMeta, DataSource } fro
 import {
     read_source_columns,
     read_source_raw_columns,
+    read_source_raw_columns_indexed_async,
     read_source_raw_rows_indexed,
+    read_source_raw_rows_indexed_async,
     read_source_rows_indexed,
 } from '../data-source/interface';
 
@@ -172,6 +174,231 @@ describe('data-source interface shapes', () => {
         expect(() => read_source_rows_indexed(ds, 0, [0.5])).toThrow(RangeError);
         expect(calls).toBe(0);
     });
+    it('prefers one native indexed raw request and preserves both dimensions', async () => {
+        const native = vi.fn(async (
+            _sheet: number,
+            rows: ArrayLike<number>,
+            columns: readonly number[],
+        ) => ({
+            rows: Array.from(rows, (row) => columns.map((column) => ({
+                raw: `${row}:${column}`,
+                rawType: 'string' as const,
+            }))),
+        }));
+        const fallback = vi.fn();
+        const ds: DataSource = {
+            meta: () => ({
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1', rowCount: 8, sourceRowCount: 8,
+                    columnCount: 4, merges: [], hasFormatting: false,
+                }],
+            }),
+            read_rows: fallback,
+            read_raw_columns_async: fallback,
+            read_raw_columns_indexed_async: native,
+            close: () => {},
+        };
+
+        const result = await read_source_raw_columns_indexed_async(
+            ds,
+            0,
+            [5, 1, 5],
+            [3, 0, 3],
+            () => false,
+        );
+        expect(result.rows.map((row) => row.map((cell) => cell?.raw))).toEqual([
+            ['5:3', '5:0', '5:3'],
+            ['1:3', '1:0', '1:3'],
+            ['5:3', '5:0', '5:3'],
+        ]);
+        expect(native).toHaveBeenCalledTimes(1);
+        expect(fallback).not.toHaveBeenCalled();
+    });
+
+    it('falls back to sorted adjacent runs without crossing gaps', async () => {
+        const calls: Array<{ start: number; count: number; columns: readonly number[] }> = [];
+        const ds: DataSource = {
+            meta: () => ({
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1', rowCount: 20, sourceRowCount: 20,
+                    columnCount: 3, merges: [], hasFormatting: false,
+                }],
+            }),
+            read_rows: () => ({ startRow: 0, rows: [] }),
+            read_raw_columns_async: async (_sheet, start, count, columns) => {
+                calls.push({ start, count, columns });
+                return {
+                    startRow: start,
+                    rows: Array.from({ length: count }, (_, offset) => columns.map((column) => ({
+                        raw: `${start + offset}:${column}`,
+                        rawType: 'string' as const,
+                    }))),
+                };
+            },
+            close: () => {},
+        };
+
+        const result = await read_source_raw_columns_indexed_async(
+            ds,
+            0,
+            [9, 2, 3, 9, 6],
+            [2, 0, 2],
+            () => false,
+        );
+        expect(calls).toEqual([
+            { start: 2, count: 2, columns: [2, 0, 2] },
+            { start: 6, count: 1, columns: [2, 0, 2] },
+            { start: 9, count: 1, columns: [2, 0, 2] },
+        ]);
+        expect(result.rows.map((row) => row.map((cell) => cell?.raw))).toEqual([
+            ['9:2', '9:0', '9:2'],
+            ['2:2', '2:0', '2:2'],
+            ['3:2', '3:0', '3:2'],
+            ['9:2', '9:0', '9:2'],
+            ['6:2', '6:0', '6:2'],
+        ]);
+    });
+
+    it('validates all indexed dimensions before source invocation', async () => {
+        const native = vi.fn(async () => ({ rows: [] }));
+        const ds: DataSource = {
+            meta: () => ({
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1', rowCount: 2, sourceRowCount: 2,
+                    columnCount: 2, merges: [], hasFormatting: false,
+                }],
+            }),
+            read_rows: () => ({ startRow: 0, rows: [] }),
+            read_raw_columns_indexed_async: native,
+            close: () => {},
+        };
+        await expect(read_source_raw_columns_indexed_async(ds, 1, [], [], () => false))
+            .rejects.toThrow(RangeError);
+        await expect(read_source_raw_columns_indexed_async(ds, 0, [0, 2], [0], () => false))
+            .rejects.toThrow(RangeError);
+        await expect(read_source_raw_columns_indexed_async(ds, 0, [0], [0, -1], () => false))
+            .rejects.toThrow(RangeError);
+        expect(native).not.toHaveBeenCalled();
+    });
+
+    it('avoids source work for either empty indexed dimension', async () => {
+        const native = vi.fn(async () => ({ rows: [] }));
+        const ds: DataSource = {
+            meta: () => ({
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1', rowCount: 2, sourceRowCount: 2,
+                    columnCount: 2, merges: [], hasFormatting: false,
+                }],
+            }),
+            read_rows: () => ({ startRow: 0, rows: [] }),
+            read_raw_columns_indexed_async: native,
+            close: () => {},
+        };
+        await expect(read_source_raw_columns_indexed_async(ds, 0, [], [0], () => false))
+            .resolves.toEqual({ rows: [] });
+        await expect(read_source_raw_columns_indexed_async(ds, 0, [0], [], () => false))
+            .resolves.toEqual({ rows: [] });
+        expect(native).not.toHaveBeenCalled();
+    });
+
+    it('checks cancellation between fallback runs and wraps all columns', async () => {
+        let cancelled = false;
+        const calls: number[] = [];
+        const ds: DataSource = {
+            meta: () => ({
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1', rowCount: 8, sourceRowCount: 8,
+                    columnCount: 2, merges: [], hasFormatting: false,
+                }],
+            }),
+            read_rows: () => ({ startRow: 0, rows: [] }),
+            read_raw_columns_async: async (_sheet, start, count, columns) => {
+                calls.push(start);
+                cancelled = true;
+                return {
+                    startRow: start,
+                    rows: Array.from({ length: count }, (_, offset) => columns.map((column) => ({
+                        raw: `${start + offset}:${column}`,
+                    }))),
+                };
+            },
+            close: () => {},
+        };
+        await expect(read_source_raw_rows_indexed_async(ds, 0, [1, 4], () => cancelled))
+            .rejects.toMatchObject({ name: 'AbortError' });
+        expect(calls).toEqual([1]);
+    });
+
+    it('does not publish a native indexed result after its final await is cancelled', async () => {
+        let cancelled = false;
+        const ds: DataSource = {
+            meta: () => ({
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1', rowCount: 1, sourceRowCount: 1,
+                    columnCount: 1, merges: [], hasFormatting: false,
+                }],
+            }),
+            read_rows: () => ({ startRow: 0, rows: [] }),
+            read_raw_columns_indexed_async: async () => {
+                cancelled = true;
+                return { rows: [[{ raw: 'late' }]] };
+            },
+            close: () => {},
+        };
+
+        await expect(read_source_raw_columns_indexed_async(
+            ds, 0, [0], [0], () => cancelled,
+        )).rejects.toMatchObject({ name: 'AbortError' });
+    });
+
+    it('does not publish a fallback result after its final run is cancelled', async () => {
+        let cancelled = false;
+        const ds: DataSource = {
+            meta: () => ({
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1', rowCount: 1, sourceRowCount: 1,
+                    columnCount: 1, merges: [], hasFormatting: false,
+                }],
+            }),
+            read_rows: () => ({ startRow: 0, rows: [] }),
+            read_raw_columns_async: async () => {
+                cancelled = true;
+                return { startRow: 0, rows: [[{ raw: 'late' }]] };
+            },
+            close: () => {},
+        };
+
+        await expect(read_source_raw_columns_indexed_async(
+            ds, 0, [0], [0], () => cancelled,
+        )).rejects.toMatchObject({ name: 'AbortError' });
+    });
+
+    it('uses the indexed column adapter for all-column raw rows', async () => {
+        const native = vi.fn(async () => ({ rows: [[{ raw: 'ok' }]] }));
+        const ds: DataSource = {
+            meta: () => ({
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1', rowCount: 1, sourceRowCount: 1,
+                    columnCount: 3, merges: [], hasFormatting: false,
+                }],
+            }),
+            read_rows: () => ({ startRow: 0, rows: [] }),
+            read_raw_columns_indexed_async: native,
+            close: () => {},
+        };
+        await expect(read_source_raw_rows_indexed_async(ds, 0, [0], () => false))
+            .resolves.toEqual({ rows: [[{ raw: 'ok' }]] });
+        expect(native).toHaveBeenCalledWith(0, [0], [0, 1, 2], expect.any(Function));
+    });
+
     it('DataSource carries optional diagnostics read polymorphically by panel-core', () => {
         const ds: DataSource = {
             meta: () => ({ hasFormatting: false, sheets: [] }),

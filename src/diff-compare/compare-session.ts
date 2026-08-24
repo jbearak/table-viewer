@@ -11,6 +11,7 @@
 // the padding and pairings computed here at construction.
 import {
     read_source_raw_columns_async,
+    read_source_raw_columns_indexed_async,
     read_source_raw_rows_indexed_async,
     read_source_rows_indexed,
     type ColumnFilterMetadata,
@@ -64,6 +65,45 @@ function compare_abort_error(): Error {
 
 function is_abort_error(error: unknown): boolean {
     return error instanceof Error && error.name === 'AbortError';
+}
+
+interface CompareOperationFence {
+    readonly isCancelled: () => boolean;
+    assertActive(): void;
+}
+
+interface FilterMetadataContributions {
+    readonly modified?: { readonly sheetIndex: number };
+    readonly original?: { readonly sheetIndex: number };
+}
+
+function merge_filter_metadata(
+    modified: ColumnFilterMetadata | undefined,
+    original: ColumnFilterMetadata | undefined,
+    both_contribute: boolean,
+): ColumnFilterMetadata | undefined {
+    if (!both_contribute) return modified ?? original;
+    const categorical = modified?.categoricalCodes || original?.categoricalCodes
+        ? true
+        : undefined;
+    const modified_label = modified?.valueLabel;
+    const original_label = original?.valueLabel;
+    const value_label = modified_label !== undefined && original_label !== undefined
+        ? (raw: string): string | undefined => {
+            const from_modified = modified_label(raw);
+            const from_original = original_label(raw);
+            return from_modified !== undefined
+                && from_original !== undefined
+                && from_modified === from_original
+                ? from_modified
+                : undefined;
+        }
+        : undefined;
+    if (categorical === undefined && value_label === undefined) return undefined;
+    return {
+        ...(categorical === undefined ? {} : { categoricalCodes: categorical }),
+        ...(value_label === undefined ? {} : { valueLabel: value_label }),
+    };
 }
 
 interface DiffWaiter {
@@ -309,8 +349,16 @@ export class CompareDataSource implements DataSource {
                         original_sheets[pairing.originalIndex].rowCount,
                         modified_meta.sheets[modified_index].rowCount,
                     ),
-                    addedRows: 0,
-                    deletedRows: 0,
+                    addedRows: Math.max(
+                        0,
+                        modified_meta.sheets[modified_index].rowCount
+                            - original_sheets[pairing.originalIndex].rowCount,
+                    ),
+                    deletedRows: Math.max(
+                        0,
+                        original_sheets[pairing.originalIndex].rowCount
+                            - modified_meta.sheets[modified_index].rowCount,
+                    ),
                     changedCells: 0,
                     changedRowIndices: [],
                     movedRowIndices: [],
@@ -487,6 +535,102 @@ export class CompareDataSource implements DataSource {
             : undefined;
     }
 
+    private operation_fence(is_cancelled: () => boolean): CompareOperationFence {
+        const epoch = this.lifecycle_epoch;
+        const cancelled = () => this.closed
+            || this.lifecycle_epoch !== epoch
+            || is_cancelled();
+        return {
+            isCancelled: cancelled,
+            assertActive: () => {
+                if (cancelled()) throw compare_abort_error();
+            },
+        };
+    }
+
+    /** Which sources can actually put values from this column into the grid.
+     * Paired rows display modified values; original metadata contributes only
+     * when a deleted row can appear. */
+    private filter_metadata_contributions(
+        sheet_index: number,
+        column_index: number,
+    ): FilterMetadataContributions {
+        const deleted_index = this.deleted_original_index(sheet_index);
+        if (deleted_index !== undefined) {
+            return column_index < this.original_meta.sheets[deleted_index].columnCount
+                ? { original: { sheetIndex: deleted_index } }
+                : {};
+        }
+        const modified_sheet = this.modified_meta.sheets[sheet_index];
+        if (modified_sheet === undefined) return {};
+        const pairing = this.matched_by_modified_index.get(sheet_index);
+        if (pairing === undefined) {
+            return column_index < modified_sheet.columnCount
+                ? { modified: { sheetIndex: sheet_index } }
+                : {};
+        }
+        const alignment = this.alignments.get(sheet_index);
+        if (alignment === undefined) return {};
+        const original_sheet = this.original_meta.sheets[pairing.originalIndex];
+        return {
+            ...(column_index < modified_sheet.columnCount
+                && modified_sheet.rowCount > 0
+                ? { modified: { sheetIndex: sheet_index } }
+                : {}),
+            ...(column_index < original_sheet.columnCount
+                && alignment.deletedRows > 0
+                ? { original: { sheetIndex: pairing.originalIndex } }
+                : {}),
+        };
+    }
+
+    private async settle_paired<Left, Right>(
+        left: (is_cancelled: () => boolean) => Promise<Left>,
+        right: (is_cancelled: () => boolean) => Promise<Right>,
+        fence: CompareOperationFence,
+        mark_terminal?: () => void,
+    ): Promise<readonly [Left, Right]> {
+        fence.assertActive();
+        let peer_failed = false;
+        const child_cancelled = () => peer_failed || fence.isCancelled();
+        const start = <Value>(operation: () => Promise<Value>): Promise<Value> => {
+            try {
+                return operation();
+            } catch (error) {
+                peer_failed = true;
+                mark_terminal?.();
+                return Promise.reject(error);
+            }
+        };
+        const observe = async <Value>(promise: Promise<Value>): Promise<Value> => {
+            try {
+                return await promise;
+            } catch (error) {
+                peer_failed = true;
+                mark_terminal?.();
+                throw error;
+            }
+        };
+        // Both operations are invoked before either promise is awaited.
+        const left_read = start(() => left(child_cancelled));
+        const right_read = start(() => right(child_cancelled));
+        const [left_result, right_result] = await Promise.allSettled([
+            observe(left_read),
+            observe(right_read),
+        ]);
+        const failures = [left_result, right_result].filter(
+            (result): result is PromiseRejectedResult => result.status === 'rejected',
+        );
+        const substantive = failures.find((failure) => !is_abort_error(failure.reason));
+        if (substantive !== undefined) throw substantive.reason;
+        if (failures.length > 0) throw failures[0].reason;
+        fence.assertActive();
+        if (left_result.status !== 'fulfilled' || right_result.status !== 'fulfilled') {
+            throw compare_abort_error();
+        }
+        return [left_result.value, right_result.value];
+    }
+
     meta(): WorkbookMeta {
         return this.padded_meta;
     }
@@ -495,27 +639,24 @@ export class CompareDataSource implements DataSource {
         sheet_index: number,
         column_index: number,
     ): ColumnFilterMetadata | undefined {
-        const deleted_index = this.deleted_original_index(sheet_index);
-        if (deleted_index !== undefined) {
-            const sheet = this.original_meta.sheets[deleted_index];
-            return column_index < sheet.columnCount
-                ? this.original.column_filter_metadata?.(deleted_index, column_index)
-                : undefined;
-        }
-        const modified_sheet = this.modified_meta.sheets[sheet_index];
-        const modified = modified_sheet && column_index < modified_sheet.columnCount
-            ? this.modified.column_filter_metadata?.(sheet_index, column_index)
-            : undefined;
-        if (modified !== undefined) return modified;
-        const pairing = this.matched_by_modified_index.get(sheet_index);
-        if (pairing === undefined) return undefined;
-        const original_sheet = this.original_meta.sheets[pairing.originalIndex];
-        return column_index < original_sheet.columnCount
-            ? this.original.column_filter_metadata?.(
-                pairing.originalIndex,
+        const contributions = this.filter_metadata_contributions(sheet_index, column_index);
+        const modified = contributions.modified === undefined
+            ? undefined
+            : this.modified.column_filter_metadata?.(
+                contributions.modified.sheetIndex,
                 column_index,
-            )
-            : undefined;
+            );
+        const original = contributions.original === undefined
+            ? undefined
+            : this.original.column_filter_metadata?.(
+                contributions.original.sheetIndex,
+                column_index,
+            );
+        return merge_filter_metadata(
+            modified,
+            original,
+            contributions.modified !== undefined && contributions.original !== undefined,
+        );
     }
 
     async column_filter_metadata_async(
@@ -523,43 +664,58 @@ export class CompareDataSource implements DataSource {
         column_index: number,
         is_cancelled: () => boolean,
     ): Promise<ColumnFilterMetadata | undefined> {
-        const deleted_index = this.deleted_original_index(sheet_index);
-        if (deleted_index !== undefined) {
-            const sheet = this.original_meta.sheets[deleted_index];
-            if (column_index >= sheet.columnCount) return undefined;
-            return this.original.column_filter_metadata_async
-                ? this.original.column_filter_metadata_async(
-                    deleted_index,
-                    column_index,
-                    is_cancelled,
-                )
-                : this.original.column_filter_metadata?.(deleted_index, column_index);
-        }
-        const modified_sheet = this.modified_meta.sheets[sheet_index];
-        const modified = modified_sheet && column_index < modified_sheet.columnCount
-            ? this.modified.column_filter_metadata_async
-                ? await this.modified.column_filter_metadata_async(
-                    sheet_index,
-                    column_index,
-                    is_cancelled,
-                )
-                : this.modified.column_filter_metadata?.(sheet_index, column_index)
-            : undefined;
-        if (modified !== undefined || is_cancelled()) return modified;
-        const pairing = this.matched_by_modified_index.get(sheet_index);
-        if (pairing === undefined) return undefined;
-        const original_sheet = this.original_meta.sheets[pairing.originalIndex];
-        if (column_index >= original_sheet.columnCount) return undefined;
-        return this.original.column_filter_metadata_async
-            ? this.original.column_filter_metadata_async(
-                pairing.originalIndex,
-                column_index,
-                is_cancelled,
-            )
-            : this.original.column_filter_metadata?.(
-                pairing.originalIndex,
-                column_index,
+        const fence = this.operation_fence(is_cancelled);
+        fence.assertActive();
+        const contributions = this.filter_metadata_contributions(sheet_index, column_index);
+        const read_modified = (cancelled: () => boolean) => Promise.resolve(
+            contributions.modified === undefined
+                ? undefined
+                : this.modified.column_filter_metadata_async
+                    ? this.modified.column_filter_metadata_async(
+                        contributions.modified.sheetIndex,
+                        column_index,
+                        cancelled,
+                    )
+                    : this.modified.column_filter_metadata?.(
+                        contributions.modified.sheetIndex,
+                        column_index,
+                    ),
+        );
+        const read_original = (cancelled: () => boolean) => Promise.resolve(
+            contributions.original === undefined
+                ? undefined
+                : this.original.column_filter_metadata_async
+                    ? this.original.column_filter_metadata_async(
+                        contributions.original.sheetIndex,
+                        column_index,
+                        cancelled,
+                    )
+                    : this.original.column_filter_metadata?.(
+                        contributions.original.sheetIndex,
+                        column_index,
+                    ),
+        );
+        let modified: ColumnFilterMetadata | undefined;
+        let original: ColumnFilterMetadata | undefined;
+        if (contributions.modified !== undefined && contributions.original !== undefined) {
+            [modified, original] = await this.settle_paired(
+                read_modified,
+                read_original,
+                fence,
             );
+        } else if (contributions.modified !== undefined) {
+            modified = await read_modified(fence.isCancelled);
+            fence.assertActive();
+        } else if (contributions.original !== undefined) {
+            original = await read_original(fence.isCancelled);
+            fence.assertActive();
+        }
+        fence.assertActive();
+        return merge_filter_metadata(
+            modified,
+            original,
+            contributions.modified !== undefined && contributions.original !== undefined,
+        );
     }
 
     /**
@@ -811,9 +967,6 @@ export class CompareDataSource implements DataSource {
         return { startRow: 0, rowStatus: row_status, changedCells: changed_cells };
     }
 
-    /** Start both raw side reads before awaiting either. A failure trips the
-     *  sibling's cancellation predicate, but both promises are observed to
-     *  settlement before the substantive failure is propagated. */
     private async read_diff_raw_batches(
         original_sheet_index: number,
         original_rows: readonly number[],
@@ -825,46 +978,26 @@ export class CompareDataSource implements DataSource {
         readonly original: (RawCell | null)[][];
         readonly modified: (RawCell | null)[][];
     }> {
-        let peer_failed = false;
-        const read_is_cancelled = () => peer_failed || is_cancelled();
-        const original_read = read_source_raw_rows_indexed_async(
-            this.original,
-            original_sheet_index,
-            original_rows,
-            read_is_cancelled,
+        const fence = this.operation_fence(is_cancelled);
+        const [original_result, modified_result] = await this.settle_paired(
+            (cancelled) => read_source_raw_rows_indexed_async(
+                this.original,
+                original_sheet_index,
+                original_rows,
+                cancelled,
+            ),
+            (cancelled) => read_source_raw_rows_indexed_async(
+                this.modified,
+                modified_sheet_index,
+                modified_rows,
+                cancelled,
+            ),
+            fence,
+            mark_terminal,
         );
-        const modified_read = read_source_raw_rows_indexed_async(
-            this.modified,
-            modified_sheet_index,
-            modified_rows,
-            read_is_cancelled,
-        );
-        const observe = async <T>(promise: Promise<T>): Promise<T> => {
-            try {
-                return await promise;
-            } catch (error) {
-                peer_failed = true;
-                mark_terminal();
-                throw error;
-            }
-        };
-        const [original_result, modified_result] = await Promise.allSettled([
-            observe(original_read),
-            observe(modified_read),
-        ]);
-        if (is_cancelled()) throw compare_abort_error();
-        const failures = [original_result, modified_result].filter(
-            (result): result is PromiseRejectedResult => result.status === 'rejected',
-        );
-        const substantive = failures.find((failure) => !is_abort_error(failure.reason));
-        if (substantive !== undefined) throw substantive.reason;
-        if (failures.length > 0) throw failures[0].reason;
-        if (original_result.status !== 'fulfilled' || modified_result.status !== 'fulfilled') {
-            throw compare_abort_error();
-        }
         return {
-            original: original_result.value.rows,
-            modified: modified_result.value.rows,
+            original: original_result.rows,
+            modified: modified_result.rows,
         };
     }
 
@@ -906,29 +1039,35 @@ export class CompareDataSource implements DataSource {
                 );
             }
         }
+        const fence = this.operation_fence(is_cancelled);
+        fence.assertActive();
         const start = Math.max(0, Math.min(start_row, sheet.rowCount));
         const end = Math.min(sheet.rowCount, start + Math.max(0, count));
         const deleted_index = this.deleted_original_index(sheet_index);
         if (deleted_index !== undefined) {
-            return read_source_raw_columns_async(
+            const result = await read_source_raw_columns_async(
                 this.original,
                 deleted_index,
                 start,
                 end - start,
                 column_indices,
-                is_cancelled,
+                fence.isCancelled,
             );
+            fence.assertActive();
+            return result;
         }
         const alignment = this.alignment_of(sheet_index);
         if (!alignment) {
-            return read_source_raw_columns_async(
+            const result = await read_source_raw_columns_async(
                 this.modified,
                 sheet_index,
                 start,
                 end - start,
                 column_indices,
-                is_cancelled,
+                fence.isCancelled,
             );
+            fence.assertActive();
+            return result;
         }
 
         const pairing = this.matched_by_modified_index.get(sheet_index)!;
@@ -940,22 +1079,45 @@ export class CompareDataSource implements DataSource {
             if (aligned.modified !== ABSENT) modified_rows.push(aligned.modified);
             else original_rows.push(aligned.original);
         }
-        const [modified_batch, original_batch] = await Promise.all([
-            this.read_side_raw_columns(
+        let modified_batch: (RawCell | null)[][] = [];
+        let original_batch: (RawCell | null)[][] = [];
+        if (modified_rows.length > 0 && original_rows.length > 0) {
+            [modified_batch, original_batch] = await this.settle_paired(
+                (cancelled) => this.read_side_raw_columns(
+                    this.modified,
+                    sheet_index,
+                    modified_rows,
+                    column_indices,
+                    cancelled,
+                ),
+                (cancelled) => this.read_side_raw_columns(
+                    this.original,
+                    pairing.originalIndex,
+                    original_rows,
+                    column_indices,
+                    cancelled,
+                ),
+                fence,
+            );
+        } else if (modified_rows.length > 0) {
+            modified_batch = await this.read_side_raw_columns(
                 this.modified,
                 sheet_index,
                 modified_rows,
                 column_indices,
-                is_cancelled,
-            ),
-            this.read_side_raw_columns(
+                fence.isCancelled,
+            );
+            fence.assertActive();
+        } else if (original_rows.length > 0) {
+            original_batch = await this.read_side_raw_columns(
                 this.original,
                 pairing.originalIndex,
                 original_rows,
                 column_indices,
-                is_cancelled,
-            ),
-        ]);
+                fence.isCancelled,
+            );
+            fence.assertActive();
+        }
         let modified_position = 0;
         let original_position = 0;
         const rows: (RawCell | null)[][] = [];
@@ -969,6 +1131,7 @@ export class CompareDataSource implements DataSource {
                 rows.push(original_batch[original_position++] ?? []);
             }
         }
+        fence.assertActive();
         return { startRow: start, rows };
     }
 
@@ -995,34 +1158,20 @@ export class CompareDataSource implements DataSource {
             return row_indices.map(() => column_indices.map(() => null));
         }
 
-        const materialized = new Map<number, (RawCell | null)[]>();
-        const unique = [...new Set(row_indices)].sort((left, right) => left - right);
-        let position = 0;
-        while (position < unique.length) {
-            const start = unique[position];
-            let run_length = 1;
-            while (
-                position + run_length < unique.length
-                && unique[position + run_length] === start + run_length
-            ) run_length += 1;
-            const window = await read_source_raw_columns_async(
-                source,
-                sheet_index,
-                start,
-                run_length,
-                valid_columns,
-                is_cancelled,
-            );
-            window.rows.forEach((row, offset) => {
-                const projected = column_indices.map((): RawCell | null => null);
-                result_positions.forEach((result_position, index) => {
-                    projected[result_position] = row[index] ?? null;
-                });
-                materialized.set(start + offset, projected);
+        const batch = await read_source_raw_columns_indexed_async(
+            source,
+            sheet_index,
+            row_indices,
+            valid_columns,
+            is_cancelled,
+        );
+        return batch.rows.map((row) => {
+            const projected = column_indices.map((): RawCell | null => null);
+            result_positions.forEach((result_position, index) => {
+                projected[result_position] = row[index] ?? null;
             });
-            position += run_length;
-        }
-        return row_indices.map((row) => materialized.get(row)!);
+            return projected;
+        });
     }
 
     /**

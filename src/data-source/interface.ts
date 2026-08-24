@@ -85,6 +85,12 @@ export interface RawColumnWindow {
     rows: (RawCell | null)[][];
 }
 
+/** Raw cells selected by arbitrary source row and column indices. Both dimensions
+ * are returned in exactly the requested order, including duplicates. */
+export interface IndexedRawColumns {
+    rows: (RawCell | null)[][];
+}
+
 export interface ColumnWindow {
     startRow: number;
     rows: (RenderedCell | null)[][];
@@ -183,6 +189,14 @@ export interface DataSource {
         column_indices: readonly number[],
         is_cancelled: () => boolean,
     ): Promise<RawColumnWindow>;
+    /** Native arbitrary-row/column projection for sparse analysis and compare
+     * reads. The adapter validates indices before invoking this capability. */
+    read_raw_columns_indexed_async?(
+        sheet_index: number,
+        row_indices: ArrayLike<number>,
+        column_indices: readonly number[],
+        is_cancelled: () => boolean,
+    ): Promise<IndexedRawColumns>;
     /** Optional source semantics used by filter analysis. This must not change
      * raw identity: labels are display-only and category codes remain raw keys. */
     column_filter_metadata?(
@@ -283,6 +297,20 @@ function validate_row_indices(
         }
     }
     return sheet;
+}
+
+function validate_column_indices(
+    sheet: SheetMeta,
+    column_indices: ArrayLike<number>,
+): void {
+    for (let position = 0; position < column_indices.length; position++) {
+        const column = column_indices[position];
+        if (!Number.isInteger(column) || column < 0 || column >= sheet.columnCount) {
+            throw new RangeError(
+                `column index ${column} out of range (${sheet.columnCount} columns)`,
+            );
+        }
+    }
 }
 
 function read_adjacent_row_runs<Cell>(
@@ -478,16 +506,28 @@ export function read_source_raw_rows_indexed(
     return { rows: requested.map((row) => materialized.get(row)!) };
 }
 
-export async function read_source_raw_rows_indexed_async(
+/** Read arbitrary rows and columns while preserving both requested dimensions.
+ * Native sparse sources receive one complete request. The compatibility path
+ * reads only sorted adjacent row runs and restores duplicate/reordered rows. */
+export async function read_source_raw_columns_indexed_async(
     source: DataSource,
     sheet_index: number,
     row_indices: ArrayLike<number>,
+    column_indices: readonly number[],
     is_cancelled: () => boolean,
-): Promise<{ rows: (RawCell | null)[][] }> {
-    validate_row_indices(source, sheet_index, row_indices);
-    if (row_indices.length === 0) return { rows: [] };
-    if (!source.read_raw_columns_async) {
-        return read_source_raw_rows_indexed(source, sheet_index, row_indices);
+): Promise<IndexedRawColumns> {
+    const sheet = validate_row_indices(source, sheet_index, row_indices);
+    validate_column_indices(sheet, column_indices);
+    if (row_indices.length === 0 || column_indices.length === 0) return { rows: [] };
+    if (source.read_raw_columns_indexed_async) {
+        const result = await source.read_raw_columns_indexed_async(
+            sheet_index,
+            row_indices,
+            column_indices,
+            is_cancelled,
+        );
+        if (is_cancelled()) throw new DOMException('Operation cancelled', 'AbortError');
+        return result;
     }
 
     const requested = Array.from(row_indices);
@@ -495,17 +535,19 @@ export async function read_source_raw_rows_indexed_async(
     const unique = [...new Set(requested)].sort((a, b) => a - b);
     let position = 0;
     while (position < unique.length) {
+        if (is_cancelled()) throw new DOMException('Operation cancelled', 'AbortError');
         const start = unique[position];
         let count = 1;
         while (
             position + count < unique.length
             && unique[position + count] === start + count
         ) count += 1;
-        const rows = (await read_source_raw_rows_async(
+        const rows = (await read_source_raw_columns_async(
             source,
             sheet_index,
             start,
             count,
+            column_indices,
             is_cancelled,
         )).rows;
         for (let offset = 0; offset < count; offset++) {
@@ -513,5 +555,23 @@ export async function read_source_raw_rows_indexed_async(
         }
         position += count;
     }
+    if (is_cancelled()) throw new DOMException('Operation cancelled', 'AbortError');
     return { rows: requested.map((row) => materialized.get(row)!) };
+}
+
+export async function read_source_raw_rows_indexed_async(
+    source: DataSource,
+    sheet_index: number,
+    row_indices: ArrayLike<number>,
+    is_cancelled: () => boolean,
+): Promise<IndexedRawColumns> {
+    const sheet = source.meta().sheets[sheet_index];
+    if (!sheet) throw new RangeError(`sheet index ${sheet_index} out of range`);
+    return read_source_raw_columns_indexed_async(
+        source,
+        sheet_index,
+        row_indices,
+        Array.from({ length: sheet.columnCount }, (_, index) => index),
+        is_cancelled,
+    );
 }

@@ -1,83 +1,207 @@
 # Stage 4 — Stata release blockers resolved
 
-Stage 4 fixed four release-blocking defects in the read-only Stata data source.
-The implementation lives primarily in `src/data-source/dta-source.ts`, with
-comparison identity support in `src/data-source/interface.ts`,
-`src/cell-display.ts`, and `src/diff-compare/`.
+Stage 4 closes the release-blocking ownership, memory-bound, exactness, and
+lifecycle defects in the read-only Stata and compare paths. The implementation
+lives primarily in `src/data-source/dta-source.ts`, with the indexed raw-read
+contract in `src/data-source/interface.ts` and comparison changes in
+`src/diff-compare/`.
 
-## Legacy expansion fields
+## Parser 0.5 encoding parity and retained workarounds
 
-`DtaDataSource.create` now validates release 113/114/115 expansion fields before
-calling the dependency's synchronous `parse_legacy_metadata`
-(`dta-source.ts:213-218`, `:808-847`). The guard rejects negative lengths,
-truncation, non-advancing cursors, and more than 10,000 fields. The count limit
-prevents a bounded-size file containing millions of zero-length fields from
-monopolizing the extension host even though each individual cursor step is
-valid.
+`DtaDataSource.create` passes explicit text-encoding options through to
+`@jbearak/dta-parser` 0.5.0 and resolves one source encoding from
+`metadata.text_encoding ?? resolve_text_encoding(metadata.format_version)`.
+That resolved encoding is used consistently for fixed strings, text `strL`
+payloads, value-label table names, and value-label text.
 
-The call-site guard intentionally duplicates the dependency's legacy header
-layout. `@jbearak/dta-parser` cannot currently reject the malformed input before
-its scanner hangs, and a fixed dependency release was not available for this
-stage. The upstream fix is tracked as `jbearak/dta-parser#36`; once a fixed
-version is released and adopted, this duplicate guard can be removed.
+ISO-8859-1 is decoded directly as byte-to-code-point mapping. The Web
+`TextDecoder('iso-8859-1')` alias is not used because browsers map that label to
+Windows-1252; byte `0x80` must remain U+0080 under true ISO-8859-1 and become
+`€` only under Windows-1252.
 
-## Bounded strL object lookup
+The local release-aware legacy expansion-field pre-scan remains. Parser 0.5
+rejects malformed fields, but it does not impose a host-work bound on long
+sequences of valid zero-length fields, so the source caps expansion fields at
+10,000 before metadata parsing. Removing or moving this workaround, along with
+the remaining release-119 pointer shim and broader parser API consolidation, is
+explicitly deferred to Stage 5.
 
-The GSO location index is an LRU capped at 1,024 complete entries
-(`dta-source.ts:149-160`, `:641-648`). A complete index was deliberately not
-retained because one boxed `Map` entry per distinct strL can consume hundreds
-of MiB in addition to the file buffer.
+## Indexed asynchronous raw reads
 
-Bounded scan checkpoints preserve efficient backward lookup after an entry is
-evicted (`dta-source.ts:620-676`). Checkpoints are ordered by physical Stata
-GSO traversal order — observation first, then variable — rather than by the
-identity key (`variable * 2^32 + observation`). Identity and traversal order
-must remain separate: ordinary files with multiple strL columns are
-observation-major, so identity keys are not monotonic. The checkpoint list is
-also capped and thinned as it grows, keeping auxiliary memory independent of
-the number of distinct strLs.
+`DataSource` has an optional
+`read_raw_columns_indexed_async(sheet, rows, columns, isCancelled)` capability.
+The shared adapter validates the complete request before source invocation,
+preserves row and column order and duplicates, avoids source work for an empty
+dimension, and invokes a native implementation exactly once when one exists.
+The compatibility fallback sorts and deduplicates rows, reads only adjacent row
+runs, checks cancellation between runs, and restores the requested shape.
 
-On an index miss, a target already covered by the scanned prefix is looked up
-there before the unvisited tail is scanned (`dta-source.ts:521-559`). A fallback
-hit is promoted into the bounded LRU, so repeated older-range reads do not pay
-the checkpoint search again.
+`DtaDataSource` implements the native capability as one sparse request. It
+decodes only requested observation chunks without spanning row gaps, gathers
+all selected `strL` pointers into one target set, resolves that complete set,
+and restores duplicate or reordered rows and columns. Sparse compare reads
+therefore reach DTA as one native request per contributing side rather than as
+one request per adjacent run.
 
-## Binary strL identity and display
+## Location-first, request-bounded GSO resolution
 
-Binary type-129 GSOs now have separate display and comparison representations.
-Display and clipboard surfaces receive a bounded 32-byte hexadecimal preview
-such as `binary (N bytes): ...`; comparison code receives a domain-separated
-SHA-256-plus-length identity through `RenderedCell.comparisonKey`
-(`dta-source.ts:105-139`, `:713-726`, `:780-799`; `cell-display.ts:8-14`). A
-text strL can therefore exactly equal the displayed binary preview without
-colliding in row alignment or changed-cell detection.
+Stata permits GSO records in `<strls>` to appear in arbitrary physical order.
+The source scans physical-file order and never infers a location from the
+`(variable, observation)` identifier.
 
-The digest is used instead of the payload because comparison must remain
-correct without materializing a two-characters-per-byte hex string. Hashing is
-lazy: ordinary rendering and copying only build the fixed-size preview. Digests
-are computed when comparison identity is requested and retained in a separate
-bounded cache keyed by GSO content offset, so decoded-window eviction does not
-immediately force expensive blobs to be rehashed.
+Long-lived source state remains bounded:
 
-Both `read_raw_columns` and rendered reads still pass through the shared
-`resolve_cell` / `canonicalize_stata_raw` path (`dta-source.ts:364-378`,
-`:450-460`). This invariant prevents fast raw consumers and rendered comparison
-consumers from assigning different identities to the same Stata value.
+- a 1,024-entry GSO location LRU;
+- a 256-entry and 16 MiB decoded-GSO LRU;
+- forward and cyclic historical cursors plus exact scan-exhaustion state;
+- an exact, lazily allocated seen-identifier bitmap compacted to `strL`
+  variable ordinals; and
+- source lifecycle and cooperative scheduler state.
 
-## Regression coverage
+A request target contains only identifier fields and an optional physical
+`GsoEntry` location. It never retains decoded text or binary payloads. During
+materialization, a request-scoped decoded memo checks the request value first,
+then the bounded source decoded LRU, then the target/location followed by
+physical decode. This guarantees exactly-once decode within a sparse request
+even when the request has more unique `strL` values than the source LRU can
+retain. The memo is discarded before the public read returns.
 
-`src/test/dta-source.test.ts` now covers the gaps that allowed these defects
-through:
+The exact seen-ID bitmap records identifiers in the successfully scanned
+physical prefix. Its dense `strL` ordinals bound it to
+`nobs × strL-column-count` bits rather than `nobs × nvar`, while preserving
+nonadjacent duplicate detection after a location leaves the LRU.
 
-- a negative legacy expansion length in a child Vitest process with a generous
-  60-second fail-closed hang guard;
-- an adversarial run of 10,000 zero-length nonzero-type expansion fields;
-- an evicted early GSO revisited while the forward scan is only partially
-  advanced, including promotion back into the bounded index;
-- observation-major data with two strL columns;
-- a text value identical to the binary display preview but distinct in
-  comparison identity; and
-- a multi-MiB binary payload whose display remains bounded and whose digest is
-  not computed until comparison identity is requested.
+## One GSO transition machine
 
-No Stage 4 release blocker remains outstanding.
+Synchronous and asynchronous GSO drivers invoke the same physical transition
+function. Its phases are `cache`, `historical`, `forward`, and `done`.
+Historical lookup scans the already-validated prefix from a cyclic cursor and
+wraps at most once without advancing the source forward cursor. Unseen targets
+continue the lazy shared forward scan. Both phases stop as soon as the request
+is resolved.
+
+The asynchronous driver adds only scheduling and lifecycle behavior: it
+consumes bounded work, awaits the shared source gate, rechecks source epoch and
+caller cancellation, absorbs cache progress made by another read while
+suspended, and rebases if the shared forward cursor advanced. Exact duplicate
+rejection, unordered records, historical rescanning, and explicit exhaustion at
+the physical section end are shared with the synchronous driver.
+
+For tagged releases, the GSO payload boundary is the start of exact
+`</strls>`, not the following `<value_labels>` offset. Header and content bounds
+reserve the complete closing tag, so a payload cannot consume it and still be
+accepted.
+
+## Cooperative source scheduling
+
+One source-owned cooperative gate shares a pending macrotask promise across
+separately bounded counters for:
+
+- GSO headers;
+- observation cells;
+- value-label discovery and decoding; and
+- binary or payload bytes and jobs.
+
+The gate is not a mutex. Synchronous reads remain callable while asynchronous
+work is suspended, and concurrent asynchronous work can progress between
+yields. Numeric-only asynchronous projections therefore yield and observe
+cancellation even when no `strL` column is selected. Deferred binary digest
+single-flight jobs retain their cache bounds while routing work accounting
+through the same scheduler.
+
+## Monotonic value-label descriptors and exact boundaries
+
+Value-label discovery is independent of decoded-table caching. Construction
+captures the immutable set of nonempty table names referenced by worksheet
+variables. The source then maintains one release-aware layout, one monotonic
+physical discovery cursor, descriptors only for referenced names, and a
+verified-complete flag. Descriptors contain offsets and scalar layout data, not
+payload slices or decoded maps.
+
+The first physical table with a referenced name wins. Decoded-label LRU
+eviction leaves the descriptor catalog and discovery cursor intact, so
+re-decoding does not restart at the section beginning. A referenced name is
+published as missing only after the exact section terminal has been verified.
+Decoded tables remain bounded by both configured entry count and aggregate byte
+limits.
+
+Release-aware compatibility is preserved: release 105 supports fixed-eight
+labels and its known offset-table compatibility form; release 108 supports
+9-byte and 33-byte table names; releases 110–115 use 33-byte names. Legacy
+layout probing is resumable and cancellable through the cooperative gate.
+
+Tagged releases accept only exact `<lbl>…</lbl>` entries followed by exact
+`</value_labels>` at the expected section close. Offset-table payload length
+must equal `8 + 8 * count + textLength`; negative or out-of-range offsets are
+rejected; and each referenced label must contain a NUL terminator inside the
+declared text block.
+
+## Binary `strL` identity and display
+
+Binary type-129 GSOs have separate display and comparison representations.
+Display and clipboard surfaces receive a bounded 32-byte hexadecimal preview,
+while comparison receives a source-owned deferred SHA-256-plus-length identity.
+A text `strL` can therefore equal the displayed binary preview without becoming
+the same comparison value.
+
+Hashing stays lazy and single-flight. Completed identities are retained in a
+separately bounded cache keyed by content offset, and exact binary equality can
+compare backing bytes cooperatively without first hashing. Rendered and raw
+reads still share `resolve_cell` and `canonicalize_stata_raw`, preventing fast
+raw consumers from assigning a different identity to the same Stata value.
+
+## Exact move verification
+
+Row hashes remain the deterministic, inexpensive move-candidate selector, but
+hash equality no longer calls `claim()` directly. Tentative pairs are read in
+sparse batches no larger than `HASH_READ_BATCH`, and every column is checked
+with `cells_exactly_equal`, including deferred binary identities. Only a fully
+equal row is claimed as an exact move.
+
+Rejected collisions remain an addition plus a deletion for the existing
+bounded similarity phase; there is no quadratic search inside a collision
+bucket. The regression uses the current FNV collision `45zx` / `fpcd`, both
+`2244945817`, and proves that hash equality alone creates no move.
+
+## Compare lifecycle and metadata contribution
+
+A compare-operation fence captures the compare wrapper epoch and caller
+cancellation. Every asynchronous result is checked after awaits and immediately
+before cache insertion or publication.
+
+All genuinely two-sided operations use one paired settlement helper: both
+siblings start before either is awaited, a failure cancels its peer,
+`Promise.allSettled` waits for both siblings, and a substantive failure is
+preferred over the peer's resulting `AbortError`. The helper is shared by diff
+raw batches, aligned indexed reads, and mixed-side asynchronous filter metadata.
+One-sided asynchronous operations still use the same lifecycle fence.
+
+Filter metadata is merged by values that can actually appear in the compare
+grid. Added or unmatched modified sheets use modified metadata; appended
+deleted sheets use original metadata. On a matched sheet, modified rows
+contribute modified metadata, while original metadata contributes only when a
+deleted row can appear. Paired rows display modified values and do not make the
+original side contribute.
+
+When both sides contribute, `categoricalCodes` is ORed. A value label survives
+only when both callbacks define exactly the same string; conflicting or
+one-sided labels are omitted, while equal empty strings survive through explicit
+`undefined` checks. Raw values, filter identities, and comparison identities are
+unchanged.
+
+## Regression coverage and deferred stages
+
+Focused coverage spans the indexed adapter, DTA source, row alignment, and
+compare session. It includes native sparse ordering and batching, decoded and
+location cache bounds, shared GSO transitions, numeric and mixed-workload
+cancellation, monotonic descriptor discovery, verified missing-name
+publication, cancellable legacy probing, exact label and section boundaries,
+Windows-1252 versus true ISO-8859-1 behavior, the real FNV collision, sparse
+exact-move verification, paired sibling settlement, lifecycle fencing, and
+contribution-aware label merging. Asynchronous tests poll observable state with
+`vi.waitFor`; no fixed-delay or fixed-turn synchronization remains in the
+Stage 4 tests touched by this tranche.
+
+Stage 5 remains responsible for parser-workaround cleanup. Stage 6 remains the
+separate histogram-cache implementation for `jbearak/table-viewer#277`; neither
+is folded into this closure tranche.

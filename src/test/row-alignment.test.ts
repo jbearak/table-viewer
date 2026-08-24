@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { runInNewContext } from 'node:vm';
+import { describe, expect, it, vi } from 'vitest';
 import {
     ABSENT,
     AlignmentCancelledError,
@@ -23,7 +24,7 @@ const single = (rows: string[][]): FixtureSource =>
 const raw_cell = (raw: string): RawCell => ({ raw, rawType: 'string' });
 
 class RawFixtureSource implements DataSource {
-    constructor(private readonly fixture_rows: readonly (readonly (RawCell | null)[])[]) {}
+    constructor(protected readonly fixture_rows: readonly (readonly (RawCell | null)[])[]) {}
 
     meta(): WorkbookMeta {
         return {
@@ -60,6 +61,24 @@ class RawFixtureSource implements DataSource {
     close(): void {}
 }
 
+class IndexedRawFixtureSource extends RawFixtureSource {
+    readonly indexedReads: number[][] = [];
+
+    async read_raw_columns_indexed_async(
+        _sheet_index: number,
+        row_indices: ArrayLike<number>,
+        column_indices: readonly number[],
+    ) {
+        const requested = Array.from(row_indices);
+        this.indexedReads.push(requested);
+        return {
+            rows: requested.map((row) => column_indices.map(
+                (column) => this.fixture_rows[row]?.[column] ?? null,
+            )),
+        };
+    }
+}
+
 function deferred_binary_cell(key: string, raw_byte_length: number): RawCell {
     const identity: DeferredCellIdentity = {
         cachedKey: () => key,
@@ -74,6 +93,16 @@ function deferred_binary_cell(key: string, raw_byte_length: number): RawCell {
     return cell;
 }
 
+const eager_identity_cell = (
+    comparison_key: string,
+    raw_byte_length: number,
+): RawCell => ({
+    raw: '',
+    rawType: 'string',
+    comparisonKey: comparison_key,
+    rawByteLength: raw_byte_length,
+});
+
 const matched: SheetPairing = {
     status: 'matched',
     name: 'Sheet1',
@@ -87,6 +116,18 @@ const shape = (rows: readonly AlignedRow[]): string[] =>
         `${row.original === ABSENT ? '-' : row.original},${row.modified === ABSENT ? '-' : row.modified}`);
 
 const rows_of = (...values: string[]): string[][] => values.map((value) => [value]);
+
+function single_raw_cell_row_hash(raw: string): number {
+    let hash = 0x811c9dc5;
+    const mix = (value: number) => {
+        hash ^= value;
+        hash = Math.imul(hash, 0x01000193);
+    };
+    mix(1);
+    mix(raw.length);
+    for (let index = 0; index < raw.length; index++) mix(raw.charCodeAt(index));
+    return hash >>> 0;
+}
 
 describe('align_sheet', () => {
     it('pairs identical files row for row', async () => {
@@ -147,6 +188,104 @@ describe('align_sheet', () => {
         });
     });
 
+    it('rejects a real FNV collision instead of claiming an exact move', async () => {
+        expect(single_raw_cell_row_hash('45zx')).toBe(2244945817);
+        expect(single_raw_cell_row_hash('fpcd')).toBe(2244945817);
+
+        const alignment = await align_sheet(
+            single(rows_of('45zx', 'anchor')),
+            single(rows_of('anchor', 'fpcd')),
+            matched,
+            { maxMoveSearchRows: 0 },
+        );
+
+        expect(shape(alignment.rows)).toEqual(['0,-', '1,0', '-,1']);
+        expect(alignment).toMatchObject({
+            addedRows: 1,
+            deletedRows: 1,
+            movedRowIndices: [],
+        });
+    });
+
+    it('verifies exact move candidates through deferred cell equality', async () => {
+        const exactly_equals = vi.fn(() => true);
+        const deferred_cell = (identity: DeferredCellIdentity): RawCell => {
+            const value: RawCell = { raw: 'bounded preview', rawType: 'string' };
+            Object.defineProperty(value, DEFERRED_COMPARISON_IDENTITY, { value: identity });
+            return value;
+        };
+        const original_identity: DeferredCellIdentity = {
+            cachedKey: () => undefined,
+            resolveKey: async () => 'same-lossless-value',
+            exactlyEquals: exactly_equals,
+        };
+        const modified_identity: DeferredCellIdentity = {
+            cachedKey: () => undefined,
+            resolveKey: async () => 'same-lossless-value',
+        };
+        const alignment = await align_sheet(
+            new RawFixtureSource([
+                [deferred_cell(original_identity)],
+                [raw_cell('anchor')],
+            ]),
+            new RawFixtureSource([
+                [raw_cell('anchor')],
+                [deferred_cell(modified_identity)],
+            ]),
+            matched,
+        );
+
+        expect(exactly_equals).toHaveBeenCalled();
+        expect(shape(alignment.rows)).toEqual(['1,0', '0,1']);
+        expect(alignment.movedRowIndices).toEqual([1]);
+    });
+
+    it('reads exact move candidates sparsely in bounded batches', async () => {
+        const values = Array.from({ length: 600 }, (_, index) => `row-${index}`);
+        const original = new IndexedRawFixtureSource(
+            values.map((value) => [raw_cell(value)]),
+        );
+        const modified = new IndexedRawFixtureSource(
+            [...values].reverse().map((value) => [raw_cell(value)]),
+        );
+
+        const alignment = await align_sheet(original, modified, matched);
+
+        expect(alignment).toMatchObject({ addedRows: 0, deletedRows: 0 });
+        expect(original.indexedReads.some((rows) => rows.length === 512)).toBe(true);
+        expect(modified.indexedReads.some((rows) => rows.length === 512)).toBe(true);
+        expect([...original.indexedReads, ...modified.indexedReads]
+            .every((rows) => rows.length <= 512)).toBe(true);
+    });
+
+    it('yields during exact move verification so cancellation can arrive', async () => {
+        const moved_row = Array.from({ length: 300 }, () => raw_cell('same'));
+        const original = new IndexedRawFixtureSource([
+            moved_row,
+            [raw_cell('anchor')],
+        ]);
+        const modified = new IndexedRawFixtureSource([
+            [raw_cell('anchor')],
+            moved_row,
+        ]);
+        let cancellation_checks_after_exact_reads = 0;
+
+        await expect(align_sheet(original, modified, matched, {
+            isCancelled: () => {
+                if (original.indexedReads.length === 0 || modified.indexedReads.length === 0) {
+                    return false;
+                }
+                cancellation_checks_after_exact_reads += 1;
+                // Admit the modified adapter's final publication check. The next
+                // check is the real macrotask checkpoint after 256 exact cells.
+                return cancellation_checks_after_exact_reads > 1;
+            },
+        })).rejects.toBeInstanceOf(AlignmentCancelledError);
+        expect(original.indexedReads).toHaveLength(1);
+        expect(modified.indexedReads).toHaveLength(1);
+        expect(cancellation_checks_after_exact_reads).toBe(2);
+    });
+
     it('reports the changed cells of a row that moved and was edited', async () => {
         // The case that motivates move detection. Before it existed this was
         // one deletion plus one addition with changedCells 0 — the 20 to 99
@@ -187,7 +326,113 @@ describe('align_sheet', () => {
         });
     });
 
-    it('pairs a whole re-sort on hashes alone', async () => {
+    it('normalizes move candidates returned through a cross-realm promise', async () => {
+        const cross_realm_key = runInNewContext(
+            'Promise.resolve("same-lossless-value")',
+        ) as Promise<string>;
+        const deferred_cell = (preview: string): RawCell => {
+            const identity: DeferredCellIdentity = {
+                cachedKey: () => undefined,
+                resolveKey: () => cross_realm_key,
+            };
+            const value: RawCell = {
+                raw: preview,
+                rawType: 'string',
+                rawByteLength: 1024,
+            };
+            Object.defineProperty(value, DEFERRED_COMPARISON_IDENTITY, { value: identity });
+            return value;
+        };
+        const original = new RawFixtureSource([
+            [deferred_cell('old preview'), raw_cell('x')],
+            [raw_cell('anchor')],
+        ]);
+        const modified = new RawFixtureSource([
+            [raw_cell('anchor')],
+            [deferred_cell('new preview'), raw_cell('y')],
+        ]);
+
+        const alignment = await align_sheet(original, modified, matched);
+
+        expect(shape(alignment.rows)).toEqual(['1,0', '0,1']);
+        expect(alignment).toMatchObject({
+            addedRows: 0,
+            deletedRows: 0,
+            changedCells: 1,
+            movedRowIndices: [1],
+        });
+    });
+
+    it('weights an eager comparison identity by source bytes when scoring a move', async () => {
+        const key = `stata-binary:sha256:${'b'.repeat(64)}:1024`;
+        const original = new RawFixtureSource([
+            [eager_identity_cell(key, 1024), raw_cell('x'.repeat(200))],
+            [raw_cell('anchor')],
+        ]);
+        const modified = new RawFixtureSource([
+            [raw_cell('anchor')],
+            [eager_identity_cell(key, 1024), raw_cell('y'.repeat(200))],
+        ]);
+
+        const alignment = await align_sheet(original, modified, matched);
+
+        expect(shape(alignment.rows)).toEqual(['1,0', '0,1']);
+        expect(alignment).toMatchObject({
+            addedRows: 0,
+            deletedRows: 0,
+            changedCells: 1,
+            movedRowIndices: [1],
+            changedRowIndices: [1],
+        });
+    });
+
+    it('does not pair distinct zero-preview comparison identities as a move', async () => {
+        const original = new RawFixtureSource([
+            [eager_identity_cell('old-id', 0)],
+            [raw_cell('anchor')],
+        ]);
+        const modified = new RawFixtureSource([
+            [raw_cell('anchor')],
+            [eager_identity_cell('new-id', 0)],
+        ]);
+
+        const alignment = await align_sheet(original, modified, matched);
+
+        expect(alignment).toMatchObject({
+            addedRows: 1,
+            deletedRows: 1,
+            movedRowIndices: [],
+        });
+    });
+
+    it('still pairs the same zero-preview comparison identity as a move', async () => {
+        const original = new RawFixtureSource([
+            [eager_identity_cell('same-id', 0)],
+            [raw_cell('anchor')],
+        ]);
+        const modified = new RawFixtureSource([
+            [raw_cell('anchor')],
+            [eager_identity_cell('same-id', 0)],
+        ]);
+
+        const alignment = await align_sheet(original, modified, matched);
+
+        expect(shape(alignment.rows)).toEqual(['1,0', '0,1']);
+        expect(alignment.movedRowIndices).toEqual([1]);
+    });
+
+    it('still pairs an ordinary blank row as a move', async () => {
+        const alignment = await align_sheet(
+            single([[''], ['anchor']]),
+            single([['anchor'], ['']]),
+            matched,
+        );
+
+        expect(shape(alignment.rows)).toEqual(['1,0', '0,1']);
+        expect(alignment.movedRowIndices).toEqual([1]);
+    });
+
+    it('pairs a whole re-sort after exact candidate verification', async () => {
         const alignment = await align_sheet(
             single(rows_of('a', 'b', 'c', 'd')),
             single(rows_of('d', 'c', 'b', 'a')),
@@ -221,6 +466,25 @@ describe('align_sheet', () => {
         );
         expect(alignment).toMatchObject({
             addedRows: 1, deletedRows: 1, movedRowIndices: [],
+        });
+    });
+
+    it('does not count comparison namespaces as sparse-row content', async () => {
+        const alignment = await align_sheet(
+            single([
+                ['old-id', '', '', ''],
+                ['anchor', '', '', ''],
+            ]),
+            single([
+                ['anchor', '', '', ''],
+                ['new-id', '', '', ''],
+            ]),
+            matched,
+        );
+        expect(alignment).toMatchObject({
+            addedRows: 1,
+            deletedRows: 1,
+            movedRowIndices: [],
         });
     });
 
@@ -589,7 +853,7 @@ describe('align_sheet', () => {
         })).rejects.toBeInstanceOf(AlignmentCancelledError);
     });
 
-    it('checks change-count cancellation at a non-dividing row checkpoint', async () => {
+    it('stops change counting when sparse raw reads observe cancellation', async () => {
         const rows = rows_of(...Array.from({ length: 1_200 }, (_, index) => `r${index}`));
         const original = single(rows);
         let original_reads = 0;
@@ -601,7 +865,8 @@ describe('align_sheet', () => {
                 return (...args: unknown[]) => {
                     original_reads += 1;
                     // Hashing uses three 512-row reads. The fourth starts change
-                    // counting; a 700-row checkpoint is reached in its next batch.
+                    // counting and arms cancellation; the indexed raw adapter
+                    // observes it before a later fallback run can start.
                     if (original_reads > 3) counting_changes = true;
                     return (value as (...a: unknown[]) => unknown).apply(target, args);
                 };
@@ -612,7 +877,7 @@ describe('align_sheet', () => {
             rowsPerCheckpoint: 700,
             isCancelled: () => counting_changes,
         })).rejects.toBeInstanceOf(AlignmentCancelledError);
-        expect(original_reads).toBe(5);
+        expect(original_reads).toBe(4);
     });
 
     it('throws when cancelled before a sheet too small to checkpoint', async () => {

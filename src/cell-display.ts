@@ -21,6 +21,12 @@ function concrete_comparison_key(
     return cell?.comparisonKey ?? comparison_identity(cell)?.cachedKey();
 }
 
+export function has_cell_comparison_identity(
+    cell: RawCell | null | undefined,
+): boolean {
+    return cell?.comparisonKey !== undefined || comparison_identity(cell) !== undefined;
+}
+
 function tagged_raw_text(cell: RawCell | null | undefined): string {
     return `raw:${get_raw_cell_text(cell?.raw ?? null)}`;
 }

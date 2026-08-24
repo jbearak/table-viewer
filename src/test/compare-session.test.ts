@@ -2,13 +2,15 @@ import { describe, expect, it, vi } from 'vitest';
 import { CompareDataSource, align_workbook } from '../diff-compare/compare-session';
 import {
     DEFERRED_COMPARISON_IDENTITY,
+    type ColumnFilterMetadata,
     type DataSource,
+    type IndexedRawColumns,
     type RawCell,
     type RawColumnWindow,
     type RenderedCell,
     type WorkbookMeta,
 } from '../data-source/interface';
-import type { SheetAlignment } from '../diff-compare/row-alignment';
+import { ABSENT, type SheetAlignment } from '../diff-compare/row-alignment';
 import { cell, FixtureSource } from './helpers/fixture-source';
 
 /** Serves cells verbatim, unlike FixtureSource's string rows, so a test can
@@ -62,15 +64,16 @@ class AsyncRawSource implements DataSource {
     closed = false;
 
     constructor(
-        private readonly rows: RenderedCell[][],
-        private readonly rawReader?: (request: RawReadRequest) => Promise<RawColumnWindow>,
+        protected readonly rows: RenderedCell[][],
+        protected readonly rawReader?: (request: RawReadRequest) => Promise<RawColumnWindow>,
+        protected readonly sheetName = 'Sheet1',
     ) {}
 
     meta(): WorkbookMeta {
         return {
             hasFormatting: true,
             sheets: [{
-                name: 'Sheet1',
+                name: this.sheetName,
                 rowCount: this.rows.length,
                 sourceRowCount: this.rows.length,
                 columnCount: this.rows.reduce((width, row) => Math.max(width, row.length), 0),
@@ -118,6 +121,76 @@ class AsyncRawSource implements DataSource {
 
     close(): void {
         this.closed = true;
+    }
+}
+
+interface IndexedRawReadRequest {
+    readonly rows: readonly number[];
+    readonly columns: readonly number[];
+    readonly isCancelled: () => boolean;
+}
+
+class IndexedAsyncRawSource extends AsyncRawSource {
+    readonly indexedRawReads: IndexedRawReadRequest[] = [];
+
+    constructor(
+        rows: RenderedCell[][],
+        private readonly indexedReader?: (
+            request: IndexedRawReadRequest,
+        ) => Promise<IndexedRawColumns>,
+        sheet_name = 'Sheet1',
+    ) {
+        super(rows, undefined, sheet_name);
+    }
+
+    read_raw_columns_indexed_async(
+        _sheet: number,
+        row_indices: ArrayLike<number>,
+        columns: readonly number[],
+        is_cancelled: () => boolean,
+    ): Promise<IndexedRawColumns> {
+        const request = { rows: Array.from(row_indices), columns, isCancelled: is_cancelled };
+        this.indexedRawReads.push(request);
+        if (this.indexedReader) return this.indexedReader(request);
+        return Promise.resolve({
+            rows: request.rows.map((row) => columns.map((column): RawCell | null => {
+                const source = this.rows[row]?.[column];
+                return source ? {
+                    raw: source.raw,
+                    ...(source.rawType === undefined ? {} : { rawType: source.rawType }),
+                } : null;
+            })),
+        });
+    }
+}
+
+class MetadataSource extends AsyncRawSource {
+    readonly metadataReads: { isCancelled: () => boolean }[] = [];
+
+    constructor(
+        rows: RenderedCell[][],
+        private readonly filterMetadata: ColumnFilterMetadata | undefined,
+        private readonly metadataReader?: (
+            is_cancelled: () => boolean,
+        ) => Promise<ColumnFilterMetadata | undefined>,
+        sheet_name = 'Sheet1',
+    ) {
+        super(rows, undefined, sheet_name);
+    }
+
+    column_filter_metadata(): ColumnFilterMetadata | undefined {
+        return this.filterMetadata;
+    }
+
+    column_filter_metadata_async(
+        _sheet: number,
+        _column: number,
+        is_cancelled: () => boolean,
+    ): Promise<ColumnFilterMetadata | undefined> {
+        this.metadataReads.push({ isCancelled: is_cancelled });
+        return this.metadataReader
+            ? this.metadataReader(is_cancelled)
+            : Promise.resolve(this.filterMetadata);
     }
 }
 
@@ -387,6 +460,338 @@ describe('CompareDataSource', () => {
         });
         original_gate.reject(failure);
         await vi.waitFor(() => expect(modified.rawReads[0].isCancelled()).toBe(true));
+        expect(settled).toBe(false);
+
+        modified_gate.reject(abort_error());
+        await rejection;
+        expect(settled).toBe(true);
+    });
+
+    it('reads each contributing aligned side through one indexed request', async () => {
+        const original = new IndexedAsyncRawSource([
+            [cell('O0')], [cell('O1')], [cell('O2')], [cell('O3')],
+        ]);
+        const modified = new IndexedAsyncRawSource([[cell('M0')], [cell('M1')]]);
+        const alignment: SheetAlignment = {
+            rows: [
+                { original: 0, modified: 0 },
+                { original: 1, modified: ABSENT },
+                { original: 2, modified: 1 },
+                { original: 3, modified: ABSENT },
+            ],
+            addedRows: 0,
+            deletedRows: 2,
+            changedCells: 2,
+            changedRowIndices: [0, 2],
+            movedRowIndices: [],
+            moveSearchTruncated: false,
+            degraded: false,
+        };
+        const source = new CompareDataSource(
+            modified,
+            original,
+            new Map([[0, alignment]]),
+        );
+
+        const window = await source.read_raw_columns_async(0, 0, 4, [0], () => false);
+
+        expect(window.rows.map((row) => row[0]?.raw)).toEqual(['M0', 'O1', 'M1', 'O3']);
+        expect(modified.indexedRawReads.map((request) => request.rows)).toEqual([[0, 1]]);
+        expect(original.indexedRawReads.map((request) => request.rows)).toEqual([[1, 3]]);
+    });
+
+    it('settles both aligned indexed reads and cancels the peer after failure', async () => {
+        const original_gate = deferred<IndexedRawColumns>();
+        const modified_gate = deferred<IndexedRawColumns>();
+        const original = new IndexedAsyncRawSource(
+            [[cell('O0')], [cell('O1')]],
+            () => original_gate.promise,
+        );
+        const modified = new IndexedAsyncRawSource(
+            [[cell('M0')]],
+            () => modified_gate.promise,
+        );
+        const alignment: SheetAlignment = {
+            rows: [
+                { original: 0, modified: 0 },
+                { original: 1, modified: ABSENT },
+            ],
+            addedRows: 0,
+            deletedRows: 1,
+            changedCells: 0,
+            changedRowIndices: [],
+            movedRowIndices: [],
+            moveSearchTruncated: false,
+            degraded: false,
+        };
+        const source = new CompareDataSource(modified, original, new Map([[0, alignment]]));
+        const failure = new Error('indexed original failed');
+
+        const pending = source.read_raw_columns_async(0, 0, 2, [0], () => false);
+        let settled = false;
+        void pending.finally(() => { settled = true; }).catch(() => {});
+        const rejection = expect(pending).rejects.toBe(failure);
+        await vi.waitFor(() => {
+            expect(original.indexedRawReads).toHaveLength(1);
+            expect(modified.indexedRawReads).toHaveLength(1);
+        });
+        original_gate.reject(failure);
+        await vi.waitFor(() =>
+            expect(modified.indexedRawReads[0].isCancelled()).toBe(true));
+        expect(settled).toBe(false);
+        modified_gate.reject(abort_error());
+        await rejection;
+        expect(settled).toBe(true);
+    });
+
+    it('prevents aligned raw publication after close', async () => {
+        const original_gate = deferred<IndexedRawColumns>();
+        const modified_gate = deferred<IndexedRawColumns>();
+        const original = new IndexedAsyncRawSource(
+            [[cell('O0')], [cell('O1')]],
+            () => original_gate.promise,
+        );
+        const modified = new IndexedAsyncRawSource(
+            [[cell('M0')]],
+            () => modified_gate.promise,
+        );
+        const alignment: SheetAlignment = {
+            rows: [
+                { original: 0, modified: 0 },
+                { original: 1, modified: ABSENT },
+            ],
+            addedRows: 0,
+            deletedRows: 1,
+            changedCells: 0,
+            changedRowIndices: [],
+            movedRowIndices: [],
+            moveSearchTruncated: false,
+            degraded: false,
+        };
+        const source = new CompareDataSource(modified, original, new Map([[0, alignment]]));
+
+        const pending = source.read_raw_columns_async(0, 0, 2, [0], () => false);
+        await vi.waitFor(() => {
+            expect(original.indexedRawReads).toHaveLength(1);
+            expect(modified.indexedRawReads).toHaveLength(1);
+        });
+        source.close();
+        original_gate.resolve({ rows: [[{ raw: 'O1' }]] });
+        modified_gate.resolve({ rows: [[{ raw: 'M0' }]] });
+        await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    });
+
+    it('merges filter metadata by actual grid contribution', async () => {
+        const labels = (values: Record<string, string>): ColumnFilterMetadata['valueLabel'] =>
+            (raw) => values[raw];
+        const original = new MetadataSource(
+            [[cell('1')], [cell('deleted')]],
+            {
+                categoricalCodes: true,
+                valueLabel: labels({ '1': '', '2': 'Original', '3': 'Same', '4': 'Only original' }),
+            },
+        );
+        const modified = new MetadataSource(
+            [[cell('1')]],
+            {
+                categoricalCodes: false,
+                valueLabel: labels({ '1': '', '2': 'Modified', '3': 'Same' }),
+            },
+        );
+        const alignment: SheetAlignment = {
+            rows: [
+                { original: 0, modified: 0 },
+                { original: 1, modified: ABSENT },
+            ],
+            addedRows: 0,
+            deletedRows: 1,
+            changedCells: 0,
+            changedRowIndices: [],
+            movedRowIndices: [],
+            moveSearchTruncated: false,
+            degraded: false,
+        };
+        const source = new CompareDataSource(modified, original, new Map([[0, alignment]]));
+
+        for (const metadata of [
+            source.column_filter_metadata(0, 0),
+            await source.column_filter_metadata_async(0, 0, () => false),
+        ]) {
+            expect(metadata?.categoricalCodes).toBe(true);
+            expect(metadata?.valueLabel?.('1')).toBe('');
+            expect(metadata?.valueLabel?.('2')).toBeUndefined();
+            expect(metadata?.valueLabel?.('3')).toBe('Same');
+            expect(metadata?.valueLabel?.('4')).toBeUndefined();
+        }
+        expect(original.metadataReads).toHaveLength(1);
+        expect(modified.metadataReads).toHaveLength(1);
+    });
+
+    it('uses only the side whose rows can contribute filter values', async () => {
+        const original = new MetadataSource(
+            [[cell('old')]],
+            { valueLabel: () => 'original' },
+        );
+        const modified = new MetadataSource(
+            [[cell('new')]],
+            { valueLabel: () => 'modified' },
+        );
+        const source = new CompareDataSource(
+            modified,
+            original,
+            new Map([[0, positional_alignment([])]]),
+        );
+
+        const paired = await source.column_filter_metadata_async(0, 0, () => false);
+        expect(paired?.valueLabel?.('x')).toBe('modified');
+        expect(modified.metadataReads).toHaveLength(1);
+        expect(original.metadataReads).toHaveLength(0);
+
+        const added = new MetadataSource(
+            [[cell('new')]],
+            { valueLabel: () => 'added' },
+            undefined,
+            'Fresh',
+        );
+        const deleted = new MetadataSource(
+            [[cell('old')]],
+            { valueLabel: () => 'deleted' },
+            undefined,
+            'Gone',
+        );
+        const one_sided = new CompareDataSource(added, deleted);
+        expect(one_sided.column_filter_metadata(0, 0)?.valueLabel?.('x')).toBe('added');
+        expect(one_sided.column_filter_metadata(1, 0)?.valueLabel?.('x')).toBe('deleted');
+    });
+
+    it('counts fallback trailing rows and includes their original metadata', async () => {
+        const original = new MetadataSource(
+            [[cell('kept')], [cell('deleted')]],
+            { categoricalCodes: true, valueLabel: () => 'original' },
+        );
+        const modified = new MetadataSource(
+            [[cell('kept')]],
+            { categoricalCodes: false, valueLabel: () => 'modified' },
+        );
+        const source = new CompareDataSource(modified, original);
+
+        expect(source.change_counts()).toMatchObject({ addedRows: 0, deletedRows: 1 });
+        for (const metadata of [
+            source.column_filter_metadata(0, 0),
+            await source.column_filter_metadata_async(0, 0, () => false),
+        ]) {
+            expect(metadata?.categoricalCodes).toBe(true);
+            expect(metadata?.valueLabel?.('x')).toBeUndefined();
+        }
+        expect(original.metadataReads).toHaveLength(1);
+        expect(modified.metadataReads).toHaveLength(1);
+    });
+
+    it('marks a synchronous startup failure before starting its metadata peer', async () => {
+        const failure = new Error('modified metadata failed synchronously');
+        let original_started_cancelled = false;
+        const original = new MetadataSource(
+            [[cell('kept')], [cell('deleted')]],
+            undefined,
+            (is_cancelled) => {
+                original_started_cancelled = is_cancelled();
+                return Promise.reject(abort_error());
+            },
+        );
+        const modified = new MetadataSource(
+            [[cell('kept')]],
+            undefined,
+            () => { throw failure; },
+        );
+        const source = new CompareDataSource(modified, original);
+
+        await expect(source.column_filter_metadata_async(0, 0, () => false))
+            .rejects.toBe(failure);
+        expect(original_started_cancelled).toBe(true);
+    });
+
+    it('settles mixed-side metadata peers and fences close', async () => {
+        const original_gate = deferred<ColumnFilterMetadata | undefined>();
+        const modified_gate = deferred<ColumnFilterMetadata | undefined>();
+        const original = new MetadataSource(
+            [[cell('old')], [cell('deleted')]],
+            undefined,
+            () => original_gate.promise,
+        );
+        const modified = new MetadataSource(
+            [[cell('new')]],
+            undefined,
+            () => modified_gate.promise,
+        );
+        const alignment: SheetAlignment = {
+            rows: [
+                { original: 0, modified: 0 },
+                { original: 1, modified: ABSENT },
+            ],
+            addedRows: 0,
+            deletedRows: 1,
+            changedCells: 0,
+            changedRowIndices: [],
+            movedRowIndices: [],
+            moveSearchTruncated: false,
+            degraded: false,
+        };
+        const source = new CompareDataSource(modified, original, new Map([[0, alignment]]));
+
+        const pending = source.column_filter_metadata_async(0, 0, () => false);
+        await vi.waitFor(() => {
+            expect(original.metadataReads).toHaveLength(1);
+            expect(modified.metadataReads).toHaveLength(1);
+        });
+        source.close();
+        expect(original.metadataReads[0].isCancelled()).toBe(true);
+        expect(modified.metadataReads[0].isCancelled()).toBe(true);
+        original_gate.resolve({ categoricalCodes: true });
+        modified_gate.resolve({ categoricalCodes: true });
+        await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    });
+
+    it('waits for a cancelled metadata peer and preserves the substantive failure', async () => {
+        const original_gate = deferred<ColumnFilterMetadata | undefined>();
+        const modified_gate = deferred<ColumnFilterMetadata | undefined>();
+        const original = new MetadataSource(
+            [[cell('old')], [cell('deleted')]],
+            undefined,
+            () => original_gate.promise,
+        );
+        const modified = new MetadataSource(
+            [[cell('new')]],
+            undefined,
+            () => modified_gate.promise,
+        );
+        const alignment: SheetAlignment = {
+            rows: [
+                { original: 0, modified: 0 },
+                { original: 1, modified: ABSENT },
+            ],
+            addedRows: 0,
+            deletedRows: 1,
+            changedCells: 0,
+            changedRowIndices: [],
+            movedRowIndices: [],
+            moveSearchTruncated: false,
+            degraded: false,
+        };
+        const source = new CompareDataSource(modified, original, new Map([[0, alignment]]));
+        const failure = new Error('original metadata failed');
+
+        const pending = source.column_filter_metadata_async(0, 0, () => false);
+        let settled = false;
+        void pending.finally(() => { settled = true; }).catch(() => {});
+        const rejection = expect(pending).rejects.toBe(failure);
+        await vi.waitFor(() => {
+            expect(original.metadataReads).toHaveLength(1);
+            expect(modified.metadataReads).toHaveLength(1);
+        });
+        original_gate.reject(failure);
+        await vi.waitFor(() => {
+            expect(modified.metadataReads[0].isCancelled()).toBe(true);
+        });
         expect(settled).toBe(false);
 
         modified_gate.reject(abort_error());

@@ -6,7 +6,6 @@
 // insertion point shifts. Aligning the two sides first is what makes
 // added/deleted mean what they say.
 import {
-    DEFERRED_COMPARISON_IDENTITY,
     read_source_raw_rows_async,
     read_source_raw_rows_indexed_async,
     type DataSource,
@@ -15,6 +14,7 @@ import {
 } from '../data-source/interface';
 import {
     cells_exactly_equal,
+    has_cell_comparison_identity,
     materialize_cell_comparison_text,
 } from '../cell-display';
 import type { SheetPairing } from './compare-source';
@@ -126,6 +126,8 @@ function yield_to_event_loop(): Promise<void> {
 }
 /** Rows read from a side in one batched call while hashing. */
 const HASH_READ_BATCH = 512;
+/** Exact cell comparisons between real event-loop checkpoints. */
+const EXACT_MOVE_CELLS_PER_CHECKPOINT = 256;
 
 /**
  * Default effort cap. Myers costs O(ND) with D the edit distance, so this
@@ -213,9 +215,9 @@ function visit_materialized_comparison_cells(
  * it silently aligns two structurally different rows. Lengths cannot appear in
  * the text stream, so the encoding is unambiguous.
  *
- * Chance collisions between unrelated rows remain possible at 32 bits and are
- * accepted: confirming a match would mean re-reading both rows' cells, and the
- * cost of being wrong is a mis-paired row in a diff, not corrupted data.
+ * Chance collisions between unrelated rows remain possible at 32 bits. Hashes
+ * are only alignment/candidate selectors: the exact-move phase re-reads and
+ * compares actual cells before consuming a delete/add pair.
  */
 function hash_row(
     cells: readonly (RawCell | null)[],
@@ -227,10 +229,16 @@ function hash_row(
         hash ^= value;
         hash = Math.imul(hash, 0x01000193);
     };
-    const mix_text = (text: string) => {
-        mix(text.length);
-        for (let position = 0; position < text.length; position++) {
-            mix(text.charCodeAt(position));
+    const mix_text = (tagged_text: string) => {
+        const comparison_identity = tagged_text.startsWith('comparison:');
+        const text_start = comparison_identity ? 'comparison:'.length : 'raw:'.length;
+        const text_length = tagged_text.length - text_start;
+        // Preserve the established raw-row encoding while keeping deferred/eager
+        // comparison identities in a disjoint namespace. Complementing the
+        // identity length cannot collide with an ordinary nonnegative length.
+        mix(comparison_identity ? ~text_length : text_length);
+        for (let position = text_start; position < tagged_text.length; position++) {
+            mix(tagged_text.charCodeAt(position));
         }
     };
     mix(column_count);
@@ -334,9 +342,9 @@ interface EditScript {
  * `degraded` is returned when the edit distance exceeds `max_distance`, in
  * which case `ops` is meaningless and the caller falls back to positional.
  *
- * Equality here is hash equality; the caller confirms candidate pairs by
- * comparing actual cell text, so a collision costs an extra read and a
- * spuriously "changed" row, never a wrong row count.
+ * Equality here is hash equality. Paired edit-script rows are later reported by
+ * exact cell comparison, while hash-selected move candidates are verified before
+ * they consume their delete/add rows.
  */
 async function myers_diff(
     left: Uint32Array,
@@ -757,9 +765,9 @@ function build_rows(
 
 /**
  * Count added/deleted/changed over the aligned rows, confirming paired rows by
- * actual cell text. This is also what catches a hash collision: two rows the
- * aligner paired on equal hashes are compared here like any other pair, so a
- * collision shows up as a changed row, never as a wrong total.
+ * actual cell equality. Move candidates have already passed the same exact-cell
+ * policy; this pass reports edits but cannot restore one-sided rows after a move
+ * claim, which is why move verification happens before `claim()`.
  */
 async function count_changes(
     original: DataSource,
@@ -855,20 +863,24 @@ interface Leftover {
  * comparison would re-derive the same row's text once per row it is scored
  * against — O(n*m*columns) string extraction for O(n+m) distinct rows.
  */
+interface WeightedCandidateCell {
+    readonly column: number;
+    readonly text: string;
+    readonly weight: number;
+}
+
 interface CandidateRow {
-    readonly texts: readonly string[];
-    readonly weights: readonly number[];
+    /** Positive-weight cells plus explicit zero-weight identities. Ordinary blank
+     *  cells are omitted so sparse rows stay sparse during quadratic scoring. */
+    readonly cells: readonly WeightedCandidateCell[];
     /** Total comparison weight, the similarity denominator. Not an integer risk:
      *  a sum over cells could exceed 2^32 on a pathological row, and JS numbers
      *  carry that exactly where a Uint32 would wrap. */
     readonly length: number;
 }
 
-function comparison_cell_weight(cell: ComparisonCell, text: string): number {
-    return cell?.[DEFERRED_COMPARISON_IDENTITY] !== undefined
-        && cell.rawByteLength !== undefined
-        ? cell.rawByteLength
-        : text.length;
+function comparison_cell_weight(cell: ComparisonCell): number {
+    return cell?.rawByteLength ?? cell?.raw?.length ?? 0;
 }
 
 function normalize_candidate(
@@ -876,21 +888,22 @@ function normalize_candidate(
     column_count: number,
     is_cancelled: () => boolean,
 ): CandidateRow | Promise<CandidateRow> {
-    const texts: string[] = [];
-    const weights: number[] = [];
+    const normalized: WeightedCandidateCell[] = [];
     let length = 0;
     const materialized = visit_materialized_comparison_cells(
-        column_count,
+        Math.min(column_count, cells?.length ?? 0),
         (column) => cells?.[column],
         is_cancelled,
         (text, column) => {
-            const weight = comparison_cell_weight(cells?.[column], text);
-            texts.push(text);
-            weights.push(weight);
+            const cell = cells?.[column];
+            const weight = comparison_cell_weight(cell);
+            if (weight > 0 || has_cell_comparison_identity(cell)) {
+                normalized.push({ column, text, weight });
+            }
             length += weight;
         },
     );
-    const finish = (): CandidateRow => ({ texts, weights, length });
+    const finish = (): CandidateRow => ({ cells: normalized, length });
     return materialized === undefined ? finish() : materialized.then(finish);
 }
 
@@ -902,9 +915,14 @@ async function normalize_candidates(
     const normalized: CandidateRow[] = [];
     for (const cells of rows) {
         const candidate = normalize_candidate(cells, column_count, is_cancelled);
-        normalized.push(typeof candidate === 'object' && 'texts' in candidate
-            ? candidate
-            : await alignment_source_read(() => candidate));
+        const then = (
+            typeof candidate === 'object' && candidate !== null
+        ) || typeof candidate === 'function'
+            ? (candidate as PromiseLike<CandidateRow>).then
+            : undefined;
+        normalized.push(typeof then === 'function'
+            ? await alignment_source_read(() => Promise.resolve(candidate))
+            : candidate as CandidateRow);
     }
     return normalized;
 }
@@ -930,13 +948,35 @@ async function normalize_candidates(
  */
 function similarity_of(left: CandidateRow, right: CandidateRow): number {
     const max_total = Math.max(left.length, right.length);
-    // Two empty rows are identical, not undefined. Returning 0 here would
-    // leave a moved blank separator row as a delete plus an add.
-    if (max_total === 0) return 1;
+    // Ordinary blank rows have no cells and remain identical. Explicit
+    // zero-weight identities (for example, empty binary payloads) must agree;
+    // otherwise different values with empty previews would be paired as moves.
+    if (max_total === 0) {
+        if (left.cells.length !== right.cells.length) return 0;
+        return left.cells.every((cell, index) => {
+            const other = right.cells[index];
+            return cell.column === other.column && cell.text === other.text;
+        }) ? 1 : 0;
+    }
     let matched = 0;
-    for (let col = 0; col < left.texts.length; col++) {
-        if (left.texts[col] !== right.texts[col]) continue;
-        matched += Math.min(left.weights[col], right.weights[col]);
+    let left_index = 0;
+    let right_index = 0;
+    while (left_index < left.cells.length && right_index < right.cells.length) {
+        const left_cell = left.cells[left_index];
+        const right_cell = right.cells[right_index];
+        if (left_cell.column < right_cell.column) {
+            left_index++;
+            continue;
+        }
+        if (right_cell.column < left_cell.column) {
+            right_index++;
+            continue;
+        }
+        if (left_cell.text === right_cell.text) {
+            matched += Math.min(left_cell.weight, right_cell.weight);
+        }
+        left_index++;
+        right_index++;
     }
     // Every column is scored, with no early exit once the threshold is
     // cleared: the score also ranks candidates against each other, so
@@ -944,6 +984,74 @@ function similarity_of(left: CandidateRow, right: CandidateRow): number {
     // half" and leave only displacement to choose between a 50% match and a
     // 95% one.
     return is_at_least_half(matched, max_total) ? matched / max_total : 0;
+}
+
+interface ExactMoveCandidate {
+    readonly originalRow: number;
+    readonly modifiedRow: number;
+}
+
+/** Verify hash-selected candidates in sparse bounded batches before they can
+ * consume one-sided rows. A collision is simply rejected and left for the
+ * existing bounded similarity phase. */
+async function verify_exact_move_candidates(
+    original: DataSource,
+    modified: DataSource,
+    pairing: Extract<SheetPairing, { status: 'matched' }>,
+    candidates: readonly ExactMoveCandidate[],
+    claim: (original_row: number, modified_row: number) => void,
+    options: AlignSheetOptions,
+): Promise<void> {
+    const column_count = Math.max(
+        original.meta().sheets[pairing.originalIndex].columnCount,
+        modified.meta().sheets[pairing.modifiedIndex].columnCount,
+    );
+    const is_cancelled = options.isCancelled ?? NEVER_CANCELLED;
+    let cells_since_checkpoint = 0;
+    for (let start = 0; start < candidates.length; start += HASH_READ_BATCH) {
+        if (options.isCancelled?.()) throw new AlignmentCancelledError();
+        const batch = candidates.slice(start, start + HASH_READ_BATCH);
+        const original_rows = (await alignment_source_read(() =>
+            read_source_raw_rows_indexed_async(
+                original,
+                pairing.originalIndex,
+                batch.map((candidate) => candidate.originalRow),
+                is_cancelled,
+            ))).rows;
+        const modified_rows = (await alignment_source_read(() =>
+            read_source_raw_rows_indexed_async(
+                modified,
+                pairing.modifiedIndex,
+                batch.map((candidate) => candidate.modifiedRow),
+                is_cancelled,
+            ))).rows;
+        for (let offset = 0; offset < batch.length; offset++) {
+            const original_row = original_rows[offset] ?? [];
+            const modified_row = modified_rows[offset] ?? [];
+            let equal = true;
+            for (let column = 0; column < column_count; column++) {
+                const result = cells_exactly_equal(
+                    original_row[column],
+                    modified_row[column],
+                    is_cancelled,
+                );
+                const cells_equal = typeof result === 'boolean'
+                    ? result
+                    : await alignment_source_read(() => result);
+                cells_since_checkpoint += 1;
+                if (cells_since_checkpoint >= EXACT_MOVE_CELLS_PER_CHECKPOINT) {
+                    cells_since_checkpoint -= EXACT_MOVE_CELLS_PER_CHECKPOINT;
+                    await yield_to_event_loop();
+                    if (options.isCancelled?.()) throw new AlignmentCancelledError();
+                }
+                if (!cells_equal) {
+                    equal = false;
+                    break;
+                }
+            }
+            if (equal) claim(batch[offset].originalRow, batch[offset].modifiedRow);
+        }
+    }
 }
 
 /**
@@ -1001,25 +1109,48 @@ async function detect_moves(
         modified_to_original.set(modified_row, original_row);
     };
 
-    // Exact-hash pass. The hashes are already computed, so an identical moved
-    // row pairs with no cell reads at all — this is the whole-file re-sort
-    // case, and it is why the work cap below does not gate this phase.
+    // Exact-hash pass. Hashes select deterministic tentative pairs cheaply, but
+    // actual cells must agree before the pair consumes its delete/add rows.
+    // Verification is sparse and bounded, so a whole-file re-sort remains linear
+    // and is still independent of the inexact work cap below.
     const by_hash = new Map<number, { entries: Leftover[]; next: number }>();
     for (const entry of deleted) {
         const bucket = by_hash.get(original_hashes[entry.row]);
         if (bucket) bucket.entries.push(entry);
         else by_hash.set(original_hashes[entry.row], { entries: [entry], next: 0 });
     }
+    const exact_candidates: ExactMoveCandidate[] = [];
     for (const entry of added) {
-        // Consumed front to back so duplicate identical rows pair in ascending
-        // order on both sides, which is what makes repeated runs produce
-        // identical output. A read cursor rather than shift(), which is
-        // O(bucket) per call: measured no slower at 10,000 duplicates in one
-        // bucket, so this is about not resting on that, not a fix for an
-        // observed cost.
+        // Consumed front to back so duplicate hash candidates pair in ascending
+        // order on both sides. Rejected collisions remain unmatched; deliberately
+        // do not search the bucket quadratically for a different candidate.
         const bucket = by_hash.get(modified_hashes[entry.row]);
         if (bucket === undefined || bucket.next >= bucket.entries.length) continue;
-        claim(bucket.entries[bucket.next++].row, entry.row);
+        exact_candidates.push({
+            originalRow: bucket.entries[bucket.next++].row,
+            modifiedRow: entry.row,
+        });
+        if (exact_candidates.length === HASH_READ_BATCH) {
+            await verify_exact_move_candidates(
+                original,
+                modified,
+                pairing,
+                exact_candidates,
+                claim,
+                options,
+            );
+            exact_candidates.length = 0;
+        }
+    }
+    if (exact_candidates.length > 0) {
+        await verify_exact_move_candidates(
+            original,
+            modified,
+            pairing,
+            exact_candidates,
+            claim,
+            options,
+        );
     }
 
     const unmatched_deleted = deleted.filter((entry) => !original_to_modified.has(entry.row));

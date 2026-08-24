@@ -1,7 +1,5 @@
 import { Buffer } from 'node:buffer';
-import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { cells_exactly_equal } from '../cell-display';
 import {
@@ -77,7 +75,10 @@ class ByteWriter {
     }
 
     fixed(value: string, width: number): void {
-        const encoded = new TextEncoder().encode(value);
+        this.fixed_bytes(new TextEncoder().encode(value), width);
+    }
+
+    fixed_bytes(encoded: Uint8Array, width: number): void {
         if (encoded.length > width) throw new Error('fixture string exceeds field width');
         this.bytes.push(...encoded, ...new Array(width - encoded.length).fill(0));
     }
@@ -110,8 +111,11 @@ interface FixtureValueLabelTable {
 }
 
 interface DtaFixtureOptions {
+    readonly firstName?: string;
     readonly statusLabels?: readonly FixtureValueLabelEntry[];
+    readonly statusValueLabelTableName?: string;
     readonly extraValueLabelTables?: readonly FixtureValueLabelTable[];
+    readonly valueLabelNames?: Partial<Record<'status' | 'amount' | 'missing', string>>;
 }
 
 /** Build a tiny release-118 file in memory; no binary fixture is committed. */
@@ -122,17 +126,26 @@ function build_dta_fixture(
 ): Uint8Array {
     const writer = new ByteWriter();
     const variables: FixtureVariable[] = [
-        { name: 'status', typeCode: 65530, format: '%8.0g', valueLabel: 'status_lbl' },
-        { name: 'amount', typeCode: 65526, format: '%9.2f' },
+        {
+            name: 'status', typeCode: 65530, format: '%8.0g',
+            valueLabel: options.valueLabelNames?.status ?? 'status_lbl',
+        },
+        {
+            name: 'amount', typeCode: 65526, format: '%9.2f',
+            valueLabel: options.valueLabelNames?.amount,
+        },
         { name: 'name', typeCode: 5, format: '%-5s' },
-        { name: 'missing', typeCode: 65530, format: '%8.0g', valueLabel: 'missing_lbl' },
+        {
+            name: 'missing', typeCode: 65530, format: '%8.0g',
+            valueLabel: options.valueLabelNames?.missing ?? 'missing_lbl',
+        },
         { name: 'long_text', typeCode: 32768, format: '%9s' },
     ];
     if (second_strl) {
         variables.push({ name: 'long_text_2', typeCode: 32768, format: '%9s' });
     }
     const observations: Array<[number, number, string, number, string]> = [
-        [1, 12.5, 'alpha', 101, 'a long first value'],
+        [1, 12.5, options.firstName ?? 'alpha', 101, 'a long first value'],
         [2, 2, 'beta', 102, 'second long value'],
         [1, 1000, 'gamma', 103, 'third long value'],
         [2, -3.25, 'delta', 127, 'fourth long value'],
@@ -261,7 +274,7 @@ function build_dta_fixture(
         });
         const texts = [...text_by_key.values()];
         const text_length = texts.reduce((total, text) => total + text.bytes.length, 0);
-        const payload_length = 129 + 3 + 8 + entries.length * 8 + text_length;
+        const payload_length = 8 + entries.length * 8 + text_length;
         writer.i32(payload_length);
         writer.fixed(name, 129);
         writer.u8(0); writer.u8(0); writer.u8(0);
@@ -272,7 +285,7 @@ function build_dta_fixture(
         for (const text of texts) for (const byte of text.bytes) writer.u8(byte);
         writer.text('</lbl>');
     };
-    write_value_label_table('status_lbl', options.statusLabels ?? [
+    write_value_label_table(options.statusValueLabelTableName ?? 'status_lbl', options.statusLabels ?? [
         { value: 1, label: 'Zulu' },
         { value: 2, label: 'Alpha' },
         { value: 3, label: 'Zulu' },
@@ -298,11 +311,78 @@ function build_dta_fixture(
     return writer.finish();
 }
 
+interface FixtureGsoRecord {
+    readonly start: number;
+    readonly end: number;
+}
+
+function release118_gso_records(fixture: Uint8Array): FixtureGsoRecord[] {
+    const records: FixtureGsoRecord[] = [];
+    const view = new DataView(fixture.buffer, fixture.byteOffset, fixture.byteLength);
+    let position = find_tag_end(fixture, '<strls>');
+    while (
+        fixture[position] === 0x47
+        && fixture[position + 1] === 0x53
+        && fixture[position + 2] === 0x4f
+    ) {
+        const end = position + 20 + view.getUint32(position + 16, true);
+        records.push({ start: position, end });
+        position = end;
+    }
+    return records;
+}
+
+function reorder_release118_gso_prefix(
+    fixture: Uint8Array,
+    order: readonly number[],
+): void {
+    const records = release118_gso_records(fixture).slice(0, order.length);
+    const snapshots = records.map(({ start, end }) => fixture.slice(start, end));
+    if (new Set(order).size !== records.length || order.some((index) => snapshots[index] === undefined)) {
+        throw new Error('fixture GSO order must be a complete prefix permutation');
+    }
+    let position = records[0].start;
+    for (const index of order) {
+        fixture.set(snapshots[index], position);
+        position += snapshots[index].length;
+    }
+}
+
+function keep_release118_gso_prefix(
+    fixture: Uint8Array,
+    count: number,
+): Uint8Array {
+    const records = release118_gso_records(fixture);
+    const close_start = find_tag_end(fixture, '</strls>') - '</strls>'.length;
+    const cut_start = records[count]?.start ?? close_start;
+    if (cut_start >= close_start) return fixture.slice();
+    const removed = close_start - cut_start;
+    const result = new Uint8Array(fixture.length - removed);
+    result.set(fixture.subarray(0, cut_start));
+    result.set(fixture.subarray(close_start), cut_start);
+
+    const map_start = find_tag_end(result, '<map>');
+    const view = new DataView(result.buffer);
+    for (let index = 0; index < 14; index++) {
+        const offset = map_start + index * 8;
+        const section = Number(view.getBigUint64(offset, true));
+        if (section >= close_start) {
+            view.setBigUint64(offset, BigInt(section - removed), true);
+        }
+    }
+    return result;
+}
+
 function build_legacy_dta_fixture(
     expansion_length = 0,
     zero_length_fields = 0,
+    text_byte = 0xe9,
+    label_name_byte?: number,
 ): Uint8Array {
     const writer = new ByteWriter();
+    const label_name = label_name_byte === undefined
+        ? new TextEncoder().encode('legacy_lbl')
+        : Uint8Array.of(...new TextEncoder().encode('legacy_'), label_name_byte);
     writer.u8(115);
     writer.u8(2); // LSF
     writer.u8(1); // file type
@@ -318,18 +398,18 @@ function build_legacy_dta_fixture(
     writer.u16(0); writer.u16(0); writer.u16(0);
     writer.fixed('%8.0g', 49);
     writer.fixed('%5s', 49);
-    writer.fixed('legacy_lbl', 33); writer.fixed('', 33);
+    writer.fixed_bytes(label_name, 33); writer.fixed('', 33);
     writer.fixed('', 81); writer.fixed('', 81);
     for (let field = 0; field < zero_length_fields; field++) {
         writer.u8(1); writer.i32(0);
     }
     writer.u8(0); writer.i32(expansion_length); // expansion-fields terminator
-    writer.i8(3); writer.u8(0x63); writer.u8(0x61); writer.u8(0x66); writer.u8(0xe9); writer.u8(0);
+    writer.i8(3); writer.u8(0x63); writer.u8(0x61); writer.u8(0x66); writer.u8(text_byte); writer.u8(0);
     writer.i8(1); writer.fixed('plain', 5);
     writer.i8(2); writer.fixed('text', 5);
-    const label = Uint8Array.of(0x43, 0x61, 0x66, 0xe9, 0);
-    writer.i32(33 + 3 + 8 + 8 + label.length);
-    writer.fixed('legacy_lbl', 33);
+    const label = Uint8Array.of(0x43, 0x61, 0x66, text_byte, 0);
+    writer.i32(8 + 8 + label.length);
+    writer.fixed_bytes(label_name, 33);
     writer.u8(0); writer.u8(0); writer.u8(0);
     writer.i32(1);
     writer.i32(label.length);
@@ -339,7 +419,57 @@ function build_legacy_dta_fixture(
     return writer.finish();
 }
 
-function build_release117_fixture(): Uint8Array {
+function build_pre111_value_label_fixture(
+    version: 105 | 108,
+    table_name_width = 9,
+    table_count = 1,
+): Uint8Array {
+    const writer = new ByteWriter();
+    const dataset_label_width = version === 105 ? 32 : 81;
+    const variable_label_width = version === 105 ? 32 : 81;
+    writer.u8(version);
+    writer.u8(2); // LSF
+    writer.u8(1); // file type
+    writer.u8(0);
+    writer.u16(1);
+    writer.i32(1);
+    writer.fixed('Legacy labels', dataset_label_width);
+    writer.fixed('', 18);
+    writer.u8(98); // byte in releases before 111
+    writer.fixed('status', 9);
+    writer.u16(0); writer.u16(0);
+    writer.fixed('%8.0g', 12);
+    writer.fixed('statuslbl', 9);
+    writer.fixed('', variable_label_width);
+    writer.u8(0); writer.u16(0); // expansion-fields terminator
+    writer.i8(3);
+
+    for (let table = 0; table < table_count; table++) {
+        if (version === 105) {
+            writer.u16(2);
+            writer.fixed('statuslbl', 9);
+            writer.u8(0);
+            writer.u16(1); writer.u16(3);
+            writer.fixed('One', 8); writer.fixed('Third', 8);
+        } else {
+            const first = new TextEncoder().encode('One\0');
+            const third = new TextEncoder().encode('Third\0');
+            const text_length = first.length + third.length;
+            writer.i32(8 + 2 * 8 + text_length);
+            writer.fixed('statuslbl', table_name_width);
+            writer.u8(0); writer.u8(0); writer.u8(0);
+            writer.i32(2);
+            writer.i32(text_length);
+            writer.i32(0); writer.i32(first.length);
+            writer.i32(1); writer.i32(3);
+            for (const byte of first) writer.u8(byte);
+            for (const byte of third) writer.u8(byte);
+        }
+    }
+    return writer.finish();
+}
+
+function build_release117_fixture(text_byte = 0xe9): Uint8Array {
     const writer = new ByteWriter();
     const offsets = new Map<string, number>();
     const mark = (name: string) => offsets.set(name, writer.length);
@@ -368,12 +498,12 @@ function build_release117_fixture(): Uint8Array {
     writer.fixed('', 81); writer.fixed('', 81); writer.text('</variable_labels>');
     mark('characteristics'); writer.text('<characteristics></characteristics>');
     mark('data'); writer.text('<data>');
-    writer.u8(0x63); writer.u8(0x61); writer.u8(0x66); writer.u8(0xe9); writer.u8(0);
+    writer.u8(0x63); writer.u8(0x61); writer.u8(0x66); writer.u8(text_byte); writer.u8(0);
     writer.i32(2); writer.i32(1);
     writer.text('</data>');
     mark('strls'); writer.text('<strls>GSO');
     writer.i32(2); writer.i32(1); writer.u8(130); writer.i32(5);
-    writer.u8(0x63); writer.u8(0x61); writer.u8(0x66); writer.u8(0xe9); writer.u8(0);
+    writer.u8(0x63); writer.u8(0x61); writer.u8(0x66); writer.u8(text_byte); writer.u8(0);
     writer.text('</strls>');
     mark('value_labels'); writer.text('<value_labels></value_labels>');
     mark('stata_data_close'); writer.text('</stata_dta>');
@@ -390,13 +520,14 @@ function build_release117_fixture(): Uint8Array {
 function build_release119_strl_rows_fixture(
     contents: readonly Uint8Array[],
     type = 129,
+    leading_numeric = false,
 ): Uint8Array {
     const writer = new ByteWriter();
     const offsets = new Map<string, number>();
     const mark = (name: string) => offsets.set(name, writer.length);
     mark('stata_data');
     writer.text('<stata_dta><header><release>119</release><byteorder>LSF</byteorder><K>');
-    writer.i32(1);
+    writer.i32(leading_numeric ? 2 : 1);
     writer.text('</K><N>'); writer.u64(contents.length);
     writer.text('</N><label>'); writer.u16(0);
     writer.text('</label><timestamp>'); writer.u8(0);
@@ -405,23 +536,36 @@ function build_release119_strl_rows_fixture(
     const map_offset = writer.length;
     for (let index = 0; index < 14; index++) writer.u64(0);
     writer.text('</map>');
-    mark('variable_types'); writer.text('<variable_types>'); writer.u16(32768);
+    mark('variable_types'); writer.text('<variable_types>');
+    if (leading_numeric) writer.u16(65530);
+    writer.u16(32768);
     writer.text('</variable_types>');
-    mark('varnames'); writer.text('<varnames>'); writer.fixed('long_text', 129);
+    mark('varnames'); writer.text('<varnames>');
+    if (leading_numeric) writer.fixed('number', 129);
+    writer.fixed('long_text', 129);
     writer.text('</varnames>');
-    mark('sortlist'); writer.text('<sortlist>'); writer.i32(0); writer.i32(0);
+    mark('sortlist'); writer.text('<sortlist>');
+    for (let index = 0; index < (leading_numeric ? 3 : 2); index++) writer.i32(0);
     writer.text('</sortlist>');
-    mark('formats'); writer.text('<formats>'); writer.fixed('%9s', 57);
+    mark('formats'); writer.text('<formats>');
+    if (leading_numeric) writer.fixed('%8.0g', 57);
+    writer.fixed('%9s', 57);
     writer.text('</formats>');
-    mark('value_label_names'); writer.text('<value_label_names>'); writer.fixed('', 129);
+    mark('value_label_names'); writer.text('<value_label_names>');
+    if (leading_numeric) writer.fixed('', 129);
+    writer.fixed('', 129);
     writer.text('</value_label_names>');
-    mark('variable_labels'); writer.text('<variable_labels>'); writer.fixed('', 321);
+    mark('variable_labels'); writer.text('<variable_labels>');
+    if (leading_numeric) writer.fixed('', 321);
+    writer.fixed('', 321);
     writer.text('</variable_labels>');
     mark('characteristics'); writer.text('<characteristics></characteristics>');
     mark('data'); writer.text('<data>');
+    const strl_variable = leading_numeric ? 2 : 1;
     for (let row = 0; row < contents.length; row++) {
+        if (leading_numeric) writer.i8(row);
         // Release 119 packs v into 3 bytes and o into 5 bytes.
-        writer.u8(1); writer.u8(0); writer.u8(0);
+        writer.u8(strl_variable); writer.u8(0); writer.u8(0);
         writer.i32(row + 1); writer.u8(0);
     }
     writer.text('</data>');
@@ -429,7 +573,7 @@ function build_release119_strl_rows_fixture(
     for (let row = 0; row < contents.length; row++) {
         const content = contents[row];
         writer.text('GSO');
-        writer.i32(1); writer.u64(row + 1); writer.u8(type); writer.i32(content.length);
+        writer.i32(strl_variable); writer.u64(row + 1); writer.u8(type); writer.i32(content.length);
         for (const byte of content) writer.u8(byte);
     }
     writer.text('</strls>');
@@ -481,6 +625,14 @@ function find_tag_end(bytes: Uint8Array, tag: string): number {
         }
     }
     throw new Error(`fixture is missing ${tag}`);
+}
+
+function first_release118_value_label_payload_start(bytes: Uint8Array): number {
+    return find_tag_end(bytes, '<value_labels>')
+        + '<lbl>'.length
+        + 4
+        + 129
+        + 3;
 }
 
 function texts(rows: ReturnType<DtaDataSource['read_rows']>['rows']) {
@@ -623,7 +775,7 @@ describe('DtaDataSource', () => {
             ],
         }));
         const internals = source as unknown as {
-            unicode_decoder: TextDecoder;
+            text_decoder: TextDecoder;
             decoded_value_label_tables: Map<string, {
                 labels: Map<number, string>;
                 decodedBytes: number;
@@ -631,14 +783,15 @@ describe('DtaDataSource', () => {
             }>;
             decoded_value_label_cache_bytes: number;
         };
-        const label_decode_spy = vi.spyOn(internals.unicode_decoder, 'decode');
+        const label_decode_spy = vi.spyOn(internals.text_decoder, 'decode');
 
         const metadata = source.column_filter_metadata(0, 0)!;
         expect(metadata.valueLabel?.('1')).toBe(shared_label);
         expect(metadata.valueLabel?.('2')).toBe(shared_label);
         expect(metadata.valueLabel?.('3')).toBe(shared_label);
-        // One decode for the table name and one for the shared text offset.
-        expect(label_decode_spy).toHaveBeenCalledTimes(2);
+        // Tagged discovery verifies the complete section before publication: two
+        // referenced table names plus one decode for the shared text offset.
+        expect(label_decode_spy).toHaveBeenCalledTimes(3);
         const cached = internals.decoded_value_label_tables.get('status_lbl')!;
         expect(cached.labels.size).toBe(3);
         expect(cached.decodedBytes).toBe(shared_label.length * 2);
@@ -719,6 +872,7 @@ describe('DtaDataSource', () => {
 
     it('evicts decoded value-label tables by aggregate bytes in LRU order', async () => {
         const source = await DtaDataSource.create(build_dta_fixture(4, false, {
+            valueLabelNames: { amount: 'tiny_lbl' },
             extraValueLabelTables: [{
                 name: 'tiny_lbl',
                 entries: [{ value: 1, label: 'X' }],
@@ -741,6 +895,113 @@ describe('DtaDataSource', () => {
         expect([...internals.decoded_value_label_tables.keys()])
             .toEqual(['status_lbl', 'tiny_lbl']);
         expect(internals.decoded_value_label_cache_bytes).toBe(284);
+    });
+
+    it('keeps referenced descriptors monotonic across decoded-cache eviction', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture(4, false, {
+            valueLabelNames: { amount: 'absent_lbl' },
+            extraValueLabelTables: [
+                { name: 'unreferenced_lbl', entries: [{ value: 1, label: 'Unused' }] },
+                { name: 'status_lbl', entries: [{ value: 1, label: 'Wrong duplicate' }] },
+            ],
+        }));
+        const internals = source as unknown as {
+            value_label_discovery_position: number;
+            value_label_discovery_complete: boolean;
+            value_label_cache_entry_limit: number;
+            value_label_descriptors: Map<string, { payloadStart: number }>;
+            decoded_value_label_tables: Map<string, unknown>;
+            missing_value_label_table_names: Set<string>;
+        };
+        internals.value_label_cache_entry_limit = 1;
+        const initial_position = internals.value_label_discovery_position;
+
+        expect(source.column_filter_metadata(0, 0)?.valueLabel?.('1')).toBe('Zulu');
+        const terminal_position = internals.value_label_discovery_position;
+        const status_descriptor = internals.value_label_descriptors.get('status_lbl');
+        expect(terminal_position).toBeGreaterThan(initial_position);
+        expect(internals.value_label_discovery_complete).toBe(true);
+        expect([...internals.value_label_descriptors.keys()])
+            .toEqual(['status_lbl', 'missing_lbl']);
+
+        expect(source.column_filter_metadata(0, 3)?.valueLabel?.('.a')).toBe('Refused');
+        expect(internals.value_label_discovery_position).toBe(terminal_position);
+        expect([...internals.decoded_value_label_tables.keys()]).toEqual(['missing_lbl']);
+
+        expect(source.column_filter_metadata(0, 1)).toBeUndefined();
+        expect(internals.value_label_discovery_position).toBe(terminal_position);
+        expect(internals.value_label_descriptors.get('status_lbl')).toBe(status_descriptor);
+        expect(internals.missing_value_label_table_names).toEqual(new Set(['absent_lbl']));
+
+        expect(source.column_filter_metadata(0, 0)?.valueLabel?.('1')).toBe('Zulu');
+        expect(internals.value_label_discovery_position).toBe(terminal_position);
+        expect([...internals.decoded_value_label_tables.keys()]).toEqual(['status_lbl']);
+    });
+
+    it('yields while scanning a large variable-width label and observes close', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture(4, false, {
+            statusLabels: [{ value: 1, label: 'x'.repeat(300_000) }],
+        }));
+        const internals = source as unknown as {
+            bytes?: Uint8Array;
+            yield_source_work: () => Promise<void>;
+        };
+        let release_yield!: () => void;
+        const yield_gate = new Promise<void>((resolve) => { release_yield = resolve; });
+        const yield_work = vi.spyOn(internals, 'yield_source_work').mockReturnValue(yield_gate);
+
+        const metadata = source.column_filter_metadata_async(0, 0, () => false);
+        await vi.waitFor(() => expect(yield_work).toHaveBeenCalled());
+        source.close();
+        release_yield();
+
+        await expect(metadata).rejects.toMatchObject({ name: 'AbortError' });
+        expect(internals.bytes).toBeUndefined();
+    });
+
+    it('coalesces concurrent cold value-label table decodes', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture());
+        const internals = source as unknown as {
+            text_decoder: { stream: () => unknown };
+            pending_value_label_tables: Map<string, unknown>;
+        };
+        const stream = vi.spyOn(internals.text_decoder, 'stream');
+
+        const first = source.column_filter_metadata_async(0, 0, () => false);
+        const second = source.column_filter_metadata_async(0, 0, () => false);
+        const [first_metadata, second_metadata] = await Promise.all([first, second]);
+
+        expect(first_metadata?.valueLabel?.('1')).toBe('Zulu');
+        expect(second_metadata?.valueLabel?.('2')).toBe('Alpha');
+        expect(stream).toHaveBeenCalledTimes(3);
+        expect(internals.pending_value_label_tables.size).toBe(0);
+    });
+
+    it('lets one value-label waiter cancel without aborting a live peer', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture(4, false, {
+            statusLabels: Array.from({ length: 257 }, (_, index) => ({
+                value: index,
+                label: `Label ${index}`,
+            })),
+        }));
+        const internals = source as unknown as {
+            yield_source_work: () => Promise<void>;
+        };
+        let release_yield!: () => void;
+        const yield_gate = new Promise<void>((resolve) => { release_yield = resolve; });
+        const yield_work = vi.spyOn(internals, 'yield_source_work').mockReturnValue(yield_gate);
+        let first_cancelled = false;
+
+        const first = source.column_filter_metadata_async(0, 0, () => first_cancelled);
+        const second = source.column_filter_metadata_async(0, 0, () => false);
+        await vi.waitFor(() => expect(yield_work).toHaveBeenCalled());
+        first_cancelled = true;
+        release_yield();
+
+        await expect(first).rejects.toMatchObject({ name: 'AbortError' });
+        await expect(second).resolves.toEqual(expect.objectContaining({
+            valueLabel: expect.any(Function),
+        }));
     });
 
     it('checks cancellation while decoding a requested value-label table', async () => {
@@ -772,16 +1033,20 @@ describe('DtaDataSource', () => {
         }));
         const internals = source as unknown as {
             bytes?: Uint8Array;
-            unicode_decoder: TextDecoder;
             decoded_value_label_tables: Map<string, unknown>;
             decoded_value_label_cache_bytes: number;
             missing_value_label_table_names: Set<string>;
+            yield_source_work: () => Promise<void>;
         };
-        const decode = vi.spyOn(internals.unicode_decoder, 'decode');
+        let release_yield!: () => void;
+        const yield_gate = new Promise<void>((resolve) => { release_yield = resolve; });
+        const yield_work = vi.spyOn(internals, 'yield_source_work')
+            .mockReturnValue(yield_gate);
 
         const reading = source.column_filter_metadata_async(0, 0, () => false);
-        expect(decode).toHaveBeenCalledTimes(257);
+        await vi.waitFor(() => expect(yield_work).toHaveBeenCalled());
         source.close();
+        release_yield();
 
         await expect(reading).rejects.toMatchObject({ name: 'AbortError' });
         expect(internals.bytes).toBeUndefined();
@@ -792,24 +1057,27 @@ describe('DtaDataSource', () => {
 
     it('does not publish a missing value-label marker after close during table scanning', async () => {
         const source = await DtaDataSource.create(build_dta_fixture(4, false, {
+            valueLabelNames: { status: 'absent_lbl' },
             extraValueLabelTables: Array.from({ length: 254 }, (_, index) => ({
                 name: `extra_${index}`,
                 entries: [],
             })),
         }));
         const internals = source as unknown as {
-            metadata: { variables: Array<{ value_label_name: string }> };
-            unicode_decoder: TextDecoder;
             decoded_value_label_tables: Map<string, unknown>;
             decoded_value_label_cache_bytes: number;
             missing_value_label_table_names: Set<string>;
+            yield_source_work: () => Promise<void>;
         };
-        internals.metadata.variables[0].value_label_name = 'absent_lbl';
-        const decode = vi.spyOn(internals.unicode_decoder, 'decode');
+        let release_yield!: () => void;
+        const yield_gate = new Promise<void>((resolve) => { release_yield = resolve; });
+        const yield_work = vi.spyOn(internals, 'yield_source_work')
+            .mockReturnValue(yield_gate);
 
         const reading = source.column_filter_metadata_async(0, 0, () => false);
-        expect(decode).toHaveBeenCalledTimes(256);
+        await vi.waitFor(() => expect(yield_work).toHaveBeenCalled());
         source.close();
+        release_yield();
 
         await expect(reading).rejects.toMatchObject({ name: 'AbortError' });
         expect(internals.decoded_value_label_tables.size).toBe(0);
@@ -911,20 +1179,20 @@ describe('DtaDataSource', () => {
             binary_identity_work_job_limit: number;
             gso_digest_cache: Map<number, string>;
             pending_binary_identities: Map<number, unknown>;
+            yield_source_work: () => Promise<void>;
         };
         internals.binary_identity_chunk_bytes = 64;
         internals.binary_identity_work_byte_limit = 10_000;
         internals.binary_identity_work_job_limit = 2;
-        let event_loop_turn_observed = false;
-        setImmediate(() => { event_loop_turn_observed = true; });
+        const yield_work = vi.spyOn(internals, 'yield_source_work');
 
         const resolving = cells.map((cell) =>
             binary_comparison_identity(cell).resolveKey(() => false));
         expect(internals.gso_digest_cache.size).toBe(2);
         expect(internals.pending_binary_identities.size).toBe(4);
+        await vi.waitFor(() => expect(yield_work).toHaveBeenCalled());
 
         const keys = await Promise.all(resolving);
-        expect(event_loop_turn_observed).toBe(true);
         expect(keys).toEqual(contents.map((content) =>
             `stata-binary:sha256:${createHash('sha256').update(content).digest('hex')}:8`));
         expect(internals.gso_digest_cache.size).toBe(contents.length);
@@ -978,10 +1246,11 @@ describe('DtaDataSource', () => {
         source.close();
 
         await expect(resolving).rejects.toMatchObject({ name: 'AbortError' });
-        await new Promise<void>((resolve) => setImmediate(resolve));
+        await vi.waitFor(() => {
+            expect(internals.pending_binary_identities.size).toBe(0);
+        });
         expect(internals.gso_digest_cache.size).toBe(0);
         expect(internals.gso_digest_cache_bytes).toBe(0);
-        expect(internals.pending_binary_identities.size).toBe(0);
     });
 
     it('shares comparison and filter hashing while cancelling only one waiter', async () => {
@@ -1069,6 +1338,36 @@ describe('DtaDataSource', () => {
         expect(left_key).not.toBe(right_key);
     });
 
+    it('awaits the cooperative yield scheduled by the final binary chunk', async () => {
+        const payload = new Uint8Array(64).fill(0x39);
+        const left = await DtaDataSource.create(
+            build_release119_strl_fixture(payload, 129),
+        );
+        const right = await DtaDataSource.create(
+            build_release119_strl_fixture(payload, 129),
+        );
+        const left_cell = left.read_raw_columns(0, 0, 1, [0]).rows[0][0]!;
+        const right_cell = right.read_raw_columns(0, 0, 1, [0]).rows[0][0]!;
+        const internals = left as unknown as {
+            binary_identity_chunk_bytes: number;
+            binary_identity_work_byte_limit: number;
+            yield_source_work: () => Promise<void>;
+        };
+        internals.binary_identity_chunk_bytes = payload.length;
+        internals.binary_identity_work_byte_limit = payload.length;
+        let release_yield!: () => void;
+        const yield_gate = new Promise<void>((resolve) => { release_yield = resolve; });
+        const yield_work = vi.spyOn(internals, 'yield_source_work').mockReturnValue(yield_gate);
+
+        const equality = cells_exactly_equal(left_cell, right_cell, () => false) as Promise<boolean>;
+        let settled = false;
+        void equality.finally(() => { settled = true; });
+        await vi.waitFor(() => expect(yield_work).toHaveBeenCalled());
+        expect(settled).toBe(false);
+        release_yield();
+        await expect(equality).resolves.toBe(true);
+    });
+
     it.each(['left', 'right'] as const)(
         'cancels direct binary equality when the %s source closes during a yield',
         async (closed_side) => {
@@ -1137,6 +1436,44 @@ describe('DtaDataSource', () => {
             .binary_digest_computations).toBe(originals.length);
         expect((modified_source as unknown as IdentityInternals)
             .binary_digest_computations).toBe(modified.length);
+    });
+
+    it('yields while materializing a large text strL and observes close', async () => {
+        const payload = new TextEncoder().encode('abcdefgh\0');
+        const source = await DtaDataSource.create(build_release119_strl_fixture(payload));
+        const internals = source as unknown as {
+            binary_identity_chunk_bytes: number;
+            binary_identity_work_byte_limit: number;
+            bytes?: Uint8Array;
+            yield_source_work: () => Promise<void>;
+        };
+        internals.binary_identity_chunk_bytes = 4;
+        internals.binary_identity_work_byte_limit = 4;
+        let release_yield!: () => void;
+        const yield_gate = new Promise<void>((resolve) => { release_yield = resolve; });
+        const yield_work = vi.spyOn(internals, 'yield_source_work').mockReturnValue(yield_gate);
+
+        const reading = source.read_raw_columns_async(0, 0, 1, [0], () => false);
+        await vi.waitFor(() => expect(yield_work).toHaveBeenCalled());
+        source.close();
+        release_yield();
+
+        await expect(reading).rejects.toMatchObject({ name: 'AbortError' });
+        expect(internals.bytes).toBeUndefined();
+    });
+
+    it.each([
+        ['empty', new Uint8Array()],
+        ['non-NUL-terminated', Uint8Array.of(0x41)],
+    ])('rejects %s non-UTF-8 type-130 strLs', async (_case, payload) => {
+        const source = await DtaDataSource.create(
+            build_release119_strl_fixture(payload, 130),
+            { encoding: 'windows-1252' },
+        );
+
+        expect(() => source.read_raw_columns(0, 0, 1, [0])).toThrow(
+            'Type-130 GSO content is not NUL-terminated',
+        );
     });
 
     it('rejects oversized text strLs before decoding their payload', async () => {
@@ -1225,6 +1562,190 @@ describe('DtaDataSource', () => {
         ]);
     });
 
+    it('restores native sparse row and column order through one GSO batch', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture(600));
+        const internals = source as unknown as {
+            resolve_gso_batch_async: (...args: unknown[]) => Promise<void>;
+        };
+        const resolve_batch = vi.spyOn(internals, 'resolve_gso_batch_async');
+        gso_decode_spy.mockClear();
+
+        const result = await source.read_raw_columns_indexed_async(
+            0,
+            [599, 0, 300, 599],
+            [4, 0, 4],
+            () => false,
+        );
+        expect(result.rows.map((row) => row.map((cell) => cell?.raw))).toEqual([
+            ['long value 599', '1', 'long value 599'],
+            ['a long first value', '1', 'a long first value'],
+            ['long value 300', '1', 'long value 300'],
+            ['long value 599', '1', 'long value 599'],
+        ]);
+        expect(resolve_batch).toHaveBeenCalledTimes(1);
+        expect(gso_decode_spy).toHaveBeenCalledTimes(3);
+    });
+
+    it('memoizes more unique strLs than the decoded LRU without payload targets', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture(600));
+        const rows = Array.from({ length: 300 }, (_, index) => index * 2);
+        type GsoTarget = { entry?: unknown; value?: unknown };
+        const internals = source as unknown as {
+            gso_cache: Map<string, unknown>;
+            gso_cache_bytes: number;
+            resolve_indexed_gso_targets: (rows: readonly number[]) => Map<string, GsoTarget>;
+        };
+        gso_decode_spy.mockClear();
+
+        const result = await source.read_raw_columns_indexed_async(
+            0,
+            [...rows, rows[0]],
+            [4, 4],
+            () => false,
+        );
+        expect(result.rows).toHaveLength(rows.length + 1);
+        expect(gso_decode_spy).toHaveBeenCalledTimes(rows.length);
+        expect(internals.gso_cache.size).toBeLessThanOrEqual(256);
+        expect(internals.gso_cache_bytes).toBeLessThanOrEqual(16 * 1024 * 1024);
+        const targets = internals.resolve_indexed_gso_targets(rows.slice(0, 3));
+        expect([...targets.values()].every((target) =>
+            target.entry !== undefined && !Object.hasOwn(target, 'value'))).toBe(true);
+    });
+
+    it('pins a decoded-cache hit in the request memo through later LRU eviction', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture(1_300));
+        expect(source.read_raw_columns(0, 1_299, 1, [4]).rows[0][0]?.raw)
+            .toBe('long value 1299');
+
+        const rows = [
+            ...Array.from({ length: 1_101 }, (_, row) => row),
+            1_299,
+        ];
+        const result = await source.read_raw_columns_indexed_async(
+            0,
+            rows,
+            [4],
+            () => false,
+        );
+
+        expect(result.rows.at(-1)?.[0]?.raw).toBe('long value 1299');
+    });
+
+    it('uses the shared GSO transition for synchronous and asynchronous reads', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture(4));
+        const internals = source as unknown as {
+            transition_gso_resolution: (...args: unknown[]) => unknown;
+        };
+        const transition = vi.spyOn(internals, 'transition_gso_resolution');
+        expect(source.read_raw_columns(0, 0, 1, [4]).rows[0][0]?.raw)
+            .toBe('a long first value');
+        const synchronous_calls = transition.mock.calls.length;
+        await expect(source.read_raw_columns_async(0, 3, 1, [4], () => false))
+            .resolves.toMatchObject({
+                rows: [[expect.objectContaining({ raw: 'fourth long value' })]],
+            });
+        expect(synchronous_calls).toBeGreaterThan(0);
+        expect(transition.mock.calls.length).toBeGreaterThan(synchronous_calls);
+    });
+
+    it('keeps asynchronous observation parser calls within the cell budget', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture(600));
+        decode_spy.mockClear();
+
+        await source.read_raw_columns_async(0, 0, 600, [0, 1], () => false);
+        await source.read_raw_columns_indexed_async(
+            0,
+            Array.from({ length: 600 }, (_, row) => row),
+            [0, 1, 2, 3],
+            () => false,
+        );
+
+        expect(decode_spy).toHaveBeenCalled();
+        for (const call of decode_spy.mock.calls) {
+            const count = call[3] as number;
+            const first_column = call[4] as number;
+            const end_column = call[5] as number;
+            expect(count * (end_column - first_column)).toBeLessThanOrEqual(256);
+        }
+    });
+
+    it('yields and cancels numeric-only asynchronous observation work', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture(600));
+        const internals = source as unknown as {
+            bytes?: Uint8Array;
+            yield_source_work: () => Promise<void>;
+        };
+        let release_yield!: () => void;
+        const yield_gate = new Promise<void>((resolve) => { release_yield = resolve; });
+        const yield_work = vi.spyOn(internals, 'yield_source_work')
+            .mockReturnValue(yield_gate);
+        const reading = source.read_raw_columns_async(0, 0, 600, [0], () => false);
+        await vi.waitFor(() => expect(yield_work).toHaveBeenCalled());
+        source.close();
+        release_yield();
+        await expect(reading).rejects.toMatchObject({ name: 'AbortError' });
+        expect(internals.bytes).toBeUndefined();
+    });
+
+    it('accounts work completed while the shared yield is pending', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture());
+        const internals = source as unknown as {
+            source_work_gso_headers: number;
+            schedule_source_work: (
+                kind: 'gsoHeaders' | 'observationCells',
+                amount: number,
+            ) => Promise<void> | undefined;
+        };
+
+        const pending = internals.schedule_source_work('observationCells', 256);
+        expect(pending).toBeInstanceOf(Promise);
+        expect(internals.source_work_gso_headers).toBe(0);
+        expect(internals.schedule_source_work('gsoHeaders', 7)).toBe(pending);
+        expect(internals.source_work_gso_headers).toBe(7);
+        await pending;
+    });
+
+    it('shares one cooperative gate across observation and value-label work', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture(600, false, {
+            statusLabels: Array.from({ length: 257 }, (_, index) => ({
+                value: index,
+                label: `Label ${index}`,
+            })),
+        }));
+        const internals = source as unknown as {
+            bytes?: Uint8Array;
+            value_label_descriptors: Map<string, unknown>;
+            decoded_value_label_tables: Map<string, unknown>;
+            source_work_yield?: Promise<void>;
+            yield_source_work: () => Promise<void>;
+        };
+        let release_yield!: () => void;
+        const yield_gate = new Promise<void>((resolve) => { release_yield = resolve; });
+        const yield_work = vi.spyOn(internals, 'yield_source_work')
+            .mockImplementation(() => {
+                internals.source_work_yield = yield_gate;
+                return yield_gate;
+            });
+
+        const numeric_read = source.read_raw_columns_async(0, 0, 600, [1], () => false);
+        await vi.waitFor(() => expect(yield_work).toHaveBeenCalledTimes(1));
+        const metadata_read = source.column_filter_metadata_async(0, 0, () => false);
+        await vi.waitFor(() => {
+            expect(internals.value_label_descriptors.has('status_lbl')).toBe(true);
+        });
+        expect(yield_work).toHaveBeenCalledTimes(1);
+        expect(internals.decoded_value_label_tables.size).toBe(0);
+
+        source.close();
+        release_yield();
+        await expect(Promise.allSettled([numeric_read, metadata_read])).resolves.toEqual([
+            expect.objectContaining({ status: 'rejected', reason: expect.objectContaining({ name: 'AbortError' }) }),
+            expect.objectContaining({ status: 'rejected', reason: expect.objectContaining({ name: 'AbortError' }) }),
+        ]);
+        expect(internals.bytes).toBeUndefined();
+        expect(internals.decoded_value_label_tables.size).toBe(0);
+    });
+
     it('decodes sparse indexed rows once and caches the runs', async () => {
         decode_spy.mockClear();
         const source = await DtaDataSource.create(build_dta_fixture());
@@ -1234,6 +1755,15 @@ describe('DtaDataSource', () => {
         expect(decode_spy).toHaveBeenCalledTimes(2);
     });
 
+    it('reuses sparse indexed strL prefetch results during window materialization', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture(600));
+        const rows = Array.from({ length: 300 }, (_, index) => index * 2);
+        gso_decode_spy.mockClear();
+
+        expect(source.read_rows_indexed(0, rows).rows).toHaveLength(rows.length);
+        expect(gso_decode_spy).toHaveBeenCalledTimes(rows.length);
+    });
+
     it('cancels a GSO scan closed during its cooperative yield without resurrecting state', async () => {
         const source = await DtaDataSource.create(build_dta_fixture(300));
         const internals = source as unknown as {
@@ -1241,50 +1771,139 @@ describe('DtaDataSource', () => {
             gso_index: Map<string, unknown>;
             gso_cache: Map<string, unknown>;
             gso_cache_bytes: number;
-            gso_checkpoints: unknown[];
-            gso_entries_scanned: number;
-            gso_last_order?: unknown;
+            gso_seen_identifiers?: Uint8Array;
             gso_start_position: number;
             gso_scan_position: number;
+            source_work_yield?: Promise<void>;
+            yield_source_work: () => Promise<void>;
         };
+        let release_yield!: () => void;
+        const yield_gate = new Promise<void>((resolve) => { release_yield = resolve; });
+        vi.spyOn(internals, 'yield_source_work').mockImplementation(() => {
+            internals.source_work_yield = yield_gate;
+            return yield_gate;
+        });
+        void yield_gate.then(() => {
+            if (internals.source_work_yield === yield_gate) {
+                internals.source_work_yield = undefined;
+            }
+        });
 
         const reading = source.read_raw_columns_async(0, 256, 1, [4], () => false);
-        expect(internals.gso_entries_scanned).toBe(256);
-        expect(internals.gso_index.size).toBe(256);
-        expect(internals.gso_checkpoints.length).toBeGreaterThan(0);
+        await vi.waitFor(() => expect(internals.gso_index.size).toBe(256));
+        expect(internals.gso_seen_identifiers).toHaveLength(Math.ceil(300 / 8));
         source.close();
+        release_yield();
 
         await expect(reading).rejects.toMatchObject({ name: 'AbortError' });
         expect(internals.bytes).toBeUndefined();
         expect(internals.gso_index.size).toBe(0);
         expect(internals.gso_cache.size).toBe(0);
         expect(internals.gso_cache_bytes).toBe(0);
-        expect(internals.gso_checkpoints).toEqual([]);
-        expect(internals.gso_entries_scanned).toBe(0);
-        expect(internals.gso_last_order).toBeUndefined();
+        expect(internals.gso_seen_identifiers).toBeUndefined();
         expect(internals.gso_scan_position).toBe(internals.gso_start_position);
     });
 
-    it('finds an evicted GSO before scanning the unvisited tail', async () => {
-        const source = await DtaDataSource.create(build_dta_fixture(2_000));
+    it('reports an async dangling strL after scanning exactly to the section end', async () => {
+        const fixture = keep_release118_gso_prefix(build_dta_fixture(), 1);
+        const pointer = find_tag_end(fixture, '<data>') + 15;
+        new DataView(fixture.buffer).setUint32(pointer + 2, 2, true);
+        const source = await DtaDataSource.create(fixture);
+
+        await expect(source.read_raw_columns_async(0, 0, 1, [4], () => false))
+            .rejects.toThrow('Stata strL cell at row 0 has a dangling reference');
+    });
+
+    it('reuses GSO progress made by another read during an async yield', async () => {
+        const fixture = build_dta_fixture(600);
+        const records = release118_gso_records(fixture);
+        const source = await DtaDataSource.create(fixture);
+        const internals = source as unknown as {
+            gso_scan_position: number;
+            source_work_yield?: Promise<void>;
+            yield_source_work: () => Promise<void>;
+        };
+        let release_yield!: () => void;
+        const yield_gate = new Promise<void>((resolve) => { release_yield = resolve; });
+        vi.spyOn(internals, 'yield_source_work').mockImplementation(() => {
+            internals.source_work_yield = yield_gate;
+            return yield_gate;
+        });
+        void yield_gate.then(() => {
+            if (internals.source_work_yield === yield_gate) {
+                internals.source_work_yield = undefined;
+            }
+        });
+
+        const reading = source.read_raw_columns_async(0, 299, 1, [4], () => false);
+        await vi.waitFor(() => {
+            expect(internals.gso_scan_position).toBe(records[256].start);
+        });
+        expect(source.read_raw_columns(0, 599, 1, [4]).rows[0][0]?.raw)
+            .toBe('long value 599');
+        release_yield();
+        await expect(reading).resolves.toMatchObject({
+            rows: [[expect.objectContaining({ raw: 'long value 299' })]],
+        });
+    });
+
+    it('cancels a historical GSO rescan closed during its cooperative yield', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture(600));
+        source.read_rows(0, 0, 600);
+        const internals = source as unknown as {
+            bytes?: Uint8Array;
+            windows: Map<string, unknown>;
+            gso_index: Map<string, unknown>;
+            gso_cache: Map<string, unknown>;
+            gso_seen_identifiers?: Uint8Array;
+        };
+        internals.windows.clear();
+        internals.gso_index.clear();
+        internals.gso_cache.clear();
+
+        const reading = source.read_raw_columns_async(0, 299, 1, [4], () => false);
+        expect(internals.gso_index.size).toBe(0);
+        source.close();
+
+        await expect(reading).rejects.toMatchObject({ name: 'AbortError' });
+        expect(internals.bytes).toBeUndefined();
+        expect(internals.gso_index.size).toBe(0);
+        expect(internals.gso_cache.size).toBe(0);
+        expect(internals.gso_seen_identifiers).toBeUndefined();
+    });
+
+    it('finds an evicted GSO in an unordered prefix before scanning the unvisited tail', async () => {
+        const fixture = build_dta_fixture(2_000);
+        reorder_release118_gso_prefix(fixture, [1, 0]);
+        const source = await DtaDataSource.create(fixture);
         source.read_rows(0, 0, 1_100);
         const internals = source as unknown as {
             windows: Map<string, unknown>;
             gso_index: Map<string, unknown>;
             gso_cache: Map<string, unknown>;
             gso_scan_position: number;
+            read_gso_at: (...args: unknown[]) => unknown;
         };
         expect(internals.gso_index.size).toBeLessThanOrEqual(1_024);
         const partial_position = internals.gso_scan_position;
         internals.windows.clear();
         internals.gso_cache.clear();
-        expect(source.read_rows(0, 0, 1).rows[0][4]?.raw).toBe('a long first value');
+        const original_read_gso_at = internals.read_gso_at.bind(source);
+        let headers_read = 0;
+        internals.read_gso_at = (...args) => {
+            headers_read += 1;
+            return original_read_gso_at(...args);
+        };
+        expect(source.read_raw_columns(0, 0, 1, [4]).rows[0][0]?.raw)
+            .toBe('a long first value');
+        expect(headers_read).toBeLessThanOrEqual(2);
         expect(internals.gso_scan_position).toBe(partial_position);
         expect(internals.gso_index.has('5:1')).toBe(true);
     });
 
-    it('resolves an evicted strL window in one ordered scan with per-cell parity', async () => {
+    it('resolves an evicted strL window in one historical physical scan', async () => {
         const fixture = build_dta_fixture(2_000);
+        reorder_release118_gso_prefix(fixture, [1, 0]);
         const batched = await DtaDataSource.create(fixture);
         batched.read_rows(0, 0, 2_000);
         const internals = batched as unknown as {
@@ -1308,23 +1927,29 @@ describe('DtaDataSource', () => {
         const per_cell_values = Array.from({ length: 256 }, (_, row) =>
             per_cell.read_raw_columns(0, row, 1, [4]).rows[0]);
         expect(batch_values).toEqual(per_cell_values);
-        expect(headers_read).toBeLessThanOrEqual(320);
+        expect(headers_read).toBeLessThanOrEqual(256);
     });
 
-    it('keeps checkpoints ordered for observation-major multi-strL data', async () => {
-        const source = await DtaDataSource.create(build_dta_fixture(1_100, true));
-        source.read_rows(0, 0, 1_100);
+    it('bounds unordered multi-strL lookup with an exact seen-id bitmap', async () => {
+        const fixture = build_dta_fixture(1_100, true);
+        reorder_release118_gso_prefix(fixture, [1, 0]);
+        const source = await DtaDataSource.create(fixture);
         const internals = source as unknown as {
             windows: Map<string, unknown>;
             gso_index: Map<string, unknown>;
             gso_cache: Map<string, unknown>;
-            gso_checkpoints: unknown[];
+            gso_seen_identifiers?: Uint8Array;
             gso_scan_position: number;
         };
+        expect(internals.gso_seen_identifiers).toBeUndefined();
+        source.read_columns(0, 0, 1, [0]);
+        expect(internals.gso_seen_identifiers).toBeUndefined();
+        source.read_rows(0, 0, 1_100);
         expect(internals.gso_index.size).toBeLessThanOrEqual(1_024);
-        expect(internals.gso_checkpoints.length).toBeLessThanOrEqual(1_024);
+        expect(internals.gso_seen_identifiers).toHaveLength(Math.ceil(1_100 * 2 / 8));
         const exhausted_position = internals.gso_scan_position;
         internals.windows.clear();
+        internals.gso_index.clear();
         internals.gso_cache.clear();
         expect(source.read_columns(0, 0, 1, [4, 5]).rows[0].map((cell) => cell?.raw))
             .toEqual(['a long first value', 'second 0']);
@@ -1338,40 +1963,10 @@ describe('DtaDataSource', () => {
         expect(source.meta().sheets[0].rowCount).toBe(4);
     });
 
-    it.skipIf(process.env.TABLE_VIEWER_LEGACY_HANG_CHILD === '1')(
-        'rejects negative legacy expansion lengths without hanging',
-        () => {
-            const child = spawnSync(process.execPath, [
-                join(process.cwd(), 'node_modules/vitest/vitest.mjs'),
-                'run',
-                'src/test/dta-source.test.ts',
-                '-t',
-                'negative legacy expansion child',
-            ], {
-                cwd: process.cwd(),
-                env: { ...process.env, TABLE_VIEWER_LEGACY_HANG_CHILD: '1' },
-                encoding: 'utf8',
-                timeout: 60_000,
-            });
-            const timed_out = child.error !== undefined
-                && 'code' in child.error
-                && child.error.code === 'ETIMEDOUT';
-            const diagnostic = timed_out
-                ? 'Legacy expansion-field child exceeded the 60-second hang guard'
-                : child.stderr;
-            expect(child.error, diagnostic).toBeUndefined();
-            expect(child.signal, diagnostic).toBeNull();
-            expect(child.status, diagnostic).toBe(0);
-        },
-    );
-
-    it.runIf(process.env.TABLE_VIEWER_LEGACY_HANG_CHILD === '1')(
-        'negative legacy expansion child',
-        async () => {
-            await expect(DtaDataSource.create(build_legacy_dta_fixture(-5)))
-                .rejects.toThrow('expansion field has negative length');
-        },
-    );
+    it('rejects negative legacy expansion lengths', async () => {
+        await expect(DtaDataSource.create(build_legacy_dta_fixture(-5)))
+            .rejects.toThrow('invalid expansion field');
+    });
 
     it('allows exactly 10,000 zero-length legacy expansion fields', async () => {
         const source = await DtaDataSource.create(build_legacy_dta_fixture(0, 10_000));
@@ -1395,13 +1990,119 @@ describe('DtaDataSource', () => {
         expect(rows[0][0]?.formatted).toBe('Café');
     });
 
-    it('rejects release 118 strL pointers whose observation exceeds 32 bits', async () => {
+    it.each([
+        ['windows-1252', 'caf€', 'Caf€'],
+        ['iso-8859-1', 'caf\x80', 'Caf\x80'],
+    ] as const)(
+        'honors explicit %s decoding for legacy fixed strings and value labels',
+        async (encoding, expected_text, expected_label) => {
+            const source = await DtaDataSource.create(
+                build_legacy_dta_fixture(0, 0, 0x80, 0x80),
+                { encoding },
+            );
+            const row = source.read_rows(0, 0, 1).rows[0];
+            expect(row[1]?.raw).toBe(expected_text);
+            expect(row[0]?.formatted).toBe(expected_label);
+        },
+    );
+
+    it('preserves a UTF-8 BOM in fixed strings, label names, and label text', async () => {
+        const bom = String.fromCharCode(0xfeff);
+        const label_name = `${bom}labels`;
+        const label_text = `${bom}shown`;
+        const source = await DtaDataSource.create(build_dta_fixture(4, false, {
+            firstName: `${bom}x`,
+            valueLabelNames: { status: label_name },
+            statusValueLabelTableName: label_name,
+            statusLabels: [{ value: 1, label: label_text }],
+        }));
+
+        expect(source.read_raw_columns(0, 0, 1, [2]).rows[0][0]?.raw).toBe(`${bom}x`);
+        expect(source.column_filter_metadata(0, 0)?.valueLabel?.('1')).toBe(label_text);
+    });
+
+    it('decodes release 105 fixed-width value-label tables', async () => {
+        const fixture = build_pre111_value_label_fixture(105);
+        const source = await DtaDataSource.create(fixture);
+        expect(source.read_rows(0, 0, 1).rows[0][0]).toMatchObject({
+            raw: '3',
+            formatted: 'Third',
+        });
+
+        const async_source = await DtaDataSource.create(fixture);
+        const metadata = await async_source.column_filter_metadata_async(0, 0, () => false);
+        expect(metadata?.valueLabel?.('1')).toBe('One');
+        expect(metadata?.valueLabel?.('3')).toBe('Third');
+    });
+
+    it.each([9, 33])(
+        'decodes release 108 value-label tables with %i-byte names',
+        async (table_name_width) => {
+            const source = await DtaDataSource.create(
+                build_pre111_value_label_fixture(108, table_name_width),
+            );
+            expect(source.read_rows(0, 0, 1).rows[0][0]).toMatchObject({
+                raw: '3',
+                formatted: 'Third',
+            });
+        },
+    );
+
+    it('bounds and cancels legacy trailing-zero terminal probing', async () => {
+        const fixture = build_legacy_dta_fixture();
+        const padded = new Uint8Array(fixture.length + 300_000);
+        padded.set(fixture);
+        const source = await DtaDataSource.create(padded);
+        const internals = source as unknown as {
+            bytes?: Uint8Array;
+            yield_source_work: () => Promise<void>;
+        };
+        let release_yield!: () => void;
+        const yield_gate = new Promise<void>((resolve) => { release_yield = resolve; });
+        const yield_work = vi.spyOn(internals, 'yield_source_work').mockReturnValue(yield_gate);
+
+        const metadata = source.column_filter_metadata_async(0, 0, () => false);
+        await vi.waitFor(() => expect(yield_work).toHaveBeenCalled());
+        source.close();
+        release_yield();
+
+        await expect(metadata).rejects.toMatchObject({ name: 'AbortError' });
+        expect(internals.bytes).toBeUndefined();
+    });
+
+    it('cancels legacy value-label layout probing at a cooperative boundary', async () => {
+        const source = await DtaDataSource.create(
+            build_pre111_value_label_fixture(108, 9, 257),
+        );
+        const internals = source as unknown as {
+            bytes?: Uint8Array;
+            value_label_layout?: unknown;
+            value_label_descriptors: Map<string, unknown>;
+            yield_source_work: () => Promise<void>;
+        };
+        let release_yield!: () => void;
+        const yield_gate = new Promise<void>((resolve) => { release_yield = resolve; });
+        const yield_work = vi.spyOn(internals, 'yield_source_work')
+            .mockReturnValue(yield_gate);
+
+        const reading = source.column_filter_metadata_async(0, 0, () => false);
+        await vi.waitFor(() => expect(yield_work).toHaveBeenCalled());
+        source.close();
+        release_yield();
+
+        await expect(reading).rejects.toMatchObject({ name: 'AbortError' });
+        expect(internals.bytes).toBeUndefined();
+        expect(internals.value_label_layout).toBeUndefined();
+        expect(internals.value_label_descriptors.size).toBe(0);
+    });
+
+    it('reads all six release 118 observation bytes without low-word aliasing', async () => {
         const fixture = build_dta_fixture();
         const pointer = find_tag_end(fixture, '<data>') + 15;
         fixture[pointer + 6] = 1;
         const source = await DtaDataSource.create(fixture);
         expect(() => source.read_rows(0, 0, 1)).toThrow(
-            'strL observation number exceeds 32-bit range',
+            'Invalid strL pointer 5:4294967297',
         );
     });
 
@@ -1414,38 +2115,21 @@ describe('DtaDataSource', () => {
         new DataView(fixture.buffer).setUint16(pointer + offset, value, true);
         const source = await DtaDataSource.create(fixture);
         expect(() => source.read_rows(0, 0, 1)).toThrow(
-            /Corrupt \.dta file: strL pointer id .* is outside the dataset range/,
+            /Invalid strL pointer/,
         );
     });
 
-    it('rejects physically out-of-order strL objects', async () => {
+    it('resolves physically out-of-order strL objects', async () => {
         const fixture = build_dta_fixture();
-        const first_gso = find_tag_end(fixture, '<strls>');
-        const view = new DataView(fixture.buffer);
-        const first_end = first_gso + 20 + view.getUint32(first_gso + 16, true);
-        const second_end = first_end + 20 + view.getUint32(first_end + 16, true);
-        const first = fixture.slice(first_gso, first_end);
-        const second = fixture.slice(first_end, second_end);
-        fixture.set(second, first_gso);
-        fixture.set(first, first_gso + second.length);
-
+        reorder_release118_gso_prefix(fixture, [1, 0]);
         const source = await DtaDataSource.create(fixture);
-        expect(() => source.read_raw_columns(0, 0, 1, [4])).toThrow(
-            'Corrupt .dta file: strL objects are out of observation-major order',
-        );
+        expect(source.read_raw_columns(0, 0, 2, [4]).rows.map((row) => row[0]?.raw))
+            .toEqual(['a long first value', 'second long value']);
     });
 
-    it('rejects an out-of-order strL batch without a recovery rescan', async () => {
+    it('resolves an unordered async strL batch in one forward physical scan', async () => {
         const fixture = build_dta_fixture(2_000);
-        const first_gso = find_tag_end(fixture, '<strls>');
-        const view = new DataView(fixture.buffer);
-        const first_end = first_gso + 20 + view.getUint32(first_gso + 16, true);
-        const second_end = first_end + 20 + view.getUint32(first_end + 16, true);
-        const first = fixture.slice(first_gso, first_end);
-        const second = fixture.slice(first_end, second_end);
-        fixture.set(second, first_gso);
-        fixture.set(first, first_gso + second.length);
-
+        reorder_release118_gso_prefix(fixture, [1, 0]);
         const source = await DtaDataSource.create(fixture);
         const internals = source as unknown as {
             read_gso_at: (...args: unknown[]) => unknown;
@@ -1456,11 +2140,10 @@ describe('DtaDataSource', () => {
             headers_read += 1;
             return original_read_gso_at(...args);
         };
-        await expect(source.read_raw_columns_async(0, 0, 256, [4], () => false))
-            .rejects.toThrow(
-                'Corrupt .dta file: strL objects are out of observation-major order',
-            );
-        expect(headers_read).toBe(2);
+        const rows = await source.read_raw_columns_async(0, 0, 256, [4], () => false);
+        expect(rows.rows[0][0]?.raw).toBe('a long first value');
+        expect(rows.rows[1][0]?.raw).toBe('second long value');
+        expect(headers_read).toBeLessThanOrEqual(256);
     });
 
     it('stops a resolved strL batch before an unrelated corrupt object', async () => {
@@ -1484,38 +2167,78 @@ describe('DtaDataSource', () => {
         );
     });
 
-    it('rejects duplicate strL ids before mutating the cache or index', async () => {
+    it('rejects nonadjacent duplicate strL ids before mutating state', async () => {
         const fixture = build_dta_fixture();
-        const first_gso = find_tag_end(fixture, '<strls>');
+        const records = release118_gso_records(fixture);
         const view = new DataView(fixture.buffer);
-        const second_gso = first_gso + 20 + view.getUint32(first_gso + 16, true);
-        view.setBigUint64(second_gso + 7, 1n, true);
+        view.setBigUint64(records[2].start + 7, 1n, true);
         const source = await DtaDataSource.create(fixture);
         const internals = source as unknown as {
             gso_index: Map<string, { content_offset: number }>;
             gso_cache: Map<string, string>;
-            gso_entries_scanned: number;
+            gso_seen_identifiers?: Uint8Array;
             gso_scan_position: number;
         };
-        expect(source.read_raw_columns(0, 0, 1, [4]).rows[0][0]?.raw)
-            .toBe('a long first value');
-        const indexed_first = internals.gso_index.get('5:1');
+        expect(source.read_raw_columns(0, 0, 2, [4]).rows.map((row) => row[0]?.raw))
+            .toEqual(['a long first value', 'second long value']);
+        const indexed_before_duplicate = [...internals.gso_index];
         const cached_before_duplicate = [...internals.gso_cache];
+        const seen_before_duplicate = internals.gso_seen_identifiers?.slice();
 
-        expect(() => source.read_raw_columns(0, 1, 1, [4])).toThrow(
+        expect(() => source.read_raw_columns(0, 2, 1, [4])).toThrow(
             'Corrupt .dta file: duplicate strL object id 5:1',
         );
-        expect(internals.gso_index.size).toBe(1);
-        expect(internals.gso_index.get('5:1')).toBe(indexed_first);
-        expect(indexed_first?.content_offset).toBe(first_gso + 20);
+        expect([...internals.gso_index]).toEqual(indexed_before_duplicate);
         expect([...internals.gso_cache]).toEqual(cached_before_duplicate);
-        expect(internals.gso_entries_scanned).toBe(1);
-        expect(internals.gso_scan_position).toBe(second_gso);
+        expect(internals.gso_seen_identifiers).toEqual(seen_before_duplicate);
+        expect(internals.gso_scan_position).toBe(records[2].start);
+    });
+
+    it('rejects duplicate strL ids after the original leaves the location LRU', async () => {
+        const fixture = build_dta_fixture(1_026);
+        const records = release118_gso_records(fixture);
+        new DataView(fixture.buffer).setBigUint64(records[1_025].start + 7, 1n, true);
+        const source = await DtaDataSource.create(fixture);
+        const internals = source as unknown as {
+            gso_index: Map<string, unknown>;
+            gso_scan_position: number;
+        };
+
+        expect(() => source.read_raw_columns(0, 0, 1_026, [4])).toThrow(
+            'Corrupt .dta file: duplicate strL object id 5:1',
+        );
+        expect(internals.gso_index.size).toBe(1_024);
+        expect(internals.gso_index.has('5:1')).toBe(false);
+        expect(internals.gso_scan_position).toBe(records[1_025].start);
     });
 
     it('decodes release 119 strL pointers with the 3+5-byte layout', async () => {
         const source = await DtaDataSource.create(build_release119_strl_fixture());
         expect(source.read_rows(0, 0, 1).rows[0][0]?.raw).toBe('hello');
+    });
+
+    it('rejects release 119 pointers to a non-strL variable', async () => {
+        const fixture = build_release119_strl_rows_fixture([
+            new TextEncoder().encode('hello\0'),
+        ], 130, true);
+        fixture[find_tag_end(fixture, '<data>') + 1] = 1;
+        const source = await DtaDataSource.create(fixture);
+
+        expect(() => source.read_rows(0, 0, 1)).toThrow(
+            'Corrupt .dta file: strL pointer variable 1 is not strL',
+        );
+    });
+
+    it('does not consume the strls closing tag as binary GSO content', async () => {
+        const fixture = build_release119_strl_rows_fixture([Uint8Array.of(1, 2, 3)]);
+        const gso = find_tag_end(fixture, '<strls>');
+        const view = new DataView(fixture.buffer);
+        view.setUint32(gso + 16, view.getUint32(gso + 16, true) + 8, true);
+        const source = await DtaDataSource.create(fixture);
+
+        expect(() => source.read_rows(0, 0, 1)).toThrow(
+            'Corrupt .dta file: strL object is truncated',
+        );
     });
 
     it('decodes release 117 fixed and strL strings as Windows-1252', async () => {
@@ -1524,6 +2247,22 @@ describe('DtaDataSource', () => {
         expect(row[0]?.raw).toBe('café');
         expect(row[1]?.raw).toBe('café');
     });
+
+    it.each([
+        ['windows-1252', 'caf€'],
+        ['iso-8859-1', 'caf\x80'],
+    ] as const)(
+        'honors explicit %s decoding for release 117 fixed and strL strings',
+        async (encoding, expected) => {
+            const source = await DtaDataSource.create(
+                build_release117_fixture(0x80),
+                { encoding },
+            );
+            const row = source.read_rows(0, 0, 1).rows[0];
+            expect(row[0]?.raw).toBe(expected);
+            expect(row[1]?.raw).toBe(expected);
+        },
+    );
 
     it('rejects metadata-complete files with truncated observations', async () => {
         const fixture = build_dta_fixture();
@@ -1589,10 +2328,115 @@ describe('DtaDataSource', () => {
         );
     });
 
+    it('rejects modern value-label tables without an exact closing tag', async () => {
+        const corrupt = build_dta_fixture();
+        const closing_tag = find_tag_end(corrupt, '</lbl>') - '</lbl>'.length;
+        corrupt[closing_tag] = 'X'.charCodeAt(0);
+        const source = await DtaDataSource.create(corrupt);
+
+        expect(() => source.column_filter_metadata(0, 0)).toThrow(
+            'Corrupt value label table: missing closing tag',
+        );
+    });
+
+    it('verifies the modern terminal before returning a requested descriptor', async () => {
+        const corrupt = build_dta_fixture();
+        const closing_tag = find_tag_end(corrupt, '</value_labels>')
+            - '</value_labels>'.length;
+        corrupt[closing_tag] = 'X'.charCodeAt(0);
+        const source = await DtaDataSource.create(corrupt);
+        const async_source = await DtaDataSource.create(corrupt);
+
+        expect(() => source.column_filter_metadata(0, 0)).toThrow(
+            'Corrupt value label table: invalid section terminal',
+        );
+        await expect(async_source.column_filter_metadata_async(0, 0, () => false))
+            .rejects.toThrow('Corrupt value label table: invalid section terminal');
+    });
+
+    it('does not let a modern value-label entry consume the section terminal', async () => {
+        const corrupt = build_dta_fixture();
+        const payload_start = first_release118_value_label_payload_start(corrupt);
+        const section_end = find_tag_end(corrupt, '</value_labels>')
+            - '</value_labels>'.length;
+        const entry_length = section_end + 1 - payload_start;
+        const first_lbl = find_tag_end(corrupt, '<lbl>') - '<lbl>'.length;
+        new DataView(corrupt.buffer).setInt32(first_lbl + '<lbl>'.length, entry_length, true);
+        const source = await DtaDataSource.create(corrupt);
+
+        expect(() => source.column_filter_metadata(0, 0)).toThrow(
+            'Corrupt value label table: entry exceeds section bounds',
+        );
+    });
+
+    it('requires the complete modern value-label closing tag inside the section', async () => {
+        const corrupt = build_dta_fixture();
+        const payload_start = first_release118_value_label_payload_start(corrupt);
+        const section_end = find_tag_end(corrupt, '</value_labels>')
+            - '</value_labels>'.length;
+        const entry_length = section_end - payload_start;
+        const first_lbl = find_tag_end(corrupt, '<lbl>') - '<lbl>'.length;
+        new DataView(corrupt.buffer).setInt32(first_lbl + '<lbl>'.length, entry_length, true);
+        const source = await DtaDataSource.create(corrupt);
+
+        expect(() => source.column_filter_metadata(0, 0)).toThrow(
+            'Corrupt value label table: closing tag overruns section',
+        );
+    });
+
+    it.each([-1, 'end'] as const)(
+        'rejects value-label text offsets outside the declared text block (%s)',
+        async (offset) => {
+            const corrupt = build_dta_fixture();
+            const payload_start = first_release118_value_label_payload_start(corrupt);
+            const view = new DataView(corrupt.buffer);
+            const text_length = view.getInt32(payload_start + 4, true);
+            view.setInt32(payload_start + 8, offset === 'end' ? text_length : offset, true);
+            const source = await DtaDataSource.create(corrupt);
+
+            expect(() => source.column_filter_metadata(0, 0)).toThrow(
+                'Corrupt value label table: text offset is outside the text block',
+            );
+        },
+    );
+
+    it('rejects value-label text without a NUL inside the declared block', async () => {
+        const corrupt = build_dta_fixture(4, false, {
+            statusLabels: [{ value: 1, label: 'Only' }],
+        });
+        const payload_start = first_release118_value_label_payload_start(corrupt);
+        const view = new DataView(corrupt.buffer);
+        const count = view.getInt32(payload_start, true);
+        const text_length = view.getInt32(payload_start + 4, true);
+        const text_start = payload_start + 8 + count * 8;
+        corrupt[text_start + text_length - 1] = 'X'.charCodeAt(0);
+        const source = await DtaDataSource.create(corrupt);
+
+        expect(() => source.column_filter_metadata(0, 0)).toThrow(
+            'Corrupt value label table: label text is missing a NUL terminator',
+        );
+    });
+
+    it('requires an exact modern value-label payload length', async () => {
+        const corrupt = build_dta_fixture();
+        const payload_start = first_release118_value_label_payload_start(corrupt);
+        const view = new DataView(corrupt.buffer);
+        view.setInt32(
+            payload_start + 4,
+            view.getInt32(payload_start + 4, true) - 1,
+            true,
+        );
+        const source = await DtaDataSource.create(corrupt);
+
+        expect(() => source.column_filter_metadata(0, 0)).toThrow(
+            'Corrupt value label table: payload length does not match entry',
+        );
+    });
+
     it('rejects pre-Unicode value-label payloads beyond their declared entry length', async () => {
         const corrupt = build_legacy_dta_fixture();
         const table_length_offset = corrupt.length - (4 + 33 + 3 + 8 + 8 + 5);
-        const declared_length_without_text = 33 + 3 + 8 + 8;
+        const declared_length_without_text = 8 + 8;
         new DataView(corrupt.buffer).setInt32(
             table_length_offset,
             declared_length_without_text,
@@ -1600,7 +2444,7 @@ describe('DtaDataSource', () => {
         );
         const source = await DtaDataSource.create(corrupt);
         expect(() => source.read_rows(0, 0, 1)).toThrow(
-            'Corrupt value label table: payload exceeds entry bounds',
+            'Corrupt value label table: payload length does not match entry',
         );
     });
 
