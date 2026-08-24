@@ -15,7 +15,10 @@ import {
     transformed_window,
 } from '../table-transform';
 import type { FilterEntry, SheetTransformState } from '../types';
-import { transform_read_columns } from '../types';
+import {
+    canonical_filter_identity_for_raw,
+    transform_read_columns,
+} from '../types';
 import type {
     CachedTransformColumn,
     TransformColumnCache,
@@ -733,6 +736,65 @@ describe('table transforms', () => {
         expect(source.read_calls).toBe(raw_reads + 1);
         expect(first_resolve).toHaveBeenCalledTimes(1);
         expect(second_resolve).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps escaped raw identities distinct and matches legacy persisted spellings', async () => {
+        const binary_key = `stata-binary:sha256:${'a'.repeat(64)}:40`;
+        const raw_identity = canonical_filter_identity_for_raw(binary_key);
+        const binary = cell('binary (40 bytes): aa…');
+        binary.filterKey = binary_key;
+        const state = (excludedValues: string[]): SheetTransformState => ({
+            filters: [{
+                ...filter('isOneOf'),
+                excludedValues,
+            }],
+            sort: [],
+        });
+
+        const both = new Source([[cell(binary_key)], [binary]]);
+        const exclude_raw = await compute_transform(
+            both,
+            0,
+            state([raw_identity]),
+        );
+        expect([...exclude_raw.indices!]).toEqual([1]);
+
+        const exclude_binary = await compute_transform(
+            both,
+            0,
+            state([binary_key]),
+        );
+        expect([...exclude_binary.indices!]).toEqual([0]);
+
+        const legacy_raw = await compute_transform(
+            new Source([[cell(binary_key)]]),
+            0,
+            state([binary_key]),
+        );
+        expect([...legacy_raw.indices!]).toEqual([]);
+
+        const prefixed_raw = 'table-viewer:raw:literal';
+        const legacy_prefixed_raw = await compute_transform(
+            new Source([[cell(prefixed_raw)]]),
+            0,
+            state([prefixed_raw]),
+        );
+        expect([...legacy_prefixed_raw.indices!]).toEqual([]);
+
+        const prefixed_identity = canonical_filter_identity_for_raw(prefixed_raw);
+        const ambiguous_prefix = await compute_transform(
+            new Source([[cell(prefixed_raw)], [cell(prefixed_identity)]]),
+            0,
+            state([prefixed_identity]),
+        );
+        expect([...ambiguous_prefix.indices!]).toEqual([1]);
+
+        const legacy_nested_prefix = await compute_transform(
+            new Source([[cell(prefixed_identity)]]),
+            0,
+            state([prefixed_identity]),
+        );
+        expect([...legacy_nested_prefix.indices!]).toEqual([]);
     });
 
     it('skips sort-column acquisition for zero and singleton survivors', async () => {

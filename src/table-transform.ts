@@ -10,7 +10,10 @@ import type {
     SortDirection,
 } from './types';
 import {
+    canonical_filter_identity_for_raw,
     is_range_filter_operator,
+    is_stata_binary_filter_identity,
+    raw_value_from_escaped_filter_identity,
     transform_is_active,
     transform_read_columns,
 } from './types';
@@ -202,6 +205,11 @@ export async function compute_transform(
                         column.numeric && column.foundValue,
                         true,
                         sort_instrumentation,
+                        await present_special_filter_identities(
+                            column,
+                            filters,
+                            is_cancelled,
+                        ),
                     );
                     let group_survivors = 0;
                     for (let row = 0; row < sheet.rowCount; row++) {
@@ -339,6 +347,50 @@ export async function compute_transform(
 function filter_uses_identity(entry: FilterEntry): boolean {
     return entry.operator === 'isOneOf'
         && entry.excludedValues?.some((value) => value !== null) === true;
+}
+
+function can_be_current_special_filter_identity(value: string): boolean {
+    if (is_stata_binary_filter_identity(value)) return true;
+    const raw = raw_value_from_escaped_filter_identity(value);
+    return raw !== undefined && canonical_filter_identity_for_raw(raw) === value;
+}
+
+/** Current special identities take precedence over an ambiguous legacy raw
+ * spelling. Only when no exact source value exists may that old spelling stand
+ * in for the ordinary raw string now escaped out of the special namespace. */
+async function present_special_filter_identities(
+    column: TransformColumn,
+    filters: readonly FilterEntry[],
+    is_cancelled: () => boolean,
+): Promise<ReadonlySet<string>> {
+    if (column.filterValues === undefined) return new Set();
+    const candidates = new Set<string>();
+    for (const filter of filters) {
+        if (filter.operator !== 'isOneOf') continue;
+        for (const value of filter.excludedValues ?? []) {
+            if (
+                value !== null
+                && can_be_current_special_filter_identity(value)
+            ) candidates.add(value);
+        }
+    }
+    if (candidates.size === 0) return candidates;
+
+    const present = new Set<string>();
+    for (let row = 0; row < column.filterValues.length; row++) {
+        const identity = column.filterValues[row];
+        if (identity !== null && identity !== undefined && candidates.has(identity)) {
+            present.add(identity);
+            if (present.size === candidates.size) return present;
+        }
+        if ((row + 1) % FILTER_ROWS_PER_CHECKPOINT === 0) {
+            await cancellation_checkpoint(is_cancelled);
+        }
+    }
+    if (column.filterValues.length % FILTER_ROWS_PER_CHECKPOINT !== 0) {
+        await cancellation_checkpoint(is_cancelled);
+    }
+    return present;
 }
 
 function group_enabled_filters(
@@ -605,17 +657,25 @@ export function matches_filter(
     entry: FilterEntry,
 ): boolean {
     const raw = raw_value(cell);
+    const identity = filter_uses_identity(entry) ? filter_value(cell) : raw;
+    const present_special = typeof identity === 'string'
+        && identity !== raw
+        && can_be_current_special_filter_identity(identity)
+        ? new Set([identity])
+        : undefined;
     const compiled = compile_filter_group(
         [entry],
         raw !== null && cell_can_be_numeric(cell),
         false,
+        undefined,
+        present_special,
     );
     const predicate = compiled.predicates[0];
     const numeric_key = raw !== null && predicate.needsNumericKey
         ? build_numeric_filter_row_key(raw)
         : undefined;
     return predicate.matches(
-        predicate.usesFilterIdentity ? filter_value(cell) : raw,
+        predicate.usesFilterIdentity ? identity : raw,
         numeric_key,
     );
 }
@@ -665,6 +725,7 @@ function compile_filter_group(
     numeric_column: boolean,
     strict_numeric_operands: boolean,
     instrumentation?: TransformSortInstrumentation,
+    present_special_identities: ReadonlySet<string> = new Set(),
 ): CompiledFilterGroup {
     if (strict_numeric_operands) {
         validate_filter_operands(entries, numeric_column);
@@ -675,6 +736,7 @@ function compile_filter_group(
             numeric_column,
             strict_numeric_operands,
             instrumentation,
+            present_special_identities,
         )),
     };
 }
@@ -684,6 +746,7 @@ function compile_filter(
     numeric_column: boolean,
     strict_numeric_operands: boolean,
     instrumentation?: TransformSortInstrumentation,
+    present_special_identities: ReadonlySet<string> = new Set(),
 ): CompiledFilterPredicate {
     if (entry.operator === 'isEmpty') {
         return {
@@ -705,10 +768,21 @@ function compile_filter(
         // canonicalization. Values absent from the set — including values that
         // appear in the file later — always pass. `null` excludes blanks.
         const excluded = new Set(entry.excludedValues ?? []);
+        const legacy_identity_fallbacks = new Set(
+            [...excluded].flatMap((value) => {
+                if (value === null || present_special_identities.has(value)) return [];
+                const canonical = canonical_filter_identity_for_raw(value);
+                return canonical === value ? [] : [canonical];
+            }),
+        );
         return {
             needsNumericKey: false,
             usesFilterIdentity: filter_uses_identity(entry),
-            matches: (raw) => !excluded.has(raw),
+            matches: (identity) => !excluded.has(identity)
+                && (
+                    identity === null
+                    || !legacy_identity_fallbacks.has(identity)
+                ),
         };
     }
 

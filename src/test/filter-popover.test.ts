@@ -864,6 +864,45 @@ describe('FilterPopover value checklist (isOneOf)', () => {
         }));
     });
 
+    it('keeps binary identities in checklist values without exposing digests', () => {
+        const current_identity = `stata-binary:sha256:${'a'.repeat(64)}:40`;
+        const stale_identity = `stata-binary:sha256:${'b'.repeat(64)}:41`;
+        const preview = 'binary (40 bytes): aa…';
+        const { on_apply } = render_popover([{
+            id: 'f', colIndex: 1, operator: 'isOneOf',
+            excludedValues: [current_identity, stale_identity],
+            caseSensitive: false, enabled: true,
+        }], {
+            status: 'ready', bins: [], columnKind: 'text',
+            distinctValues: [{ value: current_identity, rawValue: preview }],
+            distinctValuesExceeded: false,
+        });
+
+        expect(checkbox_labels()).toEqual([preview, '(Value unavailable)']);
+        expect(document.body.textContent).not.toContain('stata-binary:sha256:');
+        for (const box of document.querySelectorAll('.filter-value-item input')) {
+            expect(box.getAttribute('aria-label')).not.toContain('stata-binary:sha256:');
+        }
+
+        const search = document.querySelector('.filter-value-search') as HTMLInputElement;
+        act(() => {
+            Object.getOwnPropertyDescriptor(
+                HTMLInputElement.prototype,
+                'value',
+            )!.set!.call(search, 'stata-binary:sha256:');
+            search.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+        expect(checkbox_labels()).toEqual([]);
+        expect(document.body.textContent).toContain('No matching values');
+
+        act(() => (document.querySelector(
+            '.filter-popover-btn-primary',
+        ) as HTMLButtonElement).click());
+        expect(on_apply).toHaveBeenCalledWith(expect.objectContaining({
+            excludedValues: [current_identity, stale_identity],
+        }));
+    });
+
     it('shows raw codes with Formatting off without changing the categorical default', () => {
         render_popover([], LABELED_NUMERIC_READY, false);
         expect((document.querySelector('select') as HTMLSelectElement).value).toBe('isOneOf');

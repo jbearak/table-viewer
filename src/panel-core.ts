@@ -143,6 +143,10 @@ function allocate_transform_operation_token(): TransformOperationToken {
 const DEFAULT_MAX_CACHED_PAGES = 64;
 const DEFAULT_MAX_CACHED_TRANSFORM_CELLS = 1_000_000;
 
+function transform_column_slots(column: CachedTransformColumn): number {
+    return column.values.length + (column.filterValues?.length ?? 0);
+}
+
 class TransformColumnLruCache implements TransformColumnCache {
     private readonly entries = new Map<string, CachedTransformColumn>();
     private retained_cells = 0;
@@ -163,12 +167,12 @@ class TransformColumnLruCache implements TransformColumnCache {
         column_index: number,
         column: CachedTransformColumn,
     ): void {
-        const cells = column.values.length;
+        const cells = transform_column_slots(column);
         if (cells > this.max_cells || this.max_cells <= 0) return;
         const key = `${sheet_index}:${column_index}`;
         const previous = this.entries.get(key);
         if (previous) {
-            this.retained_cells -= previous.values.length;
+            this.retained_cells -= transform_column_slots(previous);
             this.entries.delete(key);
         }
         while (
@@ -178,7 +182,7 @@ class TransformColumnLruCache implements TransformColumnCache {
             const oldest_key = this.entries.keys().next().value as string;
             const oldest = this.entries.get(oldest_key)!;
             this.entries.delete(oldest_key);
-            this.retained_cells -= oldest.values.length;
+            this.retained_cells -= transform_column_slots(oldest);
         }
         this.entries.set(key, column);
         this.retained_cells += cells;

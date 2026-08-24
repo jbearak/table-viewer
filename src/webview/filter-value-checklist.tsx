@@ -1,6 +1,9 @@
 import React, { forwardRef, useMemo, useRef, useState } from 'react';
 import type { FilterValueOption } from '../types';
-import { filter_value_label } from './transform-ui-model';
+import {
+    filter_identity_label,
+    filter_value_label,
+} from './transform-ui-model';
 
 export interface FilterValueChecklistProps {
     /** Complete distinct raw values plus optional display-only labels. */
@@ -14,7 +17,9 @@ export interface FilterValueChecklistProps {
 const MAX_RENDERED_OPTIONS = 500;
 
 function option_raw_display(option: FilterValueOption): string {
-    return filter_value_label(option.rawValue ?? option.value);
+    return option.rawValue === undefined
+        ? filter_identity_label(option.value)
+        : filter_value_label(option.rawValue);
 }
 
 function option_display(

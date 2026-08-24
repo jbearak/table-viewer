@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer';
 import type {
     ColumnFilterMetadata,
     DataSource,
@@ -34,7 +35,12 @@ export interface ColumnHistogram {
 interface DistinctValues {
     /** Identity -> display-safe raw value. Ordinary values map to themselves. */
     readonly entries: Map<string | null, string | null>;
-    byteCount: number;
+    /** UTF-8 bytes actually carried by option identities and distinct previews. */
+    serializedByteCount: number;
+    /** Deferred identities spend a separate bounded work budget even when every
+     * result is a duplicate and the serialized option set never grows. */
+    identityResolutionCount: number;
+    identityResolutionRawBytes: number;
 }
 
 function finite_numeric_value(cell: RawCell | null | undefined): number | undefined {
@@ -92,12 +98,26 @@ function abort_error(): Error {
     return error;
 }
 
+function utf8_bytes(value: string): number {
+    return Buffer.byteLength(value, 'utf8');
+}
+
 function raw_storage_bytes(
     cell: RawCell | null | undefined,
     raw: string | null,
 ): number {
     if (raw === null) return 0;
-    return cell?.rawByteLength ?? raw.length * 2;
+    return cell?.rawByteLength ?? utf8_bytes(raw);
+}
+
+function serialized_option_bytes(
+    identity: string | null,
+    raw: string | null,
+): number {
+    if (identity === null) return 0;
+    return utf8_bytes(identity) + (
+        raw !== null && raw !== identity ? utf8_bytes(raw) : 0
+    );
 }
 
 function add_distinct_value(
@@ -106,28 +126,42 @@ function add_distinct_value(
     is_cancelled: () => boolean,
 ): boolean | Promise<boolean> {
     const raw = raw_value(cell);
-    const bytes = raw_storage_bytes(cell, raw);
+    const raw_bytes = raw_storage_bytes(cell, raw);
     // A bounded preview must not trick the checklist into hashing or retaining a
     // source value whose actual identity cannot fit in the transfer budget.
-    if (bytes > FILTER_DISTINCT_VALUE_BYTE_LIMIT) return false;
+    if (raw_bytes > FILTER_DISTINCT_VALUE_BYTE_LIMIT) return false;
 
-    const known_identity = peek_filter_value(cell);
-    if (known_identity !== undefined && distinct.entries.has(known_identity)) return true;
-    // Check both caps before starting deferred identity work. This is deliberately
-    // conservative for a repeated lossy preview: proving it is a duplicate would
-    // itself spend the work the exhausted checklist is no longer allowed to start.
-    if (
-        distinct.entries.size === FILTER_DISTINCT_VALUE_LIMIT
-        || distinct.byteCount + bytes > FILTER_DISTINCT_VALUE_BYTE_LIMIT
-    ) return false;
-
-    const identity = known_identity ?? resolve_filter_value(cell, is_cancelled);
-    const retain = (resolved: string | null): boolean => {
-        if (distinct.entries.has(resolved)) return true;
-        distinct.entries.set(resolved, raw);
-        distinct.byteCount += bytes;
+    const retain = (identity: string | null): boolean => {
+        // Resolving a new GSO offset is allowed at the distinct cap: its identity
+        // may duplicate an entry already retained. Only a genuinely new option
+        // spends serialized bytes or fails the distinct-entry cap.
+        if (distinct.entries.has(identity)) return true;
+        if (distinct.entries.size === FILTER_DISTINCT_VALUE_LIMIT) return false;
+        const option_bytes = serialized_option_bytes(identity, raw);
+        if (
+            distinct.serializedByteCount + option_bytes
+            > FILTER_DISTINCT_VALUE_BYTE_LIMIT
+        ) return false;
+        distinct.entries.set(identity, raw);
+        distinct.serializedByteCount += option_bytes;
         return true;
     };
+
+    const known_identity = peek_filter_value(cell);
+    if (known_identity !== undefined) return retain(known_identity);
+
+    // Distinct-entry and transfer caps cannot bound repeated deferred duplicates,
+    // because those may never grow the retained set. Charge every resolution by
+    // both count and source raw bytes before asking the source to do the work.
+    if (
+        distinct.identityResolutionCount === FILTER_DISTINCT_VALUE_LIMIT
+        || distinct.identityResolutionRawBytes + raw_bytes
+            > FILTER_DISTINCT_VALUE_BYTE_LIMIT
+    ) return false;
+    distinct.identityResolutionCount += 1;
+    distinct.identityResolutionRawBytes += raw_bytes;
+
+    const identity = resolve_filter_value(cell, is_cancelled);
     return typeof identity === 'object' && identity !== null
         ? identity.then(retain)
         : retain(identity);
@@ -154,7 +188,12 @@ export async function compute_column_histogram(
     let max = Number.NEGATIVE_INFINITY;
     let count = 0;
     let columnKind: FilterColumnKind = 'unknown';
-    let distinct: DistinctValues | null = { entries: new Map(), byteCount: 0 };
+    let distinct: DistinctValues | null = {
+        entries: new Map(),
+        serializedByteCount: 0,
+        identityResolutionCount: 0,
+        identityResolutionRawBytes: 0,
+    };
     for (let start = 0; start < sheet.rowCount; start += ROW_BATCH_SIZE) {
         if (is_cancelled()) throw abort_error();
         const window = await read_source_raw_columns_async(
@@ -296,7 +335,7 @@ async function build_result(
     let options: FilterValueOption[] = [];
     let exceeded = distinct === null;
     if (distinct !== null) {
-        let serialized_bytes = distinct.byteCount;
+        let serialized_bytes = distinct.serializedByteCount;
         for (const [value, raw] of distinct.entries) {
             if (value === null) {
                 options.push({ value });
@@ -306,7 +345,7 @@ async function build_result(
             if (raw !== value && raw !== null) option.rawValue = raw;
             const label = raw === null ? undefined : metadata?.valueLabel?.(raw);
             if (label !== undefined) {
-                serialized_bytes += label.length * 2;
+                serialized_bytes += utf8_bytes(label);
                 option.label = label;
             }
             if (serialized_bytes > FILTER_DISTINCT_VALUE_BYTE_LIMIT) {

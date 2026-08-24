@@ -10,7 +10,11 @@ import {
     type WorkbookMeta,
 } from '../data-source/interface';
 import { compute_column_histogram } from '../histograms';
-import { FILTER_DISTINCT_VALUE_BYTE_LIMIT } from '../types';
+import {
+    canonical_filter_identity_for_raw,
+    FILTER_DISTINCT_VALUE_BYTE_LIMIT,
+    FILTER_DISTINCT_VALUE_LIMIT,
+} from '../types';
 
 type HistogramCell = string | null | (RawCell & { raw: string });
 
@@ -298,6 +302,130 @@ describe('compute_column_histogram', () => {
             }],
             distinctValuesExceeded: false,
         });
+    });
+
+    it('separates a literal raw binary-identity spelling from the binary identity', async () => {
+        const key = `stata-binary:sha256:${'a'.repeat(64)}:40`;
+        const preview = 'binary (40 bytes): aa…';
+        const histogram = await compute_column_histogram(
+            new HistogramSource([
+                key,
+                {
+                    raw: preview,
+                    rawType: 'string',
+                    rawByteLength: 40,
+                    filterKey: key,
+                },
+            ]),
+            0,
+            0,
+            () => false,
+        );
+
+        expect(histogram.distinctValues).toEqual([
+            { value: canonical_filter_identity_for_raw(key), rawValue: key },
+            { value: key, rawValue: preview },
+        ]);
+        expect(new Set(histogram.distinctValues.map((option) => option.value)).size)
+            .toBe(2);
+    });
+
+    it('resolves a deferred duplicate even when the distinct-entry cap is full', async () => {
+        const resolve_duplicate = vi.fn(async () => 'v0');
+        const duplicate = deferred_histogram_cell(
+            'binary (1 byte): 00',
+            1,
+            resolve_duplicate,
+        );
+        duplicate.rawType = 'string';
+        const histogram = await compute_column_histogram(
+            new HistogramSource([
+                ...Array.from(
+                    { length: FILTER_DISTINCT_VALUE_LIMIT },
+                    (_, index) => `v${index}`,
+                ),
+                duplicate,
+            ]),
+            0,
+            0,
+            () => false,
+        );
+
+        expect(resolve_duplicate).toHaveBeenCalledOnce();
+        expect(histogram.distinctValuesExceeded).toBe(false);
+        expect(histogram.distinctValues).toHaveLength(FILTER_DISTINCT_VALUE_LIMIT);
+    });
+
+    it('bounds repeated deferred duplicate resolution by count', async () => {
+        const resolve_duplicate = vi.fn(async () => 'same-identity');
+        const histogram = await compute_column_histogram(
+            new HistogramSource(Array.from(
+                { length: FILTER_DISTINCT_VALUE_LIMIT + 1 },
+                () => deferred_histogram_cell('1', 1, resolve_duplicate),
+            )),
+            0,
+            0,
+            () => false,
+        );
+
+        expect(resolve_duplicate).toHaveBeenCalledTimes(FILTER_DISTINCT_VALUE_LIMIT);
+        expect(histogram.distinctValuesExceeded).toBe(true);
+        expect(histogram.distinctValues).toEqual([]);
+    });
+
+    it('bounds deferred identity resolution by aggregate source raw bytes', async () => {
+        const resolve_duplicate = vi.fn(async () => 'same-identity');
+        const raw_bytes = Math.floor(FILTER_DISTINCT_VALUE_BYTE_LIMIT / 2) + 1;
+        const histogram = await compute_column_histogram(
+            new HistogramSource([
+                deferred_histogram_cell('1', raw_bytes, resolve_duplicate),
+                deferred_histogram_cell('1', raw_bytes, resolve_duplicate),
+            ]),
+            0,
+            0,
+            () => false,
+        );
+
+        expect(resolve_duplicate).toHaveBeenCalledOnce();
+        expect(histogram.distinctValuesExceeded).toBe(true);
+        expect(histogram.distinctValues).toEqual([]);
+    });
+
+    it('charges serialized identity and raw-preview UTF-8 bytes together', async () => {
+        const half = Math.floor(FILTER_DISTINCT_VALUE_BYTE_LIMIT / 2);
+        const identity = `identity:${'i'.repeat(half)}`;
+        const preview = `preview:${'p'.repeat(half)}`;
+        const histogram = await compute_column_histogram(
+            new HistogramSource([{
+                raw: preview,
+                rawType: 'string',
+                rawByteLength: Buffer.byteLength(preview, 'utf8'),
+                filterKey: identity,
+            }]),
+            0,
+            0,
+            () => false,
+        );
+
+        expect(histogram.distinctValuesExceeded).toBe(true);
+        expect(histogram.distinctValues).toEqual([]);
+    });
+
+    it('charges source labels by their serialized UTF-8 bytes', async () => {
+        const label = '€'.repeat(
+            Math.floor(FILTER_DISTINCT_VALUE_BYTE_LIMIT / 3) + 1,
+        );
+        const histogram = await compute_column_histogram(
+            new HistogramSource(['1'], {
+                valueLabel: () => label,
+            }),
+            0,
+            0,
+            () => false,
+        );
+
+        expect(histogram.distinctValuesExceeded).toBe(true);
+        expect(histogram.distinctValues).toEqual([]);
     });
 
     it('keeps a complete distinct list for text columns under the cap', async () => {

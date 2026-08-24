@@ -102,10 +102,41 @@ export interface FilterEntry {
     value?: string;
     secondValue?: string;
     /** `isOneOf` only: exact canonical identities that must NOT match. `null`
-     * excludes blanks. Ordinary scalar identities are their raw values. */
+     * excludes blanks. Ordinary scalar identities are their raw values unless
+     * they need escaping out of a source-owned internal identity namespace. */
     excludedValues?: (string | null)[];
     caseSensitive: boolean;
     enabled: boolean;
+}
+
+const STATA_BINARY_FILTER_IDENTITY =
+    /^stata-binary:sha256:[0-9a-f]{64}:(?:0|[1-9]\d*)$/;
+const ESCAPED_RAW_FILTER_IDENTITY_PREFIX = 'table-viewer:raw:';
+
+/** True only for the exact internal identity format emitted by binary Stata strLs. */
+export function is_stata_binary_filter_identity(value: string): boolean {
+    return STATA_BINARY_FILTER_IDENTITY.test(value);
+}
+
+/**
+ * Give ordinary raw strings a namespace disjoint from binary Stata identities.
+ * The escape namespace escapes itself as well, keeping this mapping injective
+ * without rewriting the overwhelmingly common persisted raw values.
+ */
+export function canonical_filter_identity_for_raw(value: string): string {
+    return is_stata_binary_filter_identity(value)
+        || value.startsWith(ESCAPED_RAW_FILTER_IDENTITY_PREFIX)
+        ? `${ESCAPED_RAW_FILTER_IDENTITY_PREFIX}${value}`
+        : value;
+}
+
+/** Recover the ordinary raw string represented by an escaped canonical identity. */
+export function raw_value_from_escaped_filter_identity(
+    value: string,
+): string | undefined {
+    return value.startsWith(ESCAPED_RAW_FILTER_IDENTITY_PREFIX)
+        ? value.slice(ESCAPED_RAW_FILTER_IDENTITY_PREFIX.length)
+        : undefined;
 }
 
 /** Checklist entries above either cap are never offered; a partial value list

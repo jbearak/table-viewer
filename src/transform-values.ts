@@ -2,6 +2,7 @@ import {
     DEFERRED_FILTER_IDENTITY,
     type RawCell,
 } from './data-source/interface';
+import { canonical_filter_identity_for_raw } from './types';
 
 export function raw_value(cell: RawCell | null | undefined): string | null {
     const raw = cell?.raw;
@@ -22,7 +23,9 @@ export function peek_filter_value(
     const concrete = cell?.filterKey;
     if (concrete !== undefined) return concrete;
     const deferred = cell?.[DEFERRED_FILTER_IDENTITY];
-    return deferred === undefined ? raw : deferred.cachedKey();
+    return deferred === undefined
+        ? canonical_filter_identity_for_raw(raw)
+        : deferred.cachedKey();
 }
 
 /** Exact categorical matching identity. Most values use their raw text; sources

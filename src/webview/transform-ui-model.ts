@@ -8,7 +8,12 @@ import type {
     SortKey,
     TransformIntent,
 } from '../types';
-import { is_range_filter_operator, transform_read_columns } from '../types';
+import {
+    is_range_filter_operator,
+    is_stata_binary_filter_identity,
+    raw_value_from_escaped_filter_identity,
+    transform_read_columns,
+} from '../types';
 
 export { is_range_filter_operator };
 
@@ -203,14 +208,30 @@ export function filter_value_label(value: string | null): string {
     return value === null ? '(Blanks)' : value;
 }
 
+const FILTER_VALUE_UNAVAILABLE = '(Value unavailable)';
+
+/** Display a persisted canonical identity without exposing an internal digest.
+ * Escaped ordinary raw strings remain recoverable; a bare binary identity does not. */
+export function filter_identity_label(value: string | null): string {
+    if (value === null) return filter_value_label(value);
+    const escaped_raw = raw_value_from_escaped_filter_identity(value);
+    if (escaped_raw !== undefined) return filter_value_label(escaped_raw);
+    return is_stata_binary_filter_identity(value)
+        ? FILTER_VALUE_UNAVAILABLE
+        : filter_value_label(value);
+}
+
 function is_one_of_summary(name: string, entry: FilterEntry): string {
     const excluded = entry.excludedValues ?? [];
     if (excluded.length === 0) return `${name} includes all values`;
     if (excluded.length === 1) {
-        const label = excluded[0] === null
+        if (
+            excluded[0] !== null
+            && is_stata_binary_filter_identity(excluded[0])
+        ) return `${name} excludes 1 value (details unavailable)`;
+        return `${name} excludes ${excluded[0] === null
             ? '(Blanks)'
-            : `“${excluded[0]}”`;
-        return `${name} excludes ${label}`;
+            : `“${filter_identity_label(excluded[0])}”`}`;
     }
     return `${name} excludes ${excluded.length} values`;
 }

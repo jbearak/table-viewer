@@ -109,6 +109,23 @@ class TrackingColumnSource implements DataSource {
     close(): void {}
 }
 
+class TrackingIdentityColumnSource extends TrackingColumnSource {
+    override read_columns(
+        sheet: number,
+        start: number,
+        count: number,
+        columns: readonly number[],
+    ): RowWindow {
+        const window = super.read_columns(sheet, start, count, columns);
+        return {
+            ...window,
+            rows: window.rows.map((row) => row.map((cell) => cell === null
+                ? null
+                : { ...cell, filterKey: `identity:${cell.raw}` })),
+        };
+    }
+}
+
 function make_panel() {
     const posted: any[] = [];
     const postMessage = vi.fn((m: any) => { posted.push(m); return Promise.resolve(true); });
@@ -1392,6 +1409,45 @@ describe('ViewerPanelCore', () => {
 
         expect(source.column_reads.map((read) => read.columns)).toEqual([
             [0], [1], [2], [1],
+        ]);
+    });
+
+    it('charges filter-identity slots to the transform-column cache bound', async () => {
+        const { panel } = make_panel();
+        const source = new TrackingIdentityColumnSource(3);
+        const core = new ViewerPanelCore(panel, source, {
+            // One three-row column with both values arrays exactly fills the cache.
+            maxCachedTransformCells: 6,
+        });
+        const apply = async (
+            column: number,
+            requestId: string,
+            categorical: boolean,
+        ) => {
+            await core.handle_message({
+                type: 'setTransform', sheetIndex: 0, requestId,
+                generation: core.generation, sourceGeneration: core.source_generation,
+                intent: 'user', state: {
+                    sort: categorical ? [] : [{ colIndex: column, direction: 'asc' }],
+                    filters: categorical ? [{
+                        id: `filter-${column}`,
+                        colIndex: column,
+                        operator: 'isOneOf',
+                        excludedValues: ['identity:missing'],
+                        caseSensitive: false,
+                        enabled: true,
+                    }] : [],
+                    schema: '["Sheet1",3,null]',
+                },
+            });
+        };
+
+        await apply(0, 'identity-zero', true);
+        await apply(1, 'identity-one', false);
+        await apply(0, 'identity-zero-again', true);
+
+        expect(source.column_reads.map((read) => read.columns)).toEqual([
+            [0], [1], [0],
         ]);
     });
 
