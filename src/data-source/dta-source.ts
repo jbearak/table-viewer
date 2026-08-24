@@ -43,6 +43,10 @@ const MAX_GSO_CHECKPOINTS = 1_024;
 const MAX_GSO_DIGEST_CACHE_ENTRIES = 4_096;
 const MAX_SYNC_BINARY_HASH_BYTES = 16 * 1024 * 1024;
 const MAX_VALUE_LABEL_TABLE_BYTES = 16 * 1024 * 1024;
+const MAX_VALUE_LABEL_TABLE_ENTRIES = 65_536;
+const MAX_VALUE_LABEL_TABLE_DECODED_BYTES = 16 * 1024 * 1024;
+const MAX_VALUE_LABEL_CACHE_ENTRIES = 64;
+const MAX_VALUE_LABEL_CACHE_BYTES = 16 * 1024 * 1024;
 const MAX_LEGACY_EXPANSION_FIELDS = 10_000;
 const INITIAL_GSO_CHECKPOINT_STRIDE = 64;
 const GSO_SCAN_ENTRIES_PER_YIELD = 256;
@@ -75,7 +79,12 @@ const MODERN_SECTION_TAGS: readonly [
     ['stata_data_close', '</stata_dta>'],
 ];
 
-type DecodedValueLabelTables = Map<string, Map<number, string>>;
+interface DecodedValueLabelTable {
+    readonly labels: Map<number, string>;
+    readonly decodedBytes: number;
+}
+
+type DecodedValueLabelTables = Map<string, DecodedValueLabelTable>;
 type StataMissingType = Parameters<typeof missing_type_to_label_key>[0];
 
 const STATA_MISSING_TYPES: readonly StataMissingType[] = [
@@ -207,12 +216,18 @@ export class DtaDataSource implements DataSource {
     private readonly pre_unicode_fallback_decoder = new TextDecoder('windows-1252');
     private readonly unicode_decoder = new TextDecoder('utf-8');
     private readonly decoded_value_label_tables: DecodedValueLabelTables = new Map();
+    private decoded_value_label_cache_bytes = 0;
+    private value_label_table_entry_limit = MAX_VALUE_LABEL_TABLE_ENTRIES;
+    private value_label_table_decoded_byte_limit = MAX_VALUE_LABEL_TABLE_DECODED_BYTES;
+    private value_label_cache_entry_limit = MAX_VALUE_LABEL_CACHE_ENTRIES;
+    private value_label_cache_byte_limit = MAX_VALUE_LABEL_CACHE_BYTES;
     private readonly missing_value_label_table_names = new Set<string>();
     private window_cache_cells = 0;
     private window_cache_bytes = 0;
     private readonly gso_index = new Map<string, GsoEntry>();
     private readonly gso_cache = new Map<string, DecodedGso>();
     private gso_cache_bytes = 0;
+    private text_gso_decode_byte_limit = MAX_GSO_CACHE_BYTES;
     private readonly gso_digest_cache = new Map<number, string>();
     private gso_checkpoints: GsoCheckpoint[] = [];
     private gso_checkpoint_stride = INITIAL_GSO_CHECKPOINT_STRIDE;
@@ -451,6 +466,7 @@ export class DtaDataSource implements DataSource {
         this.window_cache_cells = 0;
         this.window_cache_bytes = 0;
         this.decoded_value_label_tables.clear();
+        this.decoded_value_label_cache_bytes = 0;
         this.missing_value_label_table_names.clear();
         this.gso_index.clear();
         this.gso_cache.clear();
@@ -1035,6 +1051,12 @@ export class DtaDataSource implements DataSource {
 
     private decode_gso(bytes: Uint8Array, entry: GsoEntry): DecodedGso {
         if (entry.type === 129) return encode_binary_gso(bytes, entry);
+        if (entry.content_length > this.text_gso_decode_byte_limit) {
+            throw new Error(
+                `Stata text strL payload is too large to decode safely `
+                + `(max ${this.text_gso_decode_byte_limit} bytes)`,
+            );
+        }
         if (this.metadata.format_version >= 118 || entry.type !== 130) {
             return decode_gso_entry(bytes, entry);
         }
@@ -1091,42 +1113,80 @@ export class DtaDataSource implements DataSource {
         return this.view;
     }
 
-    private value_labels(name: string): Map<number, string> | undefined {
+    private cached_value_labels(name: string): Map<number, string> | undefined {
         const cached = this.decoded_value_label_tables.get(name);
+        if (cached === undefined) return undefined;
+        this.decoded_value_label_tables.delete(name);
+        this.decoded_value_label_tables.set(name, cached);
+        return cached.labels;
+    }
+
+    private cache_value_label_table(name: string, table: DecodedValueLabelTable): void {
+        if (
+            this.value_label_cache_entry_limit < 1
+            || table.decodedBytes > this.value_label_cache_byte_limit
+        ) return;
+        if (this.decoded_value_label_tables.size === 0) {
+            this.decoded_value_label_cache_bytes = 0;
+        }
+        const previous = this.decoded_value_label_tables.get(name);
+        if (previous !== undefined) {
+            this.decoded_value_label_tables.delete(name);
+            this.decoded_value_label_cache_bytes -= previous.decodedBytes;
+        }
+        this.decoded_value_label_tables.set(name, table);
+        this.decoded_value_label_cache_bytes += table.decodedBytes;
+        while (
+            this.decoded_value_label_tables.size > this.value_label_cache_entry_limit
+            || this.decoded_value_label_cache_bytes > this.value_label_cache_byte_limit
+        ) {
+            const oldest_name = this.decoded_value_label_tables.keys().next().value!;
+            const oldest = this.decoded_value_label_tables.get(oldest_name)!;
+            this.decoded_value_label_tables.delete(oldest_name);
+            this.decoded_value_label_cache_bytes -= oldest.decodedBytes;
+        }
+    }
+
+    private value_labels(name: string): Map<number, string> | undefined {
+        const cached = this.cached_value_labels(name);
         if (cached !== undefined) return cached;
         if (this.missing_value_label_table_names.has(name)) return undefined;
-        const labels = parse_value_label_table(
+        const table = parse_value_label_table(
             this.open_buffer(),
             this.metadata,
             name,
             this.unicode_decoder,
             this.pre_unicode_utf8_decoder,
             this.pre_unicode_fallback_decoder,
+            this.value_label_table_entry_limit,
+            this.value_label_table_decoded_byte_limit,
         );
-        if (labels === undefined) this.missing_value_label_table_names.add(name);
-        else this.decoded_value_label_tables.set(name, labels);
-        return labels;
+        if (table === undefined) this.missing_value_label_table_names.add(name);
+        else this.cache_value_label_table(name, table);
+        return table?.labels;
     }
 
     private async value_labels_async(
         name: string,
         is_cancelled: () => boolean,
     ): Promise<Map<number, string> | undefined> {
-        const cached = this.decoded_value_label_tables.get(name);
+        const cached = this.cached_value_labels(name);
         if (cached !== undefined) return cached;
         if (this.missing_value_label_table_names.has(name)) return undefined;
-        const labels = await parse_value_label_table_async(
+        const table = await parse_value_label_table_async(
             this.open_buffer(),
             this.metadata,
             name,
             this.unicode_decoder,
             this.pre_unicode_utf8_decoder,
             this.pre_unicode_fallback_decoder,
+            this.value_label_table_entry_limit,
+            this.value_label_table_decoded_byte_limit,
             is_cancelled,
         );
-        if (labels === undefined) this.missing_value_label_table_names.add(name);
-        else this.decoded_value_label_tables.set(name, labels);
-        return labels;
+        if (table === undefined) this.missing_value_label_table_names.add(name);
+        else this.cache_value_label_table(name, table);
+        return table?.labels;
     }
 
     private window_start(row: number): number {
@@ -1399,7 +1459,9 @@ function parse_value_label_table(
     unicode_decoder: TextDecoder,
     pre_unicode_utf8_decoder: TextDecoder,
     pre_unicode_fallback_decoder: TextDecoder,
-): Map<number, string> | undefined {
+    max_entry_count: number,
+    max_decoded_bytes: number,
+): DecodedValueLabelTable | undefined {
     for (const entry of scan_value_label_tables(
         buffer,
         metadata,
@@ -1415,6 +1477,8 @@ function parse_value_label_table(
             unicode_decoder,
             pre_unicode_utf8_decoder,
             pre_unicode_fallback_decoder,
+            max_entry_count,
+            max_decoded_bytes,
         );
     }
     return undefined;
@@ -1427,8 +1491,10 @@ async function parse_value_label_table_async(
     unicode_decoder: TextDecoder,
     pre_unicode_utf8_decoder: TextDecoder,
     pre_unicode_fallback_decoder: TextDecoder,
+    max_entry_count: number,
+    max_decoded_bytes: number,
     is_cancelled: () => boolean,
-): Promise<Map<number, string> | undefined> {
+): Promise<DecodedValueLabelTable | undefined> {
     let tables_scanned = 0;
     for (const entry of scan_value_label_tables(
         buffer,
@@ -1446,6 +1512,8 @@ async function parse_value_label_table_async(
                 unicode_decoder,
                 pre_unicode_utf8_decoder,
                 pre_unicode_fallback_decoder,
+                max_entry_count,
+                max_decoded_bytes,
                 is_cancelled,
             );
         }
@@ -1463,6 +1531,7 @@ function value_label_payload_layout(
     buffer: ArrayBuffer,
     metadata: DtaMetadata,
     entry: ValueLabelTableEntry,
+    max_entry_count: number,
 ): {
     bytes: Uint8Array;
     view: DataView;
@@ -1490,6 +1559,12 @@ function value_label_payload_layout(
     if (count < 0 || text_length < 0) {
         throw new Error('Corrupt value label table: negative count or text length');
     }
+    if (count > max_entry_count) {
+        throw new Error(
+            `Value label table has too many entries to decode safely `
+            + `(max ${max_entry_count} entries)`,
+        );
+    }
     const offsets_start = entry.payloadStart + 8;
     const values_start = offsets_start + count * 4;
     const text_start = values_start + count * 4;
@@ -1509,6 +1584,23 @@ function value_label_payload_layout(
     };
 }
 
+interface ValueLabelDecodeState extends DecodedValueLabelTable {
+    readonly decodedTextByOffset: Map<number, string>;
+    decodedBytes: number;
+}
+
+function create_value_label_decode_state(): ValueLabelDecodeState {
+    return {
+        labels: new Map(),
+        decodedTextByOffset: new Map(),
+        decodedBytes: 0,
+    };
+}
+
+function decoded_value_label_table(state: ValueLabelDecodeState): DecodedValueLabelTable {
+    return { labels: state.labels, decodedBytes: state.decodedBytes };
+}
+
 function decode_value_label_table(
     buffer: ArrayBuffer,
     metadata: DtaMetadata,
@@ -1516,21 +1608,24 @@ function decode_value_label_table(
     unicode_decoder: TextDecoder,
     pre_unicode_utf8_decoder: TextDecoder,
     pre_unicode_fallback_decoder: TextDecoder,
-): Map<number, string> {
-    const layout = value_label_payload_layout(buffer, metadata, entry);
-    const labels = new Map<number, string>();
+    max_entry_count: number,
+    max_decoded_bytes: number,
+): DecodedValueLabelTable {
+    const layout = value_label_payload_layout(buffer, metadata, entry, max_entry_count);
+    const state = create_value_label_decode_state();
     for (let index = 0; index < layout.count; index++) {
         add_value_label(
-            labels,
+            state,
             metadata,
             layout,
             index,
             unicode_decoder,
             pre_unicode_utf8_decoder,
             pre_unicode_fallback_decoder,
+            max_decoded_bytes,
         );
     }
-    return labels;
+    return decoded_value_label_table(state);
 }
 
 async function decode_value_label_table_async(
@@ -1540,19 +1635,22 @@ async function decode_value_label_table_async(
     unicode_decoder: TextDecoder,
     pre_unicode_utf8_decoder: TextDecoder,
     pre_unicode_fallback_decoder: TextDecoder,
+    max_entry_count: number,
+    max_decoded_bytes: number,
     is_cancelled: () => boolean,
-): Promise<Map<number, string>> {
-    const layout = value_label_payload_layout(buffer, metadata, entry);
-    const labels = new Map<number, string>();
+): Promise<DecodedValueLabelTable> {
+    const layout = value_label_payload_layout(buffer, metadata, entry, max_entry_count);
+    const state = create_value_label_decode_state();
     for (let index = 0; index < layout.count; index++) {
         add_value_label(
-            labels,
+            state,
             metadata,
             layout,
             index,
             unicode_decoder,
             pre_unicode_utf8_decoder,
             pre_unicode_fallback_decoder,
+            max_decoded_bytes,
         );
         if ((index + 1) % VALUE_LABEL_ENTRIES_PER_YIELD === 0) {
             await yield_to_event_loop();
@@ -1560,40 +1658,54 @@ async function decode_value_label_table_async(
         }
     }
     if (is_cancelled()) throw source_abort_error();
-    return labels;
+    return decoded_value_label_table(state);
 }
 
 function add_value_label(
-    labels: Map<number, string>,
+    state: ValueLabelDecodeState,
     metadata: DtaMetadata,
     layout: ReturnType<typeof value_label_payload_layout>,
     index: number,
     unicode_decoder: TextDecoder,
     pre_unicode_utf8_decoder: TextDecoder,
     pre_unicode_fallback_decoder: TextDecoder,
+    max_decoded_bytes: number,
 ): void {
     const offset = layout.view.getInt32(
         layout.offsetsStart + index * 4,
         layout.littleEndian,
     );
     if (offset < 0 || offset >= layout.textLength) return;
-    const start = layout.textStart + offset;
-    let end = start;
-    while (end < layout.textStart + layout.textLength && layout.bytes[end] !== 0) end += 1;
+    let label = state.decodedTextByOffset.get(offset);
+    if (label === undefined) {
+        const start = layout.textStart + offset;
+        let end = start;
+        while (end < layout.textStart + layout.textLength && layout.bytes[end] !== 0) end += 1;
+        label = decode_value_label_text(
+            layout.bytes,
+            start,
+            end,
+            metadata,
+            unicode_decoder,
+            pre_unicode_utf8_decoder,
+            pre_unicode_fallback_decoder,
+            false,
+        );
+        const decoded_bytes = label.length * 2;
+        if (decoded_bytes > max_decoded_bytes - state.decodedBytes) {
+            throw new Error(
+                `Value label table exceeds its decoded text budget `
+                + `(max ${max_decoded_bytes} UTF-16 bytes)`,
+            );
+        }
+        state.decodedTextByOffset.set(offset, label);
+        state.decodedBytes += decoded_bytes;
+    }
     const value = layout.view.getInt32(
         layout.valuesStart + index * 4,
         layout.littleEndian,
     );
-    labels.set(value, decode_value_label_text(
-        layout.bytes,
-        start,
-        end,
-        metadata,
-        unicode_decoder,
-        pre_unicode_utf8_decoder,
-        pre_unicode_fallback_decoder,
-        false,
-    ));
+    state.labels.set(value, label);
 }
 
 function decode_value_label_text(

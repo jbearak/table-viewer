@@ -8,11 +8,16 @@ import { compute_transform } from '../table-transform';
 import { align_sheet } from '../diff-compare/row-alignment';
 
 const decode_spy = vi.hoisted(() => vi.fn());
+const gso_decode_spy = vi.hoisted(() => vi.fn());
 const gso_index_spy = vi.hoisted(() => vi.fn());
 vi.mock('@jbearak/dta-parser', async (import_original) => {
     const actual = await import_original<typeof import('@jbearak/dta-parser')>();
     return {
         ...actual,
+        decode_gso_entry: (...args: Parameters<typeof actual.decode_gso_entry>) => {
+            gso_decode_spy(...args);
+            return actual.decode_gso_entry(...args);
+        },
         build_gso_index: (...args: Parameters<typeof actual.build_gso_index>) => {
             gso_index_spy(...args);
             return actual.build_gso_index(...args);
@@ -86,8 +91,28 @@ interface FixtureVariable {
     valueLabel?: string;
 }
 
+interface FixtureValueLabelEntry {
+    readonly value: number;
+    readonly label: string;
+    readonly textKey?: string;
+}
+
+interface FixtureValueLabelTable {
+    readonly name: string;
+    readonly entries: readonly FixtureValueLabelEntry[];
+}
+
+interface DtaFixtureOptions {
+    readonly statusLabels?: readonly FixtureValueLabelEntry[];
+    readonly extraValueLabelTables?: readonly FixtureValueLabelTable[];
+}
+
 /** Build a tiny release-118 file in memory; no binary fixture is committed. */
-function build_dta_fixture(observation_count = 4, second_strl = false): Uint8Array {
+function build_dta_fixture(
+    observation_count = 4,
+    second_strl = false,
+    options: DtaFixtureOptions = {},
+): Uint8Array {
     const writer = new ByteWriter();
     const variables: FixtureVariable[] = [
         { name: 'status', typeCode: 65530, format: '%8.0g', valueLabel: 'status_lbl' },
@@ -207,27 +232,40 @@ function build_dta_fixture(observation_count = 4, second_strl = false): Uint8Arr
     writer.text('<value_labels>');
     const write_value_label_table = (
         name: string,
-        entries: readonly { value: number; label: string }[],
+        entries: readonly FixtureValueLabelEntry[],
     ) => {
         writer.text('<lbl>');
-        const labels = entries.map(({ label }) => new TextEncoder().encode(`${label}\0`));
-        const text_length = labels.reduce((total, label) => total + label.length, 0);
-        const payload_length = 129 + 3 + 8 + labels.length * 8 + text_length;
+        const text_by_key = new Map<string, { label: string; bytes: Uint8Array; offset: number }>();
+        let next_text_offset = 0;
+        const text_offsets = entries.map((entry, index) => {
+            const key = entry.textKey ?? `entry:${index}`;
+            const existing = text_by_key.get(key);
+            if (existing !== undefined) {
+                if (existing.label !== entry.label) {
+                    throw new Error('shared fixture value-label text keys must use the same label');
+                }
+                return existing.offset;
+            }
+            const bytes = new TextEncoder().encode(`${entry.label}\0`);
+            const offset = next_text_offset;
+            next_text_offset += bytes.length;
+            text_by_key.set(key, { label: entry.label, bytes, offset });
+            return offset;
+        });
+        const texts = [...text_by_key.values()];
+        const text_length = texts.reduce((total, text) => total + text.bytes.length, 0);
+        const payload_length = 129 + 3 + 8 + entries.length * 8 + text_length;
         writer.i32(payload_length);
         writer.fixed(name, 129);
         writer.u8(0); writer.u8(0); writer.u8(0);
-        writer.i32(labels.length);
+        writer.i32(entries.length);
         writer.i32(text_length);
-        let label_offset = 0;
-        for (const label of labels) {
-            writer.i32(label_offset);
-            label_offset += label.length;
-        }
+        for (const offset of text_offsets) writer.i32(offset);
         for (const { value } of entries) writer.i32(value);
-        for (const label of labels) for (const byte of label) writer.u8(byte);
+        for (const text of texts) for (const byte of text.bytes) writer.u8(byte);
         writer.text('</lbl>');
     };
-    write_value_label_table('status_lbl', [
+    write_value_label_table('status_lbl', options.statusLabels ?? [
         { value: 1, label: 'Zulu' },
         { value: 2, label: 'Alpha' },
         { value: 3, label: 'Zulu' },
@@ -235,6 +273,9 @@ function build_dta_fixture(observation_count = 4, second_strl = false): Uint8Arr
     write_value_label_table('missing_lbl', [
         { value: 2147483622, label: 'Refused' }, // .a's value-label key
     ]);
+    for (const table of options.extraValueLabelTables ?? []) {
+        write_value_label_table(table.name, table.entries);
+    }
     writer.text('</value_labels>');
 
     mark('stata_data_close');
@@ -523,6 +564,117 @@ describe('DtaDataSource', () => {
         expect([...sorted.indices!]).toEqual([0, 2, 1, 3]);
     });
 
+    it('decodes shared value-label text offsets once and accounts for one string', async () => {
+        const shared_label = 'A shared long label';
+        const source = await DtaDataSource.create(build_dta_fixture(4, false, {
+            statusLabels: [
+                { value: 1, label: shared_label, textKey: 'shared' },
+                { value: 2, label: shared_label, textKey: 'shared' },
+                { value: 3, label: shared_label, textKey: 'shared' },
+            ],
+        }));
+        const internals = source as unknown as {
+            unicode_decoder: TextDecoder;
+            decoded_value_label_tables: Map<string, {
+                labels: Map<number, string>;
+                decodedBytes: number;
+            }>;
+            decoded_value_label_cache_bytes: number;
+        };
+        const label_decode_spy = vi.spyOn(internals.unicode_decoder, 'decode');
+
+        const metadata = source.column_filter_metadata(0, 0)!;
+        expect(metadata.valueLabel?.('1')).toBe(shared_label);
+        expect(metadata.valueLabel?.('2')).toBe(shared_label);
+        expect(metadata.valueLabel?.('3')).toBe(shared_label);
+        // One decode for the table name and one for the shared text offset.
+        expect(label_decode_spy).toHaveBeenCalledTimes(2);
+        const cached = internals.decoded_value_label_tables.get('status_lbl')!;
+        expect(cached.labels.size).toBe(3);
+        expect(cached.decodedBytes).toBe(shared_label.length * 2);
+        expect(internals.decoded_value_label_cache_bytes).toBe(shared_label.length * 2);
+    });
+
+    it('rejects value-label tables above the entry limit without caching a partial table', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture());
+        const internals = source as unknown as {
+            value_label_table_entry_limit: number;
+            decoded_value_label_tables: Map<string, unknown>;
+        };
+        internals.value_label_table_entry_limit = 2;
+
+        expect(() => source.column_filter_metadata(0, 0)).toThrow(
+            'Value label table has too many entries to decode safely (max 2 entries)',
+        );
+        expect(internals.decoded_value_label_tables.size).toBe(0);
+    });
+
+    it.each([
+        ['release 118', () => build_dta_fixture(), 0],
+        ['pre-Unicode', () => build_legacy_dta_fixture(), 0],
+    ] as const)(
+        'enforces the decoded UTF-16 value-label budget for %s tables',
+        async (_format, fixture, column) => {
+            const source = await DtaDataSource.create(fixture());
+            const internals = source as unknown as {
+                value_label_table_decoded_byte_limit: number;
+                decoded_value_label_tables: Map<string, unknown>;
+            };
+            internals.value_label_table_decoded_byte_limit = 7;
+
+            expect(() => source.column_filter_metadata(0, column)).toThrow(
+                'Value label table exceeds its decoded text budget (max 7 UTF-16 bytes)',
+            );
+            expect(internals.decoded_value_label_tables.size).toBe(0);
+        },
+    );
+
+    it('evicts decoded value-label tables by aggregate bytes in LRU order', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture(4, false, {
+            extraValueLabelTables: [{
+                name: 'tiny_lbl',
+                entries: [{ value: 1, label: 'X' }],
+            }],
+        }));
+        const internals = source as unknown as {
+            value_label_cache_byte_limit: number;
+            decoded_value_label_cache_bytes: number;
+            decoded_value_label_tables: Map<string, unknown>;
+            value_labels: (name: string) => Map<number, string> | undefined;
+        };
+        internals.value_label_cache_byte_limit = 40;
+
+        expect(internals.value_labels('status_lbl')?.get(1)).toBe('Zulu');
+        expect(internals.value_labels('missing_lbl')?.get(2147483622)).toBe('Refused');
+        expect(internals.decoded_value_label_cache_bytes).toBe(40);
+        expect(internals.value_labels('status_lbl')?.get(2)).toBe('Alpha');
+        expect(internals.value_labels('tiny_lbl')?.get(1)).toBe('X');
+
+        expect([...internals.decoded_value_label_tables.keys()])
+            .toEqual(['status_lbl', 'tiny_lbl']);
+        expect(internals.decoded_value_label_cache_bytes).toBe(28);
+    });
+
+    it('checks cancellation while decoding a requested value-label table', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture(4, false, {
+            statusLabels: Array.from({ length: 257 }, (_, index) => ({
+                value: index,
+                label: `Label ${index}`,
+            })),
+        }));
+        const internals = source as unknown as {
+            decoded_value_label_tables: Map<string, unknown>;
+        };
+        const is_cancelled = vi.fn()
+            .mockReturnValueOnce(false)
+            .mockReturnValue(true);
+
+        await expect(source.column_filter_metadata_async(0, 0, is_cancelled))
+            .rejects.toMatchObject({ name: 'AbortError' });
+        expect(is_cancelled).toHaveBeenCalledTimes(2);
+        expect(internals.decoded_value_label_tables.size).toBe(0);
+    });
+
     it('keeps binary strLs distinct from text and from other binary payloads', async () => {
         const binary = await DtaDataSource.create(
             build_release119_strl_fixture(Uint8Array.of(0x80), 129),
@@ -561,6 +713,27 @@ describe('DtaDataSource', () => {
         expect(internals.gso_digest_cache.size).toBe(0);
         expect(fast.comparisonKey).toMatch(/^stata-binary:sha256:/);
         expect(internals.gso_digest_cache.size).toBe(1);
+    });
+
+    it('rejects oversized text strLs before decoding their payload', async () => {
+        const payload = new TextEncoder().encode('hello\0');
+        const source = await DtaDataSource.create(build_release119_strl_fixture(payload));
+        const internals = source as unknown as { text_gso_decode_byte_limit: number };
+        expect(internals.text_gso_decode_byte_limit).toBe(16 * 1024 * 1024);
+        internals.text_gso_decode_byte_limit = payload.length - 1;
+        gso_decode_spy.mockClear();
+
+        await expect(source.read_raw_columns_async(0, 0, 1, [0], () => false))
+            .rejects.toThrow(
+                `Stata text strL payload is too large to decode safely `
+                + `(max ${payload.length - 1} bytes)`,
+            );
+        expect(gso_decode_spy).not.toHaveBeenCalled();
+
+        const exact = await DtaDataSource.create(build_release119_strl_fixture(payload));
+        (exact as unknown as { text_gso_decode_byte_limit: number })
+            .text_gso_decode_byte_limit = payload.length;
+        expect(exact.read_raw_columns(0, 0, 1, [0]).rows[0][0]?.raw).toBe('hello');
     });
 
     it('keeps tagged missings distinct, labeled, nonempty, and numerically sortable', async () => {
