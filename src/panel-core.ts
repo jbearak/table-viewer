@@ -130,6 +130,7 @@ type DurableRowHeightsProvider = (sheet_names: readonly string[]) => {
 type RowWindowServed = (
     msg: Extract<WebviewMessage, { type: 'requestRows' }>,
     window: TransformedRowWindow,
+    receiver_epoch: number,
 ) => void | Promise<void>;
 
 type TransformOperationToken = number;
@@ -325,10 +326,10 @@ export class ViewerPanelCore {
              */
             durableRowHeights?: DurableRowHeightsProvider;
             /**
-             * Observe each row window the core serves, after `rowData` posts.
-             * The window is the resolved one — clamped and transform-projected —
-             * so an augmenting sidecar (git compare's `compareDiff`) describes
-             * exactly the rows the renderer received, not the raw request.
+             * Observe each row window only after `rowData` successfully posts to
+             * the receiver that requested it. The window is resolved (clamped and
+             * transform-projected), and the epoch is the one accepted with the
+             * request, so an augmenting sidecar cannot migrate across receivers.
              */
             onRowWindowServed?: RowWindowServed;
         },
@@ -1625,6 +1626,7 @@ export class ViewerPanelCore {
     ): Promise<void> {
         // Generation guard: silently drop requests for a superseded version.
         if (msg.generation !== this._generation) return;
+        const receiver_epoch = this.receiver_epoch;
 
         // Boundary validation: clamp a negative startRow to 0. (CSV clamps
         // internally; xlsx/xls pass through to the store — validate here so the
@@ -1657,7 +1659,7 @@ export class ViewerPanelCore {
             this.evict_excess();
         }
 
-        await this.post({
+        const posted = await this.post({
             type: 'rowData',
             sheetIndex: msg.sheetIndex,
             startRow: window.startRow,
@@ -1665,8 +1667,9 @@ export class ViewerPanelCore {
             sourceRows: window.sourceRows,
             requestId: msg.requestId,
             generation: this._generation,
-        });
-        await this.on_row_window_served?.(msg, window);
+        }, receiver_epoch);
+        if (!posted || this.disposed || this.receiver_epoch !== receiver_epoch) return;
+        await this.on_row_window_served?.(msg, window, receiver_epoch);
     }
 
     private evict_excess(): void {

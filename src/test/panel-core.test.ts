@@ -243,6 +243,56 @@ describe('ViewerPanelCore', () => {
         expect(rd.generation).toBe(core.generation);
     });
 
+    it('passes the accepted receiver epoch only after a successful rowData post', async () => {
+        const { panel, postMessage } = make_panel();
+        const served = vi.fn();
+        const core = new ViewerPanelCore(panel, new StubSource(), {
+            onRowWindowServed: served,
+        });
+        core.begin_receiver_epoch(7);
+        const request = {
+            type: 'requestRows' as const,
+            sheetIndex: 0,
+            startRow: 0,
+            count: 1,
+            generation: core.generation,
+        };
+
+        await core.handle_message({ ...request, requestId: 'accepted' });
+        expect(served).toHaveBeenCalledOnce();
+        expect(served.mock.calls[0][2]).toBe(7);
+
+        postMessage.mockResolvedValueOnce(false);
+        await core.handle_message({ ...request, requestId: 'not-posted' });
+        expect(served).toHaveBeenCalledOnce();
+    });
+
+    it('suppresses the served callback when the receiver turns over during rowData', async () => {
+        const row_post = deferred<boolean>();
+        const postMessage = vi.fn(() => row_post.promise);
+        const panel = { webview: { postMessage } };
+        const served = vi.fn();
+        const core = new ViewerPanelCore(panel, new StubSource(), {
+            onRowWindowServed: served,
+        });
+        core.begin_receiver_epoch(11);
+
+        const request = core.handle_message({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 1,
+            requestId: 'old-receiver',
+            generation: core.generation,
+        });
+        await vi.waitFor(() => expect(postMessage).toHaveBeenCalledOnce());
+        core.begin_receiver_epoch(12);
+        row_post.resolve(true);
+        await request;
+
+        expect(served).not.toHaveBeenCalled();
+    });
+
     it('drops a requestRows whose generation is stale (post-reload)', async () => {
         const { panel, posted } = make_panel();
         const src = new StubSource();

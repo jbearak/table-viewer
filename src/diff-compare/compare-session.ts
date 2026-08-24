@@ -11,12 +11,14 @@
 // the padding and pairings computed here at construction.
 import {
     read_source_raw_columns_async,
+    read_source_raw_rows_indexed_async,
     read_source_rows_indexed,
     type ColumnFilterMetadata,
     type DataSource,
     type IndexedRows,
     type RawCell,
     type RawColumnWindow,
+    type RenderedCell,
     type RowWindow,
     type SheetMeta,
     type WorkbookMeta,
@@ -58,6 +60,22 @@ function compare_abort_error(): Error {
     const error = new Error('Compare diff was cancelled.');
     error.name = 'AbortError';
     return error;
+}
+
+function is_abort_error(error: unknown): boolean {
+    return error instanceof Error && error.name === 'AbortError';
+}
+
+interface DiffWaiter {
+    readonly isCancelled: () => boolean;
+}
+
+interface InFlightDiff {
+    readonly epoch: number;
+    readonly waiters: Set<DiffWaiter>;
+    terminal: boolean;
+    cancelled: boolean;
+    promise?: Promise<CompareDiffWindow>;
 }
 
 function without_header_capability(sheet: SheetMeta): SheetMeta {
@@ -187,9 +205,16 @@ export class CompareDataSource implements DataSource {
     private readonly original_meta: WorkbookMeta;
     private static readonly MAX_CACHED_DIFF_PAGES = 64;
     private readonly diff_cache = new Map<string, CompareDiffWindow>();
+    private readonly diff_in_flight = new Map<string, InFlightDiff>();
+    private closed = false;
+    private lifecycle_epoch = 0;
     /** Aligned unified rows per *grid* sheet index, for matched sheets. Absent
      *  for added/deleted sheets, which are one-sided and need no alignment. */
     private readonly alignments: ReadonlyMap<number, SheetAlignment>;
+    /** Only caller-supplied alignments have authoritative changed-row sets. The
+     *  positional fallback uses an empty synthetic set even when cells differ. */
+    private readonly supplied_alignment_sheets: ReadonlySet<number>;
+    private readonly alignment_changed_row_lookup_cache = new Map<number, ReadonlySet<number>>();
     /** True when any matched sheet fell back to positional alignment, so the
      *  host can say so rather than present an all-changed grid as a finding. */
     readonly degraded: boolean;
@@ -249,6 +274,12 @@ export class CompareDataSource implements DataSource {
                 status_by_modified_index.get(sheet_index) ?? 'added'),
             ...this.deleted_pairings.map(() => 'deleted' as const),
         ];
+        // Preserve which entries were supplied before filling the map. A supplied
+        // alignment's changedRowIndices came from an exact count pass; the
+        // constructor fallback's identical-looking empty array proves nothing.
+        this.supplied_alignment_sheets = new Set(
+            [...this.matched_by_modified_index.keys()].filter((index) => alignments.has(index)),
+        );
         // Sheets with no supplied alignment fall back to the positional one, so
         // every matched sheet has an alignment and the rest of this class has a
         // single row-mapping path rather than two.
@@ -399,6 +430,17 @@ export class CompareDataSource implements DataSource {
         return built;
     }
 
+    /** Paired rows a caller-supplied alignment proved changed. Undefined means
+     *  the positional fallback must still compare every paired row. */
+    private proven_changed_rows_of(sheet_index: number): ReadonlySet<number> | undefined {
+        if (!this.supplied_alignment_sheets.has(sheet_index)) return undefined;
+        const cached = this.alignment_changed_row_lookup_cache.get(sheet_index);
+        if (cached) return cached;
+        const built = new Set(this.alignments.get(sheet_index)?.changedRowIndices ?? []);
+        this.alignment_changed_row_lookup_cache.set(sheet_index, built);
+        return built;
+    }
+
     private compute_changed_grid_rows(sheet_index: number): readonly number[] {
         const alignment = this.alignments.get(sheet_index);
         if (!alignment) {
@@ -521,6 +563,7 @@ export class CompareDataSource implements DataSource {
         rows: readonly number[],
         is_cancelled: () => boolean = () => false,
     ): Promise<CompareDiffWindow | undefined> {
+        if (this.closed || is_cancelled()) throw compare_abort_error();
         if (this.deleted_original_index(sheet_index) !== undefined) {
             // A deleted sheet is one all-deleted band; the rows themselves
             // carry the original content, so there are no changed cells.
@@ -549,22 +592,93 @@ export class CompareDataSource implements DataSource {
         if (cached !== undefined) {
             this.diff_cache.delete(key);
             this.diff_cache.set(key, cached);
+            if (this.closed || is_cancelled()) throw compare_abort_error();
             return cached;
         }
-        const window = await this.compute_diff(
-            sheet_index,
-            alignment,
-            rows,
-            is_cancelled,
-        );
-        if (is_cancelled()) throw compare_abort_error();
+
+        const waiter: DiffWaiter = { isCancelled: is_cancelled };
+        let operation = this.diff_in_flight.get(key);
+        // Do not attach fresh work to an operation already committed to aborting.
+        // Its sibling read may still be settling, but it can no longer produce a
+        // usable page even if a live waiter appears now.
+        if (
+            operation !== undefined
+            && (operation.terminal || this.shared_diff_cancelled(operation))
+        ) {
+            operation = undefined;
+        }
+        if (operation === undefined) {
+            const created: InFlightDiff = {
+                epoch: this.lifecycle_epoch,
+                waiters: new Set([waiter]),
+                terminal: false,
+                cancelled: false,
+            };
+            this.diff_in_flight.set(key, created);
+            const shared_is_cancelled = () => this.shared_diff_cancelled(created);
+            // Schedule source work after the operation record is complete. Built-in
+            // sources do not re-enter diff_rows, but this also makes coalescing
+            // correct for a third-party source that does so from a read callback.
+            created.promise = Promise.resolve().then(() => {
+                if (shared_is_cancelled()) throw compare_abort_error();
+                return this.compute_diff(
+                    sheet_index,
+                    alignment,
+                    rows,
+                    shared_is_cancelled,
+                    () => { created.terminal = true; },
+                );
+            }).then((window) => {
+                if (shared_is_cancelled()) throw compare_abort_error();
+                this.cache_diff(key, window, created.epoch);
+                return window;
+            }).catch((error) => {
+                created.terminal = true;
+                throw error;
+            }).finally(() => {
+                if (this.diff_in_flight.get(key) === created) {
+                    this.diff_in_flight.delete(key);
+                }
+            });
+            operation = created;
+        } else {
+            operation.waiters.add(waiter);
+        }
+
+        try {
+            const window = await operation.promise!;
+            if (
+                this.closed
+                || this.lifecycle_epoch !== operation.epoch
+                || is_cancelled()
+            ) throw compare_abort_error();
+            return window;
+        } finally {
+            operation.waiters.delete(waiter);
+        }
+    }
+
+    private shared_diff_cancelled(operation: InFlightDiff): boolean {
+        if (operation.cancelled) return true;
+        const cancelled = this.closed
+            || this.lifecycle_epoch !== operation.epoch
+            || operation.waiters.size === 0
+            || [...operation.waiters].every((waiter) => waiter.isCancelled());
+        if (cancelled) {
+            operation.cancelled = true;
+            operation.terminal = true;
+        }
+        return cancelled;
+    }
+
+    private cache_diff(key: string, window: CompareDiffWindow, epoch: number): void {
+        if (this.closed || this.lifecycle_epoch !== epoch) return;
         this.diff_cache.set(key, window);
         while (this.diff_cache.size > CompareDataSource.MAX_CACHED_DIFF_PAGES) {
             const oldest = this.diff_cache.keys().next().value;
             if (oldest === undefined) break;
             this.diff_cache.delete(oldest);
         }
-        return window;
     }
 
     /**
@@ -577,12 +691,14 @@ export class CompareDataSource implements DataSource {
         alignment: readonly AlignedRow[],
         rows: readonly number[],
         is_cancelled: () => boolean,
+        mark_terminal: () => void,
     ): Promise<CompareDiffWindow> {
         const pairing = this.matched_by_modified_index.get(sheet_index)!;
         const original_sheet = this.original_meta.sheets[pairing.originalIndex];
         const modified_sheet = this.modified_meta.sheets[sheet_index];
         const column_count = Math.max(original_sheet.columnCount, modified_sheet.columnCount);
         const moved = this.moved_rows_of(sheet_index);
+        const proven_changed = this.proven_changed_rows_of(sheet_index);
         const row_status: CompareRowStatus[] = [];
         const paired_positions: number[] = [];
         const original_rows: number[] = [];
@@ -601,47 +717,140 @@ export class CompareDataSource implements DataSource {
                 row_status.push('added');
                 return;
             }
-            // A moved row is an ordinary two-index row and still falls through
-            // to the cell comparison below, so a row that moved *and* was
-            // edited reports its changed cells as well as its band.
+            // A moved row is an ordinary two-index row. A supplied alignment has
+            // already compared it and may prove it unchanged; a fallback has not.
             row_status.push(moved.has(grid_row) ? 'moved' : 'same');
+            if (proven_changed !== undefined && !proven_changed.has(grid_row)) return;
             paired_positions.push(position);
             original_rows.push(aligned.original);
             modified_rows.push(aligned.modified);
         });
         const changed_cells: ChangedCell[] = [];
         if (paired_positions.length > 0) {
-            const original_batch = read_source_rows_indexed(
-                this.original, pairing.originalIndex, original_rows).rows;
-            const modified_batch = read_source_rows_indexed(
-                this.modified, sheet_index, modified_rows).rows;
+            const { original: original_batch, modified: modified_batch } =
+                await this.read_diff_raw_batches(
+                    pairing.originalIndex,
+                    original_rows,
+                    sheet_index,
+                    modified_rows,
+                    is_cancelled,
+                    mark_terminal,
+                );
+            const pending: {
+                readonly pairedIndex: number;
+                readonly row: number;
+                readonly col: number;
+                readonly base: string;
+            }[] = [];
             for (let index = 0; index < paired_positions.length; index++) {
                 if (is_cancelled()) throw compare_abort_error();
                 const position = paired_positions[index];
                 const original_row = original_batch[index] ?? [];
                 const modified_row = modified_batch[index] ?? [];
                 for (let col = 0; col < column_count; col++) {
-                    // Compare on identity, which is lossless for binary strLs,
-                    // but report both original spellings so the renderer can honor
-                    // Formatting without ever exposing that internal identity.
+                    // Compare on raw identity, which is lossless for binary strLs.
+                    // Formatting is acquired only for changed original rows below.
                     const equal = cells_exactly_equal(
                         original_row[col],
                         modified_row[col],
                         is_cancelled,
                     );
                     if (typeof equal === 'boolean' ? equal : await equal) continue;
-                    const original_cell = original_row[col];
-                    const base = get_raw_cell_text(original_cell?.raw ?? null);
-                    changed_cells.push({
+                    pending.push({
+                        pairedIndex: index,
                         row: position,
                         col,
-                        base,
-                        formattedBase: original_cell?.formatted ?? base,
+                        base: get_raw_cell_text(original_row[col]?.raw ?? null),
+                    });
+                }
+            }
+            if (pending.length > 0) {
+                if (is_cancelled()) throw compare_abort_error();
+                const changed_paired_indices = [...new Set(
+                    pending.map((cell) => cell.pairedIndex),
+                )];
+                const rendered_original = read_source_rows_indexed(
+                    this.original,
+                    pairing.originalIndex,
+                    changed_paired_indices.map((index) => original_rows[index]),
+                ).rows;
+                if (is_cancelled()) throw compare_abort_error();
+                const rendered_by_paired_index = new Map<number, (RenderedCell | null)[]>(
+                    changed_paired_indices.map((paired_index, position) => [
+                        paired_index,
+                        rendered_original[position] ?? [],
+                    ]),
+                );
+                for (const changed of pending) {
+                    const rendered = rendered_by_paired_index.get(changed.pairedIndex)?.[
+                        changed.col];
+                    changed_cells.push({
+                        row: changed.row,
+                        col: changed.col,
+                        base: changed.base,
+                        formattedBase: rendered?.formatted ?? changed.base,
                     });
                 }
             }
         }
         return { startRow: 0, rowStatus: row_status, changedCells: changed_cells };
+    }
+
+    /** Start both raw side reads before awaiting either. A failure trips the
+     *  sibling's cancellation predicate, but both promises are observed to
+     *  settlement before the substantive failure is propagated. */
+    private async read_diff_raw_batches(
+        original_sheet_index: number,
+        original_rows: readonly number[],
+        modified_sheet_index: number,
+        modified_rows: readonly number[],
+        is_cancelled: () => boolean,
+        mark_terminal: () => void,
+    ): Promise<{
+        readonly original: (RawCell | null)[][];
+        readonly modified: (RawCell | null)[][];
+    }> {
+        let peer_failed = false;
+        const read_is_cancelled = () => peer_failed || is_cancelled();
+        const original_read = read_source_raw_rows_indexed_async(
+            this.original,
+            original_sheet_index,
+            original_rows,
+            read_is_cancelled,
+        );
+        const modified_read = read_source_raw_rows_indexed_async(
+            this.modified,
+            modified_sheet_index,
+            modified_rows,
+            read_is_cancelled,
+        );
+        const observe = async <T>(promise: Promise<T>): Promise<T> => {
+            try {
+                return await promise;
+            } catch (error) {
+                peer_failed = true;
+                mark_terminal();
+                throw error;
+            }
+        };
+        const [original_result, modified_result] = await Promise.allSettled([
+            observe(original_read),
+            observe(modified_read),
+        ]);
+        if (is_cancelled()) throw compare_abort_error();
+        const failures = [original_result, modified_result].filter(
+            (result): result is PromiseRejectedResult => result.status === 'rejected',
+        );
+        const substantive = failures.find((failure) => !is_abort_error(failure.reason));
+        if (substantive !== undefined) throw substantive.reason;
+        if (failures.length > 0) throw failures[0].reason;
+        if (original_result.status !== 'fulfilled' || modified_result.status !== 'fulfilled') {
+            throw compare_abort_error();
+        }
+        return {
+            original: original_result.value.rows,
+            modified: modified_result.value.rows,
+        };
     }
 
     read_rows(sheet_index: number, start_row: number, count: number): RowWindow {
@@ -941,7 +1150,11 @@ export class CompareDataSource implements DataSource {
     }
 
     close(): void {
+        if (this.closed) return;
+        this.closed = true;
+        this.lifecycle_epoch += 1;
         this.diff_cache.clear();
+        this.diff_in_flight.clear();
         try {
             this.modified.close();
         } finally {

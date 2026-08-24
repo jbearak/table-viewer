@@ -409,6 +409,8 @@ const PENDING_EDIT_FLUSH_TIMEOUT_MS = 2_000;
 const ROW_HEIGHT_LIMIT_WARNING =
     'Too many resized rows to persist: a sheet may keep at most '
     + `${MAX_PERSISTED_ROW_HEIGHTS.toLocaleString('en-US')} custom row heights.`;
+const COMPARE_DIFF_INCOMPLETE_WARNING =
+    'Table Viewer could not compare some visible cells. Unhighlighted cells may still differ.';
 
 function content_digest(bytes: Uint8Array): string {
     return createHash('sha256').update(bytes).digest('hex');
@@ -432,6 +434,10 @@ function sanitized_error_code(error: unknown): string {
 
 function log_sanitized_failure(message: string, error: unknown): void {
     console.error(message, { code: sanitized_error_code(error) });
+}
+
+function is_abort_error(error: unknown): boolean {
+    return error instanceof Error && error.name === 'AbortError';
 }
 
 function is_file_not_found_error(error: unknown): boolean {
@@ -1223,6 +1229,7 @@ export function attach_viewer(
     let header_refresh_scheduled = false;
     const released_sources = new WeakSet<DataSource>();
     const released_cores = new WeakSet<ViewerPanelCore>();
+    const compare_diff_failure_notified = new WeakSet<CompareDataSource>();
 
     function reject_pending_edit_protocol(error: Error): void {
         for (const waiter of pending_edit_flush_waiters.values()) waiter.reject(error);
@@ -1285,10 +1292,10 @@ export function attach_viewer(
     async function post_compare_diff(
         msg: Extract<WebviewMessage, { type: 'requestRows' }>,
         window: { startRow: number; sourceRows: number[] },
+        receiver_epoch: number,
     ): Promise<void> {
         if (!(source instanceof CompareDataSource) || window.sourceRows.length === 0) return;
         const compare_source = source;
-        const receiver_epoch = session.current_receiver_epoch;
         const source_generation = core?.source_generation;
         const is_cancelled = () =>
             disposed
@@ -1308,7 +1315,13 @@ export function attach_viewer(
                 projected_rows as number[],
                 is_cancelled,
             );
-        } catch {
+        } catch (error) {
+            if (is_cancelled() || is_abort_error(error)) return;
+            if (!compare_diff_failure_notified.has(compare_source)) {
+                compare_diff_failure_notified.add(compare_source);
+                log_sanitized_failure('Failed to compare a visible table page', error);
+                host.ui.show_warning(COMPARE_DIFF_INCOMPLETE_WARNING);
+            }
             return;
         }
         if (!diff || is_cancelled()) return;

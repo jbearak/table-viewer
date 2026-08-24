@@ -1,11 +1,14 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { CompareDataSource, align_workbook } from '../diff-compare/compare-session';
 import {
     DEFERRED_COMPARISON_IDENTITY,
     type DataSource,
+    type RawCell,
+    type RawColumnWindow,
     type RenderedCell,
     type WorkbookMeta,
 } from '../data-source/interface';
+import type { SheetAlignment } from '../diff-compare/row-alignment';
 import { cell, FixtureSource } from './helpers/fixture-source';
 
 /** Serves cells verbatim, unlike FixtureSource's string rows, so a test can
@@ -33,6 +36,110 @@ class StubSource implements DataSource {
 
     close(): void {}
 }
+
+function deferred<T>() {
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((done, fail) => {
+        resolve = done;
+        reject = fail;
+    });
+    return { promise, resolve, reject };
+}
+
+interface RawReadRequest {
+    readonly startRow: number;
+    readonly count: number;
+    readonly columns: readonly number[];
+    readonly isCancelled: () => boolean;
+}
+
+/** Async raw source with observable reads. Its default raw projection strips
+ * display formatting, so formattedBase can only come from a later rendered read. */
+class AsyncRawSource implements DataSource {
+    readonly rawReads: RawReadRequest[] = [];
+    readonly renderedReads: { startRow: number; count: number }[] = [];
+    closed = false;
+
+    constructor(
+        private readonly rows: RenderedCell[][],
+        private readonly rawReader?: (request: RawReadRequest) => Promise<RawColumnWindow>,
+    ) {}
+
+    meta(): WorkbookMeta {
+        return {
+            hasFormatting: true,
+            sheets: [{
+                name: 'Sheet1',
+                rowCount: this.rows.length,
+                sourceRowCount: this.rows.length,
+                columnCount: this.rows.reduce((width, row) => Math.max(width, row.length), 0),
+                merges: [],
+                hasFormatting: true,
+            }],
+        };
+    }
+
+    read_rows(_sheet: number, start_row: number, count: number) {
+        this.renderedReads.push({ startRow: start_row, count });
+        return { startRow: start_row, rows: this.rows.slice(start_row, start_row + count) };
+    }
+
+    read_raw_columns_async(
+        _sheet: number,
+        start_row: number,
+        count: number,
+        columns: readonly number[],
+        is_cancelled: () => boolean,
+    ): Promise<RawColumnWindow> {
+        const request = {
+            startRow: start_row,
+            count,
+            columns,
+            isCancelled: is_cancelled,
+        };
+        this.rawReads.push(request);
+        if (this.rawReader) return this.rawReader(request);
+        return Promise.resolve({
+            startRow: start_row,
+            rows: this.rows.slice(start_row, start_row + count).map((row) =>
+                columns.map((column): RawCell | null => {
+                    const source = row[column];
+                    if (!source) return null;
+                    return {
+                        raw: source.raw,
+                        ...(source.rawType === undefined ? {} : { rawType: source.rawType }),
+                        ...(source.comparisonKey === undefined
+                            ? {} : { comparisonKey: source.comparisonKey }),
+                    };
+                })),
+        });
+    }
+
+    close(): void {
+        this.closed = true;
+    }
+}
+
+function abort_error(): Error {
+    const error = new Error('cancelled');
+    error.name = 'AbortError';
+    return error;
+}
+
+const positional_alignment = (
+    changedRowIndices: readonly number[],
+    row_count = 1,
+): SheetAlignment => ({
+    rows: Array.from({ length: row_count }, (_, row) => ({ original: row, modified: row })),
+    addedRows: 0,
+    deletedRows: 0,
+    changedCells: changedRowIndices.length,
+    changedRowIndices,
+    movedRowIndices: [],
+    moveSearchTruncated: false,
+    degraded: false,
+});
 
 /** The production path serves whole transformed windows via `diff_rows`; these
  *  tests want a plain leading page, so they name the rows themselves, clamped
@@ -239,6 +346,173 @@ describe('CompareDataSource', () => {
         expect(reads).toBe(0);
     });
 
+    it('starts both async raw side reads before awaiting either', async () => {
+        const original_gate = deferred<RawColumnWindow>();
+        const modified_gate = deferred<RawColumnWindow>();
+        const original = new AsyncRawSource([[cell('a')]], () => original_gate.promise);
+        const modified = new AsyncRawSource([[cell('b')]], () => modified_gate.promise);
+        const source = new CompareDataSource(modified, original);
+
+        const pending = source.diff_rows(0, [0]);
+        await vi.waitFor(() => {
+            expect(original.rawReads).toHaveLength(1);
+            expect(modified.rawReads).toHaveLength(1);
+        });
+        original_gate.resolve({ startRow: 0, rows: [[{ raw: 'a' }]] });
+        modified_gate.resolve({ startRow: 0, rows: [[{ raw: 'b' }]] });
+
+        expect((await pending)?.changedCells).toEqual([
+            { row: 0, col: 0, base: 'a', formattedBase: 'a' },
+        ]);
+    });
+
+    it('cancels the sibling raw read after one failure and observes both settlements', async () => {
+        const original_gate = deferred<RawColumnWindow>();
+        const modified_gate = deferred<RawColumnWindow>();
+        const original = new AsyncRawSource([[cell('a')]], () => original_gate.promise);
+        const modified = new AsyncRawSource([[cell('b')]], () => modified_gate.promise);
+        const source = new CompareDataSource(modified, original);
+        const failure = new Error('original raw read failed');
+
+        const pending = source.diff_rows(0, [0]);
+        let settled = false;
+        void pending.then(
+            () => { settled = true; },
+            () => { settled = true; },
+        );
+        const rejection = expect(pending).rejects.toBe(failure);
+        await vi.waitFor(() => {
+            expect(original.rawReads).toHaveLength(1);
+            expect(modified.rawReads).toHaveLength(1);
+        });
+        original_gate.reject(failure);
+        await vi.waitFor(() => expect(modified.rawReads[0].isCancelled()).toBe(true));
+        expect(settled).toBe(false);
+
+        modified_gate.reject(abort_error());
+        await rejection;
+        expect(settled).toBe(true);
+    });
+
+    it('coalesces identical in-flight diff pages', async () => {
+        const original_gate = deferred<RawColumnWindow>();
+        const modified_gate = deferred<RawColumnWindow>();
+        const original = new AsyncRawSource([[cell('a')]], () => original_gate.promise);
+        const modified = new AsyncRawSource([[cell('b')]], () => modified_gate.promise);
+        const source = new CompareDataSource(modified, original);
+
+        const first = source.diff_rows(0, [0]);
+        const second = source.diff_rows(0, [0]);
+        await vi.waitFor(() => {
+            expect(original.rawReads).toHaveLength(1);
+            expect(modified.rawReads).toHaveLength(1);
+        });
+        original_gate.resolve({ startRow: 0, rows: [[{ raw: 'a' }]] });
+        modified_gate.resolve({ startRow: 0, rows: [[{ raw: 'b' }]] });
+        const [first_window, second_window] = await Promise.all([first, second]);
+
+        expect(second_window).toBe(first_window);
+        expect(original.renderedReads).toEqual([{ startRow: 0, count: 1 }]);
+    });
+
+    it('cancels one coalesced waiter without cancelling another live waiter', async () => {
+        const original_gate = deferred<RawColumnWindow>();
+        const modified_gate = deferred<RawColumnWindow>();
+        const original = new AsyncRawSource([[cell('a')]], () => original_gate.promise);
+        const modified = new AsyncRawSource([[cell('b')]], () => modified_gate.promise);
+        const source = new CompareDataSource(modified, original);
+        let first_cancelled = false;
+
+        const first = source.diff_rows(0, [0], () => first_cancelled);
+        const second = source.diff_rows(0, [0]);
+        const first_rejection = expect(first).rejects.toMatchObject({ name: 'AbortError' });
+        await vi.waitFor(() => {
+            expect(original.rawReads).toHaveLength(1);
+            expect(modified.rawReads).toHaveLength(1);
+        });
+        first_cancelled = true;
+        expect(original.rawReads[0].isCancelled()).toBe(false);
+        expect(modified.rawReads[0].isCancelled()).toBe(false);
+
+        original_gate.resolve({ startRow: 0, rows: [[{ raw: 'a' }]] });
+        modified_gate.resolve({ startRow: 0, rows: [[{ raw: 'b' }]] });
+        await expect(second).resolves.toMatchObject({
+            changedCells: [{ row: 0, col: 0, base: 'a', formattedBase: 'a' }],
+        });
+        await first_rejection;
+    });
+
+    it('does not attach a fresh waiter to work already committed to cancellation', async () => {
+        const original_gates = [deferred<RawColumnWindow>(), deferred<RawColumnWindow>()];
+        const modified_gates = [deferred<RawColumnWindow>(), deferred<RawColumnWindow>()];
+        let original_read = 0;
+        let modified_read = 0;
+        const original = new AsyncRawSource(
+            [[cell('a')]],
+            () => original_gates[original_read++].promise,
+        );
+        const modified = new AsyncRawSource(
+            [[cell('b')]],
+            () => modified_gates[modified_read++].promise,
+        );
+        const source = new CompareDataSource(modified, original);
+        let cancelled = false;
+
+        const abandoned = source.diff_rows(0, [0], () => cancelled);
+        const abandoned_rejection = expect(abandoned)
+            .rejects.toMatchObject({ name: 'AbortError' });
+        await vi.waitFor(() => {
+            expect(original.rawReads).toHaveLength(1);
+            expect(modified.rawReads).toHaveLength(1);
+        });
+        cancelled = true;
+        // Model one side observing cancellation while its sibling remains pending.
+        expect(original.rawReads[0].isCancelled()).toBe(true);
+        original_gates[0].reject(abort_error());
+
+        const fresh = source.diff_rows(0, [0]);
+        await vi.waitFor(() => {
+            expect(original.rawReads).toHaveLength(2);
+            expect(modified.rawReads).toHaveLength(2);
+        });
+        original_gates[1].resolve({ startRow: 0, rows: [[{ raw: 'a' }]] });
+        modified_gates[1].resolve({ startRow: 0, rows: [[{ raw: 'b' }]] });
+        await expect(fresh).resolves.toMatchObject({
+            changedCells: [{ row: 0, col: 0, base: 'a', formattedBase: 'a' }],
+        });
+
+        modified_gates[0].reject(abort_error());
+        await abandoned_rejection;
+    });
+
+    it('aborts in-flight work on close without resurrecting the completed cache', async () => {
+        const original_gate = deferred<RawColumnWindow>();
+        const modified_gate = deferred<RawColumnWindow>();
+        const original = new AsyncRawSource([[cell('a')]], () => original_gate.promise);
+        const modified = new AsyncRawSource([[cell('b')]], () => modified_gate.promise);
+        const source = new CompareDataSource(modified, original);
+
+        const pending = source.diff_rows(0, [0]);
+        const rejection = expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+        await vi.waitFor(() => {
+            expect(original.rawReads).toHaveLength(1);
+            expect(modified.rawReads).toHaveLength(1);
+        });
+        source.close();
+        expect(original.rawReads[0].isCancelled()).toBe(true);
+        expect(modified.rawReads[0].isCancelled()).toBe(true);
+        original_gate.resolve({ startRow: 0, rows: [[{ raw: 'a' }]] });
+        modified_gate.resolve({ startRow: 0, rows: [[{ raw: 'b' }]] });
+        await rejection;
+
+        expect((source as unknown as { diff_cache: Map<string, unknown> }).diff_cache.size)
+            .toBe(0);
+        await expect(source.diff_rows(0, [0]))
+            .rejects.toMatchObject({ name: 'AbortError' });
+        expect(original.closed).toBe(true);
+        expect(modified.closed).toBe(true);
+    });
+
     it('maps padded rows to canonical rows appended after the modified side', () => {
         const source = compare([['a'], ['b'], ['c']], [['a']]);
         // Grid rows 1-2 are the deleted band; modified has 1 source row.
@@ -306,6 +580,58 @@ describe('CompareDataSource with a content alignment', () => {
             await align_workbook(modified, original),
         );
     };
+
+    it('uses a supplied alignment to skip paired rows proven unchanged', async () => {
+        const labeled = (raw: string, formatted: string): RenderedCell => ({
+            raw,
+            formatted,
+            bold: false,
+            italic: false,
+            rawType: 'number',
+        });
+        const original = new AsyncRawSource([
+            [labeled('1', 'Yes')],
+            [labeled('2', 'No')],
+        ]);
+        const modified = new AsyncRawSource([
+            [labeled('1', 'Yes')],
+            [labeled('3', 'Maybe')],
+        ]);
+        const source = new CompareDataSource(
+            modified,
+            original,
+            new Map([[0, positional_alignment([1], 2)]]),
+        );
+
+        expect(await source.diff_rows(0, [0, 1])).toMatchObject({
+            rowStatus: ['same', 'same'],
+            changedCells: [{ row: 1, col: 0, base: '2', formattedBase: 'No' }],
+        });
+        expect(original.rawReads).toEqual([
+            expect.objectContaining({ startRow: 1, count: 1 }),
+        ]);
+        expect(modified.rawReads).toEqual([
+            expect.objectContaining({ startRow: 1, count: 1 }),
+        ]);
+        expect(original.renderedReads).toEqual([{ startRow: 1, count: 1 }]);
+        expect(modified.renderedReads).toEqual([]);
+    });
+
+    it('still compares fallback-aligned rows whose synthetic changed set is empty', async () => {
+        const original = new AsyncRawSource([[cell('before')]]);
+        const modified = new AsyncRawSource([[cell('after')]]);
+        const source = new CompareDataSource(modified, original);
+
+        expect((await source.diff_rows(0, [0]))?.changedCells).toEqual([
+            { row: 0, col: 0, base: 'before', formattedBase: 'before' },
+        ]);
+        expect(original.rawReads).toEqual([
+            expect.objectContaining({ startRow: 0, count: 1 }),
+        ]);
+        expect(modified.rawReads).toEqual([
+            expect.objectContaining({ startRow: 0, count: 1 }),
+        ]);
+    });
 
     it('moves merges into unified-grid row space', async () => {
         // The unified grid interleaves the deleted row above the merge, so a
