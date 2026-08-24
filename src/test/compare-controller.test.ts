@@ -120,7 +120,9 @@ describe('compare mode controller', () => {
         const diff = posted(panel, 'compareDiff')[0];
         expect(diff.requestId).toBe('r1');
         expect(diff.rowStatus).toEqual(['same', 'added']);
-        expect(diff.changedCells).toEqual([{ row: 0, col: 0, base: 'A' }]);
+        expect(diff.changedCells).toEqual([
+            { row: 0, col: 0, base: 'A', formattedBase: 'A' },
+        ]);
         expect(posted(panel, 'rowData').length).toBeGreaterThan(0);
     });
 

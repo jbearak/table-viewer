@@ -79,7 +79,9 @@ describe('CompareDataSource', () => {
             new FixtureSource([{ name: 'Kept', rows: [['z']] }]),
         );
         const kept = diff_page(source, 0, 10);
-        expect(kept?.changedCells).toEqual([{ row: 0, col: 0, base: 'z' }]);
+        expect(kept?.changedCells).toEqual([
+            { row: 0, col: 0, base: 'z', formattedBase: 'z' },
+        ]);
         // There is no original to compare the added sheet against, so it has no
         // cell-level diff — but it is still all added, and saying nothing left
         // it painted as unchanged.
@@ -106,9 +108,15 @@ describe('CompareDataSource', () => {
             new StubSource([[binary('bbbb')]]),
             new StubSource([[binary('aaaa')]]),
         );
-        // Same preview, different payloads: caught only via comparisonKey.
-        expect(source.diff_rows(0, [0])?.changedCells)
-            .toEqual([{ row: 0, col: 0, base: preview }]);
+        // Same preview, different payloads: caught only via comparisonKey. Both
+        // user-facing bases stay on the preview; the digest must never cross the
+        // compare protocol into paint text.
+        expect(source.diff_rows(0, [0])?.changedCells).toEqual([{
+            row: 0,
+            col: 0,
+            base: preview,
+            formattedBase: preview,
+        }]);
 
         // Identical payloads must stay unchanged rather than diffing on the tag.
         const unchanged = new CompareDataSource(
@@ -116,6 +124,27 @@ describe('CompareDataSource', () => {
             new StubSource([[binary('aaaa')]]),
         );
         expect(unchanged.diff_rows(0, [0])?.changedCells).toEqual([]);
+    });
+
+    it('keeps Stata value-label text separate from the raw compare base', () => {
+        const labeled = (raw: string, formatted: string): RenderedCell => ({
+            raw,
+            formatted,
+            bold: false,
+            italic: false,
+            rawType: 'number',
+        });
+        const source = new CompareDataSource(
+            new StubSource([[labeled('2', 'No')]]),
+            new StubSource([[labeled('1', 'Yes')]]),
+        );
+
+        expect(source.diff_rows(0, [0])?.changedCells).toEqual([{
+            row: 0,
+            col: 0,
+            base: '1',
+            formattedBase: 'Yes',
+        }]);
     });
 
     it('exposes pairings including added and deleted sheets', () => {
@@ -347,7 +376,9 @@ describe('CompareDataSource with a content alignment', () => {
         const source = await aligned([['a', 'x']], [['a', 'y']]);
         const diff = diff_page(source, 0, 10);
         expect(diff?.rowStatus).toEqual(['same']);
-        expect(diff?.changedCells).toEqual([{ row: 0, col: 1, base: 'x' }]);
+        expect(diff?.changedCells).toEqual([
+            { row: 0, col: 1, base: 'x', formattedBase: 'x' },
+        ]);
     });
 
     it('lists added, deleted and changed rows for the changed-rows filter', async () => {
@@ -372,7 +403,9 @@ describe('CompareDataSource with a content alignment', () => {
         expect(diff?.rowStatus).toEqual(['same', 'same', 'moved']);
         // The moved row is still diffed cell by cell, which is the whole point:
         // its edit is reported as an edit rather than left to the eye.
-        expect(diff?.changedCells).toEqual([{ row: 2, col: 2, base: '20' }]);
+        expect(diff?.changedCells).toEqual([
+            { row: 2, col: 2, base: '20', formattedBase: '20' },
+        ]);
         // The summary has to agree with the banding. Asserted here because
         // every other movedRows assertion in the suite is either zero or a
         // hand-supplied prop, so a count that never left the aligner would go

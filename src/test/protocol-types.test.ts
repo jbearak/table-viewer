@@ -202,6 +202,29 @@ describe('paginated protocol message shapes', () => {
         }
     });
 
+    it('carries raw and formatted compare bases separately', () => {
+        const msg: HostMessage = {
+            type: 'compareDiff',
+            sheetIndex: 0,
+            startRow: 10,
+            rowStatus: ['same'],
+            changedCells: [{
+                row: 10,
+                col: 2,
+                base: '1',
+                formattedBase: 'Yes',
+            }],
+            requestId: 'compare:1',
+            generation: 3,
+        };
+        expect(msg.changedCells[0]).toEqual({
+            row: 10,
+            col: 2,
+            base: '1',
+            formattedBase: 'Yes',
+        });
+    });
+
     it('echoes exact snapshot identity and disposition in snapshotApplied', () => {
         const msg: WebviewMessage = {
             type: 'snapshotApplied',

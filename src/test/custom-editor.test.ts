@@ -722,7 +722,7 @@ describe('register_table_viewer', () => {
         });
         await vi.waitFor(() => expect(messages_of(panel, 'compareDiff')).toHaveLength(1));
         expect(messages_of(panel, 'compareDiff')[0].changedCells).toEqual([
-            { row: 0, col: 0, base: 'latest' },
+            { row: 0, col: 0, base: 'latest', formattedBase: 'latest' },
         ]);
         registration.dispose();
         await registration.drain();
