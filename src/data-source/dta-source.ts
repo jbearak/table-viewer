@@ -43,7 +43,6 @@ const MAX_LEGACY_EXPANSION_FIELDS = 10_000;
 const INITIAL_GSO_CHECKPOINT_STRIDE = 64;
 const BINARY_GSO_PREVIEW_BYTES = 32;
 const BINARY_GSO_COMPARISON_PREFIX = 'stata-binary:sha256:';
-const GSO_KEY_OBSERVATION_RANGE = 0x1_0000_0000;
 const STRLS_TAG_LENGTH = '<strls>'.length;
 const VALUE_LABELS_TAG_LENGTH = '<value_labels>'.length;
 const LBL_OPEN_TAG_LENGTH = '<lbl>'.length;
@@ -91,7 +90,7 @@ interface GsoCheckpoint extends GsoOrder {
 }
 
 interface ScannedGso extends GsoOrder {
-    readonly key: number;
+    readonly key: string;
     readonly value: GsoEntry;
     readonly nextPosition: number;
 }
@@ -147,8 +146,8 @@ export class DtaDataSource implements DataSource {
     private readonly pre_unicode_utf8_decoder = new TextDecoder('utf-8', { fatal: true });
     private readonly pre_unicode_fallback_decoder = new TextDecoder('windows-1252');
     private value_label_tables?: ValueLabelTables;
-    private readonly gso_index = new Map<number, GsoEntry>();
-    private readonly gso_cache = new Map<number, DecodedGso>();
+    private readonly gso_index = new Map<string, GsoEntry>();
+    private readonly gso_cache = new Map<string, DecodedGso>();
     private readonly gso_digest_cache = new Map<number, string>();
     private gso_checkpoints: GsoCheckpoint[] = [];
     private gso_checkpoint_stride = INITIAL_GSO_CHECKPOINT_STRIDE;
@@ -523,6 +522,7 @@ export class DtaDataSource implements DataSource {
         const view = this.open_view();
         const pointer = read_strl_cell_pointer(view, this.metadata, pointer_offset);
         if (pointer === null) return '';
+        validate_gso_identifier(pointer.v, pointer.o, this.metadata, 'strL pointer');
         const key = gso_key(pointer.v, pointer.o);
         const cached = this.gso_cache.get(key);
         if (cached !== undefined) {
@@ -605,6 +605,7 @@ export class DtaDataSource implements DataSource {
             observation = view.getUint32(position + 4, false);
             position += 8;
         }
+        validate_gso_identifier(variable, observation, this.metadata, 'strL object');
         const type = bytes[position++];
         const content_length = view.getUint32(position, little_endian);
         position += 4;
@@ -639,7 +640,7 @@ export class DtaDataSource implements DataSource {
         this.gso_entries_scanned += 1;
     }
 
-    private cache_gso_entry(key: number, entry: GsoEntry): void {
+    private cache_gso_entry(key: string, entry: GsoEntry): void {
         this.gso_index.delete(key);
         this.gso_index.set(key, entry);
         if (this.gso_index.size > MAX_GSO_INDEX_ENTRIES) {
@@ -650,7 +651,7 @@ export class DtaDataSource implements DataSource {
     private find_scanned_gso(
         bytes: Uint8Array,
         view: DataView,
-        key: number,
+        key: string,
         target_order: GsoOrder,
     ): GsoEntry | null {
         let position = this.gso_start_position;
@@ -681,7 +682,7 @@ export class DtaDataSource implements DataSource {
     }
 
     private decode_and_cache_gso(
-        key: number,
+        key: string,
         bytes: Uint8Array,
         entry: GsoEntry,
     ): DecodedGso {
@@ -847,13 +848,29 @@ function read_strl_cell_pointer(
     metadata: DtaMetadata,
     pointer_offset: number,
 ): { v: number; o: number } | null {
-    if (metadata.format_version !== 119) {
+    if (metadata.format_version !== 118 && metadata.format_version !== 119) {
         return read_strl_pointer(view, metadata, pointer_offset);
     }
     const little_endian = metadata.byte_order === 'LSF';
     let variable: number;
     let observation: number;
-    if (little_endian) {
+    if (metadata.format_version === 118) {
+        // Remove this workaround once @jbearak/dta-parser includes the fix for
+        // jbearak/dta-parser#37. Release 118 uses a 2-byte v and 6-byte o.
+        variable = view.getUint16(pointer_offset, little_endian);
+        if (little_endian) {
+            observation = view.getUint32(pointer_offset + 2, true);
+            if (view.getUint16(pointer_offset + 6, true) !== 0) {
+                throw new Error('strL observation number exceeds 32-bit range');
+            }
+        } else {
+            if (view.getUint16(pointer_offset + 2, false) !== 0) {
+                throw new Error('strL observation number exceeds 32-bit range');
+            }
+            observation = view.getUint32(pointer_offset + 4, false);
+        }
+    } else if (little_endian) {
+        // Release 119 uses a 3-byte v and 5-byte o.
         variable = view.getUint16(pointer_offset, true)
             + view.getUint8(pointer_offset + 2) * 0x1_0000;
         observation = view.getUint32(pointer_offset + 3, true);
@@ -873,8 +890,29 @@ function read_strl_cell_pointer(
         : { v: variable, o: observation };
 }
 
-function gso_key(variable: number, observation: number): number {
-    return variable * GSO_KEY_OBSERVATION_RANGE + observation;
+function validate_gso_identifier(
+    variable: number,
+    observation: number,
+    metadata: DtaMetadata,
+    source: 'strL pointer' | 'strL object',
+): void {
+    if (
+        !Number.isInteger(variable)
+        || !Number.isInteger(observation)
+        || variable < 1
+        || variable > metadata.nvar
+        || observation < 1
+        || observation > metadata.nobs
+    ) {
+        throw new Error(
+            `Corrupt .dta file: ${source} id (${variable}, ${observation}) is outside `
+            + `the dataset range (1..${metadata.nvar}, 1..${metadata.nobs})`,
+        );
+    }
+}
+
+function gso_key(variable: number, observation: number): string {
+    return `${variable}:${observation}`;
 }
 
 function validate_section_offsets(metadata: DtaMetadata, bytes: Uint8Array): void {

@@ -583,8 +583,8 @@ describe('DtaDataSource', () => {
         source.read_rows(0, 0, 1_100);
         const internals = source as unknown as {
             windows: Map<string, unknown>;
-            gso_index: Map<number, unknown>;
-            gso_cache: Map<number, unknown>;
+            gso_index: Map<string, unknown>;
+            gso_cache: Map<string, unknown>;
             gso_scan_position: number;
         };
         expect(internals.gso_index.size).toBeLessThanOrEqual(1_024);
@@ -593,7 +593,7 @@ describe('DtaDataSource', () => {
         internals.gso_cache.clear();
         expect(source.read_rows(0, 0, 1).rows[0][4]?.raw).toBe('a long first value');
         expect(internals.gso_scan_position).toBe(partial_position);
-        expect(internals.gso_index.has(5 * 0x1_0000_0000 + 1)).toBe(true);
+        expect(internals.gso_index.has('5:1')).toBe(true);
     });
 
     it('keeps checkpoints ordered for observation-major multi-strL data', async () => {
@@ -601,8 +601,8 @@ describe('DtaDataSource', () => {
         source.read_rows(0, 0, 1_100);
         const internals = source as unknown as {
             windows: Map<string, unknown>;
-            gso_index: Map<number, unknown>;
-            gso_cache: Map<number, unknown>;
+            gso_index: Map<string, unknown>;
+            gso_cache: Map<string, unknown>;
             gso_checkpoints: unknown[];
             gso_order_monotonic: boolean;
             gso_scan_position: number;
@@ -675,6 +675,39 @@ describe('DtaDataSource', () => {
         expect(rows.map((row) => row[0]?.raw)).toEqual(['3', '1', '2']);
         expect(rows[0][1]?.raw).toBe('café');
         expect(rows[0][0]?.formatted).toBe('Café');
+    });
+
+    it('rejects release 118 strL pointers whose observation exceeds 32 bits', async () => {
+        const fixture = build_dta_fixture();
+        const pointer = find_tag_end(fixture, '<data>') + 15;
+        fixture[pointer + 6] = 1;
+        const source = await DtaDataSource.create(fixture);
+        expect(() => source.read_rows(0, 0, 1)).toThrow(
+            'strL observation number exceeds 32-bit range',
+        );
+    });
+
+    it.each([
+        ['variable', 0, 6],
+        ['observation', 2, 5],
+    ] as const)('rejects out-of-range strL pointer %s ids', async (_field, offset, value) => {
+        const fixture = build_dta_fixture();
+        const pointer = find_tag_end(fixture, '<data>') + 15;
+        new DataView(fixture.buffer).setUint16(pointer + offset, value, true);
+        const source = await DtaDataSource.create(fixture);
+        expect(() => source.read_rows(0, 0, 1)).toThrow(
+            /Corrupt \.dta file: strL pointer id .* is outside the dataset range/,
+        );
+    });
+
+    it('rejects out-of-range ids in scanned strL objects', async () => {
+        const fixture = build_dta_fixture();
+        const first_gso_variable = find_tag_end(fixture, '<strls>') + 3;
+        new DataView(fixture.buffer).setUint32(first_gso_variable, 6, true);
+        const source = await DtaDataSource.create(fixture);
+        expect(() => source.read_rows(0, 0, 1)).toThrow(
+            /Corrupt \.dta file: strL object id .* is outside the dataset range/,
+        );
     });
 
     it('decodes release 119 strL pointers with the 3+5-byte layout', async () => {
