@@ -2,6 +2,12 @@ import { Buffer } from 'node:buffer';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
+import { cells_exactly_equal } from '../cell-display';
+import {
+    DEFERRED_COMPARISON_IDENTITY,
+    DEFERRED_FILTER_IDENTITY,
+    type RawCell,
+} from '../data-source/interface';
 import { displayed_text } from '../webview/cell-renderer';
 import { compute_column_histogram } from '../histograms';
 import { compute_transform } from '../table-transform';
@@ -380,9 +386,9 @@ function build_release117_fixture(): Uint8Array {
     return writer.finish();
 }
 
-function build_release119_strl_fixture(
-    content = new TextEncoder().encode('hello\0'),
-    type = 130,
+function build_release119_strl_rows_fixture(
+    contents: readonly Uint8Array[],
+    type = 129,
 ): Uint8Array {
     const writer = new ByteWriter();
     const offsets = new Map<string, number>();
@@ -390,7 +396,7 @@ function build_release119_strl_fixture(
     mark('stata_data');
     writer.text('<stata_dta><header><release>119</release><byteorder>LSF</byteorder><K>');
     writer.i32(1);
-    writer.text('</K><N>'); writer.u64(1);
+    writer.text('</K><N>'); writer.u64(contents.length);
     writer.text('</N><label>'); writer.u16(0);
     writer.text('</label><timestamp>'); writer.u8(0);
     writer.text('</timestamp></header>');
@@ -412,13 +418,19 @@ function build_release119_strl_fixture(
     writer.text('</variable_labels>');
     mark('characteristics'); writer.text('<characteristics></characteristics>');
     mark('data'); writer.text('<data>');
-    // Release 119 packs v into 3 bytes and o into 5 bytes.
-    writer.u8(1); writer.u8(0); writer.u8(0);
-    writer.i32(1); writer.u8(0);
+    for (let row = 0; row < contents.length; row++) {
+        // Release 119 packs v into 3 bytes and o into 5 bytes.
+        writer.u8(1); writer.u8(0); writer.u8(0);
+        writer.i32(row + 1); writer.u8(0);
+    }
     writer.text('</data>');
-    mark('strls'); writer.text('<strls>GSO');
-    writer.i32(1); writer.u64(1); writer.u8(type); writer.i32(content.length);
-    for (const byte of content) writer.u8(byte);
+    mark('strls'); writer.text('<strls>');
+    for (let row = 0; row < contents.length; row++) {
+        const content = contents[row];
+        writer.text('GSO');
+        writer.i32(1); writer.u64(row + 1); writer.u8(type); writer.i32(content.length);
+        for (const byte of content) writer.u8(byte);
+    }
     writer.text('</strls>');
     mark('value_labels'); writer.text('<value_labels></value_labels>');
     mark('stata_data_close'); writer.text('</stata_dta>');
@@ -430,6 +442,34 @@ function build_release119_strl_fixture(
     ];
     names.forEach((name, index) => writer.patch_u64(map_offset + index * 8, offsets.get(name)!));
     return writer.finish();
+}
+
+function build_release119_strl_fixture(
+    content = new TextEncoder().encode('hello\0'),
+    type = 130,
+): Uint8Array {
+    return build_release119_strl_rows_fixture([content], type);
+}
+
+function build_large_release119_binary_fixture(content: Uint8Array): Uint8Array {
+    const shell = build_release119_strl_fixture(new Uint8Array(0), 129);
+    const strls = find_tag_end(shell, '<strls>');
+    const content_start = strls + 3 + 4 + 8 + 1 + 4;
+    const result = new Uint8Array(shell.length + content.length);
+    result.set(shell.subarray(0, content_start));
+    result.set(content, content_start);
+    result.set(shell.subarray(content_start), content_start + content.length);
+    const view = new DataView(result.buffer);
+    view.setInt32(content_start - 4, content.length, true);
+    const map_start = find_tag_end(result, '<map>');
+    for (let index = 0; index < 14; index++) {
+        const offset = map_start + index * 8;
+        const section = Number(view.getBigUint64(offset, true));
+        if (section >= content_start) {
+            view.setBigUint64(offset, BigInt(section + content.length), true);
+        }
+    }
+    return result;
 }
 
 function find_tag_end(bytes: Uint8Array, tag: string): number {
@@ -444,6 +484,14 @@ function find_tag_end(bytes: Uint8Array, tag: string): number {
 
 function texts(rows: ReturnType<DtaDataSource['read_rows']>['rows']) {
     return rows.map((row) => row.map((cell) => ({ raw: cell?.raw, formatted: cell?.formatted })));
+}
+
+function binary_comparison_identity(cell: RawCell) {
+    return cell[DEFERRED_COMPARISON_IDENTITY]!;
+}
+
+function binary_filter_identity(cell: RawCell) {
+    return cell[DEFERRED_FILTER_IDENTITY]!;
 }
 
 describe('DtaDataSource', () => {
@@ -691,28 +739,210 @@ describe('DtaDataSource', () => {
 
         expect(binary_cell.raw).toBe('binary (1 bytes): 80');
         expect(binary_cell.formatted).toBe(binary_cell.raw);
-        expect(binary_cell.comparisonKey).toMatch(/^stata-binary:sha256:/);
-        expect(binary_cell.comparisonKey).not.toBe(other_binary_cell.comparisonKey);
+        expect(binary_cell.comparisonKey).toBeUndefined();
         expect(binary_cell.raw).toBe(text_cell.raw);
         const alignment = await align_sheet(binary, text, {
             status: 'matched', name: 'Sheet1', originalIndex: 0, modifiedIndex: 0,
         });
         expect(alignment.changedCells).toBe(1);
+        const binary_key = await binary_comparison_identity(binary_cell).resolveKey(() => false);
+        const other_key = await binary_comparison_identity(other_binary_cell)
+            .resolveKey(() => false);
+        expect(binary_key).toMatch(/^stata-binary:sha256:[0-9a-f]{64}:1$/);
+        expect(binary_key).not.toBe(other_key);
     });
 
-    it('bounds binary strL materialization to a preview and digest', async () => {
+    it('keeps binary rendering and enumeration lazy with a bounded preview', async () => {
         const payload = new Uint8Array(2 * 1024 * 1024).fill(0xab);
         const source = await DtaDataSource.create(build_release119_strl_fixture(payload, 129));
         const rendered = source.read_rows(0, 0, 1).rows[0][0]!;
         const fast = source.read_raw_columns(0, 0, 1, [0]).rows[0][0]!;
-        const internals = source as unknown as { gso_digest_cache: Map<number, string> };
+        const internals = source as unknown as {
+            gso_digest_cache: Map<number, string>;
+            binary_digest_computations: number;
+        };
         expect(rendered.raw!.length).toBeLessThan(128);
         expect(rendered.formatted.length).toBeLessThan(128);
         expect(rendered.formatted).toContain('2097152 bytes');
+        expect(displayed_text(rendered, false, undefined)).toBe(rendered.raw);
+        expect(displayed_text(rendered, true, undefined)).toBe(rendered.formatted);
         expect(fast.raw).toBe(rendered.raw);
+        expect(fast.comparisonKey).toBeUndefined();
+        expect(fast.filterKey).toBeUndefined();
+        expect(Object.keys(fast)).toEqual(['raw', 'rawType', 'rawByteLength']);
+        expect(JSON.stringify(fast)).not.toContain('sha256');
+        expect(binary_comparison_identity(fast)).toBe(binary_filter_identity(fast));
         expect(internals.gso_digest_cache.size).toBe(0);
-        expect(fast.comparisonKey).toMatch(/^stata-binary:sha256:/);
+        expect(internals.binary_digest_computations).toBe(0);
+
+        const key = await binary_comparison_identity(fast).resolveKey(() => false);
+        expect(key).toMatch(/^stata-binary:sha256:[0-9a-f]{64}:2097152$/);
         expect(internals.gso_digest_cache.size).toBe(1);
+        expect(internals.binary_digest_computations).toBe(1);
+    });
+
+    it('resolves binary identities larger than 16 MiB asynchronously', async () => {
+        const payload = new Uint8Array(17 * 1024 * 1024).fill(0x5a);
+        const source = await DtaDataSource.create(
+            build_large_release119_binary_fixture(payload),
+        );
+        const cell = source.read_raw_columns(0, 0, 1, [0]).rows[0][0]!;
+        let settled = false;
+        const resolving = binary_comparison_identity(cell).resolveKey(() => false)
+            .then((key) => {
+                settled = true;
+                return key;
+            });
+        expect(settled).toBe(false);
+        await expect(resolving).resolves.toMatch(
+            /^stata-binary:sha256:[0-9a-f]{64}:17825792$/,
+        );
+    });
+
+    it('cancels chunked hashing without caching partial work and retries cleanly', async () => {
+        const source = await DtaDataSource.create(
+            build_release119_strl_fixture(new Uint8Array(64).fill(0x4c), 129),
+        );
+        const cell = source.read_raw_columns(0, 0, 1, [0]).rows[0][0]!;
+        const internals = source as unknown as {
+            binary_identity_chunk_bytes: number;
+            binary_digest_computations: number;
+            gso_digest_cache: Map<number, string>;
+            pending_binary_identities: Map<number, unknown>;
+        };
+        internals.binary_identity_chunk_bytes = 8;
+        const cancelled = vi.fn()
+            .mockReturnValueOnce(false)
+            .mockReturnValueOnce(false)
+            .mockReturnValue(true);
+
+        await expect(binary_comparison_identity(cell).resolveKey(cancelled))
+            .rejects.toMatchObject({ name: 'AbortError' });
+        expect(internals.binary_digest_computations).toBe(1);
+        expect(internals.gso_digest_cache.size).toBe(0);
+        expect(internals.pending_binary_identities.size).toBe(0);
+
+        await expect(binary_comparison_identity(cell).resolveKey(() => false))
+            .resolves.toMatch(/^stata-binary:sha256:/);
+        expect(internals.binary_digest_computations).toBe(2);
+        expect(internals.gso_digest_cache.size).toBe(1);
+    });
+
+    it('shares comparison and filter hashing while cancelling only one waiter', async () => {
+        const source = await DtaDataSource.create(
+            build_release119_strl_fixture(new Uint8Array(64).fill(0x6d), 129),
+        );
+        const cell = source.read_raw_columns(0, 0, 1, [0]).rows[0][0]!;
+        const internals = source as unknown as {
+            binary_identity_chunk_bytes: number;
+            binary_digest_computations: number;
+        };
+        internals.binary_identity_chunk_bytes = 8;
+        let cancelled_checks = 0;
+        const live = binary_comparison_identity(cell).resolveKey(() => false);
+        const cancelled = binary_filter_identity(cell).resolveKey(
+            () => ++cancelled_checks > 1,
+        );
+
+        await expect(cancelled).rejects.toMatchObject({ name: 'AbortError' });
+        const key = await live;
+        expect(key).toMatch(/^stata-binary:sha256:/);
+        expect(binary_filter_identity(cell).cachedKey()).toBe(key);
+        expect(internals.binary_digest_computations).toBe(1);
+    });
+
+    it('bounds completed binary identities by entry count and logical bytes', async () => {
+        const contents = Array.from({ length: 4 }, (_, index) =>
+            new Uint8Array(40).fill(index + 1));
+        const source = await DtaDataSource.create(
+            build_release119_strl_rows_fixture(contents),
+        );
+        const cells = source.read_raw_columns(0, 0, contents.length, [0]).rows
+            .map((row) => row[0]!);
+        const internals = source as unknown as {
+            gso_digest_cache: Map<number, string>;
+            gso_digest_cache_bytes: number;
+            gso_digest_cache_entry_limit: number;
+            gso_digest_cache_byte_limit: number;
+        };
+        internals.gso_digest_cache_entry_limit = 2;
+        internals.gso_digest_cache_byte_limit = 10_000;
+        for (const cell of cells.slice(0, 3)) {
+            await binary_comparison_identity(cell).resolveKey(() => false);
+        }
+        expect(internals.gso_digest_cache.size).toBe(2);
+        expect(internals.gso_digest_cache_bytes).toBe(
+            [...internals.gso_digest_cache.values()]
+                .reduce((bytes, key) => bytes + key.length * 2, 0),
+        );
+
+        const one_key_bytes = [...internals.gso_digest_cache.values()][0].length * 2;
+        internals.gso_digest_cache.clear();
+        internals.gso_digest_cache_bytes = 0;
+        internals.gso_digest_cache_entry_limit = 10;
+        internals.gso_digest_cache_byte_limit = one_key_bytes + 1;
+        for (const cell of cells) {
+            await binary_comparison_identity(cell).resolveKey(() => false);
+        }
+        expect(internals.gso_digest_cache.size).toBe(1);
+        expect(internals.gso_digest_cache_bytes).toBeLessThanOrEqual(one_key_bytes + 1);
+    });
+
+    it('distinguishes equal binary previews by later backing bytes', async () => {
+        const left_payload = new Uint8Array(64).fill(0x2a);
+        const right_payload = left_payload.slice();
+        right_payload[63] = 0x2b;
+        const left = await DtaDataSource.create(
+            build_release119_strl_fixture(left_payload, 129),
+        );
+        const right = await DtaDataSource.create(
+            build_release119_strl_fixture(right_payload, 129),
+        );
+        const left_cell = left.read_raw_columns(0, 0, 1, [0]).rows[0][0]!;
+        const right_cell = right.read_raw_columns(0, 0, 1, [0]).rows[0][0]!;
+        expect(left_cell.raw).toBe(right_cell.raw);
+        const equal = cells_exactly_equal(left_cell, right_cell, () => false);
+        await expect(typeof equal === 'boolean' ? Promise.resolve(equal) : equal)
+            .resolves.toBe(false);
+        expect((left as unknown as { binary_digest_computations: number })
+            .binary_digest_computations).toBe(0);
+        expect((right as unknown as { binary_digest_computations: number })
+            .binary_digest_computations).toBe(0);
+        const left_key = await binary_comparison_identity(left_cell).resolveKey(() => false);
+        const right_key = await binary_comparison_identity(right_cell).resolveKey(() => false);
+        expect(left_key).not.toBe(right_key);
+    });
+
+    it('does not rehash evicted binary identities while counting aligned changes', async () => {
+        const originals = Array.from({ length: 6 }, (_, index) => {
+            const payload = new Uint8Array(64).fill(index + 1);
+            payload[0] = index;
+            return payload;
+        });
+        const modified = originals.map((payload) => payload.slice());
+        modified[2][63] ^= 0xff;
+        const original_source = await DtaDataSource.create(
+            build_release119_strl_rows_fixture(originals),
+        );
+        const modified_source = await DtaDataSource.create(
+            build_release119_strl_rows_fixture(modified),
+        );
+        type IdentityInternals = {
+            gso_digest_cache_entry_limit: number;
+            binary_digest_computations: number;
+        };
+        (original_source as unknown as IdentityInternals).gso_digest_cache_entry_limit = 2;
+        (modified_source as unknown as IdentityInternals).gso_digest_cache_entry_limit = 2;
+
+        const alignment = await align_sheet(original_source, modified_source, {
+            status: 'matched', name: 'Sheet1', originalIndex: 0, modifiedIndex: 0,
+        });
+        expect(alignment.changedCells).toBe(1);
+        expect(alignment.changedRowIndices).toEqual([2]);
+        expect((original_source as unknown as IdentityInternals)
+            .binary_digest_computations).toBe(originals.length);
+        expect((modified_source as unknown as IdentityInternals)
+            .binary_digest_computations).toBe(modified.length);
     });
 
     it('rejects oversized text strLs before decoding their payload', async () => {

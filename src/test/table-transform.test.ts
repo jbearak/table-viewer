@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
-import type {
-    ColumnWindow,
-    DataSource,
-    RenderedCell,
-    RowWindow,
-    WorkbookMeta,
+import {
+    DEFERRED_FILTER_IDENTITY,
+    type ColumnWindow,
+    type DataSource,
+    type RenderedCell,
+    type RowWindow,
+    type WorkbookMeta,
 } from '../data-source/interface';
 import {
     compare_cells,
@@ -31,6 +32,17 @@ const cell = (
     italic: false,
     rawType,
 });
+
+function deferred_filter_cell(
+    raw: string,
+    resolve_key: () => Promise<string>,
+): RenderedCell {
+    const rendered = cell(raw);
+    Object.defineProperty(rendered, DEFERRED_FILTER_IDENTITY, {
+        value: { cachedKey: () => undefined, resolveKey: resolve_key },
+    });
+    return rendered;
+}
 
 class Source implements DataSource {
     read_calls = 0;
@@ -659,6 +671,60 @@ describe('table transforms', () => {
         expect(stored.size).toBe(1);
     });
 
+    it('resolves identity only for isOneOf and upgrades a raw-only cached column', async () => {
+        const first_key = `stata-binary:sha256:${'a'.repeat(64)}:40`;
+        const second_key = `stata-binary:sha256:${'b'.repeat(64)}:40`;
+        const first_resolve = vi.fn(async () => first_key);
+        const second_resolve = vi.fn(async () => second_key);
+        const source = new Source([
+            [deferred_filter_cell('binary (40 bytes): aa…', first_resolve)],
+            [deferred_filter_cell('binary (40 bytes): bb…', second_resolve)],
+        ]);
+        const stored = new Map<string, CachedTransformColumn>();
+        const cache: TransformColumnCache = {
+            get: (sheet, column) => stored.get(`${sheet}:${column}`),
+            set: (sheet, column, value) => stored.set(`${sheet}:${column}`, value),
+        };
+
+        await compute_transform(source, 0, {
+            filters: [],
+            sort: [{ colIndex: 0, direction: 'asc' }],
+        }, undefined, undefined, cache);
+        expect(first_resolve).not.toHaveBeenCalled();
+        expect(second_resolve).not.toHaveBeenCalled();
+        expect(stored.get('0:0')?.filterIdentityComplete).toBe(false);
+        const raw_reads = source.read_calls;
+
+        await compute_transform(source, 0, {
+            filters: [filter('equals', 'binary (40 bytes): aa…')],
+            sort: [],
+        }, undefined, undefined, cache);
+        expect(source.read_calls).toBe(raw_reads);
+        expect(first_resolve).not.toHaveBeenCalled();
+        expect(second_resolve).not.toHaveBeenCalled();
+
+        const categorical = await compute_transform(source, 0, {
+            filters: [{
+                ...filter('isOneOf'),
+                excludedValues: [first_key],
+            }],
+            sort: [],
+        }, undefined, undefined, cache);
+        expect([...categorical.indices!]).toEqual([1]);
+        expect(source.read_calls).toBe(raw_reads + 1);
+        expect(first_resolve).toHaveBeenCalledTimes(1);
+        expect(second_resolve).toHaveBeenCalledTimes(1);
+        expect(stored.get('0:0')?.filterIdentityComplete).toBe(true);
+
+        await compute_transform(source, 0, {
+            filters: [],
+            sort: [{ colIndex: 0, direction: 'desc' }],
+        }, undefined, undefined, cache);
+        expect(source.read_calls).toBe(raw_reads + 1);
+        expect(first_resolve).toHaveBeenCalledTimes(1);
+        expect(second_resolve).toHaveBeenCalledTimes(1);
+    });
+
     it('skips sort-column acquisition for zero and singleton survivors', async () => {
         const state: SheetTransformState = {
             filters: [filter('equals', 'keep', 0)],
@@ -1087,6 +1153,9 @@ describe('table transforms', () => {
         expect(matches_filter(cell('brand new'), exclusion(['old']))).toBe(true);
         expect(matches_filter(cell('anything'), exclusion([]))).toBe(true);
         expect(matches_filter(null, exclusion([]))).toBe(true);
+        const unresolved = deferred_filter_cell('preview', async () => 'identity');
+        expect(() => matches_filter(unresolved, exclusion(['identity'])))
+            .toThrow('Deferred filter identity must be resolved asynchronously.');
 
         // Full transform: survivors keep source order; blanks drop with null.
         const source = new Source([

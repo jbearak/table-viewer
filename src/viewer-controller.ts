@@ -1282,12 +1282,20 @@ export function attach_viewer(
      * row the diff is defined over, so an arbitrarily transformed window is
      * diffed in one batch.
      */
-    function post_compare_diff(
+    async function post_compare_diff(
         msg: Extract<WebviewMessage, { type: 'requestRows' }>,
         window: { startRow: number; sourceRows: number[] },
-    ): void {
+    ): Promise<void> {
         if (!(source instanceof CompareDataSource) || window.sourceRows.length === 0) return;
         const compare_source = source;
+        const receiver_epoch = session.current_receiver_epoch;
+        const source_generation = core?.source_generation;
+        const is_cancelled = () =>
+            disposed
+            || source !== compare_source
+            || session.current_receiver_epoch !== receiver_epoch
+            || core?.source_generation !== source_generation
+            || core?.generation !== msg.generation;
         let diff;
         try {
             // The diff is positional over the compare source's projected row
@@ -1295,15 +1303,16 @@ export function attach_viewer(
             const projected_rows = window.sourceRows.map((source_row) =>
                 compare_source.projected_row_index(msg.sheetIndex, source_row));
             if (projected_rows.some((row) => row === undefined)) return;
-            diff = compare_source.diff_rows(
+            diff = await compare_source.diff_rows(
                 msg.sheetIndex,
                 projected_rows as number[],
+                is_cancelled,
             );
         } catch {
             return;
         }
-        if (!diff) return;
-        void post_to_receiver({
+        if (!diff || is_cancelled()) return;
+        await post_to_receiver({
             type: 'compareDiff',
             sheetIndex: msg.sheetIndex,
             startRow: window.startRow,
@@ -1316,7 +1325,7 @@ export function attach_viewer(
             })),
             requestId: msg.requestId,
             generation: msg.generation,
-        });
+        }, receiver_epoch);
     }
 
     function flush_sheet_selections(): void {

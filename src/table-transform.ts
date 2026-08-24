@@ -19,6 +19,7 @@ import {
     cell_can_be_numeric,
     filter_value,
     raw_value,
+    resolve_filter_value,
     stata_missing_rank,
 } from './transform-values';
 
@@ -45,6 +46,8 @@ export interface CachedTransformColumn {
     readonly values: readonly (string | null | undefined)[];
     /** Present only when at least one row has a lossy display preview. */
     readonly filterValues?: readonly (string | null | undefined)[];
+    /** False when the column was scanned only for raw sort/non-categorical work. */
+    readonly filterIdentityComplete: boolean;
     readonly numeric: boolean;
     readonly foundValue: boolean;
 }
@@ -63,6 +66,7 @@ type TransformColumn = CachedTransformColumn;
 interface MutableTransformColumn {
     values: (string | null | undefined)[];
     filterValues?: (string | null | undefined)[];
+    filterIdentityComplete: boolean;
     numeric: boolean;
     foundValue: boolean;
 }
@@ -187,6 +191,7 @@ export async function compute_transform(
                     sheet_index,
                     column_index,
                     sheet.rowCount,
+                    filters_need_identity(filters),
                     column_cache,
                     is_cancelled,
                     sort_instrumentation,
@@ -275,6 +280,7 @@ export async function compute_transform(
                 sheet_index,
                 key.colIndex,
                 sheet.rowCount,
+                false,
                 column_cache,
                 is_cancelled,
                 sort_instrumentation,
@@ -330,6 +336,12 @@ export async function compute_transform(
     }
 }
 
+function filters_need_identity(filters: readonly FilterEntry[]): boolean {
+    return filters.some((entry) =>
+        entry.operator === 'isOneOf'
+        && entry.excludedValues?.some((value) => value !== null) === true);
+}
+
 function group_enabled_filters(
     filters: readonly FilterEntry[],
 ): Map<number, FilterEntry[]> {
@@ -348,12 +360,13 @@ async function acquire_transform_column(
     sheet_index: number,
     column_index: number,
     row_count: number,
+    include_filter_identity: boolean,
     column_cache: TransformColumnCache | undefined,
     is_cancelled: () => boolean,
     instrumentation?: TransformSortInstrumentation,
 ): Promise<TransformColumn> {
     const cached = column_cache?.get(sheet_index, column_index);
-    if (cached) {
+    if (cached && (!include_filter_identity || cached.filterIdentityComplete)) {
         const column = { ...cached };
         track_transform_column(column, instrumentation);
         return column;
@@ -362,6 +375,7 @@ async function acquire_transform_column(
     await cancellation_checkpoint(is_cancelled);
     const mutable: MutableTransformColumn = {
         values: new Array(row_count),
+        filterIdentityComplete: include_filter_identity,
         numeric: true,
         foundValue: false,
     };
@@ -378,13 +392,18 @@ async function acquire_transform_column(
             const row = start + offset;
             const source_cell = rows[offset]?.[0] ?? null;
             const raw = raw_value(source_cell);
-            const identity = filter_value(source_cell);
             mutable.values[row] = raw;
-            if (identity !== raw) {
-                mutable.filterValues ??= mutable.values.slice();
-                mutable.filterValues[row] = identity;
-            } else if (mutable.filterValues !== undefined) {
-                mutable.filterValues[row] = raw;
+            if (include_filter_identity) {
+                const identity_value = resolve_filter_value(source_cell, is_cancelled);
+                const identity = typeof identity_value === 'object' && identity_value !== null
+                    ? await identity_value
+                    : identity_value;
+                if (identity !== raw) {
+                    mutable.filterValues ??= mutable.values.slice();
+                    mutable.filterValues[row] = identity;
+                } else if (mutable.filterValues !== undefined) {
+                    mutable.filterValues[row] = raw;
+                }
             }
             if (raw !== null) {
                 mutable.foundValue = true;
@@ -412,6 +431,7 @@ async function acquire_transform_column(
         ...(mutable.filterValues === undefined
             ? {}
             : { filterValues: Object.freeze(mutable.filterValues) }),
+        filterIdentityComplete: mutable.filterIdentityComplete,
         numeric: mutable.numeric,
         foundValue: mutable.foundValue,
     });
@@ -684,7 +704,7 @@ function compile_filter(
         const excluded = new Set(entry.excludedValues ?? []);
         return {
             needsNumericKey: false,
-            usesFilterIdentity: true,
+            usesFilterIdentity: [...excluded].some((value) => value !== null),
             matches: (raw) => !excluded.has(raw),
         };
     }

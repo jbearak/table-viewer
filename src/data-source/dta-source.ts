@@ -20,16 +20,19 @@ import {
     create_workbook_budget,
     MAX_SHEET_COLUMNS,
 } from '../spreadsheet-safety';
-import type {
-    ColumnFilterMetadata,
-    ColumnWindow,
-    DataSource,
-    IndexedRows,
-    RawCell,
-    RawColumnWindow,
-    RenderedCell,
-    RowWindow,
-    WorkbookMeta,
+import {
+    DEFERRED_COMPARISON_IDENTITY,
+    DEFERRED_FILTER_IDENTITY,
+    type ColumnFilterMetadata,
+    type ColumnWindow,
+    type DataSource,
+    type DeferredCellIdentity,
+    type IndexedRows,
+    type RawCell,
+    type RawColumnWindow,
+    type RenderedCell,
+    type RowWindow,
+    type WorkbookMeta,
 } from './interface';
 
 const DECODE_WINDOW_ROWS = 256;
@@ -41,7 +44,8 @@ const MAX_GSO_CACHE_BYTES = 16 * 1024 * 1024;
 const MAX_GSO_INDEX_ENTRIES = 1_024;
 const MAX_GSO_CHECKPOINTS = 1_024;
 const MAX_GSO_DIGEST_CACHE_ENTRIES = 4_096;
-const MAX_SYNC_BINARY_HASH_BYTES = 16 * 1024 * 1024;
+const MAX_GSO_DIGEST_CACHE_BYTES = 1024 * 1024;
+const BINARY_IDENTITY_CHUNK_BYTES = 256 * 1024;
 const MAX_VALUE_LABEL_TABLE_BYTES = 16 * 1024 * 1024;
 const MAX_VALUE_LABEL_TABLE_ENTRIES = 65_536;
 const MAX_VALUE_LABEL_TABLE_DECODED_BYTES = 16 * 1024 * 1024;
@@ -142,6 +146,28 @@ interface BinaryGso {
     readonly formatted: string;
 }
 
+interface BinaryIdentityWaiter {
+    readonly isCancelled: () => boolean;
+    readonly resolve: (key: string) => void;
+    readonly reject: (error: unknown) => void;
+}
+
+interface PendingBinaryIdentity {
+    readonly binary: BinaryGso;
+    readonly waiters: Set<BinaryIdentityWaiter>;
+    stopped: boolean;
+}
+
+interface DtaBinaryIdentityDescriptor {
+    readonly source: DtaDataSource;
+    readonly binary: BinaryGso;
+}
+
+const binary_identity_descriptors = new WeakMap<
+    DeferredCellIdentity,
+    DtaBinaryIdentityDescriptor
+>();
+
 type DecodedGso = string | BinaryGso;
 type ResolvedStataCell = RowCell | BinaryGso;
 
@@ -229,6 +255,12 @@ export class DtaDataSource implements DataSource {
     private gso_cache_bytes = 0;
     private text_gso_decode_byte_limit = MAX_GSO_CACHE_BYTES;
     private readonly gso_digest_cache = new Map<number, string>();
+    private gso_digest_cache_bytes = 0;
+    private gso_digest_cache_entry_limit = MAX_GSO_DIGEST_CACHE_ENTRIES;
+    private gso_digest_cache_byte_limit = MAX_GSO_DIGEST_CACHE_BYTES;
+    private binary_identity_chunk_bytes = BINARY_IDENTITY_CHUNK_BYTES;
+    private binary_digest_computations = 0;
+    private readonly pending_binary_identities = new Map<number, PendingBinaryIdentity>();
     private gso_checkpoints: GsoCheckpoint[] = [];
     private gso_checkpoint_stride = INITIAL_GSO_CHECKPOINT_STRIDE;
     private gso_entries_scanned = 0;
@@ -472,6 +504,14 @@ export class DtaDataSource implements DataSource {
         this.gso_cache.clear();
         this.gso_cache_bytes = 0;
         this.gso_digest_cache.clear();
+        this.gso_digest_cache_bytes = 0;
+        for (const job of this.pending_binary_identities.values()) {
+            job.stopped = true;
+            const error = source_abort_error();
+            for (const waiter of job.waiters) waiter.reject(error);
+            job.waiters.clear();
+        }
+        this.pending_binary_identities.clear();
         this.gso_checkpoints = [];
         this.gso_scan_exhausted = true;
         this.view = undefined;
@@ -507,10 +547,25 @@ export class DtaDataSource implements DataSource {
                 rawType: 'string',
                 rawByteLength: cell.contentLength,
             };
-            const identity = () => this.binary_comparison_key(cell);
+            const identity: DeferredCellIdentity = {
+                cachedKey: () => this.cached_binary_comparison_key(cell),
+                resolveKey: (is_cancelled) =>
+                    this.resolve_binary_comparison_key(cell, is_cancelled),
+                exactlyEquals: (other, is_cancelled) => {
+                    const descriptor = binary_identity_descriptors.get(other);
+                    if (descriptor === undefined) return undefined;
+                    return this.binary_exactly_equals(
+                        cell,
+                        descriptor.source,
+                        descriptor.binary,
+                        is_cancelled,
+                    );
+                },
+            };
+            binary_identity_descriptors.set(identity, { source: this, binary: cell });
             Object.defineProperties(raw_cell, {
-                comparisonKey: { enumerable: false, get: identity },
-                filterKey: { enumerable: false, get: identity },
+                [DEFERRED_COMPARISON_IDENTITY]: { value: identity },
+                [DEFERRED_FILTER_IDENTITY]: { value: identity },
             });
             return raw_cell;
         }
@@ -1072,29 +1127,162 @@ export class DtaDataSource implements DataSource {
         );
     }
 
-    private binary_comparison_key(binary: BinaryGso): string {
-        let digest = this.gso_digest_cache.get(binary.contentOffset);
-        if (digest !== undefined) {
+    private cached_binary_comparison_key(binary: BinaryGso): string | undefined {
+        const cached = this.gso_digest_cache.get(binary.contentOffset);
+        if (cached === undefined) return undefined;
+        this.gso_digest_cache.delete(binary.contentOffset);
+        this.gso_digest_cache.set(binary.contentOffset, cached);
+        return cached;
+    }
+
+    private cache_binary_comparison_key(binary: BinaryGso, key: string): void {
+        const key_bytes = key.length * 2;
+        if (
+            this.gso_digest_cache_entry_limit < 1
+            || key_bytes > this.gso_digest_cache_byte_limit
+        ) return;
+        if (this.gso_digest_cache.size === 0) this.gso_digest_cache_bytes = 0;
+        const previous = this.gso_digest_cache.get(binary.contentOffset);
+        if (previous !== undefined) {
             this.gso_digest_cache.delete(binary.contentOffset);
-            this.gso_digest_cache.set(binary.contentOffset, digest);
-        } else {
-            if (binary.contentLength > MAX_SYNC_BINARY_HASH_BYTES) {
-                throw new Error(
-                    `Stata binary strL is too large to compare exactly without blocking `
-                    + `(max ${MAX_SYNC_BINARY_HASH_BYTES} bytes)`,
-                );
-            }
-            const content = this.open_bytes().subarray(
-                binary.contentOffset,
-                binary.contentOffset + binary.contentLength,
-            );
-            digest = createHash('sha256').update(content).digest('hex');
-            this.gso_digest_cache.set(binary.contentOffset, digest);
-            if (this.gso_digest_cache.size > MAX_GSO_DIGEST_CACHE_ENTRIES) {
-                this.gso_digest_cache.delete(this.gso_digest_cache.keys().next().value!);
-            }
+            this.gso_digest_cache_bytes -= previous.length * 2;
         }
-        return `${BINARY_GSO_COMPARISON_PREFIX}${digest}:${binary.contentLength}`;
+        this.gso_digest_cache.set(binary.contentOffset, key);
+        this.gso_digest_cache_bytes += key_bytes;
+        while (
+            this.gso_digest_cache.size > this.gso_digest_cache_entry_limit
+            || this.gso_digest_cache_bytes > this.gso_digest_cache_byte_limit
+        ) {
+            const oldest_offset = this.gso_digest_cache.keys().next().value!;
+            const oldest = this.gso_digest_cache.get(oldest_offset)!;
+            this.gso_digest_cache.delete(oldest_offset);
+            this.gso_digest_cache_bytes -= oldest.length * 2;
+        }
+    }
+
+    private reject_cancelled_binary_waiters(job: PendingBinaryIdentity): void {
+        for (const waiter of job.waiters) {
+            let cancelled: boolean;
+            try {
+                cancelled = waiter.isCancelled();
+            } catch (error) {
+                job.waiters.delete(waiter);
+                waiter.reject(error);
+                continue;
+            }
+            if (!cancelled) continue;
+            job.waiters.delete(waiter);
+            waiter.reject(source_abort_error());
+        }
+    }
+
+    private resolve_binary_comparison_key(
+        binary: BinaryGso,
+        is_cancelled: () => boolean,
+    ): Promise<string> {
+        if (is_cancelled()) return Promise.reject(source_abort_error());
+        const cached = this.cached_binary_comparison_key(binary);
+        if (cached !== undefined) return Promise.resolve(cached);
+
+        let job = this.pending_binary_identities.get(binary.contentOffset);
+        let start_job = false;
+        if (job === undefined) {
+            job = { binary, waiters: new Set(), stopped: false };
+            this.pending_binary_identities.set(binary.contentOffset, job);
+            start_job = true;
+        }
+        const promise = new Promise<string>((resolve, reject) => {
+            job!.waiters.add({ isCancelled: is_cancelled, resolve, reject });
+        });
+        if (start_job) void this.run_binary_identity_job(job);
+        return promise;
+    }
+
+    private async run_binary_identity_job(job: PendingBinaryIdentity): Promise<void> {
+        try {
+            const bytes = this.open_bytes();
+            const hash = createHash('sha256');
+            this.binary_digest_computations += 1;
+            let hashed = 0;
+            while (hashed < job.binary.contentLength) {
+                if (job.stopped) return;
+                this.reject_cancelled_binary_waiters(job);
+                if (job.waiters.size === 0) {
+                    this.pending_binary_identities.delete(job.binary.contentOffset);
+                    return;
+                }
+                const count = Math.min(
+                    Math.max(1, this.binary_identity_chunk_bytes),
+                    job.binary.contentLength - hashed,
+                );
+                const start = job.binary.contentOffset + hashed;
+                hash.update(bytes.subarray(start, start + count));
+                hashed += count;
+                if (hashed < job.binary.contentLength) await yield_to_event_loop();
+            }
+
+            if (job.stopped) return;
+            this.reject_cancelled_binary_waiters(job);
+            if (job.waiters.size === 0) {
+                this.pending_binary_identities.delete(job.binary.contentOffset);
+                return;
+            }
+            const key = `${BINARY_GSO_COMPARISON_PREFIX}${hash.digest('hex')}`
+                + `:${job.binary.contentLength}`;
+            this.cache_binary_comparison_key(job.binary, key);
+            this.pending_binary_identities.delete(job.binary.contentOffset);
+            for (const waiter of job.waiters) waiter.resolve(key);
+            job.waiters.clear();
+        } catch (error) {
+            if (this.pending_binary_identities.get(job.binary.contentOffset) === job) {
+                this.pending_binary_identities.delete(job.binary.contentOffset);
+            }
+            for (const waiter of job.waiters) waiter.reject(error);
+            job.waiters.clear();
+        }
+    }
+
+    private binary_exactly_equals(
+        binary: BinaryGso,
+        other_source: DtaDataSource,
+        other_binary: BinaryGso,
+        is_cancelled: () => boolean,
+    ): boolean | Promise<boolean> {
+        if (binary.contentLength !== other_binary.contentLength) return false;
+        if (this === other_source && binary.contentOffset === other_binary.contentOffset) {
+            return true;
+        }
+        const cached = this.cached_binary_comparison_key(binary);
+        const other_cached = other_source.cached_binary_comparison_key(other_binary);
+        if (cached !== undefined && other_cached !== undefined) return cached === other_cached;
+        return this.compare_binary_bytes(binary, other_source, other_binary, is_cancelled);
+    }
+
+    private async compare_binary_bytes(
+        binary: BinaryGso,
+        other_source: DtaDataSource,
+        other_binary: BinaryGso,
+        is_cancelled: () => boolean,
+    ): Promise<boolean> {
+        const bytes = this.open_bytes();
+        const other_bytes = other_source.open_bytes();
+        const chunk_bytes = Math.max(1, Math.min(
+            this.binary_identity_chunk_bytes,
+            other_source.binary_identity_chunk_bytes,
+        ));
+        for (let compared = 0; compared < binary.contentLength;) {
+            if (is_cancelled()) throw source_abort_error();
+            const count = Math.min(chunk_bytes, binary.contentLength - compared);
+            const left_start = binary.contentOffset + compared;
+            const right_start = other_binary.contentOffset + compared;
+            for (let offset = 0; offset < count; offset++) {
+                if (bytes[left_start + offset] !== other_bytes[right_start + offset]) return false;
+            }
+            compared += count;
+            if (compared < binary.contentLength) await yield_to_event_loop();
+        }
+        if (is_cancelled()) throw source_abort_error();
+        return true;
     }
 
     private open_buffer(): ArrayBuffer {

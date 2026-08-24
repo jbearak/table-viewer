@@ -258,7 +258,7 @@ export class ViewerPanelCore {
     private readonly on_row_window_served?: (
         msg: Extract<WebviewMessage, { type: 'requestRows' }>,
         window: TransformedRowWindow,
-    ) => void;
+    ) => void | Promise<void>;
     /**
      * The last computed display-keyed projection, with the facts it is a function of.
      * See `row_height_projection_by_sheet` for why each is needed and why a memo is
@@ -327,7 +327,7 @@ export class ViewerPanelCore {
             onRowWindowServed?: (
                 msg: Extract<WebviewMessage, { type: 'requestRows' }>,
                 window: TransformedRowWindow,
-            ) => void;
+            ) => void | Promise<void>;
         },
     ) {
         this.max_cached_pages = opts?.maxCachedPages ?? DEFAULT_MAX_CACHED_PAGES;
@@ -1663,7 +1663,7 @@ export class ViewerPanelCore {
             requestId: msg.requestId,
             generation: this._generation,
         });
-        this.on_row_window_served?.(msg, window);
+        await this.on_row_window_served?.(msg, window);
     }
 
     private evict_excess(): void {
@@ -1745,7 +1745,7 @@ export function adopt_source_into_core(
         onRowWindowServed?: (
             msg: Extract<WebviewMessage, { type: 'requestRows' }>,
             window: TransformedRowWindow,
-        ) => void;
+        ) => void | Promise<void>;
     },
     on_installed?: (installed: ViewerPanelCore) => void,
 ): AdoptSourceIntoCoreResult {

@@ -2,12 +2,39 @@ import type { MergeRange } from '../types';
 import type { RichCellFields } from '../cell-content';
 import type { XlsxCellFormatFields } from '../spreadsheet-format';
 
+/** Deferred lossless identity for a source value whose display-safe raw text is
+ * bounded. Capabilities live behind symbols so row/filter/compare protocols can
+ * serialize cells without ever carrying functions or promises. */
+export interface DeferredCellIdentity {
+    cachedKey(): string | undefined;
+    resolveKey(is_cancelled: () => boolean): Promise<string>;
+    exactlyEquals?(
+        other: DeferredCellIdentity,
+        is_cancelled: () => boolean,
+    ): boolean | Promise<boolean> | undefined;
+}
+
+export const DEFERRED_COMPARISON_IDENTITY: unique symbol = Symbol(
+    'table-viewer.deferred-comparison-identity',
+);
+export const DEFERRED_FILTER_IDENTITY: unique symbol = Symbol(
+    'table-viewer.deferred-filter-identity',
+);
+
+interface DeferredIdentityFields {
+    [DEFERRED_COMPARISON_IDENTITY]?: DeferredCellIdentity;
+    [DEFERRED_FILTER_IDENTITY]?: DeferredCellIdentity;
+}
+
 /** Webview-facing cell. Identical shape to the old CellData so the renderer
  *  is format-agnostic. `raw` is the raw value rendered to string (numbers/bools
  *  become their string form — acceptable: copy + edit-base both String() it).
  *  The rich fields are shared with CellData via RichCellFields; only Excel
  *  sources set them, so CSV cells keep their exact legacy shape. */
-export interface RenderedCell extends RichCellFields, XlsxCellFormatFields {
+export interface RenderedCell extends
+    RichCellFields,
+    XlsxCellFormatFields,
+    DeferredIdentityFields {
     raw: string | null;       // null = empty cell
     formatted: string;        // display text (== raw for CSV)
     bold: boolean;
@@ -27,7 +54,7 @@ export interface RenderedCell extends RichCellFields, XlsxCellFormatFields {
 export type RawCell = Pick<
     RenderedCell,
     'raw' | 'rawType' | 'comparisonKey' | 'filterKey' | 'rawByteLength'
->;
+> & DeferredIdentityFields;
 
 /** Optional source semantics for one filter column. The histogram scan owns raw
  * identity; a source may add labels and a categorical default without changing

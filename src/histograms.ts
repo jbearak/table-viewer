@@ -1,7 +1,8 @@
-import type {
-    ColumnFilterMetadata,
-    DataSource,
-    RawCell,
+import {
+    DEFERRED_FILTER_IDENTITY,
+    type ColumnFilterMetadata,
+    type DataSource,
+    type RawCell,
 } from './data-source/interface';
 import { read_source_raw_columns_async } from './data-source/interface';
 import type { FilterColumnKind, FilterValueOption, HistogramBin } from './types';
@@ -11,8 +12,8 @@ import {
 } from './types';
 import {
     cell_can_be_numeric,
-    filter_value,
     raw_value,
+    resolve_filter_value,
 } from './transform-values';
 
 const BIN_COUNT = 50;
@@ -102,21 +103,37 @@ function raw_storage_bytes(
 function add_distinct_value(
     distinct: DistinctValues,
     cell: RawCell | null | undefined,
-): boolean {
+    is_cancelled: () => boolean,
+): boolean | Promise<boolean> {
     const raw = raw_value(cell);
     const bytes = raw_storage_bytes(cell, raw);
     // A bounded preview must not trick the checklist into hashing or retaining a
     // source value whose actual identity cannot fit in the transfer budget.
     if (bytes > FILTER_DISTINCT_VALUE_BYTE_LIMIT) return false;
-    const identity = filter_value(cell);
-    if (distinct.entries.has(identity)) return true;
+
+    const deferred = cell?.[DEFERRED_FILTER_IDENTITY];
+    const known_identity = raw === null
+        ? null
+        : cell?.filterKey ?? deferred?.cachedKey() ?? (deferred === undefined ? raw : undefined);
+    if (known_identity !== undefined && distinct.entries.has(known_identity)) return true;
+    // Check both caps before starting deferred identity work. This is deliberately
+    // conservative for a repeated lossy preview: proving it is a duplicate would
+    // itself spend the work the exhausted checklist is no longer allowed to start.
     if (
         distinct.entries.size === FILTER_DISTINCT_VALUE_LIMIT
         || distinct.byteCount + bytes > FILTER_DISTINCT_VALUE_BYTE_LIMIT
     ) return false;
-    distinct.entries.set(identity, raw);
-    distinct.byteCount += bytes;
-    return true;
+
+    const identity = known_identity ?? resolve_filter_value(cell, is_cancelled);
+    const retain = (resolved: string | null): boolean => {
+        if (distinct.entries.has(resolved)) return true;
+        distinct.entries.set(resolved, raw);
+        distinct.byteCount += bytes;
+        return true;
+    };
+    return typeof identity === 'object' && identity !== null
+        ? identity.then(retain)
+        : retain(identity);
 }
 
 /**
@@ -152,9 +169,12 @@ export async function compute_column_histogram(
             is_cancelled,
         );
         for (const row of window.rows) {
-            if (distinct !== null && !add_distinct_value(distinct, row[0])) {
-                // Release retained strings; a partial list is never sent.
-                distinct = null;
+            if (distinct !== null) {
+                const added = add_distinct_value(distinct, row[0], is_cancelled);
+                if (!(typeof added === 'boolean' ? added : await added)) {
+                    // Release retained strings; a partial list is never sent.
+                    distinct = null;
+                }
             }
             const classified = classify_value(row[0]);
             if (classified === undefined) continue;

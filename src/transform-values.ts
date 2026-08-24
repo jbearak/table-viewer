@@ -1,4 +1,7 @@
-import type { RawCell } from './data-source/interface';
+import {
+    DEFERRED_FILTER_IDENTITY,
+    type RawCell,
+} from './data-source/interface';
 
 export function raw_value(cell: RawCell | null | undefined): string | null {
     const raw = cell?.raw;
@@ -10,10 +13,34 @@ export function raw_value(cell: RawCell | null | undefined): string | null {
 }
 
 /** Exact categorical matching identity. Most values use their raw text; sources
- * with a bounded display preview may provide a separate lossless key. */
+ * with a bounded display preview may provide a separate lossless key. Throws for
+ * an unresolved deferred identity so synchronous callers cannot match a preview. */
 export function filter_value(cell: RawCell | null | undefined): string | null {
     const raw = raw_value(cell);
-    return raw === null ? null : cell?.filterKey ?? raw;
+    if (raw === null) return null;
+    const concrete = cell?.filterKey;
+    if (concrete !== undefined) return concrete;
+    const deferred = cell?.[DEFERRED_FILTER_IDENTITY];
+    if (deferred === undefined) return raw;
+    const cached = deferred.cachedKey();
+    if (cached !== undefined) return cached;
+    throw new Error('Deferred filter identity must be resolved asynchronously.');
+}
+
+/** Resolve an exact categorical identity only for a caller that actually needs
+ * it. Ordinary cells and completed deferred identities remain synchronous. */
+export function resolve_filter_value(
+    cell: RawCell | null | undefined,
+    is_cancelled: () => boolean,
+): string | null | Promise<string> {
+    const raw = raw_value(cell);
+    if (raw === null) return null;
+    const concrete = cell?.filterKey;
+    if (concrete !== undefined) return concrete;
+    const deferred = cell?.[DEFERRED_FILTER_IDENTITY];
+    if (deferred === undefined) return raw;
+    const cached = deferred.cachedKey();
+    return cached ?? deferred.resolveKey(is_cancelled);
 }
 
 export function stata_missing_rank(value: string): number | undefined {

@@ -11,7 +11,10 @@ import {
     type DataSource,
     type SheetMeta,
 } from '../data-source/interface';
-import { get_cell_comparison_text } from '../cell-display';
+import {
+    cells_exactly_equal,
+    materialize_cell_comparison_text,
+} from '../cell-display';
 import type { SheetPairing } from './compare-source';
 
 /** Absent from one side. Exactly one of a row's indexes may be this. */
@@ -185,23 +188,39 @@ const MOVE_SCORES_PER_CHECKPOINT = 20_000;
  * accepted: confirming a match would mean re-reading both rows' cells, and the
  * cost of being wrong is a mis-paired row in a diff, not corrupted data.
  */
-function hash_row(cells: readonly ({ raw: string | null } | null)[]): number {
+function hash_row(
+    cells: readonly ({ raw: string | null } | null)[],
+    is_cancelled: () => boolean,
+): number | Promise<number> {
     let hash = 0x811c9dc5;
     const mix = (value: number) => {
         hash ^= value;
         hash = Math.imul(hash, 0x01000193);
     };
-    mix(cells.length);
-    for (let index = 0; index < cells.length; index++) {
-        const text = get_cell_comparison_text(cells[index]);
+    const mix_text = (text: string) => {
         mix(text.length);
         for (let position = 0; position < text.length; position++) {
             mix(text.charCodeAt(position));
         }
-    }
-    // >>> 0 so the value is a stable unsigned int rather than a sign-flipped
-    // one, since it is stored in a Uint32Array and compared for equality.
-    return hash >>> 0;
+    };
+    const continue_at = (start: number): number | Promise<number> => {
+        for (let index = start; index < cells.length; index++) {
+            const text = materialize_cell_comparison_text(cells[index], is_cancelled);
+            if (typeof text === 'string') {
+                mix_text(text);
+                continue;
+            }
+            return text.then((resolved) => {
+                mix_text(resolved);
+                return continue_at(index + 1);
+            });
+        }
+        // >>> 0 so the value is a stable unsigned int rather than a sign-flipped
+        // one, since it is stored in a Uint32Array and compared for equality.
+        return hash >>> 0;
+    };
+    mix(cells.length);
+    return continue_at(0);
 }
 
 async function hash_side(
@@ -226,7 +245,13 @@ async function hash_side(
                 options.isCancelled ?? (() => false),
             ));
         for (let offset = 0; offset < count; offset++) {
-            hashes[start + offset] = hash_row(rows[offset] ?? []);
+            const hash = hash_row(
+                rows[offset] ?? [],
+                options.isCancelled ?? (() => false),
+            );
+            hashes[start + offset] = typeof hash === 'number'
+                ? hash
+                : await alignment_source_read(() => hash);
         }
         since_checkpoint += count;
         if (since_checkpoint >= checkpoint) {
@@ -747,10 +772,15 @@ async function count_changes(
             const modified_row = modified_batch[offset] ?? [];
             let row_changed = false;
             for (let col = 0; col < column_count; col++) {
-                if (
-                    get_cell_comparison_text(original_row[col])
-                    !== get_cell_comparison_text(modified_row[col])
-                ) {
+                const equal = cells_exactly_equal(
+                    original_row[col],
+                    modified_row[col],
+                    options.isCancelled ?? (() => false),
+                );
+                const exactly_equal = typeof equal === 'boolean'
+                    ? equal
+                    : await alignment_source_read(() => equal);
+                if (!exactly_equal) {
                     changed_cells++;
                     row_changed = true;
                 }
@@ -796,15 +826,42 @@ interface CandidateRow {
 function normalize_candidate(
     cells: readonly ({ raw: string | null } | null)[] | undefined,
     column_count: number,
-): CandidateRow {
+    is_cancelled: () => boolean,
+): CandidateRow | Promise<CandidateRow> {
     const texts: string[] = [];
     let length = 0;
-    for (let col = 0; col < column_count; col++) {
-        const text = get_cell_comparison_text(cells?.[col]);
-        texts.push(text);
-        length += text.length;
+    const continue_at = (start: number): CandidateRow | Promise<CandidateRow> => {
+        for (let col = start; col < column_count; col++) {
+            const text = materialize_cell_comparison_text(cells?.[col], is_cancelled);
+            if (typeof text === 'string') {
+                texts.push(text);
+                length += text.length;
+                continue;
+            }
+            return text.then((resolved) => {
+                texts.push(resolved);
+                length += resolved.length;
+                return continue_at(col + 1);
+            });
+        }
+        return { texts, length };
+    };
+    return continue_at(0);
+}
+
+async function normalize_candidates(
+    rows: readonly (readonly ({ raw: string | null } | null)[])[],
+    column_count: number,
+    is_cancelled: () => boolean,
+): Promise<CandidateRow[]> {
+    const normalized: CandidateRow[] = [];
+    for (const cells of rows) {
+        const candidate = normalize_candidate(cells, column_count, is_cancelled);
+        normalized.push(typeof candidate === 'object' && 'texts' in candidate
+            ? candidate
+            : await alignment_source_read(() => candidate));
     }
-    return { texts, length };
+    return normalized;
 }
 
 /**
@@ -1003,20 +1060,29 @@ async function score_moves(
         original.meta().sheets[pairing.originalIndex].columnCount,
         modified.meta().sheets[pairing.modifiedIndex].columnCount,
     );
-    const sources = (await alignment_source_read(() =>
-        read_source_raw_rows_indexed_async(
-            original,
-            pairing.originalIndex,
-            unmatched_deleted.map((entry) => entry.row),
-            options.isCancelled ?? (() => false),
-        ))).rows.map((cells) => normalize_candidate(cells, column_count));
-    const destinations = (await alignment_source_read(() =>
-        read_source_raw_rows_indexed_async(
-            modified,
-            pairing.modifiedIndex,
-            unmatched_added.map((entry) => entry.row),
-            options.isCancelled ?? (() => false),
-        ))).rows.map((cells) => normalize_candidate(cells, column_count));
+    const is_cancelled = options.isCancelled ?? (() => false);
+    const sources = await normalize_candidates(
+        (await alignment_source_read(() =>
+            read_source_raw_rows_indexed_async(
+                original,
+                pairing.originalIndex,
+                unmatched_deleted.map((entry) => entry.row),
+                is_cancelled,
+            ))).rows,
+        column_count,
+        is_cancelled,
+    );
+    const destinations = await normalize_candidates(
+        (await alignment_source_read(() =>
+            read_source_raw_rows_indexed_async(
+                modified,
+                pairing.modifiedIndex,
+                unmatched_added.map((entry) => entry.row),
+                is_cancelled,
+            ))).rows,
+        column_count,
+        is_cancelled,
+    );
 
     const candidates: MoveCandidate[] = [];
     let scored = 0;

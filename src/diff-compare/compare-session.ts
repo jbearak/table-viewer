@@ -30,7 +30,7 @@ import {
     type SheetPairing,
     type SheetPairStatus,
 } from './compare-source';
-import { get_cell_comparison_text, get_raw_cell_text } from '../cell-display';
+import { cells_exactly_equal, get_raw_cell_text } from '../cell-display';
 import type { MergeRange } from '../types';
 import {
     ABSENT,
@@ -54,6 +54,12 @@ import {
  * Withheld here rather than filtered in the webview so there is one answer to
  * "can this sheet promote a header row", and it is the source's.
  */
+function compare_abort_error(): Error {
+    const error = new Error('Compare diff was cancelled.');
+    error.name = 'AbortError';
+    return error;
+}
+
 function without_header_capability(sheet: SheetMeta): SheetMeta {
     if (sheet.excelFirstRowHeader === undefined) return sheet;
     const { excelFirstRowHeader: _withheld, ...rest } = sheet;
@@ -510,7 +516,11 @@ export class CompareDataSource implements DataSource {
      * cache: a renderer re-requesting a page must not reread and re-compare
      * both sides.
      */
-    diff_rows(sheet_index: number, rows: readonly number[]): CompareDiffWindow | undefined {
+    async diff_rows(
+        sheet_index: number,
+        rows: readonly number[],
+        is_cancelled: () => boolean = () => false,
+    ): Promise<CompareDiffWindow | undefined> {
         if (this.deleted_original_index(sheet_index) !== undefined) {
             // A deleted sheet is one all-deleted band; the rows themselves
             // carry the original content, so there are no changed cells.
@@ -541,7 +551,13 @@ export class CompareDataSource implements DataSource {
             this.diff_cache.set(key, cached);
             return cached;
         }
-        const window = this.compute_diff(sheet_index, alignment, rows);
+        const window = await this.compute_diff(
+            sheet_index,
+            alignment,
+            rows,
+            is_cancelled,
+        );
+        if (is_cancelled()) throw compare_abort_error();
         this.diff_cache.set(key, window);
         while (this.diff_cache.size > CompareDataSource.MAX_CACHED_DIFF_PAGES) {
             const oldest = this.diff_cache.keys().next().value;
@@ -556,11 +572,12 @@ export class CompareDataSource implements DataSource {
      * Rows present on only one side are added/deleted outright; paired rows are
      * read from both sides in one batch each and compared cell by cell.
      */
-    private compute_diff(
+    private async compute_diff(
         sheet_index: number,
         alignment: readonly AlignedRow[],
         rows: readonly number[],
-    ): CompareDiffWindow {
+        is_cancelled: () => boolean,
+    ): Promise<CompareDiffWindow> {
         const pairing = this.matched_by_modified_index.get(sheet_index)!;
         const original_sheet = this.original_meta.sheets[pairing.originalIndex];
         const modified_sheet = this.modified_meta.sheets[sheet_index];
@@ -598,28 +615,31 @@ export class CompareDataSource implements DataSource {
                 this.original, pairing.originalIndex, original_rows).rows;
             const modified_batch = read_source_rows_indexed(
                 this.modified, sheet_index, modified_rows).rows;
-            paired_positions.forEach((position, index) => {
+            for (let index = 0; index < paired_positions.length; index++) {
+                if (is_cancelled()) throw compare_abort_error();
+                const position = paired_positions[index];
                 const original_row = original_batch[index] ?? [];
                 const modified_row = modified_batch[index] ?? [];
                 for (let col = 0; col < column_count; col++) {
                     // Compare on identity, which is lossless for binary strLs,
                     // but report both original spellings so the renderer can honor
                     // Formatting without ever exposing that internal identity.
-                    if (
-                        get_cell_comparison_text(original_row[col])
-                        !== get_cell_comparison_text(modified_row[col])
-                    ) {
-                        const original_cell = original_row[col];
-                        const base = get_raw_cell_text(original_cell?.raw ?? null);
-                        changed_cells.push({
-                            row: position,
-                            col,
-                            base,
-                            formattedBase: original_cell?.formatted ?? base,
-                        });
-                    }
+                    const equal = cells_exactly_equal(
+                        original_row[col],
+                        modified_row[col],
+                        is_cancelled,
+                    );
+                    if (typeof equal === 'boolean' ? equal : await equal) continue;
+                    const original_cell = original_row[col];
+                    const base = get_raw_cell_text(original_cell?.raw ?? null);
+                    changed_cells.push({
+                        row: position,
+                        col,
+                        base,
+                        formattedBase: original_cell?.formatted ?? base,
+                    });
                 }
-            });
+            }
         }
         return { startRow: 0, rowStatus: row_status, changedCells: changed_cells };
     }
@@ -921,6 +941,7 @@ export class CompareDataSource implements DataSource {
     }
 
     close(): void {
+        this.diff_cache.clear();
         try {
             this.modified.close();
         } finally {

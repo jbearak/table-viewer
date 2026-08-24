@@ -1,10 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import { CompareDataSource, align_workbook } from '../diff-compare/compare-session';
-import type { DataSource, RenderedCell, WorkbookMeta } from '../data-source/interface';
+import {
+    DEFERRED_COMPARISON_IDENTITY,
+    type DataSource,
+    type RenderedCell,
+    type WorkbookMeta,
+} from '../data-source/interface';
 import { FixtureSource } from './helpers/fixture-source';
 
 /** Serves cells verbatim, unlike FixtureSource's string rows, so a test can
- *  give a cell the `comparisonKey` a Stata binary strL carries. */
+ *  give a cell the deferred identity a Stata binary strL carries. */
 class StubSource implements DataSource {
     constructor(private readonly rows: RenderedCell[][]) {}
 
@@ -70,7 +75,7 @@ describe('CompareDataSource', () => {
         expect(source.meta().sheets[0].rowCount).toBe(2);
     });
 
-    it('diffs a matched sheet cell by cell, and a one-sided one as a whole band', () => {
+    it('diffs a matched sheet cell by cell, and a one-sided one as a whole band', async () => {
         const source = new CompareDataSource(
             new FixtureSource([
                 { name: 'Kept', rows: [['x']] },
@@ -78,55 +83,65 @@ describe('CompareDataSource', () => {
             ]),
             new FixtureSource([{ name: 'Kept', rows: [['z']] }]),
         );
-        const kept = diff_page(source, 0, 10);
+        const kept = await diff_page(source, 0, 10);
         expect(kept?.changedCells).toEqual([
             { row: 0, col: 0, base: 'z', formattedBase: 'z' },
         ]);
         // There is no original to compare the added sheet against, so it has no
         // cell-level diff — but it is still all added, and saying nothing left
         // it painted as unchanged.
-        expect(diff_page(source, 1, 10)).toMatchObject({
+        expect(await diff_page(source, 1, 10)).toMatchObject({
             rowStatus: ['added'], changedCells: [],
         });
     });
 
     // A Stata binary strL renders a bounded preview, so two different payloads
-    // can share `raw`. Comparison has to use the lossless `comparisonKey`, but
+    // can share `raw`. Comparison has to resolve the lossless identity, but
     // `base` is shown to the user and must stay the readable preview — never
     // the digest, and never an internal `raw:`/`comparison:` tag.
-    it('compares on identity but reports the display text as the base', () => {
+    it('compares on identity but reports the display text as the base', async () => {
         const preview = 'binary (33 bytes): 0102030405…';
-        const binary = (digest: string): RenderedCell => ({
-            raw: preview,
-            formatted: preview,
-            bold: false,
-            italic: false,
-            rawType: 'string',
-            comparisonKey: `stata-binary:sha256:${digest}:33`,
-        });
+        const binary = (digest: string): RenderedCell => {
+            const rendered: RenderedCell = {
+                raw: preview,
+                formatted: preview,
+                bold: false,
+                italic: false,
+                rawType: 'string',
+            };
+            Object.defineProperty(rendered, DEFERRED_COMPARISON_IDENTITY, {
+                value: {
+                    cachedKey: () => undefined,
+                    resolveKey: async () => `stata-binary:sha256:${digest}:33`,
+                },
+            });
+            return rendered;
+        };
         const source = new CompareDataSource(
             new StubSource([[binary('bbbb')]]),
             new StubSource([[binary('aaaa')]]),
         );
-        // Same preview, different payloads: caught only via comparisonKey. Both
-        // user-facing bases stay on the preview; the digest must never cross the
-        // compare protocol into paint text.
-        expect(source.diff_rows(0, [0])?.changedCells).toEqual([{
+        // Same preview, different payloads: caught only via deferred identity.
+        // Both user-facing bases stay on the preview; the digest must never cross
+        // the compare protocol into paint text.
+        const diff = await source.diff_rows(0, [0]);
+        expect(diff?.changedCells).toEqual([{
             row: 0,
             col: 0,
             base: preview,
             formattedBase: preview,
         }]);
+        expect(JSON.stringify(diff)).not.toContain('stata-binary:sha256:');
 
         // Identical payloads must stay unchanged rather than diffing on the tag.
         const unchanged = new CompareDataSource(
             new StubSource([[binary('aaaa')]]),
             new StubSource([[binary('aaaa')]]),
         );
-        expect(unchanged.diff_rows(0, [0])?.changedCells).toEqual([]);
+        expect((await unchanged.diff_rows(0, [0]))?.changedCells).toEqual([]);
     });
 
-    it('keeps Stata value-label text separate from the raw compare base', () => {
+    it('keeps Stata value-label text separate from the raw compare base', async () => {
         const labeled = (raw: string, formatted: string): RenderedCell => ({
             raw,
             formatted,
@@ -139,7 +154,7 @@ describe('CompareDataSource', () => {
             new StubSource([[labeled('1', 'Yes')]]),
         );
 
-        expect(source.diff_rows(0, [0])?.changedCells).toEqual([{
+        expect((await source.diff_rows(0, [0]))?.changedCells).toEqual([{
             row: 0,
             col: 0,
             base: '1',
@@ -171,7 +186,7 @@ describe('CompareDataSource', () => {
         expect(original.closed).toBe(true);
     });
 
-    it('exposes deleted sheets as navigable read-only all-deleted bands', () => {
+    it('exposes deleted sheets as navigable read-only all-deleted bands', async () => {
         const source = new CompareDataSource(
             new FixtureSource([{ name: 'Kept', rows: [['x']] }]),
             new FixtureSource([
@@ -189,10 +204,11 @@ describe('CompareDataSource', () => {
         const window = source.read_rows(1, 0, 10);
         expect(window.rows.map((row) => row[0]?.raw)).toEqual(['g1', 'g2']);
         expect(source.read_rows_indexed(1, [1]).rows[0][0]?.raw).toBe('g2');
-        expect(source.diff_rows(1, [0, 1])?.rowStatus).toEqual(['deleted', 'deleted']);
+        expect((await source.diff_rows(1, [0, 1]))?.rowStatus)
+            .toEqual(['deleted', 'deleted']);
     });
 
-    it('bands an added sheet the way it bands a deleted one', () => {
+    it('bands an added sheet the way it bands a deleted one', async () => {
         // An added sheet has no original to align against, so it has no
         // alignment — and used to fall through to no diff at all, leaving a
         // wholly new sheet painted as ordinary unchanged rows while its tab
@@ -205,26 +221,27 @@ describe('CompareDataSource', () => {
             new FixtureSource([{ name: 'Kept', rows: [['x']] }]),
         );
         expect(source.sheetStatuses).toEqual(['matched', 'added']);
-        expect(source.diff_rows(1, [0, 1])?.rowStatus).toEqual(['added', 'added']);
+        expect((await source.diff_rows(1, [0, 1]))?.rowStatus)
+            .toEqual(['added', 'added']);
         // And the filter already kept them, which is what made the gap visible:
         // "only changed rows" showed every row of the sheet, unbanded.
         expect(source.changed_grid_rows(1)).toEqual([0, 1]);
     });
 
-    it('serves repeated diff_rows requests from the cache', () => {
+    it('serves repeated diff_rows requests from the cache', async () => {
         const original = new FixtureSource([{ name: 'Sheet1', rows: [['a']] }]);
         const source = new CompareDataSource(
             new FixtureSource([{ name: 'Sheet1', rows: [['b']] }]),
             original,
         );
-        const first = source.diff_rows(0, [0]);
+        const first = await source.diff_rows(0, [0]);
         let reads = 0;
         const read_rows = original.read_rows.bind(original);
         original.read_rows = (...read_args) => {
             reads += 1;
             return read_rows(...read_args);
         };
-        expect(source.diff_rows(0, [0])).toBe(first);
+        expect(await source.diff_rows(0, [0])).toBe(first);
         expect(reads).toBe(0);
     });
 
@@ -356,7 +373,7 @@ describe('CompareDataSource with a content alignment', () => {
             [['a'], ['NEW'], ['b'], ['c']],
         );
         expect(source.meta().sheets[0].rowCount).toBe(4);
-        const diff = diff_page(source, 0, 10);
+        const diff = await diff_page(source, 0, 10);
         expect(diff?.rowStatus).toEqual(['same', 'added', 'same', 'same']);
         expect(diff?.changedCells).toEqual([]);
     });
@@ -368,13 +385,13 @@ describe('CompareDataSource with a content alignment', () => {
         );
         const window = source.read_rows(0, 0, 10);
         expect(window.rows.map((row) => row[0]?.raw)).toEqual(['a', 'GONE', 'b']);
-        expect(diff_page(source, 0, 10)?.rowStatus)
+        expect((await diff_page(source, 0, 10))?.rowStatus)
             .toEqual(['same', 'deleted', 'same']);
     });
 
     it('still reports a genuine in-place edit as a changed cell', async () => {
         const source = await aligned([['a', 'x']], [['a', 'y']]);
-        const diff = diff_page(source, 0, 10);
+        const diff = await diff_page(source, 0, 10);
         expect(diff?.rowStatus).toEqual(['same']);
         expect(diff?.changedCells).toEqual([
             { row: 0, col: 1, base: 'x', formattedBase: 'x' },
@@ -394,7 +411,7 @@ describe('CompareDataSource with a content alignment', () => {
             [['Al', 'Eng', '10'], ['Bo', 'Ops', '20'], ['Cy', 'Fin', '30']],
             [['Al', 'Eng', '10'], ['Cy', 'Fin', '30'], ['Bo', 'Ops', '99']],
         );
-        const diff = diff_page(source, 0, 10);
+        const diff = await diff_page(source, 0, 10);
         // Only Bo is 'moved'. Cy also shifted up a row, but Myers paired it as
         // part of the longest common subsequence, so it was never one-sided and
         // never reached the move pass. 'moved' means "re-paired across a move",
@@ -504,7 +521,8 @@ describe('CompareDataSource with a content alignment', () => {
         );
         expect(source.degraded).toBe(true);
         // Positional fallback: three rows, all changed, none added or deleted.
-        expect(diff_page(source, 0, 10)?.rowStatus).toEqual(['same', 'same', 'same']);
+        expect((await diff_page(source, 0, 10))?.rowStatus)
+            .toEqual(['same', 'same', 'same']);
     });
     it('withholds the first-row-header capability from every grid sheet', async () => {
         // The wrapper is deliberately not an ExcelHeaderDataSource, so the

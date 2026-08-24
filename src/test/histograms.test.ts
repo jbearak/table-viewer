@@ -1,14 +1,39 @@
 import { describe, expect, it, vi } from 'vitest';
-import type {
-    ColumnFilterMetadata,
-    ColumnWindow,
-    DataSource,
-    RowWindow,
-    WorkbookMeta,
+import {
+    DEFERRED_FILTER_IDENTITY,
+    type ColumnFilterMetadata,
+    type ColumnWindow,
+    type DataSource,
+    type RawCell,
+    type RawColumnWindow,
+    type RowWindow,
+    type WorkbookMeta,
 } from '../data-source/interface';
 import { compute_column_histogram } from '../histograms';
+import { FILTER_DISTINCT_VALUE_BYTE_LIMIT } from '../types';
 
-type HistogramCell = string | null | { raw: string; rawType?: 'string' | 'number' | 'boolean' | 'date' | 'empty' };
+type HistogramCell = string | null | (RawCell & { raw: string });
+
+function histogram_raw_cell(entry: HistogramCell): RawCell | null {
+    if (entry === null) return null;
+    return typeof entry === 'string' ? { raw: entry } : entry;
+}
+
+function deferred_histogram_cell(
+    raw: string,
+    raw_byte_length: number,
+    resolve_key: () => Promise<string>,
+): RawCell & { raw: string } {
+    const cell: RawCell & { raw: string } = {
+        raw,
+        rawType: 'number',
+        rawByteLength: raw_byte_length,
+    };
+    Object.defineProperty(cell, DEFERRED_FILTER_IDENTITY, {
+        value: { cachedKey: () => undefined, resolveKey: resolve_key },
+    });
+    return cell;
+}
 
 class HistogramSource implements DataSource {
     readonly selected_columns: number[][] = [];
@@ -56,6 +81,19 @@ class HistogramSource implements DataSource {
             return column_indices.map(() => cell);
         });
         return { startRow: start, rows };
+    }
+    read_raw_columns(
+        _sheet: number,
+        start: number,
+        count: number,
+        column_indices: readonly number[],
+    ): RawColumnWindow {
+        this.selected_columns.push([...column_indices]);
+        return {
+            startRow: start,
+            rows: this.values.slice(start, start + count).map((entry) =>
+                column_indices.map(() => histogram_raw_cell(entry))),
+        };
     }
     column_filter_metadata(): ColumnFilterMetadata | undefined {
         this.filter_metadata_requests += 1;
@@ -218,6 +256,48 @@ describe('compute_column_histogram', () => {
         // also skipped because there is no complete option list to label.
         expect(source.selected_columns).toEqual([[0], [0]]);
         expect(source.filter_metadata_requests).toBe(0);
+    });
+
+    it('checks raw byte budgets before identity and stops resolving after overflow', async () => {
+        const first = vi.fn(async () => 'identity:first');
+        const oversized = vi.fn(async () => 'identity:oversized');
+        const after_overflow = vi.fn(async () => 'identity:after');
+        const histogram = await compute_column_histogram(
+            new HistogramSource([
+                deferred_histogram_cell('1', 2, first),
+                deferred_histogram_cell(
+                    '2',
+                    FILTER_DISTINCT_VALUE_BYTE_LIMIT + 1,
+                    oversized,
+                ),
+                deferred_histogram_cell('3', 2, after_overflow),
+            ]),
+            0,
+            0,
+            () => false,
+        );
+
+        expect(histogram.columnKind).toBe('numeric');
+        expect(histogram.distinctValuesExceeded).toBe(true);
+        expect(histogram.distinctValues).toEqual([]);
+        expect(first).toHaveBeenCalledTimes(1);
+        expect(oversized).not.toHaveBeenCalled();
+        expect(after_overflow).not.toHaveBeenCalled();
+    });
+
+    it('keeps deferred durable identity separate from its raw preview', async () => {
+        const key = `stata-binary:sha256:${'a'.repeat(64)}:40`;
+        const cell = deferred_histogram_cell('binary (40 bytes): aa…', 40, async () => key);
+        cell.rawType = 'string';
+        await expect(compute_column_histogram(
+            new HistogramSource([cell]), 0, 0, () => false,
+        )).resolves.toMatchObject({
+            distinctValues: [{
+                value: key,
+                rawValue: 'binary (40 bytes): aa…',
+            }],
+            distinctValuesExceeded: false,
+        });
     });
 
     it('keeps a complete distinct list for text columns under the cap', async () => {
