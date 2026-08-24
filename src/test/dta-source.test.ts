@@ -723,6 +723,60 @@ describe('DtaDataSource', () => {
         expect(internals.decoded_value_label_tables.size).toBe(0);
     });
 
+    it('cancels value-label decoding closed during its cooperative yield', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture(4, false, {
+            statusLabels: Array.from({ length: 257 }, (_, index) => ({
+                value: index,
+                label: `Label ${index}`,
+            })),
+        }));
+        const internals = source as unknown as {
+            bytes?: Uint8Array;
+            unicode_decoder: TextDecoder;
+            decoded_value_label_tables: Map<string, unknown>;
+            decoded_value_label_cache_bytes: number;
+            missing_value_label_table_names: Set<string>;
+        };
+        const decode = vi.spyOn(internals.unicode_decoder, 'decode');
+
+        const reading = source.column_filter_metadata_async(0, 0, () => false);
+        expect(decode).toHaveBeenCalledTimes(257);
+        source.close();
+
+        await expect(reading).rejects.toMatchObject({ name: 'AbortError' });
+        expect(internals.bytes).toBeUndefined();
+        expect(internals.decoded_value_label_tables.size).toBe(0);
+        expect(internals.decoded_value_label_cache_bytes).toBe(0);
+        expect(internals.missing_value_label_table_names.size).toBe(0);
+    });
+
+    it('does not publish a missing value-label marker after close during table scanning', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture(4, false, {
+            extraValueLabelTables: Array.from({ length: 254 }, (_, index) => ({
+                name: `extra_${index}`,
+                entries: [],
+            })),
+        }));
+        const internals = source as unknown as {
+            metadata: { variables: Array<{ value_label_name: string }> };
+            unicode_decoder: TextDecoder;
+            decoded_value_label_tables: Map<string, unknown>;
+            decoded_value_label_cache_bytes: number;
+            missing_value_label_table_names: Set<string>;
+        };
+        internals.metadata.variables[0].value_label_name = 'absent_lbl';
+        const decode = vi.spyOn(internals.unicode_decoder, 'decode');
+
+        const reading = source.column_filter_metadata_async(0, 0, () => false);
+        expect(decode).toHaveBeenCalledTimes(256);
+        source.close();
+
+        await expect(reading).rejects.toMatchObject({ name: 'AbortError' });
+        expect(internals.decoded_value_label_tables.size).toBe(0);
+        expect(internals.decoded_value_label_cache_bytes).toBe(0);
+        expect(internals.missing_value_label_table_names.size).toBe(0);
+    });
+
     it('keeps binary strLs distinct from text and from other binary payloads', async () => {
         const binary = await DtaDataSource.create(
             build_release119_strl_fixture(Uint8Array.of(0x80), 129),
@@ -830,6 +884,30 @@ describe('DtaDataSource', () => {
         expect(internals.gso_digest_cache.size).toBe(1);
     });
 
+    it('does not publish a binary digest after close during chunked hashing', async () => {
+        const source = await DtaDataSource.create(
+            build_release119_strl_fixture(new Uint8Array(64).fill(0x58), 129),
+        );
+        const cell = source.read_raw_columns(0, 0, 1, [0]).rows[0][0]!;
+        const internals = source as unknown as {
+            binary_identity_chunk_bytes: number;
+            gso_digest_cache: Map<number, string>;
+            gso_digest_cache_bytes: number;
+            pending_binary_identities: Map<number, unknown>;
+        };
+        internals.binary_identity_chunk_bytes = 8;
+
+        const resolving = binary_comparison_identity(cell).resolveKey(() => false);
+        expect(internals.pending_binary_identities.size).toBe(1);
+        source.close();
+
+        await expect(resolving).rejects.toMatchObject({ name: 'AbortError' });
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(internals.gso_digest_cache.size).toBe(0);
+        expect(internals.gso_digest_cache_bytes).toBe(0);
+        expect(internals.pending_binary_identities.size).toBe(0);
+    });
+
     it('shares comparison and filter hashing while cancelling only one waiter', async () => {
         const source = await DtaDataSource.create(
             build_release119_strl_fixture(new Uint8Array(64).fill(0x6d), 129),
@@ -914,6 +992,44 @@ describe('DtaDataSource', () => {
         const right_key = await binary_comparison_identity(right_cell).resolveKey(() => false);
         expect(left_key).not.toBe(right_key);
     });
+
+    it.each(['left', 'right'] as const)(
+        'cancels direct binary equality when the %s source closes during a yield',
+        async (closed_side) => {
+            const payload = new Uint8Array(64).fill(0x39);
+            const left = await DtaDataSource.create(
+                build_release119_strl_fixture(payload, 129),
+            );
+            const right = await DtaDataSource.create(
+                build_release119_strl_fixture(payload, 129),
+            );
+            const left_cell = left.read_raw_columns(0, 0, 1, [0]).rows[0][0]!;
+            const right_cell = right.read_raw_columns(0, 0, 1, [0]).rows[0][0]!;
+            type EqualityInternals = {
+                bytes?: Uint8Array;
+                binary_identity_chunk_bytes: number;
+                gso_digest_cache: Map<number, string>;
+                pending_binary_identities: Map<number, unknown>;
+            };
+            const left_internals = left as unknown as EqualityInternals;
+            const right_internals = right as unknown as EqualityInternals;
+            left_internals.binary_identity_chunk_bytes = 8;
+            right_internals.binary_identity_chunk_bytes = 8;
+
+            const equal = cells_exactly_equal(left_cell, right_cell, () => false);
+            expect(typeof equal).not.toBe('boolean');
+            const closed = closed_side === 'left' ? left : right;
+            closed.close();
+
+            await expect(equal as Promise<boolean>)
+                .rejects.toMatchObject({ name: 'AbortError' });
+            expect((closed as unknown as EqualityInternals).bytes).toBeUndefined();
+            expect(left_internals.gso_digest_cache.size).toBe(0);
+            expect(right_internals.gso_digest_cache.size).toBe(0);
+            expect(left_internals.pending_binary_identities.size).toBe(0);
+            expect(right_internals.pending_binary_identities.size).toBe(0);
+        },
+    );
 
     it('does not rehash evicted binary identities while counting aligned changes', async () => {
         const originals = Array.from({ length: 6 }, (_, index) => {
@@ -1040,6 +1156,37 @@ describe('DtaDataSource', () => {
         expect(decode_spy).toHaveBeenCalledTimes(2);
         source.read_rows_indexed(0, [3, 0, 3]);
         expect(decode_spy).toHaveBeenCalledTimes(2);
+    });
+
+    it('cancels a GSO scan closed during its cooperative yield without resurrecting state', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture(300));
+        const internals = source as unknown as {
+            bytes?: Uint8Array;
+            gso_index: Map<string, unknown>;
+            gso_cache: Map<string, unknown>;
+            gso_cache_bytes: number;
+            gso_checkpoints: unknown[];
+            gso_entries_scanned: number;
+            gso_last_order?: unknown;
+            gso_start_position: number;
+            gso_scan_position: number;
+        };
+
+        const reading = source.read_raw_columns_async(0, 256, 1, [4], () => false);
+        expect(internals.gso_entries_scanned).toBe(256);
+        expect(internals.gso_index.size).toBe(256);
+        expect(internals.gso_checkpoints.length).toBeGreaterThan(0);
+        source.close();
+
+        await expect(reading).rejects.toMatchObject({ name: 'AbortError' });
+        expect(internals.bytes).toBeUndefined();
+        expect(internals.gso_index.size).toBe(0);
+        expect(internals.gso_cache.size).toBe(0);
+        expect(internals.gso_cache_bytes).toBe(0);
+        expect(internals.gso_checkpoints).toEqual([]);
+        expect(internals.gso_entries_scanned).toBe(0);
+        expect(internals.gso_last_order).toBeUndefined();
+        expect(internals.gso_scan_position).toBe(internals.gso_start_position);
     });
 
     it('finds an evicted GSO before scanning the unvisited tail', async () => {
@@ -1318,11 +1465,18 @@ describe('DtaDataSource', () => {
         expect(source.meta().sheets[0].rowCount).toBe(4);
     });
 
-    it('releases the file bytes on close', async () => {
+    it('releases the file bytes on idempotent close and rejects post-close entry points', async () => {
         const source = await DtaDataSource.create(build_dta_fixture());
+        source.close();
         source.close();
         expect((source as unknown as { bytes?: Uint8Array }).bytes).toBeUndefined();
         expect(() => source.read_rows(0, 0, 1)).toThrow(/closed/);
+        expect(() => source.read_raw_columns(0, 0, 0, [])).toThrow(/closed/);
+        expect(() => source.column_filter_metadata(0, 1)).toThrow(/closed/);
+        await expect(source.read_raw_columns_async(0, 0, 0, [], () => false))
+            .rejects.toThrow(/closed/);
+        await expect(source.column_filter_metadata_async(0, 1, () => false))
+            .rejects.toThrow(/closed/);
     });
 
     it('rejects section offsets that do not point at their declared tags', async () => {

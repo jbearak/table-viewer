@@ -190,8 +190,6 @@ interface CachedWindow {
 }
 
 interface CollectedStrlBatch {
-    readonly bytes: Uint8Array;
-    readonly view: DataView;
     readonly cells: StrlBatchCell[];
     readonly targets: Map<string, GsoBatchTarget>;
 }
@@ -228,6 +226,7 @@ export class DtaDataSource implements DataSource {
     private readonly data_start: number;
     private bytes?: Uint8Array;
     private view?: DataView;
+    private lifecycle_epoch = 0;
     private readonly pre_unicode_utf8_decoder = new TextDecoder('utf-8', { fatal: true });
     private readonly pre_unicode_fallback_decoder = new TextDecoder('windows-1252');
     private readonly unicode_decoder = new TextDecoder('utf-8');
@@ -329,6 +328,7 @@ export class DtaDataSource implements DataSource {
     }
 
     read_rows(sheet_index: number, start_row: number, count: number): RowWindow {
+        this.open_bytes();
         this.assert_sheet(sheet_index);
         const start = this.clamp_start(start_row);
         const end = Math.min(start + Math.max(0, count), this.metadata.nobs);
@@ -339,6 +339,7 @@ export class DtaDataSource implements DataSource {
     }
 
     read_rows_indexed(sheet_index: number, row_indices: ArrayLike<number>): IndexedRows {
+        this.open_bytes();
         this.assert_sheet(sheet_index);
         const requested = Array.from(row_indices);
         for (const row of requested) this.assert_row(row);
@@ -401,6 +402,7 @@ export class DtaDataSource implements DataSource {
         column_indices: readonly number[],
         is_cancelled: () => boolean,
     ): Promise<RawColumnWindow> {
+        const lifecycle_epoch = this.capture_lifecycle_epoch();
         this.assert_sheet(sheet_index);
         for (const column of column_indices) this.assert_column(column);
         const start = this.clamp_start(start_row);
@@ -418,8 +420,10 @@ export class DtaDataSource implements DataSource {
             start,
             end,
             columns,
+            lifecycle_epoch,
             is_cancelled,
         );
+        this.assert_async_active(lifecycle_epoch, is_cancelled);
         if (already_ordered) return { startRow: start, rows };
         const positions = new Map(columns.map((column, index) => [column, index]));
         return {
@@ -432,6 +436,7 @@ export class DtaDataSource implements DataSource {
         sheet_index: number,
         column_index: number,
     ): ColumnFilterMetadata | undefined {
+        this.open_bytes();
         this.assert_sheet(sheet_index);
         this.assert_column(column_index);
         const label_name = this.metadata.variables[column_index].value_label_name;
@@ -444,13 +449,19 @@ export class DtaDataSource implements DataSource {
         column_index: number,
         is_cancelled: () => boolean,
     ): Promise<ColumnFilterMetadata | undefined> {
+        const lifecycle_epoch = this.capture_lifecycle_epoch();
+        this.assert_lifecycle_epoch(lifecycle_epoch);
         this.assert_sheet(sheet_index);
         this.assert_column(column_index);
         const label_name = this.metadata.variables[column_index].value_label_name;
         if (!label_name) return undefined;
-        return filter_metadata_from_labels(
-            await this.value_labels_async(label_name, is_cancelled),
+        const labels = await this.value_labels_async(
+            label_name,
+            lifecycle_epoch,
+            is_cancelled,
         );
+        this.assert_async_active(lifecycle_epoch, is_cancelled);
+        return filter_metadata_from_labels(labels);
     }
 
     private read_column_projection<Cell>(
@@ -460,6 +471,7 @@ export class DtaDataSource implements DataSource {
         column_indices: readonly number[],
         read_range: (start: number, end: number, columns: readonly number[]) => (Cell | null)[][],
     ): { startRow: number; rows: (Cell | null)[][] } {
+        this.open_bytes();
         this.assert_sheet(sheet_index);
         for (const column of column_indices) this.assert_column(column);
         const start = this.clamp_start(start_row);
@@ -485,6 +497,8 @@ export class DtaDataSource implements DataSource {
     }
 
     close(): void {
+        if (this.bytes === undefined) return;
+        this.lifecycle_epoch += 1;
         this.windows.clear();
         this.window_cache_cells = 0;
         this.window_cache_bytes = 0;
@@ -503,6 +517,10 @@ export class DtaDataSource implements DataSource {
         }
         this.pending_binary_identities.clear();
         this.gso_checkpoints = [];
+        this.gso_checkpoint_stride = INITIAL_GSO_CHECKPOINT_STRIDE;
+        this.gso_entries_scanned = 0;
+        this.gso_last_order = undefined;
+        this.gso_scan_position = this.gso_start_position;
         this.gso_scan_exhausted = true;
         this.view = undefined;
         this.bytes = undefined;
@@ -580,18 +598,21 @@ export class DtaDataSource implements DataSource {
         start: number,
         end: number,
         columns: readonly number[],
+        lifecycle_epoch: number,
         is_cancelled: () => boolean,
     ): Promise<(RawCell | null)[][]> {
         const rows: (RawCell | null)[][] = [];
         for (let row = start; row < end;) {
-            if (is_cancelled()) throw source_abort_error();
+            this.assert_async_active(lifecycle_epoch, is_cancelled);
             const count = Math.min(DECODE_WINDOW_ROWS, end - row);
             const decoded = await this.resolve_columns_async(
                 this.decode_columns(row, count, columns),
                 row,
                 columns,
+                lifecycle_epoch,
                 is_cancelled,
             );
+            this.assert_async_active(lifecycle_epoch, is_cancelled);
             rows.push(...decoded.map((values) => values.map((cell) =>
                 this.canonicalize_stata_raw(cell),
             )));
@@ -712,7 +733,7 @@ export class DtaDataSource implements DataSource {
     ): ResolvedStataCell[][] {
         const batch = this.collect_strl_batch(start, rows.length, columns);
         if (batch.targets.size > 0) {
-            this.resolve_gso_batch(batch.bytes, batch.view, batch.targets);
+            this.resolve_gso_batch(this.open_bytes(), this.open_view(), batch.targets);
         }
         return this.materialize_resolved_columns(rows, start, columns, batch.cells);
     }
@@ -721,16 +742,18 @@ export class DtaDataSource implements DataSource {
         rows: Row[],
         start: number,
         columns: readonly number[],
+        lifecycle_epoch: number,
         is_cancelled: () => boolean,
     ): Promise<ResolvedStataCell[][]> {
+        this.assert_lifecycle_epoch(lifecycle_epoch);
         const batch = this.collect_strl_batch(start, rows.length, columns);
         if (batch.targets.size > 0) {
             await this.resolve_gso_batch_async(
-                batch.bytes,
-                batch.view,
                 batch.targets,
+                lifecycle_epoch,
                 is_cancelled,
             );
+            this.assert_async_active(lifecycle_epoch, is_cancelled);
         }
         return this.materialize_resolved_columns(rows, start, columns, batch.cells);
     }
@@ -832,7 +855,7 @@ export class DtaDataSource implements DataSource {
             target.value = cached;
             targets.delete(key);
         }
-        return { bytes, view, cells, targets };
+        return { cells, targets };
     }
 
     private resolve_gso_batch(
@@ -876,12 +899,11 @@ export class DtaDataSource implements DataSource {
     }
 
     private async resolve_gso_batch_async(
-        bytes: Uint8Array,
-        view: DataView,
         targets: Map<string, GsoBatchTarget>,
+        lifecycle_epoch: number,
         is_cancelled: () => boolean,
     ): Promise<void> {
-        if (is_cancelled()) throw source_abort_error();
+        this.assert_async_active(lifecycle_epoch, is_cancelled);
         let first: GsoBatchTarget | undefined;
         for (const target of targets.values()) {
             if (first === undefined || compare_gso_order(target, first) < 0) {
@@ -898,35 +920,59 @@ export class DtaDataSource implements DataSource {
         const section_end = this.metadata.section_offsets.value_labels;
         let scanned_since_yield = 0;
         while (position < section_end) {
+            this.assert_lifecycle_epoch(lifecycle_epoch);
             const historical = position < this.gso_scan_position;
-            const scanned = historical
-                ? this.read_gso_at(bytes, view, position)
-                : this.scan_next_gso(bytes, view);
-            if (scanned === null) break;
-            const target = targets.get(scanned.key);
-            if (target !== undefined) {
-                if (historical) this.cache_gso_entry(scanned.key, scanned.value);
-                target.value = this.decode_and_cache_gso(
-                    scanned.key,
-                    bytes,
-                    scanned.value,
-                );
-                targets.delete(scanned.key);
-                if (targets.size === 0) return;
-            }
+            const scanned = this.scan_gso_batch_entry(
+                position,
+                historical,
+                targets,
+                lifecycle_epoch,
+            );
+            if (scanned === null || targets.size === 0) return;
             position = scanned.nextPosition;
             scanned_since_yield += 1;
             if (scanned_since_yield >= GSO_SCAN_ENTRIES_PER_YIELD) {
                 scanned_since_yield = 0;
                 await yield_to_event_loop();
-                if (is_cancelled()) throw source_abort_error();
+                this.assert_async_active(lifecycle_epoch, is_cancelled);
             }
         }
     }
 
-    private scan_next_gso(bytes: Uint8Array, view: DataView): ScannedGso | null {
+    private scan_gso_batch_entry(
+        position: number,
+        historical: boolean,
+        targets: Map<string, GsoBatchTarget>,
+        lifecycle_epoch: number,
+    ): ScannedGso | null {
+        this.assert_lifecycle_epoch(lifecycle_epoch);
+        const bytes = this.open_bytes();
+        const view = this.open_view();
+        const scanned = historical
+            ? this.read_gso_at(bytes, view, position)
+            : this.scan_next_gso(bytes, view, lifecycle_epoch);
+        if (scanned === null) return null;
+        const target = targets.get(scanned.key);
+        if (target === undefined) return scanned;
+        this.assert_lifecycle_epoch(lifecycle_epoch);
+        if (historical) this.cache_gso_entry(scanned.key, scanned.value);
+        target.value = this.decode_and_cache_gso(
+            scanned.key,
+            bytes,
+            scanned.value,
+        );
+        targets.delete(scanned.key);
+        return scanned;
+    }
+
+    private scan_next_gso(
+        bytes: Uint8Array,
+        view: DataView,
+        lifecycle_epoch?: number,
+    ): ScannedGso | null {
         const position = this.gso_scan_position;
         const scanned = this.read_gso_at(bytes, view, position);
+        if (lifecycle_epoch !== undefined) this.assert_lifecycle_epoch(lifecycle_epoch);
         if (scanned === null) {
             this.gso_scan_exhausted = true;
             return null;
@@ -1161,7 +1207,13 @@ export class DtaDataSource implements DataSource {
         binary: BinaryGso,
         is_cancelled: () => boolean,
     ): Promise<string> {
-        if (is_cancelled()) return Promise.reject(source_abort_error());
+        let lifecycle_epoch: number;
+        try {
+            lifecycle_epoch = this.capture_lifecycle_epoch();
+            this.assert_async_active(lifecycle_epoch, is_cancelled);
+        } catch (error) {
+            return Promise.reject(error);
+        }
         const cached = this.cached_binary_comparison_key(binary);
         if (cached !== undefined) return Promise.resolve(cached);
 
@@ -1181,7 +1233,6 @@ export class DtaDataSource implements DataSource {
 
     private async run_binary_identity_job(job: PendingBinaryIdentity): Promise<void> {
         try {
-            const bytes = this.open_bytes();
             const hash = createHash('sha256');
             this.binary_digest_computations += 1;
             let hashed = 0;
@@ -1196,7 +1247,7 @@ export class DtaDataSource implements DataSource {
                     job.binary.contentLength - hashed,
                 );
                 const start = job.binary.contentOffset + hashed;
-                hash.update(bytes.subarray(start, start + count));
+                hash.update(this.open_bytes().subarray(start, start + count));
                 hashed += count;
                 if (hashed < job.binary.contentLength) await yield_to_event_loop();
             }
@@ -1228,6 +1279,8 @@ export class DtaDataSource implements DataSource {
         other_binary: BinaryGso,
         is_cancelled: () => boolean,
     ): boolean | Promise<boolean> {
+        const lifecycle_epoch = this.capture_lifecycle_epoch();
+        const other_lifecycle_epoch = other_source.capture_lifecycle_epoch();
         if (binary.contentLength !== other_binary.contentLength) return false;
         if (this === other_source && binary.contentOffset === other_binary.contentOffset) {
             return true;
@@ -1235,35 +1288,88 @@ export class DtaDataSource implements DataSource {
         const cached = this.cached_binary_comparison_key(binary);
         const other_cached = other_source.cached_binary_comparison_key(other_binary);
         if (cached !== undefined && other_cached !== undefined) return cached === other_cached;
-        return this.compare_binary_bytes(binary, other_source, other_binary, is_cancelled);
+        return this.compare_binary_bytes(
+            binary,
+            lifecycle_epoch,
+            other_source,
+            other_binary,
+            other_lifecycle_epoch,
+            is_cancelled,
+        );
     }
 
     private async compare_binary_bytes(
         binary: BinaryGso,
+        lifecycle_epoch: number,
         other_source: DtaDataSource,
         other_binary: BinaryGso,
+        other_lifecycle_epoch: number,
         is_cancelled: () => boolean,
     ): Promise<boolean> {
-        const bytes = this.open_bytes();
-        const other_bytes = other_source.open_bytes();
         const chunk_bytes = Math.max(1, Math.min(
             this.binary_identity_chunk_bytes,
             other_source.binary_identity_chunk_bytes,
         ));
         for (let compared = 0; compared < binary.contentLength;) {
-            if (is_cancelled()) throw source_abort_error();
+            this.assert_binary_comparison_active(
+                lifecycle_epoch,
+                other_source,
+                other_lifecycle_epoch,
+                is_cancelled,
+            );
             const count = Math.min(chunk_bytes, binary.contentLength - compared);
             const left_start = binary.contentOffset + compared;
             const right_start = other_binary.contentOffset + compared;
             if (Buffer.compare(
-                bytes.subarray(left_start, left_start + count),
-                other_bytes.subarray(right_start, right_start + count),
+                this.open_bytes().subarray(left_start, left_start + count),
+                other_source.open_bytes().subarray(right_start, right_start + count),
             ) !== 0) return false;
             compared += count;
             if (compared < binary.contentLength) await yield_to_event_loop();
         }
-        if (is_cancelled()) throw source_abort_error();
+        this.assert_binary_comparison_active(
+            lifecycle_epoch,
+            other_source,
+            other_lifecycle_epoch,
+            is_cancelled,
+        );
         return true;
+    }
+
+    private capture_lifecycle_epoch(): number {
+        this.open_bytes();
+        this.open_view();
+        return this.lifecycle_epoch;
+    }
+
+    private assert_lifecycle_epoch(lifecycle_epoch: number): void {
+        if (
+            lifecycle_epoch !== this.lifecycle_epoch
+            || this.bytes === undefined
+            || this.view === undefined
+        ) throw source_abort_error();
+    }
+
+    private assert_async_active(
+        lifecycle_epoch: number,
+        is_cancelled: () => boolean,
+    ): void {
+        this.assert_lifecycle_epoch(lifecycle_epoch);
+        if (is_cancelled()) throw source_abort_error();
+        this.assert_lifecycle_epoch(lifecycle_epoch);
+    }
+
+    private assert_binary_comparison_active(
+        lifecycle_epoch: number,
+        other_source: DtaDataSource,
+        other_lifecycle_epoch: number,
+        is_cancelled: () => boolean,
+    ): void {
+        this.assert_lifecycle_epoch(lifecycle_epoch);
+        other_source.assert_lifecycle_epoch(other_lifecycle_epoch);
+        if (is_cancelled()) throw source_abort_error();
+        this.assert_lifecycle_epoch(lifecycle_epoch);
+        other_source.assert_lifecycle_epoch(other_lifecycle_epoch);
     }
 
     private open_buffer(): ArrayBuffer {
@@ -1337,13 +1443,21 @@ export class DtaDataSource implements DataSource {
 
     private async value_labels_async(
         name: string,
+        lifecycle_epoch: number,
         is_cancelled: () => boolean,
     ): Promise<Map<number, string> | undefined> {
+        this.assert_lifecycle_epoch(lifecycle_epoch);
         const cached = this.cached_value_labels(name);
         if (cached !== undefined) return cached;
         if (this.missing_value_label_table_names.has(name)) return undefined;
+        const assert_lifecycle = () => this.assert_lifecycle_epoch(lifecycle_epoch);
+        const assert_active = () => this.assert_async_active(lifecycle_epoch, is_cancelled);
+        const open_buffer = () => {
+            assert_lifecycle();
+            return this.open_buffer();
+        };
         const table = await parse_value_label_table_async(
-            this.open_buffer(),
+            open_buffer,
             this.metadata,
             name,
             this.unicode_decoder,
@@ -1351,8 +1465,10 @@ export class DtaDataSource implements DataSource {
             this.pre_unicode_fallback_decoder,
             this.value_label_table_entry_limit,
             this.value_label_table_decoded_byte_limit,
-            is_cancelled,
+            assert_lifecycle,
+            assert_active,
         );
+        this.assert_async_active(lifecycle_epoch, is_cancelled);
         if (table === undefined) this.missing_value_label_table_names.add(name);
         else this.cache_value_label_table(name, table);
         return table?.labels;
@@ -1577,6 +1693,93 @@ interface ValueLabelTableEntry {
     readonly entryEnd: number;
 }
 
+interface ScannedValueLabelTable {
+    readonly entry: ValueLabelTableEntry;
+    readonly entryEndPosition: number;
+}
+
+function value_label_tables_start(metadata: DtaMetadata): number {
+    return metadata.section_offsets.value_labels
+        + (is_legacy_format(metadata.format_version) ? 0 : VALUE_LABELS_TAG_LENGTH);
+}
+
+function scan_value_label_table_at(
+    buffer: ArrayBuffer,
+    metadata: DtaMetadata,
+    position: number,
+    unicode_decoder: TextDecoder,
+    pre_unicode_utf8_decoder: TextDecoder,
+    pre_unicode_fallback_decoder: TextDecoder,
+): ScannedValueLabelTable | null {
+    const bytes = new Uint8Array(buffer);
+    const view = new DataView(buffer);
+    const little_endian = metadata.byte_order === 'LSF';
+    const legacy = is_legacy_format(metadata.format_version);
+    const name_width = metadata.format_version >= 118
+        ? UNICODE_LABEL_NAME_WIDTH
+        : LEGACY_LABEL_NAME_WIDTH;
+    const section_end = metadata.section_offsets.stata_data_close;
+    if (position >= section_end) return null;
+
+    let table_length: number;
+    if (legacy) {
+        if (position + 4 > section_end) return null;
+        table_length = view.getInt32(position, little_endian);
+        if (table_length <= 0) return null;
+        position += 4;
+    } else {
+        if (!matches_ascii(bytes, position, '<lbl>')) return null;
+        position += LBL_OPEN_TAG_LENGTH;
+        if (position + 4 > section_end) {
+            throw new Error('Corrupt value label table: truncated entry length');
+        }
+        table_length = view.getInt32(position, little_endian);
+        position += 4;
+        if (table_length < 0) {
+            throw new Error('Corrupt value label table: negative entry length');
+        }
+    }
+    const entry_end = position + table_length;
+    if (!Number.isSafeInteger(entry_end) || entry_end > section_end) {
+        throw new Error('Corrupt value label table: entry exceeds section bounds');
+    }
+    if (position + name_width + LABEL_PADDING_BYTES > entry_end) {
+        throw new Error('Corrupt value label table: truncated name');
+    }
+    const name = decode_value_label_text(
+        bytes,
+        position,
+        position + name_width,
+        metadata,
+        unicode_decoder,
+        pre_unicode_utf8_decoder,
+        pre_unicode_fallback_decoder,
+        true,
+    );
+    const payload_start = position + name_width + LABEL_PADDING_BYTES;
+    return {
+        entry: {
+            name,
+            tableLength: table_length,
+            payloadStart: payload_start,
+            entryEnd: entry_end,
+        },
+        entryEndPosition: entry_end,
+    };
+}
+
+function advance_value_label_table_position(
+    buffer: ArrayBuffer,
+    metadata: DtaMetadata,
+    entry_end_position: number,
+): number {
+    if (is_legacy_format(metadata.format_version)) return entry_end_position;
+    if (!matches_ascii(new Uint8Array(buffer), entry_end_position, '</lbl>')) {
+        throw new Error('Corrupt value label table: missing closing tag');
+    }
+    return entry_end_position + LBL_CLOSE_TAG_LENGTH;
+}
+
 /** Local until @jbearak/dta-parser exposes a single-table, declared-length-bounded
  * parser with a pre-Unicode decoder hook. Version 0.3.0 parses every table and
  * lets modern payload reads cross the current <lbl>'s declared boundary. */
@@ -1587,67 +1790,23 @@ function* scan_value_label_tables(
     pre_unicode_utf8_decoder: TextDecoder,
     pre_unicode_fallback_decoder: TextDecoder,
 ): Generator<ValueLabelTableEntry> {
-    const bytes = new Uint8Array(buffer);
-    const view = new DataView(buffer);
-    const little_endian = metadata.byte_order === 'LSF';
-    const legacy = is_legacy_format(metadata.format_version);
-    const name_width = metadata.format_version >= 118
-        ? UNICODE_LABEL_NAME_WIDTH
-        : LEGACY_LABEL_NAME_WIDTH;
-    const section_end = metadata.section_offsets.stata_data_close;
-    let position = metadata.section_offsets.value_labels
-        + (legacy ? 0 : VALUE_LABELS_TAG_LENGTH);
-
-    while (position < section_end) {
-        let table_length: number;
-        if (legacy) {
-            if (position + 4 > section_end) break;
-            table_length = view.getInt32(position, little_endian);
-            if (table_length <= 0) break;
-            position += 4;
-        } else {
-            if (!matches_ascii(bytes, position, '<lbl>')) break;
-            position += LBL_OPEN_TAG_LENGTH;
-            if (position + 4 > section_end) {
-                throw new Error('Corrupt value label table: truncated entry length');
-            }
-            table_length = view.getInt32(position, little_endian);
-            position += 4;
-            if (table_length < 0) {
-                throw new Error('Corrupt value label table: negative entry length');
-            }
-        }
-        const entry_end = position + table_length;
-        if (!Number.isSafeInteger(entry_end) || entry_end > section_end) {
-            throw new Error('Corrupt value label table: entry exceeds section bounds');
-        }
-        if (position + name_width + LABEL_PADDING_BYTES > entry_end) {
-            throw new Error('Corrupt value label table: truncated name');
-        }
-        const name = decode_value_label_text(
-            bytes,
-            position,
-            position + name_width,
+    let position = value_label_tables_start(metadata);
+    while (true) {
+        const scanned = scan_value_label_table_at(
+            buffer,
             metadata,
+            position,
             unicode_decoder,
             pre_unicode_utf8_decoder,
             pre_unicode_fallback_decoder,
-            true,
         );
-        const payload_start = position + name_width + LABEL_PADDING_BYTES;
-        yield {
-            name,
-            tableLength: table_length,
-            payloadStart: payload_start,
-            entryEnd: entry_end,
-        };
-        position = entry_end;
-        if (!legacy) {
-            if (!matches_ascii(bytes, position, '</lbl>')) {
-                throw new Error('Corrupt value label table: missing closing tag');
-            }
-            position += LBL_CLOSE_TAG_LENGTH;
-        }
+        if (scanned === null) return;
+        yield scanned.entry;
+        position = advance_value_label_table_position(
+            buffer,
+            metadata,
+            scanned.entryEndPosition,
+        );
     }
 }
 
@@ -1684,7 +1843,7 @@ function parse_value_label_table(
 }
 
 async function parse_value_label_table_async(
-    buffer: ArrayBuffer,
+    open_buffer: () => ArrayBuffer,
     metadata: DtaMetadata,
     wanted_name: string,
     unicode_decoder: TextDecoder,
@@ -1692,38 +1851,66 @@ async function parse_value_label_table_async(
     pre_unicode_fallback_decoder: TextDecoder,
     max_entry_count: number,
     max_decoded_bytes: number,
-    is_cancelled: () => boolean,
+    assert_lifecycle: () => void,
+    assert_active: () => void,
 ): Promise<DecodedValueLabelTable | undefined> {
+    let position = value_label_tables_start(metadata);
     let tables_scanned = 0;
-    for (const entry of scan_value_label_tables(
-        buffer,
-        metadata,
-        unicode_decoder,
-        pre_unicode_utf8_decoder,
-        pre_unicode_fallback_decoder,
-    )) {
-        if (is_cancelled()) throw source_abort_error();
-        if (entry.name === wanted_name) {
-            return decode_value_label_table_async(
-                buffer,
+    while (true) {
+        assert_active();
+        const scanned = scan_value_label_table_at(
+            open_buffer(),
+            metadata,
+            position,
+            unicode_decoder,
+            pre_unicode_utf8_decoder,
+            pre_unicode_fallback_decoder,
+        );
+        if (scanned === null) break;
+        if (scanned.entry.name === wanted_name) {
+            const table = await decode_value_label_table_async(
+                open_buffer,
                 metadata,
-                entry,
+                scanned.entry,
                 unicode_decoder,
                 pre_unicode_utf8_decoder,
                 pre_unicode_fallback_decoder,
                 max_entry_count,
                 max_decoded_bytes,
-                is_cancelled,
+                assert_lifecycle,
+                assert_active,
             );
+            assert_active();
+            return table;
         }
+        position = advance_value_label_table_position(
+            open_buffer(),
+            metadata,
+            scanned.entryEndPosition,
+        );
         tables_scanned += 1;
         if (tables_scanned >= VALUE_LABEL_ENTRIES_PER_YIELD) {
             tables_scanned = 0;
             await yield_to_event_loop();
+            assert_lifecycle();
         }
     }
-    if (is_cancelled()) throw source_abort_error();
+    assert_active();
     return undefined;
+}
+
+interface ValueLabelPayloadLayout {
+    readonly littleEndian: boolean;
+    readonly count: number;
+    readonly textLength: number;
+    readonly offsetsStart: number;
+    readonly valuesStart: number;
+    readonly textStart: number;
+}
+
+interface ValueLabelPayloadReader extends ValueLabelPayloadLayout {
+    readonly bytes: Uint8Array;
+    readonly view: DataView;
 }
 
 function value_label_payload_layout(
@@ -1731,23 +1918,13 @@ function value_label_payload_layout(
     metadata: DtaMetadata,
     entry: ValueLabelTableEntry,
     max_entry_count: number,
-): {
-    bytes: Uint8Array;
-    view: DataView;
-    littleEndian: boolean;
-    count: number;
-    textLength: number;
-    offsetsStart: number;
-    valuesStart: number;
-    textStart: number;
-} {
+): ValueLabelPayloadLayout {
     if (entry.tableLength > MAX_VALUE_LABEL_TABLE_BYTES) {
         throw new Error(
             `Value label table is too large to decode safely `
             + `(max ${MAX_VALUE_LABEL_TABLE_BYTES} bytes)`,
         );
     }
-    const bytes = new Uint8Array(buffer);
     const view = new DataView(buffer);
     const little_endian = metadata.byte_order === 'LSF';
     if (entry.payloadStart + 8 > entry.entryEnd) {
@@ -1772,14 +1949,23 @@ function value_label_payload_layout(
         throw new Error('Corrupt value label table: payload exceeds entry bounds');
     }
     return {
-        bytes,
-        view,
         littleEndian: little_endian,
         count,
         textLength: text_length,
         offsetsStart: offsets_start,
         valuesStart: values_start,
         textStart: text_start,
+    };
+}
+
+function value_label_payload_reader(
+    buffer: ArrayBuffer,
+    layout: ValueLabelPayloadLayout,
+): ValueLabelPayloadReader {
+    return {
+        ...layout,
+        bytes: new Uint8Array(buffer),
+        view: new DataView(buffer),
     };
 }
 
@@ -1811,12 +1997,13 @@ function decode_value_label_table(
     max_decoded_bytes: number,
 ): DecodedValueLabelTable {
     const layout = value_label_payload_layout(buffer, metadata, entry, max_entry_count);
+    const reader = value_label_payload_reader(buffer, layout);
     const state = create_value_label_decode_state();
     for (let index = 0; index < layout.count; index++) {
         add_value_label(
             state,
             metadata,
-            layout,
+            reader,
             index,
             unicode_decoder,
             pre_unicode_utf8_decoder,
@@ -1828,7 +2015,7 @@ function decode_value_label_table(
 }
 
 async function decode_value_label_table_async(
-    buffer: ArrayBuffer,
+    open_buffer: () => ArrayBuffer,
     metadata: DtaMetadata,
     entry: ValueLabelTableEntry,
     unicode_decoder: TextDecoder,
@@ -1836,34 +2023,49 @@ async function decode_value_label_table_async(
     pre_unicode_fallback_decoder: TextDecoder,
     max_entry_count: number,
     max_decoded_bytes: number,
-    is_cancelled: () => boolean,
+    assert_lifecycle: () => void,
+    assert_active: () => void,
 ): Promise<DecodedValueLabelTable> {
-    const layout = value_label_payload_layout(buffer, metadata, entry, max_entry_count);
+    assert_lifecycle();
+    const layout = value_label_payload_layout(
+        open_buffer(),
+        metadata,
+        entry,
+        max_entry_count,
+    );
     const state = create_value_label_decode_state();
-    for (let index = 0; index < layout.count; index++) {
-        add_value_label(
-            state,
-            metadata,
-            layout,
-            index,
-            unicode_decoder,
-            pre_unicode_utf8_decoder,
-            pre_unicode_fallback_decoder,
-            max_decoded_bytes,
-        );
-        if ((index + 1) % VALUE_LABEL_ENTRIES_PER_YIELD === 0) {
+    for (let index = 0; index < layout.count;) {
+        assert_lifecycle();
+        const chunk_start = index;
+        const end = Math.min(index + VALUE_LABEL_ENTRIES_PER_YIELD, layout.count);
+        {
+            const reader = value_label_payload_reader(open_buffer(), layout);
+            for (; index < end; index++) {
+                add_value_label(
+                    state,
+                    metadata,
+                    reader,
+                    index,
+                    unicode_decoder,
+                    pre_unicode_utf8_decoder,
+                    pre_unicode_fallback_decoder,
+                    max_decoded_bytes,
+                );
+            }
+        }
+        if (index - chunk_start === VALUE_LABEL_ENTRIES_PER_YIELD) {
             await yield_to_event_loop();
-            if (is_cancelled()) throw source_abort_error();
+            assert_active();
         }
     }
-    if (is_cancelled()) throw source_abort_error();
+    assert_active();
     return decoded_value_label_table(state);
 }
 
 function add_value_label(
     state: ValueLabelDecodeState,
     metadata: DtaMetadata,
-    layout: ReturnType<typeof value_label_payload_layout>,
+    layout: ValueLabelPayloadReader,
     index: number,
     unicode_decoder: TextDecoder,
     pre_unicode_utf8_decoder: TextDecoder,
