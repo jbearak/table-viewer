@@ -80,6 +80,52 @@ class IndexedRawFixtureSource extends RawFixtureSource {
     }
 }
 
+class NativeRawFixtureSource extends RawFixtureSource {
+    rangeReads = 0;
+    indexedReads = 0;
+
+    constructor(
+        rows: readonly (readonly (RawCell | null)[])[],
+        private readonly onRangeRead?: () => void,
+        private readonly onIndexedRead?: () => void,
+    ) {
+        super(rows);
+    }
+
+    async read_raw_columns_async(
+        _sheet_index: number,
+        start_row: number,
+        count: number,
+        column_indices: readonly number[],
+        _is_cancelled: () => boolean,
+    ) {
+        this.rangeReads += 1;
+        this.onRangeRead?.();
+        return {
+            startRow: start_row,
+            rows: Array.from({ length: count }, (_, offset) =>
+                column_indices.map(
+                    (column) => this.fixture_rows[start_row + offset]?.[column] ?? null,
+                )),
+        };
+    }
+
+    async read_raw_columns_indexed_async(
+        _sheet_index: number,
+        row_indices: ArrayLike<number>,
+        column_indices: readonly number[],
+        _is_cancelled: () => boolean,
+    ) {
+        this.indexedReads += 1;
+        this.onIndexedRead?.();
+        return {
+            rows: Array.from(row_indices, (row) => column_indices.map(
+                (column) => this.fixture_rows[row]?.[column] ?? null,
+            )),
+        };
+    }
+}
+
 class GatedIndexedRawFixtureSource extends IndexedRawFixtureSource {
     private call_count = 0;
     private release_gate!: () => void;
@@ -1137,6 +1183,71 @@ describe('align_sheet', () => {
         // Hashing reads each side in four batches. Any later read would mean the
         // full frontier search completed and positional change counting began.
         expect(reads).toEqual({ original: 4, modified: 4 });
+    });
+
+    it('yields while hashing one large eager string so cancellation can arrive', async () => {
+        const value = raw_cell('x'.repeat(600_000));
+        let cancelled = false;
+        let scheduled = false;
+        const original = new NativeRawFixtureSource([[value]], () => {
+            if (scheduled) return;
+            scheduled = true;
+            setImmediate(() => { cancelled = true; });
+        });
+        const modified = new NativeRawFixtureSource([[value]]);
+
+        await expect(align_sheet(original, modified, matched, {
+            isCancelled: () => cancelled,
+        })).rejects.toBeInstanceOf(AlignmentCancelledError);
+
+        expect(original.rangeReads).toBe(1);
+        expect(modified.rangeReads).toBe(0);
+    });
+
+    it('normalizes non-finite row checkpoint overrides to the built-in bound', async () => {
+        const rows = rows_of(...Array.from({ length: 9_000 }, (_, index) => `row-${index}`));
+        for (const rows_per_checkpoint of [Number.NaN, Number.POSITIVE_INFINITY]) {
+            let cancelled = false;
+            let scheduled = false;
+            const original = new Proxy(single(rows), {
+                get(target, property, receiver) {
+                    const value = Reflect.get(target, property, receiver);
+                    if (property !== 'read_rows' || typeof value !== 'function') return value;
+                    return (...args: unknown[]) => {
+                        if (!scheduled) {
+                            scheduled = true;
+                            setImmediate(() => { cancelled = true; });
+                        }
+                        return (value as (...values: unknown[]) => unknown).apply(target, args);
+                    };
+                },
+            });
+
+            await expect(align_sheet(original, single(rows), matched, {
+                rowsPerCheckpoint: rows_per_checkpoint,
+                isCancelled: () => cancelled,
+            })).rejects.toBeInstanceOf(AlignmentCancelledError);
+        }
+    });
+
+    it('yields while counting one very wide eager row', async () => {
+        const column_count = 131_073;
+        const wide_row = Array<RawCell>(column_count).fill(raw_cell('same'));
+        let cancelled = false;
+        let scheduled = false;
+        const original = new NativeRawFixtureSource([wide_row]);
+        const modified = new NativeRawFixtureSource([wide_row], undefined, () => {
+            if (scheduled) return;
+            scheduled = true;
+            setImmediate(() => { cancelled = true; });
+        });
+
+        await expect(align_sheet(original, modified, matched, {
+            isCancelled: () => cancelled,
+        })).rejects.toBeInstanceOf(AlignmentCancelledError);
+
+        expect(original.indexedReads).toBe(1);
+        expect(modified.indexedReads).toBe(1);
     });
 
     it('still aligns a large file whose changes are few', async () => {

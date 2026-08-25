@@ -186,7 +186,11 @@ The bounded Myers middle-snake search charges frontier diagonals and matched
 snake cells as work. It yields to a real event-loop turn and checks cancellation
 after every one million units of work, so the default distance cap cannot hide a
 roughly 100-million-iteration root search behind one synchronous turn while the
-host is trying to cancel it.
+host is trying to cancel it. Eager row hashing additionally charges both cells
+and UTF-16 code units, yielding after every 262,144 units, so one very large
+string cannot monopolize the event loop. Finite row checkpoint overrides are
+floored and clamped to at least one; non-finite values fall back to the built-in
+4,096-row bound instead of disabling cancellation checkpoints.
 
 ## Compare lifecycle and metadata contribution
 
@@ -202,7 +206,11 @@ raw batches, aligned indexed reads, and mixed-side asynchronous filter metadata.
 One-sided asynchronous operations still use the same lifecycle fence. Diff pages
 run deferred exact cell identities through four workers: independent comparisons
 overlap without unbounded promise fan-out, output order remains positional, and a
-failure cancels and settles its peers before the operation rejects.
+failure cancels and settles its peers before the operation rejects. Each worker
+also yields after 16,384 eager comparisons, bounding the four-worker aggregate to
+about 65,536 eager cells per event-loop turn. Exact post-alignment change counting
+uses the same 65,536-cell work bound across columns, so one unusually wide eager
+row remains cancellable.
 
 Filter metadata is merged by values that can actually appear in the compare
 grid. Nonempty added or unmatched modified sheets use modified metadata;
@@ -226,11 +234,12 @@ location cache bounds, shared GSO transitions, numeric and mixed-workload
 cancellation, monotonic descriptor discovery, verified missing-name
 publication, cancellable legacy probing, exact label and section boundaries,
 Windows-1252 versus true ISO-8859-1 behavior, the real FNV collision, sparse
-exact-move verification, bounded compatibility chunks, paired sibling settlement,
-lifecycle fencing, bounded deferred comparisons, empty-sheet suppression, and
-contribution-aware label merging. Asynchronous tests poll observable state with
-`vi.waitFor`; no fixed-delay or fixed-turn synchronization remains in the
-Stage 4 tests touched by this tranche.
+exact-move verification, bounded compatibility chunks, eager string and wide-row
+cancellation, non-finite checkpoint normalization, paired sibling settlement,
+lifecycle fencing, bounded eager and deferred comparisons, empty-sheet
+suppression, and contribution-aware label merging. Asynchronous tests poll
+observable state with `vi.waitFor`; no fixed-delay or fixed-turn synchronization
+remains in the Stage 4 tests touched by this tranche.
 
 Stage 5 removed the obsolete pre-118 fixed-string redecode and synchronous
 non-UTF-8 text-GSO decoder while retaining the objectively necessary bounded and

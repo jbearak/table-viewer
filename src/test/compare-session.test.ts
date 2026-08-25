@@ -416,6 +416,44 @@ describe('CompareDataSource', () => {
             })));
     });
 
+    it('yields across a large eager diff page so cancellation can arrive', async () => {
+        const column_count = 131_073;
+        const raw_row = Array<RawCell>(column_count).fill({ raw: 'same' });
+        let cancelled = false;
+        let scheduled = false;
+        const eager_source = (schedule_cancellation: boolean): DataSource => ({
+            meta: () => ({
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1', rowCount: 1, sourceRowCount: 1,
+                    columnCount: column_count, merges: [], hasFormatting: false,
+                }],
+            }),
+            read_rows: (_sheet, start_row) => ({ startRow: start_row, rows: [] }),
+            read_raw_columns_indexed_async: async (
+                _sheet,
+                row_indices,
+                _columns,
+                _is_cancelled,
+            ) => {
+                if (schedule_cancellation && !scheduled) {
+                    scheduled = true;
+                    setImmediate(() => { cancelled = true; });
+                }
+                return { rows: Array.from(row_indices, () => raw_row) };
+            },
+            close: () => {},
+        });
+        const source = new CompareDataSource(
+            eager_source(true),
+            eager_source(false),
+            new Map([[0, positional_alignment([0], 1)]]),
+        );
+
+        await expect(source.diff_rows(0, [0], () => cancelled))
+            .rejects.toMatchObject({ name: 'AbortError' });
+    });
+
     it('settles deferred comparison peers and preserves a substantive failure', async () => {
         const gates = Array.from({ length: 4 }, () => deferred<boolean>());
         const cancellation_checks: Array<() => boolean> = [];

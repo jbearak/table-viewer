@@ -152,6 +152,10 @@ async function alignment_source_pair<Original, Modified>(
 
 const DEFAULT_ROWS_PER_CHECKPOINT = 4096;
 const NEVER_CANCELLED = () => false;
+/** Eager hash cells/code units between real event-loop checkpoints. */
+const HASH_WORK_PER_CHECKPOINT = 262_144;
+/** Eager changed-cell comparisons between real event-loop checkpoints. */
+const CHANGE_CELLS_PER_CHECKPOINT = 65_536;
 /** Divide-and-conquer steps between cancellation checks in the Myers walk. */
 const MYERS_STEPS_PER_CHECKPOINT = 256;
 /** Frontier diagonals and snake cells between cancellation checkpoints. */
@@ -168,6 +172,13 @@ const MYERS_WORK_PER_CHECKPOINT = 1_000_000;
 function yield_to_event_loop(): Promise<void> {
     return new Promise((resolve) => { setTimeout(resolve, 0); });
 }
+
+function rows_per_checkpoint(requested: number | undefined): number {
+    return requested !== undefined && Number.isFinite(requested)
+        ? Math.max(1, Math.floor(requested))
+        : DEFAULT_ROWS_PER_CHECKPOINT;
+}
+
 /** Rows read from a side in one batched call while hashing. */
 const HASH_READ_BATCH = 512;
 /** Independent FNV offset bases tried when exact validation finds a selector
@@ -227,25 +238,31 @@ const MOVE_SCORES_PER_CHECKPOINT = 20_000;
 
 type ComparisonCell = RawCell | null | undefined;
 
-/** Visit comparison text synchronously until the first deferred identity, then
- * resume through promises without imposing a microtask on ordinary rows. */
+/** Visit comparison text synchronously until either materialization or the
+ * visitor itself defers, then resume without imposing a microtask on ordinary
+ * cells. */
 function visit_materialized_comparison_cells(
     cell_count: number,
     cell_at: (index: number) => ComparisonCell,
     is_cancelled: () => boolean,
-    visit: (text: string, index: number) => void,
+    visit: (text: string, index: number) => void | Promise<void>,
 ): void | Promise<void> {
+    const continue_after_visit = (
+        visited: void | Promise<void>,
+        next_index: number,
+    ): void | Promise<void> => visited === undefined
+        ? continue_at(next_index)
+        : Promise.resolve(visited).then(() => continue_at(next_index));
     const continue_at = (start: number): void | Promise<void> => {
         for (let index = start; index < cell_count; index++) {
             const text = materialize_cell_comparison_text(cell_at(index), is_cancelled);
             if (typeof text === 'string') {
-                visit(text, index);
-                continue;
+                const visited = visit(text, index);
+                if (visited === undefined) continue;
+                return Promise.resolve(visited).then(() => continue_at(index + 1));
             }
-            return text.then((resolved) => {
-                visit(resolved, index);
-                return continue_at(index + 1);
-            });
+            return text.then((resolved) =>
+                continue_after_visit(visit(resolved, index), index + 1));
         }
     };
     return continue_at(0);
@@ -274,11 +291,12 @@ function hash_row(
     seed: number,
 ): number | Promise<number> {
     let hash = seed;
+    let work_since_checkpoint = 0;
     const mix = (value: number) => {
         hash ^= value;
         hash = Math.imul(hash, 0x01000193);
     };
-    const mix_text = (tagged_text: string) => {
+    const mix_text = (tagged_text: string): void | Promise<void> => {
         const comparison_identity = tagged_text.startsWith('comparison:');
         const text_start = comparison_identity ? 'comparison:'.length : 'raw:'.length;
         const text_length = tagged_text.length - text_start;
@@ -286,9 +304,25 @@ function hash_row(
         // comparison identities in a disjoint namespace. Complementing the
         // identity length cannot collide with an ordinary nonnegative length.
         mix(comparison_identity ? ~text_length : text_length);
-        for (let position = text_start; position < tagged_text.length; position++) {
-            mix(tagged_text.charCodeAt(position));
-        }
+        work_since_checkpoint += 1;
+        const continue_at = (start: number): void | Promise<void> => {
+            let position = start;
+            while (
+                position < tagged_text.length
+                && work_since_checkpoint < HASH_WORK_PER_CHECKPOINT
+            ) {
+                mix(tagged_text.charCodeAt(position));
+                position += 1;
+                work_since_checkpoint += 1;
+            }
+            if (work_since_checkpoint < HASH_WORK_PER_CHECKPOINT) return;
+            work_since_checkpoint = 0;
+            return yield_to_event_loop().then(() => {
+                if (is_cancelled()) throw new AlignmentCancelledError();
+                return continue_at(position);
+            });
+        };
+        return continue_at(text_start);
     };
     mix(column_count);
     const materialized = visit_materialized_comparison_cells(
@@ -316,7 +350,7 @@ async function hash_side(
     options: AlignSheetOptions,
 ): Promise<Uint32Array> {
     const hashes = new Uint32Array(row_count);
-    const checkpoint = options.rowsPerCheckpoint ?? DEFAULT_ROWS_PER_CHECKPOINT;
+    const checkpoint = rows_per_checkpoint(options.rowsPerCheckpoint);
     const is_cancelled = options.isCancelled ?? NEVER_CANCELLED;
     let since_checkpoint = 0;
     for (let start = 0; start < row_count; start += HASH_READ_BATCH) {
@@ -973,9 +1007,10 @@ async function count_changes(
     let hash_collision = false;
     const changed_row_indices: number[] = [];
     const column_count = Math.max(original_sheet.columnCount, modified_sheet.columnCount);
-    const checkpoint = options.rowsPerCheckpoint ?? DEFAULT_ROWS_PER_CHECKPOINT;
+    const checkpoint = rows_per_checkpoint(options.rowsPerCheckpoint);
     const is_cancelled = options.isCancelled ?? NEVER_CANCELLED;
     let since_checkpoint = 0;
+    let cells_since_checkpoint = 0;
     let grid_row = 0;
     while (grid_row < rows.length) {
         const original_indices: number[] = [];
@@ -1029,6 +1064,12 @@ async function count_changes(
                     if (!exactly_equal) {
                         changed_cells++;
                         row_changed = true;
+                    }
+                    cells_since_checkpoint += 1;
+                    if (cells_since_checkpoint >= CHANGE_CELLS_PER_CHECKPOINT) {
+                        cells_since_checkpoint = 0;
+                        await yield_to_event_loop();
+                        if (is_cancelled()) throw new AlignmentCancelledError();
                     }
                 }
                 if (row_changed) {

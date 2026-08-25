@@ -80,6 +80,12 @@ interface FilterMetadataContributions {
 }
 
 const MAX_CONCURRENT_DEFERRED_CELL_COMPARISONS = 4;
+/** Four eager workers therefore compare at most about 65,536 cells per turn. */
+const DIFF_CELLS_PER_WORKER_CHECKPOINT = 16_384;
+
+function yield_to_compare_event_loop(): Promise<void> {
+    return new Promise((resolve) => { setTimeout(resolve, 0); });
+}
 
 interface PendingDiffCell {
     readonly order: number;
@@ -1136,6 +1142,7 @@ export class CompareDataSource implements DataSource {
         const worker_cancelled = () => peer_failed || is_cancelled();
         const worker = async (): Promise<PendingDiffCell[]> => {
             const changed: PendingDiffCell[] = [];
+            let cells_since_checkpoint = 0;
             try {
                 while (true) {
                     if (worker_cancelled()) throw compare_abort_error();
@@ -1154,7 +1161,14 @@ export class CompareDataSource implements DataSource {
                         modified_cell,
                         worker_cancelled,
                     );
-                    if (typeof equal === 'boolean' ? equal : await equal) continue;
+                    const exactly_equal = typeof equal === 'boolean' ? equal : await equal;
+                    cells_since_checkpoint += 1;
+                    if (cells_since_checkpoint >= DIFF_CELLS_PER_WORKER_CHECKPOINT) {
+                        cells_since_checkpoint = 0;
+                        await yield_to_compare_event_loop();
+                        if (worker_cancelled()) throw compare_abort_error();
+                    }
+                    if (exactly_equal) continue;
                     if (worker_cancelled()) throw compare_abort_error();
                     changed.push({
                         order,
