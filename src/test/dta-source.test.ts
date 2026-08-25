@@ -2190,6 +2190,51 @@ describe('DtaDataSource', () => {
         expect(internals.gso_index.size).toBeLessThanOrEqual(1_024);
     });
 
+    it.each(['synchronous', 'asynchronous'] as const)(
+        'caps %s cumulative historical GSO work after two forward-scan equivalents',
+        async (mode) => {
+            const object_count = 2_049;
+            const source = await DtaDataSource.create(build_dta_fixture(object_count));
+            source.read_rows(0, 0, object_count);
+            const internals = source as unknown as {
+                windows: Map<string, unknown>;
+                gso_index: Map<string, unknown>;
+                gso_cache: Map<string, unknown>;
+                gso_cache_bytes: number;
+                gso_forward_headers_scanned: number;
+                gso_historical_headers_scanned: number;
+                read_gso_at: (...args: unknown[]) => unknown;
+            };
+            internals.windows.clear();
+            internals.gso_index.clear();
+            internals.gso_cache.clear();
+            internals.gso_cache_bytes = 0;
+            const original_read_gso_at = internals.read_gso_at.bind(source);
+            let headers_read = 0;
+            internals.read_gso_at = (...args) => {
+                headers_read += 1;
+                return original_read_gso_at(...args);
+            };
+            const read = async (row: number) => mode === 'synchronous'
+                ? source.read_raw_columns(0, row, 1, [4])
+                : source.read_raw_columns_async(0, row, 1, [4], () => false);
+
+            await expect(read(2_048)).resolves.toMatchObject({
+                rows: [[expect.objectContaining({ raw: 'long value 2048' })]],
+            });
+            await expect(read(1_024)).resolves.toMatchObject({
+                rows: [[expect.objectContaining({ raw: 'long value 1024' })]],
+            });
+            await expect(read(0)).rejects.toThrow(
+                'Stata strL lookup exceeded the safe historical scan work limit',
+            );
+            expect(internals.gso_forward_headers_scanned).toBe(object_count);
+            expect(internals.gso_historical_headers_scanned).toBe(object_count * 2);
+            expect(headers_read).toBe(object_count * 2);
+            expect(internals.gso_index.size).toBeLessThanOrEqual(1_024);
+        },
+    );
+
     it('bounds unordered multi-strL lookup with an exact seen-id bitmap', async () => {
         const fixture = build_dta_fixture(1_100, true);
         reorder_release118_gso_prefix(fixture, [1, 0]);

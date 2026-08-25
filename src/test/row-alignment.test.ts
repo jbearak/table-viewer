@@ -68,6 +68,7 @@ class IndexedRawFixtureSource extends RawFixtureSource {
         _sheet_index: number,
         row_indices: ArrayLike<number>,
         column_indices: readonly number[],
+        _is_cancelled: () => boolean,
     ) {
         const requested = Array.from(row_indices);
         this.indexedReads.push(requested);
@@ -89,7 +90,9 @@ class GatedIndexedRawFixtureSource extends IndexedRawFixtureSource {
     readonly gateReached = new Promise<void>((resolve) => {
         this.reach_gate = resolve;
     });
+    private cancellation_check = () => false;
     reachedGate = false;
+    settledGateRead = false;
 
     constructor(
         rows: readonly (readonly (RawCell | null)[])[],
@@ -102,22 +105,44 @@ class GatedIndexedRawFixtureSource extends IndexedRawFixtureSource {
         sheet_index: number,
         row_indices: ArrayLike<number>,
         column_indices: readonly number[],
+        is_cancelled: () => boolean,
     ) {
         this.call_count += 1;
         if (this.call_count === this.gated_call) {
+            this.cancellation_check = is_cancelled;
             this.reachedGate = true;
             this.reach_gate();
             await this.gate;
+            this.settledGateRead = true;
+            if (is_cancelled()) throw new DOMException('cancelled', 'AbortError');
         }
         return super.read_raw_columns_indexed_async(
             sheet_index,
             row_indices,
             column_indices,
+            is_cancelled,
         );
+    }
+
+    observedCancellation(): boolean {
+        return this.cancellation_check();
     }
 
     release(): void {
         this.release_gate();
+    }
+}
+
+class FailingIndexedRawFixtureSource extends IndexedRawFixtureSource {
+    constructor(
+        rows: readonly (readonly (RawCell | null)[])[],
+        private readonly failure: unknown,
+    ) {
+        super(rows);
+    }
+
+    override async read_raw_columns_indexed_async(): Promise<never> {
+        throw this.failure;
     }
 }
 
@@ -136,6 +161,31 @@ async function paired_read_started_together(
     const result = await alignment;
     expect(both_started).toBe(true);
     return result;
+}
+
+async function paired_read_settles_after_failure(
+    original_rows: readonly (readonly (RawCell | null)[])[],
+    modified_rows: readonly (readonly (RawCell | null)[])[],
+): Promise<void> {
+    const failure = new Error('original indexed read failed');
+    const original = new FailingIndexedRawFixtureSource(original_rows, failure);
+    const modified = new GatedIndexedRawFixtureSource(modified_rows, 1);
+
+    const pending = align_sheet(original, modified, matched);
+    let settled = false;
+    void pending.finally(() => { settled = true; }).catch(() => {});
+    const rejection = expect(pending).rejects.toBe(failure);
+    await modified.gateReached;
+    await vi.waitFor(() => {
+        expect(modified.observedCancellation()).toBe(true);
+    });
+    expect(settled).toBe(false);
+    expect(modified.settledGateRead).toBe(false);
+
+    modified.release();
+    await rejection;
+    expect(settled).toBe(true);
+    expect(modified.settledGateRead).toBe(true);
 }
 
 function deferred_binary_cell(key: string, raw_byte_length: number): RawCell {
@@ -270,6 +320,54 @@ describe('align_sheet', () => {
         );
 
         expect(alignment).toMatchObject({ changedCells: 1, movedRowIndices: [2] });
+    });
+
+    it('settles a change-counting peer before preserving the substantive failure', async () => {
+        const rows = [[raw_cell('a')], [raw_cell('b')]];
+        await paired_read_settles_after_failure(rows, rows);
+    });
+
+    it('settles an exact-move peer before preserving the substantive failure', async () => {
+        const moved = [raw_cell('moved')];
+        const anchor = [raw_cell('anchor')];
+        await paired_read_settles_after_failure(
+            [moved, anchor],
+            [anchor, moved],
+        );
+    });
+
+    it('settles an inexact-scoring peer before preserving the substantive failure', async () => {
+        await paired_read_settles_after_failure(
+            [
+                [raw_cell('Al'), raw_cell('Eng'), raw_cell('10')],
+                [raw_cell('Bo'), raw_cell('Ops'), raw_cell('20')],
+                [raw_cell('Cy'), raw_cell('Fin'), raw_cell('30')],
+            ],
+            [
+                [raw_cell('Al'), raw_cell('Eng'), raw_cell('10')],
+                [raw_cell('Cy'), raw_cell('Fin'), raw_cell('30')],
+                [raw_cell('Bo'), raw_cell('Ops'), raw_cell('99')],
+            ],
+        );
+    });
+
+    it('maps an abort after settling its peer read', async () => {
+        const rows = [[raw_cell('a')], [raw_cell('b')]];
+        const original = new FailingIndexedRawFixtureSource(
+            rows,
+            new DOMException('cancelled', 'AbortError'),
+        );
+        const modified = new GatedIndexedRawFixtureSource(rows, 1);
+
+        const pending = align_sheet(original, modified, matched);
+        const rejection = expect(pending).rejects.toBeInstanceOf(AlignmentCancelledError);
+        await modified.gateReached;
+        await vi.waitFor(() => {
+            expect(modified.observedCancellation()).toBe(true);
+        });
+        modified.release();
+        await rejection;
+        expect(modified.settledGateRead).toBe(true);
     });
 
     it('pairs a moved row at its new position instead of a delete and an add', async () => {

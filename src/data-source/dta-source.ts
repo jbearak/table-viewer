@@ -46,6 +46,7 @@ const MAX_DECODED_CACHE_BYTES = 16 * 1024 * 1024;
 const MAX_GSO_CACHE_ENTRIES = 256;
 const MAX_GSO_CACHE_BYTES = 16 * 1024 * 1024;
 const MAX_GSO_INDEX_ENTRIES = 1_024;
+const MAX_GSO_HISTORICAL_SCAN_PASSES = 2;
 const MAX_GSO_DIGEST_CACHE_ENTRIES = 4_096;
 const MAX_GSO_DIGEST_CACHE_BYTES = 1024 * 1024;
 const BINARY_IDENTITY_CHUNK_BYTES = 256 * 1024;
@@ -386,6 +387,8 @@ export class DtaDataSource implements DataSource {
     private readonly gso_start_position: number;
     private gso_scan_position: number;
     private gso_historical_scan_position: number;
+    private gso_forward_headers_scanned = 0;
+    private gso_historical_headers_scanned = 0;
     private gso_scan_exhausted = false;
 
     private constructor(
@@ -947,6 +950,8 @@ export class DtaDataSource implements DataSource {
         this.gso_seen_identifiers = undefined;
         this.gso_scan_position = this.gso_start_position;
         this.gso_historical_scan_position = this.gso_start_position;
+        this.gso_forward_headers_scanned = 0;
+        this.gso_historical_headers_scanned = 0;
         this.gso_scan_exhausted = true;
         this.view = undefined;
         this.bytes = undefined;
@@ -1588,6 +1593,7 @@ export class DtaDataSource implements DataSource {
                 state.wrapped = true;
                 return { physicalWork: false };
             }
+            this.assert_historical_gso_scan_budget();
             const scanned = this.read_gso_at(
                 this.open_bytes(),
                 this.open_view(),
@@ -1597,6 +1603,7 @@ export class DtaDataSource implements DataSource {
                 state.phase = 'forward';
                 return { physicalWork: false };
             }
+            this.gso_historical_headers_scanned += 1;
             this.gso_historical_scan_position = scanned.nextPosition >= state.historicalEnd
                 ? this.gso_start_position
                 : scanned.nextPosition;
@@ -1633,6 +1640,16 @@ export class DtaDataSource implements DataSource {
             return { physicalWork: true };
         }
         return { physicalWork: false };
+    }
+
+    private assert_historical_gso_scan_budget(): void {
+        const limit = this.gso_forward_headers_scanned
+            * MAX_GSO_HISTORICAL_SCAN_PASSES;
+        if (this.gso_historical_headers_scanned < limit) return;
+        throw new Error(
+            `Stata strL lookup exceeded the safe historical scan work limit `
+            + `(${limit.toLocaleString()} headers)`,
+        );
     }
 
     private resolve_gso_batch(
@@ -1693,6 +1710,7 @@ export class DtaDataSource implements DataSource {
             return null;
         }
         this.remember_gso(scanned);
+        this.gso_forward_headers_scanned += 1;
         this.gso_scan_position = scanned.nextPosition;
         if (this.gso_scan_position >= gso_section_end(this.metadata)) {
             this.gso_scan_exhausted = true;

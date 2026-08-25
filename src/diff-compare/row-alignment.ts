@@ -108,14 +108,46 @@ async function alignment_source_read<T>(read: () => Promise<T>): Promise<T> {
     }
 }
 
-function alignment_source_pair<Original, Modified>(
-    read_original: () => Promise<Original>,
-    read_modified: () => Promise<Modified>,
+async function alignment_source_pair<Original, Modified>(
+    read_original: (is_cancelled: () => boolean) => Promise<Original>,
+    read_modified: (is_cancelled: () => boolean) => Promise<Modified>,
+    is_cancelled: () => boolean,
 ): Promise<[Original, Modified]> {
-    return Promise.all([
-        alignment_source_read(read_original),
-        alignment_source_read(read_modified),
+    let peer_failed = false;
+    const child_cancelled = () => peer_failed || is_cancelled();
+    const observe = async <Value>(promise: Promise<Value>): Promise<Value> => {
+        try {
+            return await promise;
+        } catch (error) {
+            peer_failed = true;
+            throw error;
+        }
+    };
+    // Invoke both operations before awaiting either one. Once one fails, its
+    // sibling sees cancellation, but the pair does not reject until both reads
+    // have settled — callers may close either source as soon as this returns.
+    const original_read = observe(alignment_source_read(
+        () => read_original(child_cancelled),
+    ));
+    const modified_read = observe(alignment_source_read(
+        () => read_modified(child_cancelled),
+    ));
+    const [original_result, modified_result] = await Promise.allSettled([
+        original_read,
+        modified_read,
     ]);
+    const failures = [original_result, modified_result].filter(
+        (result): result is PromiseRejectedResult => result.status === 'rejected',
+    );
+    const substantive = failures.find(
+        (failure) => !(failure.reason instanceof AlignmentCancelledError),
+    );
+    if (substantive !== undefined) throw substantive.reason;
+    if (failures.length > 0) throw failures[0].reason;
+    if (original_result.status !== 'fulfilled' || modified_result.status !== 'fulfilled') {
+        throw new AlignmentCancelledError();
+    }
+    return [original_result.value, modified_result.value];
 }
 
 const DEFAULT_ROWS_PER_CHECKPOINT = 4096;
@@ -926,18 +958,19 @@ async function count_changes(
 
         if (original_indices.length > 0) {
             const [original_result, modified_result] = await alignment_source_pair(
-                () => read_source_raw_rows_indexed_async(
+                (cancelled) => read_source_raw_rows_indexed_async(
                     original,
                     pairing.originalIndex,
                     original_indices,
-                    is_cancelled,
+                    cancelled,
                 ),
-                () => read_source_raw_rows_indexed_async(
+                (cancelled) => read_source_raw_rows_indexed_async(
                     modified,
                     pairing.modifiedIndex,
                     modified_indices,
-                    is_cancelled,
+                    cancelled,
                 ),
+                is_cancelled,
             );
             const original_batch = original_result.rows;
             const modified_batch = modified_result.rows;
@@ -1150,18 +1183,19 @@ async function verify_exact_move_candidates(
         if (options.isCancelled?.()) throw new AlignmentCancelledError();
         const batch = candidates.slice(start, start + HASH_READ_BATCH);
         const [original_result, modified_result] = await alignment_source_pair(
-            () => read_source_raw_rows_indexed_async(
+            (cancelled) => read_source_raw_rows_indexed_async(
                 original,
                 pairing.originalIndex,
                 batch.map((candidate) => candidate.originalRow),
-                is_cancelled,
+                cancelled,
             ),
-            () => read_source_raw_rows_indexed_async(
+            (cancelled) => read_source_raw_rows_indexed_async(
                 modified,
                 pairing.modifiedIndex,
                 batch.map((candidate) => candidate.modifiedRow),
-                is_cancelled,
+                cancelled,
             ),
+            is_cancelled,
         );
         const original_rows = original_result.rows;
         const modified_rows = modified_result.rows;
@@ -1381,28 +1415,29 @@ async function score_moves(
         modified.meta().sheets[pairing.modifiedIndex].columnCount,
     );
     const is_cancelled = options.isCancelled ?? NEVER_CANCELLED;
-    const [sources, destinations] = await Promise.all([
-        alignment_source_read(() => read_source_raw_rows_indexed_async(
+    const [sources, destinations] = await alignment_source_pair(
+        (cancelled) => read_source_raw_rows_indexed_async(
             original,
             pairing.originalIndex,
             unmatched_deleted.map((entry) => entry.row),
-            is_cancelled,
-        )).then((result) => normalize_candidates(
+            cancelled,
+        ).then((result) => normalize_candidates(
             result.rows,
             column_count,
-            is_cancelled,
+            cancelled,
         )),
-        alignment_source_read(() => read_source_raw_rows_indexed_async(
+        (cancelled) => read_source_raw_rows_indexed_async(
             modified,
             pairing.modifiedIndex,
             unmatched_added.map((entry) => entry.row),
-            is_cancelled,
-        )).then((result) => normalize_candidates(
+            cancelled,
+        ).then((result) => normalize_candidates(
             result.rows,
             column_count,
-            is_cancelled,
+            cancelled,
         )),
-    ]);
+        is_cancelled,
+    );
 
     const candidates: MoveCandidate[] = [];
     let scored = 0;
