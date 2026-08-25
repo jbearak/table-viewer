@@ -411,13 +411,15 @@ export async function read_source_rows_indexed_async(
     if (row_indices.length === 0) return { rows: [] };
     const result = source.read_rows_indexed_async
         ? await source.read_rows_indexed_async(sheet_index, row_indices, is_cancelled)
-        : {
-            rows: await read_adjacent_row_runs_async(
-                row_indices,
-                (start, count) => source.read_rows(sheet_index, start, count).rows,
-                is_cancelled,
-            ),
-        };
+        : source.read_rows_indexed
+            ? source.read_rows_indexed(sheet_index, row_indices)
+            : {
+                rows: await read_adjacent_row_runs_async(
+                    row_indices,
+                    (start, count) => source.read_rows(sheet_index, start, count).rows,
+                    is_cancelled,
+                ),
+            };
     if (is_cancelled()) throw new DOMException('Operation cancelled', 'AbortError');
     return result;
 }
@@ -643,6 +645,18 @@ export async function read_source_raw_rows_indexed_async(
     row_indices: ArrayLike<number>,
     is_cancelled: () => boolean,
 ): Promise<IndexedRawColumns> {
+    if (
+        !source.read_raw_columns_indexed_async
+        && !source.read_raw_columns_async
+        && !source.read_raw_columns
+    ) {
+        return read_source_rows_indexed_async(
+            source,
+            sheet_index,
+            row_indices,
+            is_cancelled,
+        );
+    }
     const sheet = source.meta().sheets[sheet_index];
     if (!sheet) throw new RangeError(`sheet index ${sheet_index} out of range`);
     return read_source_raw_columns_indexed_async(

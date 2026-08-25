@@ -224,6 +224,51 @@ describe('data-source interface shapes', () => {
         expect(fallback).not.toHaveBeenCalled();
     });
 
+    it('uses a bounded synchronous indexed reader before rendered range fallbacks', async () => {
+        let cancel_after_read = false;
+        let cancelled = false;
+        const native = vi.fn((_sheet: number, rows: ArrayLike<number>) => {
+            if (cancel_after_read) cancelled = true;
+            return {
+                rows: Array.from(rows, (row) => [{
+                    raw: String(row),
+                    formatted: `Row ${row}`,
+                    bold: false,
+                    italic: false,
+                }]),
+            };
+        });
+        const fallback = vi.fn(() => {
+            throw new Error('range fallback should not run');
+        });
+        const ds: DataSource = {
+            meta: () => ({
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1', rowCount: 8, sourceRowCount: 8,
+                    columnCount: 1, merges: [], hasFormatting: false,
+                }],
+            }),
+            read_rows: fallback,
+            read_rows_indexed: native,
+            close: () => {},
+        };
+
+        await expect(read_source_rows_indexed_async(ds, 0, [5, 1, 5], () => cancelled))
+            .resolves.toMatchObject({
+                rows: [
+                    [expect.objectContaining({ formatted: 'Row 5' })],
+                    [expect.objectContaining({ formatted: 'Row 1' })],
+                    [expect.objectContaining({ formatted: 'Row 5' })],
+                ],
+            });
+        cancel_after_read = true;
+        await expect(read_source_rows_indexed_async(ds, 0, [0], () => cancelled))
+            .rejects.toMatchObject({ name: 'AbortError' });
+        expect(native).toHaveBeenCalledTimes(2);
+        expect(fallback).not.toHaveBeenCalled();
+    });
+
     it('rejects a native rendered result cancelled before publication', async () => {
         let release!: () => void;
         const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -615,6 +660,62 @@ describe('data-source interface shapes', () => {
         await expect(read_source_raw_columns_indexed_async(
             ds, 0, [0], [0], () => cancelled,
         )).rejects.toMatchObject({ name: 'AbortError' });
+    });
+
+    it('uses a rendered indexed reader when no raw capability exists', async () => {
+        const is_cancelled = vi.fn(() => false);
+        const native = vi.fn(async (
+            _sheet: number,
+            rows: ArrayLike<number>,
+            received_cancel: () => boolean,
+        ) => {
+            expect(received_cancel).toBe(is_cancelled);
+            return {
+                rows: Array.from(rows, (row) => [{
+                    raw: `preview-${row}`,
+                    rawType: 'string' as const,
+                    comparisonKey: `comparison-${row}`,
+                    filterKey: `filter-${row}`,
+                    formatted: `Row ${row}`,
+                    bold: false,
+                    italic: false,
+                }]),
+            };
+        });
+        const fallback = vi.fn(() => {
+            throw new Error('range fallback should not run');
+        });
+        const ds: DataSource = {
+            meta: () => ({
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1', rowCount: 8, sourceRowCount: 8,
+                    columnCount: 1, merges: [], hasFormatting: false,
+                }],
+            }),
+            read_rows: fallback,
+            read_rows_indexed_async: native,
+            close: () => {},
+        };
+
+        await expect(read_source_raw_rows_indexed_async(
+            ds,
+            0,
+            [5, 1, 5],
+            is_cancelled,
+        )).resolves.toEqual({
+            rows: [
+                [expect.objectContaining({
+                    raw: 'preview-5',
+                    comparisonKey: 'comparison-5',
+                    filterKey: 'filter-5',
+                })],
+                [expect.objectContaining({ raw: 'preview-1' })],
+                [expect.objectContaining({ raw: 'preview-5' })],
+            ],
+        });
+        expect(native).toHaveBeenCalledWith(0, [5, 1, 5], is_cancelled);
+        expect(fallback).not.toHaveBeenCalled();
     });
 
     it('uses the indexed column adapter for all-column raw rows', async () => {

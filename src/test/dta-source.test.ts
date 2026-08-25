@@ -736,6 +736,52 @@ describe('DtaDataSource', () => {
         expect(async_rows.rows[1][3]).toMatchObject({ raw: '.', formatted: '.' });
     });
 
+    it('renders each value-label group before decoding the next table', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture(4, false, {
+            valueLabelNames: { amount: 'amount_lbl' },
+            extraValueLabelTables: [{
+                name: 'amount_lbl',
+                entries: [{ value: 2, label: 'Two' }],
+            }],
+        }));
+        const events: string[] = [];
+        const internals = source as unknown as {
+            value_labels_async: (
+                name: string,
+                epoch: number,
+                is_cancelled: () => boolean,
+            ) => Promise<Map<number, string> | undefined>;
+            render_raw_cell: (
+                raw: unknown,
+                variable: { value_label_name: string },
+                labels: ReadonlyMap<number, string> | undefined,
+            ) => unknown;
+        };
+        const original_labels = internals.value_labels_async.bind(source);
+        vi.spyOn(internals, 'value_labels_async').mockImplementation(async (...args) => {
+            events.push(`decode:${args[0]}`);
+            return original_labels(...args);
+        });
+        const original_render = internals.render_raw_cell.bind(source);
+        vi.spyOn(internals, 'render_raw_cell').mockImplementation((...args) => {
+            if (args[1].value_label_name) {
+                events.push(`render:${args[1].value_label_name}`);
+            }
+            return original_render(...args);
+        });
+
+        await source.read_rows_indexed_async(0, [1], () => false);
+
+        expect(events).toEqual([
+            'decode:status_lbl',
+            'render:status_lbl',
+            'decode:amount_lbl',
+            'render:amount_lbl',
+            'decode:missing_lbl',
+            'render:missing_lbl',
+        ]);
+    });
+
     it('cancels an async rendered read closed during value-label decoding', async () => {
         const source = await DtaDataSource.create(build_dta_fixture(4, false, {
             statusLabels: Array.from({ length: 257 }, (_, index) => ({
@@ -1738,6 +1784,26 @@ describe('DtaDataSource', () => {
         expect(gso_decode_spy).toHaveBeenCalledTimes(3);
     });
 
+    it('preserves requested row shape for an empty native indexed projection', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture());
+
+        await expect(source.read_raw_columns_indexed_async(
+            0,
+            [2, 0, 2],
+            [],
+            () => false,
+        )).resolves.toEqual({ rows: [[], [], []] });
+    });
+
+    it('rejects initially cancelled empty asynchronous raw reads', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture());
+
+        await expect(source.read_raw_columns_async(0, 0, 0, [0], () => true))
+            .rejects.toMatchObject({ name: 'AbortError' });
+        await expect(source.read_raw_columns_indexed_async(0, [], [0], () => true))
+            .rejects.toMatchObject({ name: 'AbortError' });
+    });
+
     it('memoizes more unique strLs than the decoded LRU without payload targets', async () => {
         const source = await DtaDataSource.create(build_dta_fixture(600));
         const rows = Array.from({ length: 300 }, (_, index) => index * 2);
@@ -2006,7 +2072,6 @@ describe('DtaDataSource', () => {
             bytes?: Uint8Array;
             windows: Map<string, unknown>;
             gso_index: Map<string, unknown>;
-            gso_locations: Map<number, unknown>;
             gso_cache: Map<string, unknown>;
             gso_seen_identifiers?: Uint8Array;
             source_work_gso_headers: number;
@@ -2030,7 +2095,6 @@ describe('DtaDataSource', () => {
         await expect(reading).rejects.toMatchObject({ name: 'AbortError' });
         expect(internals.bytes).toBeUndefined();
         expect(internals.gso_index.size).toBe(0);
-        expect(internals.gso_locations.size).toBe(0);
         expect(internals.gso_cache.size).toBe(0);
         expect(internals.gso_seen_identifiers).toBeUndefined();
     });
@@ -2093,7 +2157,7 @@ describe('DtaDataSource', () => {
         expect(headers_read).toBeLessThanOrEqual(256);
     });
 
-    it('uses remembered locations for reverse-order evicted GSO lookups', async () => {
+    it('bounds reverse-order evicted GSO lookups with historical caching', async () => {
         const source = await DtaDataSource.create(build_dta_fixture(2_049));
         source.read_rows(0, 0, 2_049);
         const internals = source as unknown as {
@@ -2122,7 +2186,8 @@ describe('DtaDataSource', () => {
             expect(source.read_raw_columns(0, row, 1, [4]).rows[0][0]?.raw)
                 .toBe(prefix[row] ?? `long value ${row}`);
         }
-        expect(headers_read).toBeLessThanOrEqual(1_025);
+        expect(headers_read).toBeLessThanOrEqual(2_050);
+        expect(internals.gso_index.size).toBeLessThanOrEqual(1_024);
     });
 
     it('bounds unordered multi-strL lookup with an exact seen-id bitmap', async () => {

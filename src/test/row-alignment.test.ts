@@ -79,6 +79,65 @@ class IndexedRawFixtureSource extends RawFixtureSource {
     }
 }
 
+class GatedIndexedRawFixtureSource extends IndexedRawFixtureSource {
+    private call_count = 0;
+    private release_gate!: () => void;
+    private readonly gate = new Promise<void>((resolve) => {
+        this.release_gate = resolve;
+    });
+    private reach_gate!: () => void;
+    readonly gateReached = new Promise<void>((resolve) => {
+        this.reach_gate = resolve;
+    });
+    reachedGate = false;
+
+    constructor(
+        rows: readonly (readonly (RawCell | null)[])[],
+        private readonly gated_call: number,
+    ) {
+        super(rows);
+    }
+
+    override async read_raw_columns_indexed_async(
+        sheet_index: number,
+        row_indices: ArrayLike<number>,
+        column_indices: readonly number[],
+    ) {
+        this.call_count += 1;
+        if (this.call_count === this.gated_call) {
+            this.reachedGate = true;
+            this.reach_gate();
+            await this.gate;
+        }
+        return super.read_raw_columns_indexed_async(
+            sheet_index,
+            row_indices,
+            column_indices,
+        );
+    }
+
+    release(): void {
+        this.release_gate();
+    }
+}
+
+async function paired_read_started_together(
+    original_rows: readonly (readonly (RawCell | null)[])[],
+    modified_rows: readonly (readonly (RawCell | null)[])[],
+    gated_call: number,
+): Promise<Awaited<ReturnType<typeof align_sheet>>> {
+    const original = new GatedIndexedRawFixtureSource(original_rows, gated_call);
+    const modified = new GatedIndexedRawFixtureSource(modified_rows, gated_call);
+    const alignment = align_sheet(original, modified, matched);
+    await original.gateReached;
+    const both_started = modified.reachedGate;
+    original.release();
+    modified.release();
+    const result = await alignment;
+    expect(both_started).toBe(true);
+    return result;
+}
+
 function deferred_binary_cell(key: string, raw_byte_length: number): RawCell {
     const identity: DeferredCellIdentity = {
         cachedKey: () => key,
@@ -172,6 +231,45 @@ describe('align_sheet', () => {
         expect(alignment).toMatchObject({
             addedRows: 0, deletedRows: 0, changedCells: 1,
         });
+    });
+
+    it('starts both sources together while counting paired-row changes', async () => {
+        const rows = [[raw_cell('a')], [raw_cell('b')]];
+
+        const alignment = await paired_read_started_together(rows, rows, 1);
+
+        expect(alignment.changedCells).toBe(0);
+    });
+
+    it('pairs exact-move verification reads across both sources', async () => {
+        const moved = [raw_cell('moved')];
+        const anchor = [raw_cell('anchor')];
+
+        const alignment = await paired_read_started_together(
+            [moved, anchor],
+            [anchor, moved],
+            1,
+        );
+
+        expect(alignment.movedRowIndices).toEqual([1]);
+    });
+
+    it('pairs inexact-move scoring reads across both sources', async () => {
+        const alignment = await paired_read_started_together(
+            [
+                [raw_cell('Al'), raw_cell('Eng'), raw_cell('10')],
+                [raw_cell('Bo'), raw_cell('Ops'), raw_cell('20')],
+                [raw_cell('Cy'), raw_cell('Fin'), raw_cell('30')],
+            ],
+            [
+                [raw_cell('Al'), raw_cell('Eng'), raw_cell('10')],
+                [raw_cell('Cy'), raw_cell('Fin'), raw_cell('30')],
+                [raw_cell('Bo'), raw_cell('Ops'), raw_cell('99')],
+            ],
+            1,
+        );
+
+        expect(alignment).toMatchObject({ changedCells: 1, movedRowIndices: [2] });
     });
 
     it('pairs a moved row at its new position instead of a delete and an add', async () => {

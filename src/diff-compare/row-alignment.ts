@@ -108,6 +108,16 @@ async function alignment_source_read<T>(read: () => Promise<T>): Promise<T> {
     }
 }
 
+function alignment_source_pair<Original, Modified>(
+    read_original: () => Promise<Original>,
+    read_modified: () => Promise<Modified>,
+): Promise<[Original, Modified]> {
+    return Promise.all([
+        alignment_source_read(read_original),
+        alignment_source_read(read_modified),
+    ]);
+}
+
 const DEFAULT_ROWS_PER_CHECKPOINT = 4096;
 const NEVER_CANCELLED = () => false;
 /** Divide-and-conquer steps between cancellation checks in the Myers walk. */
@@ -915,20 +925,22 @@ async function count_changes(
         }
 
         if (original_indices.length > 0) {
-            const original_batch = (await alignment_source_read(() =>
-                read_source_raw_rows_indexed_async(
+            const [original_result, modified_result] = await alignment_source_pair(
+                () => read_source_raw_rows_indexed_async(
                     original,
                     pairing.originalIndex,
                     original_indices,
                     is_cancelled,
-                ))).rows;
-            const modified_batch = (await alignment_source_read(() =>
-                read_source_raw_rows_indexed_async(
+                ),
+                () => read_source_raw_rows_indexed_async(
                     modified,
                     pairing.modifiedIndex,
                     modified_indices,
                     is_cancelled,
-                ))).rows;
+                ),
+            );
+            const original_batch = original_result.rows;
+            const modified_batch = modified_result.rows;
             for (let offset = 0; offset < original_indices.length; offset++) {
                 const original_row = original_batch[offset] ?? [];
                 const modified_row = modified_batch[offset] ?? [];
@@ -1137,20 +1149,22 @@ async function verify_exact_move_candidates(
     for (let start = 0; start < candidates.length; start += HASH_READ_BATCH) {
         if (options.isCancelled?.()) throw new AlignmentCancelledError();
         const batch = candidates.slice(start, start + HASH_READ_BATCH);
-        const original_rows = (await alignment_source_read(() =>
-            read_source_raw_rows_indexed_async(
+        const [original_result, modified_result] = await alignment_source_pair(
+            () => read_source_raw_rows_indexed_async(
                 original,
                 pairing.originalIndex,
                 batch.map((candidate) => candidate.originalRow),
                 is_cancelled,
-            ))).rows;
-        const modified_rows = (await alignment_source_read(() =>
-            read_source_raw_rows_indexed_async(
+            ),
+            () => read_source_raw_rows_indexed_async(
                 modified,
                 pairing.modifiedIndex,
                 batch.map((candidate) => candidate.modifiedRow),
                 is_cancelled,
-            ))).rows;
+            ),
+        );
+        const original_rows = original_result.rows;
+        const modified_rows = modified_result.rows;
         for (let offset = 0; offset < batch.length; offset++) {
             const original_row = original_rows[offset] ?? [];
             const modified_row = modified_rows[offset] ?? [];
@@ -1367,28 +1381,28 @@ async function score_moves(
         modified.meta().sheets[pairing.modifiedIndex].columnCount,
     );
     const is_cancelled = options.isCancelled ?? NEVER_CANCELLED;
-    const sources = await normalize_candidates(
-        (await alignment_source_read(() =>
-            read_source_raw_rows_indexed_async(
-                original,
-                pairing.originalIndex,
-                unmatched_deleted.map((entry) => entry.row),
-                is_cancelled,
-            ))).rows,
-        column_count,
-        is_cancelled,
-    );
-    const destinations = await normalize_candidates(
-        (await alignment_source_read(() =>
-            read_source_raw_rows_indexed_async(
-                modified,
-                pairing.modifiedIndex,
-                unmatched_added.map((entry) => entry.row),
-                is_cancelled,
-            ))).rows,
-        column_count,
-        is_cancelled,
-    );
+    const [sources, destinations] = await Promise.all([
+        alignment_source_read(() => read_source_raw_rows_indexed_async(
+            original,
+            pairing.originalIndex,
+            unmatched_deleted.map((entry) => entry.row),
+            is_cancelled,
+        )).then((result) => normalize_candidates(
+            result.rows,
+            column_count,
+            is_cancelled,
+        )),
+        alignment_source_read(() => read_source_raw_rows_indexed_async(
+            modified,
+            pairing.modifiedIndex,
+            unmatched_added.map((entry) => entry.row),
+            is_cancelled,
+        )).then((result) => normalize_candidates(
+            result.rows,
+            column_count,
+            is_cancelled,
+        )),
+    ]);
 
     const candidates: MoveCandidate[] = [];
     let scored = 0;
