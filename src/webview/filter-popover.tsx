@@ -133,11 +133,13 @@ export function FilterPopover({
         };
     }, [on_cancel]);
 
+    const value_search_ready =
+        draft.operator === 'isOneOf' && histogram.status === 'ready';
     useEffect(() => {
         (draft.operator === 'isOneOf'
             ? value_search_ref.current
             : first_value_ref.current ?? condition_ref.current)?.focus();
-    }, [draft.operator]);
+    }, [draft.operator, value_search_ready]);
 
     // Promote pristine Contains drafts once the histogram settles: numeric
     // columns get Between, columns with a complete value list get Is one of.

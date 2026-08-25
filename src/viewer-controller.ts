@@ -1341,6 +1341,27 @@ export function attach_viewer(
         }, receiver_epoch);
     }
 
+    function start_compare_diff(
+        msg: Extract<WebviewMessage, { type: 'requestRows' }>,
+        window: { startRow: number; sourceRows: number[] },
+        receiver_epoch: number,
+    ): void {
+        void post_compare_diff(msg, window, receiver_epoch).catch((error) => {
+            if (is_abort_error(error)) return;
+            try {
+                log_sanitized_failure(
+                    'Failed to finish a visible table page comparison',
+                    error,
+                );
+            } catch {
+                // This is the terminal containment boundary: VS Code does not
+                // observe promises returned from event listeners, and even a
+                // failing logger must not turn a row sidecar into an unhandled
+                // rejection.
+            }
+        });
+    }
+
     function flush_sheet_selections(): void {
         if (
             disposed
@@ -4431,7 +4452,7 @@ export function attach_viewer(
                     onInvalidRestore: cleanup_invalid_restore,
                     durablePendingEditKeys: durable_pending_edit_keys,
                     durableRowHeights: durable_row_heights,
-                    ...(compare_mode ? { onRowWindowServed: post_compare_diff } : {}),
+                    ...(compare_mode ? { onRowWindowServed: start_compare_diff } : {}),
                 },
                 (installed) => {
                     installed.begin_receiver_epoch(session.current_receiver_epoch);

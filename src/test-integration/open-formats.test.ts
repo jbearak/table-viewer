@@ -54,9 +54,7 @@ describe('open supported formats', () => {
             ['basic.xls', 'selector.XlS'],
             ['basic.csv', 'selector.CsV'],
             ['basic.tsv', 'selector.TsV'],
-            // Selector discovery is host-level, so borrowed fixture bytes are
-            // enough to verify the mixed-case .dta registration.
-            ['basic.csv', 'selector.DtA'],
+            ['all_types_v118.dta', 'selector.DtA'],
         ] as const;
 
         try {
@@ -67,6 +65,17 @@ describe('open supported formats', () => {
 
                 const opened = await wait_for(() => has_custom_tab('tableViewer.editor'));
                 assert.ok(opened, `expected Table Viewer to be discovered for ${target_name}`);
+                if (target_name === 'selector.DtA') {
+                    const loaded = await vscode.commands.executeCommand<boolean>(
+                        'tableViewer.openWorkbookAtSheet',
+                        { uri: target.toString(), sheetName: 'Sheet1' },
+                    );
+                    assert.strictEqual(
+                        loaded,
+                        true,
+                        'expected the mixed-case DTA fixture to finish loading',
+                    );
+                }
 
                 await close_all_editors();
                 const closed = await wait_for(

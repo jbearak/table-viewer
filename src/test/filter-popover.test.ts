@@ -1140,6 +1140,37 @@ describe('FilterPopover value checklist (isOneOf)', () => {
         expect(document.activeElement?.className).toBe('filter-value-search');
     });
 
+    it('focuses a saved isOneOf search when its values finish loading', async () => {
+        const props = {
+            column_index: 1,
+            column_name: 'Value',
+            filters: [{
+                id: 'f', colIndex: 1, operator: 'isOneOf' as const,
+                excludedValues: ['beta'],
+                caseSensitive: false, enabled: true,
+            }],
+            anchor: { left: 10, top: 10 },
+            on_apply: vi.fn(),
+            on_cancel: vi.fn(),
+            on_remove: vi.fn(),
+        };
+        container = document.createElement('div');
+        document.body.appendChild(container);
+        root = createRoot(container);
+        act(() => root!.render(React.createElement(FilterPopover, {
+            ...props,
+            histogram: { status: 'loading' },
+        })));
+        expect(document.querySelector('.filter-value-search')).toBeNull();
+
+        act(() => root!.render(React.createElement(FilterPopover, {
+            ...props,
+            histogram: TEXT_READY,
+        })));
+        await vi.waitFor(() => expect(document.activeElement)
+            .toBe(document.querySelector('.filter-value-search')));
+    });
+
     function remove_button(): HTMLButtonElement | null {
         return Array.from(
             document.querySelectorAll('.filter-popover-footer button'),
