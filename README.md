@@ -1,6 +1,6 @@
 # Table Viewer
 
-View and diff Excel, Stata, CSV, and TSV tables; edit XLSX, CSV, and TSV.
+Read, edit, and diff Excel, CSV, and TSV tables.
 
 ![Table Viewer comparing two recipe tables, with added, deleted, moved, and changed rows](docs/images/app-recipe-diff.png)
 
