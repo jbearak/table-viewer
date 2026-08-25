@@ -1060,6 +1060,11 @@ describe('CompareDataSource', () => {
 
     it('forwards the modified side row mapping for real rows', () => {
         const modified = new FixtureSource([{ name: 'Sheet1', rows: [['a'], ['b']] }]);
+        const modified_meta = modified.meta();
+        (modified as DataSource).meta = () => ({
+            ...modified_meta,
+            sheets: [{ ...modified_meta.sheets[0], sourceRowCount: 3 }],
+        });
         (modified as DataSource).source_row_indices = (_sheet, rows) =>
             Uint32Array.from(rows as number[], (row) => row + 1);
         (modified as DataSource).projected_row_index = (_sheet, source_row) =>
@@ -1070,6 +1075,18 @@ describe('CompareDataSource', () => {
         );
         expect([...source.source_row_indices(0, [0, 1])]).toEqual([1, 2]);
         expect(source.projected_row_index(0, 1)).toBe(0);
+    });
+
+    it('rejects a short modified-side row mapping before it can coerce to row zero', () => {
+        const modified = new FixtureSource([{ name: 'Sheet1', rows: [['a'], ['b']] }]);
+        (modified as DataSource).source_row_indices = () => Uint32Array.of(1);
+        const source = new CompareDataSource(
+            modified,
+            new FixtureSource([{ name: 'Sheet1', rows: [['a'], ['b']] }]),
+        );
+
+        expect(() => source.source_row_indices(0, [0, 1]))
+            .toThrow('source row mapping length does not match projected rows');
     });
 
     it('surfaces original-side truncation and warnings beside the modified side', () => {
@@ -1220,6 +1237,7 @@ describe('CompareDataSource with a content alignment', () => {
         const source = new CompareDataSource(
             modified, original, await align_workbook(modified, original));
         expect(source.meta().hasFormatting).toBe(true);
+        expect(source.meta().sheets[0].hasFormatting).toBe(true);
     });
 
     it('reports an inserted row as one addition, not a cascade of changed cells', async () => {
@@ -1333,6 +1351,93 @@ describe('CompareDataSource with a content alignment', () => {
         expect(cache.size).toBe(0);
     });
 
+    it('keeps deleted-row indexes lazy and uses the stored deletion count', () => {
+        const modified = new FixtureSource([{ name: 'S', rows: [] }]);
+        const original = new FixtureSource([{ name: 'S', rows: [['gone']] }]);
+        const rows = [{ original: 0, modified: ABSENT }];
+        const filter = vi.spyOn(rows, 'filter');
+        const alignment: SheetAlignment = {
+            rows,
+            addedRows: 0,
+            deletedRows: 1,
+            changedCells: 0,
+            changedRowIndices: [],
+            movedRowIndices: [],
+            moveSearchTruncated: false,
+            degraded: false,
+        };
+        const source = new CompareDataSource(
+            modified,
+            original,
+            new Map([[0, alignment]]),
+        );
+        const deleted = (source as unknown as {
+            deleted_grid_rows: Map<number, Uint32Array>;
+        }).deleted_grid_rows;
+
+        expect(source.meta().sheets[0].sourceRowCount).toBe(1);
+        expect(filter).not.toHaveBeenCalled();
+        expect(deleted.size).toBe(0);
+        expect([...source.source_row_indices(0, [0])]).toEqual([0]);
+        expect(deleted.size).toBe(1);
+    });
+
+    it('shares one byte-bounded LRU across derived row indexes', async () => {
+        const modified = new FixtureSource([
+            { name: 'A', rows: [['keep']] },
+            { name: 'B', rows: [['keep']] },
+        ]);
+        const original = new FixtureSource([
+            { name: 'A', rows: [['gone'], ['keep']] },
+            { name: 'B', rows: [['gone'], ['keep']] },
+        ]);
+        const source = new CompareDataSource(
+            modified,
+            original,
+            await align_workbook(modified, original),
+            16 * 1024 * 1024,
+            130,
+        );
+        const internals = source as unknown as {
+            deleted_grid_rows: Map<number, Uint32Array>;
+            grid_row_by_modified_cache: Map<number, Uint32Array>;
+            changed_grid_rows_cache: Map<number, readonly number[]>;
+            derived_row_index_lru: Map<number, unknown>;
+            derived_row_index_cache_bytes: number;
+        };
+
+        expect(source.projected_row_index(0, 0)).toBe(1);
+        expect(internals.grid_row_by_modified_cache.has(0)).toBe(true);
+        expect([...source.source_row_indices(1, [0, 1])]).toEqual([1, 0]);
+        expect(internals.grid_row_by_modified_cache.size).toBe(0);
+        expect(internals.deleted_grid_rows.has(1)).toBe(true);
+        expect(source.changed_grid_rows(0)).toEqual([0]);
+        expect(internals.deleted_grid_rows.size).toBe(0);
+        expect(internals.changed_grid_rows_cache.has(0)).toBe(true);
+        expect(internals.derived_row_index_lru.size).toBe(1);
+        expect(internals.derived_row_index_cache_bytes).toBeLessThanOrEqual(130);
+    });
+
+    it('returns oversized changed-row indexes without retaining them', async () => {
+        const modified = new FixtureSource([{ name: 'S', rows: [['keep']] }]);
+        const original = new FixtureSource([{ name: 'S', rows: [['gone'], ['keep']] }]);
+        const source = new CompareDataSource(
+            modified,
+            original,
+            await align_workbook(modified, original),
+            16 * 1024 * 1024,
+            127,
+        );
+        const cache = (source as unknown as {
+            changed_grid_rows_cache: Map<number, readonly number[]>;
+        }).changed_grid_rows_cache;
+
+        expect(source.changed_grid_rows(0)).toEqual([0]);
+        expect(cache.size).toBe(0);
+        expect(source.changed_grid_rows(0)).toEqual([0]);
+        expect(cache.size).toBe(0);
+    });
+
     it('totals changes across sheets, counting one-sided sheets whole', async () => {
         const modified = new FixtureSource([
             { name: 'Kept', rows: [['a'], ['CHANGED'], ['NEW']] },
@@ -1397,17 +1502,22 @@ describe('CompareDataSource with a content alignment', () => {
             [['a'], ['CHANGED']],
         );
         source.projected_row_index(0, 0);
+        source.source_row_indices(0, [0, 1, 2]);
         source.changed_grid_rows(0);
         const internals = source as unknown as {
             alignments: Map<number, SheetAlignment>;
             deleted_grid_rows: Map<number, Uint32Array>;
             grid_row_by_modified_cache: Map<number, Uint32Array>;
             changed_grid_rows_cache: Map<number, readonly number[]>;
+            derived_row_index_lru: Map<number, unknown>;
+            derived_row_index_cache_bytes: number;
         };
         expect(internals.alignments.size).toBe(1);
         expect(internals.deleted_grid_rows.size).toBe(1);
         expect(internals.grid_row_by_modified_cache.size).toBe(1);
         expect(internals.changed_grid_rows_cache.size).toBe(1);
+        expect(internals.derived_row_index_lru.size).toBe(3);
+        expect(internals.derived_row_index_cache_bytes).toBeGreaterThan(0);
 
         source.close();
 
@@ -1415,6 +1525,8 @@ describe('CompareDataSource with a content alignment', () => {
         expect(internals.deleted_grid_rows.size).toBe(0);
         expect(internals.grid_row_by_modified_cache.size).toBe(0);
         expect(internals.changed_grid_rows_cache.size).toBe(0);
+        expect(internals.derived_row_index_lru.size).toBe(0);
+        expect(internals.derived_row_index_cache_bytes).toBe(0);
     });
 
     it('flags a degraded alignment so the host can say the rows did not match', async () => {

@@ -56,14 +56,23 @@ Stata permits GSO records in `<strls>` to appear in arbitrary physical order.
 The source scans physical-file order and never infers a location from the
 `(variable, observation)` identifier.
 
-Long-lived source state remains bounded:
+Long-lived source state is explicitly bounded:
 
-- a 1,024-entry GSO location LRU;
+- a 1,024-entry physical `GsoEntry` LRU;
 - a 256-entry and 16 MiB decoded-GSO LRU;
-- forward and cyclic historical cursors plus exact scan-exhaustion state;
+- an exact compact location index, grouped into adaptive 256-identifier typed
+  array pages with five payload bytes per capacity slot;
 - an exact, lazily allocated seen-identifier bitmap compacted to `strL`
   variable ordinals; and
 - source lifecycle and cooperative scheduler state.
+
+The location index records every successfully forward-scanned GSO. Its dense
+identifier space is `nobs × strL-column-count`, which the workbook cell ceiling
+bounds to 50 million entries. Accounted typed-array payload is therefore at
+most 250,000,640 bytes; page metadata is bounded to 195,313 occupied pages. The
+seen-ID bitmap uses the same dense ordinals and adds at most 6,250,000 bytes,
+while preserving nonadjacent duplicate detection after a physical entry leaves
+the LRU.
 
 A request target contains only identifier fields and an optional physical
 `GsoEntry` location. It never retains decoded text or binary payloads. During
@@ -73,17 +82,12 @@ physical decode. This guarantees exactly-once decode within a sparse request
 even when the request has more unique `strL` values than the source LRU can
 retain. The memo is discarded before the public read returns.
 
-The exact seen-ID bitmap records identifiers in the successfully scanned
-physical prefix. Its dense `strL` ordinals bound it to
-`nobs × strL-column-count` bits rather than `nobs × nvar`, while preserving
-nonadjacent duplicate detection after a location leaves the LRU.
-
 ## One GSO transition machine
 
 Synchronous and asynchronous GSO drivers invoke the same physical transition
 function. Its phases are `cache`, `historical`, `forward`, and `done`.
-Historical lookup scans the already-validated prefix from a cyclic cursor and
-wraps at most once without advancing the source forward cursor. Unseen targets
+Historical lookup uses the exact compact index and reads one validated physical
+header per cold target instead of rescanning the visited prefix. Unseen targets
 continue the lazy shared forward scan. Both phases stop as soon as the request
 is resolved.
 
@@ -91,8 +95,8 @@ The asynchronous driver adds only scheduling and lifecycle behavior: it
 consumes bounded work, awaits the shared source gate, rechecks source epoch and
 caller cancellation, absorbs cache progress made by another read while
 suspended, and rebases if the shared forward cursor advanced. Exact duplicate
-rejection, unordered records, historical rescanning, and explicit exhaustion at
-the physical section end are shared with the synchronous driver.
+rejection, unordered records, indexed historical lookup, and explicit exhaustion
+at the physical section end are shared with the synchronous driver.
 
 For tagged releases, the GSO payload boundary is the start of exact
 `</strls>`, not the following `<value_labels>` offset. Header and content bounds

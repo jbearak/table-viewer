@@ -761,7 +761,7 @@ export async function align_sheet(
             );
         }
 
-        const { rows, movedRowIndices, moveSearchTruncated } = await detect_moves(
+        const detected = await detect_moves(
             original,
             modified,
             pairing,
@@ -770,6 +770,8 @@ export async function align_sheet(
             modified_hashes,
             options,
         );
+        if (detected.hashCollision) continue;
+        const { rows, movedRowIndices, moveSearchTruncated } = detected;
         const counted = await count_changes(
             original,
             modified,
@@ -1163,8 +1165,9 @@ interface ExactMoveCandidate {
 }
 
 /** Verify hash-selected candidates in sparse bounded batches before they can
- * consume one-sided rows. A collision is simply rejected and left for the
- * existing bounded similarity phase. */
+ * consume one-sided rows. A rejected selector reports a collision so the
+ * caller can retry with an independent hash instead of searching a bucket
+ * quadratically or stranding a later exact row behind the collision. */
 async function verify_exact_move_candidates(
     original: DataSource,
     modified: DataSource,
@@ -1172,13 +1175,14 @@ async function verify_exact_move_candidates(
     candidates: readonly ExactMoveCandidate[],
     claim: (original_row: number, modified_row: number) => void,
     options: AlignSheetOptions,
-): Promise<void> {
+): Promise<boolean> {
     const column_count = Math.max(
         original.meta().sheets[pairing.originalIndex].columnCount,
         modified.meta().sheets[pairing.modifiedIndex].columnCount,
     );
     const is_cancelled = options.isCancelled ?? NEVER_CANCELLED;
     let cells_since_checkpoint = 0;
+    let hash_collision = false;
     for (let start = 0; start < candidates.length; start += HASH_READ_BATCH) {
         if (options.isCancelled?.()) throw new AlignmentCancelledError();
         const batch = candidates.slice(start, start + HASH_READ_BATCH);
@@ -1224,8 +1228,10 @@ async function verify_exact_move_candidates(
                 }
             }
             if (equal) claim(batch[offset].originalRow, batch[offset].modifiedRow);
+            else hash_collision = true;
         }
     }
+    return hash_collision;
 }
 
 /**
@@ -1257,6 +1263,7 @@ async function detect_moves(
     rows: readonly AlignedRow[];
     movedRowIndices: number[];
     moveSearchTruncated: boolean;
+    hashCollision: boolean;
 }> {
     if (options.isCancelled?.()) throw new AlignmentCancelledError();
     const deleted: Leftover[] = [];
@@ -1269,7 +1276,12 @@ async function detect_moves(
         // Returned as-is, not copied: the caller treats it as readonly, and on
         // a million-row sheet with nothing one-sided the copy was the largest
         // allocation the pass made, to hand back what it was given.
-        return { rows, movedRowIndices: [], moveSearchTruncated: false };
+        return {
+            rows,
+            movedRowIndices: [],
+            moveSearchTruncated: false,
+            hashCollision: false,
+        };
     }
 
     // The pass's verdict, held both ways round. Both directions are needed —
@@ -1305,7 +1317,7 @@ async function detect_moves(
             modifiedRow: entry.row,
         });
         if (exact_candidates.length === HASH_READ_BATCH) {
-            await verify_exact_move_candidates(
+            const hash_collision = await verify_exact_move_candidates(
                 original,
                 modified,
                 pairing,
@@ -1313,11 +1325,19 @@ async function detect_moves(
                 claim,
                 options,
             );
+            if (hash_collision) {
+                return {
+                    rows,
+                    movedRowIndices: [],
+                    moveSearchTruncated: false,
+                    hashCollision: true,
+                };
+            }
             exact_candidates.length = 0;
         }
     }
     if (exact_candidates.length > 0) {
-        await verify_exact_move_candidates(
+        const hash_collision = await verify_exact_move_candidates(
             original,
             modified,
             pairing,
@@ -1325,6 +1345,14 @@ async function detect_moves(
             claim,
             options,
         );
+        if (hash_collision) {
+            return {
+                rows,
+                movedRowIndices: [],
+                moveSearchTruncated: false,
+                hashCollision: true,
+            };
+        }
     }
 
     const unmatched_deleted = deleted.filter((entry) => !original_to_modified.has(entry.row));
@@ -1348,7 +1376,12 @@ async function detect_moves(
     }
 
     if (original_to_modified.size === 0) {
-        return { rows, movedRowIndices: [], moveSearchTruncated: truncated };
+        return {
+            rows,
+            movedRowIndices: [],
+            moveSearchTruncated: truncated,
+            hashCollision: false,
+        };
     }
 
     // Rebuild. A moved row is emitted once, at its modified-side slot, with
@@ -1369,7 +1402,12 @@ async function detect_moves(
         }
         rebuilt.push(row);
     }
-    return { rows: rebuilt, movedRowIndices: moved_row_indices, moveSearchTruncated: truncated };
+    return {
+        rows: rebuilt,
+        movedRowIndices: moved_row_indices,
+        moveSearchTruncated: truncated,
+        hashCollision: false,
+    };
 }
 
 /** A source row proposed as the origin of a destination row. */

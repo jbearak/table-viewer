@@ -403,6 +403,28 @@ describe('align_sheet', () => {
         });
     });
 
+    it('retries an exact-move selector when a collision hides a later bucket row', async () => {
+        expect(single_raw_cell_row_hash('45zx'))
+            .toBe(single_raw_cell_row_hash('fpcd'));
+
+        const alignment = await align_sheet(
+            single(rows_of('45zx', 'fpcd', 'anchor-a', 'anchor-b')),
+            single(rows_of('anchor-a', 'anchor-b', 'fpcd')),
+            matched,
+            { maxMoveSearchRows: 0 },
+        );
+
+        expect(shape(alignment.rows)).toEqual(['0,-', '2,0', '3,1', '1,2']);
+        expect(alignment).toMatchObject({
+            addedRows: 0,
+            deletedRows: 1,
+            changedCells: 0,
+            movedRowIndices: [3],
+            moveSearchTruncated: false,
+            degraded: false,
+        });
+    });
+
     it('retries hash-selected alignment after an exact prefix collision', async () => {
         expect(single_raw_cell_row_hash('45zx'))
             .toBe(single_raw_cell_row_hash('fpcd'));

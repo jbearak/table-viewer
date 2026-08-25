@@ -22,6 +22,7 @@ import {
     assert_safe_sheet_shape,
     create_workbook_budget,
     MAX_SHEET_COLUMNS,
+    MAX_WORKBOOK_CELLS,
 } from '../spreadsheet-safety';
 import {
     DEFERRED_COMPARISON_IDENTITY,
@@ -46,7 +47,12 @@ const MAX_DECODED_CACHE_BYTES = 16 * 1024 * 1024;
 const MAX_GSO_CACHE_ENTRIES = 256;
 const MAX_GSO_CACHE_BYTES = 16 * 1024 * 1024;
 const MAX_GSO_INDEX_ENTRIES = 1_024;
-const MAX_GSO_HISTORICAL_SCAN_PASSES = 2;
+const GSO_LOCATION_PAGE_ENTRIES = 256;
+const GSO_LOCATION_BYTES_PER_ENTRY = Uint8Array.BYTES_PER_ELEMENT
+    + Uint32Array.BYTES_PER_ELEMENT;
+const MAX_GSO_LOCATION_INDEX_BYTES = Math.ceil(
+    MAX_WORKBOOK_CELLS / GSO_LOCATION_PAGE_ENTRIES,
+) * GSO_LOCATION_PAGE_ENTRIES * GSO_LOCATION_BYTES_PER_ENTRY;
 const MAX_GSO_DIGEST_CACHE_ENTRIES = 4_096;
 const MAX_GSO_DIGEST_CACHE_BYTES = 1024 * 1024;
 const BINARY_IDENTITY_CHUNK_BYTES = 256 * 1024;
@@ -233,8 +239,15 @@ interface GsoIdentifier {
 
 interface ScannedGso extends GsoIdentifier {
     readonly key: string;
+    readonly startPosition: number;
     readonly value: GsoEntry;
     readonly nextPosition: number;
+}
+
+interface GsoLocationPage {
+    identifierOffsets: Uint8Array;
+    positions: Uint32Array;
+    count: number;
 }
 
 interface GsoBatchTarget extends GsoIdentifier {
@@ -251,12 +264,7 @@ type GsoResolutionPhase = 'cache' | 'historical' | 'forward' | 'done';
 
 interface GsoResolutionState {
     phase: GsoResolutionPhase;
-    historicalEnd: number;
-    historicalStart: number;
-    position: number;
-    rangeEnd: number;
-    wrapped: boolean;
-    historicalTargetCount: number;
+    historicalTargets?: IterableIterator<GsoBatchTarget>;
 }
 
 interface GsoTransitionResult {
@@ -364,6 +372,9 @@ export class DtaDataSource implements DataSource {
     private window_cache_cells = 0;
     private window_cache_bytes = 0;
     private readonly gso_index = new Map<string, GsoEntry>();
+    private readonly gso_locations = new Map<number, GsoLocationPage>();
+    private gso_location_bytes = 0;
+    private readonly gso_location_byte_limit: number;
     private readonly gso_cache = new Map<string, DecodedGso>();
     private gso_cache_bytes = 0;
     private text_gso_decode_byte_limit = MAX_GSO_CACHE_BYTES;
@@ -386,9 +397,6 @@ export class DtaDataSource implements DataSource {
     private gso_seen_identifiers?: Uint8Array;
     private readonly gso_start_position: number;
     private gso_scan_position: number;
-    private gso_historical_scan_position: number;
-    private gso_forward_headers_scanned = 0;
-    private gso_historical_headers_scanned = 0;
     private gso_scan_exhausted = false;
 
     private constructor(
@@ -442,12 +450,18 @@ export class DtaDataSource implements DataSource {
         });
         this.strl_variables = strl_variables;
         this.gso_variable_count = strl_variables.length;
+        const gso_identifier_capacity = metadata.nobs * this.gso_variable_count;
+        this.gso_location_byte_limit = Math.ceil(
+            gso_identifier_capacity / GSO_LOCATION_PAGE_ENTRIES,
+        ) * GSO_LOCATION_PAGE_ENTRIES * GSO_LOCATION_BYTES_PER_ENTRY;
+        if (this.gso_location_byte_limit > MAX_GSO_LOCATION_INDEX_BYTES) {
+            throw new Error('Stata strL location index exceeds the workbook cell limit');
+        }
         this.bytes = file_bytes;
         this.view = new DataView(buffer);
         this.gso_start_position = metadata.section_offsets.strls
             + (is_legacy_format(metadata.format_version) ? 0 : STRLS_TAG_LENGTH);
         this.gso_scan_position = this.gso_start_position;
-        this.gso_historical_scan_position = this.gso_start_position;
         this._meta = {
             hasFormatting: true,
             sheets: [{
@@ -931,6 +945,8 @@ export class DtaDataSource implements DataSource {
         this.value_label_section_end = undefined;
         this.legacy_value_label_terminal_probe = undefined;
         this.gso_index.clear();
+        this.gso_locations.clear();
+        this.gso_location_bytes = 0;
         this.gso_cache.clear();
         this.gso_cache_bytes = 0;
         this.gso_digest_cache.clear();
@@ -949,9 +965,6 @@ export class DtaDataSource implements DataSource {
         this.pending_binary_identities.clear();
         this.gso_seen_identifiers = undefined;
         this.gso_scan_position = this.gso_start_position;
-        this.gso_historical_scan_position = this.gso_start_position;
-        this.gso_forward_headers_scanned = 0;
-        this.gso_historical_headers_scanned = 0;
         this.gso_scan_exhausted = true;
         this.view = undefined;
         this.bytes = undefined;
@@ -1524,32 +1537,15 @@ export class DtaDataSource implements DataSource {
     }
 
     private create_gso_resolution_state(): GsoResolutionState {
-        return {
-            phase: 'cache',
-            historicalEnd: this.gso_scan_position,
-            historicalStart: this.gso_start_position,
-            position: this.gso_start_position,
-            rangeEnd: this.gso_scan_position,
-            wrapped: false,
-            historicalTargetCount: 0,
-        };
+        return { phase: 'cache' };
     }
 
     private begin_historical_gso_phase(
         state: GsoResolutionState,
-        seen_target_count: number,
+        targets: ReadonlyMap<string, GsoBatchTarget>,
     ): void {
-        state.historicalEnd = this.gso_scan_position;
-        state.historicalStart = this.gso_historical_scan_position < state.historicalEnd
-            ? this.gso_historical_scan_position
-            : this.gso_start_position;
-        state.position = state.historicalStart;
-        state.rangeEnd = state.historicalEnd;
-        state.wrapped = false;
-        state.historicalTargetCount = seen_target_count;
-        state.phase = seen_target_count > 0
-            ? 'historical'
-            : 'forward';
+        state.historicalTargets = targets.values();
+        state.phase = 'historical';
     }
 
     /** One shared physical transition used by both synchronous and asynchronous
@@ -1572,49 +1568,45 @@ export class DtaDataSource implements DataSource {
                 state.phase = 'done';
                 return { physicalWork: false };
             }
-            this.begin_historical_gso_phase(
-                state,
-                this.count_seen_gso_targets(targets),
-            );
+            this.begin_historical_gso_phase(state, targets);
             return { physicalWork: false };
         }
         if (state.phase === 'historical') {
-            if (state.historicalTargetCount === 0) {
+            const historical_targets = state.historicalTargets;
+            if (historical_targets === undefined) {
                 state.phase = 'forward';
                 return { physicalWork: false };
             }
-            if (state.position >= state.rangeEnd) {
-                if (state.wrapped || state.historicalStart === this.gso_start_position) {
-                    state.phase = 'forward';
-                    return { physicalWork: false };
+            let target: GsoBatchTarget | undefined;
+            for (
+                let next = historical_targets.next();
+                !next.done;
+                next = historical_targets.next()
+            ) {
+                if (targets.has(next.value.key) && this.has_seen_gso(next.value)) {
+                    target = next.value;
+                    break;
                 }
-                state.position = this.gso_start_position;
-                state.rangeEnd = state.historicalStart;
-                state.wrapped = true;
+            }
+            if (target === undefined) {
+                state.phase = 'forward';
                 return { physicalWork: false };
             }
-            this.assert_historical_gso_scan_budget();
+            const position = this.gso_location(target);
+            if (position === undefined) {
+                throw new Error('Corrupt .dta file: remembered strL location is missing');
+            }
             const scanned = this.read_gso_at(
                 this.open_bytes(),
                 this.open_view(),
-                state.position,
+                position,
             );
-            if (scanned === null) {
-                state.phase = 'forward';
-                return { physicalWork: false };
+            if (scanned === null || scanned.key !== target.key) {
+                throw new Error('Corrupt .dta file: remembered strL location is invalid');
             }
-            this.gso_historical_headers_scanned += 1;
-            this.gso_historical_scan_position = scanned.nextPosition >= state.historicalEnd
-                ? this.gso_start_position
-                : scanned.nextPosition;
-            state.position = scanned.nextPosition;
             this.cache_gso_entry(scanned.key, scanned.value);
-            const target = targets.get(scanned.key);
-            if (target !== undefined && this.has_seen_gso(target)) {
-                target.entry = scanned.value;
-                targets.delete(scanned.key);
-                state.historicalTargetCount -= 1;
-            }
+            target.entry = scanned.value;
+            targets.delete(scanned.key);
             return { physicalWork: true };
         }
         if (state.phase === 'forward') {
@@ -1640,16 +1632,6 @@ export class DtaDataSource implements DataSource {
             return { physicalWork: true };
         }
         return { physicalWork: false };
-    }
-
-    private assert_historical_gso_scan_budget(): void {
-        const limit = this.gso_forward_headers_scanned
-            * MAX_GSO_HISTORICAL_SCAN_PASSES;
-        if (this.gso_historical_headers_scanned < limit) return;
-        throw new Error(
-            `Stata strL lookup exceeded the safe historical scan work limit `
-            + `(${limit.toLocaleString()} headers)`,
-        );
     }
 
     private resolve_gso_batch(
@@ -1681,12 +1663,9 @@ export class DtaDataSource implements DataSource {
             const scheduled = this.schedule_source_work('gsoHeaders', 1);
             if (scheduled === undefined) continue;
             const forward_position = this.gso_scan_position;
-            const historical_position = this.gso_historical_scan_position;
             await scheduled;
             this.assert_async_active(lifecycle_epoch, is_cancelled);
-            const shared_scan_progress = forward_position !== this.gso_scan_position
-                || historical_position !== this.gso_historical_scan_position;
-            if (!shared_scan_progress) continue;
+            if (forward_position === this.gso_scan_position) continue;
             this.resolve_cached_gso_targets(targets, request_memo);
             if (targets.size === 0) return;
             // A concurrent synchronous/async reader may have advanced the shared
@@ -1710,7 +1689,6 @@ export class DtaDataSource implements DataSource {
             return null;
         }
         this.remember_gso(scanned);
-        this.gso_forward_headers_scanned += 1;
         this.gso_scan_position = scanned.nextPosition;
         if (this.gso_scan_position >= gso_section_end(this.metadata)) {
             this.gso_scan_exhausted = true;
@@ -1768,6 +1746,7 @@ export class DtaDataSource implements DataSource {
             key: gso_key(variable, observation),
             observation,
             variable,
+            startPosition: start,
             value: { content_offset: position, content_length, type },
             nextPosition: content_end,
         };
@@ -1787,8 +1766,73 @@ export class DtaDataSource implements DataSource {
                 `Corrupt .dta file: duplicate strL object id ${scanned.key}`,
             );
         }
+        this.remember_gso_location(bit_index, scanned.startPosition);
         seen[byte_index] |= mask;
         this.cache_gso_entry(scanned.key, scanned.value);
+    }
+
+    private remember_gso_location(bit_index: number, position: number): void {
+        if (position > 0xffff_ffff) {
+            throw new Error('Stata strL location exceeds the 32-bit file offset limit');
+        }
+        const page_index = Math.floor(bit_index / GSO_LOCATION_PAGE_ENTRIES);
+        const identifier_offset = bit_index % GSO_LOCATION_PAGE_ENTRIES;
+        let page = this.gso_locations.get(page_index);
+        if (page === undefined) {
+            page = {
+                identifierOffsets: Uint8Array.of(identifier_offset),
+                positions: Uint32Array.of(position),
+                count: 1,
+            };
+            this.reserve_gso_location_bytes(GSO_LOCATION_BYTES_PER_ENTRY);
+            this.gso_locations.set(page_index, page);
+            return;
+        }
+        if (page.count === page.positions.length) {
+            const previous_capacity = page.count;
+            const capacity = Math.min(
+                GSO_LOCATION_PAGE_ENTRIES,
+                previous_capacity * 2,
+            );
+            const identifier_offsets = new Uint8Array(capacity);
+            identifier_offsets.set(page.identifierOffsets);
+            const positions = new Uint32Array(capacity);
+            positions.set(page.positions);
+            this.reserve_gso_location_bytes(
+                (capacity - previous_capacity) * GSO_LOCATION_BYTES_PER_ENTRY,
+            );
+            page.identifierOffsets = identifier_offsets;
+            page.positions = positions;
+        }
+        page.identifierOffsets[page.count] = identifier_offset;
+        page.positions[page.count] = position;
+        page.count += 1;
+    }
+
+    private reserve_gso_location_bytes(additional_bytes: number): void {
+        const next_bytes = this.gso_location_bytes + additional_bytes;
+        if (
+            next_bytes > this.gso_location_byte_limit
+            || next_bytes > MAX_GSO_LOCATION_INDEX_BYTES
+        ) {
+            throw new Error('Stata strL location index exceeds the workbook cell limit');
+        }
+        this.gso_location_bytes = next_bytes;
+    }
+
+    private gso_location(identifier: GsoIdentifier): number | undefined {
+        const bit_index = this.gso_identifier_bit_index(identifier);
+        const page = this.gso_locations.get(
+            Math.floor(bit_index / GSO_LOCATION_PAGE_ENTRIES),
+        );
+        if (page === undefined) return undefined;
+        const identifier_offset = bit_index % GSO_LOCATION_PAGE_ENTRIES;
+        for (let index = 0; index < page.count; index++) {
+            if (page.identifierOffsets[index] === identifier_offset) {
+                return page.positions[index];
+            }
+        }
+        return undefined;
     }
 
     private gso_identifier_bit_index(identifier: GsoIdentifier): number {

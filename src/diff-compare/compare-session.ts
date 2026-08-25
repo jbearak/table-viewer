@@ -13,6 +13,7 @@ import {
     read_source_raw_columns_async,
     read_source_raw_columns_indexed_async,
     read_source_raw_rows_indexed_async,
+    read_source_row_indices,
     read_source_rows_indexed,
     read_source_rows_indexed_async,
     type ColumnFilterMetadata,
@@ -253,10 +254,11 @@ function project_merges(
     return moved ? projected : merges as MergeRange[];
 }
 
-function collect_deleted_grid_rows(rows: readonly AlignedRow[]): Uint32Array {
-    let count = 0;
-    for (const row of rows) if (row.modified === ABSENT) count += 1;
-    const deleted = new Uint32Array(count);
+function collect_deleted_grid_rows(
+    rows: readonly AlignedRow[],
+    deleted_count: number,
+): Uint32Array {
+    const deleted = new Uint32Array(deleted_count);
     let position = 0;
     rows.forEach((row, grid_row) => {
         if (row.modified === ABSENT) deleted[position++] = grid_row;
@@ -269,10 +271,21 @@ interface CachedDiffPage {
     readonly bytes: number;
 }
 
+type DerivedRowIndexKind = 'changed' | 'deleted' | 'modified';
+
+interface CachedDerivedRowIndex {
+    readonly kind: DerivedRowIndexKind;
+    readonly sheetIndex: number;
+    readonly bytes: number;
+}
+
 const DIFF_CACHE_WINDOW_OVERHEAD_BYTES = 64;
 const DIFF_CACHE_ARRAY_OVERHEAD_BYTES = 24;
 const DIFF_CACHE_REFERENCE_BYTES = 8;
 const DIFF_CACHE_CHANGED_CELL_OVERHEAD_BYTES = 48;
+const DERIVED_ROW_INDEX_ENTRY_OVERHEAD_BYTES = 96;
+const DERIVED_ROW_INDEX_ARRAY_OVERHEAD_BYTES = 24;
+const DERIVED_ROW_INDEX_NUMBER_BYTES = 8;
 
 function retained_string_bytes(value: string | undefined): number {
     return value === undefined ? 0 : value.length * 2;
@@ -291,6 +304,23 @@ function cached_diff_page_bytes(key: string, window: CompareDiffWindow): number 
             + retained_string_bytes(cell.formattedBase);
     }
     return bytes;
+}
+
+function typed_row_index_bytes(index: Uint32Array): number {
+    return DERIVED_ROW_INDEX_ENTRY_OVERHEAD_BYTES
+        + DERIVED_ROW_INDEX_ARRAY_OVERHEAD_BYTES
+        + index.byteLength;
+}
+
+function changed_row_index_bytes(index: readonly number[]): number {
+    return DERIVED_ROW_INDEX_ENTRY_OVERHEAD_BYTES
+        + DERIVED_ROW_INDEX_ARRAY_OVERHEAD_BYTES
+        + index.length * DERIVED_ROW_INDEX_NUMBER_BYTES;
+}
+
+function derived_row_index_key(kind: DerivedRowIndexKind, sheet_index: number): number {
+    const kind_index = kind === 'changed' ? 0 : kind === 'deleted' ? 1 : 2;
+    return sheet_index * 3 + kind_index;
 }
 
 export class CompareDataSource implements DataSource {
@@ -321,6 +351,7 @@ export class CompareDataSource implements DataSource {
     private readonly original_meta: WorkbookMeta;
     private static readonly MAX_CACHED_DIFF_PAGES = 64;
     private static readonly MAX_CACHED_DIFF_BYTES = 16 * 1024 * 1024;
+    private static readonly MAX_CACHED_DERIVED_ROW_INDEX_BYTES = 16 * 1024 * 1024;
     private readonly diff_cache = new Map<string, CachedDiffPage>();
     private diff_cache_bytes = 0;
     private readonly diff_in_flight = new Map<string, InFlightDiff>();
@@ -342,22 +373,34 @@ export class CompareDataSource implements DataSource {
     readonly moveSearchTruncated: boolean;
     private readonly grid_row_by_modified_cache = new Map<number, Uint32Array>();
     /** Memoized {@link changed_grid_rows}. Alignments never change after
-     *  construction, but PanelCore asks again on every transform recompute —
-     *  so without this, each sort or filter rescans every row of the sheet. */
+     *  construction, but PanelCore asks again on every transform recompute. All
+     *  derived row indexes share one byte-bounded LRU so visiting many sheets
+     *  cannot retain one full-sheet projection apiece until close. */
     private readonly changed_grid_rows_cache = new Map<number, readonly number[]>();
-    /** Deleted rows' grid rows per sheet, in canonical-number order. */
-    private readonly deleted_grid_rows: Map<number, Uint32Array>;
+    /** Deleted rows' grid rows per sheet, in canonical-number order. Built only
+     *  when canonical mapping needs them and retained through the shared LRU. */
+    private readonly deleted_grid_rows = new Map<number, Uint32Array>();
+    private readonly derived_row_index_lru = new Map<number, CachedDerivedRowIndex>();
+    private derived_row_index_cache_bytes = 0;
     private readonly max_cached_diff_bytes: number;
+    private readonly max_cached_derived_row_index_bytes: number;
 
     constructor(
         private readonly modified: DataSource,
         private readonly original: DataSource,
         alignments: SheetAlignments = new Map(),
         max_cached_diff_bytes = CompareDataSource.MAX_CACHED_DIFF_BYTES,
+        max_cached_derived_row_index_bytes =
+            CompareDataSource.MAX_CACHED_DERIVED_ROW_INDEX_BYTES,
     ) {
         this.max_cached_diff_bytes = Number.isFinite(max_cached_diff_bytes)
             ? Math.max(0, Math.floor(max_cached_diff_bytes))
             : CompareDataSource.MAX_CACHED_DIFF_BYTES;
+        this.max_cached_derived_row_index_bytes = Number.isFinite(
+            max_cached_derived_row_index_bytes,
+        )
+            ? Math.max(0, Math.floor(max_cached_derived_row_index_bytes))
+            : CompareDataSource.MAX_CACHED_DERIVED_ROW_INDEX_BYTES;
         this.original_meta = original.meta();
         this.modified_meta = modified.meta();
         this.pairings = pair_sheets(this.original_meta, this.modified_meta);
@@ -450,20 +493,21 @@ export class CompareDataSource implements DataSource {
                 const row_count = alignment.rows.length;
                 const column_count = Math.max(sheet.columnCount, original_sheet.columnCount);
                 const merges = project_merges(sheet.merges, alignment.rows);
+                const has_formatting = sheet.hasFormatting || original_sheet.hasFormatting;
                 return row_count === sheet.rowCount
                     && column_count === sheet.columnCount
                     && merges === sheet.merges
+                    && has_formatting === sheet.hasFormatting
                     ? sheet
                     : {
                         ...sheet,
                         rowCount: row_count,
                         merges,
+                        hasFormatting: has_formatting,
                         // Deleted rows get their own canonical rows appended
                         // after the modified side's, so their mapping can never
                         // collide with a real row's.
-                        sourceRowCount: sheet.sourceRowCount
-                            + this.alignments.get(sheet_index)!.rows.filter(
-                                (row) => row.modified === ABSENT).length,
+                        sourceRowCount: sheet.sourceRowCount + alignment.deletedRows,
                         columnCount: column_count,
                     };
             }),
@@ -471,15 +515,6 @@ export class CompareDataSource implements DataSource {
                 without_header_capability(original_sheets[pairing.originalIndex])),
             ],
         };
-        // Canonical row numbers for deleted rows are their rank in this grid-row
-        // index, offset by the modified side's sourceRowCount. Keeping only the
-        // sorted grid rows serves both mapping directions without a duplicate Map.
-        this.deleted_grid_rows = new Map(
-            [...this.alignments].map(([sheet_index, alignment]) => [
-                sheet_index,
-                collect_deleted_grid_rows(alignment.rows),
-            ]),
-        );
     }
 
     /** Aligned rows for a matched grid sheet; undefined for one-sided sheets. */
@@ -521,6 +556,60 @@ export class CompareDataSource implements DataSource {
         };
     }
 
+    private cached_derived_row_index<Value>(
+        kind: DerivedRowIndexKind,
+        sheet_index: number,
+        cache: ReadonlyMap<number, Value>,
+    ): Value | undefined {
+        const cached = cache.get(sheet_index);
+        if (cached === undefined) return undefined;
+        const key = derived_row_index_key(kind, sheet_index);
+        const entry = this.derived_row_index_lru.get(key);
+        if (entry !== undefined) {
+            this.derived_row_index_lru.delete(key);
+            this.derived_row_index_lru.set(key, entry);
+        }
+        return cached;
+    }
+
+    private retain_derived_row_index<Value>(
+        kind: DerivedRowIndexKind,
+        sheet_index: number,
+        value: Value,
+        bytes: number,
+        cache: Map<number, Value>,
+    ): Value {
+        if (bytes > this.max_cached_derived_row_index_bytes) return value;
+        while (
+            this.derived_row_index_cache_bytes + bytes
+                > this.max_cached_derived_row_index_bytes
+            && this.derived_row_index_lru.size > 0
+        ) {
+            const oldest = this.derived_row_index_lru.entries().next().value as
+                | [number, CachedDerivedRowIndex]
+                | undefined;
+            if (oldest === undefined) break;
+            const [key, entry] = oldest;
+            this.derived_row_index_lru.delete(key);
+            this.derived_row_index_cache_bytes -= entry.bytes;
+            if (entry.kind === 'changed') {
+                this.changed_grid_rows_cache.delete(entry.sheetIndex);
+            } else if (entry.kind === 'deleted') {
+                this.deleted_grid_rows.delete(entry.sheetIndex);
+            } else {
+                this.grid_row_by_modified_cache.delete(entry.sheetIndex);
+            }
+        }
+        cache.set(sheet_index, value);
+        this.derived_row_index_lru.set(derived_row_index_key(kind, sheet_index), {
+            kind,
+            sheetIndex: sheet_index,
+            bytes,
+        });
+        this.derived_row_index_cache_bytes += bytes;
+        return value;
+    }
+
     /**
      * Grid rows that are added, deleted, or have at least one changed cell, in
      * grid order — the row set behind the "only changed rows" filter. Undefined
@@ -528,11 +617,20 @@ export class CompareDataSource implements DataSource {
      */
     changed_grid_rows(sheet_index: number): readonly number[] | undefined {
         if (!this.alignments.has(sheet_index)) return undefined;
-        const cached = this.changed_grid_rows_cache.get(sheet_index);
-        if (cached) return cached;
+        const cached = this.cached_derived_row_index(
+            'changed',
+            sheet_index,
+            this.changed_grid_rows_cache,
+        );
+        if (cached !== undefined) return cached;
         const computed = this.compute_changed_grid_rows(sheet_index);
-        this.changed_grid_rows_cache.set(sheet_index, computed);
-        return computed;
+        return this.retain_derived_row_index(
+            'changed',
+            sheet_index,
+            computed,
+            changed_row_index_bytes(computed),
+            this.changed_grid_rows_cache,
+        );
     }
 
     /** Moved grid rows, kept in the alignment's ascending compact array. */
@@ -1285,20 +1383,18 @@ export class CompareDataSource implements DataSource {
     ): Uint32Array {
         const deleted_index = this.deleted_original_index(sheet_index);
         if (deleted_index !== undefined) {
-            return this.original.source_row_indices
-                ? this.original.source_row_indices(deleted_index, projected_rows)
-                : Uint32Array.from(projected_rows);
+            return read_source_row_indices(this.original, deleted_index, projected_rows);
         }
         const alignment = this.alignment_of(sheet_index);
         if (!alignment) {
             // An unaligned sheet is still a modified-side sheet — an added
             // worksheet has no original to align against but can carry header
             // promotion or hidden rows, so its projection is not the identity.
-            return this.modified.source_row_indices
-                ? this.modified.source_row_indices(sheet_index, projected_rows)
-                : Uint32Array.from(projected_rows);
+            return read_source_row_indices(this.modified, sheet_index, projected_rows);
         }
-        const deleted = this.deleted_grid_rows.get(sheet_index);
+        const deleted = this.alignments.get(sheet_index)?.deletedRows === 0
+            ? undefined
+            : this.deleted_grid_rows_of(sheet_index);
         const result = new Uint32Array(projected_rows.length);
         const real_positions: number[] = [];
         const real_rows: number[] = [];
@@ -1318,9 +1414,7 @@ export class CompareDataSource implements DataSource {
             }
         }
         if (real_rows.length > 0) {
-            const mapped = this.modified.source_row_indices
-                ? this.modified.source_row_indices(sheet_index, real_rows)
-                : Uint32Array.from(real_rows);
+            const mapped = read_source_row_indices(this.modified, sheet_index, real_rows);
             for (let position = 0; position < real_positions.length; position++) {
                 result[real_positions[position]] = mapped[position];
             }
@@ -1358,23 +1452,53 @@ export class CompareDataSource implements DataSource {
      *  that map *back* into the grid need it. A compact typed inverse costs four
      *  bytes per modified row rather than one object-heavy Map entry per row. */
     private grid_row_by_modified(sheet_index: number): Uint32Array {
-        const cached = this.grid_row_by_modified_cache.get(sheet_index);
-        if (cached) return cached;
+        const cached = this.cached_derived_row_index(
+            'modified',
+            sheet_index,
+            this.grid_row_by_modified_cache,
+        );
+        if (cached !== undefined) return cached;
         const row_count = this.modified_meta.sheets[sheet_index]?.rowCount ?? 0;
         const built = new Uint32Array(row_count);
         built.fill(0xffff_ffff);
         this.alignment_of(sheet_index)?.forEach((row, grid_row) => {
             if (row.modified !== ABSENT) built[row.modified] = grid_row;
         });
-        this.grid_row_by_modified_cache.set(sheet_index, built);
-        return built;
+        return this.retain_derived_row_index(
+            'modified',
+            sheet_index,
+            built,
+            typed_row_index_bytes(built),
+            this.grid_row_by_modified_cache,
+        );
+    }
+
+    private deleted_grid_rows_of(sheet_index: number): Uint32Array {
+        const cached = this.cached_derived_row_index(
+            'deleted',
+            sheet_index,
+            this.deleted_grid_rows,
+        );
+        if (cached !== undefined) return cached;
+        const alignment = this.alignments.get(sheet_index);
+        const built = collect_deleted_grid_rows(
+            alignment?.rows ?? [],
+            alignment?.deletedRows ?? 0,
+        );
+        return this.retain_derived_row_index(
+            'deleted',
+            sheet_index,
+            built,
+            typed_row_index_bytes(built),
+            this.deleted_grid_rows,
+        );
     }
 
     /** The grid row a deleted row's canonical row belongs to. Canonical numbers
      *  are assigned contiguously from `sourceRowCount` in grid order, so this is
      *  an index into the sheet's deleted rows rather than a search. */
     private deleted_grid_row(sheet_index: number, source_row: number): number | undefined {
-        return this.deleted_grid_rows.get(sheet_index)?.[
+        return this.deleted_grid_rows_of(sheet_index)[
             source_row - this.modified_meta.sheets[sheet_index].sourceRowCount];
     }
 
@@ -1389,6 +1513,8 @@ export class CompareDataSource implements DataSource {
         this.deleted_grid_rows.clear();
         this.grid_row_by_modified_cache.clear();
         this.changed_grid_rows_cache.clear();
+        this.derived_row_index_lru.clear();
+        this.derived_row_index_cache_bytes = 0;
         try {
             this.modified.close();
         } finally {

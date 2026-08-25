@@ -2157,7 +2157,7 @@ describe('DtaDataSource', () => {
         expect(headers_read).toBeLessThanOrEqual(256);
     });
 
-    it('bounds reverse-order evicted GSO lookups with historical caching', async () => {
+    it('bounds reverse-order evicted GSO lookups with compact locations', async () => {
         const source = await DtaDataSource.create(build_dta_fixture(2_049));
         source.read_rows(0, 0, 2_049);
         const internals = source as unknown as {
@@ -2186,25 +2186,48 @@ describe('DtaDataSource', () => {
             expect(source.read_raw_columns(0, row, 1, [4]).rows[0][0]?.raw)
                 .toBe(prefix[row] ?? `long value ${row}`);
         }
-        expect(headers_read).toBeLessThanOrEqual(2_050);
+        expect(headers_read).toBe(1_025);
         expect(internals.gso_index.size).toBeLessThanOrEqual(1_024);
     });
 
     it.each(['synchronous', 'asynchronous'] as const)(
-        'caps %s cumulative historical GSO work after two forward-scan equivalents',
+        'resolves adversarial %s cold GSO requests through one header each',
         async (mode) => {
-            const object_count = 2_049;
+            const object_count = 4_097;
+            const request_count = 300;
             const source = await DtaDataSource.create(build_dta_fixture(object_count));
             source.read_rows(0, 0, object_count);
             const internals = source as unknown as {
                 windows: Map<string, unknown>;
                 gso_index: Map<string, unknown>;
+                gso_locations: Map<number, {
+                    identifierOffsets: Uint8Array;
+                    positions: Uint32Array;
+                    count: number;
+                }>;
+                gso_location_bytes: number;
+                gso_location_byte_limit: number;
                 gso_cache: Map<string, unknown>;
                 gso_cache_bytes: number;
-                gso_forward_headers_scanned: number;
-                gso_historical_headers_scanned: number;
                 read_gso_at: (...args: unknown[]) => unknown;
             };
+            expect(internals.gso_locations.size).toBe(17);
+            expect(internals.gso_location_bytes).toBe(object_count * 5);
+            expect(internals.gso_location_byte_limit).toBe(4_352 * 5);
+            let accounted_bytes = 0;
+            let indexed_locations = 0;
+            for (const page of internals.gso_locations.values()) {
+                expect(page.identifierOffsets.length).toBe(page.positions.length);
+                expect(page.count).toBeLessThanOrEqual(page.positions.length);
+                expect(page.positions.length).toBeLessThanOrEqual(256);
+                accounted_bytes += page.identifierOffsets.byteLength
+                    + page.positions.byteLength;
+                indexed_locations += page.count;
+            }
+            expect(accounted_bytes).toBe(internals.gso_location_bytes);
+            expect(indexed_locations).toBe(object_count);
+            expect(internals.gso_locations.get(16)?.positions.length).toBe(1);
+
             internals.windows.clear();
             internals.gso_index.clear();
             internals.gso_cache.clear();
@@ -2218,19 +2241,24 @@ describe('DtaDataSource', () => {
             const read = async (row: number) => mode === 'synchronous'
                 ? source.read_raw_columns(0, row, 1, [4])
                 : source.read_raw_columns_async(0, row, 1, [4], () => false);
+            const prefix = [
+                'a long first value',
+                'second long value',
+                'third long value',
+                'fourth long value',
+            ];
 
-            await expect(read(2_048)).resolves.toMatchObject({
-                rows: [[expect.objectContaining({ raw: 'long value 2048' })]],
-            });
-            await expect(read(1_024)).resolves.toMatchObject({
-                rows: [[expect.objectContaining({ raw: 'long value 1024' })]],
-            });
-            await expect(read(0)).rejects.toThrow(
-                'Stata strL lookup exceeded the safe historical scan work limit',
-            );
-            expect(internals.gso_forward_headers_scanned).toBe(object_count);
-            expect(internals.gso_historical_headers_scanned).toBe(object_count * 2);
-            expect(headers_read).toBe(object_count * 2);
+            for (let request = 0; request < request_count; request++) {
+                const row = (object_count - 1 - 1_024 * request) % object_count;
+                const normalized_row = row < 0 ? row + object_count : row;
+                await expect(read(normalized_row)).resolves.toMatchObject({
+                    rows: [[expect.objectContaining({
+                        raw: prefix[normalized_row] ?? `long value ${normalized_row}`,
+                    })]],
+                });
+            }
+            expect(headers_read).toBe(request_count);
+            expect(internals.gso_location_bytes).toBe(object_count * 5);
             expect(internals.gso_index.size).toBeLessThanOrEqual(1_024);
         },
     );
@@ -2482,6 +2510,7 @@ describe('DtaDataSource', () => {
             gso_index: Map<string, { content_offset: number }>;
             gso_cache: Map<string, string>;
             gso_seen_identifiers?: Uint8Array;
+            gso_location_bytes: number;
             gso_scan_position: number;
         };
         expect(source.read_raw_columns(0, 0, 2, [4]).rows.map((row) => row[0]?.raw))
@@ -2489,6 +2518,7 @@ describe('DtaDataSource', () => {
         const indexed_before_duplicate = [...internals.gso_index];
         const cached_before_duplicate = [...internals.gso_cache];
         const seen_before_duplicate = internals.gso_seen_identifiers?.slice();
+        const location_bytes_before_duplicate = internals.gso_location_bytes;
 
         expect(() => source.read_raw_columns(0, 2, 1, [4])).toThrow(
             'Corrupt .dta file: duplicate strL object id 5:1',
@@ -2496,16 +2526,18 @@ describe('DtaDataSource', () => {
         expect([...internals.gso_index]).toEqual(indexed_before_duplicate);
         expect([...internals.gso_cache]).toEqual(cached_before_duplicate);
         expect(internals.gso_seen_identifiers).toEqual(seen_before_duplicate);
+        expect(internals.gso_location_bytes).toBe(location_bytes_before_duplicate);
         expect(internals.gso_scan_position).toBe(records[2].start);
     });
 
-    it('rejects duplicate strL ids after the original leaves the location LRU', async () => {
+    it('rejects duplicate strL ids after the original leaves the physical LRU', async () => {
         const fixture = build_dta_fixture(1_026);
         const records = release118_gso_records(fixture);
         new DataView(fixture.buffer).setBigUint64(records[1_025].start + 7, 1n, true);
         const source = await DtaDataSource.create(fixture);
         const internals = source as unknown as {
             gso_index: Map<string, unknown>;
+            gso_location_bytes: number;
             gso_scan_position: number;
         };
 
@@ -2514,6 +2546,7 @@ describe('DtaDataSource', () => {
         );
         expect(internals.gso_index.size).toBe(1_024);
         expect(internals.gso_index.has('5:1')).toBe(false);
+        expect(internals.gso_location_bytes).toBe(1_025 * 5);
         expect(internals.gso_scan_position).toBe(records[1_025].start);
     });
 
@@ -2597,14 +2630,21 @@ describe('DtaDataSource', () => {
             bytes?: Uint8Array;
             decoded_value_label_tables: Map<string, unknown>;
             decoded_value_label_cache_bytes: number;
+            gso_locations: Map<number, unknown>;
+            gso_location_bytes: number;
         };
         source.column_filter_metadata(0, 0);
+        source.read_rows(0, 0, 4);
         expect(internals.decoded_value_label_cache_bytes).toBeGreaterThan(0);
+        expect(internals.gso_locations.size).toBeGreaterThan(0);
+        expect(internals.gso_location_bytes).toBeGreaterThan(0);
         source.close();
         source.close();
         expect(internals.bytes).toBeUndefined();
         expect(internals.decoded_value_label_tables.size).toBe(0);
         expect(internals.decoded_value_label_cache_bytes).toBe(0);
+        expect(internals.gso_locations.size).toBe(0);
+        expect(internals.gso_location_bytes).toBe(0);
         expect(() => source.read_rows(0, 0, 1)).toThrow(/closed/);
         expect(() => source.read_raw_columns(0, 0, 0, [])).toThrow(/closed/);
         expect(() => source.column_filter_metadata(0, 1)).toThrow(/closed/);
