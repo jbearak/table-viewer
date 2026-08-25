@@ -1536,6 +1536,59 @@ describe('DtaDataSource', () => {
         expect(left_key).not.toBe(right_key);
     });
 
+    it('reserves payload work before comparing unequal binary chunks', async () => {
+        const left_payload = new Uint8Array(64).fill(0x2a);
+        const right_payload = left_payload.slice();
+        right_payload[63] = 0x2b;
+        const left = await DtaDataSource.create(
+            build_release119_strl_fixture(left_payload, 129),
+        );
+        const right = await DtaDataSource.create(
+            build_release119_strl_fixture(right_payload, 129),
+        );
+        const left_cell = left.read_raw_columns(0, 0, 1, [0]).rows[0][0]!;
+        const right_cell = right.read_raw_columns(0, 0, 1, [0]).rows[0][0]!;
+        const internals = left as unknown as {
+            source_work_yield?: Promise<void>;
+            source_work_payload_bytes: number;
+            binary_digest_computations: number;
+        };
+        let release_gate!: () => void;
+        const gate = new Promise<void>((resolve) => { release_gate = resolve; });
+        internals.source_work_yield = gate;
+        void gate.then(() => {
+            if (internals.source_work_yield === gate) internals.source_work_yield = undefined;
+        });
+
+        const compare = vi.spyOn(Buffer, 'compare');
+        try {
+            const equality = cells_exactly_equal(
+                left_cell,
+                right_cell,
+                () => false,
+            ) as Promise<boolean>;
+            let settled = false;
+            void equality.then(
+                () => { settled = true; },
+                () => { settled = true; },
+            );
+            expect(compare).not.toHaveBeenCalled();
+            expect(settled).toBe(false);
+            expect(internals.source_work_payload_bytes).toBe(0);
+
+            release_gate();
+            await expect(equality).resolves.toBe(false);
+            expect(compare).toHaveBeenCalledTimes(1);
+            expect(internals.source_work_payload_bytes).toBe(left_payload.length);
+            expect(internals.binary_digest_computations).toBe(0);
+            expect((right as unknown as { binary_digest_computations: number })
+                .binary_digest_computations).toBe(0);
+        } finally {
+            release_gate();
+            compare.mockRestore();
+        }
+    });
+
     it('awaits the cooperative yield scheduled by the final binary chunk', async () => {
         const payload = new Uint8Array(64).fill(0x39);
         const left = await DtaDataSource.create(

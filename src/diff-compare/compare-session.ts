@@ -126,6 +126,8 @@ function merge_filter_metadata(
 
 interface DiffWaiter {
     readonly isCancelled: () => boolean;
+    readonly cancellation: Promise<never>;
+    rejectCancellation(): void;
 }
 
 interface InFlightDiff {
@@ -136,11 +138,21 @@ interface InFlightDiff {
     promise?: Promise<CompareDiffWindow>;
 }
 
-function all_diff_waiters_cancelled(waiters: ReadonlySet<DiffWaiter>): boolean {
-    for (const waiter of waiters) {
-        if (!waiter.isCancelled()) return false;
-    }
-    return true;
+function diff_waiter(is_cancelled: () => boolean): DiffWaiter {
+    let reject!: (error: Error) => void;
+    let rejected = false;
+    const cancellation = new Promise<never>((_resolve, reject_promise) => {
+        reject = reject_promise;
+    });
+    return {
+        isCancelled: is_cancelled,
+        cancellation,
+        rejectCancellation: () => {
+            if (rejected) return;
+            rejected = true;
+            reject(compare_abort_error());
+        },
+    };
 }
 
 function sorted_number_array_index(
@@ -923,7 +935,7 @@ export class CompareDataSource implements DataSource {
             return cached.window;
         }
 
-        const waiter: DiffWaiter = { isCancelled: is_cancelled };
+        const waiter = diff_waiter(is_cancelled);
         let operation = this.diff_in_flight.get(key);
         // Do not attach fresh work to an operation already committed to aborting.
         // Its sibling read may still be settling, but it can no longer produce a
@@ -973,7 +985,10 @@ export class CompareDataSource implements DataSource {
         }
 
         try {
-            const window = await operation.promise!;
+            const window = await Promise.race([
+                operation.promise!,
+                waiter.cancellation,
+            ]);
             if (
                 this.closed
                 || this.lifecycle_epoch !== operation.epoch
@@ -987,9 +1002,17 @@ export class CompareDataSource implements DataSource {
 
     private shared_diff_cancelled(operation: InFlightDiff): boolean {
         if (operation.cancelled) return true;
-        const cancelled = this.closed
-            || this.lifecycle_epoch !== operation.epoch
-            || all_diff_waiters_cancelled(operation.waiters);
+        const lifecycle_cancelled = this.closed || this.lifecycle_epoch !== operation.epoch;
+        let cancelled_waiters: DiffWaiter[] | undefined;
+        for (const waiter of operation.waiters) {
+            if (!lifecycle_cancelled && !waiter.isCancelled()) continue;
+            (cancelled_waiters ??= []).push(waiter);
+        }
+        if (cancelled_waiters !== undefined) {
+            for (const waiter of cancelled_waiters) operation.waiters.delete(waiter);
+            for (const waiter of cancelled_waiters) waiter.rejectCancellation();
+        }
+        const cancelled = lifecycle_cancelled || operation.waiters.size === 0;
         if (cancelled) {
             operation.cancelled = true;
             operation.terminal = true;
@@ -1589,6 +1612,9 @@ export class CompareDataSource implements DataSource {
         this.lifecycle_epoch += 1;
         this.diff_cache.clear();
         this.diff_cache_bytes = 0;
+        for (const operation of this.diff_in_flight.values()) {
+            this.shared_diff_cancelled(operation);
+        }
         this.diff_in_flight.clear();
         this.alignments.clear();
         this.deleted_grid_rows.clear();

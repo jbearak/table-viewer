@@ -901,6 +901,32 @@ describe('align_sheet', () => {
         expect(reads).toBe(2);
     });
 
+    it('charges eager text work while scoring one moved row', async () => {
+        const left_text = 'x'.repeat(300_000);
+        const right_text = `${left_text.slice(0, -1)}x`;
+        let cancelled = false;
+        let scheduled = false;
+        const original = new NativeRawFixtureSource([
+            [raw_cell(left_text), raw_cell('old')],
+            [raw_cell('anchor')],
+        ]);
+        const modified = new NativeRawFixtureSource([
+            [raw_cell('anchor')],
+            [raw_cell(right_text), raw_cell('new')],
+        ], undefined, () => {
+            if (scheduled) return;
+            scheduled = true;
+            setImmediate(() => { cancelled = true; });
+        });
+
+        await expect(align_sheet(original, modified, matched, {
+            isCancelled: () => cancelled,
+        })).rejects.toBeInstanceOf(AlignmentCancelledError);
+
+        expect(original.indexedReads).toBe(1);
+        expect(modified.indexedReads).toBe(1);
+    });
+
     it('does not hunt for moves in a degraded alignment', async () => {
         // A degraded alignment is positional and means "these files do not
         // correspond"; decorating it with moves would dress a failed alignment
@@ -931,6 +957,94 @@ describe('align_sheet', () => {
                 },
             },
         )).rejects.toBeInstanceOf(AlignmentCancelledError);
+    });
+
+    it('yields while constructing a large paired replacement block', async () => {
+        const size = 60;
+        let cancelled = false;
+        let scheduled = false;
+        const original = new NativeRawFixtureSource(Array.from(
+            { length: size },
+            (_, index) => [raw_cell(`left-${index}`)],
+        ));
+        const modified = new NativeRawFixtureSource(Array.from(
+            { length: size },
+            (_, index) => [raw_cell(`right-${index}`)],
+        ), () => {
+            if (scheduled) return;
+            scheduled = true;
+            setImmediate(() => { cancelled = true; });
+        });
+
+        await expect(align_sheet(original, modified, matched, {
+            maxEditDistance: size * 2,
+            maxMoveSearchRows: 0,
+            rowsPerCheckpoint: 62,
+            isCancelled: () => cancelled,
+        })).rejects.toBeInstanceOf(AlignmentCancelledError);
+
+        expect(original.indexedReads).toBe(0);
+        expect(modified.indexedReads).toBe(0);
+    });
+
+    it('yields during the early move-detection passes', async () => {
+        const size = 30;
+        let cancelled = false;
+        let scheduled = false;
+        const original = new NativeRawFixtureSource([
+            ...Array.from({ length: size }, (_, index) => [raw_cell(`left-${index}`)]),
+            [raw_cell('anchor')],
+        ]);
+        const modified = new NativeRawFixtureSource([
+            [raw_cell('anchor')],
+            ...Array.from({ length: size }, (_, index) => [raw_cell(`right-${index}`)]),
+        ], () => {
+            if (scheduled) return;
+            scheduled = true;
+            setImmediate(() => { cancelled = true; });
+        });
+
+        await expect(align_sheet(original, modified, matched, {
+            maxMoveSearchRows: 0,
+            rowsPerCheckpoint: 90,
+            isCancelled: () => cancelled,
+        })).rejects.toBeInstanceOf(AlignmentCancelledError);
+
+        expect(original.indexedReads).toBe(0);
+        expect(modified.indexedReads).toBe(0);
+    });
+
+    it('yields during late move filtering and rebuilding', async () => {
+        const size = 15;
+        const common = raw_cell('common-value');
+        let cancelled = false;
+        let scheduled = false;
+        const original = new NativeRawFixtureSource([
+            ...Array.from({ length: size }, (_, index) => [
+                common,
+                raw_cell(`left-${index}`),
+            ]),
+            [raw_cell('anchor')],
+        ]);
+        const modified = new NativeRawFixtureSource([
+            [raw_cell('anchor')],
+            ...Array.from({ length: size }, (_, index) => [
+                common,
+                raw_cell(`right-${index}`),
+            ]),
+        ], undefined, () => {
+            if (scheduled) return;
+            scheduled = true;
+            setImmediate(() => { cancelled = true; });
+        });
+
+        await expect(align_sheet(original, modified, matched, {
+            rowsPerCheckpoint: 100,
+            isCancelled: () => cancelled,
+        })).rejects.toBeInstanceOf(AlignmentCancelledError);
+
+        expect(original.indexedReads).toBe(1);
+        expect(modified.indexedReads).toBe(1);
     });
 
     it('pairs a replaced block row for row, then reports the excess', async () => {
@@ -1195,6 +1309,28 @@ describe('align_sheet', () => {
             setImmediate(() => { cancelled = true; });
         });
         const modified = new NativeRawFixtureSource([[value]]);
+
+        await expect(align_sheet(original, modified, matched, {
+            isCancelled: () => cancelled,
+        })).rejects.toBeInstanceOf(AlignmentCancelledError);
+
+        expect(original.rangeReads).toBe(1);
+        expect(modified.rangeReads).toBe(0);
+    });
+
+    it('accumulates eager hash work across individually bounded rows', async () => {
+        const rows = [
+            [raw_cell('x'.repeat(200_000))],
+            [raw_cell('y'.repeat(200_000))],
+        ];
+        let cancelled = false;
+        let scheduled = false;
+        const original = new NativeRawFixtureSource(rows, () => {
+            if (scheduled) return;
+            scheduled = true;
+            setImmediate(() => { cancelled = true; });
+        });
+        const modified = new NativeRawFixtureSource(rows);
 
         await expect(align_sheet(original, modified, matched, {
             isCancelled: () => cancelled,

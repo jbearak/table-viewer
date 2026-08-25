@@ -2229,8 +2229,8 @@ export class DtaDataSource implements DataSource {
         is_cancelled: () => boolean,
     ): Promise<boolean> {
         const chunk_bytes = Math.max(1, Math.min(
-            this.binary_identity_chunk_bytes,
-            other_source.binary_identity_chunk_bytes,
+            this.payload_work_chunk_bytes(),
+            other_source.payload_work_chunk_bytes(),
         ));
         for (let compared = 0; compared < binary.contentLength;) {
             this.assert_binary_comparison_active(
@@ -2240,16 +2240,38 @@ export class DtaDataSource implements DataSource {
                 is_cancelled,
             );
             const count = Math.min(chunk_bytes, binary.contentLength - compared);
+            const reserved = this.reserve_payload_work(count, false);
+            if (reserved !== undefined) {
+                await reserved;
+                continue;
+            }
+            this.assert_binary_comparison_active(
+                lifecycle_epoch,
+                other_source,
+                other_lifecycle_epoch,
+                is_cancelled,
+            );
             const left_start = binary.contentOffset + compared;
             const right_start = other_binary.contentOffset + compared;
-            if (Buffer.compare(
+            const equal = Buffer.compare(
                 this.open_bytes().subarray(left_start, left_start + count),
                 other_source.open_bytes().subarray(right_start, right_start + count),
-            ) !== 0) return false;
+            ) === 0;
             compared += count;
-            const scheduled = this.schedule_source_work('payloadBytes', count);
-            if (scheduled !== undefined) await scheduled;
-            else if (compared < binary.contentLength) await this.yield_source_work();
+            const exhausted = this.schedule_source_work('payloadBytes', 0);
+            if (exhausted !== undefined) {
+                await exhausted;
+                this.assert_binary_comparison_active(
+                    lifecycle_epoch,
+                    other_source,
+                    other_lifecycle_epoch,
+                    is_cancelled,
+                );
+            }
+            if (!equal) return false;
+            if (exhausted === undefined && compared < binary.contentLength) {
+                await this.yield_source_work();
+            }
         }
         this.assert_binary_comparison_active(
             lifecycle_epoch,

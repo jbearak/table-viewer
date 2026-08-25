@@ -126,7 +126,9 @@ work is suspended, and concurrent asynchronous work can progress between
 yields. Numeric-only asynchronous projections therefore yield and observe
 cancellation even when no `strL` column is selected. Deferred binary digest
 single-flight jobs retain their cache bounds while routing work accounting
-through the same scheduler.
+through the same scheduler. Direct exact binary comparison reserves each chunk
+before examining its bytes, including chunks that prove unequal, and observes an
+already-pending or newly exhausted payload gate without charging the chunk twice.
 
 ## Monotonic value-label descriptors and exact boundaries
 
@@ -187,10 +189,15 @@ snake cells as work. It yields to a real event-loop turn and checks cancellation
 after every one million units of work, so the default distance cap cannot hide a
 roughly 100-million-iteration root search behind one synchronous turn while the
 host is trying to cancel it. Eager row hashing additionally charges both cells
-and UTF-16 code units, yielding after every 262,144 units, so one very large
-string cannot monopolize the event loop. Finite row checkpoint overrides are
-floored and clamped to at least one; non-finite values fall back to the built-in
-4,096-row bound instead of disabling cancellation checkpoints.
+and UTF-16 code units cumulatively across rows and both source sides, yielding
+after every 262,144 units so neither one very large string nor many individually
+bounded rows can monopolize the event loop. Inexact move scoring retains its
+20,000-pair bound and separately charges sparse-cell traversal plus equal-length
+eager text comparisons. Expanding the edit script and every production-sized
+linear move-detection pass share cooperative row-work checkpoints. Finite row
+checkpoint overrides are floored and clamped to at least one; non-finite values
+fall back to the built-in 4,096-row bound instead of disabling cancellation
+checkpoints.
 
 ## Compare lifecycle and metadata contribution
 
@@ -210,7 +217,11 @@ failure cancels and settles its peers before the operation rejects. Each worker
 also yields after 16,384 eager comparisons, bounding the four-worker aggregate to
 about 65,536 eager cells per event-loop turn. Exact post-alignment change counting
 uses the same 65,536-cell work bound across columns, so one unusually wide eager
-row remains cancellable.
+row remains cancellable. Coalesced page callers have independent cancellation
+promises: a canceled waiter is removed and rejected at the next shared checkpoint
+without retaining its request until a live peer finishes, while shared work and
+cache publication continue for any remaining waiter. Closing the compare source
+rejects all such waiter races before clearing the in-flight catalog.
 
 Filter metadata is merged by values that can actually appear in the compare
 grid. Nonempty added or unmatched modified sheets use modified metadata;
@@ -235,11 +246,14 @@ cancellation, monotonic descriptor discovery, verified missing-name
 publication, cancellable legacy probing, exact label and section boundaries,
 Windows-1252 versus true ISO-8859-1 behavior, the real FNV collision, sparse
 exact-move verification, bounded compatibility chunks, eager string and wide-row
-cancellation, non-finite checkpoint normalization, paired sibling settlement,
-lifecycle fencing, bounded eager and deferred comparisons, empty-sheet
-suppression, and contribution-aware label merging. Asynchronous tests poll
-observable state with `vi.waitFor`; no fixed-delay or fixed-turn synchronization
-remains in the Stage 4 tests touched by this tranche.
+cancellation, cumulative cross-row hash work, eager move-score text work,
+cooperative edit-script and move-pass construction, non-finite checkpoint
+normalization, paired sibling settlement, lifecycle fencing, canceled coalesced
+waiter detachment, bounded eager and deferred comparisons, pre-reserved unequal
+binary work, empty-sheet suppression, and contribution-aware label merging.
+Asynchronous tests synchronize on controlled gates or poll observable state with
+`vi.waitFor`; no fixed-delay or fixed-turn synchronization remains in the Stage 4
+tests touched by this tranche.
 
 Stage 5 removed the obsolete pre-118 fixed-string redecode and synchronous
 non-UTF-8 text-GSO decoder while retaining the objectively necessary bounded and

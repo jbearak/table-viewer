@@ -80,7 +80,7 @@ export interface AlignSheetOptions {
      * through however long it is.
      */
     readonly maxEditDistance?: number;
-    /** Rows hashed between cancellation checks. */
+    /** Rows or linear alignment units between cancellation checks. */
     readonly rowsPerCheckpoint?: number;
     /** Cap on leftover rows per side entering the inexact move phase. See
      *  {@link MOVE_SEARCH_LIMIT}. */
@@ -235,8 +235,14 @@ const MOVE_SEARCH_LIMIT = 1000;
  *  loop can run a million comparisons with no read between them, so reads are
  *  not sufficient yield points here. */
 const MOVE_SCORES_PER_CHECKPOINT = 20_000;
+/** Eager similarity cells/code units between real event-loop checkpoints. */
+const MOVE_SIMILARITY_WORK_PER_CHECKPOINT = HASH_WORK_PER_CHECKPOINT;
 
 type ComparisonCell = RawCell | null | undefined;
+
+interface HashWorkState {
+    sinceCheckpoint: number;
+}
 
 /** Visit comparison text synchronously until either materialization or the
  * visitor itself defers, then resume without imposing a microtask on ordinary
@@ -289,9 +295,9 @@ function hash_row(
     column_count: number,
     is_cancelled: () => boolean,
     seed: number,
+    work: HashWorkState,
 ): number | Promise<number> {
     let hash = seed;
-    let work_since_checkpoint = 0;
     const mix = (value: number) => {
         hash ^= value;
         hash = Math.imul(hash, 0x01000193);
@@ -304,19 +310,19 @@ function hash_row(
         // comparison identities in a disjoint namespace. Complementing the
         // identity length cannot collide with an ordinary nonnegative length.
         mix(comparison_identity ? ~text_length : text_length);
-        work_since_checkpoint += 1;
+        work.sinceCheckpoint += 1;
         const continue_at = (start: number): void | Promise<void> => {
             let position = start;
             while (
                 position < tagged_text.length
-                && work_since_checkpoint < HASH_WORK_PER_CHECKPOINT
+                && work.sinceCheckpoint < HASH_WORK_PER_CHECKPOINT
             ) {
                 mix(tagged_text.charCodeAt(position));
                 position += 1;
-                work_since_checkpoint += 1;
+                work.sinceCheckpoint += 1;
             }
-            if (work_since_checkpoint < HASH_WORK_PER_CHECKPOINT) return;
-            work_since_checkpoint = 0;
+            if (work.sinceCheckpoint < HASH_WORK_PER_CHECKPOINT) return;
+            work.sinceCheckpoint = 0;
             return yield_to_event_loop().then(() => {
                 if (is_cancelled()) throw new AlignmentCancelledError();
                 return continue_at(position);
@@ -348,6 +354,7 @@ async function hash_side(
     scanned_before: number,
     total_rows: number,
     options: AlignSheetOptions,
+    work: HashWorkState,
 ): Promise<Uint32Array> {
     const hashes = new Uint32Array(row_count);
     const checkpoint = rows_per_checkpoint(options.rowsPerCheckpoint);
@@ -369,6 +376,7 @@ async function hash_side(
                 column_count,
                 is_cancelled,
                 seed,
+                work,
             );
             hashes[start + offset] = typeof hash === 'number'
                 ? hash
@@ -381,6 +389,7 @@ async function hash_side(
             // Yield so the host stays responsive and a cancel is observed
             // promptly on a file large enough for this to matter.
             await yield_to_event_loop();
+            work.sinceCheckpoint = 0;
             if (options.isCancelled?.()) throw new AlignmentCancelledError();
         }
     }
@@ -765,6 +774,7 @@ export async function align_sheet(
     const column_count = Math.max(original_sheet.columnCount, modified_sheet.columnCount);
     const total_rows = original_rows + modified_rows;
     const max_distance = options.maxEditDistance ?? DEFAULT_MAX_EDIT_DISTANCE;
+    const hash_work: HashWorkState = { sinceCheckpoint: 0 };
 
     for (let attempt = 0; attempt < ROW_HASH_SEEDS.length; attempt++) {
         // The first scan owns user-visible progress. A collision retry starts
@@ -783,6 +793,7 @@ export async function align_sheet(
             0,
             total_rows,
             hash_options,
+            hash_work,
         );
         const modified_hashes = await hash_side(
             modified,
@@ -793,6 +804,7 @@ export async function align_sheet(
             original_rows,
             total_rows,
             hash_options,
+            hash_work,
         );
 
         // Trim matching ends. Cheap, and on a normal edit it leaves the Myers step
@@ -832,11 +844,19 @@ export async function align_sheet(
             );
         }
 
+        const initial_rows = await build_rows(
+            script,
+            prefix,
+            suffix,
+            original_rows,
+            modified_rows,
+            options,
+        );
         const detected = await detect_moves(
             original,
             modified,
             pairing,
-            build_rows(script, prefix, suffix, original_rows, modified_rows),
+            initial_rows,
             original_hashes,
             modified_hashes,
             options,
@@ -921,23 +941,43 @@ async function positional_degraded_alignment(
  * each other. Only adjacent runs pair — a row deleted here and a similar row
  * inserted far below is a move, and stays a delete plus an add.
  */
-function build_rows(
+async function build_rows(
     script: EditScript,
     prefix: number,
     suffix: number,
     original_rows: number,
     modified_rows: number,
-): AlignedRow[] {
+    options: AlignSheetOptions,
+): Promise<AlignedRow[]> {
     const rows: AlignedRow[] = [];
-    for (let row = 0; row < prefix; row++) rows.push({ original: row, modified: row });
+    const checkpoint = rows_per_checkpoint(options.rowsPerCheckpoint);
+    const is_cancelled = options.isCancelled ?? NEVER_CANCELLED;
+    let since_checkpoint = 0;
+    const charge_work = (): Promise<void> | undefined => {
+        since_checkpoint += 1;
+        if (since_checkpoint < checkpoint) return undefined;
+        since_checkpoint = 0;
+        return yield_to_event_loop().then(() => {
+            if (is_cancelled()) throw new AlignmentCancelledError();
+        });
+    };
+    for (let row = 0; row < prefix; row++) {
+        rows.push({ original: row, modified: row });
+        const yielding = charge_work();
+        if (yielding !== undefined) await yielding;
+    }
     let original_row = prefix;
     let modified_row = prefix;
     const ops = script.ops;
     for (let index = 0; index < ops.length; index++) {
         const op = ops[index];
+        const op_yield = charge_work();
+        if (op_yield !== undefined) await op_yield;
         if (op.kind === 'equal') {
             for (let step = 0; step < op.count; step++) {
                 rows.push({ original: original_row++, modified: modified_row++ });
+                const yielding = charge_work();
+                if (yielding !== undefined) await yielding;
             }
             continue;
         }
@@ -950,17 +990,25 @@ function build_rows(
             if (ops[scan].kind === 'delete') deletes += ops[scan].count;
             else inserts += ops[scan].count;
             scan++;
+            const yielding = charge_work();
+            if (yielding !== undefined) await yielding;
         }
         index = scan - 1;
         const paired = Math.min(deletes, inserts);
         for (let step = 0; step < paired; step++) {
             rows.push({ original: original_row++, modified: modified_row++ });
+            const yielding = charge_work();
+            if (yielding !== undefined) await yielding;
         }
         for (let step = paired; step < deletes; step++) {
             rows.push({ original: original_row++, modified: ABSENT });
+            const yielding = charge_work();
+            if (yielding !== undefined) await yielding;
         }
         for (let step = paired; step < inserts; step++) {
             rows.push({ original: ABSENT, modified: modified_row++ });
+            const yielding = charge_work();
+            if (yielding !== undefined) await yielding;
         }
     }
     for (let step = 0; step < suffix; step++) {
@@ -968,6 +1016,8 @@ function build_rows(
             original: original_rows - suffix + step,
             modified: modified_rows - suffix + step,
         });
+        const yielding = charge_work();
+        if (yielding !== undefined) await yielding;
     }
     return rows;
 }
@@ -1197,22 +1247,40 @@ async function normalize_candidates(
  * Catching it would need intra-cell chunk matching — a second diff algorithm
  * with its own effort cap.
  */
-function similarity_of(left: CandidateRow, right: CandidateRow): number {
+interface SimilarityResult {
+    readonly similarity: number;
+    readonly eagerWork: number;
+}
+
+function similarity_of(left: CandidateRow, right: CandidateRow): SimilarityResult {
     const max_total = Math.max(left.length, right.length);
+    let eager_work = 0;
     // Ordinary blank rows have no cells and remain identical. Explicit
     // zero-weight identities (for example, empty binary payloads) must agree;
     // otherwise different values with empty previews would be paired as moves.
     if (max_total === 0) {
-        if (left.cells.length !== right.cells.length) return 0;
-        return left.cells.every((cell, index) => {
+        if (left.cells.length !== right.cells.length) {
+            return { similarity: 0, eagerWork: 1 };
+        }
+        for (let index = 0; index < left.cells.length; index++) {
+            eager_work += 1;
+            const cell = left.cells[index];
             const other = right.cells[index];
-            return cell.column === other.column && cell.text === other.text;
-        }) ? 1 : 0;
+            if (cell.column !== other.column) {
+                return { similarity: 0, eagerWork: eager_work };
+            }
+            if (cell.text.length === other.text.length) eager_work += cell.text.length;
+            if (cell.text !== other.text) {
+                return { similarity: 0, eagerWork: eager_work };
+            }
+        }
+        return { similarity: 1, eagerWork: eager_work };
     }
     let matched = 0;
     let left_index = 0;
     let right_index = 0;
     while (left_index < left.cells.length && right_index < right.cells.length) {
+        eager_work += 1;
         const left_cell = left.cells[left_index];
         const right_cell = right.cells[right_index];
         if (left_cell.column < right_cell.column) {
@@ -1222,6 +1290,9 @@ function similarity_of(left: CandidateRow, right: CandidateRow): number {
         if (right_cell.column < left_cell.column) {
             right_index++;
             continue;
+        }
+        if (left_cell.text.length === right_cell.text.length) {
+            eager_work += left_cell.text.length;
         }
         if (left_cell.text === right_cell.text) {
             matched += Math.min(left_cell.weight, right_cell.weight);
@@ -1234,7 +1305,10 @@ function similarity_of(left: CandidateRow, right: CandidateRow): number {
     // stopping at the verdict would flatten every survivor to "at least
     // half" and leave only displacement to choose between a 50% match and a
     // 95% one.
-    return is_at_least_half(matched, max_total) ? matched / max_total : 0;
+    return {
+        similarity: is_at_least_half(matched, max_total) ? matched / max_total : 0,
+        eagerWork: eager_work,
+    };
 }
 
 interface ExactMoveCandidate {
@@ -1344,12 +1418,26 @@ async function detect_moves(
     hashCollision: boolean;
 }> {
     if (options.isCancelled?.()) throw new AlignmentCancelledError();
+    const checkpoint = rows_per_checkpoint(options.rowsPerCheckpoint);
+    const is_cancelled = options.isCancelled ?? NEVER_CANCELLED;
+    let since_checkpoint = 0;
+    const charge_work = (): Promise<void> | undefined => {
+        since_checkpoint += 1;
+        if (since_checkpoint < checkpoint) return undefined;
+        since_checkpoint = 0;
+        return yield_to_event_loop().then(() => {
+            if (is_cancelled()) throw new AlignmentCancelledError();
+        });
+    };
     const deleted: Leftover[] = [];
     const added: Leftover[] = [];
-    rows.forEach((row, grid_row) => {
+    for (let grid_row = 0; grid_row < rows.length; grid_row++) {
+        const row = rows[grid_row];
         if (row.modified === ABSENT) deleted.push({ row: row.original, gridRow: grid_row });
         else if (row.original === ABSENT) added.push({ row: row.modified, gridRow: grid_row });
-    });
+        const yielding = charge_work();
+        if (yielding !== undefined) await yielding;
+    }
     if (deleted.length === 0 || added.length === 0) {
         // Returned as-is, not copied: the caller treats it as readonly, and on
         // a million-row sheet with nothing one-sided the copy was the largest
@@ -1382,6 +1470,8 @@ async function detect_moves(
         const bucket = by_hash.get(original_hashes[entry.row]);
         if (bucket) bucket.entries.push(entry);
         else by_hash.set(original_hashes[entry.row], { entries: [entry], next: 0 });
+        const yielding = charge_work();
+        if (yielding !== undefined) await yielding;
     }
     const exact_candidates: ExactMoveCandidate[] = [];
     for (const entry of added) {
@@ -1389,30 +1479,33 @@ async function detect_moves(
         // order on both sides. Rejected collisions remain unmatched; deliberately
         // do not search the bucket quadratically for a different candidate.
         const bucket = by_hash.get(modified_hashes[entry.row]);
-        if (bucket === undefined || bucket.next >= bucket.entries.length) continue;
-        exact_candidates.push({
-            originalRow: bucket.entries[bucket.next++].row,
-            modifiedRow: entry.row,
-        });
-        if (exact_candidates.length === HASH_READ_BATCH) {
-            const hash_collision = await verify_exact_move_candidates(
-                original,
-                modified,
-                pairing,
-                exact_candidates,
-                claim,
-                options,
-            );
-            if (hash_collision) {
-                return {
-                    rows,
-                    movedRowIndices: [],
-                    moveSearchTruncated: false,
-                    hashCollision: true,
-                };
+        if (bucket !== undefined && bucket.next < bucket.entries.length) {
+            exact_candidates.push({
+                originalRow: bucket.entries[bucket.next++].row,
+                modifiedRow: entry.row,
+            });
+            if (exact_candidates.length === HASH_READ_BATCH) {
+                const hash_collision = await verify_exact_move_candidates(
+                    original,
+                    modified,
+                    pairing,
+                    exact_candidates,
+                    claim,
+                    options,
+                );
+                if (hash_collision) {
+                    return {
+                        rows,
+                        movedRowIndices: [],
+                        moveSearchTruncated: false,
+                        hashCollision: true,
+                    };
+                }
+                exact_candidates.length = 0;
             }
-            exact_candidates.length = 0;
         }
+        const yielding = charge_work();
+        if (yielding !== undefined) await yielding;
     }
     if (exact_candidates.length > 0) {
         const hash_collision = await verify_exact_move_candidates(
@@ -1433,8 +1526,18 @@ async function detect_moves(
         }
     }
 
-    const unmatched_deleted = deleted.filter((entry) => !original_to_modified.has(entry.row));
-    const unmatched_added = added.filter((entry) => !modified_to_original.has(entry.row));
+    const unmatched_deleted: Leftover[] = [];
+    for (const entry of deleted) {
+        if (!original_to_modified.has(entry.row)) unmatched_deleted.push(entry);
+        const yielding = charge_work();
+        if (yielding !== undefined) await yielding;
+    }
+    const unmatched_added: Leftover[] = [];
+    for (const entry of added) {
+        if (!modified_to_original.has(entry.row)) unmatched_added.push(entry);
+        const yielding = charge_work();
+        if (yielding !== undefined) await yielding;
+    }
     let truncated = false;
     if (unmatched_deleted.length > 0 && unmatched_added.length > 0) {
         const requested_limit = options.maxMoveSearchRows;
@@ -1469,16 +1572,19 @@ async function detect_moves(
     const rebuilt: AlignedRow[] = [];
     const moved_row_indices: number[] = [];
     for (const row of rows) {
-        if (row.modified === ABSENT && original_to_modified.has(row.original)) continue;
-        const origin = row.original === ABSENT
-            ? modified_to_original.get(row.modified)
-            : undefined;
-        if (origin !== undefined) {
-            moved_row_indices.push(rebuilt.length);
-            rebuilt.push({ original: origin, modified: row.modified });
-            continue;
+        if (!(row.modified === ABSENT && original_to_modified.has(row.original))) {
+            const origin = row.original === ABSENT
+                ? modified_to_original.get(row.modified)
+                : undefined;
+            if (origin !== undefined) {
+                moved_row_indices.push(rebuilt.length);
+                rebuilt.push({ original: origin, modified: row.modified });
+            } else {
+                rebuilt.push(row);
+            }
         }
-        rebuilt.push(row);
+        const yielding = charge_work();
+        if (yielding !== undefined) await yielding;
     }
     return {
         rows: rebuilt,
@@ -1556,7 +1662,8 @@ async function score_moves(
     );
 
     const candidates: MoveCandidate[] = [];
-    let scored = 0;
+    let scored_since_checkpoint = 0;
+    let eager_work_since_checkpoint = 0;
     for (let added_index = 0; added_index < unmatched_added.length; added_index++) {
         const destination = unmatched_added[added_index];
         const destination_row = destinations[added_index];
@@ -1570,12 +1677,14 @@ async function score_moves(
             // length never reaches a checkpoint, so the loop cannot be
             // cancelled — and rejection is the cheap-per-pair case, which is
             // exactly where the iteration count runs highest.
-            scored++;
-            if (scored % MOVE_SCORES_PER_CHECKPOINT === 0) {
+            scored_since_checkpoint += 1;
+            if (scored_since_checkpoint >= MOVE_SCORES_PER_CHECKPOINT) {
                 // The loop can run a million iterations with no read between
                 // them, so reads are not sufficient yield points here.
                 await yield_to_event_loop();
-                if (options.isCancelled?.()) throw new AlignmentCancelledError();
+                scored_since_checkpoint = 0;
+                eager_work_since_checkpoint = 0;
+                if (is_cancelled()) throw new AlignmentCancelledError();
             }
             const source = unmatched_deleted[deleted_index];
             const source_row = sources[deleted_index];
@@ -1585,15 +1694,22 @@ async function score_moves(
             // compare cells to reach a conclusion arithmetic already reached.
             const delta = Math.abs(source_row.length - destination_row.length);
             if (max_length > 0 && !is_at_least_half(max_length - delta, max_length)) continue;
-            const similarity = similarity_of(source_row, destination_row);
-            if (similarity === 0) continue;
+            const scored = similarity_of(source_row, destination_row);
+            eager_work_since_checkpoint += scored.eagerWork;
+            if (eager_work_since_checkpoint >= MOVE_SIMILARITY_WORK_PER_CHECKPOINT) {
+                await yield_to_event_loop();
+                scored_since_checkpoint = 0;
+                eager_work_since_checkpoint = 0;
+                if (is_cancelled()) throw new AlignmentCancelledError();
+            }
+            if (scored.similarity === 0) continue;
             // Displacement only separates equally strong matches: of two
             // sources that resemble the destination alike, the one that moved
             // less is the likelier origin.
             const candidate: MoveCandidate = {
                 originalRow: source.row,
                 modifiedRow: destination.row,
-                similarity,
+                similarity: scored.similarity,
                 displacement: Math.abs(source.gridRow - destination.gridRow),
             };
             // Sorted on every insert, which is free at this size and avoids

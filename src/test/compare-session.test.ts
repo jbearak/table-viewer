@@ -1129,8 +1129,15 @@ describe('CompareDataSource', () => {
             expect(original.rawReads).toHaveLength(1);
             expect(modified.rawReads).toHaveLength(1);
         });
+        const operation = (source as unknown as {
+            diff_in_flight: Map<string, { waiters: Set<unknown> }>;
+        }).diff_in_flight.get('0:0')!;
+        expect(operation.waiters.size).toBe(2);
+
         first_cancelled = true;
         expect(original.rawReads[0].isCancelled()).toBe(false);
+        expect(operation.waiters.size).toBe(1);
+        await first_rejection;
         expect(modified.rawReads[0].isCancelled()).toBe(false);
 
         original_gate.resolve({ startRow: 0, rows: [[{ raw: 'a' }]] });
@@ -1138,7 +1145,42 @@ describe('CompareDataSource', () => {
         await expect(second).resolves.toMatchObject({
             changedCells: [{ row: 0, col: 0, base: 'a', formattedBase: 'a' }],
         });
-        await first_rejection;
+    });
+
+    it('does not retain cancelled generations behind one live diff waiter', async () => {
+        const original_gate = deferred<RawColumnWindow>();
+        const modified_gate = deferred<RawColumnWindow>();
+        const original = new AsyncRawSource([[cell('a')]], () => original_gate.promise);
+        const modified = new AsyncRawSource([[cell('b')]], () => modified_gate.promise);
+        const source = new CompareDataSource(modified, original);
+        const live = source.diff_rows(0, [0]);
+
+        await vi.waitFor(() => {
+            expect(original.rawReads).toHaveLength(1);
+            expect(modified.rawReads).toHaveLength(1);
+        });
+        const operation = (source as unknown as {
+            diff_in_flight: Map<string, { waiters: Set<unknown> }>;
+        }).diff_in_flight.get('0:0')!;
+
+        for (let generation = 0; generation < 10; generation++) {
+            let cancelled = false;
+            const stale = source.diff_rows(0, [0], () => cancelled);
+            const rejection = expect(stale).rejects.toMatchObject({ name: 'AbortError' });
+            expect(operation.waiters.size).toBe(2);
+            cancelled = true;
+            expect(original.rawReads[0].isCancelled()).toBe(false);
+            expect(operation.waiters.size).toBe(1);
+            await rejection;
+        }
+
+        expect(original.rawReads).toHaveLength(1);
+        expect(modified.rawReads).toHaveLength(1);
+        original_gate.resolve({ startRow: 0, rows: [[{ raw: 'a' }]] });
+        modified_gate.resolve({ startRow: 0, rows: [[{ raw: 'b' }]] });
+        await expect(live).resolves.toMatchObject({
+            changedCells: [{ row: 0, col: 0, base: 'a', formattedBase: 'a' }],
+        });
     });
 
     it('does not attach a fresh waiter to work already committed to cancellation', async () => {
@@ -1164,10 +1206,20 @@ describe('CompareDataSource', () => {
             expect(original.rawReads).toHaveLength(1);
             expect(modified.rawReads).toHaveLength(1);
         });
+        const abandoned_operation = (source as unknown as {
+            diff_in_flight: Map<string, {
+                waiters: Set<unknown>;
+                terminal: boolean;
+                cancelled: boolean;
+                promise?: Promise<unknown>;
+            }>;
+        }).diff_in_flight.get('0:0')!;
         cancelled = true;
         // Model one side observing cancellation while its sibling remains pending.
         expect(original.rawReads[0].isCancelled()).toBe(true);
-        original_gates[0].reject(abort_error());
+        expect(abandoned_operation.waiters.size).toBe(0);
+        expect(abandoned_operation).toMatchObject({ terminal: true, cancelled: true });
+        await abandoned_rejection;
 
         const fresh = source.diff_rows(0, [0]);
         await vi.waitFor(() => {
@@ -1180,8 +1232,9 @@ describe('CompareDataSource', () => {
             changedCells: [{ row: 0, col: 0, base: 'a', formattedBase: 'a' }],
         });
 
+        original_gates[0].reject(abort_error());
         modified_gates[0].reject(abort_error());
-        await abandoned_rejection;
+        await expect(abandoned_operation.promise).rejects.toMatchObject({ name: 'AbortError' });
     });
 
     it('awaits native rendered formatting without a synchronous reread', async () => {
@@ -1250,13 +1303,24 @@ describe('CompareDataSource', () => {
             expect(original.rawReads).toHaveLength(1);
             expect(modified.rawReads).toHaveLength(1);
         });
+        const operation = (source as unknown as {
+            diff_in_flight: Map<string, {
+                waiters: Set<unknown>;
+                terminal: boolean;
+                cancelled: boolean;
+                promise?: Promise<unknown>;
+            }>;
+        }).diff_in_flight.get('0:0')!;
         source.close();
         expect(original.rawReads[0].isCancelled()).toBe(true);
         expect(modified.rawReads[0].isCancelled()).toBe(true);
-        original_gate.resolve({ startRow: 0, rows: [[{ raw: 'a' }]] });
-        modified_gate.resolve({ startRow: 0, rows: [[{ raw: 'b' }]] });
+        expect(operation.waiters.size).toBe(0);
+        expect(operation).toMatchObject({ terminal: true, cancelled: true });
         await rejection;
 
+        original_gate.resolve({ startRow: 0, rows: [[{ raw: 'a' }]] });
+        modified_gate.resolve({ startRow: 0, rows: [[{ raw: 'b' }]] });
+        await expect(operation.promise).rejects.toMatchObject({ name: 'AbortError' });
         expect((source as unknown as { diff_cache: Map<string, unknown> }).diff_cache.size)
             .toBe(0);
         await expect(source.diff_rows(0, [0]))
