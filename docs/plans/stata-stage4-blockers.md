@@ -184,16 +184,25 @@ bounded similarity phase; there is no quadratic search inside a collision
 bucket. The regression uses the current FNV collision `45zx` / `fpcd`, both
 `2244945817`, and proves that hash equality alone creates no move.
 
-The bounded Myers middle-snake search charges frontier diagonals and matched
-snake cells as work. It yields to a real event-loop turn and checks cancellation
-after every one million units of work, so the default distance cap cannot hide a
-roughly 100-million-iteration root search behind one synchronous turn while the
-host is trying to cancel it. Eager row hashing additionally charges both cells
-and UTF-16 code units cumulatively across rows and both source sides, yielding
-after every 262,144 units so neither one very large string nor many individually
-bounded rows can monopolize the event loop. Inexact move scoring retains its
-20,000-pair bound and separately charges sparse-cell traversal plus equal-length
-eager text comparisons. Expanding the edit script and every production-sized
+The bounded Myers middle-snake search distinguishes its semantic edit-distance
+limit, resettable cancellation cadence, and non-resetting cumulative work
+ceiling. One shared phase state charges every frontier diagonal and matched
+snake cell across all middle-snake calls, yields after each one million units,
+and degrades positionally after 100 million cumulative units. A valid long input
+at or below the 20,000 distance limit therefore cannot multiply recursive
+frontier work into tens of billions of operations. Eager row hashing additionally
+charges both cells and UTF-16 code units cumulatively across rows and both source
+sides, yielding after every 262,144 units so neither one very large string nor
+many individually bounded rows can monopolize the event loop.
+
+Inexact move scoring admits at most 1,000 leftovers per side, or one million
+candidate pairs. The 20,000-pair and 262,144 eager-unit values are cancellation
+cadences rather than terminal limits. A separate 128 Mi-unit cumulative ceiling
+bounds sparse-cell traversal plus equal-length eager text comparisons. Once it
+would need another eligible similarity comparison, the optional phase reports
+`moveSearchTruncated`, discards every partially accumulated inexact candidate,
+and preserves already verified exact moves. One admitted native string equality
+may remain indivisible. Expanding the edit script and every production-sized
 linear move-detection pass share cooperative row-work checkpoints. Finite row
 checkpoint overrides are floored and clamped to at least one; non-finite values
 fall back to the built-in 4,096-row bound instead of disabling cancellation
@@ -247,10 +256,12 @@ publication, cancellable legacy probing, exact label and section boundaries,
 Windows-1252 versus true ISO-8859-1 behavior, the real FNV collision, sparse
 exact-move verification, bounded compatibility chunks, eager string and wide-row
 cancellation, cumulative cross-row hash work, eager move-score text work,
-cooperative edit-script and move-pass construction, non-finite checkpoint
-normalization, paired sibling settlement, lifecycle fencing, canceled coalesced
-waiter detachment, bounded eager and deferred comparisons, pre-reserved unequal
-binary work, empty-sheet suppression, and contribution-aware label merging.
+transactional inexact-move truncation, cumulative Myers degradation below the
+distance limit, cooperative edit-script and move-pass construction, non-finite
+checkpoint normalization, paired sibling settlement, lifecycle fencing, canceled
+coalesced waiter detachment, bounded eager and deferred comparisons, pre-reserved
+unequal binary work, empty-sheet suppression, and contribution-aware label
+merging.
 Asynchronous tests synchronize on controlled gates or poll observable state with
 `vi.waitFor`; no fixed-delay or fixed-turn synchronization remains in the Stage 4
 tests touched by this tranche.

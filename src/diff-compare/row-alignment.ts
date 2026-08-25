@@ -74,10 +74,10 @@ export interface AlignSheetOptions {
     /**
      * Cap on the diff's edit distance (D in Myers' O(ND)). Exceeding it means
      * the files are too dissimilar to align usefully — two unrelated exports,
-     * or one re-sorted — so alignment degrades to positional rather than
-     * spending unbounded time proving they do not match. It bounds the
-     * *search*: a wholly one-sided run costs nothing to align and is allowed
-     * through however long it is.
+     * or one re-sorted — so alignment degrades to positional. This bounds the
+     * semantic search distance; a separate internal ceiling bounds cumulative
+     * frontier work. A wholly one-sided run costs nothing to search and is
+     * allowed through however long it is.
      */
     readonly maxEditDistance?: number;
     /** Rows or linear alignment units between cancellation checks. */
@@ -152,6 +152,12 @@ async function alignment_source_pair<Original, Modified>(
 
 const DEFAULT_ROWS_PER_CHECKPOINT = 4096;
 const NEVER_CANCELLED = () => false;
+
+/**
+ * Shape limits bound admitted input, checkpoint cadences bound uninterrupted
+ * work before a real event-loop yield, and cumulative ceilings terminate a
+ * variable-cost phase. Only checkpoint counters reset after yielding.
+ */
 /** Eager hash cells/code units between real event-loop checkpoints. */
 const HASH_WORK_PER_CHECKPOINT = 262_144;
 /** Eager changed-cell comparisons between real event-loop checkpoints. */
@@ -160,6 +166,8 @@ const CHANGE_CELLS_PER_CHECKPOINT = 65_536;
 const MYERS_STEPS_PER_CHECKPOINT = 256;
 /** Frontier diagonals and snake cells between cancellation checkpoints. */
 const MYERS_WORK_PER_CHECKPOINT = 1_000_000;
+/** Cumulative frontier diagonals and snake cells allowed in one Myers diff. */
+const MYERS_TOTAL_WORK_CEILING = 100_000_000;
 
 /**
  * Yield to a real event-loop turn, not just a microtask.
@@ -188,16 +196,15 @@ const ROW_HASH_SEEDS = [0x811c9dc5, 0x9e3779b9, 0x85ebca6b] as const;
 const EXACT_MOVE_CELLS_PER_CHECKPOINT = 256;
 
 /**
- * Default effort cap. Myers costs O(ND) with D the edit distance, so this
- * bounds the *work*, not the file size: a million-row file with a thousand
- * changed rows aligns well inside it, while two unrelated files hit it early
- * and degrade instead of grinding.
+ * Default semantic distance limit. Myers costs O(ND) with D the edit distance,
+ * so a useful revision stays far below this while unrelated files reach it.
+ * The independent cumulative work ceiling prevents valid long inputs at or
+ * below this distance from multiplying that admitted search into O(ND) work.
  *
- * Chosen against the cost of *failing*. Reaching the cap is quadratic in it —
- * two unrelated 50,000-row files degrade in about 0.2 s at 10,000 and about
- * 1.6 s at 40,000 — so the cap is really a budget for the answer "these files
- * do not correspond". 20,000 differing rows is far past any edit someone would
- * still call a revision, and buys that answer in about half a second.
+ * Chosen against the cost of *failing*. Reaching this distance on unrelated
+ * inputs is quadratic in it — two unrelated 50,000-row files take about 0.2 s
+ * at 10,000 and about 1.6 s at 40,000. 20,000 differing rows is far past any
+ * edit someone would still call a revision.
  */
 const DEFAULT_MAX_EDIT_DISTANCE = 20_000;
 
@@ -237,11 +244,29 @@ const MOVE_SEARCH_LIMIT = 1000;
 const MOVE_SCORES_PER_CHECKPOINT = 20_000;
 /** Eager similarity cells/code units between real event-loop checkpoints. */
 const MOVE_SIMILARITY_WORK_PER_CHECKPOINT = HASH_WORK_PER_CHECKPOINT;
+/** Cumulative eager similarity work allowed in one optional move search. */
+const MOVE_SIMILARITY_TOTAL_WORK_CEILING = 128 * 1024 * 1024;
 
 type ComparisonCell = RawCell | null | undefined;
 
+interface CumulativeWorkCeiling {
+    readonly limit: number;
+    used: number;
+}
+
 interface HashWorkState {
     sinceCheckpoint: number;
+}
+
+interface MyersWorkState {
+    readonly ceiling: CumulativeWorkCeiling;
+    sinceCheckpoint: number;
+}
+
+interface MoveScoreWorkState {
+    readonly eagerCeiling: CumulativeWorkCeiling;
+    pairsSinceCheckpoint: number;
+    eagerSinceCheckpoint: number;
 }
 
 /** Visit comparison text synchronously until either materialization or the
@@ -433,8 +458,9 @@ interface EditScript {
  * O(ND) time and the same edit script; the frontiers are the only large
  * allocation, and there are two of them rather than D.
  *
- * `degraded` is returned when the edit distance exceeds `max_distance`, in
- * which case `ops` is meaningless and the caller falls back to positional.
+ * `degraded` is returned when the edit distance exceeds `max_distance` or the
+ * cumulative frontier/snake work ceiling is exhausted. In either case `ops` is
+ * meaningless and the caller falls back to positional.
  *
  * Equality here is hash equality. Paired edit-script rows are later reported by
  * exact cell comparison, while hash-selected move candidates are verified before
@@ -452,6 +478,10 @@ async function myers_diff(
         Math.max(0, Math.floor(max_distance)),
     );
     const frontiers = new MiddleSnakeFrontiers(frontier_extent);
+    const work_state: MyersWorkState = {
+        ceiling: { limit: MYERS_TOTAL_WORK_CEILING, used: 0 },
+        sinceCheckpoint: 0,
+    };
     let steps = 0;
 
     /**
@@ -478,11 +508,11 @@ async function myers_diff(
         const n = l1 - l0;
         const m = r1 - r0;
         if (n === 0 && m === 0) continue;
-        // Deliberately not charged against the cap, even though a one-sided
-        // run of 100,000 rows is an edit distance of 100,000. The cap bounds
-        // *search*, and there is nothing to search here — the answer is known
-        // in constant time. Degrading would replace a correct, free answer
-        // with a positional one, which for an empty side is meaningless.
+        // Deliberately not charged against either search limit, even though a
+        // one-sided run of 100,000 rows has edit distance 100,000. There is no
+        // frontier work here — the answer is known in constant time. Degrading
+        // would replace a correct, free answer with a positional one, which for
+        // an empty side is meaningless.
         if (n === 0) { builder.emit('insert', m); continue; }
         if (m === 0) { builder.emit('delete', n); continue; }
 
@@ -492,20 +522,19 @@ async function myers_diff(
         // cancelling worth offering is precisely too late.
         if (++steps % MYERS_STEPS_PER_CHECKPOINT === 0) {
             await yield_to_event_loop();
+            work_state.sinceCheckpoint = 0;
             if (options.isCancelled?.()) throw new AlignmentCancelledError();
         }
 
-        // The bound is handed to the search rather than checked after it
-        // returns: the middle-snake search is itself O(ND), so a sub-problem
-        // that will blow the cap has to be abandoned while it is running, not
-        // once it has finished proving how expensive it was.
+        // Both limits are handed to the search rather than checked after it
+        // returns: the middle-snake search is itself O(ND), so it must stop
+        // before finishing work the caller will discard.
         //
-        // Each sub-problem is bounded by the *whole* cap, and nothing is
-        // deducted for its children. A parent's distance already accounts for
-        // every edit its children will find — they are the same edits, seen at
-        // finer grain — so subtracting as the recursion descended charged the
-        // same work repeatedly and degraded inputs that were comfortably
-        // inside the cap.
+        // Each sub-problem receives the whole semantic distance limit. A
+        // parent's distance already accounts for every edit its children will
+        // find, so deducting D during descent would charge the same edits twice.
+        // Cumulative frontier/snake work is different: one shared state is
+        // charged across the complete divide-and-conquer walk.
         const snake = await frontiers.find(
             left,
             right,
@@ -514,6 +543,7 @@ async function myers_diff(
             r0,
             r1,
             max_distance,
+            work_state,
             options.isCancelled ?? NEVER_CANCELLED,
         );
         if (snake === undefined) return { ops: [], degraded: true };
@@ -623,9 +653,9 @@ class MiddleSnakeFrontiers {
      * Runs the forward frontier from the top-left and the reverse frontier from
      * the bottom-right one step at a time; the first time they overlap on a
      * diagonal, that overlap is on a shortest edit path, and its snake splits
-     * the problem into two strictly smaller ones. Returns undefined only if the
-     * frontiers could not meet within `budget`, which is the caller's signal
-     * to degrade to a positional alignment.
+     * the problem into two strictly smaller ones. Returns undefined if the
+     * frontiers cannot meet within the distance budget or the shared cumulative
+     * work ceiling, which is the caller's signal to degrade to positional.
      */
     async find(
         left: Uint32Array,
@@ -637,6 +667,7 @@ class MiddleSnakeFrontiers {
         /** Edit distance still affordable; searching past it is wasted work
          *  because the caller degrades either way. */
         budget: number,
+        work_state: MyersWorkState,
         is_cancelled: () => boolean,
     ): Promise<MiddleSnake | undefined> {
         if (is_cancelled()) throw new AlignmentCancelledError();
@@ -655,16 +686,18 @@ class MiddleSnakeFrontiers {
         const reverse = this.reverse;
         forward[offset + 1] = 0;
         reverse[offset + 1] = 0;
-        let work_since_checkpoint = 0;
         const checkpoint = async (): Promise<void> => {
-            work_since_checkpoint = 0;
             await yield_to_event_loop();
+            work_state.sinceCheckpoint = 0;
             if (is_cancelled()) throw new AlignmentCancelledError();
         };
 
         for (let d = 0; d <= half; d++) {
             for (let k = -d; k <= d; k += 2) {
-                if (++work_since_checkpoint >= MYERS_WORK_PER_CHECKPOINT) {
+                if (work_state.ceiling.used >= work_state.ceiling.limit) return undefined;
+                work_state.ceiling.used += 1;
+                work_state.sinceCheckpoint += 1;
+                if (work_state.sinceCheckpoint >= MYERS_WORK_PER_CHECKPOINT) {
                     await checkpoint();
                 }
                 const index = offset + k;
@@ -675,11 +708,14 @@ class MiddleSnakeFrontiers {
                 const snake_start_x = x;
                 const snake_start_y = y;
                 while (x < n && y < m && left[l0 + x] === right[r0 + y]) {
-                    x++;
-                    y++;
-                    if (++work_since_checkpoint >= MYERS_WORK_PER_CHECKPOINT) {
+                    if (work_state.ceiling.used >= work_state.ceiling.limit) return undefined;
+                    work_state.ceiling.used += 1;
+                    work_state.sinceCheckpoint += 1;
+                    if (work_state.sinceCheckpoint >= MYERS_WORK_PER_CHECKPOINT) {
                         await checkpoint();
                     }
+                    x++;
+                    y++;
                 }
                 forward[index] = x;
                 // On an odd delta the forward frontier is the one that can
@@ -700,7 +736,10 @@ class MiddleSnakeFrontiers {
                 }
             }
             for (let k = -d; k <= d; k += 2) {
-                if (++work_since_checkpoint >= MYERS_WORK_PER_CHECKPOINT) {
+                if (work_state.ceiling.used >= work_state.ceiling.limit) return undefined;
+                work_state.ceiling.used += 1;
+                work_state.sinceCheckpoint += 1;
+                if (work_state.sinceCheckpoint >= MYERS_WORK_PER_CHECKPOINT) {
                     await checkpoint();
                 }
                 const index = offset + k;
@@ -714,11 +753,14 @@ class MiddleSnakeFrontiers {
                     x < n && y < m
                     && left[l1 - 1 - x] === right[r1 - 1 - y]
                 ) {
-                    x++;
-                    y++;
-                    if (++work_since_checkpoint >= MYERS_WORK_PER_CHECKPOINT) {
+                    if (work_state.ceiling.used >= work_state.ceiling.limit) return undefined;
+                    work_state.ceiling.used += 1;
+                    work_state.sinceCheckpoint += 1;
+                    if (work_state.sinceCheckpoint >= MYERS_WORK_PER_CHECKPOINT) {
                         await checkpoint();
                     }
+                    x++;
+                    y++;
                 }
                 reverse[index] = x;
                 if (!odd && k >= delta - d && k <= delta + d) {
@@ -1551,8 +1593,9 @@ async function detect_moves(
             // worse than the honest delete-plus-add they already understand.
             truncated = true;
         } else {
-            await score_moves(
+            const outcome = await score_moves(
                 original, modified, pairing, unmatched_deleted, unmatched_added, claim, options);
+            if (outcome === 'truncated') truncated = true;
         }
     }
 
@@ -1617,8 +1660,11 @@ function compare_candidates(left: MoveCandidate, right: MoveCandidate): number {
  * The inexact phase: score surviving leftovers and assign one-to-one.
  *
  * Reports its verdicts through `claim`, so the exact-hash pass's pairings stay
- * authoritative and are never reconsidered here.
+ * authoritative and are never reconsidered here. Cumulative-work exhaustion
+ * returns before ranking, so no row-order-dependent partial result is claimed.
  */
+type MoveScoreOutcome = 'complete' | 'truncated';
+
 async function score_moves(
     original: DataSource,
     modified: DataSource,
@@ -1627,7 +1673,7 @@ async function score_moves(
     unmatched_added: readonly Leftover[],
     claim: (original_row: number, modified_row: number) => void,
     options: AlignSheetOptions,
-): Promise<void> {
+): Promise<MoveScoreOutcome> {
     // Read and normalize once up front. Both sides are capped at
     // MOVE_SEARCH_LIMIT rows, so this is bounded, and it is far cheaper than
     // re-deriving a row's text for each of the up-to-1000 rows it is scored
@@ -1662,8 +1708,11 @@ async function score_moves(
     );
 
     const candidates: MoveCandidate[] = [];
-    let scored_since_checkpoint = 0;
-    let eager_work_since_checkpoint = 0;
+    const work_state: MoveScoreWorkState = {
+        eagerCeiling: { limit: MOVE_SIMILARITY_TOTAL_WORK_CEILING, used: 0 },
+        pairsSinceCheckpoint: 0,
+        eagerSinceCheckpoint: 0,
+    };
     for (let added_index = 0; added_index < unmatched_added.length; added_index++) {
         const destination = unmatched_added[added_index];
         const destination_row = destinations[added_index];
@@ -1677,13 +1726,13 @@ async function score_moves(
             // length never reaches a checkpoint, so the loop cannot be
             // cancelled — and rejection is the cheap-per-pair case, which is
             // exactly where the iteration count runs highest.
-            scored_since_checkpoint += 1;
-            if (scored_since_checkpoint >= MOVE_SCORES_PER_CHECKPOINT) {
+            work_state.pairsSinceCheckpoint += 1;
+            if (work_state.pairsSinceCheckpoint >= MOVE_SCORES_PER_CHECKPOINT) {
                 // The loop can run a million iterations with no read between
                 // them, so reads are not sufficient yield points here.
                 await yield_to_event_loop();
-                scored_since_checkpoint = 0;
-                eager_work_since_checkpoint = 0;
+                work_state.pairsSinceCheckpoint = 0;
+                work_state.eagerSinceCheckpoint = 0;
                 if (is_cancelled()) throw new AlignmentCancelledError();
             }
             const source = unmatched_deleted[deleted_index];
@@ -1694,12 +1743,20 @@ async function score_moves(
             // compare cells to reach a conclusion arithmetic already reached.
             const delta = Math.abs(source_row.length - destination_row.length);
             if (max_length > 0 && !is_at_least_half(max_length - delta, max_length)) continue;
+            if (work_state.eagerCeiling.used >= work_state.eagerCeiling.limit) {
+                if (is_cancelled()) throw new AlignmentCancelledError();
+                return 'truncated';
+            }
             const scored = similarity_of(source_row, destination_row);
-            eager_work_since_checkpoint += scored.eagerWork;
-            if (eager_work_since_checkpoint >= MOVE_SIMILARITY_WORK_PER_CHECKPOINT) {
+            work_state.eagerCeiling.used = Math.min(
+                work_state.eagerCeiling.limit,
+                work_state.eagerCeiling.used + scored.eagerWork,
+            );
+            work_state.eagerSinceCheckpoint += scored.eagerWork;
+            if (work_state.eagerSinceCheckpoint >= MOVE_SIMILARITY_WORK_PER_CHECKPOINT) {
                 await yield_to_event_loop();
-                scored_since_checkpoint = 0;
-                eager_work_since_checkpoint = 0;
+                work_state.pairsSinceCheckpoint = 0;
+                work_state.eagerSinceCheckpoint = 0;
                 if (is_cancelled()) throw new AlignmentCancelledError();
             }
             if (scored.similarity === 0) continue;
@@ -1733,4 +1790,5 @@ async function score_moves(
         claimed_modified.add(candidate.modifiedRow);
         claim(candidate.originalRow, candidate.modifiedRow);
     }
+    return 'complete';
 }

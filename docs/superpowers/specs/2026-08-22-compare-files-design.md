@@ -86,11 +86,12 @@ reason about, one to test, and the Git panel gets the fix as a side effect.
    confirmed by re-reading the two candidate rows only on hash collision.
    Myers is O(ND) in the number of *differences*, which is why two similar
    million-row files align fast.
-4. **Cap the effort.** When D exceeds the cap, stop and return the identity
-   alignment with `degraded: true`. This is mockup 6. The cap is charged
-   against the middle-snake search itself rather than checked once a snake
-   completes: checking afterwards made the capped path *slower* than the
-   uncapped one, because it paid the full cost and then discarded the answer.
+4. **Bound distance and cumulative work independently.** When D exceeds the
+   semantic distance limit or the complete divide-and-conquer walk reaches its
+   100-million-unit frontier/snake ceiling, stop and return the identity
+   alignment with `degraded: true`. This is mockup 6. Both limits are charged
+   inside the middle-snake search rather than checked after a snake completes:
+   checking afterwards paid the full cost and then discarded the answer.
 5. **Count while walking**, so the counts cost nothing extra.
 
 The diff is Myers' **linear-space** refinement — recurse on the middle snake —
@@ -101,11 +102,14 @@ exhausted memory *instead of* reaching the graceful degradation above. Memory
 is now O(N+M). Two unrelated 10,000-row files, which previously needed roughly
 3 GB, align in about 0.5 s with no measurable heap growth.
 
-Reaching the cap costs time quadratic in the cap, so the cap is really a budget
-for the answer "these files do not correspond": two unrelated 50,000-row files
-degrade in about 0.2 s at 10,000 and about 1.6 s at 40,000. The default is
-**20,000** — far past any edit still worth calling a revision, and about half a
-second to say so.
+Reaching a distance limit costs time quadratic in that limit, so the default
+**20,000** is a semantic boundary far past any edit still worth calling a
+revision. It does not by itself bound O(ND) work when valid long inputs contain
+widely distributed edits. A separate **100 million** cumulative frontier/snake
+ceiling preserves the calibrated cost of answering "these files do not
+correspond" without allowing recursive searches at or below D=20,000 to multiply
+that work into tens of billions of units. Checkpoint counters still reset after
+a real event-loop yield; the cumulative ceiling never does.
 
 Measured on in-memory fixtures: 200,000 rows with ten scattered cell edits plus
 one insert and one delete aligns in **271 ms**. These figures are recorded here

@@ -927,6 +927,51 @@ describe('align_sheet', () => {
         expect(modified.indexedReads).toBe(1);
     });
 
+    it('truncates cumulative inexact text work without publishing partial moves', async () => {
+        const size = 1_000;
+        const common = 'x'.repeat(128);
+        const original_rows = [
+            ['start'],
+            ...Array.from(
+                { length: size },
+                (_, index) => [common, `old-${String(index).padStart(4, '0')}`],
+            ),
+            ['exact-move'],
+            ['bridge-a'],
+            ['bridge-b'],
+            ['end'],
+        ];
+        const modified_rows = [
+            ['start'],
+            ['bridge-a'],
+            ['bridge-b'],
+            ['exact-move'],
+            ...Array.from(
+                { length: size },
+                (_, index) => [common, `new-${String(index).padStart(4, '0')}`],
+            ),
+            ['end'],
+        ];
+
+        const alignment = await align_sheet(
+            single(original_rows),
+            single(modified_rows),
+            matched,
+        );
+
+        expect(alignment).toMatchObject({
+            addedRows: size,
+            deletedRows: size,
+            moveSearchTruncated: true,
+            degraded: false,
+        });
+        expect(alignment.movedRowIndices).toHaveLength(1);
+        expect(alignment.rows[alignment.movedRowIndices[0]]).toEqual({
+            original: size + 1,
+            modified: 3,
+        });
+    });
+
     it('does not hunt for moves in a degraded alignment', async () => {
         // A degraded alignment is positional and means "these files do not
         // correspond"; decorating it with moves would dress a failed alignment
@@ -1263,6 +1308,40 @@ describe('align_sheet', () => {
             { maxEditDistance: 64 },
         );
         expect(alignment.degraded).toBe(true);
+    });
+
+    it('bounds cumulative Myers work across middle-snake searches', async () => {
+        const block_size = 2_000;
+        const block_count = 4;
+        const rows = (tag: string): string[][] => {
+            const result: string[][] = [];
+            for (let block = 0; block < block_count; block++) {
+                result.push(...rows_of(...Array.from(
+                    { length: block_size },
+                    (_, index) => `${tag}-${block}-${index}`,
+                )));
+                if (block + 1 < block_count) result.push([`anchor-${block}`]);
+            }
+            return result;
+        };
+
+        const alignment = await align_sheet(
+            single(rows('original')),
+            single(rows('modified')),
+            matched,
+        );
+
+        // Four unrelated blocks contribute distance 16,000, below the default
+        // 20,000 limit. Each individual search is below the work ceiling; only
+        // their shared cumulative state degrades the complete Myers walk.
+        expect(alignment).toMatchObject({
+            degraded: true,
+            moveSearchTruncated: false,
+            addedRows: 0,
+            deletedRows: 0,
+            changedCells: block_size * block_count,
+        });
+        expect(shape(alignment.rows.slice(0, 3))).toEqual(['0,0', '1,1', '2,2']);
     });
 
     it('yields inside a long middle-snake search so cancellation can arrive', async () => {
