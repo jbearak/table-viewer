@@ -721,6 +721,47 @@ describe('DtaDataSource', () => {
         expect(rendered[0][0]?.formatted).toBe('Zulu');
     });
 
+    it('renders arbitrary async rows in requested order with Stata formatting', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture());
+
+        const async_rows = await source.read_rows_indexed_async(
+            0,
+            [3, 0, 3],
+            () => false,
+        );
+
+        expect(async_rows).toEqual(source.read_rows_indexed(0, [3, 0, 3]));
+        expect(async_rows.rows[1][0]).toMatchObject({ raw: '1', formatted: 'Zulu' });
+        expect(async_rows.rows[1][1]).toMatchObject({ raw: '12.5', formatted: '12.50' });
+        expect(async_rows.rows[1][3]).toMatchObject({ raw: '.', formatted: '.' });
+    });
+
+    it('cancels an async rendered read closed during value-label decoding', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture(4, false, {
+            statusLabels: Array.from({ length: 257 }, (_, index) => ({
+                value: index,
+                label: `Label ${index}`,
+            })),
+        }));
+        const internals = source as unknown as {
+            bytes?: Uint8Array;
+            decoded_value_label_tables: Map<string, unknown>;
+            yield_source_work: () => Promise<void>;
+        };
+        let release_yield!: () => void;
+        const yield_gate = new Promise<void>((resolve) => { release_yield = resolve; });
+        const yield_work = vi.spyOn(internals, 'yield_source_work').mockReturnValue(yield_gate);
+
+        const reading = source.read_rows_indexed_async(0, [0], () => false);
+        await vi.waitFor(() => expect(yield_work).toHaveBeenCalled());
+        source.close();
+        release_yield();
+
+        await expect(reading).rejects.toMatchObject({ name: 'AbortError' });
+        expect(internals.bytes).toBeUndefined();
+        expect(internals.decoded_value_label_tables.size).toBe(0);
+    });
+
     it('keeps Stata filter labels display-only and categorical by label semantics', async () => {
         const fixture = build_dta_fixture();
         const data_start = find_tag_end(fixture, '<data>');
@@ -1002,6 +1043,117 @@ describe('DtaDataSource', () => {
         await expect(second).resolves.toEqual(expect.objectContaining({
             valueLabel: expect.any(Function),
         }));
+    });
+
+    it('keeps later value-label jobs behind a cancelled queued table predecessor', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture(4, false, {
+            statusLabels: Array.from({ length: 257 }, (_, index) => ({
+                value: index,
+                label: `Label ${index}`,
+            })),
+            valueLabelNames: { amount: 'tiny_lbl' },
+            extraValueLabelTables: [{
+                name: 'tiny_lbl',
+                entries: [{ value: 12, label: 'Twelve' }],
+            }],
+        }));
+        const internals = source as unknown as {
+            decoded_value_label_tables: Map<string, unknown>;
+            pending_value_label_tables: Map<string, unknown>;
+            run_value_label_table_job: (job: unknown) => Promise<void>;
+            yield_source_work: () => Promise<void>;
+        };
+        let release_yield!: () => void;
+        const yield_gate = new Promise<void>((resolve) => { release_yield = resolve; });
+        const yield_work = vi.spyOn(internals, 'yield_source_work').mockReturnValue(yield_gate);
+        const run_job = vi.spyOn(internals, 'run_value_label_table_job');
+
+        const first = source.column_filter_metadata_async(0, 0, () => false);
+        await vi.waitFor(() => expect(yield_work).toHaveBeenCalled());
+        expect(run_job).toHaveBeenCalledTimes(1);
+
+        let second_cancelled = false;
+        const second = source.column_filter_metadata_async(0, 3, () => second_cancelled);
+        second_cancelled = true;
+        await expect(second).rejects.toMatchObject({ name: 'AbortError' });
+        expect(internals.pending_value_label_tables.has('missing_lbl')).toBe(false);
+        expect(internals.decoded_value_label_tables.has('missing_lbl')).toBe(false);
+
+        const third_cancel = vi.fn(() => false);
+        const third = source.column_filter_metadata_async(0, 1, third_cancel);
+        const initial_third_cancel_checks = third_cancel.mock.calls.length;
+        await vi.waitFor(() => {
+            expect(third_cancel.mock.calls.length).toBeGreaterThan(initial_third_cancel_checks);
+        });
+        expect(run_job).toHaveBeenCalledTimes(1);
+
+        release_yield();
+        await expect(first).resolves.toEqual(expect.objectContaining({
+            valueLabel: expect.any(Function),
+        }));
+        await expect(third).resolves.toEqual(expect.objectContaining({
+            valueLabel: expect.any(Function),
+        }));
+        expect(run_job).toHaveBeenCalledTimes(2);
+
+        await expect(source.column_filter_metadata_async(0, 3, () => false))
+            .resolves.toEqual(expect.objectContaining({
+                valueLabel: expect.any(Function),
+            }));
+        expect(internals.decoded_value_label_tables.has('missing_lbl')).toBe(true);
+    });
+
+    it('round-robins cancellation across more than one queued-table batch', async () => {
+        const queued_table_count = 40;
+        const source = await DtaDataSource.create(build_dta_fixture(4, false, {
+            statusLabels: Array.from({ length: 257 }, (_, index) => ({
+                value: index,
+                label: `Label ${index}`,
+            })),
+            extraValueLabelTables: Array.from(
+                { length: queued_table_count },
+                (_, index) => ({
+                    name: `queued_${index}`,
+                    entries: [{ value: index, label: `Queued ${index}` }],
+                }),
+            ),
+        }));
+        const internals = source as unknown as {
+            capture_lifecycle_epoch: () => number;
+            value_labels_async: (
+                name: string,
+                epoch: number,
+                is_cancelled: () => boolean,
+            ) => Promise<Map<number, string> | undefined>;
+            yield_source_work: () => Promise<void>;
+        };
+        let release_yield!: () => void;
+        const yield_gate = new Promise<void>((resolve) => { release_yield = resolve; });
+        const yield_work = vi.spyOn(internals, 'yield_source_work').mockReturnValue(yield_gate);
+
+        const active = source.column_filter_metadata_async(0, 0, () => false);
+        await vi.waitFor(() => expect(yield_work).toHaveBeenCalled());
+
+        let last_cancelled = false;
+        const cancellation_checks = Array.from(
+            { length: queued_table_count },
+            (_, index) => vi.fn(() => index === queued_table_count - 1 && last_cancelled),
+        );
+        const epoch = internals.capture_lifecycle_epoch();
+        const queued = cancellation_checks.map((is_cancelled, index) =>
+            internals.value_labels_async(`queued_${index}`, epoch, is_cancelled));
+        last_cancelled = true;
+
+        await expect(queued.at(-1)!).rejects.toMatchObject({ name: 'AbortError' });
+        expect(cancellation_checks.at(-1)!.mock.calls.length).toBeGreaterThan(1);
+
+        release_yield();
+        await expect(active).resolves.toEqual(expect.objectContaining({
+            valueLabel: expect.any(Function),
+        }));
+        await expect(Promise.all(queued.slice(0, -1))).resolves.toHaveLength(
+            queued_table_count - 1,
+        );
     });
 
     it('checks cancellation while decoding a requested value-label table', async () => {
@@ -1854,20 +2006,31 @@ describe('DtaDataSource', () => {
             bytes?: Uint8Array;
             windows: Map<string, unknown>;
             gso_index: Map<string, unknown>;
+            gso_locations: Map<number, unknown>;
             gso_cache: Map<string, unknown>;
             gso_seen_identifiers?: Uint8Array;
+            source_work_gso_headers: number;
+            yield_source_work: () => Promise<void>;
         };
         internals.windows.clear();
         internals.gso_index.clear();
         internals.gso_cache.clear();
+        internals.source_work_gso_headers = 255;
+        let release_yield!: () => void;
+        const yield_gate = new Promise<void>((resolve) => { release_yield = resolve; });
+        const yield_work = vi.spyOn(internals, 'yield_source_work')
+            .mockReturnValue(yield_gate);
 
         const reading = source.read_raw_columns_async(0, 299, 1, [4], () => false);
-        expect(internals.gso_index.size).toBe(0);
+        await vi.waitFor(() => expect(yield_work).toHaveBeenCalledTimes(1));
+        expect(internals.gso_index.size).toBe(1);
         source.close();
+        release_yield();
 
         await expect(reading).rejects.toMatchObject({ name: 'AbortError' });
         expect(internals.bytes).toBeUndefined();
         expect(internals.gso_index.size).toBe(0);
+        expect(internals.gso_locations.size).toBe(0);
         expect(internals.gso_cache.size).toBe(0);
         expect(internals.gso_seen_identifiers).toBeUndefined();
     });
@@ -1928,6 +2091,38 @@ describe('DtaDataSource', () => {
             per_cell.read_raw_columns(0, row, 1, [4]).rows[0]);
         expect(batch_values).toEqual(per_cell_values);
         expect(headers_read).toBeLessThanOrEqual(256);
+    });
+
+    it('uses remembered locations for reverse-order evicted GSO lookups', async () => {
+        const source = await DtaDataSource.create(build_dta_fixture(2_049));
+        source.read_rows(0, 0, 2_049);
+        const internals = source as unknown as {
+            windows: Map<string, unknown>;
+            gso_index: Map<string, unknown>;
+            gso_cache: Map<string, unknown>;
+            read_gso_at: (...args: unknown[]) => unknown;
+        };
+        internals.windows.clear();
+        internals.gso_index.clear();
+        internals.gso_cache.clear();
+        const original_read_gso_at = internals.read_gso_at.bind(source);
+        let headers_read = 0;
+        internals.read_gso_at = (...args) => {
+            headers_read += 1;
+            return original_read_gso_at(...args);
+        };
+
+        const prefix = [
+            'a long first value',
+            'second long value',
+            'third long value',
+            'fourth long value',
+        ];
+        for (let row = 1_024; row >= 0; row--) {
+            expect(source.read_raw_columns(0, row, 1, [4]).rows[0][0]?.raw)
+                .toBe(prefix[row] ?? `long value ${row}`);
+        }
+        expect(headers_read).toBeLessThanOrEqual(1_025);
     });
 
     it('bounds unordered multi-strL lookup with an exact seen-id bitmap', async () => {

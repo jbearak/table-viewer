@@ -5,6 +5,7 @@ import {
     type ColumnFilterMetadata,
     type DataSource,
     type IndexedRawColumns,
+    type IndexedRows,
     type RawCell,
     type RawColumnWindow,
     type RenderedCell,
@@ -161,6 +162,36 @@ class IndexedAsyncRawSource extends AsyncRawSource {
                 } : null;
             })),
         });
+    }
+}
+
+interface IndexedRenderedReadRequest {
+    readonly rows: readonly number[];
+    readonly isCancelled: () => boolean;
+}
+
+class AsyncRenderedSource extends AsyncRawSource {
+    readonly indexedRenderedReads: IndexedRenderedReadRequest[] = [];
+
+    constructor(
+        rows: RenderedCell[][],
+        private readonly indexedRenderedReader?: (
+            request: IndexedRenderedReadRequest,
+        ) => Promise<IndexedRows>,
+        sheet_name = 'Sheet1',
+    ) {
+        super(rows, undefined, sheet_name);
+    }
+
+    read_rows_indexed_async(
+        _sheet: number,
+        row_indices: ArrayLike<number>,
+        is_cancelled: () => boolean,
+    ): Promise<IndexedRows> {
+        const request = { rows: Array.from(row_indices), isCancelled: is_cancelled };
+        this.indexedRenderedReads.push(request);
+        if (this.indexedRenderedReader) return this.indexedRenderedReader(request);
+        return Promise.resolve({ rows: request.rows.map((row) => this.rows[row] ?? []) });
     }
 }
 
@@ -397,9 +428,8 @@ describe('CompareDataSource', () => {
         expect(source.sheetStatuses).toEqual(['matched', 'added']);
         expect((await source.diff_rows(1, [0, 1]))?.rowStatus)
             .toEqual(['added', 'added']);
-        // And the filter already kept them, which is what made the gap visible:
-        // "only changed rows" showed every row of the sheet, unbanded.
-        expect(source.changed_grid_rows(1)).toEqual([0, 1]);
+        // Undefined is the compact all-rows sentinel for a one-sided sheet.
+        expect(source.changed_grid_rows(1)).toBeUndefined();
     });
 
     it('serves repeated diff_rows requests from the cache', async () => {
@@ -417,6 +447,55 @@ describe('CompareDataSource', () => {
         };
         expect(await source.diff_rows(0, [0])).toBe(first);
         expect(reads).toBe(0);
+    });
+
+    it('rejects an oversized diff page without evicting cached work', async () => {
+        const source = new CompareDataSource(
+            new FixtureSource([{ name: 'Sheet1', rows: [['b'], ['changed']] }]),
+            new FixtureSource([{
+                name: 'Sheet1', rows: [['a'], ['x'.repeat(100)]],
+            }]),
+            new Map(),
+            300,
+        );
+        const internals = source as unknown as {
+            diff_cache: Map<string, { window: unknown; bytes: number }>;
+            diff_cache_bytes: number;
+        };
+
+        await source.diff_rows(0, [0]);
+        expect([...internals.diff_cache.keys()]).toEqual(['0:0']);
+        const retained = internals.diff_cache_bytes;
+
+        await source.diff_rows(0, [1]);
+        expect([...internals.diff_cache.keys()]).toEqual(['0:0']);
+        expect(internals.diff_cache_bytes).toBe(retained);
+    });
+
+    it('evicts diff pages when their aggregate byte charge exceeds the cap', async () => {
+        const source = new CompareDataSource(
+            new FixtureSource([{ name: 'Sheet1', rows: [['b'], ['d']] }]),
+            new FixtureSource([{
+                name: 'Sheet1',
+                rows: [['a'.repeat(40)], ['c'.repeat(40)]],
+            }]),
+            new Map(),
+            500,
+        );
+        const internals = source as unknown as {
+            diff_cache: Map<string, { window: unknown; bytes: number }>;
+            diff_cache_bytes: number;
+        };
+
+        await source.diff_rows(0, [0]);
+        expect([...internals.diff_cache.keys()]).toEqual(['0:0']);
+        await source.diff_rows(0, [1]);
+        expect([...internals.diff_cache.keys()]).toEqual(['0:1']);
+        expect(internals.diff_cache_bytes).toBeLessThanOrEqual(500);
+
+        await source.diff_rows(0, [0]);
+        expect([...internals.diff_cache.keys()]).toEqual(['0:0']);
+        expect(internals.diff_cache_bytes).toBeLessThanOrEqual(500);
     });
 
     it('starts both async raw side reads before awaiting either', async () => {
@@ -890,6 +969,59 @@ describe('CompareDataSource', () => {
         await abandoned_rejection;
     });
 
+    it('awaits native rendered formatting without a synchronous reread', async () => {
+        const rendered_gate = deferred<IndexedRows>();
+        const original_cell: RenderedCell = {
+            raw: '1',
+            formatted: 'One',
+            bold: false,
+            italic: false,
+            rawType: 'number',
+        };
+        const original = new AsyncRenderedSource(
+            [[original_cell]],
+            () => rendered_gate.promise,
+        );
+        const modified = new AsyncRawSource([[cell('2')]]);
+        const source = new CompareDataSource(modified, original);
+
+        const pending = source.diff_rows(0, [0]);
+        let settled = false;
+        void pending.finally(() => { settled = true; }).catch(() => {});
+        await vi.waitFor(() => expect(original.indexedRenderedReads).toHaveLength(1));
+        expect(settled).toBe(false);
+        expect(original.indexedRenderedReads[0].rows).toEqual([0]);
+        expect(original.renderedReads).toEqual([]);
+
+        rendered_gate.resolve({ rows: [[original_cell]] });
+        await expect(pending).resolves.toMatchObject({
+            changedCells: [{ row: 0, col: 0, base: '1', formattedBase: 'One' }],
+        });
+        expect(original.renderedReads).toEqual([]);
+    });
+
+    it('fences close during native rendered formatting', async () => {
+        const rendered_gate = deferred<IndexedRows>();
+        const original_cell = cell('before');
+        const original = new AsyncRenderedSource(
+            [[original_cell]],
+            () => rendered_gate.promise,
+        );
+        const modified = new AsyncRawSource([[cell('after')]]);
+        const source = new CompareDataSource(modified, original);
+
+        const pending = source.diff_rows(0, [0]);
+        await vi.waitFor(() => expect(original.indexedRenderedReads).toHaveLength(1));
+        source.close();
+        expect(original.indexedRenderedReads[0].isCancelled()).toBe(true);
+        rendered_gate.resolve({ rows: [[original_cell]] });
+
+        await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+        expect((source as unknown as { diff_cache: Map<string, unknown> }).diff_cache.size)
+            .toBe(0);
+        expect(original.renderedReads).toEqual([]);
+    });
+
     it('aborts in-flight work on close without resurrecting the completed cache', async () => {
         const original_gate = deferred<RawColumnWindow>();
         const modified_gate = deferred<RawColumnWindow>();
@@ -1187,13 +1319,18 @@ describe('CompareDataSource with a content alignment', () => {
         expect(source.changed_grid_rows(0)).toEqual([3]);
     });
 
-    it('treats every row of a one-sided sheet as changed', async () => {
+    it('uses an uncached all-rows sentinel for one-sided sheets', async () => {
         const modified = new FixtureSource([{ name: 'Fresh', rows: [['x'], ['y']] }]);
         const original = new FixtureSource([{ name: 'Gone', rows: [['z']] }]);
         const source = new CompareDataSource(
             modified, original, await align_workbook(modified, original));
-        expect(source.changed_grid_rows(0)).toEqual([0, 1]);
-        expect(source.changed_grid_rows(1)).toEqual([0]);
+        const cache = (source as unknown as {
+            changed_grid_rows_cache: Map<number, readonly number[]>;
+        }).changed_grid_rows_cache;
+
+        expect(source.changed_grid_rows(0)).toBeUndefined();
+        expect(source.changed_grid_rows(1)).toBeUndefined();
+        expect(cache.size).toBe(0);
     });
 
     it('totals changes across sheets, counting one-sided sheets whole', async () => {
@@ -1220,6 +1357,23 @@ describe('CompareDataSource with a content alignment', () => {
         expect(source.projected_row_index(0, 2)).toBe(1);
         expect(source.projected_row_index(0, 0)).toBe(0);
         expect(source.projected_row_index(0, 1)).toBe(2);
+        const inverse = (source as unknown as {
+            grid_row_by_modified_cache: Map<number, Uint32Array>;
+        }).grid_row_by_modified_cache.get(0);
+        expect(inverse).toBeInstanceOf(Uint32Array);
+        expect([...inverse!]).toEqual([0, 2]);
+    });
+
+    it('derives interleaved deleted canonical rows from their grid rank', async () => {
+        const source = await aligned(
+            [['a'], ['GONE-1'], ['b'], ['GONE-2'], ['c']],
+            [['a'], ['b'], ['c']],
+        );
+
+        expect([...source.source_row_indices(0, [0, 1, 2, 3, 4])])
+            .toEqual([0, 3, 1, 4, 2]);
+        expect(source.projected_row_index(0, 3)).toBe(1);
+        expect(source.projected_row_index(0, 4)).toBe(3);
     });
 
     it('round-trips every grid row through source_row_indices', async () => {
@@ -1235,6 +1389,32 @@ describe('CompareDataSource with a content alignment', () => {
         grid_rows.forEach((grid_row, index) => {
             expect(source.projected_row_index(0, canonical[index])).toBe(grid_row);
         });
+    });
+
+    it('releases derived row-index caches on close', async () => {
+        const source = await aligned(
+            [['a'], ['GONE'], ['b']],
+            [['a'], ['CHANGED']],
+        );
+        source.projected_row_index(0, 0);
+        source.changed_grid_rows(0);
+        const internals = source as unknown as {
+            alignments: Map<number, SheetAlignment>;
+            deleted_grid_rows: Map<number, Uint32Array>;
+            grid_row_by_modified_cache: Map<number, Uint32Array>;
+            changed_grid_rows_cache: Map<number, readonly number[]>;
+        };
+        expect(internals.alignments.size).toBe(1);
+        expect(internals.deleted_grid_rows.size).toBe(1);
+        expect(internals.grid_row_by_modified_cache.size).toBe(1);
+        expect(internals.changed_grid_rows_cache.size).toBe(1);
+
+        source.close();
+
+        expect(internals.alignments.size).toBe(0);
+        expect(internals.deleted_grid_rows.size).toBe(0);
+        expect(internals.grid_row_by_modified_cache.size).toBe(0);
+        expect(internals.changed_grid_rows_cache.size).toBe(0);
     });
 
     it('flags a degraded alignment so the host can say the rows did not match', async () => {

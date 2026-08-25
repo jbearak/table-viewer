@@ -207,6 +207,33 @@ describe('align_sheet', () => {
         });
     });
 
+    it('retries hash-selected alignment after an exact prefix collision', async () => {
+        expect(single_raw_cell_row_hash('45zx'))
+            .toBe(single_raw_cell_row_hash('fpcd'));
+        const progress: number[] = [];
+
+        const alignment = await align_sheet(
+            single(rows_of('45zx', 'anchor')),
+            single(rows_of('fpcd', '45zx', 'anchor')),
+            matched,
+            {
+                maxMoveSearchRows: 0,
+                rowsPerCheckpoint: 1,
+                onProgress: (scanned) => progress.push(scanned),
+            },
+        );
+
+        expect(shape(alignment.rows)).toEqual(['-,0', '0,1', '1,2']);
+        expect(alignment).toMatchObject({
+            addedRows: 1,
+            deletedRows: 0,
+            changedCells: 0,
+            movedRowIndices: [],
+            degraded: false,
+        });
+        expect(progress).toEqual([...progress].sort((left, right) => left - right));
+    });
+
     it('verifies exact move candidates through deferred cell equality', async () => {
         const exactly_equals = vi.fn(() => true);
         const deferred_cell = (identity: DeferredCellIdentity): RawCell => {
@@ -543,6 +570,25 @@ describe('align_sheet', () => {
         expect(alignment).toMatchObject({ addedRows: 1, deletedRows: 1 });
     });
 
+    it('keeps non-finite move-search overrides within the built-in work cap', async () => {
+        const size = 1_001;
+        const alignment = await align_sheet(
+            single([
+                ...Array.from({ length: size }, (_, index) => [`original-${index}`]),
+                ['anchor'],
+            ]),
+            single([
+                ['anchor'],
+                ...Array.from({ length: size }, (_, index) => [`modified-${index}`]),
+            ]),
+            matched,
+            { maxMoveSearchRows: Number.POSITIVE_INFINITY },
+        );
+
+        expect(alignment.moveSearchTruncated).toBe(true);
+        expect(alignment).toMatchObject({ addedRows: size, deletedRows: size });
+    });
+
     it('observes a cancel when every scored pair is rejected on length', async () => {
         // The scoring loop's checkpoint counted pairs that SURVIVED the size
         // prefilter, so a run where every pair is rejected never reached one
@@ -781,13 +827,38 @@ describe('align_sheet', () => {
         }
     });
 
+    it('bounds Myers frontier buffers by the edit-distance budget', async () => {
+        const widths: number[] = [];
+        class TrackingInt32Array extends Int32Array {
+            constructor(length: number) {
+                super(length);
+                widths.push(length);
+            }
+        }
+        vi.stubGlobal('Int32Array', TrackingInt32Array);
+        try {
+            const rows = (tag: string) =>
+                rows_of(...Array.from({ length: 1_000 }, (_, index) => `${tag}-${index}`));
+            await align_sheet(
+                single(rows('original')),
+                single(rows('modified')),
+                matched,
+                { maxEditDistance: 8 },
+            );
+        } finally {
+            vi.unstubAllGlobals();
+        }
+
+        expect(widths).toEqual([19, 19]);
+    });
+
     it('aligns two wholly unrelated files without a quadratic-memory blowup', async () => {
         // The regression the linear-space rewrite exists for. The textbook
         // Myers keeps one frontier per edit distance, which for inputs this
         // dissimilar is O(D^2) — gigabytes here, and tens of gigabytes at the
         // default cap, so the process died rather than reaching the graceful
-        // degradation it was supposed to reach. Memory is now O(N+M): what
-        // this asserts is that the call simply completes.
+        // degradation it was supposed to reach. Memory is now O(the configured
+        // edit-distance budget): what this asserts is that the call completes.
         const rows = (tag: string) =>
             rows_of(...Array.from({ length: 4_000 }, (_, i) => `${tag}-${i}`));
         const alignment = await align_sheet(

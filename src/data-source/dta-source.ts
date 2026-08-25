@@ -46,6 +46,7 @@ const MAX_DECODED_CACHE_BYTES = 16 * 1024 * 1024;
 const MAX_GSO_CACHE_ENTRIES = 256;
 const MAX_GSO_CACHE_BYTES = 16 * 1024 * 1024;
 const MAX_GSO_INDEX_ENTRIES = 1_024;
+const GSO_LOCATION_PAGE_ENTRIES = 256;
 const MAX_GSO_DIGEST_CACHE_ENTRIES = 4_096;
 const MAX_GSO_DIGEST_CACHE_BYTES = 1024 * 1024;
 const BINARY_IDENTITY_CHUNK_BYTES = 256 * 1024;
@@ -61,6 +62,7 @@ const MAX_LEGACY_EXPANSION_FIELDS = 10_000;
 const GSO_SCAN_ENTRIES_PER_YIELD = 256;
 const OBSERVATION_CELLS_PER_YIELD = 256;
 const VALUE_LABEL_ENTRIES_PER_YIELD = 256;
+const VALUE_LABEL_QUEUE_CHECKS_PER_YIELD = 32;
 const LEGACY_VALUE_LABEL_BYTES_PER_YIELD = 256 * 1024;
 const BINARY_GSO_PREVIEW_BYTES = 32;
 const BINARY_GSO_COMPARISON_PREFIX = 'stata-binary:sha256:';
@@ -158,6 +160,51 @@ function is_strictly_increasing(values: ArrayLike<number>): boolean {
     return true;
 }
 
+function touch_lru<K, V>(entries: Map<K, V>, key: K): V | undefined {
+    const value = entries.get(key);
+    if (value === undefined) return undefined;
+    entries.delete(key);
+    entries.set(key, value);
+    return value;
+}
+
+function cache_byte_bounded_lru<K, V>(options: {
+    readonly entries: Map<K, V>;
+    readonly key: K;
+    readonly value: V;
+    readonly valueBytes: number;
+    readonly bytesOf: (value: V) => number;
+    readonly currentBytes: number;
+    readonly entryLimit: number;
+    readonly byteLimit: number;
+}): number {
+    const {
+        entries,
+        key,
+        value,
+        valueBytes,
+        bytesOf,
+        entryLimit,
+        byteLimit,
+    } = options;
+    if (entryLimit < 1 || valueBytes > byteLimit) return options.currentBytes;
+    let current_bytes = entries.size === 0 ? 0 : options.currentBytes;
+    const previous = entries.get(key);
+    if (previous !== undefined) {
+        current_bytes -= bytesOf(previous);
+        entries.delete(key);
+    }
+    entries.set(key, value);
+    current_bytes += valueBytes;
+    while (entries.size > entryLimit || current_bytes > byteLimit) {
+        const oldest_key = entries.keys().next().value!;
+        const oldest = entries.get(oldest_key)!;
+        entries.delete(oldest_key);
+        current_bytes -= bytesOf(oldest);
+    }
+    return current_bytes;
+}
+
 interface BinaryGso {
     readonly kind: 'binary-gso';
     readonly contentOffset: number;
@@ -186,8 +233,15 @@ interface GsoIdentifier {
 
 interface ScannedGso extends GsoIdentifier {
     readonly key: string;
+    readonly startPosition: number;
     readonly value: GsoEntry;
     readonly nextPosition: number;
+}
+
+interface GsoLocationPage {
+    identifierOffsets: Uint8Array;
+    positions: Uint32Array;
+    count: number;
 }
 
 interface GsoBatchTarget extends GsoIdentifier {
@@ -204,12 +258,8 @@ type GsoResolutionPhase = 'cache' | 'historical' | 'forward' | 'done';
 
 interface GsoResolutionState {
     phase: GsoResolutionPhase;
-    historicalEnd: number;
-    historicalStart: number;
-    position: number;
-    rangeEnd: number;
-    wrapped: boolean;
-    historicalTargetCount: number;
+    historicalTargets: readonly GsoBatchTarget[];
+    historicalTargetIndex: number;
 }
 
 interface GsoTransitionResult {
@@ -306,6 +356,8 @@ export class DtaDataSource implements DataSource {
     private readonly decoded_value_label_tables: DecodedValueLabelTables = new Map();
     private decoded_value_label_cache_bytes = 0;
     private readonly pending_value_label_tables = new Map<string, PendingValueLabelTable>();
+    private readonly queued_value_label_tables = new Set<PendingValueLabelTable>();
+    private value_label_queue_monitor?: Promise<void>;
     private value_label_decode_tail: Promise<void> = Promise.resolve();
     private value_label_table_entry_limit = MAX_VALUE_LABEL_TABLE_ENTRIES;
     private value_label_table_decoded_byte_limit = MAX_VALUE_LABEL_TABLE_DECODED_BYTES;
@@ -315,6 +367,7 @@ export class DtaDataSource implements DataSource {
     private window_cache_cells = 0;
     private window_cache_bytes = 0;
     private readonly gso_index = new Map<string, GsoEntry>();
+    private readonly gso_locations = new Map<number, GsoLocationPage>();
     private readonly gso_cache = new Map<string, DecodedGso>();
     private gso_cache_bytes = 0;
     private text_gso_decode_byte_limit = MAX_GSO_CACHE_BYTES;
@@ -337,7 +390,6 @@ export class DtaDataSource implements DataSource {
     private gso_seen_identifiers?: Uint8Array;
     private readonly gso_start_position: number;
     private gso_scan_position: number;
-    private gso_historical_scan_position: number;
     private gso_scan_exhausted = false;
 
     private constructor(
@@ -396,7 +448,6 @@ export class DtaDataSource implements DataSource {
         this.gso_start_position = metadata.section_offsets.strls
             + (is_legacy_format(metadata.format_version) ? 0 : STRLS_TAG_LENGTH);
         this.gso_scan_position = this.gso_start_position;
-        this.gso_historical_scan_position = this.gso_start_position;
         this._meta = {
             hasFormatting: true,
             sheets: [{
@@ -503,6 +554,74 @@ export class DtaDataSource implements DataSource {
         return { rows: requested.map((row) => materialized.get(row)!) };
     }
 
+    async read_rows_indexed_async(
+        sheet_index: number,
+        row_indices: ArrayLike<number>,
+        is_cancelled: () => boolean,
+    ): Promise<IndexedRows> {
+        const lifecycle_epoch = this.capture_lifecycle_epoch();
+        this.assert_sheet(sheet_index);
+        const requested = Array.from(row_indices);
+        for (const row of requested) this.assert_row(row);
+        this.assert_async_active(lifecycle_epoch, is_cancelled);
+        if (requested.length === 0) return { rows: [] };
+        if (this.all_columns.length === 0) {
+            return { rows: requested.map(() => []) };
+        }
+
+        const raw = await this.read_raw_columns_indexed_async(
+            sheet_index,
+            requested,
+            this.all_columns,
+            is_cancelled,
+        );
+        this.assert_async_active(lifecycle_epoch, is_cancelled);
+        const labels_by_name = new Map<string, Map<number, string> | undefined>();
+        for (const variable of this.metadata.variables) {
+            const name = variable.value_label_name;
+            if (!name || labels_by_name.has(name)) continue;
+            labels_by_name.set(
+                name,
+                await this.value_labels_async(name, lifecycle_epoch, is_cancelled),
+            );
+            this.assert_async_active(lifecycle_epoch, is_cancelled);
+        }
+
+        const rows: (RenderedCell | null)[][] = [];
+        let cells_since_yield = 0;
+        for (const raw_row of raw.rows) {
+            const rendered: (RenderedCell | null)[] = [];
+            for (let column = 0; column < this.metadata.variables.length; column++) {
+                const raw_cell = raw_row[column];
+                const variable = this.metadata.variables[column];
+                rendered.push(raw_cell === null || raw_cell === undefined
+                    ? null
+                    : this.render_raw_cell(
+                        raw_cell,
+                        variable,
+                        variable.value_label_name
+                            ? labels_by_name.get(variable.value_label_name)
+                            : undefined,
+                    ));
+                cells_since_yield += 1;
+                if (cells_since_yield >= OBSERVATION_CELLS_PER_YIELD) {
+                    cells_since_yield = 0;
+                    const scheduled = this.schedule_source_work(
+                        'observationCells',
+                        OBSERVATION_CELLS_PER_YIELD,
+                    );
+                    if (scheduled !== undefined) {
+                        await scheduled;
+                        this.assert_async_active(lifecycle_epoch, is_cancelled);
+                    }
+                }
+            }
+            rows.push(rendered);
+        }
+        this.assert_async_active(lifecycle_epoch, is_cancelled);
+        return { rows };
+    }
+
     read_columns(
         sheet_index: number,
         start_row: number,
@@ -590,13 +709,61 @@ export class DtaDataSource implements DataSource {
             ? column_indices
             : [...new Set(column_indices)].sort((a, b) => a - b);
         const request_memo: GsoRequestMemo = new Map();
-        const targets = new Map<string, GsoBatchTarget>();
-        const chunks: Array<{
-            start: number;
-            rows: Row[];
-            strls: StrlBatchCell[];
-        }> = [];
+        const target_catalog = new Map<string, GsoBatchTarget>();
         const rows_per_chunk = this.async_observation_rows_per_chunk(unique_columns.length);
+        const strl_column_count = unique_columns.reduce(
+            (count, column) => count + (this.metadata.variables[column].type === 'strL' ? 1 : 0),
+            0,
+        );
+
+        // Discover every requested GSO before decoding observations, but retain
+        // only pointer targets — not every decoded chunk. Once the shared GSO
+        // pass finishes, observations can be decoded and materialized one bounded
+        // chunk at a time directly into the requested result.
+        if (strl_column_count > 0) {
+            let position = 0;
+            while (position < unique_rows.length) {
+                this.assert_async_active(lifecycle_epoch, is_cancelled);
+                const start = unique_rows[position];
+                let count = 1;
+                while (
+                    count < rows_per_chunk
+                    && position + count < unique_rows.length
+                    && unique_rows[position + count] === start + count
+                ) count += 1;
+                this.collect_strl_batch(
+                    start,
+                    count,
+                    unique_columns,
+                    undefined,
+                    target_catalog,
+                    request_memo,
+                );
+                position += count;
+                const scheduled = this.schedule_source_work(
+                    'observationCells',
+                    count * strl_column_count,
+                );
+                if (scheduled !== undefined) {
+                    await scheduled;
+                    this.assert_async_active(lifecycle_epoch, is_cancelled);
+                }
+            }
+
+            const unresolved_targets = new Map(target_catalog);
+            this.resolve_cached_gso_targets(unresolved_targets, request_memo);
+            if (unresolved_targets.size > 0) {
+                await this.resolve_gso_batch_async(
+                    unresolved_targets,
+                    lifecycle_epoch,
+                    is_cancelled,
+                    request_memo,
+                );
+            }
+            this.assert_async_active(lifecycle_epoch, is_cancelled);
+        }
+
+        const materialized = new Map<number, (RawCell | null)[]>();
         let position = 0;
         while (position < unique_rows.length) {
             this.assert_async_active(lifecycle_epoch, is_cancelled);
@@ -614,44 +781,30 @@ export class DtaDataSource implements DataSource {
                 lifecycle_epoch,
                 is_cancelled,
             );
-            const batch = this.collect_strl_batch(
-                start,
-                count,
-                unique_columns,
-                undefined,
-                targets,
-                request_memo,
-            );
-            chunks.push({ start, rows: decoded, strls: batch.cells });
-            position += count;
-        }
-
-        this.resolve_cached_gso_targets(targets, request_memo);
-        if (targets.size > 0) {
-            await this.resolve_gso_batch_async(
-                targets,
-                lifecycle_epoch,
-                is_cancelled,
-                request_memo,
-            );
-        }
-        this.assert_async_active(lifecycle_epoch, is_cancelled);
-
-        const materialized = new Map<number, (RawCell | null)[]>();
-        for (const chunk of chunks) {
+            const strls = strl_column_count === 0
+                ? []
+                : this.collect_strl_batch(
+                    start,
+                    count,
+                    unique_columns,
+                    target_catalog,
+                    undefined,
+                    request_memo,
+                ).cells;
             const resolved = await this.materialize_resolved_columns_async(
-                chunk.rows,
-                chunk.start,
+                decoded,
+                start,
                 unique_columns,
-                chunk.strls,
+                strls,
                 request_memo,
                 lifecycle_epoch,
                 is_cancelled,
             );
             resolved.forEach((row, offset) => materialized.set(
-                chunk.start + offset,
+                start + offset,
                 row.map((cell) => this.canonicalize_stata_raw(cell)),
             ));
+            position += count;
             const scheduled = this.schedule_source_work(
                 'observationCells',
                 resolved.length * unique_columns.length,
@@ -754,10 +907,12 @@ export class DtaDataSource implements DataSource {
             job.waiters.clear();
         }
         this.pending_value_label_tables.clear();
+        this.queued_value_label_tables.clear();
         this.value_label_layout = undefined;
         this.value_label_section_end = undefined;
         this.legacy_value_label_terminal_probe = undefined;
         this.gso_index.clear();
+        this.gso_locations.clear();
         this.gso_cache.clear();
         this.gso_cache_bytes = 0;
         this.gso_digest_cache.clear();
@@ -776,7 +931,6 @@ export class DtaDataSource implements DataSource {
         this.pending_binary_identities.clear();
         this.gso_seen_identifiers = undefined;
         this.gso_scan_position = this.gso_start_position;
-        this.gso_historical_scan_position = this.gso_start_position;
         this.gso_scan_exhausted = true;
         this.view = undefined;
         this.bytes = undefined;
@@ -1043,25 +1197,29 @@ export class DtaDataSource implements DataSource {
         variable: VariableInfo,
         labels: ReadonlyMap<number, string> | undefined,
     ): RenderedCell {
-        const raw_cell = this.canonicalize_stata_raw(resolved);
-        if (is_binary_gso(resolved) || typeof resolved === 'string') {
-            return rendered_stata_cell(
-                raw_cell,
-                is_binary_gso(resolved) ? resolved.formatted : resolved,
-            );
-        }
+        return this.render_raw_cell(
+            this.canonicalize_stata_raw(resolved),
+            variable,
+            labels,
+        );
+    }
 
-        const label = labels === undefined
-            ? undefined
-            : stata_value_label(labels, raw_cell.raw!);
-        if (is_missing_value_object(resolved)) {
-            return rendered_stata_cell(raw_cell, label ?? resolved.missing_type);
+    private render_raw_cell(
+        raw_cell: RawCell,
+        variable: VariableInfo,
+        labels: ReadonlyMap<number, string> | undefined,
+    ): RenderedCell {
+        const raw = raw_cell.raw ?? '';
+        if (raw_cell.rawType !== 'number') return rendered_stata_cell(raw_cell, raw);
+        const label = labels === undefined ? undefined : stata_value_label(labels, raw);
+        if (STATA_MISSING_LABEL_KEY_BY_TYPE.has(raw)) {
+            return rendered_stata_cell(raw_cell, label ?? raw);
         }
         return rendered_stata_cell(
             raw_cell,
             label
-                ?? apply_display_format(resolved, variable.format)
-                ?? raw_cell.raw!,
+                ?? apply_display_format(Number(raw), variable.format)
+                ?? raw,
         );
     }
 
@@ -1347,32 +1505,22 @@ export class DtaDataSource implements DataSource {
     private create_gso_resolution_state(): GsoResolutionState {
         return {
             phase: 'cache',
-            historicalEnd: this.gso_scan_position,
-            historicalStart: this.gso_start_position,
-            position: this.gso_start_position,
-            rangeEnd: this.gso_scan_position,
-            wrapped: false,
-            historicalTargetCount: 0,
+            historicalTargets: [],
+            historicalTargetIndex: 0,
         };
     }
 
     private begin_historical_gso_phase(
         state: GsoResolutionState,
-        seen_target_count: number,
+        targets: ReadonlyMap<string, GsoBatchTarget>,
     ): void {
-        state.historicalEnd = this.gso_scan_position;
-        state.historicalStart = this.gso_historical_scan_position < state.historicalEnd
-            ? this.gso_historical_scan_position
-            : this.gso_start_position;
-        state.position = state.historicalStart;
-        state.rangeEnd = state.historicalEnd;
-        state.wrapped = false;
-        state.historicalTargetCount = seen_target_count;
-        state.phase = seen_target_count > 0
+        state.historicalTargets = [...targets.values()]
+            .filter((target) => this.has_seen_gso(target));
+        state.historicalTargetIndex = 0;
+        state.phase = state.historicalTargets.length > 0
             ? 'historical'
             : 'forward';
     }
-
 
     /** One shared physical transition used by both synchronous and asynchronous
      * GSO drivers. It records locations only; payload decode happens later while
@@ -1394,47 +1542,31 @@ export class DtaDataSource implements DataSource {
                 state.phase = 'done';
                 return { physicalWork: false };
             }
-            this.begin_historical_gso_phase(
-                state,
-                this.count_seen_gso_targets(targets),
-            );
+            this.begin_historical_gso_phase(state, targets);
             return { physicalWork: false };
         }
         if (state.phase === 'historical') {
-            if (state.historicalTargetCount === 0) {
+            const target = state.historicalTargets[state.historicalTargetIndex++];
+            if (target === undefined) {
                 state.phase = 'forward';
                 return { physicalWork: false };
             }
-            if (state.position >= state.rangeEnd) {
-                if (state.wrapped || state.historicalStart === this.gso_start_position) {
-                    state.phase = 'forward';
-                    return { physicalWork: false };
-                }
-                state.position = this.gso_start_position;
-                state.rangeEnd = state.historicalStart;
-                state.wrapped = true;
-                return { physicalWork: false };
+            if (!targets.has(target.key)) return { physicalWork: false };
+            const position = this.gso_location(target);
+            if (position === undefined) {
+                throw new Error('Corrupt .dta file: remembered strL location is missing');
             }
             const scanned = this.read_gso_at(
                 this.open_bytes(),
                 this.open_view(),
-                state.position,
+                position,
             );
-            if (scanned === null) {
-                state.phase = 'forward';
-                return { physicalWork: false };
+            if (scanned === null || scanned.key !== target.key) {
+                throw new Error('Corrupt .dta file: remembered strL location is invalid');
             }
-            this.gso_historical_scan_position = scanned.nextPosition >= state.historicalEnd
-                ? this.gso_start_position
-                : scanned.nextPosition;
-            state.position = scanned.nextPosition;
-            const target = targets.get(scanned.key);
-            if (target !== undefined && this.has_seen_gso(target)) {
-                this.cache_gso_entry(scanned.key, scanned.value);
-                target.entry = scanned.value;
-                targets.delete(scanned.key);
-                state.historicalTargetCount -= 1;
-            }
+            this.cache_gso_entry(scanned.key, scanned.value);
+            target.entry = scanned.value;
+            targets.delete(scanned.key);
             return { physicalWork: true };
         }
         if (state.phase === 'forward') {
@@ -1491,12 +1623,9 @@ export class DtaDataSource implements DataSource {
             const scheduled = this.schedule_source_work('gsoHeaders', 1);
             if (scheduled === undefined) continue;
             const forward_position = this.gso_scan_position;
-            const historical_position = this.gso_historical_scan_position;
             await scheduled;
             this.assert_async_active(lifecycle_epoch, is_cancelled);
-            const shared_scan_progress = forward_position !== this.gso_scan_position
-                || historical_position !== this.gso_historical_scan_position;
-            if (!shared_scan_progress) continue;
+            if (forward_position === this.gso_scan_position) continue;
             this.resolve_cached_gso_targets(targets, request_memo);
             if (targets.size === 0) return;
             // A concurrent synchronous/async reader may have advanced the shared
@@ -1577,6 +1706,7 @@ export class DtaDataSource implements DataSource {
             key: gso_key(variable, observation),
             observation,
             variable,
+            startPosition: start,
             value: { content_offset: position, content_length, type },
             nextPosition: content_end,
         };
@@ -1596,8 +1726,54 @@ export class DtaDataSource implements DataSource {
                 `Corrupt .dta file: duplicate strL object id ${scanned.key}`,
             );
         }
+        this.remember_gso_location(bit_index, scanned.startPosition);
         seen[byte_index] |= mask;
         this.cache_gso_entry(scanned.key, scanned.value);
+    }
+
+    private remember_gso_location(bit_index: number, position: number): void {
+        const page_index = Math.floor(bit_index / GSO_LOCATION_PAGE_ENTRIES);
+        const identifier_offset = bit_index % GSO_LOCATION_PAGE_ENTRIES;
+        let page = this.gso_locations.get(page_index);
+        if (page === undefined) {
+            page = {
+                identifierOffsets: Uint8Array.of(identifier_offset),
+                positions: Uint32Array.of(position),
+                count: 1,
+            };
+            this.gso_locations.set(page_index, page);
+            return;
+        }
+        if (page.count === page.positions.length) {
+            const capacity = Math.min(
+                GSO_LOCATION_PAGE_ENTRIES,
+                page.count * 2,
+            );
+            const identifier_offsets = new Uint8Array(capacity);
+            identifier_offsets.set(page.identifierOffsets);
+            const positions = new Uint32Array(capacity);
+            positions.set(page.positions);
+            page.identifierOffsets = identifier_offsets;
+            page.positions = positions;
+        }
+        page.identifierOffsets[page.count] = identifier_offset;
+        page.positions[page.count] = position;
+        page.count += 1;
+    }
+
+    private gso_location(identifier: GsoIdentifier): number | undefined {
+        const bit_index = this.gso_identifier_bit_index(identifier);
+        const page = this.gso_locations.get(
+            Math.floor(bit_index / GSO_LOCATION_PAGE_ENTRIES),
+        );
+        if (page === undefined) return undefined;
+        const identifier_offset = bit_index % GSO_LOCATION_PAGE_ENTRIES;
+        for (let index = 0; index < page.count; index++) {
+            if (page.identifierOffsets[index] === identifier_offset) {
+                return page.positions[index];
+            }
+        }
+        return undefined;
     }
 
     private gso_identifier_bit_index(identifier: GsoIdentifier): number {
@@ -1647,11 +1823,7 @@ export class DtaDataSource implements DataSource {
     }
 
     private touch_decoded_gso(key: string): DecodedGso | undefined {
-        const cached = this.gso_cache.get(key);
-        if (cached === undefined) return undefined;
-        this.gso_cache.delete(key);
-        this.gso_cache.set(key, cached);
-        return cached;
+        return touch_lru(this.gso_cache, key);
     }
 
     private touch_gso_entry(key: string): GsoEntry | undefined {
@@ -1662,25 +1834,16 @@ export class DtaDataSource implements DataSource {
     }
 
     private cache_decoded_gso(key: string, decoded: DecodedGso): void {
-        const decoded_bytes = decoded_gso_byte_count(decoded);
-        if (decoded_bytes > MAX_GSO_CACHE_BYTES) return;
-        if (this.gso_cache.size === 0) this.gso_cache_bytes = 0;
-        const previous = this.gso_cache.get(key);
-        if (previous !== undefined) {
-            this.gso_cache_bytes -= decoded_gso_byte_count(previous);
-            this.gso_cache.delete(key);
-        }
-        this.gso_cache.set(key, decoded);
-        this.gso_cache_bytes += decoded_bytes;
-        while (
-            this.gso_cache.size > MAX_GSO_CACHE_ENTRIES
-            || this.gso_cache_bytes > MAX_GSO_CACHE_BYTES
-        ) {
-            const oldest_key = this.gso_cache.keys().next().value!;
-            const oldest = this.gso_cache.get(oldest_key)!;
-            this.gso_cache.delete(oldest_key);
-            this.gso_cache_bytes -= decoded_gso_byte_count(oldest);
-        }
+        this.gso_cache_bytes = cache_byte_bounded_lru({
+            entries: this.gso_cache,
+            key,
+            value: decoded,
+            valueBytes: decoded_gso_byte_count(decoded),
+            bytesOf: decoded_gso_byte_count,
+            currentBytes: this.gso_cache_bytes,
+            entryLimit: MAX_GSO_CACHE_ENTRIES,
+            byteLimit: MAX_GSO_CACHE_BYTES,
+        });
     }
 
     private decode_and_cache_gso(
@@ -1762,36 +1925,20 @@ export class DtaDataSource implements DataSource {
 
     /** @internal Used only by the module-private DtaBinaryIdentity capability. */
     cached_binary_comparison_key(binary: BinaryGso): string | undefined {
-        const cached = this.gso_digest_cache.get(binary.contentOffset);
-        if (cached === undefined) return undefined;
-        this.gso_digest_cache.delete(binary.contentOffset);
-        this.gso_digest_cache.set(binary.contentOffset, cached);
-        return cached;
+        return touch_lru(this.gso_digest_cache, binary.contentOffset);
     }
 
     private cache_binary_comparison_key(binary: BinaryGso, key: string): void {
-        const key_bytes = key.length * 2;
-        if (
-            this.gso_digest_cache_entry_limit < 1
-            || key_bytes > this.gso_digest_cache_byte_limit
-        ) return;
-        if (this.gso_digest_cache.size === 0) this.gso_digest_cache_bytes = 0;
-        const previous = this.gso_digest_cache.get(binary.contentOffset);
-        if (previous !== undefined) {
-            this.gso_digest_cache.delete(binary.contentOffset);
-            this.gso_digest_cache_bytes -= previous.length * 2;
-        }
-        this.gso_digest_cache.set(binary.contentOffset, key);
-        this.gso_digest_cache_bytes += key_bytes;
-        while (
-            this.gso_digest_cache.size > this.gso_digest_cache_entry_limit
-            || this.gso_digest_cache_bytes > this.gso_digest_cache_byte_limit
-        ) {
-            const oldest_offset = this.gso_digest_cache.keys().next().value!;
-            const oldest = this.gso_digest_cache.get(oldest_offset)!;
-            this.gso_digest_cache.delete(oldest_offset);
-            this.gso_digest_cache_bytes -= oldest.length * 2;
-        }
+        this.gso_digest_cache_bytes = cache_byte_bounded_lru({
+            entries: this.gso_digest_cache,
+            key: binary.contentOffset,
+            value: key,
+            valueBytes: key.length * 2,
+            bytesOf: (value) => value.length * 2,
+            currentBytes: this.gso_digest_cache_bytes,
+            entryLimit: this.gso_digest_cache_entry_limit,
+            byteLimit: this.gso_digest_cache_byte_limit,
+        });
     }
 
     private reject_cancelled_binary_waiters(job: PendingBinaryIdentity): void {
@@ -2107,37 +2254,20 @@ export class DtaDataSource implements DataSource {
     }
 
     private cached_value_labels(name: string): Map<number, string> | undefined {
-        const cached = this.decoded_value_label_tables.get(name);
-        if (cached === undefined) return undefined;
-        this.decoded_value_label_tables.delete(name);
-        this.decoded_value_label_tables.set(name, cached);
-        return cached.labels;
+        return touch_lru(this.decoded_value_label_tables, name)?.labels;
     }
 
     private cache_value_label_table(name: string, table: DecodedValueLabelTable): void {
-        if (
-            this.value_label_cache_entry_limit < 1
-            || table.cacheBytes > this.value_label_cache_byte_limit
-        ) return;
-        if (this.decoded_value_label_tables.size === 0) {
-            this.decoded_value_label_cache_bytes = 0;
-        }
-        const previous = this.decoded_value_label_tables.get(name);
-        if (previous !== undefined) {
-            this.decoded_value_label_tables.delete(name);
-            this.decoded_value_label_cache_bytes -= previous.cacheBytes;
-        }
-        this.decoded_value_label_tables.set(name, table);
-        this.decoded_value_label_cache_bytes += table.cacheBytes;
-        while (
-            this.decoded_value_label_tables.size > this.value_label_cache_entry_limit
-            || this.decoded_value_label_cache_bytes > this.value_label_cache_byte_limit
-        ) {
-            const oldest_name = this.decoded_value_label_tables.keys().next().value!;
-            const oldest = this.decoded_value_label_tables.get(oldest_name)!;
-            this.decoded_value_label_tables.delete(oldest_name);
-            this.decoded_value_label_cache_bytes -= oldest.cacheBytes;
-        }
+        this.decoded_value_label_cache_bytes = cache_byte_bounded_lru({
+            entries: this.decoded_value_label_tables,
+            key: name,
+            value: table,
+            valueBytes: table.cacheBytes,
+            bytesOf: (value) => value.cacheBytes,
+            currentBytes: this.decoded_value_label_cache_bytes,
+            entryLimit: this.value_label_cache_entry_limit,
+            byteLimit: this.value_label_cache_byte_limit,
+        });
     }
 
     private legacy_value_label_last_nonzero(): number | undefined {
@@ -2353,6 +2483,39 @@ export class DtaDataSource implements DataSource {
         }
     }
 
+    /** Poll queued cancellation through one bounded round-robin monitor, rather
+     * than one timer loop per table or an unbounded full-queue sweep per turn. */
+    private ensure_value_label_queue_monitor(): void {
+        if (this.value_label_queue_monitor !== undefined) return;
+        const monitor = (async () => {
+            while (this.queued_value_label_tables.size > 0) {
+                const checks = Math.min(
+                    VALUE_LABEL_QUEUE_CHECKS_PER_YIELD,
+                    this.queued_value_label_tables.size,
+                );
+                for (let index = 0; index < checks; index++) {
+                    const job = this.queued_value_label_tables.values().next().value!;
+                    this.queued_value_label_tables.delete(job);
+                    this.reject_cancelled_value_label_waiters(job);
+                    if (job.waiters.size > 0) {
+                        this.queued_value_label_tables.add(job);
+                    } else if (this.pending_value_label_tables.get(job.name) === job) {
+                        this.pending_value_label_tables.delete(job.name);
+                    }
+                }
+                if (this.queued_value_label_tables.size > 0) {
+                    await yield_to_event_loop();
+                }
+            }
+        })();
+        this.value_label_queue_monitor = monitor.finally(() => {
+            this.value_label_queue_monitor = undefined;
+            if (this.queued_value_label_tables.size > 0) {
+                this.ensure_value_label_queue_monitor();
+            }
+        });
+    }
+
     private async run_value_label_table_job(job: PendingValueLabelTable): Promise<void> {
         const assert_active = (): void => {
             this.assert_lifecycle_epoch(job.epoch);
@@ -2451,9 +2614,21 @@ export class DtaDataSource implements DataSource {
             job!.waiters.add({ isCancelled: is_cancelled, resolve, reject });
         });
         if (start_job) {
-            const run = this.value_label_decode_tail.then(
-                () => this.run_value_label_table_job(job!),
-            );
+            const predecessor = this.value_label_decode_tail;
+            this.queued_value_label_tables.add(job!);
+            this.ensure_value_label_queue_monitor();
+            const run = predecessor.then(async () => {
+                this.queued_value_label_tables.delete(job!);
+                this.assert_lifecycle_epoch(job!.epoch);
+                this.reject_cancelled_value_label_waiters(job!);
+                if (job!.waiters.size === 0) {
+                    if (this.pending_value_label_tables.get(job!.name) === job) {
+                        this.pending_value_label_tables.delete(job!.name);
+                    }
+                    return;
+                }
+                await this.run_value_label_table_job(job!);
+            });
             this.value_label_decode_tail = run.catch(() => undefined);
         }
         return promise;

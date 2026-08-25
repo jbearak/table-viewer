@@ -161,6 +161,13 @@ export interface DataSource {
         sheet_index: number,
         row_indices: ArrayLike<number>,
     ): IndexedRows;
+    /** Cancellable arbitrary-row rendered read for sources whose formatting may
+     * lazily traverse large backing sections. Bounded sources may omit it. */
+    read_rows_indexed_async?(
+        sheet_index: number,
+        row_indices: ArrayLike<number>,
+        is_cancelled: () => boolean,
+    ): Promise<IndexedRows>;
     /** Materialize only the requested columns, in the supplied order. Optional
      *  for third-party/test sources; callers use read_source_columns for a
      *  compatibility fallback. */
@@ -313,6 +320,12 @@ function validate_column_indices(
     }
 }
 
+const INDEXED_RUNS_PER_YIELD = 128;
+
+async function yield_to_event_loop(): Promise<void> {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
 function read_adjacent_row_runs<Cell>(
     row_indices: ArrayLike<number>,
     read_run: (start: number, count: number) => (Cell | null)[][],
@@ -329,6 +342,37 @@ function read_adjacent_row_runs<Cell>(
         const run = read_run(start, count);
         for (let offset = 0; offset < count; offset++) rows.push(run[offset] ?? []);
         position += count;
+    }
+    return rows;
+}
+
+async function read_adjacent_row_runs_async<Cell>(
+    row_indices: ArrayLike<number>,
+    read_run: (start: number, count: number) => (Cell | null)[][],
+    is_cancelled: () => boolean,
+): Promise<(Cell | null)[][]> {
+    const rows: (Cell | null)[][] = [];
+    let position = 0;
+    let runs_since_yield = 0;
+    while (position < row_indices.length) {
+        if (is_cancelled()) throw new DOMException('Operation cancelled', 'AbortError');
+        const start = row_indices[position];
+        let count = 1;
+        while (
+            position + count < row_indices.length
+            && row_indices[position + count] === start + count
+        ) count += 1;
+        const run = read_run(start, count);
+        for (let offset = 0; offset < count; offset++) rows.push(run[offset] ?? []);
+        position += count;
+        runs_since_yield += 1;
+        if (
+            runs_since_yield >= INDEXED_RUNS_PER_YIELD
+            && position < row_indices.length
+        ) {
+            runs_since_yield = 0;
+            await yield_to_event_loop();
+        }
     }
     return rows;
 }
@@ -352,6 +396,30 @@ export function read_source_rows_indexed(
             (start, count) => source.read_rows(sheet_index, start, count).rows,
         ),
     };
+}
+
+/** Prefer a source's cancellable rendered path. Legacy sources fall back to
+ * adjacent synchronous runs with periodic cancellation checkpoints. */
+export async function read_source_rows_indexed_async(
+    source: DataSource,
+    sheet_index: number,
+    row_indices: ArrayLike<number>,
+    is_cancelled: () => boolean,
+): Promise<IndexedRows> {
+    if (is_cancelled()) throw new DOMException('Operation cancelled', 'AbortError');
+    validate_row_indices(source, sheet_index, row_indices);
+    if (row_indices.length === 0) return { rows: [] };
+    const result = source.read_rows_indexed_async
+        ? await source.read_rows_indexed_async(sheet_index, row_indices, is_cancelled)
+        : {
+            rows: await read_adjacent_row_runs_async(
+                row_indices,
+                (start, count) => source.read_rows(sheet_index, start, count).rows,
+                is_cancelled,
+            ),
+        };
+    if (is_cancelled()) throw new DOMException('Operation cancelled', 'AbortError');
+    return result;
 }
 
 /** Read a compact column projection, falling back to full rows for legacy
@@ -516,9 +584,13 @@ export async function read_source_raw_columns_indexed_async(
     column_indices: readonly number[],
     is_cancelled: () => boolean,
 ): Promise<IndexedRawColumns> {
+    if (is_cancelled()) throw new DOMException('Operation cancelled', 'AbortError');
     const sheet = validate_row_indices(source, sheet_index, row_indices);
     validate_column_indices(sheet, column_indices);
-    if (row_indices.length === 0 || column_indices.length === 0) return { rows: [] };
+    if (row_indices.length === 0) return { rows: [] };
+    if (column_indices.length === 0) {
+        return { rows: Array.from({ length: row_indices.length }, () => []) };
+    }
     if (source.read_raw_columns_indexed_async) {
         const result = await source.read_raw_columns_indexed_async(
             sheet_index,
@@ -534,6 +606,7 @@ export async function read_source_raw_columns_indexed_async(
     const materialized = new Map<number, (RawCell | null)[]>();
     const unique = [...new Set(requested)].sort((a, b) => a - b);
     let position = 0;
+    let runs_since_yield = 0;
     while (position < unique.length) {
         if (is_cancelled()) throw new DOMException('Operation cancelled', 'AbortError');
         const start = unique[position];
@@ -554,6 +627,11 @@ export async function read_source_raw_columns_indexed_async(
             materialized.set(start + offset, rows[offset] ?? []);
         }
         position += count;
+        runs_since_yield += 1;
+        if (runs_since_yield >= INDEXED_RUNS_PER_YIELD && position < unique.length) {
+            runs_since_yield = 0;
+            await yield_to_event_loop();
+        }
     }
     if (is_cancelled()) throw new DOMException('Operation cancelled', 'AbortError');
     return { rows: requested.map((row) => materialized.get(row)!) };

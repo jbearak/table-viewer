@@ -126,6 +126,9 @@ function yield_to_event_loop(): Promise<void> {
 }
 /** Rows read from a side in one batched call while hashing. */
 const HASH_READ_BATCH = 512;
+/** Independent FNV offset bases tried when exact validation finds a selector
+ * collision. The first preserves the established hash and its regressions. */
+const ROW_HASH_SEEDS = [0x811c9dc5, 0x9e3779b9, 0x85ebca6b] as const;
 /** Exact cell comparisons between real event-loop checkpoints. */
 const EXACT_MOVE_CELLS_PER_CHECKPOINT = 256;
 
@@ -216,15 +219,17 @@ function visit_materialized_comparison_cells(
  * the text stream, so the encoding is unambiguous.
  *
  * Chance collisions between unrelated rows remain possible at 32 bits. Hashes
- * are only alignment/candidate selectors: the exact-move phase re-reads and
- * compares actual cells before consuming a delete/add pair.
+ * are only alignment/candidate selectors: paired selector matches are validated
+ * exactly before publication and retried with an independent seed on collision,
+ * while the exact-move phase verifies candidates before consuming delete/add rows.
  */
 function hash_row(
     cells: readonly (RawCell | null)[],
     column_count: number,
     is_cancelled: () => boolean,
+    seed: number,
 ): number | Promise<number> {
-    let hash = 0x811c9dc5;
+    let hash = seed;
     const mix = (value: number) => {
         hash ^= value;
         hash = Math.imul(hash, 0x01000193);
@@ -261,6 +266,7 @@ async function hash_side(
     sheet_index: number,
     row_count: number,
     column_count: number,
+    seed: number,
     scanned_before: number,
     total_rows: number,
     options: AlignSheetOptions,
@@ -284,6 +290,7 @@ async function hash_side(
                 rows[offset] ?? [],
                 column_count,
                 is_cancelled,
+                seed,
             );
             hashes[start + offset] = typeof hash === 'number'
                 ? hash
@@ -328,7 +335,7 @@ interface EditScript {
     readonly degraded: boolean;
 }
 /**
- * Myers' O(ND) diff over two hash arrays, in O(N+M) memory.
+ * Myers' O(ND) diff over two hash arrays, in O(min(N+M, max_distance)) memory.
  *
  * The textbook formulation records every frontier so the path can be walked
  * back at the end, which costs O(D^2) memory — at a distance cap of 100,000
@@ -353,7 +360,11 @@ async function myers_diff(
     options: AlignSheetOptions,
 ): Promise<EditScript> {
     const builder = new OpBuilder();
-    const frontiers = new MiddleSnakeFrontiers(left.length + right.length);
+    const frontier_extent = Math.min(
+        left.length + right.length,
+        Math.max(0, Math.floor(max_distance)),
+    );
+    const frontiers = new MiddleSnakeFrontiers(frontier_extent);
     let steps = 0;
 
     /**
@@ -493,18 +504,21 @@ interface MiddleSnake {
 /**
  * The two frontier buffers the middle-snake search needs, allocated once.
  *
- * Reused across every step of the divide-and-conquer walk: the sub-problems
- * only ever shrink, so buffers sized for the whole input fit all of them, and
- * allocating per step would put the garbage collector in the inner loop.
+ * Reused across every step of the divide-and-conquer walk. The buffers cover
+ * only diagonals reachable within the whole edit-distance budget; sub-problems
+ * use the same fixed offset, and allocating per step would put the garbage
+ * collector in the inner loop.
  */
 class MiddleSnakeFrontiers {
     private readonly forward: Int32Array;
     private readonly reverse: Int32Array;
+    private readonly offset: number;
 
     constructor(max_distance: number) {
         const width = 2 * max_distance + 3;
         this.forward = new Int32Array(width);
         this.reverse = new Int32Array(width);
+        this.offset = max_distance + 1;
     }
 
     /**
@@ -531,13 +545,14 @@ class MiddleSnakeFrontiers {
         const n = l1 - l0;
         const m = r1 - r0;
         const delta = n - m;
+        if (Math.abs(delta) > budget) return undefined;
         const odd = (delta & 1) !== 0;
         // Each search step d resolves an edit distance of about 2d, so a
         // budget of B is exhausted by the time d reaches B/2. The `+ 1` keeps
         // the odd-delta case reachable, where step d proves a distance of
         // 2d - 1; the exact distance is re-checked at each return site.
         const half = Math.min(Math.ceil((n + m) / 2), Math.floor(budget / 2) + 1);
-        const offset = Math.ceil((n + m) / 2) + 1;
+        const offset = this.offset;
         const forward = this.forward;
         const reverse = this.reverse;
         forward[offset + 1] = 0;
@@ -636,69 +651,148 @@ export async function align_sheet(
     const modified_rows = modified_sheet.rowCount;
     const column_count = Math.max(original_sheet.columnCount, modified_sheet.columnCount);
     const total_rows = original_rows + modified_rows;
-    const original_hashes = await hash_side(
-        original, pairing.originalIndex, original_rows, column_count, 0, total_rows, options);
-    const modified_hashes = await hash_side(
-        modified,
-        pairing.modifiedIndex,
-        modified_rows,
-        column_count,
-        original_rows,
-        total_rows,
-        options,
-    );
+    const max_distance = options.maxEditDistance ?? DEFAULT_MAX_EDIT_DISTANCE;
 
-    // Trim matching ends. Cheap, and on a normal edit it leaves the Myers step
-    // a handful of rows regardless of how large the file is.
-    let prefix = 0;
-    const shortest = Math.min(original_rows, modified_rows);
-    while (prefix < shortest && original_hashes[prefix] === modified_hashes[prefix]) prefix++;
-    let suffix = 0;
-    while (
-        suffix < shortest - prefix
-        && original_hashes[original_rows - 1 - suffix] === modified_hashes[modified_rows - 1 - suffix]
-    ) suffix++;
+    for (let attempt = 0; attempt < ROW_HASH_SEEDS.length; attempt++) {
+        // The first scan owns user-visible progress. A collision retry starts
+        // only after that scan reached its end, so reporting its rows from zero
+        // would make the progress bar run backwards.
+        const hash_options = attempt === 0
+            ? options
+            : { ...options, onProgress: undefined };
+        const seed = ROW_HASH_SEEDS[attempt];
+        const original_hashes = await hash_side(
+            original,
+            pairing.originalIndex,
+            original_rows,
+            column_count,
+            seed,
+            0,
+            total_rows,
+            hash_options,
+        );
+        const modified_hashes = await hash_side(
+            modified,
+            pairing.modifiedIndex,
+            modified_rows,
+            column_count,
+            seed,
+            original_rows,
+            total_rows,
+            hash_options,
+        );
 
-    const script = await myers_diff(
-        original_hashes.subarray(prefix, original_rows - suffix),
-        modified_hashes.subarray(prefix, modified_rows - suffix),
-        options.maxEditDistance ?? DEFAULT_MAX_EDIT_DISTANCE,
-        options,
-    );
+        // Trim matching ends. Cheap, and on a normal edit it leaves the Myers step
+        // a handful of rows regardless of how large the file is.
+        let prefix = 0;
+        const shortest = Math.min(original_rows, modified_rows);
+        while (
+            prefix < shortest
+            && original_hashes[prefix] === modified_hashes[prefix]
+        ) prefix++;
+        let suffix = 0;
+        while (
+            suffix < shortest - prefix
+            && original_hashes[original_rows - 1 - suffix]
+                === modified_hashes[modified_rows - 1 - suffix]
+        ) suffix++;
 
-    // A degraded alignment is positional and means "these files do not
-    // correspond". Hunting moves inside it would spend real time decorating an
-    // answer already known to be meaningless, and would produce a misleading
-    // hybrid where some rows are move-eligible and the positional body is not.
-    if (script.degraded) {
-        const rows = identity_alignment(original_rows, modified_rows);
-        return {
+        const script = await myers_diff(
+            original_hashes.subarray(prefix, original_rows - suffix),
+            modified_hashes.subarray(prefix, modified_rows - suffix),
+            max_distance,
+            options,
+        );
+
+        // A degraded alignment is positional and means "these files do not
+        // correspond". Hunting moves inside it would spend real time decorating an
+        // answer already known to be meaningless, and would produce a misleading
+        // hybrid where some rows are move-eligible and the positional body is not.
+        if (script.degraded) {
+            return positional_degraded_alignment(
+                original,
+                modified,
+                pairing,
+                original_sheet,
+                modified_sheet,
+                options,
+            );
+        }
+
+        const { rows, movedRowIndices, moveSearchTruncated } = await detect_moves(
+            original,
+            modified,
+            pairing,
+            build_rows(script, prefix, suffix, original_rows, modified_rows),
+            original_hashes,
+            modified_hashes,
+            options,
+        );
+        const counted = await count_changes(
+            original,
+            modified,
+            pairing,
+            original_sheet,
+            modified_sheet,
             rows,
-            degraded: true,
-            movedRowIndices: [],
-            moveSearchTruncated: false,
-            ...await count_changes(
-                original, modified, pairing, original_sheet, modified_sheet, rows, options),
-        };
+            options,
+            original_hashes,
+            modified_hashes,
+        );
+        if (!counted.hashCollision) {
+            return {
+                rows,
+                degraded: false,
+                movedRowIndices,
+                moveSearchTruncated,
+                ...changes_without_collision(counted),
+            };
+        }
     }
 
-    const { rows, movedRowIndices, moveSearchTruncated } = await detect_moves(
+    // Every independent selector collided on an exact mismatch. Positional is
+    // less clever but exact: do not publish a row pairing no seed could validate.
+    return positional_degraded_alignment(
         original,
         modified,
         pairing,
-        build_rows(script, prefix, suffix, original_rows, modified_rows),
-        original_hashes,
-        modified_hashes,
+        original_sheet,
+        modified_sheet,
         options,
     );
+}
 
+function changes_without_collision(counted: CountedChanges): Pick<
+    SheetAlignment,
+    'addedRows' | 'deletedRows' | 'changedCells' | 'changedRowIndices'
+> {
+    const { hashCollision: _hash_collision, ...changes } = counted;
+    return changes;
+}
+
+async function positional_degraded_alignment(
+    original: DataSource,
+    modified: DataSource,
+    pairing: Extract<SheetPairing, { status: 'matched' }>,
+    original_sheet: SheetMeta,
+    modified_sheet: SheetMeta,
+    options: AlignSheetOptions,
+): Promise<SheetAlignment> {
+    const rows = identity_alignment(original_sheet.rowCount, modified_sheet.rowCount);
     return {
         rows,
-        degraded: false,
-        movedRowIndices,
-        moveSearchTruncated,
-        ...await count_changes(
-            original, modified, pairing, original_sheet, modified_sheet, rows, options),
+        degraded: true,
+        movedRowIndices: [],
+        moveSearchTruncated: false,
+        ...changes_without_collision(await count_changes(
+            original,
+            modified,
+            pairing,
+            original_sheet,
+            modified_sheet,
+            rows,
+            options,
+        )),
     };
 }
 
@@ -763,11 +857,23 @@ function build_rows(
     return rows;
 }
 
+interface CountedChanges extends Pick<
+    SheetAlignment,
+    'addedRows' | 'deletedRows' | 'changedCells' | 'changedRowIndices'
+> {
+    /** A paired row selected as equal by this attempt's hash differed exactly. */
+    readonly hashCollision: boolean;
+}
+
 /**
  * Count added/deleted/changed over the aligned rows, confirming paired rows by
  * actual cell equality. Move candidates have already passed the same exact-cell
  * policy; this pass reports edits but cannot restore one-sided rows after a move
  * claim, which is why move verification happens before `claim()`.
+ *
+ * When hashes are supplied it also validates every paired selector equality.
+ * A collision makes the entire hash-selected alignment unsafe, so the caller
+ * discards the attempt and retries rather than publishing a plausible wrong row.
  */
 async function count_changes(
     original: DataSource,
@@ -777,67 +883,86 @@ async function count_changes(
     modified_sheet: SheetMeta,
     rows: readonly AlignedRow[],
     options: AlignSheetOptions,
-): Promise<Pick<
-    SheetAlignment,
-    'addedRows' | 'deletedRows' | 'changedCells' | 'changedRowIndices'
->> {
+    original_hashes?: Uint32Array,
+    modified_hashes?: Uint32Array,
+): Promise<CountedChanges> {
     let added = 0;
     let deleted = 0;
     let changed_cells = 0;
+    let hash_collision = false;
     const changed_row_indices: number[] = [];
     const column_count = Math.max(original_sheet.columnCount, modified_sheet.columnCount);
     const checkpoint = options.rowsPerCheckpoint ?? DEFAULT_ROWS_PER_CHECKPOINT;
     const is_cancelled = options.isCancelled ?? NEVER_CANCELLED;
     let since_checkpoint = 0;
-    /** Paired rows with the grid row each came from, so a difference can be
-     *  reported against its position in the unified grid. */
-    const paired: { row: AlignedRow; gridRow: number }[] = [];
-    rows.forEach((row, grid_row) => {
-        if (row.modified === ABSENT) deleted++;
-        else if (row.original === ABSENT) added++;
-        else paired.push({ row, gridRow: grid_row });
-    });
-    for (let start = 0; start < paired.length; start += HASH_READ_BATCH) {
-        const batch = paired.slice(start, start + HASH_READ_BATCH);
-        const original_batch = (await alignment_source_read(() =>
-            read_source_raw_rows_indexed_async(
-                original,
-                pairing.originalIndex,
-                batch.map((entry) => entry.row.original),
-                is_cancelled,
-            ))).rows;
-        const modified_batch = (await alignment_source_read(() =>
-            read_source_raw_rows_indexed_async(
-                modified,
-                pairing.modifiedIndex,
-                batch.map((entry) => entry.row.modified),
-                is_cancelled,
-            ))).rows;
-        for (let offset = 0; offset < batch.length; offset++) {
-            const original_row = original_batch[offset] ?? [];
-            const modified_row = modified_batch[offset] ?? [];
-            let row_changed = false;
-            for (let col = 0; col < column_count; col++) {
-                const equal = cells_exactly_equal(
-                    original_row[col],
-                    modified_row[col],
+    let grid_row = 0;
+    while (grid_row < rows.length) {
+        const original_indices: number[] = [];
+        const modified_indices: number[] = [];
+        const grid_rows: number[] = [];
+        while (grid_row < rows.length && original_indices.length < HASH_READ_BATCH) {
+            const row = rows[grid_row];
+            if (row.modified === ABSENT) deleted++;
+            else if (row.original === ABSENT) added++;
+            else {
+                original_indices.push(row.original);
+                modified_indices.push(row.modified);
+                grid_rows.push(grid_row);
+            }
+            grid_row += 1;
+            since_checkpoint += 1;
+            if (since_checkpoint >= checkpoint) break;
+        }
+
+        if (original_indices.length > 0) {
+            const original_batch = (await alignment_source_read(() =>
+                read_source_raw_rows_indexed_async(
+                    original,
+                    pairing.originalIndex,
+                    original_indices,
                     is_cancelled,
-                );
-                const exactly_equal = typeof equal === 'boolean'
-                    ? equal
-                    : await alignment_source_read(() => equal);
-                if (!exactly_equal) {
-                    changed_cells++;
-                    row_changed = true;
+                ))).rows;
+            const modified_batch = (await alignment_source_read(() =>
+                read_source_raw_rows_indexed_async(
+                    modified,
+                    pairing.modifiedIndex,
+                    modified_indices,
+                    is_cancelled,
+                ))).rows;
+            for (let offset = 0; offset < original_indices.length; offset++) {
+                const original_row = original_batch[offset] ?? [];
+                const modified_row = modified_batch[offset] ?? [];
+                let row_changed = false;
+                for (let col = 0; col < column_count; col++) {
+                    const equal = cells_exactly_equal(
+                        original_row[col],
+                        modified_row[col],
+                        is_cancelled,
+                    );
+                    const exactly_equal = typeof equal === 'boolean'
+                        ? equal
+                        : await alignment_source_read(() => equal);
+                    if (!exactly_equal) {
+                        changed_cells++;
+                        row_changed = true;
+                    }
+                }
+                if (row_changed) {
+                    changed_row_indices.push(grid_rows[offset]);
+                    if (
+                        original_hashes !== undefined
+                        && modified_hashes !== undefined
+                        && original_hashes[original_indices[offset]]
+                            === modified_hashes[modified_indices[offset]]
+                    ) hash_collision = true;
                 }
             }
-            if (row_changed) changed_row_indices.push(batch[offset].gridRow);
-            since_checkpoint += 1;
-            if (since_checkpoint >= checkpoint) {
-                since_checkpoint -= checkpoint;
-                await yield_to_event_loop();
-                if (options.isCancelled?.()) throw new AlignmentCancelledError();
-            }
+        }
+
+        if (since_checkpoint >= checkpoint) {
+            since_checkpoint -= checkpoint;
+            await yield_to_event_loop();
+            if (options.isCancelled?.()) throw new AlignmentCancelledError();
         }
     }
     return {
@@ -845,6 +970,7 @@ async function count_changes(
         deletedRows: deleted,
         changedCells: changed_cells,
         changedRowIndices: changed_row_indices,
+        hashCollision: hash_collision,
     };
 }
 
@@ -1157,7 +1283,10 @@ async function detect_moves(
     const unmatched_added = added.filter((entry) => !modified_to_original.has(entry.row));
     let truncated = false;
     if (unmatched_deleted.length > 0 && unmatched_added.length > 0) {
-        const limit = options.maxMoveSearchRows ?? MOVE_SEARCH_LIMIT;
+        const requested_limit = options.maxMoveSearchRows;
+        const limit = requested_limit === undefined || !Number.isFinite(requested_limit)
+            ? MOVE_SEARCH_LIMIT
+            : Math.min(MOVE_SEARCH_LIMIT, Math.max(0, Math.floor(requested_limit)));
         if (unmatched_deleted.length > limit || unmatched_added.length > limit) {
             // Skipped wholesale rather than sampled. Scoring an arbitrary
             // subset would make the result depend on row order in a way no

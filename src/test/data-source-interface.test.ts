@@ -7,6 +7,7 @@ import {
     read_source_raw_rows_indexed,
     read_source_raw_rows_indexed_async,
     read_source_rows_indexed,
+    read_source_rows_indexed_async,
 } from '../data-source/interface';
 
 describe('data-source interface shapes', () => {
@@ -155,6 +156,176 @@ describe('data-source interface shapes', () => {
             { start: 2, count: 1 },
         ]);
     });
+    it('rejects cancelled rendered reads before validation or fallback work', async () => {
+        const meta = vi.fn(() => ({
+            hasFormatting: false,
+            sheets: [{
+                name: 'Sheet1', rowCount: 8, sourceRowCount: 8,
+                columnCount: 1, merges: [], hasFormatting: false,
+            }],
+        }));
+        const read_rows = vi.fn();
+        const native = vi.fn();
+        const ds: DataSource = {
+            meta,
+            read_rows,
+            read_rows_indexed_async: native,
+            close: () => {},
+        };
+
+        await expect(read_source_rows_indexed_async(ds, 0, [5, 1, 5], () => true))
+            .rejects.toMatchObject({ name: 'AbortError' });
+        expect(meta).not.toHaveBeenCalled();
+        expect(native).not.toHaveBeenCalled();
+        expect(read_rows).not.toHaveBeenCalled();
+    });
+
+    it('prefers a native cancellable rendered reader and preserves row order', async () => {
+        const fallback = vi.fn();
+        const is_cancelled = vi.fn(() => false);
+        const native = vi.fn(async (
+            _sheet: number,
+            rows: ArrayLike<number>,
+            received_cancel: () => boolean,
+        ) => {
+            expect(received_cancel).toBe(is_cancelled);
+            return {
+                rows: Array.from(rows, (row) => [{
+                    raw: String(row),
+                    formatted: `Row ${row}`,
+                    bold: false,
+                    italic: false,
+                }]),
+            };
+        });
+        const ds: DataSource = {
+            meta: () => ({
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1', rowCount: 8, sourceRowCount: 8,
+                    columnCount: 1, merges: [], hasFormatting: false,
+                }],
+            }),
+            read_rows: fallback,
+            read_rows_indexed_async: native,
+            close: () => {},
+        };
+
+        const result = await read_source_rows_indexed_async(
+            ds,
+            0,
+            [5, 1, 5],
+            is_cancelled,
+        );
+
+        expect(result.rows.map((row) => row[0]?.formatted))
+            .toEqual(['Row 5', 'Row 1', 'Row 5']);
+        expect(native).toHaveBeenCalledWith(0, [5, 1, 5], is_cancelled);
+        expect(fallback).not.toHaveBeenCalled();
+    });
+
+    it('rejects a native rendered result cancelled before publication', async () => {
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => { release = resolve; });
+        let cancelled = false;
+        const native = vi.fn(async () => {
+            await gate;
+            return { rows: [[]] };
+        });
+        const ds: DataSource = {
+            meta: () => ({
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1', rowCount: 1, sourceRowCount: 1,
+                    columnCount: 0, merges: [], hasFormatting: false,
+                }],
+            }),
+            read_rows: vi.fn(),
+            read_rows_indexed_async: native,
+            close: () => {},
+        };
+
+        const pending = read_source_rows_indexed_async(ds, 0, [0], () => cancelled);
+        await vi.waitFor(() => expect(native).toHaveBeenCalled());
+        cancelled = true;
+        release();
+
+        await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    });
+
+    it('keeps reordered duplicate rows in the bounded rendered fallback', async () => {
+        const calls: Array<{ start: number; count: number }> = [];
+        const ds: DataSource = {
+            meta: () => ({
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1', rowCount: 8, sourceRowCount: 8,
+                    columnCount: 1, merges: [], hasFormatting: false,
+                }],
+            }),
+            read_rows: (_sheet, start, count) => {
+                calls.push({ start, count });
+                return {
+                    startRow: start,
+                    rows: Array.from({ length: count }, (_, offset) => [{
+                        raw: String(start + offset),
+                        formatted: `Row ${start + offset}`,
+                        bold: false,
+                        italic: false,
+                    }]),
+                };
+            },
+            close: () => {},
+        };
+
+        const result = await read_source_rows_indexed_async(
+            ds,
+            0,
+            [5, 1, 5],
+            () => false,
+        );
+
+        expect(result.rows.map((row) => row[0]?.formatted))
+            .toEqual(['Row 5', 'Row 1', 'Row 5']);
+        expect(calls).toEqual([
+            { start: 5, count: 1 },
+            { start: 1, count: 1 },
+            { start: 5, count: 1 },
+        ]);
+    });
+
+    it('yields between rendered fallback batches so cancellation can run', async () => {
+        let cancelled = false;
+        const calls: number[] = [];
+        const rows = Array.from({ length: 512 }, (_, index) => index * 2);
+        const ds: DataSource = {
+            meta: () => ({
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1', rowCount: 1_024, sourceRowCount: 1_024,
+                    columnCount: 1, merges: [], hasFormatting: false,
+                }],
+            }),
+            read_rows: (_sheet, start) => {
+                calls.push(start);
+                if (calls.length === 1) setImmediate(() => { cancelled = true; });
+                return {
+                    startRow: start,
+                    rows: [[{
+                        raw: String(start), formatted: String(start),
+                        bold: false, italic: false,
+                    }]],
+                };
+            },
+            close: () => {},
+        };
+
+        await expect(read_source_rows_indexed_async(ds, 0, rows, () => cancelled))
+            .rejects.toMatchObject({ name: 'AbortError' });
+        expect(calls.length).toBeGreaterThan(0);
+        expect(calls.length).toBeLessThan(rows.length);
+    });
+
     it('validates indexed rows before reading and accepts an empty request', () => {
         let calls = 0;
         const ds: DataSource = {
@@ -174,6 +345,35 @@ describe('data-source interface shapes', () => {
         expect(() => read_source_rows_indexed(ds, 0, [0.5])).toThrow(RangeError);
         expect(calls).toBe(0);
     });
+    it('rejects cancelled indexed raw reads before validation or source work', async () => {
+        const meta = vi.fn(() => ({
+            hasFormatting: false,
+            sheets: [{
+                name: 'Sheet1', rowCount: 8, sourceRowCount: 8,
+                columnCount: 1, merges: [], hasFormatting: false,
+            }],
+        }));
+        const read_rows = vi.fn();
+        const native = vi.fn();
+        const ds: DataSource = {
+            meta,
+            read_rows,
+            read_raw_columns_indexed_async: native,
+            close: () => {},
+        };
+
+        await expect(read_source_raw_columns_indexed_async(
+            ds,
+            0,
+            [5, 1, 5],
+            [0],
+            () => true,
+        )).rejects.toMatchObject({ name: 'AbortError' });
+        expect(meta).not.toHaveBeenCalled();
+        expect(native).not.toHaveBeenCalled();
+        expect(read_rows).not.toHaveBeenCalled();
+    });
+
     it('prefers one native indexed raw request and preserves both dimensions', async () => {
         const native = vi.fn(async (
             _sheet: number,
@@ -300,9 +500,46 @@ describe('data-source interface shapes', () => {
         };
         await expect(read_source_raw_columns_indexed_async(ds, 0, [], [0], () => false))
             .resolves.toEqual({ rows: [] });
-        await expect(read_source_raw_columns_indexed_async(ds, 0, [0], [], () => false))
-            .resolves.toEqual({ rows: [] });
+        await expect(read_source_raw_columns_indexed_async(ds, 0, [0, 0], [], () => false))
+            .resolves.toEqual({ rows: [[], []] });
         expect(native).not.toHaveBeenCalled();
+    });
+
+    it('yields between raw fallback batches so cancellation can run', async () => {
+        let cancelled = false;
+        const calls: number[] = [];
+        const rows = Array.from({ length: 512 }, (_, index) => index * 2);
+        const ds: DataSource = {
+            meta: () => ({
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1', rowCount: 1_024, sourceRowCount: 1_024,
+                    columnCount: 1, merges: [], hasFormatting: false,
+                }],
+            }),
+            read_rows: (_sheet, start) => {
+                calls.push(start);
+                if (calls.length === 1) setImmediate(() => { cancelled = true; });
+                return {
+                    startRow: start,
+                    rows: [[{
+                        raw: String(start), formatted: String(start),
+                        bold: false, italic: false,
+                    }]],
+                };
+            },
+            close: () => {},
+        };
+
+        await expect(read_source_raw_columns_indexed_async(
+            ds,
+            0,
+            rows,
+            [0],
+            () => cancelled,
+        )).rejects.toMatchObject({ name: 'AbortError' });
+        expect(calls.length).toBeGreaterThan(0);
+        expect(calls.length).toBeLessThan(rows.length);
     });
 
     it('checks cancellation between fallback runs and wraps all columns', async () => {
