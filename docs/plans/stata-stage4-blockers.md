@@ -38,10 +38,18 @@ selective, cancellable value-label discovery and decoding.
 `DataSource` has an optional
 `read_raw_columns_indexed_async(sheet, rows, columns, isCancelled)` capability.
 The shared adapter validates the complete request before source invocation,
-preserves row and column order and duplicates, avoids source work for an empty
-dimension, and invokes a native implementation exactly once when one exists.
-The compatibility fallback sorts and deduplicates rows, reads only adjacent row
-runs, checks cancellation between runs, and restores the requested shape.
+preserves row and column order and duplicates, and avoids source work for an
+empty dimension. A native cancellable asynchronous implementation receives the
+complete request once. Synchronous indexed rendered reads and contiguous
+rendered range reads are split at the smaller of 4,096 rows or the rows that can
+materialize at most 65,536 cells at the sheet width. Synchronous indexed and
+non-indexed raw compatibility reads use the same 4,096-row and
+65,536-materialized-cell bounds, accounting for selected columns when a
+selective synchronous reader exists and the full sheet width when the source
+must materialize complete rendered rows. Full-row raw range and indexed
+fallbacks use the full sheet width as well. The adapters yield and check
+cancellation between full chunks as well as between bounded groups of sparse
+runs, then restore duplicate and reordered rows to the requested shape.
 
 `DtaDataSource` implements the native capability as one sparse request. It
 decodes only requested observation chunks without spanning row gaps, gathers
@@ -185,14 +193,18 @@ siblings start before either is awaited, a failure cancels its peer,
 `Promise.allSettled` waits for both siblings, and a substantive failure is
 preferred over the peer's resulting `AbortError`. The helper is shared by diff
 raw batches, aligned indexed reads, and mixed-side asynchronous filter metadata.
-One-sided asynchronous operations still use the same lifecycle fence.
+One-sided asynchronous operations still use the same lifecycle fence. Diff pages
+run deferred exact cell identities through four workers: independent comparisons
+overlap without unbounded promise fan-out, output order remains positional, and a
+failure cancels and settles its peers before the operation rejects.
 
 Filter metadata is merged by values that can actually appear in the compare
-grid. Added or unmatched modified sheets use modified metadata; appended
-deleted sheets use original metadata. On a matched sheet, modified rows
-contribute modified metadata, while original metadata contributes only when a
-deleted row can appear. Paired rows display modified values and do not make the
-original side contribute.
+grid. Nonempty added or unmatched modified sheets use modified metadata;
+nonempty appended deleted sheets use original metadata. Empty one-sided sheets
+do not invoke either synchronous or asynchronous metadata providers. On a
+matched sheet, modified rows contribute modified metadata, while original
+metadata contributes only when a deleted row can appear. Paired rows display
+modified values and do not make the original side contribute.
 
 When both sides contribute, `categoricalCodes` is ORed. A value label survives
 only when both callbacks define exactly the same string; conflicting or
@@ -208,7 +220,8 @@ location cache bounds, shared GSO transitions, numeric and mixed-workload
 cancellation, monotonic descriptor discovery, verified missing-name
 publication, cancellable legacy probing, exact label and section boundaries,
 Windows-1252 versus true ISO-8859-1 behavior, the real FNV collision, sparse
-exact-move verification, paired sibling settlement, lifecycle fencing, and
+exact-move verification, bounded compatibility chunks, paired sibling settlement,
+lifecycle fencing, bounded deferred comparisons, empty-sheet suppression, and
 contribution-aware label merging. Asynchronous tests poll observable state with
 `vi.waitFor`; no fixed-delay or fixed-turn synchronization remains in the
 Stage 4 tests touched by this tranche.

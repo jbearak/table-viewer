@@ -4,6 +4,7 @@ import {
     DEFERRED_COMPARISON_IDENTITY,
     type ColumnFilterMetadata,
     type DataSource,
+    type DeferredCellIdentity,
     type IndexedRawColumns,
     type IndexedRows,
     type RawCell,
@@ -197,6 +198,7 @@ class AsyncRenderedSource extends AsyncRawSource {
 
 class MetadataSource extends AsyncRawSource {
     readonly metadataReads: { isCancelled: () => boolean }[] = [];
+    syncMetadataReads = 0;
 
     constructor(
         rows: RenderedCell[][],
@@ -210,6 +212,7 @@ class MetadataSource extends AsyncRawSource {
     }
 
     column_filter_metadata(): ColumnFilterMetadata | undefined {
+        this.syncMetadataReads += 1;
         return this.filterMetadata;
     }
 
@@ -223,6 +226,15 @@ class MetadataSource extends AsyncRawSource {
             ? this.metadataReader(is_cancelled)
             : Promise.resolve(this.filterMetadata);
     }
+}
+
+function with_empty_metadata_column(source: MetadataSource): MetadataSource {
+    const metadata = source.meta();
+    (source as DataSource).meta = () => ({
+        ...metadata,
+        sheets: metadata.sheets.map((sheet) => ({ ...sheet, columnCount: 1 })),
+    });
+    return source;
 }
 
 function abort_error(): Error {
@@ -344,6 +356,110 @@ describe('CompareDataSource', () => {
             new StubSource([[binary('aaaa')]]),
         );
         expect((await unchanged.diff_rows(0, [0]))?.changedCells).toEqual([]);
+    });
+
+    it('bounds and overlaps deferred cell comparisons', async () => {
+        const release = deferred<void>();
+        let active = 0;
+        let started = 0;
+        let max_active = 0;
+        const binary = (side: 'original' | 'modified', column: number): RenderedCell => {
+            const rendered = cell(`${side}-${column}`);
+            const identity: DeferredCellIdentity = {
+                cachedKey: () => undefined,
+                resolveKey: async () => `${side}-${column}`,
+                ...(side === 'original' ? {
+                    exactlyEquals: async (
+                        _other: DeferredCellIdentity,
+                        is_cancelled: () => boolean,
+                    ): Promise<boolean> => {
+                        active += 1;
+                        started += 1;
+                        max_active = Math.max(max_active, active);
+                        try {
+                            await release.promise;
+                            if (is_cancelled()) throw abort_error();
+                            return false;
+                        } finally {
+                            active -= 1;
+                        }
+                    },
+                } : {}),
+            };
+            Object.defineProperty(rendered, DEFERRED_COMPARISON_IDENTITY, {
+                value: identity,
+            });
+            return rendered;
+        };
+        const columns = Array.from({ length: 12 }, (_, column) => column);
+        const source = new CompareDataSource(
+            new StubSource([columns.map((column) => binary('modified', column))]),
+            new StubSource([columns.map((column) => binary('original', column))]),
+        );
+
+        const pending = source.diff_rows(0, [0]);
+        let settled = false;
+        void pending.finally(() => { settled = true; }).catch(() => {});
+        await vi.waitFor(() => expect(started).toBe(4));
+        expect(max_active).toBe(4);
+        expect(settled).toBe(false);
+
+        release.resolve(undefined);
+        const diff = await pending;
+        expect(started).toBe(12);
+        expect(max_active).toBe(4);
+        expect(diff?.changedCells.map(({ row, col, base }) => ({ row, col, base })))
+            .toEqual(columns.map((column) => ({
+                row: 0,
+                col: column,
+                base: `original-${column}`,
+            })));
+    });
+
+    it('settles deferred comparison peers and preserves a substantive failure', async () => {
+        const gates = Array.from({ length: 4 }, () => deferred<boolean>());
+        const cancellation_checks: Array<() => boolean> = [];
+        const failure = new Error('comparison failed');
+        const binary = (side: 'original' | 'modified', column: number): RenderedCell => {
+            const rendered = cell(`${side}-${column}`);
+            const identity: DeferredCellIdentity = {
+                cachedKey: () => undefined,
+                resolveKey: async () => `${side}-${column}`,
+                ...(side === 'original' ? {
+                    exactlyEquals: (
+                        _other: DeferredCellIdentity,
+                        is_cancelled: () => boolean,
+                    ): Promise<boolean> => {
+                        cancellation_checks[column] = is_cancelled;
+                        return gates[column].promise;
+                    },
+                } : {}),
+            };
+            Object.defineProperty(rendered, DEFERRED_COMPARISON_IDENTITY, {
+                value: identity,
+            });
+            return rendered;
+        };
+        const columns = [0, 1, 2, 3];
+        const source = new CompareDataSource(
+            new StubSource([columns.map((column) => binary('modified', column))]),
+            new StubSource([columns.map((column) => binary('original', column))]),
+        );
+
+        const pending = source.diff_rows(0, [0]);
+        let settled = false;
+        void pending.finally(() => { settled = true; }).catch(() => {});
+        const rejection = expect(pending).rejects.toBe(failure);
+        await vi.waitFor(() => expect(cancellation_checks).toHaveLength(4));
+        gates[0].reject(failure);
+        await vi.waitFor(() => {
+            expect(cancellation_checks.slice(1).every((cancelled) => cancelled())).toBe(true);
+        });
+        expect(settled).toBe(false);
+
+        gates.slice(1).forEach((gate) => gate.reject(abort_error()));
+        await rejection;
+        expect(settled).toBe(true);
     });
 
     it('keeps Stata value-label text separate from the raw compare base', async () => {
@@ -741,6 +857,67 @@ describe('CompareDataSource', () => {
         const one_sided = new CompareDataSource(added, deleted);
         expect(one_sided.column_filter_metadata(0, 0)?.valueLabel?.('x')).toBe('added');
         expect(one_sided.column_filter_metadata(1, 0)?.valueLabel?.('x')).toBe('deleted');
+    });
+
+    it('does not read filter metadata from empty one-sided sheets', async () => {
+        const added = with_empty_metadata_column(new MetadataSource(
+            [],
+            { categoricalCodes: true, valueLabel: () => 'added' },
+            undefined,
+            'Fresh',
+        ));
+        const deleted = with_empty_metadata_column(new MetadataSource(
+            [],
+            { categoricalCodes: true, valueLabel: () => 'deleted' },
+            undefined,
+            'Gone',
+        ));
+        const source = new CompareDataSource(added, deleted);
+
+        expect(source.column_filter_metadata(0, 0)).toBeUndefined();
+        expect(source.column_filter_metadata(1, 0)).toBeUndefined();
+        await expect(source.column_filter_metadata_async(0, 0, () => false))
+            .resolves.toBeUndefined();
+        await expect(source.column_filter_metadata_async(1, 0, () => false))
+            .resolves.toBeUndefined();
+        expect(added.syncMetadataReads).toBe(0);
+        expect(deleted.syncMetadataReads).toBe(0);
+        expect(added.metadataReads).toHaveLength(0);
+        expect(deleted.metadataReads).toHaveLength(0);
+    });
+
+    it('retains original filter metadata when only deleted rows contribute', async () => {
+        const modified = with_empty_metadata_column(new MetadataSource(
+            [],
+            { valueLabel: () => 'modified' },
+        ));
+        const original = new MetadataSource(
+            [[cell('deleted')]],
+            { categoricalCodes: true, valueLabel: () => 'original' },
+        );
+        const alignment: SheetAlignment = {
+            rows: [{ original: 0, modified: ABSENT }],
+            addedRows: 0,
+            deletedRows: 1,
+            changedCells: 0,
+            changedRowIndices: [],
+            movedRowIndices: [],
+            moveSearchTruncated: false,
+            degraded: false,
+        };
+        const source = new CompareDataSource(modified, original, new Map([[0, alignment]]));
+
+        for (const metadata of [
+            source.column_filter_metadata(0, 0),
+            await source.column_filter_metadata_async(0, 0, () => false),
+        ]) {
+            expect(metadata?.categoricalCodes).toBe(true);
+            expect(metadata?.valueLabel?.('x')).toBe('original');
+        }
+        expect(modified.syncMetadataReads).toBe(0);
+        expect(modified.metadataReads).toHaveLength(0);
+        expect(original.syncMetadataReads).toBe(1);
+        expect(original.metadataReads).toHaveLength(1);
     });
 
     it('counts fallback trailing rows and includes their original metadata', async () => {

@@ -79,6 +79,16 @@ interface FilterMetadataContributions {
     readonly original?: { readonly sheetIndex: number };
 }
 
+const MAX_CONCURRENT_DEFERRED_CELL_COMPARISONS = 4;
+
+interface PendingDiffCell {
+    readonly order: number;
+    readonly pairedIndex: number;
+    readonly row: number;
+    readonly col: number;
+    readonly base: string;
+}
+
 function merge_filter_metadata(
     modified: ColumnFilterMetadata | undefined,
     original: ColumnFilterMetadata | undefined,
@@ -697,7 +707,9 @@ export class CompareDataSource implements DataSource {
     ): FilterMetadataContributions {
         const deleted_index = this.deleted_original_index(sheet_index);
         if (deleted_index !== undefined) {
-            return column_index < this.original_meta.sheets[deleted_index].columnCount
+            const original_sheet = this.original_meta.sheets[deleted_index];
+            return original_sheet.rowCount > 0
+                && column_index < original_sheet.columnCount
                 ? { original: { sheetIndex: deleted_index } }
                 : {};
         }
@@ -705,7 +717,8 @@ export class CompareDataSource implements DataSource {
         if (modified_sheet === undefined) return {};
         const pairing = this.matched_by_modified_index.get(sheet_index);
         if (pairing === undefined) {
-            return column_index < modified_sheet.columnCount
+            return modified_sheet.rowCount > 0
+                && column_index < modified_sheet.columnCount
                 ? { modified: { sheetIndex: sheet_index } }
                 : {};
         }
@@ -718,6 +731,7 @@ export class CompareDataSource implements DataSource {
                 ? { modified: { sheetIndex: sheet_index } }
                 : {}),
             ...(column_index < original_sheet.columnCount
+                && original_sheet.rowCount > 0
                 && alignment.deletedRows > 0
                 ? { original: { sheetIndex: pairing.originalIndex } }
                 : {}),
@@ -1061,34 +1075,14 @@ export class CompareDataSource implements DataSource {
                     is_cancelled,
                     mark_terminal,
                 );
-            const pending: {
-                readonly pairedIndex: number;
-                readonly row: number;
-                readonly col: number;
-                readonly base: string;
-            }[] = [];
-            for (let index = 0; index < paired_positions.length; index++) {
-                if (is_cancelled()) throw compare_abort_error();
-                const position = paired_positions[index];
-                const original_row = original_batch[index] ?? [];
-                const modified_row = modified_batch[index] ?? [];
-                for (let col = 0; col < column_count; col++) {
-                    // Compare on raw identity, which is lossless for binary strLs.
-                    // Formatting is acquired only for changed original rows below.
-                    const equal = cells_exactly_equal(
-                        original_row[col],
-                        modified_row[col],
-                        is_cancelled,
-                    );
-                    if (typeof equal === 'boolean' ? equal : await equal) continue;
-                    pending.push({
-                        pairedIndex: index,
-                        row: position,
-                        col,
-                        base: get_raw_cell_text(original_row[col]?.raw ?? null),
-                    });
-                }
-            }
+            const pending = await this.compare_diff_cells(
+                paired_positions,
+                original_batch,
+                modified_batch,
+                column_count,
+                is_cancelled,
+                mark_terminal,
+            );
             if (pending.length > 0) {
                 if (is_cancelled()) throw compare_abort_error();
                 const changed_paired_indices = [...new Set(
@@ -1120,6 +1114,79 @@ export class CompareDataSource implements DataSource {
             }
         }
         return { startRow: 0, rowStatus: row_status, changedCells: changed_cells };
+    }
+
+    /** Compare deferred cell identities through a small worker pool. A source may
+     * route every binary comparison through one cooperative scheduler, so serial
+     * awaits multiply its macrotask latency; starting every cell at once instead
+     * makes a wide page an unbounded promise fan-out. */
+    private async compare_diff_cells(
+        paired_positions: readonly number[],
+        original_batch: readonly (readonly (RawCell | null)[])[],
+        modified_batch: readonly (readonly (RawCell | null)[])[],
+        column_count: number,
+        is_cancelled: () => boolean,
+        mark_terminal: () => void,
+    ): Promise<PendingDiffCell[]> {
+        const cell_count = paired_positions.length * column_count;
+        if (cell_count === 0) return [];
+
+        let next_cell = 0;
+        let peer_failed = false;
+        const worker_cancelled = () => peer_failed || is_cancelled();
+        const worker = async (): Promise<PendingDiffCell[]> => {
+            const changed: PendingDiffCell[] = [];
+            try {
+                while (true) {
+                    if (worker_cancelled()) throw compare_abort_error();
+                    const order = next_cell;
+                    if (order >= cell_count) return changed;
+                    next_cell += 1;
+
+                    const paired_index = Math.floor(order / column_count);
+                    const col = order % column_count;
+                    const original_cell = original_batch[paired_index]?.[col];
+                    const modified_cell = modified_batch[paired_index]?.[col];
+                    // Compare on raw identity, which is lossless for binary strLs.
+                    // Formatting is acquired only for changed original rows later.
+                    const equal = cells_exactly_equal(
+                        original_cell,
+                        modified_cell,
+                        worker_cancelled,
+                    );
+                    if (typeof equal === 'boolean' ? equal : await equal) continue;
+                    if (worker_cancelled()) throw compare_abort_error();
+                    changed.push({
+                        order,
+                        pairedIndex: paired_index,
+                        row: paired_positions[paired_index],
+                        col,
+                        base: get_raw_cell_text(original_cell?.raw ?? null),
+                    });
+                }
+            } catch (error) {
+                peer_failed = true;
+                mark_terminal();
+                throw error;
+            }
+        };
+
+        const worker_count = Math.min(
+            MAX_CONCURRENT_DEFERRED_CELL_COMPARISONS,
+            cell_count,
+        );
+        const results = await Promise.allSettled(
+            Array.from({ length: worker_count }, () => worker()),
+        );
+        const failures = results.filter(
+            (result): result is PromiseRejectedResult => result.status === 'rejected',
+        );
+        const substantive = failures.find((failure) => !is_abort_error(failure.reason));
+        if (substantive !== undefined) throw substantive.reason;
+        if (failures.length > 0) throw failures[0].reason;
+        if (is_cancelled()) throw compare_abort_error();
+        return results.flatMap((result) => result.status === 'fulfilled' ? result.value : [])
+            .sort((left, right) => left.order - right.order);
     }
 
     private async read_diff_raw_batches(
