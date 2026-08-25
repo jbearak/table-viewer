@@ -1,23 +1,31 @@
 import type { DataSource, RenderedCell } from './data-source/interface';
 import {
-    read_source_columns,
     read_source_row_indices,
     read_source_rows_indexed,
 } from './data-source/interface';
+import {
+    acquire_column_analysis,
+    type ColumnAnalysis,
+    type ColumnAnalysisCache,
+} from './column-analysis';
 import type {
     FilterEntry,
     SheetTransformState,
     SortDirection,
 } from './types';
 import {
+    canonical_filter_identity_for_raw,
     is_range_filter_operator,
+    is_stata_binary_filter_identity,
+    raw_value_from_escaped_filter_identity,
     transform_is_active,
     transform_read_columns,
 } from './types';
 import {
-    canonical_numeric_string,
     cell_can_be_numeric,
+    filter_value,
     raw_value,
+    stata_missing_rank,
 } from './transform-values';
 
 // Keep each synchronous source read bounded so cancellation can interrupt a
@@ -39,28 +47,8 @@ export interface TransformResult {
     rowCount: number;
 }
 
-export interface CachedTransformColumn {
-    readonly values: readonly (string | null | undefined)[];
-    readonly numeric: boolean;
-    readonly foundValue: boolean;
-}
-
-export interface TransformColumnCache {
-    get(sheet_index: number, column_index: number): CachedTransformColumn | undefined;
-    set(
-        sheet_index: number,
-        column_index: number,
-        column: CachedTransformColumn,
-    ): void;
-}
-
-type TransformColumn = CachedTransformColumn;
-
-interface MutableTransformColumn {
-    values: (string | null | undefined)[];
-    numeric: boolean;
-    foundValue: boolean;
-}
+export type CachedTransformColumn = ColumnAnalysis;
+export type TransformColumnCache = ColumnAnalysisCache;
 
 /** Optional cumulative counters for deterministic transform performance tests. */
 export interface TransformSortInstrumentation {
@@ -182,6 +170,7 @@ export async function compute_transform(
                     sheet_index,
                     column_index,
                     sheet.rowCount,
+                    filters.some(filter_uses_identity),
                     column_cache,
                     is_cancelled,
                     sort_instrumentation,
@@ -189,14 +178,20 @@ export async function compute_transform(
                 try {
                     const compiled = compile_filter_group(
                         filters,
-                        column.numeric && column.foundValue,
+                        column.columnKind === 'numeric',
                         true,
                         sort_instrumentation,
+                        await present_special_filter_identities(
+                            column,
+                            filters,
+                            is_cancelled,
+                        ),
                     );
                     let group_survivors = 0;
                     for (let row = 0; row < sheet.rowCount; row++) {
                         if (first_group || survivor_mask[row] === 1) {
                             const raw = column.values[row] ?? null;
+                            const identity = column.filterValues?.[row] ?? raw;
                             let numeric_key: NumericSortKey | undefined;
                             let matches = true;
                             for (const predicate of compiled.predicates) {
@@ -210,7 +205,10 @@ export async function compute_transform(
                                         sort_instrumentation,
                                     );
                                 }
-                                if (!predicate.matches(raw, numeric_key)) {
+                                if (!predicate.matches(
+                                    predicate.usesFilterIdentity ? identity : raw,
+                                    numeric_key,
+                                )) {
                                     matches = false;
                                     break;
                                 }
@@ -266,13 +264,14 @@ export async function compute_transform(
                 sheet_index,
                 key.colIndex,
                 sheet.rowCount,
+                false,
                 column_cache,
                 is_cancelled,
                 sort_instrumentation,
             );
             let numeric_keys: NumericColumnKeys | undefined;
             try {
-                if (column.numeric && column.foundValue) {
+                if (column.columnKind === 'numeric') {
                     numeric_keys = await prepare_numeric_column_keys(
                         column,
                         survivors,
@@ -321,6 +320,64 @@ export async function compute_transform(
     }
 }
 
+function filter_uses_identity(entry: FilterEntry): boolean {
+    return entry.operator === 'isOneOf'
+        && entry.excludedValues?.some((value) => value !== null) === true;
+}
+
+function can_be_current_special_filter_identity(value: string): boolean {
+    if (is_stata_binary_filter_identity(value)) return true;
+    const raw = raw_value_from_escaped_filter_identity(value);
+    return raw !== undefined && canonical_filter_identity_for_raw(raw) === value;
+}
+
+/** Current special identities take precedence over an ambiguous legacy raw
+ * spelling. Only when no exact source value exists may that old spelling stand
+ * in for the ordinary raw string now escaped out of the special namespace. */
+async function present_special_filter_identities(
+    column: ColumnAnalysis,
+    filters: readonly FilterEntry[],
+    is_cancelled: () => boolean,
+): Promise<ReadonlySet<string>> {
+    if (column.filterValues === undefined) return new Set();
+    const candidates = new Set<string>();
+    for (const filter of filters) {
+        if (filter.operator !== 'isOneOf') continue;
+        for (const value of filter.excludedValues ?? []) {
+            if (
+                value !== null
+                && can_be_current_special_filter_identity(value)
+            ) candidates.add(value);
+        }
+    }
+    if (candidates.size === 0) return candidates;
+    if (!column.distinct.exceeded) {
+        const present = new Set<string>();
+        for (const entry of column.distinct.entries) {
+            if (entry.value !== null && candidates.has(entry.value)) {
+                present.add(entry.value);
+            }
+        }
+        return present;
+    }
+
+    const present = new Set<string>();
+    for (let row = 0; row < column.filterValues.length; row++) {
+        const identity = column.filterValues[row];
+        if (identity !== null && identity !== undefined && candidates.has(identity)) {
+            present.add(identity);
+            if (present.size === candidates.size) return present;
+        }
+        if ((row + 1) % FILTER_ROWS_PER_CHECKPOINT === 0) {
+            await cancellation_checkpoint(is_cancelled);
+        }
+    }
+    if (column.filterValues.length % FILTER_ROWS_PER_CHECKPOINT !== 0) {
+        await cancellation_checkpoint(is_cancelled);
+    }
+    return present;
+}
+
 function group_enabled_filters(
     filters: readonly FilterEntry[],
 ): Map<number, FilterEntry[]> {
@@ -339,73 +396,31 @@ async function acquire_transform_column(
     sheet_index: number,
     column_index: number,
     row_count: number,
+    include_filter_identity: boolean,
     column_cache: TransformColumnCache | undefined,
     is_cancelled: () => boolean,
     instrumentation?: TransformSortInstrumentation,
-): Promise<TransformColumn> {
-    const cached = column_cache?.get(sheet_index, column_index);
-    if (cached) {
-        const column = { ...cached };
-        track_transform_column(column, instrumentation);
-        return column;
-    }
-
-    await cancellation_checkpoint(is_cancelled);
-    const mutable: MutableTransformColumn = {
-        values: new Array(row_count),
-        numeric: true,
-        foundValue: false,
-    };
-    for (let start = 0; start < row_count; start += SCAN_ROWS_PER_CHECKPOINT) {
-        const rows = read_source_columns(
-            source,
-            sheet_index,
-            start,
-            Math.min(SCAN_ROWS_PER_CHECKPOINT, row_count - start),
-            [column_index],
-        ).rows;
-        for (let offset = 0; offset < rows.length; offset++) {
-            const source_cell = rows[offset]?.[0] ?? null;
-            const raw = raw_value(source_cell);
-            mutable.values[start + offset] = raw;
-            if (raw !== null) {
-                mutable.foundValue = true;
-                if (
-                    source_cell?.rawType === 'boolean'
-                    || (
-                        source_cell?.rawType === 'number'
-                        && !Number.isFinite(Number(raw))
-                    )
-                    || (
-                        source_cell?.rawType !== 'number'
-                        && !canonical_numeric_string(raw)
-                    )
-                ) mutable.numeric = false;
-            }
-        }
-        await cancellation_checkpoint(is_cancelled);
-    }
-
-    // The request holds only this one active column. The cache deliberately
-    // retains published columns across requests and owns its separate bound.
-    const published: CachedTransformColumn = Object.freeze({
-        values: Object.freeze(mutable.values),
-        numeric: mutable.numeric,
-        foundValue: mutable.foundValue,
-    });
-    column_cache?.set(sheet_index, column_index, published);
-    const column = { ...published };
+): Promise<ColumnAnalysis> {
+    const column = await acquire_column_analysis(
+        source,
+        sheet_index,
+        column_index,
+        row_count,
+        include_filter_identity ? 'complete' : 'bounded',
+        column_cache,
+        is_cancelled,
+    );
     track_transform_column(column, instrumentation);
     return column;
 }
 
 function track_transform_column(
-    column: TransformColumn,
+    column: ColumnAnalysis,
     instrumentation?: TransformSortInstrumentation,
 ): void {
     if (!instrumentation) return;
     instrumentation.transformColumnValueSlots =
-        (instrumentation.transformColumnValueSlots ?? 0) + column.values.length;
+        (instrumentation.transformColumnValueSlots ?? 0) + column.values.length + (column.filterValues?.length ?? 0);
     instrumentation.peakTransformColumnValueSlots = Math.max(
         instrumentation.peakTransformColumnValueSlots ?? 0,
         instrumentation.transformColumnValueSlots,
@@ -413,12 +428,14 @@ function track_transform_column(
 }
 
 function release_transform_column(
-    column: TransformColumn,
+    column: ColumnAnalysis,
     instrumentation?: TransformSortInstrumentation,
 ): void {
     if (!instrumentation) return;
     instrumentation.transformColumnValueSlots =
-        (instrumentation.transformColumnValueSlots ?? 0) - column.values.length;
+        (instrumentation.transformColumnValueSlots ?? 0)
+        - column.values.length
+        - (column.filterValues?.length ?? 0);
 }
 
 interface NumericColumnKeys {
@@ -428,7 +445,7 @@ interface NumericColumnKeys {
 }
 
 async function prepare_numeric_column_keys(
-    column: TransformColumn,
+    column: ColumnAnalysis,
     survivors: Uint32Array,
     row_count: number,
     is_cancelled: () => boolean,
@@ -528,7 +545,7 @@ function compare_values(
 }
 
 function compare_precomputed_numeric_values(
-    column: TransformColumn,
+    column: ColumnAnalysis,
     keys: NumericColumnKeys,
     a_row: number,
     b_row: number,
@@ -558,20 +575,32 @@ export function matches_filter(
     entry: FilterEntry,
 ): boolean {
     const raw = raw_value(cell);
+    const identity = filter_uses_identity(entry) ? filter_value(cell) : raw;
+    const present_special = typeof identity === 'string'
+        && identity !== raw
+        && can_be_current_special_filter_identity(identity)
+        ? new Set([identity])
+        : undefined;
     const compiled = compile_filter_group(
         [entry],
         raw !== null && cell_can_be_numeric(cell),
         false,
+        undefined,
+        present_special,
     );
     const predicate = compiled.predicates[0];
     const numeric_key = raw !== null && predicate.needsNumericKey
         ? build_numeric_filter_row_key(raw)
         : undefined;
-    return predicate.matches(raw, numeric_key);
+    return predicate.matches(
+        predicate.usesFilterIdentity ? identity : raw,
+        numeric_key,
+    );
 }
 
 interface CompiledFilterPredicate {
     readonly needsNumericKey: boolean;
+    readonly usesFilterIdentity: boolean;
     readonly matches: (
         raw: string | null,
         numeric_key: NumericSortKey | undefined,
@@ -593,7 +622,7 @@ export class InvalidNumericFilterOperandError extends Error {
         readonly operator: FilterEntry['operator'],
         readonly operand: 'value' | 'secondValue',
     ) {
-        super('Numeric filter values must be finite numbers.');
+        super('Numeric filter values must be finite numbers or Stata missing tags.');
         this.name = 'InvalidNumericFilterOperandError';
     }
 }
@@ -614,6 +643,7 @@ function compile_filter_group(
     numeric_column: boolean,
     strict_numeric_operands: boolean,
     instrumentation?: TransformSortInstrumentation,
+    present_special_identities: ReadonlySet<string> = new Set(),
 ): CompiledFilterGroup {
     if (strict_numeric_operands) {
         validate_filter_operands(entries, numeric_column);
@@ -624,6 +654,7 @@ function compile_filter_group(
             numeric_column,
             strict_numeric_operands,
             instrumentation,
+            present_special_identities,
         )),
     };
 }
@@ -633,10 +664,12 @@ function compile_filter(
     numeric_column: boolean,
     strict_numeric_operands: boolean,
     instrumentation?: TransformSortInstrumentation,
+    present_special_identities: ReadonlySet<string> = new Set(),
 ): CompiledFilterPredicate {
     if (entry.operator === 'isEmpty') {
         return {
             needsNumericKey: false,
+            usesFilterIdentity: false,
             matches: (raw) => raw === null,
         };
     }
@@ -644,17 +677,30 @@ function compile_filter(
         // Sight's correction to Raven's stale include-missing bug.
         return {
             needsNumericKey: false,
+            usesFilterIdentity: false,
             matches: (raw) => raw !== null,
         };
     }
     if (entry.operator === 'isOneOf') {
-        // Exact raw-value exclusion: no case folding, no numeric
+        // Exact canonical-identity exclusion: no case folding or numeric
         // canonicalization. Values absent from the set — including values that
         // appear in the file later — always pass. `null` excludes blanks.
         const excluded = new Set(entry.excludedValues ?? []);
+        const legacy_identity_fallbacks = new Set(
+            [...excluded].flatMap((value) => {
+                if (value === null || present_special_identities.has(value)) return [];
+                const canonical = canonical_filter_identity_for_raw(value);
+                return canonical === value ? [] : [canonical];
+            }),
+        );
         return {
             needsNumericKey: false,
-            matches: (raw) => !excluded.has(raw),
+            usesFilterIdentity: filter_uses_identity(entry),
+            matches: (identity) => !excluded.has(identity)
+                && (
+                    identity === null
+                    || !legacy_identity_fallbacks.has(identity)
+                ),
         };
     }
 
@@ -686,6 +732,7 @@ function compile_filter(
         return {
             needsNumericKey: lower.numeric !== undefined
                 || upper.numeric !== undefined,
+            usesFilterIdentity: false,
             matches: (raw, numeric_key) => {
                 if (raw === null) return false;
                 const in_range =
@@ -708,6 +755,7 @@ function compile_filter(
         const compare = numeric_comparison(entry.operator);
         return {
             needsNumericKey: true,
+            usesFilterIdentity: false,
             matches: (raw, numeric_key) => raw !== null
                 && compare(compare_numeric_sort_keys(
                     numeric_key!,
@@ -829,7 +877,7 @@ function text_relational_filter(
 function text_filter(
     matches: CompiledFilterPredicate['matches'],
 ): CompiledFilterPredicate {
-    return { needsNumericKey: false, matches };
+    return { needsNumericKey: false, usesFilterIdentity: false, matches };
 }
 
 interface CompiledComparisonOperand {
@@ -869,7 +917,9 @@ function numeric_operand_is_usable(
     value: string,
     strict: boolean,
 ): boolean {
-    return strict ? finite_number_text(value) : Number.isFinite(Number(value));
+    return strict
+        ? numeric_operand_text(value)
+        : Number.isFinite(Number(value)) || stata_missing_rank(value) !== undefined;
 }
 
 function compile_numeric_filter_operand(
@@ -955,6 +1005,14 @@ function validate_column(col: number, count: number): void {
 }
 
 function compare_numeric_text(a: string, b: string): number {
+    const a_missing = stata_missing_rank(a);
+    const b_missing = stata_missing_rank(b);
+    if (a_missing !== undefined || b_missing !== undefined) {
+        if (a_missing !== undefined && b_missing !== undefined) {
+            return a_missing - b_missing;
+        }
+        return a_missing !== undefined ? 1 : -1;
+    }
     const a_decimal = parse_canonical_decimal(a);
     const b_decimal = parse_canonical_decimal(b);
     if (a_decimal && b_decimal) {
@@ -971,7 +1029,11 @@ interface ExactDecimal {
     readonly magnitude: bigint;
 }
 
-type NumericSortKey = ExactDecimal;
+interface StataMissingSortKey {
+    readonly stataMissingRank: number;
+}
+
+type NumericSortKey = ExactDecimal | StataMissingSortKey;
 
 /**
  * Reuses exact keys for repeated raw values without retaining an entry for
@@ -1050,6 +1112,8 @@ function parse_canonical_decimal(value: string): ExactDecimal | undefined {
 }
 
 function build_numeric_sort_key(value: string): NumericSortKey {
+    const missing_rank = stata_missing_rank(value);
+    if (missing_rank !== undefined) return { stataMissingRank: missing_rank };
     const exact = parse_canonical_decimal(value);
     if (exact) return exact;
 
@@ -1060,6 +1124,12 @@ function build_numeric_sort_key(value: string): NumericSortKey {
 }
 
 function compare_numeric_sort_keys(a: NumericSortKey, b: NumericSortKey): number {
+    const a_missing = 'stataMissingRank' in a;
+    const b_missing = 'stataMissingRank' in b;
+    if (a_missing || b_missing) {
+        if (a_missing && b_missing) return a.stataMissingRank - b.stataMissingRank;
+        return a_missing ? 1 : -1;
+    }
     return compare_exact_decimals(a, b);
 }
 
@@ -1092,7 +1162,7 @@ function validate_filter_operands(
     if (!numeric_column) return;
     for (const entry of filters) {
         if (!NUMERIC_FILTER_OPERATORS.has(entry.operator)) continue;
-        if (!finite_number_text(entry.value)) {
+        if (!numeric_operand_text(entry.value)) {
             throw new InvalidNumericFilterOperandError(
                 entry.id,
                 entry.operator,
@@ -1101,7 +1171,7 @@ function validate_filter_operands(
         }
         if (
             is_range_filter_operator(entry.operator)
-            && !finite_number_text(entry.secondValue)
+            && !numeric_operand_text(entry.secondValue)
         ) {
             throw new InvalidNumericFilterOperandError(
                 entry.id,
@@ -1112,10 +1182,12 @@ function validate_filter_operands(
     }
 }
 
-function finite_number_text(value: string | undefined): boolean {
+function numeric_operand_text(value: string | undefined): boolean {
     return value !== undefined
-        && value.trim() !== ''
-        && Number.isFinite(Number(value));
+        && (
+            stata_missing_rank(value) !== undefined
+            || (value.trim() !== '' && Number.isFinite(Number(value)))
+        );
 }
 
 async function cooperative_stable_sort(

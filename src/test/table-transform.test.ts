@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
-import type {
-    ColumnWindow,
-    DataSource,
-    RenderedCell,
-    RowWindow,
-    WorkbookMeta,
+import {
+    DEFERRED_FILTER_IDENTITY,
+    type ColumnWindow,
+    type DataSource,
+    type RenderedCell,
+    type RowWindow,
+    type WorkbookMeta,
 } from '../data-source/interface';
 import {
     compare_cells,
@@ -14,7 +15,11 @@ import {
     transformed_window,
 } from '../table-transform';
 import type { FilterEntry, SheetTransformState } from '../types';
-import { transform_read_columns } from '../types';
+import {
+    canonical_filter_identity_for_raw,
+    FILTER_DISTINCT_VALUE_BYTE_LIMIT,
+    transform_read_columns,
+} from '../types';
 import type {
     CachedTransformColumn,
     TransformColumnCache,
@@ -31,6 +36,21 @@ const cell = (
     italic: false,
     rawType,
 });
+
+function deferred_filter_cell(
+    raw: string,
+    resolve_key: () => Promise<string>,
+    raw_byte_length?: number,
+): RenderedCell {
+    const rendered = {
+        ...cell(raw),
+        ...(raw_byte_length === undefined ? {} : { rawByteLength: raw_byte_length }),
+    };
+    Object.defineProperty(rendered, DEFERRED_FILTER_IDENTITY, {
+        value: { cachedKey: () => undefined, resolveKey: resolve_key },
+    });
+    return rendered;
+}
 
 class Source implements DataSource {
     read_calls = 0;
@@ -657,6 +677,167 @@ describe('table transforms', () => {
 
         expect(source.read_calls).toBe(first_read_count);
         expect(stored.size).toBe(1);
+        expect(stored.get('0:0')?.filterIdentityComplete).toBe(true);
+
+        await compute_transform(source, 0, {
+            filters: [{
+                ...filter('isOneOf'),
+                excludedValues: ['0'],
+            }],
+            sort: [],
+        }, undefined, undefined, cache);
+        expect(source.read_calls).toBe(first_read_count);
+    });
+
+    it('resolves bounded deferred identities during shared analysis', async () => {
+        const key = `stata-binary:sha256:${'a'.repeat(64)}:40`;
+        const resolve = vi.fn(async () => key);
+        const source = new Source([
+            [deferred_filter_cell('binary (40 bytes): aa…', resolve, 40)],
+            [cell('ordinary')],
+        ]);
+        const stored = new Map<string, CachedTransformColumn>();
+        const cache: TransformColumnCache = {
+            get: (sheet, column) => stored.get(`${sheet}:${column}`),
+            set: (sheet, column, value) => stored.set(`${sheet}:${column}`, value),
+        };
+
+        await compute_transform(source, 0, {
+            filters: [],
+            sort: [{ colIndex: 0, direction: 'asc' }],
+        }, undefined, undefined, cache);
+        const reads = source.read_calls;
+
+        expect(resolve).toHaveBeenCalledOnce();
+        expect(stored.get('0:0')?.filterIdentityComplete).toBe(true);
+        const categorical = await compute_transform(source, 0, {
+            filters: [{
+                ...filter('isOneOf'),
+                excludedValues: [key],
+            }],
+            sort: [],
+        }, undefined, undefined, cache);
+        expect([...categorical.indices!]).toEqual([1]);
+        expect(source.read_calls).toBe(reads);
+        expect(resolve).toHaveBeenCalledOnce();
+    });
+
+    it('bounds deferred identity work and upgrades the cache for isOneOf', async () => {
+        const first_key = `stata-binary:sha256:${'a'.repeat(64)}:40`;
+        const second_key = `stata-binary:sha256:${'b'.repeat(64)}:40`;
+        const first_resolve = vi.fn(async () => first_key);
+        const second_resolve = vi.fn(async () => second_key);
+        const oversized = FILTER_DISTINCT_VALUE_BYTE_LIMIT + 1;
+        const source = new Source([
+            [deferred_filter_cell(
+                'binary (40 bytes): aa…', first_resolve, oversized,
+            )],
+            [deferred_filter_cell(
+                'binary (40 bytes): bb…', second_resolve, oversized,
+            )],
+        ]);
+        const stored = new Map<string, CachedTransformColumn>();
+        const cache: TransformColumnCache = {
+            get: (sheet, column) => stored.get(`${sheet}:${column}`),
+            set: (sheet, column, value) => stored.set(`${sheet}:${column}`, value),
+        };
+
+        await compute_transform(source, 0, {
+            filters: [],
+            sort: [{ colIndex: 0, direction: 'asc' }],
+        }, undefined, undefined, cache);
+        expect(first_resolve).not.toHaveBeenCalled();
+        expect(second_resolve).not.toHaveBeenCalled();
+        expect(stored.get('0:0')?.filterIdentityComplete).toBe(false);
+        const raw_reads = source.read_calls;
+
+        await compute_transform(source, 0, {
+            filters: [filter('equals', 'binary (40 bytes): aa…')],
+            sort: [],
+        }, undefined, undefined, cache);
+        expect(source.read_calls).toBe(raw_reads);
+        expect(first_resolve).not.toHaveBeenCalled();
+        expect(second_resolve).not.toHaveBeenCalled();
+
+        const categorical = await compute_transform(source, 0, {
+            filters: [{
+                ...filter('isOneOf'),
+                excludedValues: [first_key],
+            }],
+            sort: [],
+        }, undefined, undefined, cache);
+        expect([...categorical.indices!]).toEqual([1]);
+        expect(source.read_calls).toBe(raw_reads + 1);
+        expect(first_resolve).toHaveBeenCalledTimes(1);
+        expect(second_resolve).toHaveBeenCalledTimes(1);
+        expect(stored.get('0:0')?.filterIdentityComplete).toBe(true);
+
+        await compute_transform(source, 0, {
+            filters: [],
+            sort: [{ colIndex: 0, direction: 'desc' }],
+        }, undefined, undefined, cache);
+        expect(source.read_calls).toBe(raw_reads + 1);
+        expect(first_resolve).toHaveBeenCalledTimes(1);
+        expect(second_resolve).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps escaped raw identities distinct and matches legacy persisted spellings', async () => {
+        const binary_key = `stata-binary:sha256:${'a'.repeat(64)}:40`;
+        const raw_identity = canonical_filter_identity_for_raw(binary_key);
+        const binary = cell('binary (40 bytes): aa…');
+        binary.filterKey = binary_key;
+        const state = (excludedValues: string[]): SheetTransformState => ({
+            filters: [{
+                ...filter('isOneOf'),
+                excludedValues,
+            }],
+            sort: [],
+        });
+
+        const both = new Source([[cell(binary_key)], [binary]]);
+        const exclude_raw = await compute_transform(
+            both,
+            0,
+            state([raw_identity]),
+        );
+        expect([...exclude_raw.indices!]).toEqual([1]);
+
+        const exclude_binary = await compute_transform(
+            both,
+            0,
+            state([binary_key]),
+        );
+        expect([...exclude_binary.indices!]).toEqual([0]);
+
+        const legacy_raw = await compute_transform(
+            new Source([[cell(binary_key)]]),
+            0,
+            state([binary_key]),
+        );
+        expect([...legacy_raw.indices!]).toEqual([]);
+
+        const prefixed_raw = 'table-viewer:raw:literal';
+        const legacy_prefixed_raw = await compute_transform(
+            new Source([[cell(prefixed_raw)]]),
+            0,
+            state([prefixed_raw]),
+        );
+        expect([...legacy_prefixed_raw.indices!]).toEqual([]);
+
+        const prefixed_identity = canonical_filter_identity_for_raw(prefixed_raw);
+        const ambiguous_prefix = await compute_transform(
+            new Source([[cell(prefixed_raw)], [cell(prefixed_identity)]]),
+            0,
+            state([prefixed_identity]),
+        );
+        expect([...ambiguous_prefix.indices!]).toEqual([1]);
+
+        const legacy_nested_prefix = await compute_transform(
+            new Source([[cell(prefixed_identity)]]),
+            0,
+            state([prefixed_identity]),
+        );
+        expect([...legacy_nested_prefix.indices!]).toEqual([]);
     });
 
     it('skips sort-column acquisition for zero and singleton survivors', async () => {
@@ -1031,6 +1212,31 @@ describe('table transforms', () => {
         )).toBe(true);
     });
 
+    it('filters and directly compares Stata missing tags numerically', async () => {
+        const source = new Source([
+            [cell('1', 'number')],
+            [cell('.', 'number')],
+            [cell('.a', 'number')],
+            [cell('.z', 'number')],
+        ]);
+        const apply = (entry: FilterEntry) => compute_transform(source, 0, {
+            sort: [],
+            filters: [entry],
+        });
+
+        await expect(apply(filter('equals', '.a')))
+            .resolves.toMatchObject({ indices: Uint32Array.from([2]) });
+        await expect(apply(filter('greaterThan', '100')))
+            .resolves.toMatchObject({ indices: Uint32Array.from([1, 2, 3]) });
+        await expect(apply({
+            ...filter('between', '.a'),
+            secondValue: '.z',
+        })).resolves.toMatchObject({ indices: Uint32Array.from([2, 3]) });
+        expect(matches_filter(cell('.a', 'number'), filter('greaterThan', '.'))).toBe(true);
+        expect(compare_cells(cell('.a', 'number'), cell('100', 'number'), 'asc'))
+            .toBeGreaterThan(0);
+    });
+
     it('excludes exact raw values with isOneOf and passes everything else', async () => {
         const exclusion = (
             excluded: (string | null)[],
@@ -1062,6 +1268,9 @@ describe('table transforms', () => {
         expect(matches_filter(cell('brand new'), exclusion(['old']))).toBe(true);
         expect(matches_filter(cell('anything'), exclusion([]))).toBe(true);
         expect(matches_filter(null, exclusion([]))).toBe(true);
+        const unresolved = deferred_filter_cell('preview', async () => 'identity');
+        expect(() => matches_filter(unresolved, exclusion(['identity'])))
+            .toThrow('Deferred filter identity must be resolved asynchronously.');
 
         // Full transform: survivors keep source order; blanks drop with null.
         const source = new Source([

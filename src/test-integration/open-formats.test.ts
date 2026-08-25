@@ -54,6 +54,9 @@ describe('open supported formats', () => {
             ['basic.xls', 'selector.XlS'],
             ['basic.csv', 'selector.CsV'],
             ['basic.tsv', 'selector.TsV'],
+            // Selector discovery is host-level, so borrowed fixture bytes are
+            // enough to verify the mixed-case .dta registration.
+            ['basic.csv', 'selector.DtA'],
         ] as const;
 
         try {

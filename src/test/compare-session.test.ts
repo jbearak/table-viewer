@@ -1,7 +1,218 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { CompareDataSource, align_workbook } from '../diff-compare/compare-session';
-import type { DataSource } from '../data-source/interface';
-import { FixtureSource } from './helpers/fixture-source';
+import {
+    DEFERRED_COMPARISON_IDENTITY,
+    type ColumnFilterMetadata,
+    type DataSource,
+    type IndexedRawColumns,
+    type RawCell,
+    type RawColumnWindow,
+    type RenderedCell,
+    type WorkbookMeta,
+} from '../data-source/interface';
+import { ABSENT, type SheetAlignment } from '../diff-compare/row-alignment';
+import { cell, FixtureSource } from './helpers/fixture-source';
+
+/** Serves cells verbatim, unlike FixtureSource's string rows, so a test can
+ *  give a cell the deferred identity a Stata binary strL carries. */
+class StubSource implements DataSource {
+    constructor(private readonly rows: RenderedCell[][]) {}
+
+    meta(): WorkbookMeta {
+        return {
+            hasFormatting: false,
+            sheets: [{
+                name: 'Sheet1',
+                rowCount: this.rows.length,
+                sourceRowCount: this.rows.length,
+                columnCount: this.rows.reduce((w, r) => Math.max(w, r.length), 0),
+                merges: [],
+                hasFormatting: false,
+            }],
+        };
+    }
+
+    read_rows(_sheet: number, start_row: number, count: number) {
+        return { startRow: start_row, rows: this.rows.slice(start_row, start_row + count) };
+    }
+
+    close(): void {}
+}
+
+function deferred<T>() {
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((done, fail) => {
+        resolve = done;
+        reject = fail;
+    });
+    return { promise, resolve, reject };
+}
+
+interface RawReadRequest {
+    readonly startRow: number;
+    readonly count: number;
+    readonly columns: readonly number[];
+    readonly isCancelled: () => boolean;
+}
+
+/** Async raw source with observable reads. Its default raw projection strips
+ * display formatting, so formattedBase can only come from a later rendered read. */
+class AsyncRawSource implements DataSource {
+    readonly rawReads: RawReadRequest[] = [];
+    readonly renderedReads: { startRow: number; count: number }[] = [];
+    closed = false;
+
+    constructor(
+        protected readonly rows: RenderedCell[][],
+        protected readonly rawReader?: (request: RawReadRequest) => Promise<RawColumnWindow>,
+        protected readonly sheetName = 'Sheet1',
+    ) {}
+
+    meta(): WorkbookMeta {
+        return {
+            hasFormatting: true,
+            sheets: [{
+                name: this.sheetName,
+                rowCount: this.rows.length,
+                sourceRowCount: this.rows.length,
+                columnCount: this.rows.reduce((width, row) => Math.max(width, row.length), 0),
+                merges: [],
+                hasFormatting: true,
+            }],
+        };
+    }
+
+    read_rows(_sheet: number, start_row: number, count: number) {
+        this.renderedReads.push({ startRow: start_row, count });
+        return { startRow: start_row, rows: this.rows.slice(start_row, start_row + count) };
+    }
+
+    read_raw_columns_async(
+        _sheet: number,
+        start_row: number,
+        count: number,
+        columns: readonly number[],
+        is_cancelled: () => boolean,
+    ): Promise<RawColumnWindow> {
+        const request = {
+            startRow: start_row,
+            count,
+            columns,
+            isCancelled: is_cancelled,
+        };
+        this.rawReads.push(request);
+        if (this.rawReader) return this.rawReader(request);
+        return Promise.resolve({
+            startRow: start_row,
+            rows: this.rows.slice(start_row, start_row + count).map((row) =>
+                columns.map((column): RawCell | null => {
+                    const source = row[column];
+                    if (!source) return null;
+                    return {
+                        raw: source.raw,
+                        ...(source.rawType === undefined ? {} : { rawType: source.rawType }),
+                        ...(source.comparisonKey === undefined
+                            ? {} : { comparisonKey: source.comparisonKey }),
+                    };
+                })),
+        });
+    }
+
+    close(): void {
+        this.closed = true;
+    }
+}
+
+interface IndexedRawReadRequest {
+    readonly rows: readonly number[];
+    readonly columns: readonly number[];
+    readonly isCancelled: () => boolean;
+}
+
+class IndexedAsyncRawSource extends AsyncRawSource {
+    readonly indexedRawReads: IndexedRawReadRequest[] = [];
+
+    constructor(
+        rows: RenderedCell[][],
+        private readonly indexedReader?: (
+            request: IndexedRawReadRequest,
+        ) => Promise<IndexedRawColumns>,
+        sheet_name = 'Sheet1',
+    ) {
+        super(rows, undefined, sheet_name);
+    }
+
+    read_raw_columns_indexed_async(
+        _sheet: number,
+        row_indices: ArrayLike<number>,
+        columns: readonly number[],
+        is_cancelled: () => boolean,
+    ): Promise<IndexedRawColumns> {
+        const request = { rows: Array.from(row_indices), columns, isCancelled: is_cancelled };
+        this.indexedRawReads.push(request);
+        if (this.indexedReader) return this.indexedReader(request);
+        return Promise.resolve({
+            rows: request.rows.map((row) => columns.map((column): RawCell | null => {
+                const source = this.rows[row]?.[column];
+                return source ? {
+                    raw: source.raw,
+                    ...(source.rawType === undefined ? {} : { rawType: source.rawType }),
+                } : null;
+            })),
+        });
+    }
+}
+
+class MetadataSource extends AsyncRawSource {
+    readonly metadataReads: { isCancelled: () => boolean }[] = [];
+
+    constructor(
+        rows: RenderedCell[][],
+        private readonly filterMetadata: ColumnFilterMetadata | undefined,
+        private readonly metadataReader?: (
+            is_cancelled: () => boolean,
+        ) => Promise<ColumnFilterMetadata | undefined>,
+        sheet_name = 'Sheet1',
+    ) {
+        super(rows, undefined, sheet_name);
+    }
+
+    column_filter_metadata(): ColumnFilterMetadata | undefined {
+        return this.filterMetadata;
+    }
+
+    column_filter_metadata_async(
+        _sheet: number,
+        _column: number,
+        is_cancelled: () => boolean,
+    ): Promise<ColumnFilterMetadata | undefined> {
+        this.metadataReads.push({ isCancelled: is_cancelled });
+        return this.metadataReader
+            ? this.metadataReader(is_cancelled)
+            : Promise.resolve(this.filterMetadata);
+    }
+}
+
+function abort_error(): Error {
+    const error = new Error('cancelled');
+    error.name = 'AbortError';
+    return error;
+}
+
+const positional_alignment = (
+    changedRowIndices: readonly number[],
+    row_count = 1,
+): SheetAlignment => ({
+    rows: Array.from({ length: row_count }, (_, row) => ({ original: row, modified: row })),
+    addedRows: 0,
+    deletedRows: 0,
+    changedCells: changedRowIndices.length,
+    changedRowIndices,
+    movedRowIndices: [],
+    moveSearchTruncated: false,
+    degraded: false,
+});
 
 /** The production path serves whole transformed windows via `diff_rows`; these
  *  tests want a plain leading page, so they name the rows themselves, clamped
@@ -44,7 +255,7 @@ describe('CompareDataSource', () => {
         expect(source.meta().sheets[0].rowCount).toBe(2);
     });
 
-    it('diffs a matched sheet cell by cell, and a one-sided one as a whole band', () => {
+    it('diffs a matched sheet cell by cell, and a one-sided one as a whole band', async () => {
         const source = new CompareDataSource(
             new FixtureSource([
                 { name: 'Kept', rows: [['x']] },
@@ -52,14 +263,77 @@ describe('CompareDataSource', () => {
             ]),
             new FixtureSource([{ name: 'Kept', rows: [['z']] }]),
         );
-        const kept = diff_page(source, 0, 10);
-        expect(kept?.changedCells).toEqual([{ row: 0, col: 0, base: 'z' }]);
+        const kept = await diff_page(source, 0, 10);
+        expect(kept?.changedCells).toEqual([
+            { row: 0, col: 0, base: 'z', formattedBase: 'z' },
+        ]);
         // There is no original to compare the added sheet against, so it has no
         // cell-level diff — but it is still all added, and saying nothing left
         // it painted as unchanged.
-        expect(diff_page(source, 1, 10)).toMatchObject({
+        expect(await diff_page(source, 1, 10)).toMatchObject({
             rowStatus: ['added'], changedCells: [],
         });
+    });
+
+    // A Stata binary strL renders a bounded preview, so two different payloads
+    // can share `raw`. Comparison has to resolve the lossless identity, but
+    // `base` is shown to the user and must stay the readable preview — never
+    // the digest, and never an internal `raw:`/`comparison:` tag.
+    it('compares on identity but reports the display text as the base', async () => {
+        const preview = 'binary (33 bytes): 0102030405…';
+        const binary = (digest: string): RenderedCell => {
+            const rendered = cell(preview);
+            Object.defineProperty(rendered, DEFERRED_COMPARISON_IDENTITY, {
+                value: {
+                    cachedKey: () => undefined,
+                    resolveKey: async () => `stata-binary:sha256:${digest}:33`,
+                },
+            });
+            return rendered;
+        };
+        const source = new CompareDataSource(
+            new StubSource([[binary('bbbb')]]),
+            new StubSource([[binary('aaaa')]]),
+        );
+        // Same preview, different payloads: caught only via deferred identity.
+        // Both user-facing bases stay on the preview; the digest must never cross
+        // the compare protocol into paint text.
+        const diff = await source.diff_rows(0, [0]);
+        expect(diff?.changedCells).toEqual([{
+            row: 0,
+            col: 0,
+            base: preview,
+            formattedBase: preview,
+        }]);
+        expect(JSON.stringify(diff)).not.toContain('stata-binary:sha256:');
+
+        // Identical payloads must stay unchanged rather than diffing on the tag.
+        const unchanged = new CompareDataSource(
+            new StubSource([[binary('aaaa')]]),
+            new StubSource([[binary('aaaa')]]),
+        );
+        expect((await unchanged.diff_rows(0, [0]))?.changedCells).toEqual([]);
+    });
+
+    it('keeps Stata value-label text separate from the raw compare base', async () => {
+        const labeled = (raw: string, formatted: string): RenderedCell => ({
+            raw,
+            formatted,
+            bold: false,
+            italic: false,
+            rawType: 'number',
+        });
+        const source = new CompareDataSource(
+            new StubSource([[labeled('2', 'No')]]),
+            new StubSource([[labeled('1', 'Yes')]]),
+        );
+
+        expect((await source.diff_rows(0, [0]))?.changedCells).toEqual([{
+            row: 0,
+            col: 0,
+            base: '1',
+            formattedBase: 'Yes',
+        }]);
     });
 
     it('exposes pairings including added and deleted sheets', () => {
@@ -86,7 +360,7 @@ describe('CompareDataSource', () => {
         expect(original.closed).toBe(true);
     });
 
-    it('exposes deleted sheets as navigable read-only all-deleted bands', () => {
+    it('exposes deleted sheets as navigable read-only all-deleted bands', async () => {
         const source = new CompareDataSource(
             new FixtureSource([{ name: 'Kept', rows: [['x']] }]),
             new FixtureSource([
@@ -104,10 +378,11 @@ describe('CompareDataSource', () => {
         const window = source.read_rows(1, 0, 10);
         expect(window.rows.map((row) => row[0]?.raw)).toEqual(['g1', 'g2']);
         expect(source.read_rows_indexed(1, [1]).rows[0][0]?.raw).toBe('g2');
-        expect(source.diff_rows(1, [0, 1])?.rowStatus).toEqual(['deleted', 'deleted']);
+        expect((await source.diff_rows(1, [0, 1]))?.rowStatus)
+            .toEqual(['deleted', 'deleted']);
     });
 
-    it('bands an added sheet the way it bands a deleted one', () => {
+    it('bands an added sheet the way it bands a deleted one', async () => {
         // An added sheet has no original to align against, so it has no
         // alignment — and used to fall through to no diff at all, leaving a
         // wholly new sheet painted as ordinary unchanged rows while its tab
@@ -120,27 +395,527 @@ describe('CompareDataSource', () => {
             new FixtureSource([{ name: 'Kept', rows: [['x']] }]),
         );
         expect(source.sheetStatuses).toEqual(['matched', 'added']);
-        expect(source.diff_rows(1, [0, 1])?.rowStatus).toEqual(['added', 'added']);
+        expect((await source.diff_rows(1, [0, 1]))?.rowStatus)
+            .toEqual(['added', 'added']);
         // And the filter already kept them, which is what made the gap visible:
         // "only changed rows" showed every row of the sheet, unbanded.
         expect(source.changed_grid_rows(1)).toEqual([0, 1]);
     });
 
-    it('serves repeated diff_rows requests from the cache', () => {
+    it('serves repeated diff_rows requests from the cache', async () => {
         const original = new FixtureSource([{ name: 'Sheet1', rows: [['a']] }]);
         const source = new CompareDataSource(
             new FixtureSource([{ name: 'Sheet1', rows: [['b']] }]),
             original,
         );
-        const first = source.diff_rows(0, [0]);
+        const first = await source.diff_rows(0, [0]);
         let reads = 0;
         const read_rows = original.read_rows.bind(original);
         original.read_rows = (...read_args) => {
             reads += 1;
             return read_rows(...read_args);
         };
-        expect(source.diff_rows(0, [0])).toBe(first);
+        expect(await source.diff_rows(0, [0])).toBe(first);
         expect(reads).toBe(0);
+    });
+
+    it('starts both async raw side reads before awaiting either', async () => {
+        const original_gate = deferred<RawColumnWindow>();
+        const modified_gate = deferred<RawColumnWindow>();
+        const original = new AsyncRawSource([[cell('a')]], () => original_gate.promise);
+        const modified = new AsyncRawSource([[cell('b')]], () => modified_gate.promise);
+        const source = new CompareDataSource(modified, original);
+
+        const pending = source.diff_rows(0, [0]);
+        await vi.waitFor(() => {
+            expect(original.rawReads).toHaveLength(1);
+            expect(modified.rawReads).toHaveLength(1);
+        });
+        original_gate.resolve({ startRow: 0, rows: [[{ raw: 'a' }]] });
+        modified_gate.resolve({ startRow: 0, rows: [[{ raw: 'b' }]] });
+
+        expect((await pending)?.changedCells).toEqual([
+            { row: 0, col: 0, base: 'a', formattedBase: 'a' },
+        ]);
+    });
+
+    it('cancels the sibling raw read after one failure and observes both settlements', async () => {
+        const original_gate = deferred<RawColumnWindow>();
+        const modified_gate = deferred<RawColumnWindow>();
+        const original = new AsyncRawSource([[cell('a')]], () => original_gate.promise);
+        const modified = new AsyncRawSource([[cell('b')]], () => modified_gate.promise);
+        const source = new CompareDataSource(modified, original);
+        const failure = new Error('original raw read failed');
+
+        const pending = source.diff_rows(0, [0]);
+        let settled = false;
+        void pending.then(
+            () => { settled = true; },
+            () => { settled = true; },
+        );
+        const rejection = expect(pending).rejects.toBe(failure);
+        await vi.waitFor(() => {
+            expect(original.rawReads).toHaveLength(1);
+            expect(modified.rawReads).toHaveLength(1);
+        });
+        original_gate.reject(failure);
+        await vi.waitFor(() => expect(modified.rawReads[0].isCancelled()).toBe(true));
+        expect(settled).toBe(false);
+
+        modified_gate.reject(abort_error());
+        await rejection;
+        expect(settled).toBe(true);
+    });
+
+    it('reads each contributing aligned side through one indexed request', async () => {
+        const original = new IndexedAsyncRawSource([
+            [cell('O0')], [cell('O1')], [cell('O2')], [cell('O3')],
+        ]);
+        const modified = new IndexedAsyncRawSource([[cell('M0')], [cell('M1')]]);
+        const alignment: SheetAlignment = {
+            rows: [
+                { original: 0, modified: 0 },
+                { original: 1, modified: ABSENT },
+                { original: 2, modified: 1 },
+                { original: 3, modified: ABSENT },
+            ],
+            addedRows: 0,
+            deletedRows: 2,
+            changedCells: 2,
+            changedRowIndices: [0, 2],
+            movedRowIndices: [],
+            moveSearchTruncated: false,
+            degraded: false,
+        };
+        const source = new CompareDataSource(
+            modified,
+            original,
+            new Map([[0, alignment]]),
+        );
+
+        const window = await source.read_raw_columns_async(0, 0, 4, [0], () => false);
+
+        expect(window.rows.map((row) => row[0]?.raw)).toEqual(['M0', 'O1', 'M1', 'O3']);
+        expect(modified.indexedRawReads.map((request) => request.rows)).toEqual([[0, 1]]);
+        expect(original.indexedRawReads.map((request) => request.rows)).toEqual([[1, 3]]);
+    });
+
+    it('settles both aligned indexed reads and cancels the peer after failure', async () => {
+        const original_gate = deferred<IndexedRawColumns>();
+        const modified_gate = deferred<IndexedRawColumns>();
+        const original = new IndexedAsyncRawSource(
+            [[cell('O0')], [cell('O1')]],
+            () => original_gate.promise,
+        );
+        const modified = new IndexedAsyncRawSource(
+            [[cell('M0')]],
+            () => modified_gate.promise,
+        );
+        const alignment: SheetAlignment = {
+            rows: [
+                { original: 0, modified: 0 },
+                { original: 1, modified: ABSENT },
+            ],
+            addedRows: 0,
+            deletedRows: 1,
+            changedCells: 0,
+            changedRowIndices: [],
+            movedRowIndices: [],
+            moveSearchTruncated: false,
+            degraded: false,
+        };
+        const source = new CompareDataSource(modified, original, new Map([[0, alignment]]));
+        const failure = new Error('indexed original failed');
+
+        const pending = source.read_raw_columns_async(0, 0, 2, [0], () => false);
+        let settled = false;
+        void pending.finally(() => { settled = true; }).catch(() => {});
+        const rejection = expect(pending).rejects.toBe(failure);
+        await vi.waitFor(() => {
+            expect(original.indexedRawReads).toHaveLength(1);
+            expect(modified.indexedRawReads).toHaveLength(1);
+        });
+        original_gate.reject(failure);
+        await vi.waitFor(() =>
+            expect(modified.indexedRawReads[0].isCancelled()).toBe(true));
+        expect(settled).toBe(false);
+        modified_gate.reject(abort_error());
+        await rejection;
+        expect(settled).toBe(true);
+    });
+
+    it('prevents aligned raw publication after close', async () => {
+        const original_gate = deferred<IndexedRawColumns>();
+        const modified_gate = deferred<IndexedRawColumns>();
+        const original = new IndexedAsyncRawSource(
+            [[cell('O0')], [cell('O1')]],
+            () => original_gate.promise,
+        );
+        const modified = new IndexedAsyncRawSource(
+            [[cell('M0')]],
+            () => modified_gate.promise,
+        );
+        const alignment: SheetAlignment = {
+            rows: [
+                { original: 0, modified: 0 },
+                { original: 1, modified: ABSENT },
+            ],
+            addedRows: 0,
+            deletedRows: 1,
+            changedCells: 0,
+            changedRowIndices: [],
+            movedRowIndices: [],
+            moveSearchTruncated: false,
+            degraded: false,
+        };
+        const source = new CompareDataSource(modified, original, new Map([[0, alignment]]));
+
+        const pending = source.read_raw_columns_async(0, 0, 2, [0], () => false);
+        await vi.waitFor(() => {
+            expect(original.indexedRawReads).toHaveLength(1);
+            expect(modified.indexedRawReads).toHaveLength(1);
+        });
+        source.close();
+        original_gate.resolve({ rows: [[{ raw: 'O1' }]] });
+        modified_gate.resolve({ rows: [[{ raw: 'M0' }]] });
+        await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    });
+
+    it('merges filter metadata by actual grid contribution', async () => {
+        const labels = (values: Record<string, string>): ColumnFilterMetadata['valueLabel'] =>
+            (raw) => values[raw];
+        const original = new MetadataSource(
+            [[cell('1')], [cell('deleted')]],
+            {
+                categoricalCodes: true,
+                valueLabel: labels({ '1': '', '2': 'Original', '3': 'Same', '4': 'Only original' }),
+            },
+        );
+        const modified = new MetadataSource(
+            [[cell('1')]],
+            {
+                categoricalCodes: false,
+                valueLabel: labels({ '1': '', '2': 'Modified', '3': 'Same' }),
+            },
+        );
+        const alignment: SheetAlignment = {
+            rows: [
+                { original: 0, modified: 0 },
+                { original: 1, modified: ABSENT },
+            ],
+            addedRows: 0,
+            deletedRows: 1,
+            changedCells: 0,
+            changedRowIndices: [],
+            movedRowIndices: [],
+            moveSearchTruncated: false,
+            degraded: false,
+        };
+        const source = new CompareDataSource(modified, original, new Map([[0, alignment]]));
+
+        for (const metadata of [
+            source.column_filter_metadata(0, 0),
+            await source.column_filter_metadata_async(0, 0, () => false),
+        ]) {
+            expect(metadata?.categoricalCodes).toBe(true);
+            expect(metadata?.valueLabel?.('1')).toBe('');
+            expect(metadata?.valueLabel?.('2')).toBeUndefined();
+            expect(metadata?.valueLabel?.('3')).toBe('Same');
+            expect(metadata?.valueLabel?.('4')).toBeUndefined();
+        }
+        expect(original.metadataReads).toHaveLength(1);
+        expect(modified.metadataReads).toHaveLength(1);
+    });
+
+    it('uses only the side whose rows can contribute filter values', async () => {
+        const original = new MetadataSource(
+            [[cell('old')]],
+            { valueLabel: () => 'original' },
+        );
+        const modified = new MetadataSource(
+            [[cell('new')]],
+            { valueLabel: () => 'modified' },
+        );
+        const source = new CompareDataSource(
+            modified,
+            original,
+            new Map([[0, positional_alignment([])]]),
+        );
+
+        const paired = await source.column_filter_metadata_async(0, 0, () => false);
+        expect(paired?.valueLabel?.('x')).toBe('modified');
+        expect(modified.metadataReads).toHaveLength(1);
+        expect(original.metadataReads).toHaveLength(0);
+
+        const added = new MetadataSource(
+            [[cell('new')]],
+            { valueLabel: () => 'added' },
+            undefined,
+            'Fresh',
+        );
+        const deleted = new MetadataSource(
+            [[cell('old')]],
+            { valueLabel: () => 'deleted' },
+            undefined,
+            'Gone',
+        );
+        const one_sided = new CompareDataSource(added, deleted);
+        expect(one_sided.column_filter_metadata(0, 0)?.valueLabel?.('x')).toBe('added');
+        expect(one_sided.column_filter_metadata(1, 0)?.valueLabel?.('x')).toBe('deleted');
+    });
+
+    it('counts fallback trailing rows and includes their original metadata', async () => {
+        const original = new MetadataSource(
+            [[cell('kept')], [cell('deleted')]],
+            { categoricalCodes: true, valueLabel: () => 'original' },
+        );
+        const modified = new MetadataSource(
+            [[cell('kept')]],
+            { categoricalCodes: false, valueLabel: () => 'modified' },
+        );
+        const source = new CompareDataSource(modified, original);
+
+        expect(source.change_counts()).toMatchObject({ addedRows: 0, deletedRows: 1 });
+        for (const metadata of [
+            source.column_filter_metadata(0, 0),
+            await source.column_filter_metadata_async(0, 0, () => false),
+        ]) {
+            expect(metadata?.categoricalCodes).toBe(true);
+            expect(metadata?.valueLabel?.('x')).toBeUndefined();
+        }
+        expect(original.metadataReads).toHaveLength(1);
+        expect(modified.metadataReads).toHaveLength(1);
+    });
+
+    it('marks a synchronous startup failure before starting its metadata peer', async () => {
+        const failure = new Error('modified metadata failed synchronously');
+        let original_started_cancelled = false;
+        const original = new MetadataSource(
+            [[cell('kept')], [cell('deleted')]],
+            undefined,
+            (is_cancelled) => {
+                original_started_cancelled = is_cancelled();
+                return Promise.reject(abort_error());
+            },
+        );
+        const modified = new MetadataSource(
+            [[cell('kept')]],
+            undefined,
+            () => { throw failure; },
+        );
+        const source = new CompareDataSource(modified, original);
+
+        await expect(source.column_filter_metadata_async(0, 0, () => false))
+            .rejects.toBe(failure);
+        expect(original_started_cancelled).toBe(true);
+    });
+
+    it('settles mixed-side metadata peers and fences close', async () => {
+        const original_gate = deferred<ColumnFilterMetadata | undefined>();
+        const modified_gate = deferred<ColumnFilterMetadata | undefined>();
+        const original = new MetadataSource(
+            [[cell('old')], [cell('deleted')]],
+            undefined,
+            () => original_gate.promise,
+        );
+        const modified = new MetadataSource(
+            [[cell('new')]],
+            undefined,
+            () => modified_gate.promise,
+        );
+        const alignment: SheetAlignment = {
+            rows: [
+                { original: 0, modified: 0 },
+                { original: 1, modified: ABSENT },
+            ],
+            addedRows: 0,
+            deletedRows: 1,
+            changedCells: 0,
+            changedRowIndices: [],
+            movedRowIndices: [],
+            moveSearchTruncated: false,
+            degraded: false,
+        };
+        const source = new CompareDataSource(modified, original, new Map([[0, alignment]]));
+
+        const pending = source.column_filter_metadata_async(0, 0, () => false);
+        await vi.waitFor(() => {
+            expect(original.metadataReads).toHaveLength(1);
+            expect(modified.metadataReads).toHaveLength(1);
+        });
+        source.close();
+        expect(original.metadataReads[0].isCancelled()).toBe(true);
+        expect(modified.metadataReads[0].isCancelled()).toBe(true);
+        original_gate.resolve({ categoricalCodes: true });
+        modified_gate.resolve({ categoricalCodes: true });
+        await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    });
+
+    it('waits for a cancelled metadata peer and preserves the substantive failure', async () => {
+        const original_gate = deferred<ColumnFilterMetadata | undefined>();
+        const modified_gate = deferred<ColumnFilterMetadata | undefined>();
+        const original = new MetadataSource(
+            [[cell('old')], [cell('deleted')]],
+            undefined,
+            () => original_gate.promise,
+        );
+        const modified = new MetadataSource(
+            [[cell('new')]],
+            undefined,
+            () => modified_gate.promise,
+        );
+        const alignment: SheetAlignment = {
+            rows: [
+                { original: 0, modified: 0 },
+                { original: 1, modified: ABSENT },
+            ],
+            addedRows: 0,
+            deletedRows: 1,
+            changedCells: 0,
+            changedRowIndices: [],
+            movedRowIndices: [],
+            moveSearchTruncated: false,
+            degraded: false,
+        };
+        const source = new CompareDataSource(modified, original, new Map([[0, alignment]]));
+        const failure = new Error('original metadata failed');
+
+        const pending = source.column_filter_metadata_async(0, 0, () => false);
+        let settled = false;
+        void pending.finally(() => { settled = true; }).catch(() => {});
+        const rejection = expect(pending).rejects.toBe(failure);
+        await vi.waitFor(() => {
+            expect(original.metadataReads).toHaveLength(1);
+            expect(modified.metadataReads).toHaveLength(1);
+        });
+        original_gate.reject(failure);
+        await vi.waitFor(() => {
+            expect(modified.metadataReads[0].isCancelled()).toBe(true);
+        });
+        expect(settled).toBe(false);
+
+        modified_gate.reject(abort_error());
+        await rejection;
+        expect(settled).toBe(true);
+    });
+
+    it('coalesces identical in-flight diff pages', async () => {
+        const original_gate = deferred<RawColumnWindow>();
+        const modified_gate = deferred<RawColumnWindow>();
+        const original = new AsyncRawSource([[cell('a')]], () => original_gate.promise);
+        const modified = new AsyncRawSource([[cell('b')]], () => modified_gate.promise);
+        const source = new CompareDataSource(modified, original);
+
+        const first = source.diff_rows(0, [0]);
+        const second = source.diff_rows(0, [0]);
+        await vi.waitFor(() => {
+            expect(original.rawReads).toHaveLength(1);
+            expect(modified.rawReads).toHaveLength(1);
+        });
+        original_gate.resolve({ startRow: 0, rows: [[{ raw: 'a' }]] });
+        modified_gate.resolve({ startRow: 0, rows: [[{ raw: 'b' }]] });
+        const [first_window, second_window] = await Promise.all([first, second]);
+
+        expect(second_window).toBe(first_window);
+        expect(original.renderedReads).toEqual([{ startRow: 0, count: 1 }]);
+    });
+
+    it('cancels one coalesced waiter without cancelling another live waiter', async () => {
+        const original_gate = deferred<RawColumnWindow>();
+        const modified_gate = deferred<RawColumnWindow>();
+        const original = new AsyncRawSource([[cell('a')]], () => original_gate.promise);
+        const modified = new AsyncRawSource([[cell('b')]], () => modified_gate.promise);
+        const source = new CompareDataSource(modified, original);
+        let first_cancelled = false;
+
+        const first = source.diff_rows(0, [0], () => first_cancelled);
+        const second = source.diff_rows(0, [0]);
+        const first_rejection = expect(first).rejects.toMatchObject({ name: 'AbortError' });
+        await vi.waitFor(() => {
+            expect(original.rawReads).toHaveLength(1);
+            expect(modified.rawReads).toHaveLength(1);
+        });
+        first_cancelled = true;
+        expect(original.rawReads[0].isCancelled()).toBe(false);
+        expect(modified.rawReads[0].isCancelled()).toBe(false);
+
+        original_gate.resolve({ startRow: 0, rows: [[{ raw: 'a' }]] });
+        modified_gate.resolve({ startRow: 0, rows: [[{ raw: 'b' }]] });
+        await expect(second).resolves.toMatchObject({
+            changedCells: [{ row: 0, col: 0, base: 'a', formattedBase: 'a' }],
+        });
+        await first_rejection;
+    });
+
+    it('does not attach a fresh waiter to work already committed to cancellation', async () => {
+        const original_gates = [deferred<RawColumnWindow>(), deferred<RawColumnWindow>()];
+        const modified_gates = [deferred<RawColumnWindow>(), deferred<RawColumnWindow>()];
+        let original_read = 0;
+        let modified_read = 0;
+        const original = new AsyncRawSource(
+            [[cell('a')]],
+            () => original_gates[original_read++].promise,
+        );
+        const modified = new AsyncRawSource(
+            [[cell('b')]],
+            () => modified_gates[modified_read++].promise,
+        );
+        const source = new CompareDataSource(modified, original);
+        let cancelled = false;
+
+        const abandoned = source.diff_rows(0, [0], () => cancelled);
+        const abandoned_rejection = expect(abandoned)
+            .rejects.toMatchObject({ name: 'AbortError' });
+        await vi.waitFor(() => {
+            expect(original.rawReads).toHaveLength(1);
+            expect(modified.rawReads).toHaveLength(1);
+        });
+        cancelled = true;
+        // Model one side observing cancellation while its sibling remains pending.
+        expect(original.rawReads[0].isCancelled()).toBe(true);
+        original_gates[0].reject(abort_error());
+
+        const fresh = source.diff_rows(0, [0]);
+        await vi.waitFor(() => {
+            expect(original.rawReads).toHaveLength(2);
+            expect(modified.rawReads).toHaveLength(2);
+        });
+        original_gates[1].resolve({ startRow: 0, rows: [[{ raw: 'a' }]] });
+        modified_gates[1].resolve({ startRow: 0, rows: [[{ raw: 'b' }]] });
+        await expect(fresh).resolves.toMatchObject({
+            changedCells: [{ row: 0, col: 0, base: 'a', formattedBase: 'a' }],
+        });
+
+        modified_gates[0].reject(abort_error());
+        await abandoned_rejection;
+    });
+
+    it('aborts in-flight work on close without resurrecting the completed cache', async () => {
+        const original_gate = deferred<RawColumnWindow>();
+        const modified_gate = deferred<RawColumnWindow>();
+        const original = new AsyncRawSource([[cell('a')]], () => original_gate.promise);
+        const modified = new AsyncRawSource([[cell('b')]], () => modified_gate.promise);
+        const source = new CompareDataSource(modified, original);
+
+        const pending = source.diff_rows(0, [0]);
+        const rejection = expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+        await vi.waitFor(() => {
+            expect(original.rawReads).toHaveLength(1);
+            expect(modified.rawReads).toHaveLength(1);
+        });
+        source.close();
+        expect(original.rawReads[0].isCancelled()).toBe(true);
+        expect(modified.rawReads[0].isCancelled()).toBe(true);
+        original_gate.resolve({ startRow: 0, rows: [[{ raw: 'a' }]] });
+        modified_gate.resolve({ startRow: 0, rows: [[{ raw: 'b' }]] });
+        await rejection;
+
+        expect((source as unknown as { diff_cache: Map<string, unknown> }).diff_cache.size)
+            .toBe(0);
+        await expect(source.diff_rows(0, [0]))
+            .rejects.toMatchObject({ name: 'AbortError' });
+        expect(original.closed).toBe(true);
+        expect(modified.closed).toBe(true);
     });
 
     it('maps padded rows to canonical rows appended after the modified side', () => {
@@ -211,6 +986,58 @@ describe('CompareDataSource with a content alignment', () => {
         );
     };
 
+    it('uses a supplied alignment to skip paired rows proven unchanged', async () => {
+        const labeled = (raw: string, formatted: string): RenderedCell => ({
+            raw,
+            formatted,
+            bold: false,
+            italic: false,
+            rawType: 'number',
+        });
+        const original = new AsyncRawSource([
+            [labeled('1', 'Yes')],
+            [labeled('2', 'No')],
+        ]);
+        const modified = new AsyncRawSource([
+            [labeled('1', 'Yes')],
+            [labeled('3', 'Maybe')],
+        ]);
+        const source = new CompareDataSource(
+            modified,
+            original,
+            new Map([[0, positional_alignment([1], 2)]]),
+        );
+
+        expect(await source.diff_rows(0, [0, 1])).toMatchObject({
+            rowStatus: ['same', 'same'],
+            changedCells: [{ row: 1, col: 0, base: '2', formattedBase: 'No' }],
+        });
+        expect(original.rawReads).toEqual([
+            expect.objectContaining({ startRow: 1, count: 1 }),
+        ]);
+        expect(modified.rawReads).toEqual([
+            expect.objectContaining({ startRow: 1, count: 1 }),
+        ]);
+        expect(original.renderedReads).toEqual([{ startRow: 1, count: 1 }]);
+        expect(modified.renderedReads).toEqual([]);
+    });
+
+    it('still compares fallback-aligned rows whose synthetic changed set is empty', async () => {
+        const original = new AsyncRawSource([[cell('before')]]);
+        const modified = new AsyncRawSource([[cell('after')]]);
+        const source = new CompareDataSource(modified, original);
+
+        expect((await source.diff_rows(0, [0]))?.changedCells).toEqual([
+            { row: 0, col: 0, base: 'before', formattedBase: 'before' },
+        ]);
+        expect(original.rawReads).toEqual([
+            expect.objectContaining({ startRow: 0, count: 1 }),
+        ]);
+        expect(modified.rawReads).toEqual([
+            expect.objectContaining({ startRow: 0, count: 1 }),
+        ]);
+    });
+
     it('moves merges into unified-grid row space', async () => {
         // The unified grid interleaves the deleted row above the merge, so a
         // block anchored at modified rows 1-2 renders at 2-3. Left unprojected
@@ -271,7 +1098,7 @@ describe('CompareDataSource with a content alignment', () => {
             [['a'], ['NEW'], ['b'], ['c']],
         );
         expect(source.meta().sheets[0].rowCount).toBe(4);
-        const diff = diff_page(source, 0, 10);
+        const diff = await diff_page(source, 0, 10);
         expect(diff?.rowStatus).toEqual(['same', 'added', 'same', 'same']);
         expect(diff?.changedCells).toEqual([]);
     });
@@ -283,15 +1110,17 @@ describe('CompareDataSource with a content alignment', () => {
         );
         const window = source.read_rows(0, 0, 10);
         expect(window.rows.map((row) => row[0]?.raw)).toEqual(['a', 'GONE', 'b']);
-        expect(diff_page(source, 0, 10)?.rowStatus)
+        expect((await diff_page(source, 0, 10))?.rowStatus)
             .toEqual(['same', 'deleted', 'same']);
     });
 
     it('still reports a genuine in-place edit as a changed cell', async () => {
         const source = await aligned([['a', 'x']], [['a', 'y']]);
-        const diff = diff_page(source, 0, 10);
+        const diff = await diff_page(source, 0, 10);
         expect(diff?.rowStatus).toEqual(['same']);
-        expect(diff?.changedCells).toEqual([{ row: 0, col: 1, base: 'x' }]);
+        expect(diff?.changedCells).toEqual([
+            { row: 0, col: 1, base: 'x', formattedBase: 'x' },
+        ]);
     });
 
     it('lists added, deleted and changed rows for the changed-rows filter', async () => {
@@ -307,7 +1136,7 @@ describe('CompareDataSource with a content alignment', () => {
             [['Al', 'Eng', '10'], ['Bo', 'Ops', '20'], ['Cy', 'Fin', '30']],
             [['Al', 'Eng', '10'], ['Cy', 'Fin', '30'], ['Bo', 'Ops', '99']],
         );
-        const diff = diff_page(source, 0, 10);
+        const diff = await diff_page(source, 0, 10);
         // Only Bo is 'moved'. Cy also shifted up a row, but Myers paired it as
         // part of the longest common subsequence, so it was never one-sided and
         // never reached the move pass. 'moved' means "re-paired across a move",
@@ -316,7 +1145,9 @@ describe('CompareDataSource with a content alignment', () => {
         expect(diff?.rowStatus).toEqual(['same', 'same', 'moved']);
         // The moved row is still diffed cell by cell, which is the whole point:
         // its edit is reported as an edit rather than left to the eye.
-        expect(diff?.changedCells).toEqual([{ row: 2, col: 2, base: '20' }]);
+        expect(diff?.changedCells).toEqual([
+            { row: 2, col: 2, base: '20', formattedBase: '20' },
+        ]);
         // The summary has to agree with the banding. Asserted here because
         // every other movedRows assertion in the suite is either zero or a
         // hand-supplied prop, so a count that never left the aligner would go
@@ -415,7 +1246,8 @@ describe('CompareDataSource with a content alignment', () => {
         );
         expect(source.degraded).toBe(true);
         // Positional fallback: three rows, all changed, none added or deleted.
-        expect(diff_page(source, 0, 10)?.rowStatus).toEqual(['same', 'same', 'same']);
+        expect((await diff_page(source, 0, 10))?.rowStatus)
+            .toEqual(['same', 'same', 'same']);
     });
     it('withholds the first-row-header capability from every grid sheet', async () => {
         // The wrapper is deliberately not an ExcelHeaderDataSource, so the

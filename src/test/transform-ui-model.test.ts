@@ -152,6 +152,18 @@ describe('transform UI model', () => {
         }
     });
 
+    it('never exposes an internal binary identity in a filter summary', () => {
+        const identity = `stata-binary:sha256:${'a'.repeat(64)}:40`;
+        const summary = filter_summary({
+            ...entry('isOneOf'),
+            excludedValues: [identity],
+        }, ['Amount']);
+
+        expect(summary).toBe('Amount excludes 1 value (details unavailable)');
+        expect(summary).not.toContain(identity);
+        expect(summary).not.toContain('stata-binary:sha256:');
+    });
+
     it('hydrates an existing draft without losing identity, state, or zero values', () => {
         const existing: FilterEntry = {
             id: 'stable',

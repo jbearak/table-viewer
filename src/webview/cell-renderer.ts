@@ -74,8 +74,8 @@ export interface CellEditOverlay {
     bg?: string;
     /** The "before" text to diff against the cell's current text. The Diff
      * toggle supplies it with `dirty_value` (pre-edit vs edited text); git
-     * compare mode supplies it alone (original vs the cell's own raw text —
-     * raw on both sides, so the Formatting toggle cannot fabricate a diff). */
+     * compare mode supplies the raw or formatted original spelling selected for
+     * the active Formatting state. */
     diff_base?: string;
     /** Git compare: this cell belongs to a deleted row, whose content *is* the
      * original text — struck through whole, with no "after" side to diff. */
@@ -226,7 +226,6 @@ export function displayed_text(
             ? overlay.dirty_display ?? overlay.dirty_value
             : overlay.dirty_value;
     }
-    if (overlay?.diff_base !== undefined) return c?.raw ?? '';
     return show_formatting ? c?.formatted ?? '' : (c?.raw ?? '');
 }
 
@@ -262,10 +261,8 @@ function rich_cell(
         // rich multiline path; otherwise GridShell enables wrapping only after the
         // effective row/merge height exceeds one default row.
         //
-        // Exception: a compare diff cell (diff_base without dirty_value) always
-        // diffs raw against raw — the host computed `base` from raw text, so
-        // letting the Formatting toggle swap in the formatted value would
-        // fabricate differences that are not in the file.
+        // Compare bases are selected upstream from the same Formatting state,
+        // so both before and after switch together without affecting identity.
         const display = displayed_text(c, show_formatting, overlay);
         // The wrap heuristic looks at everything the cell will paint: for a
         // diff cell that includes the old text, whose hard breaks must still

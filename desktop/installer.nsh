@@ -30,35 +30,37 @@
 ; (HKCU for a per-user install, HKLM for all-users), which is what we want:
 ; the associations land in the same hive as the app itself.
 
-!macro TV_REGISTER_TYPE EXT PROGID DESCRIPTION
-  WriteRegStr SHELL_CONTEXT "Software\Classes\${PROGID}" "" "${DESCRIPTION}"
-  WriteRegStr SHELL_CONTEXT "Software\Classes\${PROGID}\DefaultIcon" "" "$INSTDIR\${APP_EXECUTABLE_FILENAME},0"
-  WriteRegStr SHELL_CONTEXT "Software\Classes\${PROGID}\shell\open\command" "" '"$INSTDIR\${APP_EXECUTABLE_FILENAME}" "%1"'
+!macro TV_REGISTER_TYPE EXT DESCRIPTION
+  WriteRegStr SHELL_CONTEXT "Software\Classes\TableViewer.${EXT}" "" "${DESCRIPTION}"
+  WriteRegStr SHELL_CONTEXT "Software\Classes\TableViewer.${EXT}\DefaultIcon" "" "$INSTDIR\${APP_EXECUTABLE_FILENAME},0"
+  WriteRegStr SHELL_CONTEXT "Software\Classes\TableViewer.${EXT}\shell\open\command" "" '"$INSTDIR\${APP_EXECUTABLE_FILENAME}" "%1"'
   ; A value under OpenWithProgids adds us to the "Open with…" list. Note this
   ; is deliberately NOT `WriteRegStr ... "Software\Classes\.${EXT}" ""`, which
   ; would make us the default handler.
-  WriteRegNone SHELL_CONTEXT "Software\Classes\.${EXT}\OpenWithProgids" "${PROGID}"
+  WriteRegNone SHELL_CONTEXT "Software\Classes\.${EXT}\OpenWithProgids" "TableViewer.${EXT}"
 !macroend
 
-!macro TV_UNREGISTER_TYPE EXT PROGID
-  DeleteRegValue SHELL_CONTEXT "Software\Classes\.${EXT}\OpenWithProgids" "${PROGID}"
-  DeleteRegKey SHELL_CONTEXT "Software\Classes\${PROGID}"
+!macro TV_UNREGISTER_TYPE EXT
+  DeleteRegValue SHELL_CONTEXT "Software\Classes\.${EXT}\OpenWithProgids" "TableViewer.${EXT}"
+  DeleteRegKey SHELL_CONTEXT "Software\Classes\TableViewer.${EXT}"
 !macroend
 
 !macro customInstall
-  !insertmacro TV_REGISTER_TYPE "csv"  "TableViewer.csv"  "Comma-separated values"
-  !insertmacro TV_REGISTER_TYPE "tsv"  "TableViewer.tsv"  "Tab-separated values"
-  !insertmacro TV_REGISTER_TYPE "xlsx" "TableViewer.xlsx" "Excel workbook"
-  !insertmacro TV_REGISTER_TYPE "xls"  "TableViewer.xls"  "Legacy Excel workbook"
+  !insertmacro TV_REGISTER_TYPE "csv"     "Comma-separated values"
+  !insertmacro TV_REGISTER_TYPE "tsv"     "Tab-separated values"
+  !insertmacro TV_REGISTER_TYPE "xlsx"    "Excel workbook"
+  !insertmacro TV_REGISTER_TYPE "xls"     "Legacy Excel workbook"
+  !insertmacro TV_REGISTER_TYPE "dta"     "Stata dataset"
   ; Tell the shell to reload associations so "Open with…" is correct without a
   ; sign-out. SHCNE_ASSOCCHANGED | SHCNF_FLUSH.
   System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0x1000, i 0, i 0)'
 !macroend
 
 !macro customUnInstall
-  !insertmacro TV_UNREGISTER_TYPE "csv"  "TableViewer.csv"
-  !insertmacro TV_UNREGISTER_TYPE "tsv"  "TableViewer.tsv"
-  !insertmacro TV_UNREGISTER_TYPE "xlsx" "TableViewer.xlsx"
-  !insertmacro TV_UNREGISTER_TYPE "xls"  "TableViewer.xls"
+  !insertmacro TV_UNREGISTER_TYPE "csv"
+  !insertmacro TV_UNREGISTER_TYPE "tsv"
+  !insertmacro TV_UNREGISTER_TYPE "xlsx"
+  !insertmacro TV_UNREGISTER_TYPE "xls"
+  !insertmacro TV_UNREGISTER_TYPE "dta"
   System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0x1000, i 0, i 0)'
 !macroend

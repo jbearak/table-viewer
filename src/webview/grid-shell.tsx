@@ -2605,7 +2605,7 @@ export function GridShell({
             // the `compare_deleted` overlay flag.
             const compare_status = git_compare ? get_compare_status(row) : undefined;
             const compare_base = git_compare
-                ? get_compare_base(row, source_column)
+                ? get_compare_base(row, source_column, show_formatting)
                 : undefined;
             const compare_bg = compare_status !== undefined
                 ? compare_row_bgs[compare_status]

@@ -1,15 +1,43 @@
 import React, { forwardRef, useMemo, useRef, useState } from 'react';
-import { filter_value_label } from './transform-ui-model';
+import type { FilterValueOption } from '../types';
+import {
+    filter_identity_label,
+    filter_value_label,
+} from './transform-ui-model';
 
 export interface FilterValueChecklistProps {
-    /** Complete distinct values for the column; `null` is the blank entry. */
-    values: readonly (string | null)[];
+    /** Complete distinct raw values plus optional display-only labels. */
+    values: readonly FilterValueOption[];
     excluded_values: readonly (string | null)[];
+    show_labels: boolean;
     on_change: (excluded_values: (string | null)[]) => void;
 }
 
 /** Matches the column visibility control's synchronous DOM bound. */
 const MAX_RENDERED_OPTIONS = 500;
+
+function option_raw_display(option: FilterValueOption): string {
+    return option.rawValue === undefined
+        ? filter_identity_label(option.value)
+        : filter_value_label(option.rawValue);
+}
+
+function option_display(
+    option: FilterValueOption,
+    show_labels: boolean,
+    duplicate_labels: ReadonlySet<string>,
+): string {
+    const raw = option_raw_display(option);
+    if (show_labels && option.label !== undefined) {
+        if (duplicate_labels.has(option.label)) return `${option.label} (${raw})`;
+        return option.value !== null && option.label === filter_value_label(null)
+            ? `${option.label} (raw ${raw})`
+            : option.label;
+    }
+    return option.value !== null && raw === filter_value_label(null)
+        ? `${raw} (text value)`
+        : raw;
+}
 
 /**
  * Searchable checklist for the "Is one of" filter operator. Checked means the
@@ -22,18 +50,21 @@ export const FilterValueChecklist = forwardRef<
 >(function FilterValueChecklist({
     values,
     excluded_values,
+    show_labels,
     on_change,
 }, search_ref): React.JSX.Element {
     const [search, set_search] = useState('');
     // The value universe is stable while the popover is open: current column
     // values first, then stale exclusions. Captured once so re-checking a
     // stale exclusion does not reorder or drop it mid-interaction.
-    const universe_ref = useRef<(string | null)[] | null>(null);
+    const universe_ref = useRef<FilterValueOption[] | null>(null);
     if (universe_ref.current === null) {
-        const known = new Set(values);
+        const known = new Set(values.map((option) => option.value));
         universe_ref.current = [
             ...values,
-            ...excluded_values.filter((value) => !known.has(value)),
+            ...excluded_values
+                .filter((value) => !known.has(value))
+                .map((value) => ({ value })),
         ];
     }
     const universe = universe_ref.current;
@@ -41,22 +72,36 @@ export const FilterValueChecklist = forwardRef<
         () => new Set(excluded_values),
         [excluded_values],
     );
+    const duplicate_labels = useMemo(() => {
+        if (!show_labels) return new Set<string>();
+        const counts = new Map<string, number>();
+        for (const option of universe) {
+            if (option.label !== undefined) {
+                counts.set(option.label, (counts.get(option.label) ?? 0) + 1);
+            }
+        }
+        return new Set(
+            [...counts].flatMap(([label, count]) => count > 1 ? [label] : []),
+        );
+    }, [show_labels, universe]);
 
     const { rendered, has_more } = useMemo(() => {
         const needle = search.trim().toLowerCase();
-        const matches: (string | null)[] = [];
-        for (const value of universe) {
+        const matches: FilterValueOption[] = [];
+        for (const option of universe) {
+            const display = option_display(option, show_labels, duplicate_labels);
+            const raw = option_raw_display(option);
             if (
                 needle.length > 0
-                && !filter_value_label(value).toLowerCase().includes(needle)
+                && !`${display}\n${raw}`.toLowerCase().includes(needle)
             ) continue;
             if (matches.length === MAX_RENDERED_OPTIONS) {
                 return { rendered: matches, has_more: true };
             }
-            matches.push(value);
+            matches.push(option);
         }
         return { rendered: matches, has_more: false };
-    }, [search, universe]);
+    }, [duplicate_labels, search, show_labels, universe]);
 
     const toggle = (value: string | null) => {
         const next = new Set(excluded);
@@ -90,21 +135,26 @@ export const FilterValueChecklist = forwardRef<
                 <button
                     type="button"
                     className="filter-value-action"
-                    onClick={() => on_change([...universe])}
+                    onClick={() => on_change(universe.map((option) => option.value))}
                 >
                     Uncheck all
                 </button>
             </div>
             <div className="filter-value-options">
-                {rendered.map((value) => {
+                {rendered.map((option) => {
+                    const { value } = option;
                     const checked = !excluded.has(value);
-                    const label = filter_value_label(value);
-                    // A real cell value equal to the blank placeholder must
-                    // stay distinguishable from the synthetic blank entry.
-                    const display = value !== null && label === filter_value_label(null)
-                        ? `${label} (text value)`
-                        : label;
-                    const accessible_name = value === null ? 'blank values' : display;
+                    const display = option_display(
+                        option,
+                        show_labels,
+                        duplicate_labels,
+                    );
+                    const raw_display = option_raw_display(option);
+                    const accessible_name = value === null
+                        ? 'blank values'
+                        : show_labels && option.label !== undefined
+                            ? `${display}, raw value ${raw_display}`
+                            : display;
                     return (
                         <label
                             key={value === null ? 'blank' : `v:${value}`}

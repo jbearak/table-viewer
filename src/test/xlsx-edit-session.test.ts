@@ -233,6 +233,7 @@ describe('xlsx edit sessions', () => {
         // The writer is an OOXML package splice; .xls shares none of it, and the
         // profile must say so rather than failing inside a confirmed save.
         expect(profile_for('/tmp/legacy.xls').editing).toBe(false);
+        expect(profile_for('/tmp/read-only.dta').editing).toBe(false);
     });
 
     it.each([

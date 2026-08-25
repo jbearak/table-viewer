@@ -1540,6 +1540,7 @@ export function App(): React.JSX.Element {
                     const ready: FilterHistogramReady = {
                         bins: msg.bins,
                         columnKind: msg.columnKind ?? 'unknown',
+                        defaultCategorical: msg.defaultCategorical === true,
                         distinctValues: msg.distinctValues,
                         distinctValuesExceeded: msg.distinctValuesExceeded,
                     };
@@ -5867,6 +5868,7 @@ export function App(): React.JSX.Element {
                     histogram={filter_histogram.key === `${source_generation_ref.current}:${active_sheet_index}:${filter_editor.column_index}`
                         ? filter_histogram.value
                         : { status: 'loading' }}
+                    show_formatting={show_formatting}
                     on_apply={apply_filter_editor}
                     on_cancel={(reason) => close_filter_editor(
                         reason === 'escape' || reason === 'explicit',

@@ -43,7 +43,7 @@ export interface UseRowLoader {
      *  `CompareRowDiff` rather than restated, so a new status cannot drift. */
     get_compare_status(row: number): CompareRowDiff['status'] | undefined;
     /** Original-side text of a changed cell in git compare mode, when resident. */
-    get_compare_base(row: number, col: number): string | undefined;
+    get_compare_base(row: number, col: number, show_formatting?: boolean): string | undefined;
     /** Up to `max` resident rows for sampling (column auto-fit). */
     sample_loaded_rows(max: number): (RenderedCell | null)[][];
     /** Bumps on every ingested page so consumers can re-key Glide redraws. */
@@ -119,7 +119,8 @@ export function use_row_loader(
         [loader],
     );
     const get_compare_base = useCallback(
-        (row: number, col: number) => loader.get_compare_base(row, col),
+        (row: number, col: number, show_formatting = false) =>
+            loader.get_compare_base(row, col, show_formatting),
         [loader],
     );
     const sample_loaded_rows = useCallback((max: number) => loader.sample_loaded_rows(max), [loader]);

@@ -13,6 +13,7 @@ import {
     type ViewerProfile,
 } from '../viewer-controller';
 import { transform_schema_for_sheet } from '../types';
+import { CompareDataSource } from '../diff-compare/compare-session';
 import { with_in_memory_authority_transactions } from '../state-authority';
 import { versioned_state_store } from './helpers/versioned-state-store';
 import * as vscode_mock from './mocks/vscode';
@@ -53,6 +54,22 @@ type Posted = { type: string } & Record<string, unknown>;
 
 function posted(panel: ReturnType<typeof open_compare_table>, type: string): Posted[] {
     return (panel.__messages as Posted[]).filter((message) => message.type === type);
+}
+
+function deferred<T>() {
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((done, fail) => {
+        resolve = done;
+        reject = fail;
+    });
+    return { promise, resolve, reject };
+}
+
+function abort_error(): Error {
+    const error = new Error('cancelled compare page');
+    error.name = 'AbortError';
+    return error;
 }
 
 beforeEach(() => {
@@ -120,8 +137,107 @@ describe('compare mode controller', () => {
         const diff = posted(panel, 'compareDiff')[0];
         expect(diff.requestId).toBe('r1');
         expect(diff.rowStatus).toEqual(['same', 'added']);
-        expect(diff.changedCells).toEqual([{ row: 0, col: 0, base: 'A' }]);
+        expect(diff.changedCells).toEqual([
+            { row: 0, col: 0, base: 'A', formattedBase: 'A' },
+        ]);
         expect(posted(panel, 'rowData').length).toBeGreaterThan(0);
+    });
+
+    it('warns once with sanitized details when visible-page comparison fails', async () => {
+        const panel = open_compare_table();
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot')).toHaveLength(1));
+        const { generation } = posted(panel, 'workbookSnapshot')[0]
+            .snapshot as { generation: number };
+        const secret = '/private/source/path: lazy decode exploded';
+        const failure = Object.assign(new Error(secret), { code: 'not-a-safe-code' });
+        vi.spyOn(CompareDataSource.prototype, 'diff_rows').mockRejectedValue(failure);
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+        for (const [startRow, requestId] of [[0, 'bad-1'], [1, 'bad-2']] as const) {
+            await panel.__receive({
+                type: 'requestRows',
+                sheetIndex: 0,
+                startRow,
+                count: 1,
+                requestId,
+                generation,
+            });
+        }
+
+        expect(warning).toHaveBeenCalledTimes(1);
+        expect(warning).toHaveBeenCalledWith(
+            'Table Viewer could not compare some visible cells. '
+            + 'Unhighlighted cells may still differ.',
+        );
+        expect(log).toHaveBeenCalledTimes(1);
+        expect(log).toHaveBeenCalledWith(
+            'Failed to compare a visible table page',
+            { code: 'UNKNOWN' },
+        );
+        expect(JSON.stringify([warning.mock.calls, log.mock.calls])).not.toContain(secret);
+        expect(posted(panel, 'compareDiff')).toEqual([]);
+    });
+
+    it('keeps a current cancelled compare sidecar silent', async () => {
+        const panel = open_compare_table();
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot')).toHaveLength(1));
+        const { generation } = posted(panel, 'workbookSnapshot')[0]
+            .snapshot as { generation: number };
+        vi.spyOn(CompareDataSource.prototype, 'diff_rows').mockRejectedValue(abort_error());
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+        await panel.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 1,
+            requestId: 'cancelled-sidecar',
+            generation,
+        });
+
+        expect(warning).not.toHaveBeenCalled();
+        expect(log).not.toHaveBeenCalled();
+        expect(posted(panel, 'compareDiff')).toEqual([]);
+    });
+
+    it('suppresses a sidecar failure after receiver turnover', async () => {
+        const panel = open_compare_table();
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot')).toHaveLength(1));
+        const { generation } = posted(panel, 'workbookSnapshot')[0]
+            .snapshot as { generation: number };
+        const sidecar = deferred<undefined>();
+        let is_cancelled: (() => boolean) | undefined;
+        vi.spyOn(CompareDataSource.prototype, 'diff_rows').mockImplementation(
+            (_sheet, _rows, cancelled) => {
+                is_cancelled = cancelled ?? (() => false);
+                return sidecar.promise;
+            },
+        );
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+        const old_request = panel.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 1,
+            requestId: 'old-sidecar',
+            generation,
+        });
+        await vi.waitFor(() => expect(is_cancelled).toBeDefined());
+        await panel.__receive({ type: 'ready' });
+        expect(is_cancelled?.()).toBe(true);
+        sidecar.reject(new Error('stale raw source detail'));
+        await old_request;
+
+        expect(warning).not.toHaveBeenCalled();
+        expect(log).not.toHaveBeenCalled();
+        expect(posted(panel, 'compareDiff')).toEqual([]);
     });
 
     it('reports an inserted row as one addition rather than shifting every row', async () => {

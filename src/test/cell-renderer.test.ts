@@ -671,23 +671,35 @@ describe('build_grid_cell — diff overlay (Diff toggle)', () => {
         expect(c.copyData).toBe('7');
     });
 
-    it('compare diffs raw against raw even with Formatting on', () => {
-        // The host computed `base` from raw text; letting the Formatting
-        // toggle swap in the formatted value would fabricate differences.
-        const c = build_grid_cell(
-            0,
-            [{ raw: '3.14159', formatted: '3.14', bold: false, italic: false, rawType: 'number' }],
-            true, // Formatting on
-            { diff_base: '3' },
-            undefined,
-            false,
-            false,
-            colors,
+    it('compares formatted labels when Formatting is on and raw codes when off', () => {
+        // Stata labeled numerics carry both spellings. The host selects the base
+        // for the active Formatting state; the renderer must select the modified
+        // spelling from that same state so the two sides never mix label and code.
+        const labeled: RenderedCell = {
+            raw: '2',
+            formatted: 'No',
+            bold: false,
+            italic: false,
+            rawType: 'number',
+        };
+        const formatted = build_grid_cell(
+            0, [labeled], true, { diff_base: 'Yes' },
+            undefined, false, false, colors,
         ) as unknown as { data: { lines: unknown[] } };
-        expect(c.data.lines).toEqual([[
-            { text: '3', style: { strikethrough: true }, diff_color: '#c00' },
+        expect(formatted.data.lines).toEqual([[
+            { text: 'Yes', style: { strikethrough: true }, diff_color: '#c00' },
             { text: ' → ' },
-            { text: '3.14159', diff_color: '#0c0' },
+            { text: 'No', diff_color: '#0c0' },
+        ]]);
+
+        const raw = build_grid_cell(
+            0, [labeled], false, { diff_base: '1' },
+            undefined, false, false, colors,
+        ) as unknown as { data: { lines: unknown[] } };
+        expect(raw.data.lines).toEqual([[
+            { text: '1', style: { strikethrough: true }, diff_color: '#c00' },
+            { text: ' → ' },
+            { text: '2', diff_color: '#0c0' },
         ]]);
     });
 
