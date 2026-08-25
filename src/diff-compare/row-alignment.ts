@@ -154,6 +154,8 @@ const DEFAULT_ROWS_PER_CHECKPOINT = 4096;
 const NEVER_CANCELLED = () => false;
 /** Divide-and-conquer steps between cancellation checks in the Myers walk. */
 const MYERS_STEPS_PER_CHECKPOINT = 256;
+/** Frontier diagonals and snake cells between cancellation checkpoints. */
+const MYERS_WORK_PER_CHECKPOINT = 1_000_000;
 
 /**
  * Yield to a real event-loop turn, not just a microtask.
@@ -461,7 +463,16 @@ async function myers_diff(
         // finer grain — so subtracting as the recursion descended charged the
         // same work repeatedly and degraded inputs that were comfortably
         // inside the cap.
-        const snake = frontiers.find(left, right, l0, l1, r0, r1, max_distance);
+        const snake = await frontiers.find(
+            left,
+            right,
+            l0,
+            l1,
+            r0,
+            r1,
+            max_distance,
+            options.isCancelled ?? NEVER_CANCELLED,
+        );
         if (snake === undefined) return { ops: [], degraded: true };
 
         if (snake.distance <= 1) {
@@ -573,7 +584,7 @@ class MiddleSnakeFrontiers {
      * frontiers could not meet within `budget`, which is the caller's signal
      * to degrade to a positional alignment.
      */
-    find(
+    async find(
         left: Uint32Array,
         right: Uint32Array,
         l0: number,
@@ -583,7 +594,9 @@ class MiddleSnakeFrontiers {
         /** Edit distance still affordable; searching past it is wasted work
          *  because the caller degrades either way. */
         budget: number,
-    ): MiddleSnake | undefined {
+        is_cancelled: () => boolean,
+    ): Promise<MiddleSnake | undefined> {
+        if (is_cancelled()) throw new AlignmentCancelledError();
         const n = l1 - l0;
         const m = r1 - r0;
         const delta = n - m;
@@ -599,9 +612,18 @@ class MiddleSnakeFrontiers {
         const reverse = this.reverse;
         forward[offset + 1] = 0;
         reverse[offset + 1] = 0;
+        let work_since_checkpoint = 0;
+        const checkpoint = async (): Promise<void> => {
+            work_since_checkpoint = 0;
+            await yield_to_event_loop();
+            if (is_cancelled()) throw new AlignmentCancelledError();
+        };
 
         for (let d = 0; d <= half; d++) {
             for (let k = -d; k <= d; k += 2) {
+                if (++work_since_checkpoint >= MYERS_WORK_PER_CHECKPOINT) {
+                    await checkpoint();
+                }
                 const index = offset + k;
                 let x = (k === -d || (k !== d && forward[index - 1] < forward[index + 1]))
                     ? forward[index + 1]
@@ -609,7 +631,13 @@ class MiddleSnakeFrontiers {
                 let y = x - k;
                 const snake_start_x = x;
                 const snake_start_y = y;
-                while (x < n && y < m && left[l0 + x] === right[r0 + y]) { x++; y++; }
+                while (x < n && y < m && left[l0 + x] === right[r0 + y]) {
+                    x++;
+                    y++;
+                    if (++work_since_checkpoint >= MYERS_WORK_PER_CHECKPOINT) {
+                        await checkpoint();
+                    }
+                }
                 forward[index] = x;
                 // On an odd delta the forward frontier is the one that can
                 // overtake a reverse path already laid down at d-1.
@@ -629,6 +657,9 @@ class MiddleSnakeFrontiers {
                 }
             }
             for (let k = -d; k <= d; k += 2) {
+                if (++work_since_checkpoint >= MYERS_WORK_PER_CHECKPOINT) {
+                    await checkpoint();
+                }
                 const index = offset + k;
                 let x = (k === -d || (k !== d && reverse[index - 1] < reverse[index + 1]))
                     ? reverse[index + 1]
@@ -639,7 +670,13 @@ class MiddleSnakeFrontiers {
                 while (
                     x < n && y < m
                     && left[l1 - 1 - x] === right[r1 - 1 - y]
-                ) { x++; y++; }
+                ) {
+                    x++;
+                    y++;
+                    if (++work_since_checkpoint >= MYERS_WORK_PER_CHECKPOINT) {
+                        await checkpoint();
+                    }
+                }
                 reverse[index] = x;
                 if (!odd && k >= delta - d && k <= delta + d) {
                     if (x + forward[offset + delta - k] >= n) {

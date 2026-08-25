@@ -182,6 +182,12 @@ bounded similarity phase; there is no quadratic search inside a collision
 bucket. The regression uses the current FNV collision `45zx` / `fpcd`, both
 `2244945817`, and proves that hash equality alone creates no move.
 
+The bounded Myers middle-snake search charges frontier diagonals and matched
+snake cells as work. It yields to a real event-loop turn and checks cancellation
+after every one million units of work, so the default distance cap cannot hide a
+roughly 100-million-iteration root search behind one synchronous turn while the
+host is trying to cancel it.
+
 ## Compare lifecycle and metadata contribution
 
 A compare-operation fence captures the compare wrapper epoch and caller

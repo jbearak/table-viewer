@@ -1105,6 +1105,40 @@ describe('align_sheet', () => {
         expect(alignment.degraded).toBe(true);
     });
 
+    it('yields inside a long middle-snake search so cancellation can arrive', async () => {
+        const make_rows = (tag: string) =>
+            rows_of(...Array.from({ length: 2_000 }, (_, index) => `${tag}-${index}`));
+        const reads = { original: 0, modified: 0 };
+        let cancelled = false;
+        const observe_reads = (
+            source: FixtureSource,
+            side: keyof typeof reads,
+        ): FixtureSource => new Proxy(source, {
+            get(target, property, receiver) {
+                const value = Reflect.get(target, property, receiver);
+                if (property !== 'read_rows' || typeof value !== 'function') return value;
+                return (...args: unknown[]) => {
+                    reads[side] += 1;
+                    if (side === 'modified' && reads.modified === 1) {
+                        setImmediate(() => { cancelled = true; });
+                    }
+                    return (value as (...values: unknown[]) => unknown).apply(target, args);
+                };
+            },
+        });
+        const original = observe_reads(single(make_rows('original')), 'original');
+        const modified = observe_reads(single(make_rows('modified')), 'modified');
+
+        await expect(align_sheet(original, modified, matched, {
+            maxEditDistance: 3_000,
+            isCancelled: () => cancelled,
+        })).rejects.toBeInstanceOf(AlignmentCancelledError);
+
+        // Hashing reads each side in four batches. Any later read would mean the
+        // full frontier search completed and positional change counting began.
+        expect(reads).toEqual({ original: 4, modified: 4 });
+    });
+
     it('still aligns a large file whose changes are few', async () => {
         // Prefix/suffix trimming must keep this cheap: without it, Myers would
         // run over 20,000 rows rather than the handful that actually differ.
