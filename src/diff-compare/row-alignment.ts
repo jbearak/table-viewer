@@ -12,6 +12,7 @@ import {
     type RawCell,
     type SheetMeta,
 } from '../data-source/interface';
+import { MAX_SHEET_COLUMNS } from '../spreadsheet-safety';
 import {
     cells_exactly_equal,
     has_cell_comparison_identity,
@@ -97,6 +98,13 @@ export class AlignmentCancelledError extends Error {
     }
 }
 
+class MoveWorkExhaustedError extends Error {
+    constructor() {
+        super('Optional move-detection work was exhausted.');
+        this.name = 'MoveWorkExhaustedError';
+    }
+}
+
 async function alignment_source_read<T>(read: () => Promise<T>): Promise<T> {
     try {
         return await read();
@@ -140,9 +148,14 @@ async function alignment_source_pair<Original, Modified>(
         (result): result is PromiseRejectedResult => result.status === 'rejected',
     );
     const substantive = failures.find(
-        (failure) => !(failure.reason instanceof AlignmentCancelledError),
+        (failure) => !(failure.reason instanceof AlignmentCancelledError)
+            && !(failure.reason instanceof MoveWorkExhaustedError),
     );
     if (substantive !== undefined) throw substantive.reason;
+    const exhausted = failures.find(
+        (failure) => failure.reason instanceof MoveWorkExhaustedError,
+    );
+    if (exhausted !== undefined) throw exhausted.reason;
     if (failures.length > 0) throw failures[0].reason;
     if (original_result.status !== 'fulfilled' || modified_result.status !== 'fulfilled') {
         throw new AlignmentCancelledError();
@@ -242,10 +255,14 @@ const MOVE_SEARCH_LIMIT = 1000;
  *  loop can run a million comparisons with no read between them, so reads are
  *  not sufficient yield points here. */
 const MOVE_SCORES_PER_CHECKPOINT = 20_000;
-/** Eager similarity cells/code units between real event-loop checkpoints. */
-const MOVE_SIMILARITY_WORK_PER_CHECKPOINT = HASH_WORK_PER_CHECKPOINT;
-/** Cumulative eager similarity work allowed in one optional move search. */
-const MOVE_SIMILARITY_TOTAL_WORK_CEILING = 128 * 1024 * 1024;
+/** Candidate normalization and similarity work between event-loop checkpoints. */
+const MOVE_EAGER_WORK_PER_CHECKPOINT = HASH_WORK_PER_CHECKPOINT;
+/** Candidate cells read together before compatibility raw rows can be released. */
+const MOVE_NORMALIZATION_READ_CELLS_PER_BATCH = MOVE_EAGER_WORK_PER_CHECKPOINT;
+/** Cells admitted across both sides of one optional move search. */
+const MOVE_NORMALIZATION_CELL_CEILING = 2 * MOVE_SEARCH_LIMIT * MAX_SHEET_COLUMNS;
+/** Cumulative normalization and similarity work allowed in one move search. */
+const MOVE_TOTAL_EAGER_WORK_CEILING = 128 * 1024 * 1024;
 
 type ComparisonCell = RawCell | null | undefined;
 
@@ -263,10 +280,34 @@ interface MyersWorkState {
     sinceCheckpoint: number;
 }
 
-interface MoveScoreWorkState {
+interface MoveWorkState {
+    readonly normalizedCells: CumulativeWorkCeiling;
     readonly eagerCeiling: CumulativeWorkCeiling;
     pairsSinceCheckpoint: number;
     eagerSinceCheckpoint: number;
+}
+
+function exhaust_move_work(is_cancelled: () => boolean): never {
+    if (is_cancelled()) throw new AlignmentCancelledError();
+    throw new MoveWorkExhaustedError();
+}
+
+function charge_move_eager_work(
+    work: MoveWorkState,
+    units: number,
+    is_cancelled: () => boolean,
+): void | Promise<void> {
+    work.eagerCeiling.used = Math.min(
+        work.eagerCeiling.limit,
+        work.eagerCeiling.used + units,
+    );
+    work.eagerSinceCheckpoint += units;
+    if (work.eagerSinceCheckpoint < MOVE_EAGER_WORK_PER_CHECKPOINT) return;
+    return yield_to_event_loop().then(() => {
+        work.pairsSinceCheckpoint = 0;
+        work.eagerSinceCheckpoint = 0;
+        if (is_cancelled()) throw new AlignmentCancelledError();
+    });
 }
 
 /** Visit comparison text synchronously until either materialization or the
@@ -1229,21 +1270,36 @@ function comparison_cell_weight(cell: ComparisonCell): number {
 function normalize_candidate(
     cells: readonly (RawCell | null)[] | undefined,
     column_count: number,
+    work: MoveWorkState,
     is_cancelled: () => boolean,
 ): CandidateRow | Promise<CandidateRow> {
     const normalized: WeightedCandidateCell[] = [];
     let length = 0;
     const materialized = visit_materialized_comparison_cells(
         Math.min(column_count, cells?.length ?? 0),
-        (column) => cells?.[column],
+        (column) => {
+            if (work.eagerCeiling.used >= work.eagerCeiling.limit) {
+                exhaust_move_work(is_cancelled);
+            }
+            if (work.normalizedCells.used >= work.normalizedCells.limit) {
+                exhaust_move_work(is_cancelled);
+            }
+            work.normalizedCells.used += 1;
+            return cells?.[column];
+        },
         is_cancelled,
         (text, column) => {
             const cell = cells?.[column];
             const weight = comparison_cell_weight(cell);
-            if (weight > 0 || has_cell_comparison_identity(cell)) {
-                normalized.push({ column, text, weight });
-            }
-            length += weight;
+            const retain = () => {
+                if (weight > 0 || has_cell_comparison_identity(cell)) {
+                    normalized.push({ column, text, weight });
+                }
+                length += weight;
+            };
+            const charged = charge_move_eager_work(work, text.length + 1, is_cancelled);
+            if (charged === undefined) retain();
+            else return charged.then(retain);
         },
     );
     const finish = (): CandidateRow => ({ cells: normalized, length });
@@ -1253,11 +1309,12 @@ function normalize_candidate(
 async function normalize_candidates(
     rows: readonly (readonly (RawCell | null)[])[],
     column_count: number,
+    work: MoveWorkState,
     is_cancelled: () => boolean,
 ): Promise<CandidateRow[]> {
     const normalized: CandidateRow[] = [];
     for (const cells of rows) {
-        const candidate = normalize_candidate(cells, column_count, is_cancelled);
+        const candidate = normalize_candidate(cells, column_count, work, is_cancelled);
         const then = (
             typeof candidate === 'object' && candidate !== null
         ) || typeof candidate === 'function'
@@ -1266,6 +1323,50 @@ async function normalize_candidates(
         normalized.push(typeof then === 'function'
             ? await alignment_source_read(() => Promise.resolve(candidate))
             : candidate as CandidateRow);
+    }
+    return normalized;
+}
+
+async function read_and_normalize_candidates(
+    source: DataSource,
+    sheet_index: number,
+    rows: readonly number[],
+    column_count: number,
+    work: MoveWorkState,
+    is_cancelled: () => boolean,
+): Promise<CandidateRow[]> {
+    if (source.read_raw_columns_indexed_async !== undefined) {
+        const result = await read_source_raw_rows_indexed_async(
+            source,
+            sheet_index,
+            rows,
+            is_cancelled,
+        );
+        return normalize_candidates(result.rows, column_count, work, is_cancelled);
+    }
+
+    const sheet_width = source.meta().sheets[sheet_index].columnCount;
+    // The compatibility adapter materializes one complete row even when the
+    // row is wider than its normal cell-sized batch. Refuse that optional work
+    // before it can allocate beyond the phase's complete admission ceiling.
+    if (sheet_width > work.normalizedCells.limit) exhaust_move_work(is_cancelled);
+    const rows_per_batch = Math.max(1, Math.floor(
+        MOVE_NORMALIZATION_READ_CELLS_PER_BATCH / Math.max(1, sheet_width),
+    ));
+    const normalized: CandidateRow[] = [];
+    for (let start = 0; start < rows.length; start += rows_per_batch) {
+        const result = await read_source_raw_rows_indexed_async(
+            source,
+            sheet_index,
+            rows.slice(start, start + rows_per_batch),
+            is_cancelled,
+        );
+        normalized.push(...await normalize_candidates(
+            result.rows,
+            column_count,
+            work,
+            is_cancelled,
+        ));
     }
     return normalized;
 }
@@ -1674,45 +1775,49 @@ async function score_moves(
     claim: (original_row: number, modified_row: number) => void,
     options: AlignSheetOptions,
 ): Promise<MoveScoreOutcome> {
-    // Read and normalize once up front. Both sides are capped at
-    // MOVE_SEARCH_LIMIT rows, so this is bounded, and it is far cheaper than
-    // re-deriving a row's text for each of the up-to-1000 rows it is scored
-    // against.
+    // Read and normalize once up front. Native sparse sources retain one complete
+    // request so request-scoped identities and memos survive; compatibility
+    // sources release each bounded raw-row batch after normalization.
     const column_count = Math.max(
         original.meta().sheets[pairing.originalIndex].columnCount,
         modified.meta().sheets[pairing.modifiedIndex].columnCount,
     );
     const is_cancelled = options.isCancelled ?? NEVER_CANCELLED;
-    const [sources, destinations] = await alignment_source_pair(
-        (cancelled) => read_source_raw_rows_indexed_async(
-            original,
-            pairing.originalIndex,
-            unmatched_deleted.map((entry) => entry.row),
-            cancelled,
-        ).then((result) => normalize_candidates(
-            result.rows,
-            column_count,
-            cancelled,
-        )),
-        (cancelled) => read_source_raw_rows_indexed_async(
-            modified,
-            pairing.modifiedIndex,
-            unmatched_added.map((entry) => entry.row),
-            cancelled,
-        ).then((result) => normalize_candidates(
-            result.rows,
-            column_count,
-            cancelled,
-        )),
-        is_cancelled,
-    );
-
-    const candidates: MoveCandidate[] = [];
-    const work_state: MoveScoreWorkState = {
-        eagerCeiling: { limit: MOVE_SIMILARITY_TOTAL_WORK_CEILING, used: 0 },
+    const work_state: MoveWorkState = {
+        normalizedCells: { limit: MOVE_NORMALIZATION_CELL_CEILING, used: 0 },
+        eagerCeiling: { limit: MOVE_TOTAL_EAGER_WORK_CEILING, used: 0 },
         pairsSinceCheckpoint: 0,
         eagerSinceCheckpoint: 0,
     };
+    let sources: CandidateRow[];
+    let destinations: CandidateRow[];
+    try {
+        [sources, destinations] = await alignment_source_pair(
+            (cancelled) => read_and_normalize_candidates(
+                original,
+                pairing.originalIndex,
+                unmatched_deleted.map((entry) => entry.row),
+                column_count,
+                work_state,
+                cancelled,
+            ),
+            (cancelled) => read_and_normalize_candidates(
+                modified,
+                pairing.modifiedIndex,
+                unmatched_added.map((entry) => entry.row),
+                column_count,
+                work_state,
+                cancelled,
+            ),
+            is_cancelled,
+        );
+    } catch (error) {
+        if (!(error instanceof MoveWorkExhaustedError)) throw error;
+        if (is_cancelled()) throw new AlignmentCancelledError();
+        return 'truncated';
+    }
+
+    const candidates: MoveCandidate[] = [];
     for (let added_index = 0; added_index < unmatched_added.length; added_index++) {
         const destination = unmatched_added[added_index];
         const destination_row = destinations[added_index];
@@ -1748,17 +1853,12 @@ async function score_moves(
                 return 'truncated';
             }
             const scored = similarity_of(source_row, destination_row);
-            work_state.eagerCeiling.used = Math.min(
-                work_state.eagerCeiling.limit,
-                work_state.eagerCeiling.used + scored.eagerWork,
+            const yielding = charge_move_eager_work(
+                work_state,
+                scored.eagerWork,
+                is_cancelled,
             );
-            work_state.eagerSinceCheckpoint += scored.eagerWork;
-            if (work_state.eagerSinceCheckpoint >= MOVE_SIMILARITY_WORK_PER_CHECKPOINT) {
-                await yield_to_event_loop();
-                work_state.pairsSinceCheckpoint = 0;
-                work_state.eagerSinceCheckpoint = 0;
-                if (is_cancelled()) throw new AlignmentCancelledError();
-            }
+            if (yielding !== undefined) await yielding;
             if (scored.similarity === 0) continue;
             // Displacement only separates equally strong matches: of two
             // sources that resemble the destination alike, the one that moved

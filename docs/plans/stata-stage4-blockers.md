@@ -195,18 +195,25 @@ charges both cells and UTF-16 code units cumulatively across rows and both sourc
 sides, yielding after every 262,144 units so neither one very large string nor
 many individually bounded rows can monopolize the event loop.
 
-Inexact move scoring admits at most 1,000 leftovers per side, or one million
-candidate pairs. The 20,000-pair and 262,144 eager-unit values are cancellation
-cadences rather than terminal limits. A separate 128 Mi-unit cumulative ceiling
-bounds sparse-cell traversal plus equal-length eager text comparisons. Once it
-would need another eligible similarity comparison, the optional phase reports
-`moveSearchTruncated`, discards every partially accumulated inexact candidate,
-and preserves already verified exact moves. One admitted native string equality
-may remain indivisible. Expanding the edit script and every production-sized
-linear move-detection pass share cooperative row-work checkpoints. Finite row
-checkpoint overrides are floored and clamped to at least one; non-finite values
-fall back to the built-in 4,096-row bound instead of disabling cancellation
-checkpoints.
+Inexact move detection admits at most 1,000 leftovers per side, or one million
+candidate pairs. Candidate preparation and scoring share one phase-owned state:
+a 512,000-cell admission ceiling bounds normalization across both sides, while
+a separate 128 Mi-unit cumulative ceiling charges normalization traversal and
+text plus sparse-cell traversal and equal-length eager text comparisons during
+scoring. The 20,000-pair and 262,144 eager-unit values are cancellation cadences
+rather than terminal limits. Native sparse sources retain one complete request
+so request-scoped DTA identities and memos remain valid. A compatibility row
+wider than the complete 512,000-cell admission ceiling truncates before any
+candidate read; other compatibility sources read and normalize batches of at
+least one row sized around 262,144 raw cells, then release each raw batch before
+continuing. On either cumulative ceiling the optional phase reports
+`moveSearchTruncated`, discards every partially normalized
+or scored inexact candidate, and preserves already verified exact moves. One
+admitted native string equality may remain indivisible. Expanding the edit
+script and every production-sized linear move-detection pass share cooperative
+row-work checkpoints. Finite row checkpoint overrides are floored and clamped
+to at least one; non-finite values fall back to the built-in 4,096-row bound
+instead of disabling cancellation checkpoints.
 
 ## Compare lifecycle and metadata contribution
 
@@ -255,7 +262,8 @@ cancellation, monotonic descriptor discovery, verified missing-name
 publication, cancellable legacy probing, exact label and section boundaries,
 Windows-1252 versus true ISO-8859-1 behavior, the real FNV collision, sparse
 exact-move verification, bounded compatibility chunks, eager string and wide-row
-cancellation, cumulative cross-row hash work, eager move-score text work,
+cancellation, cumulative cross-row hash work, cancellable move normalization,
+wide and ultra-wide compatibility-source normalization ceilings, eager move-score text work,
 transactional inexact-move truncation, cumulative Myers degradation below the
 distance limit, cooperative edit-script and move-pass construction, non-finite
 checkpoint normalization, paired sibling settlement, lifecycle fencing, canceled

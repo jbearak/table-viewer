@@ -117,6 +117,18 @@ rather than asserted in a test — a timing assertion is a CI flake already
 written (CLAUDE.md). What *is* asserted is that unrelated files complete at
 all, which is the property the rewrite exists for.
 
+Optional inexact move detection owns candidate preparation as well as quadratic
+scoring. It admits at most 1,000 leftovers per side, normalizes at most 512,000
+cells across both sources, and shares a 128 Mi-unit cumulative eager-work ceiling
+between normalization and scoring. A compatibility row wider than the complete
+cell-admission ceiling truncates before its candidate read; otherwise
+compatibility sources are normalized in raw batches of at least one row sized
+around 262,144 cells, so complete wide candidate sets are not retained before
+the ceiling applies. Native sparse sources keep one complete request so
+request-scoped comparison identities remain valid. Exhaustion is transactional:
+partial inexact candidates are discarded, exact verified moves survive, and the
+result reports `moveSearchTruncated`.
+
 Async and cancellable, checkpointing on the same cadence as
 `compute_transform` (`SCAN_ROWS_PER_CHECKPOINT`, `table-transform.ts:25`) so the
 window stays responsive and Cancel is honoured promptly.

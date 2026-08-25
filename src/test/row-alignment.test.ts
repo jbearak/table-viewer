@@ -8,6 +8,7 @@ import {
     type AlignedRow,
 } from '../diff-compare/row-alignment';
 import type { SheetPairing } from '../diff-compare/compare-source';
+import { CsvDataSource } from '../data-source/csv-source';
 import {
     DEFERRED_COMPARISON_IDENTITY,
     type DataSource,
@@ -76,6 +77,45 @@ class IndexedRawFixtureSource extends RawFixtureSource {
             rows: requested.map((row) => column_indices.map(
                 (column) => this.fixture_rows[row]?.[column] ?? null,
             )),
+        };
+    }
+}
+
+class UltraWideCompatibilitySource extends RawFixtureSource {
+    candidateReads = 0;
+
+    constructor(
+        rows: readonly (readonly (RawCell | null)[])[],
+        private readonly column_count: number,
+        private readonly candidate_row: number,
+    ) {
+        super(rows);
+    }
+
+    override meta(): WorkbookMeta {
+        const meta = super.meta();
+        return {
+            ...meta,
+            sheets: [{ ...meta.sheets[0], columnCount: this.column_count }],
+        };
+    }
+
+    async read_raw_columns_async(
+        _sheet_index: number,
+        start_row: number,
+        count: number,
+        _column_indices: readonly number[],
+        _is_cancelled: () => boolean,
+    ) {
+        if (start_row === this.candidate_row && count === 1) {
+            this.candidateReads += 1;
+            throw new Error('ultra-wide candidate row should not be materialized');
+        }
+        return {
+            startRow: start_row,
+            rows: this.fixture_rows.slice(start_row, start_row + count).map(
+                (row) => [row[0] ?? null],
+            ),
         };
     }
 }
@@ -970,6 +1010,126 @@ describe('align_sheet', () => {
             original: size + 1,
             modified: 3,
         });
+    });
+
+    it('yields while normalizing production-sized move candidates', async () => {
+        const size = 1_000;
+        const column_count = 256;
+        let armed = false;
+        let cancelled = false;
+        let scheduled = false;
+        let normalized_cells = 0;
+        const observed_cell: RawCell = {
+            get raw() {
+                if (armed) normalized_cells += 1;
+                return 'common';
+            },
+            rawType: 'string',
+            rawByteLength: 6,
+        };
+        const candidate_rows = (tag: string): RawCell[][] => Array.from(
+            { length: size },
+            (_, index) => [
+                raw_cell(`${tag}-${index}`),
+                ...Array.from({ length: column_count - 1 }, () => observed_cell),
+            ],
+        );
+        const original = new NativeRawFixtureSource([
+            ...candidate_rows('original'),
+            [raw_cell('anchor')],
+        ]);
+        const modified = new NativeRawFixtureSource([
+            [raw_cell('anchor')],
+            ...candidate_rows('modified'),
+        ], undefined, () => {
+            armed = true;
+            if (scheduled) return;
+            scheduled = true;
+            setImmediate(() => { cancelled = true; });
+        });
+
+        await expect(align_sheet(original, modified, matched, {
+            isCancelled: () => cancelled,
+        })).rejects.toBeInstanceOf(AlignmentCancelledError);
+
+        expect(normalized_cells).toBeGreaterThan(0);
+        expect(normalized_cells).toBeLessThan(size * (column_count - 1) * 2);
+        expect(original.indexedReads).toBe(1);
+        expect(modified.indexedReads).toBe(1);
+    });
+
+    it('bounds wide compatibility-source normalization before inexact scoring', async () => {
+        const size = 1_000;
+        const column_count = 300;
+        const wide_start = [
+            'start',
+            ...Array.from({ length: column_count - 1 }, () => 'anchor'),
+        ];
+        const original_rows = [
+            wide_start,
+            ...Array.from({ length: size }, (_, index) => [
+                `old-${index}`,
+                ...Array.from({ length: column_count - 1 }, () => 'payload'),
+            ]),
+            ['exact-move'],
+            ['bridge-a'],
+            ['bridge-b'],
+            ['end'],
+        ];
+        const modified_rows = [
+            wide_start,
+            ['bridge-a'],
+            ['bridge-b'],
+            ['exact-move'],
+            ...Array.from({ length: size }, (_, index) => [`new-${index}`]),
+            ['end'],
+        ];
+        const source = (rows: string[][]): CsvDataSource => new CsvDataSource(
+            new TextEncoder().encode(rows.map((row) => row.join(',')).join('\n')),
+            ',',
+            rows.length,
+        );
+
+        const alignment = await align_sheet(
+            source(original_rows),
+            source(modified_rows),
+            matched,
+        );
+
+        expect(alignment).toMatchObject({
+            addedRows: size,
+            deletedRows: size,
+            moveSearchTruncated: true,
+            degraded: false,
+        });
+        expect(alignment.movedRowIndices).toHaveLength(1);
+        expect(alignment.rows[alignment.movedRowIndices[0]]).toEqual({
+            original: size + 1,
+            modified: 3,
+        });
+    });
+
+    it('truncates an ultra-wide compatibility candidate before reading it', async () => {
+        const column_count = 512_001;
+        const original = new UltraWideCompatibilitySource([
+            [raw_cell('old')],
+            [raw_cell('anchor')],
+        ], column_count, 0);
+        const modified = new UltraWideCompatibilitySource([
+            [raw_cell('anchor')],
+            [raw_cell('new')],
+        ], column_count, 1);
+
+        const alignment = await align_sheet(original, modified, matched);
+
+        expect(alignment).toMatchObject({
+            addedRows: 1,
+            deletedRows: 1,
+            moveSearchTruncated: true,
+            degraded: false,
+        });
+        expect(original.candidateReads).toBe(0);
+        expect(modified.candidateReads).toBe(0);
     });
 
     it('does not hunt for moves in a degraded alignment', async () => {
