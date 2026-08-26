@@ -145,6 +145,7 @@ function allocate_transform_operation_token(): TransformOperationToken {
 }
 
 const DEFAULT_MAX_CACHED_PAGES = 64;
+const DEFAULT_MAX_CACHED_ROW_CELLS = 1_000_000;
 const DEFAULT_MAX_CACHED_TRANSFORM_CELLS = 1_000_000;
 const DEFAULT_MAX_CACHED_TRANSFORM_BYTES = 64 * 1024 * 1024;
 const DEFAULT_MAX_CACHED_HISTOGRAM_BYTES = 16 * 1024 * 1024;
@@ -1787,10 +1788,20 @@ export class ViewerPanelCore {
     }
 
     private evict_excess(): void {
-        while (this.cache.size > this.max_cached_pages) {
+        const cells_in = (window: TransformedRowWindow) => window.rows.reduce(
+            (total, row) => total + row.length,
+            0,
+        );
+        let cached_cells = 0;
+        for (const window of this.cache.values()) cached_cells += cells_in(window);
+        while (
+            this.cache.size > this.max_cached_pages
+            || cached_cells > DEFAULT_MAX_CACHED_ROW_CELLS
+        ) {
             // Map preserves insertion order; the first key is least-recently-used.
             const oldest = this.cache.keys().next().value;
             if (oldest === undefined) break;
+            cached_cells -= cells_in(this.cache.get(oldest)!);
             this.cache.delete(oldest);
         }
     }

@@ -194,6 +194,76 @@ describe('CSV reload races', () => {
         expect(warning).toHaveBeenCalledTimes(2);
     });
 
+    it('uses one admission and no whole-file read for a file-backed oversized source', async () => {
+        const source = await CsvDataSource.create(enc.encode('h\na\n'), ',', 10, {
+            firstRowIsHeader: true,
+        });
+        const build_from_file = vi.fn(async () => source);
+        const build_from_buffer = vi.fn(async () => {
+            throw new Error('whole-file builder should not run');
+        });
+        const profile: ViewerProfile = {
+            editing: false,
+            build_source: build_from_buffer,
+            build_file_source: build_from_file,
+        };
+        vscode_mock.__setConfigurationValue('tableViewer.maxFileSizeMiB', 1);
+        vscode_mock.__setStatImplementation(async () => ({
+            size: 5 * 1024 * 1024 * 1024,
+            mtime: 1,
+        }));
+        const read = vi.fn(async () => {
+            throw Object.assign(new Error('greater than 2 GiB'), {
+                code: 'ERR_FS_FILE_TOO_LARGE',
+            });
+        });
+        vscode_mock.__setReadFileImplementation(read);
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage')
+            .mockResolvedValue('Open Anyway' as never);
+        const panel = open_csv_table(uri('/tmp/file-backed.dta'), undefined, profile);
+
+        await panel.__receive({ type: 'ready' });
+        await flush_promises();
+
+        expect(warning).toHaveBeenCalledOnce();
+        expect(build_from_file).toHaveBeenCalledOnce();
+        expect(build_from_buffer).not.toHaveBeenCalled();
+        expect(read).not.toHaveBeenCalled();
+        expect(initial_snapshots(panel)).toHaveLength(1);
+    });
+
+    it('does not ask again when an admitted file-backed load is retried', async () => {
+        const source = await CsvDataSource.create(enc.encode('h\na\n'), ',', 10, {
+            firstRowIsHeader: true,
+        });
+        let builds = 0;
+        const profile: ViewerProfile = {
+            editing: false,
+            async build_source() {
+                throw new Error('whole-file builder should not run');
+            },
+            async build_file_source() {
+                builds += 1;
+                if (builds === 1) throw new Error('transient open failure');
+                return source;
+            },
+        };
+        vscode_mock.__setConfigurationValue('tableViewer.maxFileSizeMiB', 1);
+        vscode_mock.__setStatImplementation(async () => ({
+            size: 5 * 1024 * 1024 * 1024,
+            mtime: 1,
+        }));
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage')
+            .mockResolvedValue('Open Anyway' as never);
+        const panel = open_csv_table(uri('/tmp/retried-file-backed.dta'), undefined, profile);
+
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(initial_snapshots(panel)).toHaveLength(1));
+
+        expect(builds).toBe(2);
+        expect(warning).toHaveBeenCalledOnce();
+    });
+
     it('saves output above the threshold after the file is admitted through Open Anyway', async () => {
         const bytes = enc.encode('h\na\n');
         const saved = 'x'.repeat(1024 * 1024);

@@ -692,6 +692,7 @@ export function GridShell({
         row_count,
         generation,
         has_visible_columns,
+        sheet_meta.columnCount,
     );
     const {
         theme,

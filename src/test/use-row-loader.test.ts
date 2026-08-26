@@ -82,6 +82,21 @@ describe('RowLoader', () => {
         expect(msg.generation).toBe(1);
     });
 
+    it('shrinks row pages for a very wide dataset', () => {
+        const post = vi.fn();
+        const loader = new RowLoader(post, () => {});
+        loader.configure(0, 1000, 1, true, 5_972);
+
+        loader.ensure_rows(0, 20);
+
+        const requests = post.mock.calls.map((call) => call[0] as RequestRows);
+        expect(requests.map(({ startRow, count }) => ({ startRow, count }))).toEqual([
+            { startRow: 0, count: 10 },
+            { startRow: 10, count: 10 },
+            { startRow: 20, count: 10 },
+        ]);
+    });
+
     it('does not re-request a page that is already pending', () => {
         const post = vi.fn();
         const loader = new RowLoader(post, () => {});

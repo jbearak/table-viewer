@@ -29,12 +29,17 @@ export const DEFAULT_COLUMN_WIDTH_PX = 120;
  * Page-aligned start indices whose pages intersect the inclusive visible range
  * [start_row, end_row]. A negative start clamps to 0; an inverted range yields [].
  */
-export function get_needed_page_starts(start_row: number, end_row: number): number[] {
+export function get_needed_page_starts(
+    start_row: number,
+    end_row: number,
+    page_size = PAGE_SIZE,
+): number[] {
     if (end_row < start_row) return [];
-    const first = Math.floor(Math.max(0, start_row) / PAGE_SIZE) * PAGE_SIZE;
-    const last = Math.floor(Math.max(0, end_row) / PAGE_SIZE) * PAGE_SIZE;
+    const size = Math.max(1, Math.floor(page_size));
+    const first = Math.floor(Math.max(0, start_row) / size) * size;
+    const last = Math.floor(Math.max(0, end_row) / size) * size;
     const starts: number[] = [];
-    for (let s = first; s <= last; s += PAGE_SIZE) starts.push(s);
+    for (let s = first; s <= last; s += size) starts.push(s);
     return starts;
 }
 

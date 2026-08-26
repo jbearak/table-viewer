@@ -33,6 +33,8 @@ interface CachedPage {
 }
 
 let next_loader_id = 0;
+const MAX_CELLS_PER_PAGE = 64 * 1024;
+const DEFAULT_MAX_CACHED_CELLS = 1_000_000;
 
 /**
  * Demand-paged row store for the Glide grid. Pure (no React, no vscode import):
@@ -98,6 +100,8 @@ export class RowLoader {
     private viewport = { start: 0, end: 0 };
     private viewport_set = false;
     private enabled = true;
+    private page_size = PAGE_SIZE;
+    private column_count = 1;
     // Outstanding bulk-copy loads: each holds its own range's pages resident
     // until that range is fully cached and the promise settles.
     private load_waiters: Array<{
@@ -117,6 +121,7 @@ export class RowLoader {
         private readonly post: PostFn,
         private readonly on_change: () => void,
         private readonly max_pages = 50,
+        private readonly max_cached_cells = DEFAULT_MAX_CACHED_CELLS,
     ) {}
 
     get generation(): number {
@@ -150,13 +155,23 @@ export class RowLoader {
         row_count: number,
         generation: number,
         enabled = true,
+        column_count = 1,
     ): void {
+        const next_column_count = Math.max(1, Math.floor(column_count));
+        const next_page_size = Math.min(
+            PAGE_SIZE,
+            Math.max(1, Math.floor(MAX_CELLS_PER_PAGE / next_column_count)),
+        );
         const source_changed =
-            sheet_index !== this.sheet_index || generation !== this._generation;
+            sheet_index !== this.sheet_index
+            || generation !== this._generation
+            || next_page_size !== this.page_size;
         this.sheet_index = sheet_index;
         this.row_count = row_count;
         this._generation = generation;
         this.enabled = enabled;
+        this.column_count = next_column_count;
+        this.page_size = next_page_size;
         if (source_changed) {
             this.clear();
         }
@@ -176,7 +191,7 @@ export class RowLoader {
     /** Whether every page covering the inclusive range is already resident. */
     private range_resident(start_row: number, end_row: number): boolean {
         if (this.row_count <= 0) return true;
-        for (const start of get_needed_page_starts(start_row, end_row)) {
+        for (const start of get_needed_page_starts(start_row, end_row, this.page_size)) {
             if (start >= this.row_count) continue;
             if (!this.pages.has(start)) return false;
         }
@@ -185,7 +200,7 @@ export class RowLoader {
 
     /** Send requests for any not-yet-resident, not-yet-pending pages in range. */
     private request_missing_pages(start_row: number, end_row: number): void {
-        for (const start of get_needed_page_starts(start_row, end_row)) {
+        for (const start of get_needed_page_starts(start_row, end_row, this.page_size)) {
             if (start >= this.row_count) continue;
             if (this.pages.has(start)) {
                 this.touch(start);
@@ -198,7 +213,7 @@ export class RowLoader {
                 type: 'requestRows',
                 sheetIndex: this.sheet_index,
                 startRow: start,
-                count: PAGE_SIZE,
+                count: this.page_size,
                 requestId: request_id,
                 generation: this._generation,
             });
@@ -509,7 +524,7 @@ export class RowLoader {
     }
 
     private locate(row: number): { page: CachedPage; offset: number } | undefined {
-        const start = Math.floor(row / PAGE_SIZE) * PAGE_SIZE;
+        const start = Math.floor(row / this.page_size) * this.page_size;
         const page = this.pages.get(start);
         if (page === undefined) return undefined;
         return { page, offset: row - start };
@@ -523,16 +538,25 @@ export class RowLoader {
     }
 
     private evict(): void {
-        if (this.pages.size <= this.max_pages) return;
+        const page_cells = this.page_size * this.column_count;
+        const effective_max_pages = Math.min(
+            this.max_pages,
+            Math.max(1, Math.floor(this.max_cached_cells / page_cells)),
+        );
+        if (this.pages.size <= effective_max_pages) return;
         const protect = new Set(
-            get_needed_page_starts(this.viewport.start, this.viewport.end),
+            get_needed_page_starts(
+                this.viewport.start, this.viewport.end, this.page_size,
+            ),
         );
         // Each outstanding bulk copy load may hold far more than the cap
         // resident; never evict the pages any of them is still assembling.
         // Protecting per waiter (rather than one merged envelope) keeps the gap
         // between disjoint loads evictable and shrinks protection as each settles.
         for (const waiter of this.load_waiters) {
-            for (const start of get_needed_page_starts(waiter.start, waiter.end)) {
+            for (const start of get_needed_page_starts(
+                waiter.start, waiter.end, this.page_size,
+            )) {
                 protect.add(start);
             }
         }
@@ -540,11 +564,13 @@ export class RowLoader {
         // the waiter loop above: per pin, so releasing one stops protecting only
         // its own range.
         for (const pin of this.pins.values()) {
-            for (const start of get_needed_page_starts(pin.start, pin.end)) {
+            for (const start of get_needed_page_starts(
+                pin.start, pin.end, this.page_size,
+            )) {
                 protect.add(start);
             }
         }
-        while (this.pages.size > this.max_pages) {
+        while (this.pages.size > effective_max_pages) {
             let removed = false;
             for (const key of this.pages.keys()) {
                 if (protect.has(key)) continue;
