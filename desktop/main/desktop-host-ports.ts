@@ -35,7 +35,7 @@ export const node_file_system_port: FileSystemPort = {
 
 export interface DesktopUiDialogs {
     show_warning(message: string): void;
-    show_error(message: string): void;
+    show_error(message: string): void | Promise<void>;
     show_save_discard_dialog(): Promise<SaveDialogChoice>;
     show_file_size_limit_dialog(
         details: FileSizeLimitDialogDetails,

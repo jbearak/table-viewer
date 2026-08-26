@@ -123,6 +123,9 @@ export interface SheetMeta {
     /** Size of the stable canonical row space in the underlying physical source. */
     sourceRowCount: number;
     columnCount: number;
+    /** Approximate encoded bytes per physical row, when cheaply known. Used to
+     * bound page/cache/copy work for byte-heavy formats in addition to cells. */
+    estimatedRowBytes?: number;
     merges: MergeRange[];             // from types.ts (rowSpan + colSpan)
     hasFormatting: boolean;
     /** Per-column header titles. Length === columnCount; a blank entry means
@@ -140,6 +143,12 @@ export interface WorkbookMeta {
 export interface DataSource {
     /** Workbook structure only — no cell data. Cheap; safe to call repeatedly. */
     meta(): WorkbookMeta;
+    /** Re-hash a descriptor-backed source for operations that must prove the
+     * physical bytes still match the adopted source without a whole-file read. */
+    physical_content_matches?(
+        expected_digest: string,
+        is_cancelled: () => boolean,
+    ): Promise<boolean>;
     /** Map projected rows exposed by this DataSource to canonical source rows.
      * Optional identity default for sources without a row projection. */
     source_row_indices?(

@@ -282,6 +282,15 @@ export interface ViewerController extends Disposable {
 
 export interface ViewerSourceBuildOptions {
     readonly loadAllRows?: boolean;
+    /** Observable cancellation for long-running file-backed opens. */
+    readonly isCancelled?: () => boolean;
+}
+
+interface FileSourceBuildResult {
+    readonly source: DataSource;
+    readonly digest: string;
+    readonly size: number;
+    readonly mtime: number;
 }
 
 interface ViewerProfileBase {
@@ -292,6 +301,13 @@ interface ViewerProfileBase {
         state: PerFileState,
         options?: ViewerSourceBuildOptions,
     ): Promise<DataSource>;
+    /** Node-local random-access source used when one whole-file Uint8Array is
+     * impossible or needlessly expensive. Only file: resources may select it. */
+    build_file_source?(
+        file_path: string,
+        state: PerFileState,
+        options?: ViewerSourceBuildOptions,
+    ): Promise<FileSourceBuildResult>;
     /** Sets previewMode on the meta envelope (read-only synced preview). */
     previewMode?: boolean;
     /** Called after each (re)load adopts a source — preview refreshes its line map. */
@@ -384,6 +400,9 @@ function allocate_edit_session_id(file_key: string): string {
 
 const RELOAD_RETRY_COUNT = 3;
 const RELOAD_RETRY_MS = 50;
+// Node/Electron's whole-file read rejects at this boundary even on 64-bit
+// systems. Local DTA files beyond it use the parser's descriptor-backed path.
+const MAX_WHOLE_FILE_READ_BYTES = 2 * 1024 * 1024 * 1024 - 1;
 const READY_STATE_RETRY_COUNT = 3;
 const READY_STATE_RETRY_MS = 50;
 const READY_STATE_REBASE_COUNT = 16;
@@ -456,6 +475,8 @@ type PhysicalAuthorityCommitResult =
 interface PanelLoadRequest {
     readonly seq: number;
     readonly refreshEvent?: FileRefreshEvent;
+    /** Admission belongs to this logical load, including its stability retries. */
+    bypassFileSizeLimit?: boolean;
 }
 
 interface CsvSaveHostOperation {
@@ -781,6 +802,23 @@ function excel_profile(file_path: string): ViewerProfile {
         : { ...base, editing: false };
 }
 
+function dta_profile(): ViewerProfile {
+    return {
+        editing: false,
+        build_source(raw, file_path) {
+            return build_source_from_buffer(raw, file_path);
+        },
+        async build_file_source(file_path, _state, options) {
+            const { FileDtaDataSource } = await import('./data-source/file-dta-source');
+            return FileDtaDataSource.open_observed(
+                file_path,
+                true,
+                options?.isCancelled,
+            );
+        },
+    };
+}
+
 /** Build the editable CSV/TSV DataSource shared by the table and preview hosts.
  *  `csv_max_rows` comes from the host's ConfigPort; it is normalized to a
  *  finite non-negative integer. Non-finite host values fall back to the default,
@@ -951,6 +989,8 @@ export function profile_for(file_path: string, config?: ConfigPort): ViewerProfi
     const ext = file_path.toLowerCase();
     return ext.endsWith('.csv') || ext.endsWith('.tsv')
         ? csv_table_profile(config)
+        : ext.endsWith('.dta')
+            ? dta_profile()
         : excel_profile(file_path);
 }
 
@@ -3740,37 +3780,74 @@ export function attach_viewer(
         const stat = await host.fs.stat(uri);
         const max_mib = host.config.max_file_size_mib();
         if (!bypassFileSizeLimit) assert_safe_file_size(stat.size, max_mib);
-        const read_raw_main = await host.fs.read_file(uri);
-        if (!bypassFileSizeLimit) {
-            assert_safe_file_size(read_raw_main.byteLength, max_mib);
-        }
-        const observation: PhysicalSourceObservation = {
-            fingerprint: `${stat.mtime}:${stat.size}`,
-            // Digests what was *read*, not what is parsed below: substituting
-            // smudged bytes must not make the panel look like it has already
-            // seen a file it has not, or the next real change is missed.
-            digest: content_digest(read_raw_main),
-        };
-        // Before the parser, which is the whole point: a `.csv` pointer parses
-        // into a convincing three-row grid of LFS metadata and an `.xlsx`
-        // pointer fails somewhere inside the ZIP reader. Neither tells the user
-        // the bytes were never fetched, so a pointer never reaches a profile.
-        const pointer = parse_git_lfs_pointer(read_raw_main);
-        let raw = read_raw_main;
-        if (pointer && resolved_lfs_main?.oid === pointer.oid) {
-            // Already fetched for this panel, so the pointer is not news. Kept
-            // in memory because this side may be a `git:` revision, whose read
-            // returns the committed pointer blob however often it is retried.
-            // Matched on oid so a refresh reading a different revision is not
-            // served another revision's bytes.
-            raw = resolved_lfs_main.content;
-            if (unresolved_lfs?.side === 'file') unresolved_lfs = undefined;
-        } else if (pointer) {
-            note_unresolved_lfs('file', pointer);
-            // The comparison is moot when the file itself has no content: there
-            // is nothing to diff against, and fetching the original would spend
-            // a download on an alignment against an empty grid.
-            return new SourceCandidate(new UnresolvedLfsDataSource(), observation);
+        const fingerprint = `${stat.mtime}:${stat.size}`;
+        const use_file_backed_source = uri.scheme.toLowerCase() === 'file'
+            && stat.size > MAX_WHOLE_FILE_READ_BYTES
+            && profile.build_file_source !== undefined;
+        let observation: PhysicalSourceObservation;
+        let raw: Uint8Array | undefined;
+        let file_backed_source: DataSource | undefined;
+        if (use_file_backed_source) {
+            let owned_source: DataSource | undefined;
+            try {
+                const built = await profile.build_file_source!(
+                    file_path,
+                    state,
+                    {
+                        ...(load_all_csv_rows ? { loadAllRows: true } : {}),
+                        isCancelled: () => !load_is_current(
+                            load_request.seq,
+                            load_request.refreshEvent,
+                        ),
+                    },
+                );
+                owned_source = built.source;
+                if (`${built.mtime}:${built.size}` !== fingerprint) {
+                    throw new Error('The file changed while it was being opened.');
+                }
+                file_backed_source = owned_source;
+                owned_source = undefined;
+                observation = {
+                    fingerprint,
+                    digest: built.digest,
+                    verification: 'bracketedDigest',
+                };
+            } finally {
+                owned_source?.close();
+            }
+        } else {
+            const read_raw_main = await host.fs.read_file(uri);
+            if (!bypassFileSizeLimit) {
+                assert_safe_file_size(read_raw_main.byteLength, max_mib);
+            }
+            observation = {
+                fingerprint,
+                // Digests what was *read*, not what is parsed below: substituting
+                // smudged bytes must not make the panel look like it has already
+                // seen a file it has not, or the next real change is missed.
+                digest: content_digest(read_raw_main),
+            };
+            // Before the parser, which is the whole point: a `.csv` pointer parses
+            // into a convincing three-row grid of LFS metadata and an `.xlsx`
+            // pointer fails somewhere inside the ZIP reader. Neither tells the user
+            // the bytes were never fetched, so a pointer never reaches a profile.
+            const pointer = parse_git_lfs_pointer(read_raw_main);
+            raw = read_raw_main;
+            if (pointer && resolved_lfs_main?.oid === pointer.oid) {
+                // Already fetched for this panel, so the pointer is not news. Kept
+                // in memory because this side may be a `git:` revision, whose read
+                // returns the committed pointer blob however often it is retried.
+                // Matched on oid so a refresh reading a different revision is not
+                // served another revision's bytes.
+                raw = resolved_lfs_main.content;
+                if (unresolved_lfs?.side === 'file') unresolved_lfs = undefined;
+            } else if (pointer) {
+                note_unresolved_lfs('file', pointer);
+                // The comparison is moot when the file itself has no content: there
+                // is nothing to diff against, and fetching the original would spend
+                // a download on an alignment against an empty grid.
+                return new SourceCandidate(new UnresolvedLfsDataSource(), observation);
+            }
         }
         // Only this side's record is cleared. A blanket clear here would run
         // *before* the original side is read, so it would erase the failure
@@ -3788,10 +3865,8 @@ export function attach_viewer(
             : Promise.resolve(undefined);
         let modified: DataSource;
         try {
-            modified = await profile.build_source(
-                raw,
-                file_path,
-                state,
+            modified = file_backed_source ?? await profile.build_source(
+                raw!, file_path, state,
                 load_all_csv_rows ? { loadAllRows: true } : undefined,
             );
         } catch (error) {
@@ -4117,6 +4192,7 @@ export function attach_viewer(
             return {
                 type: 'candidate',
                 candidate: await build_source({
+                    bypassFileSizeLimit: request.bypassFileSizeLimit,
                     includeCompareOriginal: include_compare_original,
                     load: request,
                 }),
@@ -4130,6 +4206,10 @@ export function attach_viewer(
             });
             if (!load_is_current(request.seq, request.refreshEvent)) return { type: 'stale' };
             if (choice === 'openAnyway') {
+                // A stability/authority retry is still the same user-directed
+                // open. Carry its admission with the request so a deterministic
+                // downstream error cannot reopen this modal three more times.
+                request.bypassFileSizeLimit = true;
                 return {
                     type: 'candidate',
                     candidate: await build_source({
@@ -4162,14 +4242,16 @@ export function attach_viewer(
         ) {
             return 'stale';
         }
-        const raw = await host.fs.read_file(uri);
-        const verified_stat = await host.fs.stat(uri);
-        if (
-            !load_is_current(seq, refresh_event)
-            || `${verified_stat.mtime}:${verified_stat.size}` !== fingerprint
-            || content_digest(raw) !== digest
-        ) {
-            return 'stale';
+        if (candidate.observation.verification !== 'bracketedDigest') {
+            const raw = await host.fs.read_file(uri);
+            const verified_stat = await host.fs.stat(uri);
+            if (
+                !load_is_current(seq, refresh_event)
+                || `${verified_stat.mtime}:${verified_stat.size}` !== fingerprint
+                || content_digest(raw) !== digest
+            ) {
+                return 'stale';
+            }
         }
         const comparison_fingerprint = candidate.observation.comparisonFingerprint;
         const comparison_digest = candidate.observation.comparisonDigest;
@@ -5051,14 +5133,19 @@ export function attach_viewer(
         return disposed ? { type: 'disposed' } : { type: 'superseded' };
     }
 
-    function report_refresh_failure(
+    async function report_refresh_failure(
         error: unknown,
         initial: boolean,
+        request: Pick<PanelLoadRequest, 'seq' | 'refreshEvent'>,
         post_save = false,
-    ): void {
+    ): Promise<void> {
         if (initial) {
-            host.ui.show_error(
-                error instanceof Error ? error.message : String(error));
+            await host.ui.show_error(
+                error instanceof Error ? error.message : String(error),
+            );
+            if (load_is_current(request.seq, request.refreshEvent)) {
+                await options.requestClose?.();
+            }
             return;
         }
         log_sanitized_failure('Failed to reload table viewer data', error);
@@ -5069,7 +5156,7 @@ export function attach_viewer(
             host.ui.show_warning(
                 `The file was saved, but Table Viewer could not refresh the table view. ${message}`);
         } else {
-            host.ui.show_error(message);
+            void host.ui.show_error(message);
         }
     }
 
@@ -5220,9 +5307,10 @@ export function attach_viewer(
                     attempts = 0;
                     continue;
                 }
-                report_refresh_failure(
+                await report_refresh_failure(
                     last_error,
                     initial,
+                    request,
                     request.refreshEvent?.reason === 'postSave',
                 );
                 return { type: 'failed', error: last_error };
@@ -5274,11 +5362,14 @@ export function attach_viewer(
                             false,
                         );
                     }
-                    report_refresh_failure(
+                    dispose_unadopted_candidate(candidate);
+                    candidate = undefined;
+                    await report_refresh_failure(
                         currency === 'comparison-stale'
                             ? unstable_comparison_error()
                             : new Error('The file changed while it was being refreshed.'),
                         initial,
+                        request,
                     );
                 }
                 return false;
@@ -5307,9 +5398,12 @@ export function attach_viewer(
                     )
                     && load_is_current(request.seq)
                 ) {
-                    report_refresh_failure(
+                    dispose_unadopted_candidate(candidate);
+                    candidate = undefined;
+                    await report_refresh_failure(
                         new Error('The file authority changed while it was refreshed.'),
                         initial,
+                        request,
                     );
                 }
                 return false;
@@ -5328,9 +5422,12 @@ export function attach_viewer(
                     )
                     && load_is_current(request.seq)
                 ) {
-                    report_refresh_failure(
+                    dispose_unadopted_candidate(candidate);
+                    candidate = undefined;
+                    await report_refresh_failure(
                         new Error('The file authority changed while it was refreshed.'),
                         initial,
+                        request,
                     );
                 }
                 return false;
@@ -5358,7 +5455,9 @@ export function attach_viewer(
                 initial,
                 include_compare_original,
             )) {
-                report_refresh_failure(error, initial);
+                dispose_unadopted_candidate(candidate);
+                candidate = undefined;
+                await report_refresh_failure(error, initial, request);
             }
             return false;
         } finally {
@@ -5391,10 +5490,16 @@ export function attach_viewer(
             refreshEvent: event,
         };
         const projection_recovery = event.reason === 'projectionRecovery';
+        // A watcher can supersede the ready-triggered load before any source is
+        // adopted. Its failure is still an initial-load failure: treating it as
+        // an ordinary reload would leave an empty renderer on "Loading..." after
+        // the superseded dialog correctly declines to close a newer request.
+        const initial = source_observation === undefined;
         return run_physical_refresh(
             request,
             projection_recovery,
             projection_recovery ? 'recovery' : 'fileReload',
+            initial,
         );
     }
 
@@ -5521,7 +5626,7 @@ export function attach_viewer(
     }
     function show_owner_error(message: string): void {
         if (disposed) return;
-        host.ui.show_error(message);
+        void host.ui.show_error(message);
     }
 
     function finish_save_failure(
@@ -8470,9 +8575,11 @@ export function attach_viewer(
         // 3. PHYSICAL CURRENCY. Last because it reads the whole file, and a
         // conflict found above would have made the read wasted work.
         const physical = await replay_physical_source_is_current(
+            src,
             observation,
             expected_digest,
             expected_authority,
+            () => !replay_is_current(),
         );
         if (!replay_is_current()) {
             refuse('document-changed');
@@ -8673,9 +8780,11 @@ export function attach_viewer(
         // replay a refusal — the user retries after the reload lands — never a
         // mutation against bytes nobody read, and never a partial application.
         if (!await replay_physical_source_is_current(
+            src,
             observation,
             expected_digest,
             expected_authority,
+            () => !payload.isCurrent(),
         )) return refused('document-changed');
         if (!payload.isCurrent()) return refused('document-changed');
 
@@ -8949,13 +9058,26 @@ export function attach_viewer(
      * does and does not close; see the comment above its call.
      */
     async function replay_physical_source_is_current(
+        current_source: DataSource,
         observation: Readonly<PhysicalSourceObservation>,
         expected_digest: string,
         expected_authority: number,
+        is_cancelled: () => boolean,
     ): Promise<boolean> {
         try {
             const before = await host.fs.stat(uri);
             if (`${before.mtime}:${before.size}` !== observation.fingerprint) return false;
+            if (observation.verification === 'bracketedDigest') {
+                return observation.digest === expected_digest
+                    && current_source.physical_content_matches !== undefined
+                    && await current_source.physical_content_matches(
+                        expected_digest,
+                        is_cancelled,
+                    )
+                    && source_authority.authorityRevision === expected_authority
+                    && expected_authority
+                        === file_coordinator.authority().authorityRevision;
+            }
             const raw = await host.fs.read_file(uri);
             const after = await host.fs.stat(uri);
             return before.mtime === after.mtime

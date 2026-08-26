@@ -470,6 +470,7 @@ export class DtaDataSource implements DataSource {
                 rowCount: metadata.nobs,
                 sourceRowCount: metadata.nobs,
                 columnCount: metadata.nvar,
+                estimatedRowBytes: metadata.obs_length,
                 merges: [],
                 hasFormatting: true,
                 columnNames: metadata.variables.map((variable) => variable.name),

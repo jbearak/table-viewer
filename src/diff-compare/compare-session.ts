@@ -807,6 +807,15 @@ export class CompareDataSource implements DataSource {
         return this.padded_meta;
     }
 
+    async physical_content_matches(
+        expected_digest: string,
+        is_cancelled: () => boolean,
+    ): Promise<boolean> {
+        const matches = this.modified.physical_content_matches;
+        return matches !== undefined
+            && await matches.call(this.modified, expected_digest, is_cancelled);
+    }
+
     column_filter_metadata(
         sheet_index: number,
         column_index: number,

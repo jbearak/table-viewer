@@ -1,5 +1,8 @@
 import { Buffer } from 'node:buffer';
 import { createHash } from 'node:crypto';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { cells_exactly_equal } from '../cell-display';
 import {
@@ -35,6 +38,7 @@ vi.mock('@jbearak/dta-parser', async (import_original) => {
 });
 
 import { DtaDataSource } from '../data-source/dta-source';
+import { FileDtaDataSource } from '../data-source/file-dta-source';
 import { build_source_from_buffer } from '../data-source/from-buffer';
 
 class ByteWriter {
@@ -469,6 +473,20 @@ function build_pre111_value_label_fixture(
     return writer.finish();
 }
 
+async function with_temporary_dta<T>(
+    bytes: Uint8Array,
+    action: (file_path: string) => Promise<T>,
+): Promise<T> {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'tv-dta-preflight-'));
+    const file_path = path.join(directory, 'fixture.dta');
+    fs.writeFileSync(file_path, bytes);
+    try {
+        return await action(file_path);
+    } finally {
+        fs.rmSync(directory, { recursive: true, force: true });
+    }
+}
+
 function build_release117_fixture(text_byte = 0xe9): Uint8Array {
     const writer = new ByteWriter();
     const offsets = new Map<string, number>();
@@ -659,6 +677,7 @@ describe('DtaDataSource', () => {
                 rowCount: 4,
                 sourceRowCount: 4,
                 columnCount: 5,
+                estimatedRowBytes: 23,
                 merges: [],
                 hasFormatting: true,
                 columnNames: ['status', 'amount', 'name', 'missing', 'long_text'],
@@ -2374,6 +2393,69 @@ describe('DtaDataSource', () => {
         expect(rows.map((row) => row[0]?.raw)).toEqual(['3', '1', '2']);
         expect(rows[0][1]?.raw).toBe('café');
         expect(rows[0][0]?.formatted).toBe('Café');
+    });
+
+    it('reads a legacy value-label table through the file-backed descriptor', async () => {
+        await with_temporary_dta(build_legacy_dta_fixture(), async (file_path) => {
+            const source = await FileDtaDataSource.open(file_path);
+            try {
+                expect(source.read_rows(0, 0, 1).rows[0][0]?.formatted).toBe('Café');
+            } finally {
+                source.close();
+            }
+        });
+    });
+
+    it('rejects excessive declared legacy label entries before parser allocation', async () => {
+        const dense = build_pre111_value_label_fixture(105, 9, 32_769);
+        await with_temporary_dta(dense, async (file_path) => {
+            await expect(FileDtaDataSource.open(file_path)).rejects.toThrow(
+                /65,536 entry safety limit/u,
+            );
+        });
+    });
+
+    it('fails closed on malformed modern value-label framing', async () => {
+        const malformed = build_dta_fixture();
+        const tag = new TextEncoder().encode('<value_labels>');
+        const offset = Buffer.from(malformed).indexOf(tag);
+        expect(offset).toBeGreaterThanOrEqual(0);
+        malformed[offset] = '!'.charCodeAt(0);
+        await with_temporary_dta(malformed, async (file_path) => {
+            await expect(FileDtaDataSource.open(file_path)).rejects.toThrow(
+                /value-label section opener/u,
+            );
+        });
+    });
+
+    it('fails closed on a corrupt modern value-label table length', async () => {
+        const malformed = build_dta_fixture();
+        const table_offset = Buffer.from(malformed).indexOf('<lbl>');
+        expect(table_offset).toBeGreaterThanOrEqual(0);
+        const view = new DataView(
+            malformed.buffer,
+            malformed.byteOffset,
+            malformed.byteLength,
+        );
+        const length_offset = table_offset + '<lbl>'.length;
+        view.setInt32(length_offset, view.getInt32(length_offset, true) + 1, true);
+        await with_temporary_dta(malformed, async (file_path) => {
+            await expect(FileDtaDataSource.open(file_path)).rejects.toThrow(
+                /value-label table length/u,
+            );
+        });
+    });
+
+    it('fails closed on a corrupt modern value-label table closer', async () => {
+        const malformed = build_dta_fixture();
+        const close_offset = Buffer.from(malformed).indexOf('</lbl>');
+        expect(close_offset).toBeGreaterThanOrEqual(0);
+        malformed[close_offset] = '!'.charCodeAt(0);
+        await with_temporary_dta(malformed, async (file_path) => {
+            await expect(FileDtaDataSource.open(file_path)).rejects.toThrow(
+                /value-label table closer/u,
+            );
+        });
     });
 
     it.each([

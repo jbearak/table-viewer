@@ -61,7 +61,7 @@ export const vscode_host_ui_port: HostUiPort = {
         void vscode.window.showWarningMessage(message);
     },
     show_error(message) {
-        void vscode.window.showErrorMessage(message);
+        return Promise.resolve(vscode.window.showErrorMessage(message)).then(() => {});
     },
     async show_save_discard_dialog(): Promise<SaveDialogChoice> {
         const choice = await vscode.window.showWarningMessage(

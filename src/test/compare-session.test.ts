@@ -279,6 +279,24 @@ const compare = (
     );
 
 describe('CompareDataSource', () => {
+    it('delegates physical-content verification to the modified source', async () => {
+        const modified: DataSource = new FixtureSource([
+            { name: 'Sheet1', rows: [['modified']] },
+        ]);
+        const original = new FixtureSource([{ name: 'Sheet1', rows: [['original']] }]);
+        const matches = vi.fn(async () => true);
+        modified.physical_content_matches = matches;
+        const source = new CompareDataSource(modified, original);
+        const is_cancelled = () => false;
+
+        await expect(source.physical_content_matches(
+            'expected-digest',
+            is_cancelled,
+        )).resolves.toBe(true);
+        expect(matches).toHaveBeenCalledOnce();
+        expect(matches).toHaveBeenCalledWith('expected-digest', is_cancelled);
+    });
+
     it('pads matched sheets to the larger side so deleted rows have grid rows', () => {
         const source = compare([['a'], ['b'], ['c']], [['a']]);
         const sheet = source.meta().sheets[0];

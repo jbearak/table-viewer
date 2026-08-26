@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { RowLoader } from '../webview/row-loader';
+import { MAX_PENDING_PAGE_REQUESTS, RowLoader } from '../webview/row-loader';
 import { PAGE_SIZE } from '../webview/grid-model';
 import type { RenderedCell } from '../data-source/interface';
 import type { WebviewMessage, HostMessage } from '../types';
@@ -80,6 +80,36 @@ describe('RowLoader', () => {
         expect(msg.startRow).toBe(0);
         expect(msg.count).toBe(PAGE_SIZE);
         expect(msg.generation).toBe(1);
+    });
+
+    it('shrinks row pages for a very wide dataset', () => {
+        const post = vi.fn();
+        const loader = new RowLoader(post, () => {});
+        loader.configure(0, 1000, 1, true, 5_972);
+
+        loader.ensure_rows(0, 20);
+
+        const requests = post.mock.calls.map((call) => call[0] as RequestRows);
+        expect(requests.map(({ startRow, count }) => ({ startRow, count }))).toEqual([
+            { startRow: 0, count: 10 },
+            { startRow: 10, count: 10 },
+            { startRow: 20, count: 10 },
+        ]);
+    });
+
+    it('shrinks row pages for byte-heavy observations', () => {
+        const post = vi.fn();
+        const loader = new RowLoader(post, () => {});
+        loader.configure(0, 1000, 1, true, 1, 1024 * 1024);
+
+        loader.ensure_rows(0, 20);
+
+        const requests = post.mock.calls.map((call) => call[0] as RequestRows);
+        expect(requests.map(({ startRow, count }) => ({ startRow, count }))).toEqual([
+            { startRow: 0, count: 8 },
+            { startRow: 8, count: 8 },
+            { startRow: 16, count: 8 },
+        ]);
     });
 
     it('does not re-request a page that is already pending', () => {
@@ -706,6 +736,18 @@ describe('RowLoader', () => {
             expect(loader.get_row(250)).toBeDefined();
         });
 
+        it('backpressures bulk loads and replenishes slots as replies arrive', () => {
+            const post = vi.fn();
+            const loader = new RowLoader(post, () => {});
+            loader.configure(0, 100_000, 1);
+            void loader.ensure_rows_loaded(0, 9_999);
+
+            expect(post).toHaveBeenCalledTimes(MAX_PENDING_PAGE_REQUESTS);
+            loader.on_row_data(reply_for(post, 0, 0, 1));
+            expect(post).toHaveBeenCalledTimes(MAX_PENDING_PAGE_REQUESTS + 1);
+            expect(last_request(post).startRow).toBe(MAX_PENDING_PAGE_REQUESTS * PAGE_SIZE);
+        });
+
         it('holds more than the cache cap resident until the bulk load resolves', async () => {
             const post = vi.fn();
             const loader = new RowLoader(post, () => {}, 2); // cap = 2
@@ -719,7 +761,7 @@ describe('RowLoader', () => {
             expect(loader.get_row(200)).toBeDefined();
         });
 
-        it('trims back to the cap once the protected copy completes', async () => {
+        it('trims back to the cap on demand once the protected copy completes', async () => {
             const post = vi.fn();
             const loader = new RowLoader(post, () => {}, 2);
             loader.configure(0, 1000, 1);
@@ -727,10 +769,28 @@ describe('RowLoader', () => {
             for (const start of [0, 100, 200]) loader.on_row_data(reply_for(post, 0, start, 1));
             await done;
             expect(loader.page_count).toBe(3);
-            // A later unrelated page load evicts down to the cap now that the copy
-            // range is no longer protected.
-            loader.ensure_rows(300, 310);
-            loader.on_row_data(reply_for(post, 0, 300, 1));
+            loader.trim();
+            expect(loader.page_count).toBe(2);
+        });
+
+        it('keeps overlapping completed copies resident until each releases its pin', async () => {
+            const post = vi.fn();
+            const loader = new RowLoader(post, () => {}, 2);
+            loader.configure(0, 1000, 1);
+            const first_pin = loader.pin_rows(0, 250);
+            const second_pin = loader.pin_rows(0, 250);
+            const first = loader.ensure_rows_loaded(0, 250);
+            const second = loader.ensure_rows_loaded(0, 250);
+            for (const start of [0, 100, 200]) {
+                loader.on_row_data(reply_for(post, 0, start, 1));
+            }
+            await Promise.all([first, second]);
+
+            loader.unpin_rows(first_pin);
+            loader.trim();
+            expect(loader.page_count).toBe(3);
+            loader.unpin_rows(second_pin);
+            loader.trim();
             expect(loader.page_count).toBe(2);
         });
 

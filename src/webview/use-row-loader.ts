@@ -14,6 +14,8 @@ export interface UseRowLoader {
      * caller can abandon the operation.
      */
     ensure_rows_loaded(start_row: number, end_row: number): Promise<boolean>;
+    /** Return completed bulk-load pages to the normal cache cap. */
+    trim_rows(): void;
     /**
      * Hold the pages covering the inclusive range resident until the returned
      * token is released. For a row whose identity something outside the viewport
@@ -63,6 +65,8 @@ export function use_row_loader(
     row_count: number,
     generation: number,
     enabled = true,
+    column_count = 1,
+    estimated_row_bytes = 0,
 ): UseRowLoader {
     const [version, bump] = useReducer((n: number) => n + 1, 0);
     const ref = useRef<RowLoader | null>(null);
@@ -72,8 +76,23 @@ export function use_row_loader(
     const loader = ref.current;
 
     useEffect(() => {
-        loader.configure(sheet_index, row_count, generation, enabled);
-    }, [loader, sheet_index, row_count, generation, enabled]);
+        loader.configure(
+            sheet_index,
+            row_count,
+            generation,
+            enabled,
+            column_count,
+            estimated_row_bytes,
+        );
+    }, [
+        loader,
+        sheet_index,
+        row_count,
+        generation,
+        enabled,
+        column_count,
+        estimated_row_bytes,
+    ]);
 
     useEffect(() => {
         const handler = (e: MessageEvent) => {
@@ -98,6 +117,7 @@ export function use_row_loader(
         (s: number, en: number) => loader.ensure_rows_loaded(s, en),
         [loader],
     );
+    const trim_rows = useCallback(() => loader.trim(), [loader]);
     const pin_rows = useCallback(
         (s: number, en: number) => loader.pin_rows(s, en),
         [loader],
@@ -128,6 +148,7 @@ export function use_row_loader(
     return {
         ensure_rows,
         ensure_rows_loaded,
+        trim_rows,
         pin_rows,
         unpin_rows,
         get_row,

@@ -1560,7 +1560,7 @@ export class ViewerWindowManager {
                     void message_box({ type: 'warning', message });
                 },
                 show_error: (message) => {
-                    void message_box({ type: 'error', message });
+                    return message_box({ type: 'error', message }).then(() => {});
                 },
                 show_save_discard_dialog: async () => {
                     const { response } = await message_box({

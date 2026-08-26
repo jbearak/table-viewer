@@ -33,6 +33,12 @@ interface CachedPage {
 }
 
 let next_loader_id = 0;
+const MAX_CELLS_PER_PAGE = 64 * 1024;
+const DEFAULT_MAX_CACHED_CELLS = 1_000_000;
+const MAX_SOURCE_BYTES_PER_PAGE = 8 * 1024 * 1024;
+const DEFAULT_MAX_CACHED_SOURCE_BYTES = 64 * 1024 * 1024;
+/** Keep bulk operations from synchronously flooding the extension host. */
+export const MAX_PENDING_PAGE_REQUESTS = 16;
 
 /**
  * Demand-paged row store for the Glide grid. Pure (no React, no vscode import):
@@ -63,21 +69,9 @@ export class RowLoader {
      * landing during a scroll — O(resident rows) per page instead of O(PAGE_SIZE).
      *
      * Bound: this tracks resident *rows*, not a fixed page cap. Steady state is
-     * `max_pages` x PAGE_SIZE (50 x 100 = 5,000 rows), but bulk-copy waiters are
-     * exempt from eviction (see {@link evict}) and "Copy sheet" loads up to
-     * `DEFAULT_MAX_ROWS` (100,000) rows, so the map can legitimately hold ~100k
-     * entries.
-     *
-     * That peak does NOT come back down on its own when the copy settles.
-     * `evict` has exactly one call site — the tail of {@link on_row_data} — so
-     * trimming is driven by page *landings*, not by waiters resolving:
-     * `settle_load_waiters` deliberately does not evict (it runs after `evict`
-     * within the same ingest). After a whole-sheet copy has every page resident,
-     * the next landing is what trims back to the cap, and if the user never
-     * scrolls to a page that is not already resident there is no next landing —
-     * the ~100k entries stay until a sheet switch or reload calls
-     * {@link clear}. Bounded and deliberate, not leaked: capping it needs a
-     * standalone trim, which is out of scope here.
+     * `max_pages` x PAGE_SIZE (50 x 100 = 5,000 rows). Bulk-copy waiters may
+     * temporarily exceed that cap because their pages are eviction-protected;
+     * the caller invokes {@link trim} immediately after serialization.
      *
      * Deliberately total rather than injective, so no assertion here. Nothing we
      * ship produces a non-injective projection — `transform_indices` is a
@@ -98,6 +92,9 @@ export class RowLoader {
     private viewport = { start: 0, end: 0 };
     private viewport_set = false;
     private enabled = true;
+    private page_size = PAGE_SIZE;
+    private column_count = 1;
+    private estimated_row_bytes = 0;
     // Outstanding bulk-copy loads: each holds its own range's pages resident
     // until that range is fully cached and the promise settles.
     private load_waiters: Array<{
@@ -117,6 +114,8 @@ export class RowLoader {
         private readonly post: PostFn,
         private readonly on_change: () => void,
         private readonly max_pages = 50,
+        private readonly max_cached_cells = DEFAULT_MAX_CACHED_CELLS,
+        private readonly max_cached_source_bytes = DEFAULT_MAX_CACHED_SOURCE_BYTES,
     ) {}
 
     get generation(): number {
@@ -150,13 +149,34 @@ export class RowLoader {
         row_count: number,
         generation: number,
         enabled = true,
+        column_count = 1,
+        estimated_row_bytes = 0,
     ): void {
+        const next_column_count = Math.max(1, Math.floor(column_count));
+        const next_estimated_row_bytes = Number.isFinite(estimated_row_bytes)
+            ? Math.max(0, Math.floor(estimated_row_bytes))
+            : 0;
+        const next_page_size = Math.min(
+            PAGE_SIZE,
+            Math.max(1, Math.floor(MAX_CELLS_PER_PAGE / next_column_count)),
+            next_estimated_row_bytes > 0
+                ? Math.max(1, Math.floor(
+                    MAX_SOURCE_BYTES_PER_PAGE / next_estimated_row_bytes,
+                ))
+                : PAGE_SIZE,
+        );
         const source_changed =
-            sheet_index !== this.sheet_index || generation !== this._generation;
+            sheet_index !== this.sheet_index
+            || generation !== this._generation
+            || next_page_size !== this.page_size
+            || next_estimated_row_bytes !== this.estimated_row_bytes;
         this.sheet_index = sheet_index;
         this.row_count = row_count;
         this._generation = generation;
         this.enabled = enabled;
+        this.column_count = next_column_count;
+        this.estimated_row_bytes = next_estimated_row_bytes;
+        this.page_size = next_page_size;
         if (source_changed) {
             this.clear();
         }
@@ -170,38 +190,54 @@ export class RowLoader {
         this.viewport = { start: start_row, end: end_row };
         this.viewport_set = true;
         if (!this.enabled || this.row_count <= 0) return;
-        this.request_missing_pages(start_row, end_row);
+        this.pump_requests();
     }
 
     /** Whether every page covering the inclusive range is already resident. */
     private range_resident(start_row: number, end_row: number): boolean {
         if (this.row_count <= 0) return true;
-        for (const start of get_needed_page_starts(start_row, end_row)) {
+        for (const start of get_needed_page_starts(start_row, end_row, this.page_size)) {
             if (start >= this.row_count) continue;
             if (!this.pages.has(start)) return false;
         }
         return true;
     }
 
-    /** Send requests for any not-yet-resident, not-yet-pending pages in range. */
+    /**
+     * Send requests for missing pages in a range until the global in-flight cap
+     * is full. Returns early at the cap; each accepted reply pumps the next page.
+     */
     private request_missing_pages(start_row: number, end_row: number): void {
-        for (const start of get_needed_page_starts(start_row, end_row)) {
+        for (const start of get_needed_page_starts(start_row, end_row, this.page_size)) {
             if (start >= this.row_count) continue;
             if (this.pages.has(start)) {
                 this.touch(start);
                 continue;
             }
             if (this.pending.has(start)) continue;
+            if (this.pending.size >= MAX_PENDING_PAGE_REQUESTS) return;
             const request_id = `${this.loader_id}:${this.sheet_index}:${start}:${++this.req_seq}`;
             this.pending.set(start, request_id);
             this.post({
                 type: 'requestRows',
                 sheetIndex: this.sheet_index,
                 startRow: start,
-                count: PAGE_SIZE,
+                count: this.page_size,
                 requestId: request_id,
                 generation: this._generation,
             });
+        }
+    }
+
+    /** Fill available request slots, prioritizing the visible range over copies. */
+    private pump_requests(): void {
+        if (!this.enabled || this.row_count <= 0) return;
+        if (this.viewport_set) {
+            this.request_missing_pages(this.viewport.start, this.viewport.end);
+        }
+        for (const waiter of this.load_waiters) {
+            if (this.pending.size >= MAX_PENDING_PAGE_REQUESTS) return;
+            this.request_missing_pages(waiter.start, waiter.end);
         }
     }
 
@@ -233,8 +269,13 @@ export class RowLoader {
             // Register the waiter before requesting, so its range is protected
             // from eviction the moment any of its pages start arriving.
             this.load_waiters.push({ start, end, resolve });
-            this.request_missing_pages(start, end);
+            this.pump_requests();
         });
+    }
+
+    /** Drop completed bulk-load pages back to the normal LRU/cell cap. */
+    trim(): void {
+        this.evict();
     }
 
     /**
@@ -320,6 +361,7 @@ export class RowLoader {
         this.evict();
         this.on_change();
         this.settle_load_waiters();
+        this.pump_requests();
         return true;
     }
 
@@ -391,10 +433,7 @@ export class RowLoader {
     /**
      * Resolve any bulk-copy waiters whose range is now fully resident. Runs after
      * `evict()` — which still sees the waiter, so the just-loaded pages are kept.
-     * A resolved waiter drops out of {@link load_waiters}, so its pages become
-     * evictable again; but its `await` continuation is a microtask that runs
-     * before the next `rowData` macrotask, so the awaiting copy serializes those
-     * pages before any later ingest can trim them.
+     * Once serialization finishes, the caller explicitly invokes {@link trim}.
      */
     private settle_load_waiters(): void {
         if (this.load_waiters.length === 0) return;
@@ -509,7 +548,7 @@ export class RowLoader {
     }
 
     private locate(row: number): { page: CachedPage; offset: number } | undefined {
-        const start = Math.floor(row / PAGE_SIZE) * PAGE_SIZE;
+        const start = Math.floor(row / this.page_size) * this.page_size;
         const page = this.pages.get(start);
         if (page === undefined) return undefined;
         return { page, offset: row - start };
@@ -523,16 +562,31 @@ export class RowLoader {
     }
 
     private evict(): void {
-        if (this.pages.size <= this.max_pages) return;
+        const page_cells = this.page_size * this.column_count;
+        const effective_max_pages = Math.min(
+            this.max_pages,
+            Math.max(1, Math.floor(this.max_cached_cells / page_cells)),
+            this.estimated_row_bytes > 0
+                ? Math.max(1, Math.floor(
+                    this.max_cached_source_bytes
+                    / (this.page_size * this.estimated_row_bytes),
+                ))
+                : this.max_pages,
+        );
+        if (this.pages.size <= effective_max_pages) return;
         const protect = new Set(
-            get_needed_page_starts(this.viewport.start, this.viewport.end),
+            get_needed_page_starts(
+                this.viewport.start, this.viewport.end, this.page_size,
+            ),
         );
         // Each outstanding bulk copy load may hold far more than the cap
         // resident; never evict the pages any of them is still assembling.
         // Protecting per waiter (rather than one merged envelope) keeps the gap
         // between disjoint loads evictable and shrinks protection as each settles.
         for (const waiter of this.load_waiters) {
-            for (const start of get_needed_page_starts(waiter.start, waiter.end)) {
+            for (const start of get_needed_page_starts(
+                waiter.start, waiter.end, this.page_size,
+            )) {
                 protect.add(start);
             }
         }
@@ -540,11 +594,13 @@ export class RowLoader {
         // the waiter loop above: per pin, so releasing one stops protecting only
         // its own range.
         for (const pin of this.pins.values()) {
-            for (const start of get_needed_page_starts(pin.start, pin.end)) {
+            for (const start of get_needed_page_starts(
+                pin.start, pin.end, this.page_size,
+            )) {
                 protect.add(start);
             }
         }
-        while (this.pages.size > this.max_pages) {
+        while (this.pages.size > effective_max_pages) {
             let removed = false;
             for (const key of this.pages.keys()) {
                 if (protect.has(key)) continue;

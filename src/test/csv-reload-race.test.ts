@@ -6,6 +6,7 @@ import {
     csv_table_profile,
     plan_csv_save,
     type ViewerProfile,
+    type ViewerSourceBuildOptions,
 } from '../viewer-controller';
 import { dispose_csv_preview, show_csv_preview } from '../csv-preview';
 import { CsvDataSource } from '../data-source/csv-source';
@@ -192,6 +193,173 @@ describe('CSV reload races', () => {
         await vscode_mock.__getWatchers()[0].__fireChange();
         await flush_promises();
         expect(warning).toHaveBeenCalledTimes(2);
+    });
+
+    it('uses one admission and no whole-file read for a file-backed oversized source', async () => {
+        const source = await CsvDataSource.create(enc.encode('h\na\n'), ',', 10, {
+            firstRowIsHeader: true,
+        });
+        const build_from_file = vi.fn(async (
+            _file_path: string,
+            _state: unknown,
+            _options?: ViewerSourceBuildOptions,
+        ) => ({
+            source,
+            digest: 'file-backed-digest',
+            size: 5 * 1024 * 1024 * 1024,
+            mtime: 1,
+        }));
+        const build_from_buffer = vi.fn(async () => {
+            throw new Error('whole-file builder should not run');
+        });
+        const profile: ViewerProfile = {
+            editing: false,
+            build_source: build_from_buffer,
+            build_file_source: build_from_file,
+        };
+        vscode_mock.__setConfigurationValue('tableViewer.maxFileSizeMiB', 1);
+        vscode_mock.__setStatImplementation(async () => ({
+            size: 5 * 1024 * 1024 * 1024,
+            mtime: 1,
+        }));
+        const read = vi.fn(async () => {
+            throw Object.assign(new Error('greater than 2 GiB'), {
+                code: 'ERR_FS_FILE_TOO_LARGE',
+            });
+        });
+        vscode_mock.__setReadFileImplementation(read);
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage')
+            .mockResolvedValue('Open Anyway' as never);
+        const panel = open_csv_table(uri('/tmp/file-backed.dta'), undefined, profile);
+
+        await panel.__receive({ type: 'ready' });
+        await flush_promises();
+
+        expect(warning).toHaveBeenCalledOnce();
+        expect(build_from_file).toHaveBeenCalledOnce();
+        expect(build_from_buffer).not.toHaveBeenCalled();
+        expect(read).not.toHaveBeenCalled();
+        expect(initial_snapshots(panel)).toHaveLength(1);
+        const build_options = build_from_file.mock.calls[0][2];
+        expect(build_options?.isCancelled?.()).toBe(false);
+        panel.dispose();
+        expect(build_options?.isCancelled?.()).toBe(true);
+    });
+
+    it('does not ask again when an admitted file-backed load is retried', async () => {
+        const source = await CsvDataSource.create(enc.encode('h\na\n'), ',', 10, {
+            firstRowIsHeader: true,
+        });
+        let builds = 0;
+        const profile: ViewerProfile = {
+            editing: false,
+            async build_source() {
+                throw new Error('whole-file builder should not run');
+            },
+            async build_file_source() {
+                builds += 1;
+                if (builds === 1) throw new Error('transient open failure');
+                return {
+                    source,
+                    digest: 'retried-file-backed-digest',
+                    size: 5 * 1024 * 1024 * 1024,
+                    mtime: 1,
+                };
+            },
+        };
+        vscode_mock.__setConfigurationValue('tableViewer.maxFileSizeMiB', 1);
+        vscode_mock.__setStatImplementation(async () => ({
+            size: 5 * 1024 * 1024 * 1024,
+            mtime: 1,
+        }));
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage')
+            .mockResolvedValue('Open Anyway' as never);
+        const panel = open_csv_table(uri('/tmp/retried-file-backed.dta'), undefined, profile);
+
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(initial_snapshots(panel)).toHaveLength(1));
+
+        expect(builds).toBe(2);
+        expect(warning).toHaveBeenCalledOnce();
+    });
+
+    it('closes every file-backed source whose observed stat misses the admitted file', async () => {
+        const closed: ReturnType<typeof vi.fn>[] = [];
+        const profile: ViewerProfile = {
+            editing: false,
+            async build_source() {
+                throw new Error('whole-file builder should not run');
+            },
+            async build_file_source() {
+                const source = await CsvDataSource.create(enc.encode('h\na\n'), ',', 10, {
+                    firstRowIsHeader: true,
+                });
+                const close = vi.spyOn(source, 'close');
+                closed.push(close);
+                return {
+                    source,
+                    digest: 'mismatched-source',
+                    size: 5 * 1024 * 1024 * 1024 - 1,
+                    mtime: 1,
+                };
+            },
+        };
+        vscode_mock.__setConfigurationValue('tableViewer.maxFileSizeMiB', 1);
+        vscode_mock.__setStatImplementation(async () => ({
+            size: 5 * 1024 * 1024 * 1024,
+            mtime: 1,
+        }));
+        vi.spyOn(vscode_mock.window, 'showWarningMessage')
+            .mockResolvedValue('Open Anyway' as never);
+        const error = vi.spyOn(vscode_mock.window, 'showErrorMessage');
+        const panel = open_csv_table(uri('/tmp/mismatched-file-backed.dta'), undefined, profile);
+
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(error).toHaveBeenCalledOnce());
+
+        expect(closed).toHaveLength(4);
+        for (const close of closed) expect(close).toHaveBeenCalledOnce();
+    });
+
+    it('does not deduplicate different file-backed content with the same stat', async () => {
+        const first = await CsvDataSource.create(enc.encode('h\na\n'), ',', 10, {
+            firstRowIsHeader: true,
+        });
+        const second = await CsvDataSource.create(enc.encode('h\nb\n'), ',', 10, {
+            firstRowIsHeader: true,
+        });
+        const first_close = vi.spyOn(first, 'close');
+        let builds = 0;
+        const profile: ViewerProfile = {
+            editing: false,
+            async build_source() {
+                throw new Error('whole-file builder should not run');
+            },
+            async build_file_source() {
+                const source = builds++ === 0 ? first : second;
+                return {
+                    source,
+                    digest: source === first ? 'content-a' : 'content-b',
+                    size: 5 * 1024 * 1024 * 1024,
+                    mtime: 1,
+                };
+            },
+        };
+        vscode_mock.__setConfigurationValue('tableViewer.maxFileSizeMiB', 1);
+        vscode_mock.__setStatImplementation(async () => ({
+            size: 5 * 1024 * 1024 * 1024,
+            mtime: 1,
+        }));
+        vi.spyOn(vscode_mock.window, 'showWarningMessage')
+            .mockResolvedValue('Open Anyway' as never);
+        const panel = open_csv_table(uri('/tmp/same-stat-file-backed.dta'), undefined, profile);
+
+        await panel.__receive({ type: 'ready' });
+        await vscode_mock.__getWatchers()[0].__fireChange();
+        await vi.waitFor(() => expect(refresh_snapshots(panel)).toHaveLength(1));
+
+        expect(builds).toBe(2);
+        expect(first_close).toHaveBeenCalledOnce();
     });
 
     it('saves output above the threshold after the file is admitted through Open Anyway', async () => {
@@ -1193,25 +1361,86 @@ describe('CSV reload races', () => {
         vi.useRealTimers();
     });
 
-    it('reports initial-load failure after stale verification exhausts local retries', async () => {
+    it('reports initial-load failure and closes the empty viewer after retries', async () => {
         vi.useFakeTimers();
         let mtime = 0;
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: ++mtime }));
         vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
         const close_spy = vi.spyOn(CsvDataSource.prototype, 'close');
-        const error_spy = vi.spyOn(vscode_mock.window, 'showErrorMessage');
+        const error_dismissed = deferred<undefined>();
+        const error_spy = vi.spyOn(vscode_mock.window, 'showErrorMessage')
+            .mockReturnValue(error_dismissed.promise);
         open_csv_table(uri('/tmp/stale-initial-retry.csv'));
         const panel = vscode_mock.__getPanels()[0];
+        const panel_close = vi.spyOn(panel, 'dispose');
 
         await panel.__receive({ type: 'ready' });
-        await vi.advanceTimersByTimeAsync(200);
+        await vi.waitFor(() => expect(error_spy).toHaveBeenCalledOnce());
 
         expect(initial_snapshots(panel)).toHaveLength(0);
         expect(close_spy).toHaveBeenCalledTimes(4);
-        expect(error_spy).toHaveBeenCalledOnce();
         expect(error_spy).toHaveBeenCalledWith(
             'The file changed while it was being refreshed.',
         );
+        expect(panel_close).not.toHaveBeenCalled();
+        error_dismissed.resolve(undefined);
+        await flush_promises();
+        expect(panel_close).toHaveBeenCalledOnce();
+        vi.useRealTimers();
+    });
+
+    it('does not close a recovered viewer when a stale load error is dismissed', async () => {
+        vi.useFakeTimers();
+        let unstable = true;
+        let mtime = 0;
+        vscode_mock.__setStatImplementation(async () => ({
+            size: 100,
+            mtime: unstable ? ++mtime : 10_000,
+        }));
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+        const error_dismissed = deferred<undefined>();
+        const error_spy = vi.spyOn(vscode_mock.window, 'showErrorMessage')
+            .mockReturnValue(error_dismissed.promise);
+        const panel = open_csv_table(uri('/tmp/recovered-during-error.csv'));
+        const panel_close = vi.spyOn(panel, 'dispose');
+
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(error_spy).toHaveBeenCalledOnce());
+        unstable = false;
+        await panel.__receive({ type: 'ready' });
+        expect(initial_snapshots(panel)).toHaveLength(1);
+
+        error_dismissed.resolve(undefined);
+        await flush_promises();
+        expect(panel_close).not.toHaveBeenCalled();
+        panel.dispose();
+        vi.useRealTimers();
+    });
+
+    it('closes a source-less viewer when a failing watcher supersedes initial loading', async () => {
+        vi.useFakeTimers();
+        let mtime = 0;
+        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: ++mtime }));
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+        const initial_error_dismissed = deferred<undefined>();
+        const watcher_error_dismissed = deferred<undefined>();
+        const error_spy = vi.spyOn(vscode_mock.window, 'showErrorMessage')
+            .mockReturnValueOnce(initial_error_dismissed.promise)
+            .mockReturnValueOnce(watcher_error_dismissed.promise);
+        const panel = open_csv_table(uri('/tmp/source-less-watcher-failure.csv'));
+        const panel_close = vi.spyOn(panel, 'dispose');
+
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(error_spy).toHaveBeenCalledOnce());
+        const watcher_refresh = vscode_mock.__getWatchers()[0].__fireChange();
+        await vi.waitFor(() => expect(error_spy).toHaveBeenCalledTimes(2));
+
+        initial_error_dismissed.resolve(undefined);
+        await flush_promises();
+        expect(panel_close).not.toHaveBeenCalled();
+        watcher_error_dismissed.resolve(undefined);
+        await watcher_refresh;
+        await vi.waitFor(() => expect(panel_close).toHaveBeenCalledOnce());
         vi.useRealTimers();
     });
 
