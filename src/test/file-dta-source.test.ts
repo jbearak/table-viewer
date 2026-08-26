@@ -1,4 +1,6 @@
 import * as fs from 'node:fs';
+import { createHash } from 'node:crypto';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { DtaDataSource } from '../data-source/dta-source';
@@ -34,6 +36,49 @@ describe('FileDtaDataSource', () => {
             )).rejects.toMatchObject({ name: 'AbortError' });
         } finally {
             source.close();
+        }
+    });
+
+    it('digests the same descriptor that backs the source', async () => {
+        const observed = await FileDtaDataSource.open_observed(fixture);
+        try {
+            expect(observed.digest).toBe(
+                createHash('sha256').update(fs.readFileSync(fixture)).digest('hex'),
+            );
+            expect(observed.size).toBe(fs.statSync(fixture).size);
+        } finally {
+            observed.source.close();
+        }
+    });
+
+    it('rejects an oversized strL file before the parser can load its strL section', async () => {
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'tv-file-dta-'));
+        const sparse = path.join(directory, 'oversized-strl.dta');
+        try {
+            fs.copyFileSync(fixture, sparse);
+            fs.truncateSync(sparse, 2 * 1024 * 1024 * 1024);
+
+            await expect(FileDtaDataSource.open_observed(sparse)).rejects.toThrow(
+                /larger than 2 GiB.*strL variables/u,
+            );
+        } finally {
+            fs.rmSync(directory, { recursive: true, force: true });
+        }
+    });
+
+    it('preserves reordered and duplicate sparse column projections', async () => {
+        const buffered = await DtaDataSource.create(fs.readFileSync(fixture));
+        const file_backed = await FileDtaDataSource.open(fixture);
+        try {
+            const columns = [7, 0, 7, 3];
+            await expect(file_backed.read_raw_columns_async(
+                0, 0, 5, columns, () => false,
+            )).resolves.toEqual(await buffered.read_raw_columns_async(
+                0, 0, 5, columns, () => false,
+            ));
+        } finally {
+            file_backed.close();
+            buffered.close();
         }
     });
 });

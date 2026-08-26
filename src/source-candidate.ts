@@ -3,9 +3,9 @@ import type { DataSource } from './data-source/interface';
 export interface PhysicalSourceObservation {
     readonly fingerprint: string;
     readonly digest: string;
-    /** A file-backed source is opened through one descriptor and bracketed by
-     * path stats. It has no giant in-memory buffer to digest a second time. */
-    readonly verification?: 'fingerprint';
+    /** A file-backed source was content-digested through its own descriptor and
+     * bracketed by descriptor/path identity checks during construction. */
+    readonly verification?: 'bracketedDigest';
     readonly comparisonFingerprint?: string;
     readonly comparisonDigest?: string;
 }

@@ -284,6 +284,13 @@ export interface ViewerSourceBuildOptions {
     readonly loadAllRows?: boolean;
 }
 
+interface FileSourceBuildResult {
+    readonly source: DataSource;
+    readonly digest: string;
+    readonly size: number;
+    readonly mtime: number;
+}
+
 interface ViewerProfileBase {
     /** Build a DataSource from freshly-read bytes. Throws are surfaced as errors. */
     build_source(
@@ -298,7 +305,7 @@ interface ViewerProfileBase {
         file_path: string,
         state: PerFileState,
         options?: ViewerSourceBuildOptions,
-    ): Promise<DataSource>;
+    ): Promise<FileSourceBuildResult>;
     /** Sets previewMode on the meta envelope (read-only synced preview). */
     previewMode?: boolean;
     /** Called after each (re)load adopts a source — preview refreshes its line map. */
@@ -801,7 +808,7 @@ function dta_profile(): ViewerProfile {
         },
         async build_file_source(file_path) {
             const { FileDtaDataSource } = await import('./data-source/file-dta-source');
-            return FileDtaDataSource.open(file_path);
+            return FileDtaDataSource.open_observed(file_path);
         },
     };
 }
@@ -3775,24 +3782,27 @@ export function attach_viewer(
         let raw: Uint8Array | undefined;
         let file_backed_source: DataSource | undefined;
         if (use_file_backed_source) {
-            file_backed_source = await profile.build_file_source!(
-                file_path,
-                state,
-                load_all_csv_rows ? { loadAllRows: true } : undefined,
-            );
-            const verified_stat = await host.fs.stat(uri);
-            if (`${verified_stat.mtime}:${verified_stat.size}` !== fingerprint) {
-                file_backed_source.close();
-                throw new Error('The file changed while it was being opened.');
+            let owned_source: DataSource | undefined;
+            try {
+                const built = await profile.build_file_source!(
+                    file_path,
+                    state,
+                    load_all_csv_rows ? { loadAllRows: true } : undefined,
+                );
+                owned_source = built.source;
+                if (`${built.mtime}:${built.size}` !== fingerprint) {
+                    throw new Error('The file changed while it was being opened.');
+                }
+                file_backed_source = owned_source;
+                owned_source = undefined;
+                observation = {
+                    fingerprint,
+                    digest: built.digest,
+                    verification: 'bracketedDigest',
+                };
+            } finally {
+                owned_source?.close();
             }
-            observation = {
-                fingerprint,
-                // The source owns a descriptor over the bracketed physical file;
-                // hashing a 5 GiB file twice merely to rediscover the two matching
-                // stats would defeat the random-access path's memory and latency.
-                digest: createHash('sha256').update(`file:${fingerprint}`).digest('hex'),
-                verification: 'fingerprint',
-            };
         } else {
             const read_raw_main = await host.fs.read_file(uri);
             if (!bypassFileSizeLimit) {
@@ -4220,7 +4230,7 @@ export function attach_viewer(
         ) {
             return 'stale';
         }
-        if (candidate.observation.verification !== 'fingerprint') {
+        if (candidate.observation.verification !== 'bracketedDigest') {
             const raw = await host.fs.read_file(uri);
             const verified_stat = await host.fs.stat(uri);
             if (
@@ -9016,7 +9026,7 @@ export function attach_viewer(
         try {
             const before = await host.fs.stat(uri);
             if (`${before.mtime}:${before.size}` !== observation.fingerprint) return false;
-            if (observation.verification === 'fingerprint') {
+            if (observation.verification === 'bracketedDigest') {
                 return observation.digest === expected_digest
                     && source_authority.authorityRevision === expected_authority
                     && expected_authority
