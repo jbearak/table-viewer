@@ -90,6 +90,10 @@ export interface DesktopSettings {
      *  no version is dismissed. This is internal update state, not a control in
      *  Preferences; a newer release replaces it when that release is dismissed. */
     dismissedUpdateVersion: string;
+    /** Directory used by the last successful native file-picker selection.
+     *  Internal shell state rather than a Preferences control; empty means let
+     *  the operating system choose its default location. */
+    lastOpenDirectory: string;
     /** Whether the two sizes below are tracked from the windows the user
      *  resizes, or typed in the Preferences window. */
     newWindowSize: NewWindowSizeMode;
@@ -128,6 +132,7 @@ export const DEFAULT_SETTINGS: Readonly<DesktopSettings> = Object.freeze({
     diffOnByDefault: false,
     automaticallyCheckForUpdates: true,
     dismissedUpdateVersion: '',
+    lastOpenDirectory: '',
     newWindowSize: 'match-last',
     windowWidth: DEFAULT_WINDOW_WIDTH,
     windowHeight: DEFAULT_WINDOW_HEIGHT,
@@ -176,6 +181,9 @@ export function sanitize_settings(raw: unknown): DesktopSettings {
             && record.dismissedUpdateVersion.length <= 100
             ? record.dismissedUpdateVersion
             : DEFAULT_SETTINGS.dismissedUpdateVersion,
+        lastOpenDirectory: typeof record.lastOpenDirectory === 'string'
+            ? record.lastOpenDirectory
+            : DEFAULT_SETTINGS.lastOpenDirectory,
         newWindowSize: sanitize_new_window_size_mode(record.newWindowSize),
         windowWidth: Math.round(sanitize_number(
             record.windowWidth,
