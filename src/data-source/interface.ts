@@ -123,6 +123,9 @@ export interface SheetMeta {
     /** Size of the stable canonical row space in the underlying physical source. */
     sourceRowCount: number;
     columnCount: number;
+    /** Approximate encoded bytes per physical row, when cheaply known. Used to
+     * bound page/cache/copy work for byte-heavy formats in addition to cells. */
+    estimatedRowBytes?: number;
     merges: MergeRange[];             // from types.ts (rowSpan + colSpan)
     hasFormatting: boolean;
     /** Per-column header titles. Length === columnCount; a blank entry means

@@ -35,6 +35,8 @@ interface CachedPage {
 let next_loader_id = 0;
 const MAX_CELLS_PER_PAGE = 64 * 1024;
 const DEFAULT_MAX_CACHED_CELLS = 1_000_000;
+const MAX_SOURCE_BYTES_PER_PAGE = 8 * 1024 * 1024;
+const DEFAULT_MAX_CACHED_SOURCE_BYTES = 64 * 1024 * 1024;
 /** Keep bulk operations from synchronously flooding the extension host. */
 export const MAX_PENDING_PAGE_REQUESTS = 16;
 
@@ -92,6 +94,7 @@ export class RowLoader {
     private enabled = true;
     private page_size = PAGE_SIZE;
     private column_count = 1;
+    private estimated_row_bytes = 0;
     // Outstanding bulk-copy loads: each holds its own range's pages resident
     // until that range is fully cached and the promise settles.
     private load_waiters: Array<{
@@ -112,6 +115,7 @@ export class RowLoader {
         private readonly on_change: () => void,
         private readonly max_pages = 50,
         private readonly max_cached_cells = DEFAULT_MAX_CACHED_CELLS,
+        private readonly max_cached_source_bytes = DEFAULT_MAX_CACHED_SOURCE_BYTES,
     ) {}
 
     get generation(): number {
@@ -146,21 +150,32 @@ export class RowLoader {
         generation: number,
         enabled = true,
         column_count = 1,
+        estimated_row_bytes = 0,
     ): void {
         const next_column_count = Math.max(1, Math.floor(column_count));
+        const next_estimated_row_bytes = Number.isFinite(estimated_row_bytes)
+            ? Math.max(0, Math.floor(estimated_row_bytes))
+            : 0;
         const next_page_size = Math.min(
             PAGE_SIZE,
             Math.max(1, Math.floor(MAX_CELLS_PER_PAGE / next_column_count)),
+            next_estimated_row_bytes > 0
+                ? Math.max(1, Math.floor(
+                    MAX_SOURCE_BYTES_PER_PAGE / next_estimated_row_bytes,
+                ))
+                : PAGE_SIZE,
         );
         const source_changed =
             sheet_index !== this.sheet_index
             || generation !== this._generation
-            || next_page_size !== this.page_size;
+            || next_page_size !== this.page_size
+            || next_estimated_row_bytes !== this.estimated_row_bytes;
         this.sheet_index = sheet_index;
         this.row_count = row_count;
         this._generation = generation;
         this.enabled = enabled;
         this.column_count = next_column_count;
+        this.estimated_row_bytes = next_estimated_row_bytes;
         this.page_size = next_page_size;
         if (source_changed) {
             this.clear();
@@ -551,6 +566,12 @@ export class RowLoader {
         const effective_max_pages = Math.min(
             this.max_pages,
             Math.max(1, Math.floor(this.max_cached_cells / page_cells)),
+            this.estimated_row_bytes > 0
+                ? Math.max(1, Math.floor(
+                    this.max_cached_source_bytes
+                    / (this.page_size * this.estimated_row_bytes),
+                ))
+                : this.max_pages,
         );
         if (this.pages.size <= effective_max_pages) return;
         const protect = new Set(

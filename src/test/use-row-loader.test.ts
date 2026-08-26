@@ -97,6 +97,21 @@ describe('RowLoader', () => {
         ]);
     });
 
+    it('shrinks row pages for byte-heavy observations', () => {
+        const post = vi.fn();
+        const loader = new RowLoader(post, () => {});
+        loader.configure(0, 1000, 1, true, 1, 1024 * 1024);
+
+        loader.ensure_rows(0, 20);
+
+        const requests = post.mock.calls.map((call) => call[0] as RequestRows);
+        expect(requests.map(({ startRow, count }) => ({ startRow, count }))).toEqual([
+            { startRow: 0, count: 8 },
+            { startRow: 8, count: 8 },
+            { startRow: 16, count: 8 },
+        ]);
+    });
+
     it('does not re-request a page that is already pending', () => {
         const post = vi.fn();
         const loader = new RowLoader(post, () => {});
@@ -754,6 +769,27 @@ describe('RowLoader', () => {
             for (const start of [0, 100, 200]) loader.on_row_data(reply_for(post, 0, start, 1));
             await done;
             expect(loader.page_count).toBe(3);
+            loader.trim();
+            expect(loader.page_count).toBe(2);
+        });
+
+        it('keeps overlapping completed copies resident until each releases its pin', async () => {
+            const post = vi.fn();
+            const loader = new RowLoader(post, () => {}, 2);
+            loader.configure(0, 1000, 1);
+            const first_pin = loader.pin_rows(0, 250);
+            const second_pin = loader.pin_rows(0, 250);
+            const first = loader.ensure_rows_loaded(0, 250);
+            const second = loader.ensure_rows_loaded(0, 250);
+            for (const start of [0, 100, 200]) {
+                loader.on_row_data(reply_for(post, 0, start, 1));
+            }
+            await Promise.all([first, second]);
+
+            loader.unpin_rows(first_pin);
+            loader.trim();
+            expect(loader.page_count).toBe(3);
+            loader.unpin_rows(second_pin);
             loader.trim();
             expect(loader.page_count).toBe(2);
         });

@@ -66,6 +66,7 @@ export function use_row_loader(
     generation: number,
     enabled = true,
     column_count = 1,
+    estimated_row_bytes = 0,
 ): UseRowLoader {
     const [version, bump] = useReducer((n: number) => n + 1, 0);
     const ref = useRef<RowLoader | null>(null);
@@ -75,8 +76,23 @@ export function use_row_loader(
     const loader = ref.current;
 
     useEffect(() => {
-        loader.configure(sheet_index, row_count, generation, enabled, column_count);
-    }, [loader, sheet_index, row_count, generation, enabled, column_count]);
+        loader.configure(
+            sheet_index,
+            row_count,
+            generation,
+            enabled,
+            column_count,
+            estimated_row_bytes,
+        );
+    }, [
+        loader,
+        sheet_index,
+        row_count,
+        generation,
+        enabled,
+        column_count,
+        estimated_row_bytes,
+    ]);
 
     useEffect(() => {
         const handler = (e: MessageEvent) => {

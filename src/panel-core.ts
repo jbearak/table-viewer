@@ -146,6 +146,7 @@ function allocate_transform_operation_token(): TransformOperationToken {
 
 const DEFAULT_MAX_CACHED_PAGES = 64;
 const DEFAULT_MAX_CACHED_ROW_CELLS = 1_000_000;
+const DEFAULT_MAX_CACHED_ROW_BYTES = 64 * 1024 * 1024;
 const DEFAULT_MAX_CACHED_TRANSFORM_CELLS = 1_000_000;
 const DEFAULT_MAX_CACHED_TRANSFORM_BYTES = 64 * 1024 * 1024;
 const DEFAULT_MAX_CACHED_HISTOGRAM_BYTES = 16 * 1024 * 1024;
@@ -1792,16 +1793,30 @@ export class ViewerPanelCore {
             (total, row) => total + row.length,
             0,
         );
+        const bytes_in = (window: TransformedRowWindow) => window.rows.reduce(
+            (row_total, row) => row_total + row.reduce((cell_total, cell) => {
+                if (cell === null) return cell_total + 8;
+                const raw_length = String(cell.raw ?? '').length;
+                return cell_total + 64 + 2 * (raw_length + cell.formatted.length);
+            }, 0),
+            0,
+        );
         let cached_cells = 0;
-        for (const window of this.cache.values()) cached_cells += cells_in(window);
+        let cached_bytes = 0;
+        for (const window of this.cache.values()) {
+            cached_cells += cells_in(window);
+            cached_bytes += bytes_in(window);
+        }
         while (
             this.cache.size > this.max_cached_pages
             || cached_cells > DEFAULT_MAX_CACHED_ROW_CELLS
+            || cached_bytes > DEFAULT_MAX_CACHED_ROW_BYTES
         ) {
             // Map preserves insertion order; the first key is least-recently-used.
             const oldest = this.cache.keys().next().value;
             if (oldest === undefined) break;
             cached_cells -= cells_in(this.cache.get(oldest)!);
+            cached_bytes -= bytes_in(this.cache.get(oldest)!);
             this.cache.delete(oldest);
         }
     }

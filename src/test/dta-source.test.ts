@@ -659,6 +659,7 @@ describe('DtaDataSource', () => {
                 rowCount: 4,
                 sourceRowCount: 4,
                 columnCount: 5,
+                estimatedRowBytes: 23,
                 merges: [],
                 hasFormatting: true,
                 columnNames: ['status', 'amount', 'name', 'missing', 'long_text'],

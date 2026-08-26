@@ -6,6 +6,7 @@ import {
     csv_table_profile,
     plan_csv_save,
     type ViewerProfile,
+    type ViewerSourceBuildOptions,
 } from '../viewer-controller';
 import { dispose_csv_preview, show_csv_preview } from '../csv-preview';
 import { CsvDataSource } from '../data-source/csv-source';
@@ -198,7 +199,11 @@ describe('CSV reload races', () => {
         const source = await CsvDataSource.create(enc.encode('h\na\n'), ',', 10, {
             firstRowIsHeader: true,
         });
-        const build_from_file = vi.fn(async () => ({
+        const build_from_file = vi.fn(async (
+            _file_path: string,
+            _state: unknown,
+            _options?: ViewerSourceBuildOptions,
+        ) => ({
             source,
             digest: 'file-backed-digest',
             size: 5 * 1024 * 1024 * 1024,
@@ -235,6 +240,10 @@ describe('CSV reload races', () => {
         expect(build_from_buffer).not.toHaveBeenCalled();
         expect(read).not.toHaveBeenCalled();
         expect(initial_snapshots(panel)).toHaveLength(1);
+        const build_options = build_from_file.mock.calls[0][2];
+        expect(build_options?.isCancelled?.()).toBe(false);
+        panel.dispose();
+        expect(build_options?.isCancelled?.()).toBe(true);
     });
 
     it('does not ask again when an admitted file-backed load is retried', async () => {

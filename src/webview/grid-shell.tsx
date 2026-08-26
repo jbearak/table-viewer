@@ -693,6 +693,7 @@ export function GridShell({
         generation,
         has_visible_columns,
         sheet_meta.columnCount,
+        sheet_meta.estimatedRowBytes,
     );
     const {
         theme,
@@ -3269,7 +3270,12 @@ export function GridShell({
     const copy_source_selection = useCallback((
         selection: Parameters<typeof format_selection_tsv>[0],
         include_header = false,
-        max_rows = max_copy_rows_for_columns(selection.source_columns.length),
+        max_rows = max_copy_rows_for_columns(
+            selection.source_columns.length,
+            undefined,
+            undefined,
+            sheet_meta.estimatedRowBytes,
+        ),
     ) => {
         // Snapshot the displayed edit layers once per copy. A row must still be
         // resident before edits are overlaid: one known dirty cell must not make an
@@ -3336,13 +3342,23 @@ export function GridShell({
         merge_index,
         read_live_edit,
         sheet_meta.columnNames,
+        sheet_meta.estimatedRowBytes,
         show_formatting,
         safe_write_to_clipboard,
         store,
     ]);
 
     const copy_rect = useCallback(
-        (rect: Rectangle, include_header = false) => {
+        (
+            rect: Rectangle,
+            include_header = false,
+            max_rows = max_copy_rows_for_columns(
+                rect.width,
+                undefined,
+                undefined,
+                sheet_meta.estimatedRowBytes,
+            ),
+        ) => {
             copy_source_selection({
                 y: rect.y,
                 height: rect.height,
@@ -3350,9 +3366,9 @@ export function GridShell({
                     rect.x,
                     rect.x + rect.width,
                 ),
-            }, include_header);
+            }, include_header, max_rows);
         },
-        [copy_source_selection, visible_source_columns],
+        [copy_source_selection, sheet_meta.estimatedRowBytes, visible_source_columns],
     );
 
     const copy_display_rows = useCallback((intervals: readonly DisplayRowInterval[]) => {
@@ -3389,25 +3405,45 @@ export function GridShell({
     // doesn't come back blank with a "scroll to load" warning it can't act on.
     const copy_sheet = useCallback(async () => {
         if (row_count === 0 || display_column_count === 0) return;
-        const copy_row_limit = max_copy_rows_for_columns(display_column_count);
+        // A page carries every source column even when most are hidden, so the
+        // load budget must use the resident row width as well as the TSV width.
+        const copy_row_limit = max_copy_rows_for_columns(Math.max(
+            display_column_count,
+            sheet_meta.columnCount,
+        ), undefined, undefined, sheet_meta.estimatedRowBytes);
         const copy_row_count = Math.min(row_count, copy_row_limit);
-        const loaded = await ensure_rows_loaded(0, copy_row_count - 1);
-        // A sheet switch or reload cleared the cache mid-load: abandon the copy
-        // rather than overwrite the clipboard with a now-empty grid.
-        if (!loaded) return;
+        // Keep an operation-owned hold through synchronous serialization. Two
+        // concurrent copies can have their load waiters settle together; without
+        // separate pins, the first copy's trim could evict the second's rows.
+        const residency_pin = pin_rows(0, copy_row_count - 1);
         try {
+            const loaded = await ensure_rows_loaded(0, copy_row_count - 1);
+            // A sheet switch or reload cleared the cache mid-load: abandon the
+            // copy rather than overwrite the clipboard with a now-empty grid.
+            if (!loaded) return;
             copy_rect({
                 x: 0,
                 y: 0,
                 width: display_column_count,
                 height: row_count,
-            }, true);
+            }, true, copy_row_limit);
         } finally {
             // The TSV is materialized synchronously before the clipboard promise
             // starts, so bulk-loaded pages no longer need waiter protection.
+            unpin_rows(residency_pin);
             trim_rows();
         }
-    }, [copy_rect, display_column_count, ensure_rows_loaded, row_count, trim_rows]);
+    }, [
+        copy_rect,
+        display_column_count,
+        ensure_rows_loaded,
+        pin_rows,
+        row_count,
+        sheet_meta.columnCount,
+        sheet_meta.estimatedRowBytes,
+        trim_rows,
+        unpin_rows,
+    ]);
 
     // Publish sheet-tab actions to App, mirroring the grid_focus_ref bridge. The
     // sheet_index lets App reject a stale handle during a keyed remount.

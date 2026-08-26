@@ -31,6 +31,7 @@ describe('max_copy_rows_for_columns', () => {
         expect(max_copy_rows_for_columns(5_972)).toBe(167);
         expect(max_copy_rows_for_columns(2_000_000)).toBe(1);
         expect(max_copy_rows_for_columns(0)).toBe(0);
+        expect(max_copy_rows_for_columns(1, undefined, undefined, 2_045)).toBe(16_408);
     });
 });
 

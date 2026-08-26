@@ -4,7 +4,11 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { DtaDataSource } from '../data-source/dta-source';
-import { FileDtaDataSource } from '../data-source/file-dta-source';
+import {
+    FileDtaDataSource,
+    assert_file_backed_dta_row_size,
+} from '../data-source/file-dta-source';
+import { parse_metadata } from '@jbearak/dta-parser';
 
 const fixture = path.join(__dirname, 'fixtures', 'all_types_v118.dta');
 
@@ -39,6 +43,22 @@ describe('FileDtaDataSource', () => {
         }
     });
 
+    it('yields and observes cancellation during a large sparse indexed read', async () => {
+        const source = await FileDtaDataSource.open(fixture);
+        let cancelled = false;
+        setImmediate(() => { cancelled = true; });
+        try {
+            await expect(source.read_raw_columns_indexed_async(
+                0,
+                new Array<number>(10_000).fill(0),
+                [0, 2, 4, 6],
+                () => cancelled,
+            )).rejects.toMatchObject({ name: 'AbortError' });
+        } finally {
+            source.close();
+        }
+    });
+
     it('digests the same descriptor that backs the source', async () => {
         const observed = await FileDtaDataSource.open_observed(fixture);
         try {
@@ -49,6 +69,22 @@ describe('FileDtaDataSource', () => {
         } finally {
             observed.source.close();
         }
+    });
+
+    it('cancels an obsolete open before hashing the descriptor', async () => {
+        await expect(FileDtaDataSource.open_observed(
+            fixture,
+            true,
+            () => true,
+        )).rejects.toMatchObject({ name: 'AbortError' });
+    });
+
+    it('rejects byte-heavy fixed-width observation layouts', () => {
+        const metadata = parse_metadata(new Uint8Array(fs.readFileSync(fixture)).buffer);
+        expect(() => assert_file_backed_dta_row_size({
+            ...metadata,
+            obs_length: 1024 * 1024 + 1,
+        })).toThrow(/per-row safety limit/u);
     });
 
     it('rejects an oversized strL file before the parser can load its strL section', async () => {

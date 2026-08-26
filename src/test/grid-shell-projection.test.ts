@@ -1606,7 +1606,7 @@ describe('GridShell column projection', () => {
     });
 
     it('copies a projected source column with its visible header title', async () => {
-        const write_text = vi.fn(async () => {});
+        const write_text = vi.fn(async (_text: string) => {});
         Object.defineProperty(navigator, 'clipboard', {
             configurable: true,
             value: { writeText: write_text },
@@ -2646,6 +2646,50 @@ describe('GridShell column projection', () => {
         // Guard the shared afterEach unmount against a second call.
         root = null;
         void GridShell;
+    });
+
+    it('budgets whole-sheet loading by source width when most columns are hidden', async () => {
+        const write_text = vi.fn(async (_text: string) => {});
+        Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: { writeText: write_text },
+        });
+        const source_to_visible = new Array<number | undefined>(5_972);
+        source_to_visible[0] = 0;
+        const grid_actions_ref = React.createRef<
+            import('../webview/grid-shell').GridActionsHandle | null
+        >() as React.MutableRefObject<
+            import('../webview/grid-shell').GridActionsHandle | null
+        >;
+        await render_grid(props({
+            row_count: 100_000,
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 100_000,
+                sourceRowCount: 100_000,
+                columnCount: 5_972,
+                columnNames: ['A name'],
+            },
+            column_projection: {
+                visible_to_source: [0],
+                source_to_visible,
+                hidden_count: 5_971,
+            },
+            grid_actions_ref,
+        }));
+
+        await act(async () => { await grid_actions_ref.current!.copy_sheet(); });
+
+        // Pages contain all 5,972 source columns even though the TSV has one, so
+        // loading is capped at floor(1,000,000 / 5,972) = 167 rows.
+        expect(grid_mock.ensure_rows_loaded).toHaveBeenCalledWith(0, 166);
+        const copied = write_text.mock.calls[0][0] as string;
+        expect(copied.split('\n')).toHaveLength(168); // header + 167 rows
+        expect(grid_mock.post_message).toHaveBeenCalledWith({
+            type: 'showWarning',
+            message: expect.stringMatching(/first 167 rows/),
+        });
+        expect(grid_mock.trim_rows).toHaveBeenCalledTimes(1);
     });
 
     it('renders an unrecoverable message for a genuine zero-column sheet', async () => {

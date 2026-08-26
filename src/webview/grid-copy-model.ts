@@ -55,16 +55,27 @@ export const DEFAULT_MAX_ROWS = 100_000;
  * materialize nearly 600 million cells before writing the clipboard.
  */
 export const DEFAULT_MAX_CELLS = 1_000_000;
+/** Approximate encoded-data budget for one clipboard serialization. */
+export const DEFAULT_MAX_COPY_SOURCE_BYTES = 32 * 1024 * 1024;
 
 /** Maximum whole-sheet rows that fit both the row and total-cell copy caps. */
 export function max_copy_rows_for_columns(
     column_count: number,
     max_rows = DEFAULT_MAX_ROWS,
     max_cells = DEFAULT_MAX_CELLS,
+    estimated_row_bytes = 0,
+    max_source_bytes = DEFAULT_MAX_COPY_SOURCE_BYTES,
 ): number {
     if (!Number.isFinite(column_count) || column_count <= 0) return 0;
     const columns = Math.max(1, Math.floor(column_count));
-    return Math.min(max_rows, Math.max(1, Math.floor(max_cells / columns)));
+    const byte_rows = estimated_row_bytes > 0
+        ? Math.max(1, Math.floor(max_source_bytes / estimated_row_bytes))
+        : max_rows;
+    return Math.min(
+        max_rows,
+        Math.max(1, Math.floor(max_cells / columns)),
+        byte_rows,
+    );
 }
 
 /**

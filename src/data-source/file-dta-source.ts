@@ -39,17 +39,34 @@ import type {
 export const MAX_FILE_BACKED_DTA_COLUMNS = 10_000;
 const MAX_FILE_BACKED_DTA_METADATA_BYTES = 64 * 1024 * 1024;
 const MAX_FILE_BACKED_DTA_VALUE_LABEL_BYTES = 16 * 1024 * 1024;
+const MAX_FILE_BACKED_DTA_VALUE_LABEL_ENTRIES = 65_536;
+const MAX_FILE_BACKED_DTA_OBSERVATION_BYTES = 1024 * 1024;
 const MAX_WHOLE_FILE_READ_BYTES = 2 * 1024 * 1024 * 1024 - 1;
 const FILE_DIGEST_CHUNK_BYTES = 4 * 1024 * 1024;
 const MAX_ASYNC_READ_BYTES = 8 * 1024 * 1024;
 const MAX_ASYNC_READ_CELLS = 64 * 1024;
 const MAX_ASYNC_READ_ROWS = 128;
+const MAX_COLUMN_RUNS_PER_READ = 8;
+
+interface PreflightDta {
+    readonly metadata: DtaMetadata;
+    readonly stat: fs.Stats;
+}
 
 export interface ObservedFileDtaSource {
     readonly source: FileDtaDataSource;
     readonly digest: string;
     readonly size: number;
     readonly mtime: number;
+}
+
+export function assert_file_backed_dta_row_size(metadata: DtaMetadata): void {
+    if (metadata.obs_length > MAX_FILE_BACKED_DTA_OBSERVATION_BYTES) {
+        throw new Error(
+            `Stata observations exceed the `
+            + `${MAX_FILE_BACKED_DTA_OBSERVATION_BYTES / 1024 / 1024} MiB per-row safety limit`,
+        );
+    }
 }
 
 interface SynchronousDtaFileReader {
@@ -77,10 +94,69 @@ function read_prefix(fd: number, file_size: number, requested: number): ArrayBuf
     return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
 }
 
-function preflight_metadata(file_path: string): DtaMetadata {
+function read_slice(fd: number, file_size: number, offset: number, requested: number): Buffer {
+    const length = Math.min(Math.max(0, file_size - offset), requested);
+    const bytes = Buffer.allocUnsafe(length);
+    let read_position = 0;
+    while (read_position < length) {
+        const read = fs.readSync(
+            fd, bytes, read_position, length - read_position, offset + read_position,
+        );
+        if (read === 0) throw new Error('Unexpected EOF while reading Stata file');
+        read_position += read;
+    }
+    return bytes;
+}
+
+function assert_value_label_entry_limits(
+    fd: number,
+    metadata: DtaMetadata,
+): void {
+    // Modern tables have stable framing, so entry counts can be checked without
+    // decoding strings or constructing Maps. Legacy layouts are checked again
+    // from the opened parser result below; their raw section remains byte-capped.
+    if (metadata.format_version < 117) return;
+    const start = metadata.section_offsets.value_labels;
+    const length = metadata.section_offsets.end_of_file - start;
+    if (length <= 0) return;
+    const buffer = read_slice(fd, fs.fstatSync(fd).size, start, length);
+    const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    const little_endian = metadata.byte_order === 'LSF';
+    const name_width = metadata.format_version === 117 ? 33 : 129;
+    const open_tag = Buffer.from('<value_labels>');
+    const table_tag = Buffer.from('<lbl>');
+    let position = buffer.subarray(0, open_tag.length).equals(open_tag)
+        ? open_tag.length
+        : 0;
+    let total_entries = 0;
+    while (position + table_tag.length <= buffer.length) {
+        if (!buffer.subarray(position, position + table_tag.length).equals(table_tag)) break;
+        position += table_tag.length;
+        const payload = position + 4 + name_width + 3;
+        if (payload + 8 > buffer.length) throw new Error('Truncated Stata value-label table');
+        const entries = view.getInt32(payload, little_endian);
+        const text_bytes = view.getInt32(payload + 4, little_endian);
+        if (entries < 0 || text_bytes < 0) throw new Error('Invalid Stata value-label table');
+        total_entries += entries;
+        if (total_entries > MAX_FILE_BACKED_DTA_VALUE_LABEL_ENTRIES) {
+            throw new Error(
+                `Stata value-label data exceeds the `
+                + `${MAX_FILE_BACKED_DTA_VALUE_LABEL_ENTRIES.toLocaleString('en-US')} entry safety limit`,
+            );
+        }
+        const next = payload + 8 + entries * 8 + text_bytes + '</lbl>'.length;
+        if (!Number.isSafeInteger(next) || next <= position || next > buffer.length) {
+            throw new Error('Invalid Stata value-label table bounds');
+        }
+        position = next;
+    }
+}
+
+function preflight_metadata(file_path: string): PreflightDta {
     const fd = fs.openSync(file_path, 'r');
     try {
-        const file_size = fs.fstatSync(fd).size;
+        const stat = fs.fstatSync(fd);
+        const file_size = stat.size;
         const header = new Uint8Array(read_prefix(fd, file_size, 10));
         if (header.length < 1) throw new Error('Not a valid .dta file: file is empty');
         const release = header[0];
@@ -104,8 +180,9 @@ function preflight_metadata(file_path: string): DtaMetadata {
         }
         let last_error: unknown;
         while (size <= Math.min(file_size, MAX_FILE_BACKED_DTA_METADATA_BYTES)) {
+            let metadata: DtaMetadata;
             try {
-                return parse(read_prefix(fd, file_size, size));
+                metadata = parse(read_prefix(fd, file_size, size));
             } catch (error) {
                 last_error = error;
                 if (size === file_size || size === MAX_FILE_BACKED_DTA_METADATA_BYTES) break;
@@ -114,7 +191,18 @@ function preflight_metadata(file_path: string): DtaMetadata {
                     MAX_FILE_BACKED_DTA_METADATA_BYTES,
                     size * 2,
                 );
+                continue;
             }
+            const value_label_bytes = metadata.section_offsets.end_of_file
+                - metadata.section_offsets.value_labels;
+            if (value_label_bytes > MAX_FILE_BACKED_DTA_VALUE_LABEL_BYTES) {
+                throw new Error(
+                    `Stata value-label data exceeds the `
+                    + `${MAX_FILE_BACKED_DTA_VALUE_LABEL_BYTES / 1024 / 1024} MiB safety limit`,
+                );
+            }
+            assert_value_label_entry_limits(fd, metadata);
+            return { metadata, stat };
         }
         throw new Error(
             `Stata metadata could not be parsed within the `
@@ -126,11 +214,22 @@ function preflight_metadata(file_path: string): DtaMetadata {
     }
 }
 
-async function digest_descriptor(fd: number, size: number): Promise<string> {
+function abort_error(): Error {
+    const error = new Error('Stata source open was cancelled.');
+    error.name = 'AbortError';
+    return error;
+}
+
+async function digest_descriptor(
+    fd: number,
+    size: number,
+    is_cancelled: () => boolean,
+): Promise<string> {
     const digest = createHash('sha256');
     const chunk = Buffer.allocUnsafe(Math.min(FILE_DIGEST_CHUNK_BYTES, Math.max(1, size)));
     let position = 0;
     while (position < size) {
+        if (is_cancelled()) throw abort_error();
         const length = Math.min(chunk.byteLength, size - position);
         const bytes_read = await new Promise<number>((resolve, reject) => {
             fs.read(fd, chunk, 0, length, position, (error, read) => {
@@ -142,6 +241,7 @@ async function digest_descriptor(fd: number, size: number): Promise<string> {
         digest.update(chunk.subarray(0, bytes_read));
         position += bytes_read;
     }
+    if (is_cancelled()) throw abort_error();
     return digest.digest('hex');
 }
 
@@ -176,6 +276,40 @@ function raw_stata_cell(cell: RowCell): RawCell {
     return typeof cell === 'string'
         ? { raw: cell, rawType: 'string' }
         : { raw: String(cell), rawType: 'number' };
+}
+
+interface ColumnRun {
+    first: number;
+    last: number;
+}
+
+/**
+ * Keep sparse projection reads from rereading the same complete observation an
+ * unbounded number of times. Merge the smallest gaps until physical passes are
+ * capped; output projection still discards every unrequested gap column.
+ */
+function bounded_column_runs(columns: readonly number[]): ColumnRun[] {
+    const unique = [...new Set(columns)].sort((left, right) => left - right);
+    const runs: ColumnRun[] = [];
+    for (const column of unique) {
+        const previous = runs.at(-1);
+        if (previous && previous.last === column) previous.last += 1;
+        else runs.push({ first: column, last: column + 1 });
+    }
+    while (runs.length > MAX_COLUMN_RUNS_PER_READ) {
+        let merge_at = 0;
+        let smallest_gap = Number.POSITIVE_INFINITY;
+        for (let index = 0; index + 1 < runs.length; index++) {
+            const gap = runs[index + 1].first - runs[index].last;
+            if (gap < smallest_gap) {
+                smallest_gap = gap;
+                merge_at = index;
+            }
+        }
+        runs[merge_at].last = runs[merge_at + 1].last;
+        runs.splice(merge_at + 1, 1);
+    }
+    return runs;
 }
 
 async function yield_to_event_loop(): Promise<void> {
@@ -223,6 +357,7 @@ export class FileDtaDataSource implements DataSource {
                 rowCount: file.nobs,
                 sourceRowCount: file.nobs,
                 columnCount: file.nvar,
+                estimatedRowBytes: this.reader._metadata.obs_length,
                 merges: [],
                 hasFormatting: true,
                 columnNames: file.variables.map((variable) => variable.name),
@@ -237,12 +372,15 @@ export class FileDtaDataSource implements DataSource {
     static async open_observed(
         file_path: string,
         include_digest = true,
+        is_cancelled: () => boolean = () => false,
     ): Promise<ObservedFileDtaSource> {
         let file: DtaFile | undefined;
         try {
-            const metadata = preflight_metadata(file_path);
+            if (is_cancelled()) throw abort_error();
+            const preflight = preflight_metadata(file_path);
+            const { metadata } = preflight;
             if (
-                fs.statSync(file_path).size > MAX_WHOLE_FILE_READ_BYTES
+                preflight.stat.size > MAX_WHOLE_FILE_READ_BYTES
                 && metadata.variables.some((variable) => variable.type === 'strL')
             ) {
                 throw new Error(
@@ -250,34 +388,38 @@ export class FileDtaDataSource implements DataSource {
                     + 'are not supported yet.',
                 );
             }
-            const value_label_bytes = metadata.section_offsets.end_of_file
-                - metadata.section_offsets.value_labels;
-            if (value_label_bytes > MAX_FILE_BACKED_DTA_VALUE_LABEL_BYTES) {
-                throw new Error(
-                    `Stata value-label data exceeds the `
-                    + `${MAX_FILE_BACKED_DTA_VALUE_LABEL_BYTES / 1024 / 1024} MiB safety limit`,
-                );
-            }
+            assert_file_backed_dta_row_size(metadata);
+            if (is_cancelled()) throw abort_error();
             file = await DtaFile.open(file_path);
+            const reader = file as unknown as SynchronousDtaFileReader;
+            if (reader._fd === null || !same_descriptor(preflight.stat, fs.fstatSync(reader._fd))) {
+                throw new Error('The file changed between safety checks and parser open.');
+            }
+            let label_entries = 0;
+            let label_characters = 0;
+            for (const table of file.value_label_tables.values()) {
+                label_entries += table.size;
+                for (const label of table.values()) label_characters += label.length;
+            }
+            if (label_entries > MAX_FILE_BACKED_DTA_VALUE_LABEL_ENTRIES) {
+                throw new Error('Stata value-label data exceeds the entry safety limit');
+            }
+            if (label_characters * 2 > MAX_FILE_BACKED_DTA_VALUE_LABEL_BYTES) {
+                throw new Error('Decoded Stata value-label data exceeds the memory safety limit');
+            }
             const source = new FileDtaDataSource(file, file_path);
             file = undefined;
-            if (!include_digest) {
-                const stat = fs.statSync(file_path);
-                return {
-                    source,
-                    digest: '',
-                    size: stat.size,
-                    mtime: stat.mtimeMs,
-                };
-            }
             try {
-                return await source.observe_file();
+                return include_digest
+                    ? await source.observe_file(is_cancelled)
+                    : source.observe_file_without_digest();
             } catch (error) {
                 source.close();
                 throw error;
             }
         } catch (error) {
             file?.close();
+            if (error instanceof Error && error.name === 'AbortError') throw error;
             const detail = error instanceof Error ? error.message : String(error);
             throw new Error(`Could not open Stata file: ${detail}`, { cause: error });
         }
@@ -319,6 +461,9 @@ export class FileDtaDataSource implements DataSource {
         const rows_per_yield = Math.max(1, Math.min(
             MAX_ASYNC_READ_ROWS,
             Math.floor(MAX_ASYNC_READ_CELLS / Math.max(1, this.file.nvar)),
+            Math.floor(
+                MAX_ASYNC_READ_BYTES / Math.max(1, this.reader._metadata.obs_length),
+            ),
         ));
         for (let position = 0; position < requested.length; position += 1) {
             this.assert_active(is_cancelled);
@@ -373,7 +518,11 @@ export class FileDtaDataSource implements DataSource {
         const rows_per_chunk = Math.max(1, Math.min(
             MAX_ASYNC_READ_ROWS,
             Math.floor(
-                MAX_ASYNC_READ_BYTES / Math.max(1, this.reader._metadata.obs_length),
+                MAX_ASYNC_READ_BYTES / Math.max(
+                    1,
+                    this.reader._metadata.obs_length
+                        * bounded_column_runs(column_indices).length,
+                ),
             ),
             Math.floor(MAX_ASYNC_READ_CELLS / Math.max(1, column_indices.length)),
         ));
@@ -407,6 +556,13 @@ export class FileDtaDataSource implements DataSource {
         const rows_per_yield = Math.max(1, Math.min(
             MAX_ASYNC_READ_ROWS,
             Math.floor(MAX_ASYNC_READ_CELLS / Math.max(1, column_indices.length)),
+            Math.floor(
+                MAX_ASYNC_READ_BYTES / Math.max(
+                    1,
+                    this.reader._metadata.obs_length
+                        * bounded_column_runs(column_indices).length,
+                ),
+            ),
         ));
         for (let position = 0; position < requested.length; position += 1) {
             this.assert_active(is_cancelled);
@@ -457,11 +613,29 @@ export class FileDtaDataSource implements DataSource {
         return this.all_column_indices;
     }
 
-    private async observe_file(): Promise<ObservedFileDtaSource> {
+    private observe_file_without_digest(): ObservedFileDtaSource {
+        const fd = this.reader._fd;
+        if (fd === null) throw new Error('Stata source is closed');
+        const descriptor = fs.fstatSync(fd);
+        const path_stat = fs.statSync(this.file_path);
+        if (!same_descriptor(descriptor, path_stat)) {
+            throw new Error('The file changed while it was being opened.');
+        }
+        return {
+            source: this,
+            digest: '',
+            size: descriptor.size,
+            mtime: descriptor.mtimeMs,
+        };
+    }
+
+    private async observe_file(
+        is_cancelled: () => boolean,
+    ): Promise<ObservedFileDtaSource> {
         const fd = this.reader._fd;
         if (fd === null) throw new Error('Stata source is closed');
         const before = fs.fstatSync(fd);
-        const digest = await digest_descriptor(fd, before.size);
+        const digest = await digest_descriptor(fd, before.size, is_cancelled);
         const after = fs.fstatSync(fd);
         const path_stat = fs.statSync(this.file_path);
         if (!same_descriptor(before, after) || !same_descriptor(after, path_stat)) {
@@ -503,33 +677,26 @@ export class FileDtaDataSource implements DataSource {
             if (existing) existing.push(position);
             else positions.set(column, [position]);
         });
-        const unique = [...positions.keys()].sort((left, right) => left - right);
+        const runs = bounded_column_runs([...positions.keys()]);
         const output: (RenderedCell | RawCell | null)[][] = Array.from(
             { length: count },
             () => new Array<RenderedCell | RawCell | null>(columns.length),
         );
-        let run_start = 0;
-        while (run_start < unique.length) {
-            let run_end = run_start + 1;
-            while (
-                run_end < unique.length
-                && unique[run_end] === unique[run_end - 1] + 1
-            ) run_end += 1;
-            const first = unique[run_start];
-            const last = unique[run_end - 1] + 1;
+        for (const { first, last } of runs) {
             const rows = this.reader._read_rows_range(start, count, first, last);
             rows.forEach((row, row_index) => {
                 for (let column = first; column < last; column += 1) {
+                    const requested_positions = positions.get(column);
+                    if (!requested_positions) continue;
                     const cell = row[column - first];
                     const value = rendered
                         ? this.render_cell(cell, column)
                         : raw_stata_cell(cell);
-                    for (const position of positions.get(column)!) {
+                    for (const position of requested_positions) {
                         output[row_index][position] = value;
                     }
                 }
             });
-            run_start = run_end;
         }
         return output;
     }

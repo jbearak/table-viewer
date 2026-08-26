@@ -282,6 +282,8 @@ export interface ViewerController extends Disposable {
 
 export interface ViewerSourceBuildOptions {
     readonly loadAllRows?: boolean;
+    /** Observable cancellation for long-running file-backed opens. */
+    readonly isCancelled?: () => boolean;
 }
 
 interface FileSourceBuildResult {
@@ -806,9 +808,13 @@ function dta_profile(): ViewerProfile {
         build_source(raw, file_path) {
             return build_source_from_buffer(raw, file_path);
         },
-        async build_file_source(file_path) {
+        async build_file_source(file_path, _state, options) {
             const { FileDtaDataSource } = await import('./data-source/file-dta-source');
-            return FileDtaDataSource.open_observed(file_path);
+            return FileDtaDataSource.open_observed(
+                file_path,
+                true,
+                options?.isCancelled,
+            );
         },
     };
 }
@@ -3787,7 +3793,13 @@ export function attach_viewer(
                 const built = await profile.build_file_source!(
                     file_path,
                     state,
-                    load_all_csv_rows ? { loadAllRows: true } : undefined,
+                    {
+                        ...(load_all_csv_rows ? { loadAllRows: true } : {}),
+                        isCancelled: () => !load_is_current(
+                            load_request.seq,
+                            load_request.refreshEvent,
+                        ),
+                    },
                 );
                 owned_source = built.source;
                 if (`${built.mtime}:${built.size}` !== fingerprint) {
