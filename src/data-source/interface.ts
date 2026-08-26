@@ -143,6 +143,12 @@ export interface WorkbookMeta {
 export interface DataSource {
     /** Workbook structure only — no cell data. Cheap; safe to call repeatedly. */
     meta(): WorkbookMeta;
+    /** Re-hash a descriptor-backed source for operations that must prove the
+     * physical bytes still match the adopted source without a whole-file read. */
+    physical_content_matches?(
+        expected_digest: string,
+        is_cancelled: () => boolean,
+    ): Promise<boolean>;
     /** Map projected rows exposed by this DataSource to canonical source rows.
      * Optional identity default for sources without a row projection. */
     source_row_indices?(

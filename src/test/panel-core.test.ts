@@ -405,6 +405,47 @@ describe('ViewerPanelCore', () => {
         expect(src.read_rows_calls).toBe(1);
     });
 
+    it('computes each row-window cache weight only once', async () => {
+        let formatted_reads = 0;
+        class WeightedSource extends StubSource {
+            override read_rows(_sheet: number, start: number, count: number): RowWindow {
+                this.read_rows_calls++;
+                return {
+                    startRow: start,
+                    rows: Array.from({ length: count }, (_, offset) => {
+                        const raw = String(start + offset);
+                        return [{
+                            raw,
+                            get formatted() {
+                                formatted_reads += 1;
+                                return raw;
+                            },
+                            bold: false,
+                            italic: false,
+                        }];
+                    }),
+                };
+            }
+        }
+        const { panel } = make_panel();
+        const core = new ViewerPanelCore(panel, new WeightedSource(1000));
+        const request = (startRow: number) => core.handle_message({
+            type: 'requestRows' as const,
+            sheetIndex: 0,
+            startRow,
+            count: 5,
+            requestId: `weight-${startRow}`,
+            generation: core.generation,
+        });
+
+        await request(0);
+        expect(formatted_reads).toBe(5);
+        await request(5);
+        // Only the newly inserted page is measured; the first page is not
+        // traversed again merely to recompute aggregate cache weight.
+        expect(formatted_reads).toBe(10);
+    });
+
     it('computes histograms lazily, caches by source/sheet/column, and reuses across view generations', async () => {
         const { panel, posted } = make_panel();
         const src = new StubSource(5);

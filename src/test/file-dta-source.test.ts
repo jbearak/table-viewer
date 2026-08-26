@@ -71,6 +71,38 @@ describe('FileDtaDataSource', () => {
         }
     });
 
+    it('rechecks descriptor content instead of trusting an unchanged file stat', async () => {
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'tv-file-dta-'));
+        const copy = path.join(directory, 'same-stat.dta');
+        fs.copyFileSync(fixture, copy);
+        const observed = await FileDtaDataSource.open_observed(copy);
+        try {
+            await expect(observed.source.physical_content_matches(
+                observed.digest,
+                () => false,
+            )).resolves.toBe(true);
+            const original_stat = fs.statSync(copy);
+            const fd = fs.openSync(copy, 'r+');
+            try {
+                const tail = Buffer.allocUnsafe(1);
+                fs.readSync(fd, tail, 0, 1, original_stat.size - 1);
+                tail[0] ^= 1;
+                fs.writeSync(fd, tail, 0, 1, original_stat.size - 1);
+            } finally {
+                fs.closeSync(fd);
+            }
+            fs.utimesSync(copy, original_stat.atime, original_stat.mtime);
+
+            await expect(observed.source.physical_content_matches(
+                observed.digest,
+                () => false,
+            )).resolves.toBe(false);
+        } finally {
+            observed.source.close();
+            fs.rmSync(directory, { recursive: true, force: true });
+        }
+    });
+
     it('cancels an obsolete open before hashing the descriptor', async () => {
         await expect(FileDtaDataSource.open_observed(
             fixture,

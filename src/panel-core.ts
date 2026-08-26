@@ -339,7 +339,13 @@ export interface PreparedTransformReconciliation {
  */
 export class ViewerPanelCore {
     private _generation = 1;
-    private readonly cache = new Map<string, TransformedRowWindow>();
+    private readonly cache = new Map<string, {
+        readonly window: TransformedRowWindow;
+        readonly cells: number;
+        readonly bytes: number;
+    }>();
+    private cached_row_cells = 0;
+    private cached_row_bytes = 0;
     private readonly max_cached_pages: number;
     private readonly column_analysis_cache: ColumnAnalysisLruCache;
     private readonly transform_indices = new Map<number, Uint32Array>();
@@ -682,7 +688,7 @@ export class ViewerPanelCore {
         this.histogram_cache.clear();
         this.histogram_operations.clear();
         this.column_analysis_cache.clear();
-        this.cache.clear();
+        this.clear_row_cache();
         // Unfalsifiable, and said so rather than dressed up as a fix: the `_generation`
         // bump above already makes the memo's key miss, so no test can tell this line from
         // its absence — probed by deleting it, and nothing failed. Kept on the precedent
@@ -787,7 +793,7 @@ export class ViewerPanelCore {
         this.transform_states.clear();
         this.histogram_cache.clear();
         this.column_analysis_cache.clear();
-        this.cache.clear();
+        this.clear_row_cache();
         this.row_height_projection_memo = undefined;
         // Dropped here for the memory rather than for correctness — unlike the small
         // numbers above, these entries retain a projection per sheet, and a pre-cap legacy
@@ -1027,7 +1033,7 @@ export class ViewerPanelCore {
                 this.sheet_mapping_generations.set(change.sheetIndex, this._generation);
             }
         }
-        if (prepared.changes.length > 0) this.cache.clear();
+        if (prepared.changes.length > 0) this.clear_row_cache();
         return true;
     }
 
@@ -1619,7 +1625,7 @@ export class ViewerPanelCore {
             if (mapping_moved) {
                 this.sheet_mapping_generations.set(msg.sheetIndex, this._generation);
             }
-            this.cache.clear();
+            this.clear_row_cache();
             // Built after the mutation above, so the record's basis carries the
             // bumped generation and its rules/rowCount/permuted come from what was
             // actually installed rather than from what was asked for.
@@ -1747,11 +1753,13 @@ export class ViewerPanelCore {
         const start_row = Math.max(0, msg.startRow);
 
         const key = `${msg.sheetIndex}:${start_row}:${msg.count}`;
-        let window = this.cache.get(key);
-        if (window !== undefined) {
+        const cached = this.cache.get(key);
+        let window: TransformedRowWindow;
+        if (cached !== undefined) {
+            window = cached.window;
             // LRU touch: re-insert to mark most-recently-used.
             this.cache.delete(key);
-            this.cache.set(key, window);
+            this.cache.set(key, cached);
         } else {
             try {
                 window = transformed_window(
@@ -1768,7 +1776,10 @@ export class ViewerPanelCore {
                 // given key, so caching the empty result is safe.
                 window = { startRow: start_row, rows: [], sourceRows: [] };
             }
-            this.cache.set(key, window);
+            const weight = this.row_window_weight(window);
+            this.cache.set(key, { window, ...weight });
+            this.cached_row_cells += weight.cells;
+            this.cached_row_bytes += weight.bytes;
             this.evict_excess();
         }
 
@@ -1788,12 +1799,12 @@ export class ViewerPanelCore {
         }, receiver_epoch);
     }
 
-    private evict_excess(): void {
-        const cells_in = (window: TransformedRowWindow) => window.rows.reduce(
-            (total, row) => total + row.length,
-            0,
-        );
-        const bytes_in = (window: TransformedRowWindow) => window.rows.reduce(
+    private row_window_weight(window: TransformedRowWindow): {
+        cells: number;
+        bytes: number;
+    } {
+        const cells = window.rows.reduce((total, row) => total + row.length, 0);
+        const bytes = window.rows.reduce(
             (row_total, row) => row_total + row.reduce((cell_total, cell) => {
                 if (cell === null) return cell_total + 8;
                 const raw_length = String(cell.raw ?? '').length;
@@ -1801,22 +1812,27 @@ export class ViewerPanelCore {
             }, 0),
             0,
         );
-        let cached_cells = 0;
-        let cached_bytes = 0;
-        for (const window of this.cache.values()) {
-            cached_cells += cells_in(window);
-            cached_bytes += bytes_in(window);
-        }
+        return { cells, bytes };
+    }
+
+    private clear_row_cache(): void {
+        this.cache.clear();
+        this.cached_row_cells = 0;
+        this.cached_row_bytes = 0;
+    }
+
+    private evict_excess(): void {
         while (
             this.cache.size > this.max_cached_pages
-            || cached_cells > DEFAULT_MAX_CACHED_ROW_CELLS
-            || cached_bytes > DEFAULT_MAX_CACHED_ROW_BYTES
+            || this.cached_row_cells > DEFAULT_MAX_CACHED_ROW_CELLS
+            || this.cached_row_bytes > DEFAULT_MAX_CACHED_ROW_BYTES
         ) {
             // Map preserves insertion order; the first key is least-recently-used.
             const oldest = this.cache.keys().next().value;
             if (oldest === undefined) break;
-            cached_cells -= cells_in(this.cache.get(oldest)!);
-            cached_bytes -= bytes_in(this.cache.get(oldest)!);
+            const entry = this.cache.get(oldest)!;
+            this.cached_row_cells -= entry.cells;
+            this.cached_row_bytes -= entry.bytes;
             this.cache.delete(oldest);
         }
     }

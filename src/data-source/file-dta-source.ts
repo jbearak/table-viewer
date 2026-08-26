@@ -15,6 +15,7 @@ import {
     legacy_metadata_buffer_size,
     parse_legacy_metadata,
     parse_metadata,
+    parse_value_labels,
 } from '@jbearak/dta-parser';
 import { MAX_SHEET_ROWS } from '../spreadsheet-safety';
 import type {
@@ -49,6 +50,7 @@ const MAX_ASYNC_READ_ROWS = 128;
 const MAX_COLUMN_RUNS_PER_READ = 8;
 
 interface PreflightDta {
+    readonly fd: number;
     readonly metadata: DtaMetadata;
     readonly stat: fs.Stats;
 }
@@ -78,6 +80,14 @@ interface SynchronousDtaFileReader {
         columnStart?: number,
         columnEnd?: number,
     ): Row[];
+}
+
+interface OwnedDtaFileConstructor {
+    new (
+        fd: number,
+        metadata: DtaMetadata,
+        value_label_tables: Map<string, Map<number, string>>,
+    ): DtaFile;
 }
 
 const LEGACY_RELEASES = new Set<number>([105, 108, 110, 111, 113, 114, 115]);
@@ -112,22 +122,98 @@ function assert_value_label_entry_limits(
     fd: number,
     metadata: DtaMetadata,
 ): void {
-    // Modern tables have stable framing, so entry counts can be checked without
-    // decoding strings or constructing Maps. Legacy layouts are checked again
-    // from the opened parser result below; their raw section remains byte-capped.
-    if (metadata.format_version < 117) return;
     const start = metadata.section_offsets.value_labels;
     const length = metadata.section_offsets.end_of_file - start;
     if (length <= 0) return;
     const buffer = read_slice(fd, fs.fstatSync(fd).size, start, length);
     const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
     const little_endian = metadata.byte_order === 'LSF';
+    const assert_total = (total: number): void => {
+        if (total > MAX_FILE_BACKED_DTA_VALUE_LABEL_ENTRIES) {
+            throw new Error(
+                `Stata value-label data exceeds the `
+                + `${MAX_FILE_BACKED_DTA_VALUE_LABEL_ENTRIES.toLocaleString('en-US')} entry safety limit`,
+            );
+        }
+    };
+    const all_zero_from = (position: number): boolean => {
+        for (let index = position; index < buffer.length; index++) {
+            if (buffer[index] !== 0) return false;
+        }
+        return true;
+    };
+
+    if (metadata.format_version < 117) {
+        const scan_offset_tables = (name_width: number): number | undefined => {
+            let position = 0;
+            let total = 0;
+            while (position < buffer.length) {
+                if (all_zero_from(position)) return total;
+                const payload = position + 4 + name_width + 3;
+                if (payload + 8 > buffer.length) return undefined;
+                const table_length = view.getInt32(position, little_endian);
+                const entries = view.getInt32(payload, little_endian);
+                const text_bytes = view.getInt32(payload + 4, little_endian);
+                if (table_length <= 0 || entries < 0 || text_bytes < 0) return undefined;
+                const payload_length = 8 + entries * 8 + text_bytes;
+                if (payload_length !== table_length) return undefined;
+                const next = payload + payload_length;
+                if (!Number.isSafeInteger(next) || next <= position || next > buffer.length) {
+                    return undefined;
+                }
+                total += entries;
+                position = next;
+            }
+            return total;
+        };
+        const scan_fixed8 = (name_width: number): number => {
+            let position = 0;
+            let total = 0;
+            while (position < buffer.length) {
+                if (all_zero_from(position)) return total;
+                const header_width = 2 + name_width + 1;
+                if (position + header_width > buffer.length) {
+                    throw new Error('Truncated legacy Stata value-label table');
+                }
+                const entries = view.getUint16(position, little_endian);
+                const next = position + header_width + entries * 10;
+                if (!Number.isSafeInteger(next) || next <= position || next > buffer.length) {
+                    throw new Error('Invalid legacy Stata value-label table bounds');
+                }
+                total += entries;
+                position = next;
+            }
+            assert_total(total);
+            return total;
+        };
+        if (metadata.format_version === 105) {
+            const offset_entries = scan_offset_tables(33);
+            if (offset_entries === undefined) scan_fixed8(9);
+            else assert_total(offset_entries);
+        } else if (metadata.format_version === 108) {
+            const entries = scan_offset_tables(9) ?? scan_offset_tables(33);
+            if (entries === undefined) {
+                throw new Error('Invalid legacy Stata value-label framing');
+            }
+            assert_total(entries);
+        } else {
+            const entries = scan_offset_tables(33);
+            if (entries === undefined) {
+                throw new Error('Invalid legacy Stata value-label framing');
+            }
+            assert_total(entries);
+        }
+        return;
+    }
+
     const name_width = metadata.format_version === 117 ? 33 : 129;
     const open_tag = Buffer.from('<value_labels>');
     const table_tag = Buffer.from('<lbl>');
-    let position = buffer.subarray(0, open_tag.length).equals(open_tag)
-        ? open_tag.length
-        : 0;
+    const close_tag = Buffer.from('</value_labels>');
+    if (!buffer.subarray(0, open_tag.length).equals(open_tag)) {
+        throw new Error('Invalid Stata value-label section opener');
+    }
+    let position = open_tag.length;
     let total_entries = 0;
     while (position + table_tag.length <= buffer.length) {
         if (!buffer.subarray(position, position + table_tag.length).equals(table_tag)) break;
@@ -138,17 +224,15 @@ function assert_value_label_entry_limits(
         const text_bytes = view.getInt32(payload + 4, little_endian);
         if (entries < 0 || text_bytes < 0) throw new Error('Invalid Stata value-label table');
         total_entries += entries;
-        if (total_entries > MAX_FILE_BACKED_DTA_VALUE_LABEL_ENTRIES) {
-            throw new Error(
-                `Stata value-label data exceeds the `
-                + `${MAX_FILE_BACKED_DTA_VALUE_LABEL_ENTRIES.toLocaleString('en-US')} entry safety limit`,
-            );
-        }
+        assert_total(total_entries);
         const next = payload + 8 + entries * 8 + text_bytes + '</lbl>'.length;
         if (!Number.isSafeInteger(next) || next <= position || next > buffer.length) {
             throw new Error('Invalid Stata value-label table bounds');
         }
         position = next;
+    }
+    if (!buffer.subarray(position, position + close_tag.length).equals(close_tag)) {
+        throw new Error('Invalid Stata value-label section framing');
     }
 }
 
@@ -202,15 +286,16 @@ function preflight_metadata(file_path: string): PreflightDta {
                 );
             }
             assert_value_label_entry_limits(fd, metadata);
-            return { metadata, stat };
+            return { fd, metadata, stat };
         }
         throw new Error(
             `Stata metadata could not be parsed within the `
             + `${MAX_FILE_BACKED_DTA_METADATA_BYTES / 1024 / 1024} MiB safety limit`,
             { cause: last_error },
         );
-    } finally {
+    } catch (error) {
         fs.closeSync(fd);
+        throw error;
     }
 }
 
@@ -375,9 +460,10 @@ export class FileDtaDataSource implements DataSource {
         is_cancelled: () => boolean = () => false,
     ): Promise<ObservedFileDtaSource> {
         let file: DtaFile | undefined;
+        let preflight: PreflightDta | undefined;
         try {
             if (is_cancelled()) throw abort_error();
-            const preflight = preflight_metadata(file_path);
+            preflight = preflight_metadata(file_path);
             const { metadata } = preflight;
             if (
                 preflight.stat.size > MAX_WHOLE_FILE_READ_BYTES
@@ -390,11 +476,25 @@ export class FileDtaDataSource implements DataSource {
             }
             assert_file_backed_dta_row_size(metadata);
             if (is_cancelled()) throw abort_error();
-            file = await DtaFile.open(file_path);
-            const reader = file as unknown as SynchronousDtaFileReader;
-            if (reader._fd === null || !same_descriptor(preflight.stat, fs.fstatSync(reader._fd))) {
-                throw new Error('The file changed between safety checks and parser open.');
-            }
+            const label_start = metadata.section_offsets.value_labels;
+            const label_length = metadata.section_offsets.end_of_file - label_start;
+            const label_bytes = read_slice(
+                preflight.fd,
+                preflight.stat.size,
+                label_start,
+                label_length,
+            );
+            const label_buffer = label_bytes.buffer.slice(
+                label_bytes.byteOffset,
+                label_bytes.byteOffset + label_bytes.byteLength,
+            ) as ArrayBuffer;
+            const value_label_tables = label_length <= 0
+                ? new Map<string, Map<number, string>>()
+                : parse_value_labels(label_buffer, metadata, label_start);
+            const Constructor = DtaFile as unknown as OwnedDtaFileConstructor;
+            file = new Constructor(preflight.fd, metadata, value_label_tables);
+            // The exact descriptor preflighted above is now owned by DtaFile.
+            preflight = undefined;
             let label_entries = 0;
             let label_characters = 0;
             for (const table of file.value_label_tables.values()) {
@@ -419,6 +519,7 @@ export class FileDtaDataSource implements DataSource {
             }
         } catch (error) {
             file?.close();
+            if (preflight) fs.closeSync(preflight.fd);
             if (error instanceof Error && error.name === 'AbortError') throw error;
             const detail = error instanceof Error ? error.message : String(error);
             throw new Error(`Could not open Stata file: ${detail}`, { cause: error });
@@ -607,6 +708,22 @@ export class FileDtaDataSource implements DataSource {
         if (this.closed) return;
         this.closed = true;
         this.file.close();
+    }
+
+    async physical_content_matches(
+        expected_digest: string,
+        is_cancelled: () => boolean,
+    ): Promise<boolean> {
+        this.assert_open();
+        const fd = this.reader._fd;
+        if (fd === null) return false;
+        const before = fs.fstatSync(fd);
+        const digest = await digest_descriptor(fd, before.size, is_cancelled);
+        const after = fs.fstatSync(fd);
+        const path_stat = fs.statSync(this.file_path);
+        return digest === expected_digest
+            && same_descriptor(before, after)
+            && same_descriptor(after, path_stat);
     }
 
     private all_columns(): readonly number[] {

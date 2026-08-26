@@ -8552,9 +8552,11 @@ export function attach_viewer(
         // 3. PHYSICAL CURRENCY. Last because it reads the whole file, and a
         // conflict found above would have made the read wasted work.
         const physical = await replay_physical_source_is_current(
+            src,
             observation,
             expected_digest,
             expected_authority,
+            () => !replay_is_current(),
         );
         if (!replay_is_current()) {
             refuse('document-changed');
@@ -8755,9 +8757,11 @@ export function attach_viewer(
         // replay a refusal — the user retries after the reload lands — never a
         // mutation against bytes nobody read, and never a partial application.
         if (!await replay_physical_source_is_current(
+            src,
             observation,
             expected_digest,
             expected_authority,
+            () => !payload.isCurrent(),
         )) return refused('document-changed');
         if (!payload.isCurrent()) return refused('document-changed');
 
@@ -9031,15 +9035,22 @@ export function attach_viewer(
      * does and does not close; see the comment above its call.
      */
     async function replay_physical_source_is_current(
+        current_source: DataSource,
         observation: Readonly<PhysicalSourceObservation>,
         expected_digest: string,
         expected_authority: number,
+        is_cancelled: () => boolean,
     ): Promise<boolean> {
         try {
             const before = await host.fs.stat(uri);
             if (`${before.mtime}:${before.size}` !== observation.fingerprint) return false;
             if (observation.verification === 'bracketedDigest') {
                 return observation.digest === expected_digest
+                    && current_source.physical_content_matches !== undefined
+                    && await current_source.physical_content_matches(
+                        expected_digest,
+                        is_cancelled,
+                    )
                     && source_authority.authorityRevision === expected_authority
                     && expected_authority
                         === file_coordinator.authority().authorityRevision;
