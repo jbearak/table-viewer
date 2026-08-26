@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { DtaDataSource } from '../data-source/dta-source';
 import {
     FileDtaDataSource,
+    MAX_FILE_BACKED_DTA_ROWS,
     assert_file_backed_dta_layout,
     assert_file_backed_dta_row_size,
 } from '../data-source/file-dta-source';
@@ -142,23 +143,41 @@ describe('FileDtaDataSource', () => {
 
     it('accepts paged datasets beyond the eager worksheet row budget', () => {
         const close = vi.fn();
+        const read_range = vi.fn(() => [['tail']]);
         const UnsafeConstructor = FileDtaDataSource as unknown as new (
             file: unknown,
             file_path: string,
         ) => FileDtaDataSource;
         const source = new UnsafeConstructor({
             nobs: 1_274_250,
-            nvar: 0,
-            variables: [],
+            nvar: 1,
+            variables: [{ name: 'value' }],
             close,
             _fd: 1,
-            _metadata: { obs_length: 0 },
-            _read_rows_range: () => [],
+            _metadata: { obs_length: 1 },
+            _read_rows_range: read_range,
         }, fixture);
 
         expect(source.meta().sheets[0].rowCount).toBe(1_274_250);
+        expect(source.read_raw_columns(0, 1_274_249, 1, [0])).toMatchObject({
+            startRow: 1_274_249,
+            rows: [[{ raw: 'tail' }]],
+        });
+        expect(read_range).toHaveBeenCalledWith(1_274_249, 1, 0, 1);
         source.close();
         expect(close).toHaveBeenCalledOnce();
+    });
+
+    it('bounds paged rows by whole-sheet rendering and transform work', () => {
+        const UnsafeConstructor = FileDtaDataSource as unknown as new (
+            file: unknown,
+            file_path: string,
+        ) => FileDtaDataSource;
+        expect(() => new UnsafeConstructor({
+            nobs: MAX_FILE_BACKED_DTA_ROWS + 1,
+            nvar: 0,
+            variables: [],
+        }, fixture)).toThrow(/too many observations.*2,000,000/u);
     });
 
     it('preserves reordered and duplicate sparse column projections', async () => {

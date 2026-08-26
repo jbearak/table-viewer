@@ -1417,6 +1417,33 @@ describe('CSV reload races', () => {
         vi.useRealTimers();
     });
 
+    it('closes a source-less viewer when a failing watcher supersedes initial loading', async () => {
+        vi.useFakeTimers();
+        let mtime = 0;
+        vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: ++mtime }));
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+        const initial_error_dismissed = deferred<undefined>();
+        const watcher_error_dismissed = deferred<undefined>();
+        const error_spy = vi.spyOn(vscode_mock.window, 'showErrorMessage')
+            .mockReturnValueOnce(initial_error_dismissed.promise)
+            .mockReturnValueOnce(watcher_error_dismissed.promise);
+        const panel = open_csv_table(uri('/tmp/source-less-watcher-failure.csv'));
+        const panel_close = vi.spyOn(panel, 'dispose');
+
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(error_spy).toHaveBeenCalledOnce());
+        const watcher_refresh = vscode_mock.__getWatchers()[0].__fireChange();
+        await vi.waitFor(() => expect(error_spy).toHaveBeenCalledTimes(2));
+
+        initial_error_dismissed.resolve(undefined);
+        await flush_promises();
+        expect(panel_close).not.toHaveBeenCalled();
+        watcher_error_dismissed.resolve(undefined);
+        await watcher_refresh;
+        await vi.waitFor(() => expect(panel_close).toHaveBeenCalledOnce());
+        vi.useRealTimers();
+    });
+
     it('reports initial-load failure after authority conflicts exhaust local retries', async () => {
         vi.useFakeTimers();
         const base = state_store();

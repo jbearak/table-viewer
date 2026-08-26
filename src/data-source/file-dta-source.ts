@@ -37,7 +37,11 @@ import type {
  * budget to a source that never materializes the full table.
  */
 export const MAX_FILE_BACKED_DTA_COLUMNS = 10_000;
-const MAX_FILE_BACKED_DTA_ROWS = 0xffff_ffff;
+// Paging avoids retaining every cell, but transforms and variable row heights
+// still keep or visit row-count-sized structures. Two million admits the DHS
+// dataset that motivated this source while bounding each typed row-index array
+// to 8 MiB and keeping those whole-sheet passes finite.
+export const MAX_FILE_BACKED_DTA_ROWS = 2_000_000;
 const MAX_FILE_BACKED_DTA_METADATA_BYTES = 64 * 1024 * 1024;
 const MAX_FILE_BACKED_DTA_VALUE_LABEL_BYTES = 16 * 1024 * 1024;
 const MAX_FILE_BACKED_DTA_VALUE_LABEL_ENTRIES = 65_536;
@@ -475,13 +479,10 @@ export class FileDtaDataSource implements DataSource {
         private readonly file: DtaFile,
         private readonly file_path: string,
     ) {
-        // Canonical/projected row maps use Uint32Array and reserve 0xffff_ffff
-        // as an absent-row sentinel. Unlike eager workbook sources, this source
-        // does not retain one object per logical cell, so the materialized-sheet
-        // one-million-row budget does not apply.
         if (file.nobs > MAX_FILE_BACKED_DTA_ROWS) {
             throw new Error(
-                'Stata dataset has too many observations for 32-bit row indexing',
+                `Stata dataset has too many observations to open safely `
+                + `(max ${MAX_FILE_BACKED_DTA_ROWS.toLocaleString('en-US')})`,
             );
         }
         if (file.nvar > MAX_FILE_BACKED_DTA_COLUMNS) {

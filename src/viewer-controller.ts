@@ -5490,10 +5490,16 @@ export function attach_viewer(
             refreshEvent: event,
         };
         const projection_recovery = event.reason === 'projectionRecovery';
+        // A watcher can supersede the ready-triggered load before any source is
+        // adopted. Its failure is still an initial-load failure: treating it as
+        // an ordinary reload would leave an empty renderer on "Loading..." after
+        // the superseded dialog correctly declines to close a newer request.
+        const initial = source_observation === undefined;
         return run_physical_refresh(
             request,
             projection_recovery,
             projection_recovery ? 'recovery' : 'fileReload',
+            initial,
         );
     }
 
