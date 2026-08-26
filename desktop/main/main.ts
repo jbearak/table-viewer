@@ -77,6 +77,10 @@ import {
     is_existing_directory,
     unique_completion,
 } from './compare-path-complete';
+import {
+    open_dialog_directory,
+    selected_file_directory,
+} from './open-dialog-directory';
 import { save_open_window_paths, take_open_window_paths } from './window-restoration';
 import {
     clear_recent_entries,
@@ -804,7 +808,9 @@ function remember_recent(entry: RecentEntry): void {
 }
 
 async function show_open_dialog(source?: BrowserWindow): Promise<void> {
+    const folder = open_dialog_directory(config_store.settings().lastOpenDirectory);
     const options: Electron.OpenDialogOptions = {
+        ...(folder ? { defaultPath: folder } : {}),
         properties: ['openFile', 'multiSelections'],
         filters: [
             { name: 'Tables', extensions: [...SUPPORTED_FILE_EXTENSIONS] },
@@ -814,7 +820,22 @@ async function show_open_dialog(source?: BrowserWindow): Promise<void> {
     const { canceled, filePaths } = await (source && !source.isDestroyed()
         ? dialog.showOpenDialog(source, options)
         : dialog.showOpenDialog(options));
-    if (!canceled) open_files(filePaths, source);
+    if (!canceled) {
+        remember_open_dialog_directory(filePaths);
+        open_files(filePaths, source);
+    }
+}
+
+/** Remembering picker convenience state must never turn a valid selection into
+ *  a failed open when the settings directory is temporarily unwritable. */
+function remember_open_dialog_directory(file_paths: readonly string[]): void {
+    const folder = selected_file_directory(file_paths);
+    if (!folder || folder === config_store.settings().lastOpenDirectory) return;
+    try {
+        config_store.update({ lastOpenDirectory: folder });
+    } catch {
+        // Best effort; opening the selected file is the primary operation.
+    }
 }
 
 /** The Compare Files dialog. Singleton, like Preferences: two of them would
@@ -1370,10 +1391,13 @@ function register_ipc(): void {
             // Expanded first: `path.dirname('~/reports/old.xlsx')` is
             // `~/reports`, which is not a directory the native dialog can open,
             // so browsing from a tilde path silently landed on the default
-            // folder instead of beside the file already named.
-            const folder = typeof near_path === 'string' && near_path.trim() !== ''
-                ? path.dirname(expand_tilde(near_path, app.getPath('home')))
-                : undefined;
+            // folder instead of beside the file already named. If there is no
+            // usable path in the field, use the last successful picker folder.
+            const folder = open_dialog_directory(
+                config_store.settings().lastOpenDirectory,
+                typeof near_path === 'string' ? near_path : undefined,
+                app.getPath('home'),
+            );
             const options: Electron.OpenDialogOptions = {
                 title: side === 'original'
                     ? 'Choose the original file'
@@ -1390,7 +1414,9 @@ function register_ipc(): void {
             const { canceled, filePaths } = compare_window && !compare_window.isDestroyed()
                 ? await dialog.showOpenDialog(compare_window, options)
                 : await dialog.showOpenDialog(options);
-            return canceled ? undefined : filePaths[0];
+            if (canceled) return undefined;
+            remember_open_dialog_directory(filePaths);
+            return filePaths[0];
         },
     );
     /**

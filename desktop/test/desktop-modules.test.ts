@@ -27,6 +27,10 @@ import {
 } from '../main/window-geometry';
 import { create_viewer_panel, type ViewerPanelTransport } from '../main/viewer-panel';
 import {
+    open_dialog_directory,
+    selected_file_directory,
+} from '../main/open-dialog-directory';
+import {
     DEFAULT_THEME_ID,
     REQUIRED_THEME_VARIABLES,
     THEME_DEFINITIONS,
@@ -234,11 +238,13 @@ describe('desktop-config', () => {
             fontFamily: 'Menlo',
             tabOrientation: 'vertical',
             diffOnByDefault: true,
+            lastOpenDirectory: path.join(dir, 'reports'),
         });
         const reread = new DesktopConfigStore(file);
         expect(reread.settings().fontFamily).toBe('Menlo');
         expect(reread.settings().tabOrientation).toBe('vertical');
         expect(reread.settings().diffOnByDefault).toBe(true);
+        expect(reread.settings().lastOpenDirectory).toBe(path.join(dir, 'reports'));
         // Untouched keys keep their defaults.
         expect(reread.settings().csvMaxRows).toBe(DEFAULT_SETTINGS.csvMaxRows);
         expect(reread.settings().automaticallyCheckForUpdates).toBe(true);
@@ -292,6 +298,7 @@ describe('desktop-config', () => {
             diffOnByDefault: 'yes',
             automaticallyCheckForUpdates: 'yes',
             dismissedUpdateVersion: 42,
+            lastOpenDirectory: 42,
             newWindowSize: 'whatever',
             windowWidth: 'wide',
             windowHeight: 10,
@@ -308,6 +315,7 @@ describe('desktop-config', () => {
             diffOnByDefault: false,
             automaticallyCheckForUpdates: true,
             dismissedUpdateVersion: '',
+            lastOpenDirectory: '',
             newWindowSize: 'match-last',
             windowWidth: DEFAULT_SETTINGS.windowWidth,
             // Below the usable minimum: raised, not taken literally.
@@ -353,6 +361,34 @@ describe('desktop-config', () => {
         expect(port.font_family()).toBe(`Monaco, ${MONO_FONT}`);
         store.update({ fontFamily: '   ' });
         expect(port.font_family()).toBeNull();
+    });
+});
+
+describe('open dialog directory', () => {
+    let dir: string;
+    beforeEach(() => {
+        dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tv-open-dialog-'));
+    });
+    afterEach(() => {
+        fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('returns the remembered directory when it still exists', () => {
+        expect(open_dialog_directory(dir)).toBe(dir);
+    });
+
+    it('prefers a nearby file parent and falls back when that parent is missing', () => {
+        const nearby = path.join(dir, 'nearby');
+        fs.mkdirSync(nearby);
+        expect(open_dialog_directory(dir, path.join(nearby, 'old.csv'))).toBe(nearby);
+        expect(open_dialog_directory(dir, path.join(dir, 'missing', 'old.csv'))).toBe(dir);
+    });
+
+    it('ignores a stale remembered directory and derives the selected directory', () => {
+        expect(open_dialog_directory(path.join(dir, 'gone'))).toBeUndefined();
+        expect(selected_file_directory([path.join(dir, 'chosen.csv')])).toBe(dir);
+        expect(selected_file_directory(['', path.join(dir, 'chosen.csv')])).toBe(dir);
+        expect(selected_file_directory([])).toBeUndefined();
     });
 });
 
