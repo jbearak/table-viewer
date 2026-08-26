@@ -53,6 +53,7 @@ interface PreflightDta {
     readonly fd: number;
     readonly metadata: DtaMetadata;
     readonly stat: fs.Stats;
+    readonly value_label_bytes: Buffer;
 }
 
 export interface ObservedFileDtaSource {
@@ -121,10 +122,10 @@ function read_slice(fd: number, file_size: number, offset: number, requested: nu
 function assert_value_label_entry_limits(
     fd: number,
     metadata: DtaMetadata,
-): void {
+): Buffer {
     const start = metadata.section_offsets.value_labels;
     const length = metadata.section_offsets.end_of_file - start;
-    if (length <= 0) return;
+    if (length <= 0) return Buffer.alloc(0);
     const buffer = read_slice(fd, fs.fstatSync(fd).size, start, length);
     const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
     const little_endian = metadata.byte_order === 'LSF';
@@ -203,12 +204,13 @@ function assert_value_label_entry_limits(
             }
             assert_total(entries);
         }
-        return;
+        return buffer;
     }
 
     const name_width = metadata.format_version === 117 ? 33 : 129;
     const open_tag = Buffer.from('<value_labels>');
     const table_tag = Buffer.from('<lbl>');
+    const table_close_tag = Buffer.from('</lbl>');
     const close_tag = Buffer.from('</value_labels>');
     if (!buffer.subarray(0, open_tag.length).equals(open_tag)) {
         throw new Error('Invalid Stata value-label section opener');
@@ -218,6 +220,7 @@ function assert_value_label_entry_limits(
     while (position + table_tag.length <= buffer.length) {
         if (!buffer.subarray(position, position + table_tag.length).equals(table_tag)) break;
         position += table_tag.length;
+        const declared_length = view.getInt32(position, little_endian);
         const payload = position + 4 + name_width + 3;
         if (payload + 8 > buffer.length) throw new Error('Truncated Stata value-label table');
         const entries = view.getInt32(payload, little_endian);
@@ -225,15 +228,24 @@ function assert_value_label_entry_limits(
         if (entries < 0 || text_bytes < 0) throw new Error('Invalid Stata value-label table');
         total_entries += entries;
         assert_total(total_entries);
-        const next = payload + 8 + entries * 8 + text_bytes + '</lbl>'.length;
+        const payload_length = 8 + entries * 8 + text_bytes;
+        if (declared_length !== payload_length) {
+            throw new Error('Invalid Stata value-label table length');
+        }
+        const close_position = payload + payload_length;
+        const next = close_position + table_close_tag.length;
         if (!Number.isSafeInteger(next) || next <= position || next > buffer.length) {
             throw new Error('Invalid Stata value-label table bounds');
+        }
+        if (!buffer.subarray(close_position, next).equals(table_close_tag)) {
+            throw new Error('Invalid Stata value-label table closer');
         }
         position = next;
     }
     if (!buffer.subarray(position, position + close_tag.length).equals(close_tag)) {
         throw new Error('Invalid Stata value-label section framing');
     }
+    return buffer;
 }
 
 function preflight_metadata(file_path: string): PreflightDta {
@@ -277,16 +289,19 @@ function preflight_metadata(file_path: string): PreflightDta {
                 );
                 continue;
             }
-            const value_label_bytes = metadata.section_offsets.end_of_file
+            const value_label_length = metadata.section_offsets.end_of_file
                 - metadata.section_offsets.value_labels;
-            if (value_label_bytes > MAX_FILE_BACKED_DTA_VALUE_LABEL_BYTES) {
+            if (!Number.isSafeInteger(value_label_length) || value_label_length < 0) {
+                throw new Error('Invalid Stata value-label section bounds');
+            }
+            if (value_label_length > MAX_FILE_BACKED_DTA_VALUE_LABEL_BYTES) {
                 throw new Error(
                     `Stata value-label data exceeds the `
                     + `${MAX_FILE_BACKED_DTA_VALUE_LABEL_BYTES / 1024 / 1024} MiB safety limit`,
                 );
             }
-            assert_value_label_entry_limits(fd, metadata);
-            return { fd, metadata, stat };
+            const value_label_bytes = assert_value_label_entry_limits(fd, metadata);
+            return { fd, metadata, stat, value_label_bytes };
         }
         throw new Error(
             `Stata metadata could not be parsed within the `
@@ -477,18 +492,12 @@ export class FileDtaDataSource implements DataSource {
             assert_file_backed_dta_row_size(metadata);
             if (is_cancelled()) throw abort_error();
             const label_start = metadata.section_offsets.value_labels;
-            const label_length = metadata.section_offsets.end_of_file - label_start;
-            const label_bytes = read_slice(
-                preflight.fd,
-                preflight.stat.size,
-                label_start,
-                label_length,
-            );
+            const label_bytes = preflight.value_label_bytes;
             const label_buffer = label_bytes.buffer.slice(
                 label_bytes.byteOffset,
                 label_bytes.byteOffset + label_bytes.byteLength,
             ) as ArrayBuffer;
-            const value_label_tables = label_length <= 0
+            const value_label_tables = label_bytes.byteLength === 0
                 ? new Map<string, Map<number, string>>()
                 : parse_value_labels(label_buffer, metadata, label_start);
             const Constructor = DtaFile as unknown as OwnedDtaFileConstructor;

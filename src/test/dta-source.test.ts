@@ -2428,6 +2428,36 @@ describe('DtaDataSource', () => {
         });
     });
 
+    it('fails closed on a corrupt modern value-label table length', async () => {
+        const malformed = build_dta_fixture();
+        const table_offset = Buffer.from(malformed).indexOf('<lbl>');
+        expect(table_offset).toBeGreaterThanOrEqual(0);
+        const view = new DataView(
+            malformed.buffer,
+            malformed.byteOffset,
+            malformed.byteLength,
+        );
+        const length_offset = table_offset + '<lbl>'.length;
+        view.setInt32(length_offset, view.getInt32(length_offset, true) + 1, true);
+        await with_temporary_dta(malformed, async (file_path) => {
+            await expect(FileDtaDataSource.open(file_path)).rejects.toThrow(
+                /value-label table length/u,
+            );
+        });
+    });
+
+    it('fails closed on a corrupt modern value-label table closer', async () => {
+        const malformed = build_dta_fixture();
+        const close_offset = Buffer.from(malformed).indexOf('</lbl>');
+        expect(close_offset).toBeGreaterThanOrEqual(0);
+        malformed[close_offset] = '!'.charCodeAt(0);
+        await with_temporary_dta(malformed, async (file_path) => {
+            await expect(FileDtaDataSource.open(file_path)).rejects.toThrow(
+                /value-label table closer/u,
+            );
+        });
+    });
+
     it.each([
         ['windows-1252', 'caf€', 'Caf€'],
         ['iso-8859-1', 'caf\x80', 'Caf\x80'],
