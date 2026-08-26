@@ -3,6 +3,7 @@ import {
     format_selection_tsv,
     copy_truncation_message,
     display_row_indices,
+    max_copy_rows_for_columns,
 } from '../webview/grid-copy-model';
 import type { RenderedCell } from '../data-source/interface';
 import type { MergeRange } from '../types';
@@ -23,6 +24,15 @@ function loader(
 }
 
 const NO_MERGES = new MergeIndex([]);
+
+describe('max_copy_rows_for_columns', () => {
+    it('bounds whole-sheet copies by both rows and total cells', () => {
+        expect(max_copy_rows_for_columns(1)).toBe(100_000);
+        expect(max_copy_rows_for_columns(5_972)).toBe(167);
+        expect(max_copy_rows_for_columns(2_000_000)).toBe(1);
+        expect(max_copy_rows_for_columns(0)).toBe(0);
+    });
+});
 
 describe('display_row_indices', () => {
     it('lazily expands ordered display-row intervals', () => {

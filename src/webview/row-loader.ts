@@ -35,6 +35,8 @@ interface CachedPage {
 let next_loader_id = 0;
 const MAX_CELLS_PER_PAGE = 64 * 1024;
 const DEFAULT_MAX_CACHED_CELLS = 1_000_000;
+/** Keep bulk operations from synchronously flooding the extension host. */
+export const MAX_PENDING_PAGE_REQUESTS = 16;
 
 /**
  * Demand-paged row store for the Glide grid. Pure (no React, no vscode import):
@@ -65,21 +67,9 @@ export class RowLoader {
      * landing during a scroll — O(resident rows) per page instead of O(PAGE_SIZE).
      *
      * Bound: this tracks resident *rows*, not a fixed page cap. Steady state is
-     * `max_pages` x PAGE_SIZE (50 x 100 = 5,000 rows), but bulk-copy waiters are
-     * exempt from eviction (see {@link evict}) and "Copy sheet" loads up to
-     * `DEFAULT_MAX_ROWS` (100,000) rows, so the map can legitimately hold ~100k
-     * entries.
-     *
-     * That peak does NOT come back down on its own when the copy settles.
-     * `evict` has exactly one call site — the tail of {@link on_row_data} — so
-     * trimming is driven by page *landings*, not by waiters resolving:
-     * `settle_load_waiters` deliberately does not evict (it runs after `evict`
-     * within the same ingest). After a whole-sheet copy has every page resident,
-     * the next landing is what trims back to the cap, and if the user never
-     * scrolls to a page that is not already resident there is no next landing —
-     * the ~100k entries stay until a sheet switch or reload calls
-     * {@link clear}. Bounded and deliberate, not leaked: capping it needs a
-     * standalone trim, which is out of scope here.
+     * `max_pages` x PAGE_SIZE (50 x 100 = 5,000 rows). Bulk-copy waiters may
+     * temporarily exceed that cap because their pages are eviction-protected;
+     * the caller invokes {@link trim} immediately after serialization.
      *
      * Deliberately total rather than injective, so no assertion here. Nothing we
      * ship produces a non-injective projection — `transform_indices` is a
@@ -185,7 +175,7 @@ export class RowLoader {
         this.viewport = { start: start_row, end: end_row };
         this.viewport_set = true;
         if (!this.enabled || this.row_count <= 0) return;
-        this.request_missing_pages(start_row, end_row);
+        this.pump_requests();
     }
 
     /** Whether every page covering the inclusive range is already resident. */
@@ -198,7 +188,10 @@ export class RowLoader {
         return true;
     }
 
-    /** Send requests for any not-yet-resident, not-yet-pending pages in range. */
+    /**
+     * Send requests for missing pages in a range until the global in-flight cap
+     * is full. Returns early at the cap; each accepted reply pumps the next page.
+     */
     private request_missing_pages(start_row: number, end_row: number): void {
         for (const start of get_needed_page_starts(start_row, end_row, this.page_size)) {
             if (start >= this.row_count) continue;
@@ -207,6 +200,7 @@ export class RowLoader {
                 continue;
             }
             if (this.pending.has(start)) continue;
+            if (this.pending.size >= MAX_PENDING_PAGE_REQUESTS) return;
             const request_id = `${this.loader_id}:${this.sheet_index}:${start}:${++this.req_seq}`;
             this.pending.set(start, request_id);
             this.post({
@@ -217,6 +211,18 @@ export class RowLoader {
                 requestId: request_id,
                 generation: this._generation,
             });
+        }
+    }
+
+    /** Fill available request slots, prioritizing the visible range over copies. */
+    private pump_requests(): void {
+        if (!this.enabled || this.row_count <= 0) return;
+        if (this.viewport_set) {
+            this.request_missing_pages(this.viewport.start, this.viewport.end);
+        }
+        for (const waiter of this.load_waiters) {
+            if (this.pending.size >= MAX_PENDING_PAGE_REQUESTS) return;
+            this.request_missing_pages(waiter.start, waiter.end);
         }
     }
 
@@ -248,8 +254,13 @@ export class RowLoader {
             // Register the waiter before requesting, so its range is protected
             // from eviction the moment any of its pages start arriving.
             this.load_waiters.push({ start, end, resolve });
-            this.request_missing_pages(start, end);
+            this.pump_requests();
         });
+    }
+
+    /** Drop completed bulk-load pages back to the normal LRU/cell cap. */
+    trim(): void {
+        this.evict();
     }
 
     /**
@@ -335,6 +346,7 @@ export class RowLoader {
         this.evict();
         this.on_change();
         this.settle_load_waiters();
+        this.pump_requests();
         return true;
     }
 
@@ -406,10 +418,7 @@ export class RowLoader {
     /**
      * Resolve any bulk-copy waiters whose range is now fully resident. Runs after
      * `evict()` — which still sees the waiter, so the just-loaded pages are kept.
-     * A resolved waiter drops out of {@link load_waiters}, so its pages become
-     * evictable again; but its `await` continuation is a microtask that runs
-     * before the next `rowData` macrotask, so the awaiting copy serializes those
-     * pages before any later ingest can trim them.
+     * Once serialization finishes, the caller explicitly invokes {@link trim}.
      */
     private settle_load_waiters(): void {
         if (this.load_waiters.length === 0) return;

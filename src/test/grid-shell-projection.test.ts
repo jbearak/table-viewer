@@ -113,6 +113,7 @@ const grid_mock = vi.hoisted(() => ({
     source_row_for_display: null as null | ((display_row: number) => number | undefined),
     ensure_rows: vi.fn(),
     ensure_rows_loaded: vi.fn(async () => true),
+    trim_rows: vi.fn(),
     // Eviction holds. Recorded rather than simulated: what the loader does with a
     // pin is pinned by use-row-loader.test.ts; what matters here is that GridShell
     // takes one when an overlay opens and gives it back when the overlay closes.
@@ -183,6 +184,7 @@ vi.mock('../webview/use-row-loader', () => ({
         return {
             ensure_rows: grid_mock.ensure_rows,
             ensure_rows_loaded: grid_mock.ensure_rows_loaded,
+            trim_rows: grid_mock.trim_rows,
             pin_rows: grid_mock.pin_rows,
             unpin_rows: grid_mock.unpin_rows,
             get_row: grid_mock.get_row,
@@ -375,6 +377,7 @@ afterEach(() => {
     grid_mock.ensure_rows.mockReset();
     grid_mock.ensure_rows_loaded.mockReset();
     grid_mock.ensure_rows_loaded.mockImplementation(async () => true);
+    grid_mock.trim_rows.mockReset();
     grid_mock.pin_rows.mockReset();
     grid_mock.pin_rows.mockImplementation(() => Symbol('test-pin'));
     grid_mock.unpin_rows.mockReset();
@@ -2636,6 +2639,7 @@ describe('GridShell column projection', () => {
         expect(write_text).toHaveBeenCalledWith(
             'A name\tC name\nsource-a\tsource-c\nsource-a\tsource-c',
         );
+        expect(grid_mock.trim_rows).toHaveBeenCalledTimes(1);
 
         await act(async () => root!.unmount());
         expect(grid_actions_ref.current).toBeNull();

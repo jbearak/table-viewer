@@ -49,6 +49,23 @@ export interface TsvResult {
 
 /** Default cap so a runaway "select all" copy can't blow up the clipboard. */
 export const DEFAULT_MAX_ROWS = 100_000;
+/**
+ * Whole-sheet copies are also bounded by cell count. A row-only limit is not
+ * meaningful for very wide data: 100,000 rows x 5,972 columns would attempt to
+ * materialize nearly 600 million cells before writing the clipboard.
+ */
+export const DEFAULT_MAX_CELLS = 1_000_000;
+
+/** Maximum whole-sheet rows that fit both the row and total-cell copy caps. */
+export function max_copy_rows_for_columns(
+    column_count: number,
+    max_rows = DEFAULT_MAX_ROWS,
+    max_cells = DEFAULT_MAX_CELLS,
+): number {
+    if (!Number.isFinite(column_count) || column_count <= 0) return 0;
+    const columns = Math.max(1, Math.floor(column_count));
+    return Math.min(max_rows, Math.max(1, Math.floor(max_cells / columns)));
+}
 
 /**
  * Builds a user-facing warning explaining why a copied selection was clipped,

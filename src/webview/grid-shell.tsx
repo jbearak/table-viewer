@@ -80,7 +80,7 @@ import {
     format_selection_tsv,
     copy_truncation_message,
     display_row_indices,
-    DEFAULT_MAX_ROWS,
+    max_copy_rows_for_columns,
 } from './grid-copy-model';
 import {
     resolve_nav,
@@ -897,6 +897,7 @@ export function GridShell({
     const {
         ensure_rows,
         ensure_rows_loaded,
+        trim_rows,
         pin_rows,
         unpin_rows,
         get_row,
@@ -3268,6 +3269,7 @@ export function GridShell({
     const copy_source_selection = useCallback((
         selection: Parameters<typeof format_selection_tsv>[0],
         include_header = false,
+        max_rows = max_copy_rows_for_columns(selection.source_columns.length),
     ) => {
         // Snapshot the displayed edit layers once per copy. A row must still be
         // resident before edits are overlaid: one known dirty cell must not make an
@@ -3311,6 +3313,7 @@ export function GridShell({
             get_displayed_row,
             merge_index,
             show_formatting,
+            max_rows,
         );
         const warning = copy_truncation_message(result);
         if (warning) {
@@ -3386,17 +3389,25 @@ export function GridShell({
     // doesn't come back blank with a "scroll to load" warning it can't act on.
     const copy_sheet = useCallback(async () => {
         if (row_count === 0 || display_column_count === 0) return;
-        const loaded = await ensure_rows_loaded(0, Math.min(row_count, DEFAULT_MAX_ROWS) - 1);
+        const copy_row_limit = max_copy_rows_for_columns(display_column_count);
+        const copy_row_count = Math.min(row_count, copy_row_limit);
+        const loaded = await ensure_rows_loaded(0, copy_row_count - 1);
         // A sheet switch or reload cleared the cache mid-load: abandon the copy
         // rather than overwrite the clipboard with a now-empty grid.
         if (!loaded) return;
-        copy_rect({
-            x: 0,
-            y: 0,
-            width: display_column_count,
-            height: row_count,
-        }, true);
-    }, [copy_rect, display_column_count, ensure_rows_loaded, row_count]);
+        try {
+            copy_rect({
+                x: 0,
+                y: 0,
+                width: display_column_count,
+                height: row_count,
+            }, true);
+        } finally {
+            // The TSV is materialized synchronously before the clipboard promise
+            // starts, so bulk-loaded pages no longer need waiter protection.
+            trim_rows();
+        }
+    }, [copy_rect, display_column_count, ensure_rows_loaded, row_count, trim_rows]);
 
     // Publish sheet-tab actions to App, mirroring the grid_focus_ref bridge. The
     // sheet_index lets App reject a stale handle during a keyed remount.
