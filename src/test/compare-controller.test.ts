@@ -145,7 +145,7 @@ describe('compare mode controller', () => {
     });
 
     it('settles the row request while its compare sidecar is still pending', async () => {
-        const panel = open_compare_table();
+        const { controller, panel } = open_compare_controller();
         await panel.__receive({ type: 'ready' });
         await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot')).toHaveLength(1));
         const { generation } = posted(panel, 'workbookSnapshot')[0]
@@ -167,11 +167,13 @@ describe('compare mode controller', () => {
             generation,
         }).then(() => { request_settled = true; });
         await sidecar_started.promise;
-        await new Promise<void>((resolve) => { setImmediate(resolve); });
+        let drain_settled = false;
+        const drain = controller.drain().then(() => { drain_settled = true; });
+        await vi.waitFor(() => expect(request_settled).toBe(true));
 
-        expect(request_settled).toBe(true);
         expect(posted(panel, 'rowData')).toHaveLength(1);
         expect(posted(panel, 'compareDiff')).toEqual([]);
+        expect(drain_settled).toBe(false);
 
         sidecar.resolve({
             startRow: 0,
@@ -179,7 +181,8 @@ describe('compare mode controller', () => {
             changedCells: [{ row: 0, col: 0, base: 'A', formattedBase: 'A' }],
         });
         await request;
-        await vi.waitFor(() => expect(posted(panel, 'compareDiff')).toHaveLength(1));
+        await drain;
+        expect(posted(panel, 'compareDiff')).toHaveLength(1);
         const row_data_index = panel.__messages.findIndex(
             (message) => (message as Posted).type === 'rowData',
         );
@@ -191,7 +194,7 @@ describe('compare mode controller', () => {
     });
 
     it('contains unexpected failures after visible-page comparison completes', async () => {
-        const panel = open_compare_table();
+        const { controller, panel } = open_compare_controller();
         await panel.__receive({ type: 'ready' });
         await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot')).toHaveLength(1));
         const { generation } = posted(panel, 'workbookSnapshot')[0]
@@ -216,18 +219,19 @@ describe('compare mode controller', () => {
             requestId: 'unexpected-sidecar-failure',
             generation,
         });
+        await controller.drain();
 
-        await vi.waitFor(() => expect(log).toHaveBeenCalledWith(
+        expect(log).toHaveBeenCalledWith(
             'Failed to finish a visible table page comparison',
             { code: 'UNKNOWN' },
-        ));
+        );
         expect(warning).not.toHaveBeenCalled();
         expect(JSON.stringify(log.mock.calls)).not.toContain(secret);
         expect(posted(panel, 'compareDiff')).toEqual([]);
     });
 
     it('warns once with sanitized details when visible-page comparison fails', async () => {
-        const panel = open_compare_table();
+        const { controller, panel } = open_compare_controller();
         await panel.__receive({ type: 'ready' });
         await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot')).toHaveLength(1));
         const { generation } = posted(panel, 'workbookSnapshot')[0]
@@ -248,8 +252,9 @@ describe('compare mode controller', () => {
                 generation,
             });
         }
+        await controller.drain();
 
-        await vi.waitFor(() => expect(warning).toHaveBeenCalledTimes(1));
+        expect(warning).toHaveBeenCalledTimes(1);
         expect(warning).toHaveBeenCalledWith(
             'Table Viewer could not compare some visible cells. '
             + 'Unhighlighted cells may still differ.',
@@ -264,7 +269,7 @@ describe('compare mode controller', () => {
     });
 
     it('keeps a current cancelled compare sidecar silent', async () => {
-        const panel = open_compare_table();
+        const { controller, panel } = open_compare_controller();
         await panel.__receive({ type: 'ready' });
         await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot')).toHaveLength(1));
         const { generation } = posted(panel, 'workbookSnapshot')[0]
@@ -281,7 +286,7 @@ describe('compare mode controller', () => {
             requestId: 'cancelled-sidecar',
             generation,
         });
-        await new Promise<void>((resolve) => { setImmediate(resolve); });
+        await controller.drain();
 
         expect(warning).not.toHaveBeenCalled();
         expect(log).not.toHaveBeenCalled();
@@ -289,7 +294,7 @@ describe('compare mode controller', () => {
     });
 
     it('suppresses a sidecar failure after receiver turnover', async () => {
-        const panel = open_compare_table();
+        const { controller, panel } = open_compare_controller();
         await panel.__receive({ type: 'ready' });
         await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot')).toHaveLength(1));
         const { generation } = posted(panel, 'workbookSnapshot')[0]
@@ -318,7 +323,52 @@ describe('compare mode controller', () => {
         expect(is_cancelled?.()).toBe(true);
         sidecar.reject(new Error('stale raw source detail'));
         await old_request;
-        await new Promise<void>((resolve) => { setImmediate(resolve); });
+        await controller.drain();
+
+        expect(warning).not.toHaveBeenCalled();
+        expect(log).not.toHaveBeenCalled();
+        expect(posted(panel, 'compareDiff')).toEqual([]);
+    });
+
+    it('waits for a disposed compare sidecar to settle silently', async () => {
+        const { controller, panel } = open_compare_controller();
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot')).toHaveLength(1));
+        const { generation } = posted(panel, 'workbookSnapshot')[0]
+            .snapshot as { generation: number };
+        const sidecar = deferred<undefined>();
+        const sidecar_started = deferred<void>();
+        let is_cancelled: (() => boolean) | undefined;
+        vi.spyOn(CompareDataSource.prototype, 'diff_rows').mockImplementation(
+            (_sheet, _rows, cancelled) => {
+                is_cancelled = cancelled ?? (() => false);
+                sidecar_started.resolve();
+                return sidecar.promise;
+            },
+        );
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+        let request_settled = false;
+        const request = panel.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 1,
+            requestId: 'disposed-sidecar',
+            generation,
+        }).then(() => { request_settled = true; });
+        await sidecar_started.promise;
+        panel.dispose();
+        expect(is_cancelled?.()).toBe(true);
+        let drain_settled = false;
+        const drain = controller.drain().then(() => { drain_settled = true; });
+        await vi.waitFor(() => expect(request_settled).toBe(true));
+        expect(drain_settled).toBe(false);
+
+        sidecar.reject(new Error('disposed raw source detail'));
+        await request;
+        await drain;
 
         expect(warning).not.toHaveBeenCalled();
         expect(log).not.toHaveBeenCalled();

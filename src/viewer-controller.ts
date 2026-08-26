@@ -1230,6 +1230,7 @@ export function attach_viewer(
     const released_sources = new WeakSet<DataSource>();
     const released_cores = new WeakSet<ViewerPanelCore>();
     const compare_diff_failure_notified = new WeakSet<CompareDataSource>();
+    const compare_diff_sidecars = new Set<Promise<void>>();
 
     function reject_pending_edit_protocol(error: Error): void {
         for (const waiter of pending_edit_flush_waiters.values()) waiter.reject(error);
@@ -1346,20 +1347,24 @@ export function attach_viewer(
         window: { startRow: number; sourceRows: number[] },
         receiver_epoch: number,
     ): void {
-        void post_compare_diff(msg, window, receiver_epoch).catch((error) => {
-            if (is_abort_error(error)) return;
-            try {
-                log_sanitized_failure(
-                    'Failed to finish a visible table page comparison',
-                    error,
-                );
-            } catch {
-                // This is the terminal containment boundary: VS Code does not
-                // observe promises returned from event listeners, and even a
-                // failing logger must not turn a row sidecar into an unhandled
-                // rejection.
-            }
-        });
+        let sidecar!: Promise<void>;
+        sidecar = post_compare_diff(msg, window, receiver_epoch)
+            .catch((error) => {
+                if (is_abort_error(error)) return;
+                try {
+                    log_sanitized_failure(
+                        'Failed to finish a visible table page comparison',
+                        error,
+                    );
+                } catch {
+                    // This is the terminal containment boundary: VS Code does not
+                    // observe promises returned from event listeners, and even a
+                    // failing logger must not turn a row sidecar into an unhandled
+                    // rejection.
+                }
+            })
+            .finally(() => { compare_diff_sidecars.delete(sidecar); });
+        compare_diff_sidecars.add(sidecar);
     }
 
     function flush_sheet_selections(): void {
@@ -9038,12 +9043,14 @@ export function attach_viewer(
             const layout_tail = layout_write_tail;
             const transform_tails = [...transform_commit_barriers]
                 .map((barrier) => barrier.completion);
+            const compare_tails = [...compare_diff_sidecars];
             await Promise.all([
                 edit_tail,
                 save_tail,
                 disposal_release_tail,
                 layout_tail,
                 ...transform_tails,
+                ...compare_tails,
             ]);
             if (
                 edit_tail === pending_edit_writes
@@ -9051,6 +9058,7 @@ export function attach_viewer(
                 && disposal_release_tail === disposal_edit_release_drain
                 && layout_tail === layout_write_tail
                 && transform_commit_barriers.size === 0
+                && compare_diff_sidecars.size === 0
             ) return;
         }
     }
