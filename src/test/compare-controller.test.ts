@@ -13,6 +13,8 @@ import {
     type ViewerProfile,
 } from '../viewer-controller';
 import { transform_schema_for_sheet } from '../types';
+import { read_source_raw_columns } from '../data-source/interface';
+import { CompareDataSource } from '../diff-compare/compare-session';
 import { with_in_memory_authority_transactions } from '../state-authority';
 import { versioned_state_store } from './helpers/versioned-state-store';
 import * as vscode_mock from './mocks/vscode';
@@ -53,6 +55,22 @@ type Posted = { type: string } & Record<string, unknown>;
 
 function posted(panel: ReturnType<typeof open_compare_table>, type: string): Posted[] {
     return (panel.__messages as Posted[]).filter((message) => message.type === type);
+}
+
+function deferred<T>() {
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((done, fail) => {
+        resolve = done;
+        reject = fail;
+    });
+    return { promise, resolve, reject };
+}
+
+function abort_error(): Error {
+    const error = new Error('cancelled compare page');
+    error.name = 'AbortError';
+    return error;
 }
 
 beforeEach(() => {
@@ -120,8 +138,241 @@ describe('compare mode controller', () => {
         const diff = posted(panel, 'compareDiff')[0];
         expect(diff.requestId).toBe('r1');
         expect(diff.rowStatus).toEqual(['same', 'added']);
-        expect(diff.changedCells).toEqual([{ row: 0, col: 0, base: 'A' }]);
+        expect(diff.changedCells).toEqual([
+            { row: 0, col: 0, base: 'A', formattedBase: 'A' },
+        ]);
         expect(posted(panel, 'rowData').length).toBeGreaterThan(0);
+    });
+
+    it('settles the row request while its compare sidecar is still pending', async () => {
+        const { controller, panel } = open_compare_controller();
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot')).toHaveLength(1));
+        const { generation } = posted(panel, 'workbookSnapshot')[0]
+            .snapshot as { generation: number };
+        const sidecar = deferred<Awaited<ReturnType<CompareDataSource['diff_rows']>>>();
+        const sidecar_started = deferred<void>();
+        vi.spyOn(CompareDataSource.prototype, 'diff_rows').mockImplementation(() => {
+            sidecar_started.resolve();
+            return sidecar.promise;
+        });
+
+        let request_settled = false;
+        const request = panel.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 1,
+            requestId: 'detached-sidecar',
+            generation,
+        }).then(() => { request_settled = true; });
+        await sidecar_started.promise;
+        let drain_settled = false;
+        const drain = controller.drain().then(() => { drain_settled = true; });
+        await vi.waitFor(() => expect(request_settled).toBe(true));
+
+        expect(posted(panel, 'rowData')).toHaveLength(1);
+        expect(posted(panel, 'compareDiff')).toEqual([]);
+        expect(drain_settled).toBe(false);
+
+        sidecar.resolve({
+            startRow: 0,
+            rowStatus: ['same'],
+            changedCells: [{ row: 0, col: 0, base: 'A', formattedBase: 'A' }],
+        });
+        await request;
+        await drain;
+        expect(posted(panel, 'compareDiff')).toHaveLength(1);
+        const row_data_index = panel.__messages.findIndex(
+            (message) => (message as Posted).type === 'rowData',
+        );
+        const diff_index = panel.__messages.findIndex(
+            (message) => (message as Posted).type === 'compareDiff',
+        );
+        expect(row_data_index).toBeGreaterThanOrEqual(0);
+        expect(diff_index).toBeGreaterThan(row_data_index);
+    });
+
+    it('contains unexpected failures after visible-page comparison completes', async () => {
+        const { controller, panel } = open_compare_controller();
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot')).toHaveLength(1));
+        const { generation } = posted(panel, 'workbookSnapshot')[0]
+            .snapshot as { generation: number };
+        const secret = '/private/source/path: result projection exploded';
+        const failure = new Error(secret);
+        vi.spyOn(CompareDataSource.prototype, 'diff_rows').mockResolvedValue({
+            startRow: 0,
+            rowStatus: ['same'],
+            get changedCells(): never {
+                throw failure;
+            },
+        });
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+        await panel.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 1,
+            requestId: 'unexpected-sidecar-failure',
+            generation,
+        });
+        await controller.drain();
+
+        expect(log).toHaveBeenCalledWith(
+            'Failed to finish a visible table page comparison',
+            { code: 'UNKNOWN' },
+        );
+        expect(warning).not.toHaveBeenCalled();
+        expect(JSON.stringify(log.mock.calls)).not.toContain(secret);
+        expect(posted(panel, 'compareDiff')).toEqual([]);
+    });
+
+    it('warns once with sanitized details when visible-page comparison fails', async () => {
+        const { controller, panel } = open_compare_controller();
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot')).toHaveLength(1));
+        const { generation } = posted(panel, 'workbookSnapshot')[0]
+            .snapshot as { generation: number };
+        const secret = '/private/source/path: lazy decode exploded';
+        const failure = Object.assign(new Error(secret), { code: 'not-a-safe-code' });
+        vi.spyOn(CompareDataSource.prototype, 'diff_rows').mockRejectedValue(failure);
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+        for (const [startRow, requestId] of [[0, 'bad-1'], [1, 'bad-2']] as const) {
+            await panel.__receive({
+                type: 'requestRows',
+                sheetIndex: 0,
+                startRow,
+                count: 1,
+                requestId,
+                generation,
+            });
+        }
+        await controller.drain();
+
+        expect(warning).toHaveBeenCalledTimes(1);
+        expect(warning).toHaveBeenCalledWith(
+            'Table Viewer could not compare some visible cells. '
+            + 'Unhighlighted cells may still differ.',
+        );
+        expect(log).toHaveBeenCalledTimes(1);
+        expect(log).toHaveBeenCalledWith(
+            'Failed to compare a visible table page',
+            { code: 'UNKNOWN' },
+        );
+        expect(JSON.stringify([warning.mock.calls, log.mock.calls])).not.toContain(secret);
+        expect(posted(panel, 'compareDiff')).toEqual([]);
+    });
+
+    it('keeps a current cancelled compare sidecar silent', async () => {
+        const { controller, panel } = open_compare_controller();
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot')).toHaveLength(1));
+        const { generation } = posted(panel, 'workbookSnapshot')[0]
+            .snapshot as { generation: number };
+        vi.spyOn(CompareDataSource.prototype, 'diff_rows').mockRejectedValue(abort_error());
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+        await panel.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 1,
+            requestId: 'cancelled-sidecar',
+            generation,
+        });
+        await controller.drain();
+
+        expect(warning).not.toHaveBeenCalled();
+        expect(log).not.toHaveBeenCalled();
+        expect(posted(panel, 'compareDiff')).toEqual([]);
+    });
+
+    it('suppresses a sidecar failure after receiver turnover', async () => {
+        const { controller, panel } = open_compare_controller();
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot')).toHaveLength(1));
+        const { generation } = posted(panel, 'workbookSnapshot')[0]
+            .snapshot as { generation: number };
+        const sidecar = deferred<undefined>();
+        let is_cancelled: (() => boolean) | undefined;
+        vi.spyOn(CompareDataSource.prototype, 'diff_rows').mockImplementation(
+            (_sheet, _rows, cancelled) => {
+                is_cancelled = cancelled ?? (() => false);
+                return sidecar.promise;
+            },
+        );
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+        const old_request = panel.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 1,
+            requestId: 'old-sidecar',
+            generation,
+        });
+        await vi.waitFor(() => expect(is_cancelled).toBeDefined());
+        await panel.__receive({ type: 'ready' });
+        expect(is_cancelled?.()).toBe(true);
+        sidecar.reject(new Error('stale raw source detail'));
+        await old_request;
+        await controller.drain();
+
+        expect(warning).not.toHaveBeenCalled();
+        expect(log).not.toHaveBeenCalled();
+        expect(posted(panel, 'compareDiff')).toEqual([]);
+    });
+
+    it('waits for a disposed compare sidecar to settle silently', async () => {
+        const { controller, panel } = open_compare_controller();
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot')).toHaveLength(1));
+        const { generation } = posted(panel, 'workbookSnapshot')[0]
+            .snapshot as { generation: number };
+        const sidecar = deferred<undefined>();
+        const sidecar_started = deferred<void>();
+        let is_cancelled: (() => boolean) | undefined;
+        vi.spyOn(CompareDataSource.prototype, 'diff_rows').mockImplementation(
+            (_sheet, _rows, cancelled) => {
+                is_cancelled = cancelled ?? (() => false);
+                sidecar_started.resolve();
+                return sidecar.promise;
+            },
+        );
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+        let request_settled = false;
+        const request = panel.__receive({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 1,
+            requestId: 'disposed-sidecar',
+            generation,
+        }).then(() => { request_settled = true; });
+        await sidecar_started.promise;
+        panel.dispose();
+        expect(is_cancelled?.()).toBe(true);
+        let drain_settled = false;
+        const drain = controller.drain().then(() => { drain_settled = true; });
+        await vi.waitFor(() => expect(request_settled).toBe(true));
+        expect(drain_settled).toBe(false);
+
+        sidecar.reject(new Error('disposed raw source detail'));
+        await request;
+        await drain;
+
+        expect(warning).not.toHaveBeenCalled();
+        expect(log).not.toHaveBeenCalled();
+        expect(posted(panel, 'compareDiff')).toEqual([]);
     });
 
     it('reports an inserted row as one addition rather than shifting every row', async () => {
@@ -496,43 +747,58 @@ describe('compare mode controller', () => {
     });
 
     it('stops an alignment a refresh has already superseded', async () => {
-        // Two alignments can be in flight over one window: a refresh replaces
-        // the load, and the original side has a watcher of its own. The stale
-        // one used to run to completion — on a large file that is real time
-        // spent on a result already thrown away, and its progress reports still
-        // reached the renderer, sending the one bar backwards.
-        const big_modified = `h\n${Array.from({ length: 30_000 }, (_, i) => `r${i}`).join('\n')}\n`;
-        const big_original = `h\n${Array.from({ length: 30_000 }, (_, i) => `q${i}`).join('\n')}\n`;
+        // Hold one alignment read at an observable gate, supersede its load,
+        // then ask the read's own cancellation callback what happened. This
+        // proves cancellation inside alignment without tying the test to file
+        // size, batch counts, machine speed or the progress side channel.
+        const original = 'h\nbase\n';
+        let revision = 1;
+        const modified = () => `h\nrevision-${revision}\n`;
         vscode_mock.__setStatImplementation(async (uri) =>
             (String(uri.fsPath ?? uri).includes('original')
-                ? { size: big_original.length, mtime: 1 }
-                : { size: big_modified.length, mtime: 1 }));
+                ? { size: original.length, mtime: 1 }
+                : { size: modified().length, mtime: revision }));
         vscode_mock.__setReadFileImplementation(async (uri) =>
             enc.encode(String(uri.fsPath ?? uri).includes('original')
-                ? big_original
-                : big_modified));
+                ? original
+                : modified()));
 
-        // Counting the aligner's own work, which is what "stops" has to mean.
-        // Progress messages cannot answer it: `onProgress` carries a supersede
-        // check of its own, so a stale alignment that runs to completion goes
-        // quiet either way and the count stays the same whether or not it
-        // actually stopped.
-        let reads_after_supersede = 0;
-        let counting = false;
-        let on_read: (() => void) | undefined;
-        const counting_profile: ViewerProfile = {
-            ...csv_table_profile(),
-            async build_source(raw, file_path, state, extra) {
-                const source = await csv_table_profile()
-                    .build_source(raw, file_path, state, extra);
-                return new Proxy(source, {
+        const read_started = deferred<void>();
+        const release_read = deferred<void>();
+        let gate_next_alignment_read = false;
+        let gated_read_claimed = false;
+        let stale_read_cancelled = false;
+        const base_profile = csv_table_profile();
+        const gated_profile: ViewerProfile = {
+            ...base_profile,
+            async build_source(...args) {
+                const built = await base_profile.build_source(...args);
+                return new Proxy(built, {
                     get(target, property, receiver) {
-                        const value = Reflect.get(target, property, receiver);
-                        if (property !== 'read_rows' || typeof value !== 'function') return value;
-                        return (...args: unknown[]) => {
-                            on_read?.();
-                            if (counting) reads_after_supersede++;
-                            return (value as (...a: unknown[]) => unknown).apply(target, args);
+                        if (property !== 'read_raw_columns_async') {
+                            return Reflect.get(target, property, receiver);
+                        }
+                        return async (
+                            sheet_index: number,
+                            start_row: number,
+                            count: number,
+                            column_indices: readonly number[],
+                            is_cancelled: () => boolean,
+                        ) => {
+                            if (gate_next_alignment_read && !gated_read_claimed) {
+                                gated_read_claimed = true;
+                                read_started.resolve();
+                                await release_read.promise;
+                                stale_read_cancelled = is_cancelled();
+                                if (stale_read_cancelled) throw abort_error();
+                            }
+                            return read_source_raw_columns(
+                                target,
+                                sheet_index,
+                                start_row,
+                                count,
+                                column_indices,
+                            );
                         };
                     },
                 });
@@ -541,55 +807,26 @@ describe('compare mode controller', () => {
 
         const { controller, panel } = open_compare_controller(
             '/tmp/original.csv',
-            counting_profile,
+            gated_profile,
         );
         await panel.__receive({ type: 'ready' });
         await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot')).toHaveLength(1));
 
-        // A real change on the modified side — new bytes, new size, new mtime —
-        // so the refresh genuinely rebuilds and realigns rather than no-opping.
-        let revision = 2;
-        const revised = () => `${big_modified}extra${revision}\n`;
-        vscode_mock.__setStatImplementation(async (uri) =>
-            (String(uri.fsPath ?? uri).includes('original')
-                ? { size: big_original.length, mtime: 1 }
-                : { size: revised().length, mtime: revision }));
-        vscode_mock.__setReadFileImplementation(async (uri) =>
-            enc.encode(String(uri.fsPath ?? uri).includes('original')
-                ? big_original
-                : revised()));
-
-        // Supersede while the alignment is under way, then let both settle.
-        // "Under way" has to be observed, not assumed: `first` yields several
-        // times during source construction, so starting `second` straight after
-        // it can supersede a load that has not reached `align_workbook` at all,
-        // and the test would then pass on a build that only cancels before
-        // alignment begins. The first row read is that observation.
-        let first_read: () => void;
-        const alignment_started = new Promise<void>((resolve) => { first_read = resolve; });
-        on_read = () => first_read();
+        gate_next_alignment_read = true;
+        revision = 2;
         const first = controller.refresh_if_changed();
-        await alignment_started;
+        await read_started.promise;
+
+        // refresh_if_changed advances load_seq before it returns its promise, so
+        // the held read is already stale when it is released.
         revision = 3;
         const second = controller.refresh_if_changed();
-        counting = true;
-        await Promise.all([first, second]);
-        counting = false;
-        await vi.waitFor(() =>
-            expect(posted(panel, 'workbookSnapshot').length).toBeGreaterThanOrEqual(2));
+        release_read.resolve();
 
-        // One alignment's worth of reads after the supersede, not two. The
-        // superseded one roughly doubles it — 118 against 228 as measured —
-        // because it re-walks every row the live one is already walking. The
-        // bound sits between those and well clear of both; the counts are
-        // fixed by batch size and row count, not by timing.
-        expect(reads_after_supersede).toBeLessThan(170);
-
-        // Deliberately NOT asserted: that progress never goes backwards. It
-        // does, legitimately — the superseding load is a new alignment and its
-        // bar restarts from the first batch. Progress cannot answer this
-        // question in any case: `onProgress` fires only while hashing, and the
-        // phases a supersede cuts short report nothing at all.
+        await expect(first).resolves.toBe(false);
+        await expect(second).resolves.toBe(true);
+        expect(stale_read_cancelled).toBe(true);
+        await vi.waitFor(() => expect(posted(panel, 'workbookSnapshot')).toHaveLength(2));
     });
 
     it('degrades when the original cannot stabilize during validation', async () => {

@@ -5,7 +5,12 @@ import { resolve } from 'node:path';
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { FilterEntry, HistogramBin, SheetTransformState } from '../types';
+import type {
+    FilterEntry,
+    FilterValueOption,
+    HistogramBin,
+    SheetTransformState,
+} from '../types';
 import { FilterPopover } from '../webview/filter-popover';
 
 let root: Root | null = null;
@@ -34,10 +39,12 @@ function render_popover(
             status: 'ready';
             bins: readonly HistogramBin[];
             columnKind?: import('../types').FilterColumnKind;
-            distinctValues?: readonly (string | null)[];
+            defaultCategorical?: boolean;
+            distinctValues?: readonly FilterValueOption[];
             distinctValuesExceeded?: boolean;
         }
         | { status: 'error'; message: string },
+    show_formatting = true,
 ) {
     const on_apply = vi.fn();
     const on_cancel = vi.fn();
@@ -50,6 +57,7 @@ function render_popover(
         column_name: 'Value',
         filters,
         histogram,
+        show_formatting,
         anchor: { left: 10_000, top: 10_000 },
         on_apply,
         on_cancel,
@@ -758,7 +766,30 @@ describe('FilterPopover value checklist (isOneOf)', () => {
         status: 'ready',
         bins: [],
         columnKind: 'text',
-        distinctValues: ['alpha', 'beta', null],
+        distinctValues: [{ value: 'alpha' }, { value: 'beta' }, { value: null }],
+        distinctValuesExceeded: false,
+    } as const;
+    const LABELED_NUMERIC_READY = {
+        status: 'ready',
+        bins: READY_BINS,
+        columnKind: 'numeric',
+        defaultCategorical: true,
+        distinctValues: [
+            { value: '1', label: 'First' },
+            { value: '2', label: 'Second' },
+            { value: '3', label: 'First' },
+        ],
+        distinctValuesExceeded: false,
+    } as const;
+    const MISSING_ONLY_LABELS_READY = {
+        status: 'ready',
+        bins: READY_BINS,
+        columnKind: 'numeric',
+        defaultCategorical: false,
+        distinctValues: [
+            { value: '.' },
+            { value: '.a', label: 'Refused' },
+        ],
         distinctValuesExceeded: false,
     } as const;
 
@@ -812,6 +843,95 @@ describe('FilterPopover value checklist (isOneOf)', () => {
         expect(options.slice(0, 3)).toEqual(['contains', 'isOneOf', 'notContains']);
     });
 
+    it('uses display labels for labeled numeric options while preserving raw identities', () => {
+        const { on_apply } = render_popover([], LABELED_NUMERIC_READY, true);
+        expect((document.querySelector('select') as HTMLSelectElement).value).toBe('isOneOf');
+        expect(checkbox_labels()).toEqual(['First (1)', 'Second', 'First (3)']);
+        const boxes = Array.from(
+            document.querySelectorAll('.filter-value-item input'),
+        ) as HTMLInputElement[];
+        expect(boxes).toHaveLength(3);
+        expect(boxes[0].getAttribute('aria-label')).toContain('raw value 1');
+        expect(boxes[2].getAttribute('aria-label')).toContain('raw value 3');
+
+        act(() => boxes[2].click());
+        act(() => (document.querySelector(
+            '.filter-popover-btn-primary',
+        ) as HTMLButtonElement).click());
+        expect(on_apply).toHaveBeenCalledWith(expect.objectContaining({
+            operator: 'isOneOf',
+            excludedValues: ['3'],
+        }));
+    });
+
+    it('keeps binary identities in checklist values without exposing digests', () => {
+        const current_identity = `stata-binary:sha256:${'a'.repeat(64)}:40`;
+        const stale_identity = `stata-binary:sha256:${'b'.repeat(64)}:41`;
+        const preview = 'binary (40 bytes): aa…';
+        const { on_apply } = render_popover([{
+            id: 'f', colIndex: 1, operator: 'isOneOf',
+            excludedValues: [current_identity, stale_identity],
+            caseSensitive: false, enabled: true,
+        }], {
+            status: 'ready', bins: [], columnKind: 'text',
+            distinctValues: [{ value: current_identity, rawValue: preview }],
+            distinctValuesExceeded: false,
+        });
+
+        expect(checkbox_labels()).toEqual([preview, '(Value unavailable)']);
+        expect(document.body.textContent).not.toContain('stata-binary:sha256:');
+        for (const box of document.querySelectorAll('.filter-value-item input')) {
+            expect(box.getAttribute('aria-label')).not.toContain('stata-binary:sha256:');
+        }
+
+        const search = document.querySelector('.filter-value-search') as HTMLInputElement;
+        act(() => {
+            Object.getOwnPropertyDescriptor(
+                HTMLInputElement.prototype,
+                'value',
+            )!.set!.call(search, 'stata-binary:sha256:');
+            search.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+        expect(checkbox_labels()).toEqual([]);
+        expect(document.body.textContent).toContain('No matching values');
+
+        act(() => (document.querySelector(
+            '.filter-popover-btn-primary',
+        ) as HTMLButtonElement).click());
+        expect(on_apply).toHaveBeenCalledWith(expect.objectContaining({
+            excludedValues: [current_identity, stale_identity],
+        }));
+    });
+
+    it('shows raw codes with Formatting off without changing the categorical default', () => {
+        render_popover([], LABELED_NUMERIC_READY, false);
+        expect((document.querySelector('select') as HTMLSelectElement).value).toBe('isOneOf');
+        expect(checkbox_labels()).toEqual(['1', '2', '3']);
+    });
+
+    it('does not force numeric columns categorical when only missing codes have labels', () => {
+        render_popover([], MISSING_ONLY_LABELS_READY, true);
+        expect((document.querySelector('select') as HTMLSelectElement).value).toBe('between');
+        select_is_one_of();
+        expect(checkbox_labels()).toEqual(['.', 'Refused']);
+        act(() => root!.unmount());
+
+        root = createRoot(container!);
+        act(() => root!.render(React.createElement(FilterPopover, {
+            column_index: 1,
+            column_name: 'Value',
+            filters: [],
+            histogram: MISSING_ONLY_LABELS_READY,
+            show_formatting: false,
+            anchor: { left: 10, top: 10 },
+            on_apply: vi.fn(),
+            on_cancel: vi.fn(),
+            on_remove: vi.fn(),
+        })));
+        select_is_one_of();
+        expect(checkbox_labels()).toEqual(['.', '.a']);
+    });
+
     it('promotes a pristine Contains draft to Is one of when the value list settles', async () => {
         const props = {
             column_index: 1, column_name: 'Value', filters: [] as FilterEntry[],
@@ -828,9 +948,8 @@ describe('FilterPopover value checklist (isOneOf)', () => {
             ...props, histogram: TEXT_READY,
         })));
         expect((document.querySelector('select') as HTMLSelectElement).value).toBe('isOneOf');
-        // Focus is deferred with a zero-delay timer until the checklist mounts.
-        await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
-        expect(document.activeElement?.className).toBe('filter-value-search');
+        await vi.waitFor(() => expect(document.activeElement?.className)
+            .toBe('filter-value-search'));
     });
 
     it('keeps Contains when the distinct list is over cap or empty', () => {
@@ -992,7 +1111,7 @@ describe('FilterPopover value checklist (isOneOf)', () => {
     it('distinguishes a real "(Blanks)" text value from the blank entry', () => {
         render_popover([], {
             status: 'ready', bins: [], columnKind: 'text',
-            distinctValues: ['(Blanks)', null], distinctValuesExceeded: false,
+            distinctValues: [{ value: '(Blanks)' }, { value: null }], distinctValuesExceeded: false,
         });
         select_is_one_of();
         expect(checkbox_labels()).toEqual(['(Blanks) (text value)', '(Blanks)']);
@@ -1019,6 +1138,37 @@ describe('FilterPopover value checklist (isOneOf)', () => {
             caseSensitive: false, enabled: true,
         }], TEXT_READY);
         expect(document.activeElement?.className).toBe('filter-value-search');
+    });
+
+    it('focuses a saved isOneOf search when its values finish loading', async () => {
+        const props = {
+            column_index: 1,
+            column_name: 'Value',
+            filters: [{
+                id: 'f', colIndex: 1, operator: 'isOneOf' as const,
+                excludedValues: ['beta'],
+                caseSensitive: false, enabled: true,
+            }],
+            anchor: { left: 10, top: 10 },
+            on_apply: vi.fn(),
+            on_cancel: vi.fn(),
+            on_remove: vi.fn(),
+        };
+        container = document.createElement('div');
+        document.body.appendChild(container);
+        root = createRoot(container);
+        act(() => root!.render(React.createElement(FilterPopover, {
+            ...props,
+            histogram: { status: 'loading' },
+        })));
+        expect(document.querySelector('.filter-value-search')).toBeNull();
+
+        act(() => root!.render(React.createElement(FilterPopover, {
+            ...props,
+            histogram: TEXT_READY,
+        })));
+        await vi.waitFor(() => expect(document.activeElement)
+            .toBe(document.querySelector('.filter-value-search')));
     });
 
     function remove_button(): HTMLButtonElement | null {

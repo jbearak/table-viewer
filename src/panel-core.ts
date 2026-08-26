@@ -8,12 +8,15 @@ import { CompareDataSource } from './diff-compare/compare-session';
 import { clamp_row_height } from './webview/row-heights';
 import { deep_clone_and_freeze } from './immutable';
 import { compute_column_histogram, type ColumnHistogram } from './histograms';
+import type {
+    ColumnAnalysis,
+    ColumnAnalysisCache,
+    ColumnIdentityRequirement,
+} from './column-analysis';
 import {
     compute_transform,
     InvalidNumericFilterOperandError,
     transformed_window,
-    type CachedTransformColumn,
-    type TransformColumnCache,
     type TransformedRowWindow,
 } from './table-transform';
 import type {
@@ -127,6 +130,12 @@ type DurableRowHeightsProvider = (sheet_names: readonly string[]) => {
     readonly heights: readonly (Record<number, number> | undefined)[];
 };
 
+type RowWindowServed = (
+    msg: Extract<WebviewMessage, { type: 'requestRows' }>,
+    window: Pick<TransformedRowWindow, 'startRow' | 'sourceRows'>,
+    receiver_epoch: number,
+) => void | Promise<void>;
+
 type TransformOperationToken = number;
 let next_transform_operation_token = 0;
 
@@ -137,17 +146,34 @@ function allocate_transform_operation_token(): TransformOperationToken {
 
 const DEFAULT_MAX_CACHED_PAGES = 64;
 const DEFAULT_MAX_CACHED_TRANSFORM_CELLS = 1_000_000;
+const DEFAULT_MAX_CACHED_TRANSFORM_BYTES = 64 * 1024 * 1024;
+const DEFAULT_MAX_CACHED_HISTOGRAM_BYTES = 16 * 1024 * 1024;
+const CACHE_ARRAY_OVERHEAD_BYTES = 64;
+const CACHE_OBJECT_OVERHEAD_BYTES = 64;
+const CACHE_REFERENCE_BYTES = 8;
 
-class TransformColumnLruCache implements TransformColumnCache {
-    private readonly entries = new Map<string, CachedTransformColumn>();
+class ColumnAnalysisLruCache implements ColumnAnalysisCache {
+    private readonly entries = new Map<string, ColumnAnalysis>();
     private retained_cells = 0;
+    private retained_bytes = 0;
 
-    constructor(private readonly max_cells: number) {}
+    constructor(
+        private readonly max_cells: number,
+        private readonly max_bytes: number,
+    ) {}
 
-    get(sheet_index: number, column_index: number): CachedTransformColumn | undefined {
+    get(
+        sheet_index: number,
+        column_index: number,
+        identity_requirement: ColumnIdentityRequirement,
+    ): ColumnAnalysis | undefined {
         const key = `${sheet_index}:${column_index}`;
         const entry = this.entries.get(key);
         if (!entry) return undefined;
+        if (
+            identity_requirement === 'complete'
+            && !entry.filterIdentityComplete
+        ) return entry;
         this.entries.delete(key);
         this.entries.set(key, entry);
         return entry;
@@ -156,32 +182,120 @@ class TransformColumnLruCache implements TransformColumnCache {
     set(
         sheet_index: number,
         column_index: number,
-        column: CachedTransformColumn,
+        analysis: ColumnAnalysis,
     ): void {
-        const cells = column.values.length;
-        if (cells > this.max_cells || this.max_cells <= 0) return;
         const key = `${sheet_index}:${column_index}`;
         const previous = this.entries.get(key);
-        if (previous) {
-            this.retained_cells -= previous.values.length;
+        if (previous !== undefined) {
+            if (
+                previous.filterIdentityComplete
+                || !analysis.filterIdentityComplete
+            ) {
+                this.entries.delete(key);
+                this.entries.set(key, previous);
+                return;
+            }
+        }
+        if (
+            analysis.retainedSlots > this.max_cells
+            || analysis.estimatedBytes > this.max_bytes
+            || this.max_cells <= 0
+            || this.max_bytes <= 0
+        ) return;
+
+        if (previous !== undefined) {
+            this.retained_cells -= previous.retainedSlots;
+            this.retained_bytes -= previous.estimatedBytes;
             this.entries.delete(key);
         }
         while (
-            this.retained_cells + cells > this.max_cells
+            (
+                this.retained_cells + analysis.retainedSlots > this.max_cells
+                || this.retained_bytes + analysis.estimatedBytes > this.max_bytes
+            )
             && this.entries.size > 0
         ) {
             const oldest_key = this.entries.keys().next().value as string;
             const oldest = this.entries.get(oldest_key)!;
             this.entries.delete(oldest_key);
-            this.retained_cells -= oldest.values.length;
+            this.retained_cells -= oldest.retainedSlots;
+            this.retained_bytes -= oldest.estimatedBytes;
         }
-        this.entries.set(key, column);
-        this.retained_cells += cells;
+        this.entries.set(key, analysis);
+        this.retained_cells += analysis.retainedSlots;
+        this.retained_bytes += analysis.estimatedBytes;
     }
 
     clear(): void {
         this.entries.clear();
         this.retained_cells = 0;
+        this.retained_bytes = 0;
+    }
+}
+
+function retained_string_bytes(value: string | undefined): number {
+    return value === undefined
+        ? 0
+        : CACHE_OBJECT_OVERHEAD_BYTES + value.length * 2;
+}
+
+function histogram_result_bytes(histogram: ColumnHistogram): number {
+    let bytes = CACHE_OBJECT_OVERHEAD_BYTES
+        + CACHE_ARRAY_OVERHEAD_BYTES
+        + histogram.bins.length * CACHE_REFERENCE_BYTES
+        + CACHE_ARRAY_OVERHEAD_BYTES
+        + histogram.distinctValues.length * CACHE_REFERENCE_BYTES;
+    bytes += histogram.bins.length * CACHE_OBJECT_OVERHEAD_BYTES;
+    for (const option of histogram.distinctValues) {
+        bytes += CACHE_OBJECT_OVERHEAD_BYTES;
+        bytes += retained_string_bytes(option.value ?? undefined);
+        bytes += retained_string_bytes(option.rawValue);
+        bytes += retained_string_bytes(option.label);
+    }
+    return bytes;
+}
+
+class HistogramLruCache {
+    private readonly entries = new Map<string, {
+        readonly histogram: ColumnHistogram;
+        readonly bytes: number;
+    }>();
+    private retained_bytes = 0;
+
+    constructor(private readonly max_bytes: number) {}
+
+    get(key: string): ColumnHistogram | undefined {
+        const entry = this.entries.get(key);
+        if (entry === undefined) return undefined;
+        this.entries.delete(key);
+        this.entries.set(key, entry);
+        return entry.histogram;
+    }
+
+    set(key: string, histogram: ColumnHistogram): void {
+        const bytes = histogram_result_bytes(histogram);
+        if (bytes > this.max_bytes || this.max_bytes <= 0) return;
+        const previous = this.entries.get(key);
+        if (previous !== undefined) {
+            this.retained_bytes -= previous.bytes;
+            this.entries.delete(key);
+        }
+        while (
+            this.retained_bytes + bytes > this.max_bytes
+            && this.entries.size > 0
+        ) {
+            const oldest_key = this.entries.keys().next().value as string;
+            const oldest = this.entries.get(oldest_key)!;
+            this.entries.delete(oldest_key);
+            this.retained_bytes -= oldest.bytes;
+        }
+        this.entries.set(key, { histogram, bytes });
+        this.retained_bytes += bytes;
+    }
+
+    clear(): void {
+        this.entries.clear();
+        this.retained_bytes = 0;
     }
 }
 
@@ -225,7 +339,7 @@ export class ViewerPanelCore {
     private _generation = 1;
     private readonly cache = new Map<string, TransformedRowWindow>();
     private readonly max_cached_pages: number;
-    private readonly transform_column_cache: TransformColumnLruCache;
+    private readonly column_analysis_cache: ColumnAnalysisLruCache;
     private readonly transform_indices = new Map<number, Uint32Array>();
     /** Projected source-row -> display-row, built lazily for transformed views. */
     private readonly inverse_transform_indices = new Map<number, Int32Array>();
@@ -245,7 +359,7 @@ export class ViewerPanelCore {
     private readonly transform_states = new Map<number, SheetTransformState>();
     private readonly transform_operations = new Map<number, TransformOperationToken>();
     private readonly transforms_in_flight = new Map<number, TransformOperationToken>();
-    private readonly histogram_cache = new Map<string, ColumnHistogram>();
+    private readonly histogram_cache: HistogramLruCache;
     private readonly histogram_operations = new Map<string, TransformOperationToken>();
     private source_epoch = 0;
     private receiver_epoch = 0;
@@ -255,10 +369,7 @@ export class ViewerPanelCore {
     private readonly on_invalid_restore?: InvalidRestoreCleanup;
     private readonly durable_pending_edit_keys?: (sheet_index: number) => readonly string[];
     private readonly durable_row_heights?: DurableRowHeightsProvider;
-    private readonly on_row_window_served?: (
-        msg: Extract<WebviewMessage, { type: 'requestRows' }>,
-        window: TransformedRowWindow,
-    ) => void;
+    private readonly on_row_window_served?: RowWindowServed;
     /**
      * The last computed display-keyed projection, with the facts it is a function of.
      * See `row_height_projection_by_sheet` for why each is needed and why a memo is
@@ -293,6 +404,8 @@ export class ViewerPanelCore {
         opts?: {
             maxCachedPages?: number;
             maxCachedTransformCells?: number;
+            maxCachedTransformBytes?: number;
+            maxCachedHistogramBytes?: number;
             onTransformCommit?: TransformCommit;
             onInvalidRestore?: InvalidRestoreCleanup;
             /**
@@ -319,20 +432,21 @@ export class ViewerPanelCore {
              */
             durableRowHeights?: DurableRowHeightsProvider;
             /**
-             * Observe each row window the core serves, after `rowData` posts.
-             * The window is the resolved one — clamped and transform-projected —
-             * so an augmenting sidecar (git compare's `compareDiff`) describes
-             * exactly the rows the renderer received, not the raw request.
+             * Observe each row window only after `rowData` successfully posts to
+             * the receiver that requested it. The window is resolved (clamped and
+             * transform-projected), and the epoch is the one accepted with the
+             * request, so an augmenting sidecar cannot migrate across receivers.
              */
-            onRowWindowServed?: (
-                msg: Extract<WebviewMessage, { type: 'requestRows' }>,
-                window: TransformedRowWindow,
-            ) => void;
+            onRowWindowServed?: RowWindowServed;
         },
     ) {
         this.max_cached_pages = opts?.maxCachedPages ?? DEFAULT_MAX_CACHED_PAGES;
-        this.transform_column_cache = new TransformColumnLruCache(
+        this.column_analysis_cache = new ColumnAnalysisLruCache(
             opts?.maxCachedTransformCells ?? DEFAULT_MAX_CACHED_TRANSFORM_CELLS,
+            opts?.maxCachedTransformBytes ?? DEFAULT_MAX_CACHED_TRANSFORM_BYTES,
+        );
+        this.histogram_cache = new HistogramLruCache(
+            opts?.maxCachedHistogramBytes ?? DEFAULT_MAX_CACHED_HISTOGRAM_BYTES,
         );
         this.on_transform_commit = opts?.onTransformCommit;
         this.on_invalid_restore = opts?.onInvalidRestore;
@@ -565,7 +679,7 @@ export class ViewerPanelCore {
         this.transforms_in_flight.clear();
         this.histogram_cache.clear();
         this.histogram_operations.clear();
-        this.transform_column_cache.clear();
+        this.column_analysis_cache.clear();
         this.cache.clear();
         // Unfalsifiable, and said so rather than dressed up as a fix: the `_generation`
         // bump above already makes the memo's key miss, so no test can tell this line from
@@ -670,7 +784,7 @@ export class ViewerPanelCore {
         this.inverse_transform_indices.clear();
         this.transform_states.clear();
         this.histogram_cache.clear();
-        this.transform_column_cache.clear();
+        this.column_analysis_cache.clear();
         this.cache.clear();
         this.row_height_projection_memo = undefined;
         // Dropped here for the memory rather than for correctness — unlike the small
@@ -745,6 +859,7 @@ export class ViewerPanelCore {
                 msg.sheetIndex,
                 msg.columnIndex,
                 is_cancelled,
+                this.column_analysis_cache,
             );
             if (is_cancelled()) return;
             if (!cached) this.histogram_cache.set(cache_key, histogram);
@@ -754,6 +869,7 @@ export class ViewerPanelCore {
                 columnIndex: msg.columnIndex,
                 bins: histogram.bins,
                 columnKind: histogram.columnKind,
+                defaultCategorical: histogram.defaultCategorical,
                 distinctValues: histogram.distinctValues,
                 distinctValuesExceeded: histogram.distinctValuesExceeded,
                 requestId: msg.requestId,
@@ -826,7 +942,7 @@ export class ViewerPanelCore {
                         || this.receiver_epoch !== receiver_epoch
                         || is_cancelled(),
                     undefined,
-                    this.transform_column_cache,
+                    this.column_analysis_cache,
                     this.changed_grid_rows(sheet_index, state),
                 );
             } catch (error) {
@@ -1455,7 +1571,7 @@ export class ViewerPanelCore {
                 msg.state,
                 compute_is_cancelled,
                 undefined,
-                this.transform_column_cache,
+                this.column_analysis_cache,
                 this.changed_grid_rows(msg.sheetIndex, msg.state),
             );
             if (compute_is_cancelled()) return;
@@ -1621,6 +1737,7 @@ export class ViewerPanelCore {
     ): Promise<void> {
         // Generation guard: silently drop requests for a superseded version.
         if (msg.generation !== this._generation) return;
+        const receiver_epoch = this.receiver_epoch;
 
         // Boundary validation: clamp a negative startRow to 0. (CSV clamps
         // internally; xlsx/xls pass through to the store — validate here so the
@@ -1653,7 +1770,7 @@ export class ViewerPanelCore {
             this.evict_excess();
         }
 
-        await this.post({
+        const posted = await this.post({
             type: 'rowData',
             sheetIndex: msg.sheetIndex,
             startRow: window.startRow,
@@ -1661,8 +1778,12 @@ export class ViewerPanelCore {
             sourceRows: window.sourceRows,
             requestId: msg.requestId,
             generation: this._generation,
-        });
-        this.on_row_window_served?.(msg, window);
+        }, receiver_epoch);
+        if (!posted || this.disposed || this.receiver_epoch !== receiver_epoch) return;
+        await this.on_row_window_served?.(msg, {
+            startRow: window.startRow,
+            sourceRows: window.sourceRows,
+        }, receiver_epoch);
     }
 
     private evict_excess(): void {
@@ -1741,10 +1862,7 @@ export function adopt_source_into_core(
         onInvalidRestore?: InvalidRestoreCleanup;
         durablePendingEditKeys?: (sheet_index: number) => readonly string[];
         durableRowHeights?: DurableRowHeightsProvider;
-        onRowWindowServed?: (
-            msg: Extract<WebviewMessage, { type: 'requestRows' }>,
-            window: TransformedRowWindow,
-        ) => void;
+        onRowWindowServed?: RowWindowServed;
     },
     on_installed?: (installed: ViewerPanelCore) => void,
 ): AdoptSourceIntoCoreResult {

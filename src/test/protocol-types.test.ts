@@ -42,7 +42,12 @@ describe('paginated protocol message shapes', () => {
             sourceGeneration: 5,
             bins: [{ lo: 0, hi: 1, count: 3 }],
             columnKind: 'numeric',
-            distinctValues: ['1', '2', null],
+            defaultCategorical: true,
+            distinctValues: [
+                { value: '1', label: 'First' },
+                { value: '2', label: 'Second' },
+                { value: null },
+            ],
             distinctValuesExceeded: false,
         };
         const cancel: WebviewMessage = {
@@ -195,6 +200,29 @@ describe('paginated protocol message shapes', () => {
             expect(msg.sourceRows).toEqual([147]);
             expect(msg.requestId).toBe('req-1');
         }
+    });
+
+    it('carries raw and formatted compare bases separately', () => {
+        const msg: HostMessage = {
+            type: 'compareDiff',
+            sheetIndex: 0,
+            startRow: 10,
+            rowStatus: ['same'],
+            changedCells: [{
+                row: 10,
+                col: 2,
+                base: '1',
+                formattedBase: 'Yes',
+            }],
+            requestId: 'compare:1',
+            generation: 3,
+        };
+        expect(msg.changedCells[0]).toEqual({
+            row: 10,
+            col: 2,
+            base: '1',
+            formattedBase: 'Yes',
+        });
     });
 
     it('echoes exact snapshot identity and disposition in snapshotApplied', () => {

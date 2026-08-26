@@ -21,6 +21,7 @@ export interface FilterPopoverProps {
     filters: readonly FilterEntry[];
     anchor: { left: number; top: number };
     histogram?: FilterHistogramStatus;
+    show_formatting?: boolean;
     on_apply: (entry: FilterEntry) => void;
     on_cancel: (reason: FilterPopoverDismissReason) => void;
     on_remove: () => void;
@@ -29,6 +30,11 @@ export interface FilterPopoverProps {
 function preferred_operator_from_histogram(
     histogram: NonNullable<FilterPopoverProps['histogram']>,
 ): FilterOperator {
+    if (
+        histogram.status === 'ready'
+        && histogram.defaultCategorical === true
+        && value_list_offered(histogram)
+    ) return 'isOneOf';
     if (filter_column_kind_from_histogram(histogram) === 'numeric') return 'between';
     if (histogram.status !== 'ready') return 'contains';
     // Kind may settle as 'unknown' when the host omits it; bins still mean numeric.
@@ -55,6 +61,7 @@ export function FilterPopover({
     filters,
     anchor,
     histogram = { status: 'loading' },
+    show_formatting = true,
     on_apply,
     on_cancel,
     on_remove,
@@ -126,11 +133,13 @@ export function FilterPopover({
         };
     }, [on_cancel]);
 
+    const value_search_ready =
+        draft.operator === 'isOneOf' && histogram.status === 'ready';
     useEffect(() => {
-        (value_search_ref.current
-            ?? first_value_ref.current
-            ?? condition_ref.current)?.focus();
-    }, []);
+        (draft.operator === 'isOneOf'
+            ? value_search_ref.current
+            : first_value_ref.current ?? condition_ref.current)?.focus();
+    }, [draft.operator, value_search_ready]);
 
     // Promote pristine Contains drafts once the histogram settles: numeric
     // columns get Between, columns with a complete value list get Is one of.
@@ -143,17 +152,11 @@ export function FilterPopover({
             if (!is_pristine_default_filter_draft(current)) return current;
             return { ...current, operator: promoted };
         });
-        if (promoted === 'isOneOf') {
-            // Focus after the checklist mounts.
-            window.setTimeout(() => value_search_ref.current?.focus(), 0);
-        }
     }, [existing, histogram]);
 
     const uses_value_list = draft.operator === 'isOneOf';
-    const value_list_ready = histogram.status === 'ready'
-        && histogram.distinctValuesExceeded !== true;
-    const value_list_available = value_list_ready
-        && (histogram.distinctValues?.length ?? 0) > 0;
+    const value_list_available = histogram.status === 'ready'
+        && value_list_offered(histogram);
     const needs_value = !uses_value_list
         && draft.operator !== 'isEmpty'
         && draft.operator !== 'isNotEmpty';
@@ -200,10 +203,6 @@ export function FilterPopover({
                 ? draft.excludedValues ?? []
                 : draft.excludedValues,
         });
-        if (operator === 'isOneOf') {
-            // Focus after the checklist mounts.
-            window.setTimeout(() => value_search_ref.current?.focus(), 0);
-        }
     };
 
     const update_range_bounds = (lo: number, hi: number) => {
@@ -281,6 +280,7 @@ export function FilterPopover({
                     <FilterValueChecklistStatus
                         histogram={histogram}
                         excluded_values={draft.excludedValues ?? []}
+                        show_labels={show_formatting}
                         search_ref={value_search_ref}
                         on_change={(excluded_values) => update_draft({
                             ...draft,
@@ -362,11 +362,13 @@ export function FilterPopover({
 function FilterValueChecklistStatus({
     histogram,
     excluded_values,
+    show_labels,
     search_ref,
     on_change,
 }: {
     histogram: NonNullable<FilterPopoverProps['histogram']>;
     excluded_values: readonly (string | null)[];
+    show_labels: boolean;
     search_ref: React.RefObject<HTMLInputElement>;
     on_change: (excluded_values: (string | null)[]) => void;
 }): React.JSX.Element {
@@ -396,6 +398,7 @@ function FilterValueChecklistStatus({
                     ref={search_ref}
                     values={[]}
                     excluded_values={excluded_values}
+                    show_labels={show_labels}
                     on_change={on_change}
                 />
             </>
@@ -406,6 +409,7 @@ function FilterValueChecklistStatus({
             ref={search_ref}
             values={histogram.distinctValues ?? []}
             excluded_values={excluded_values}
+            show_labels={show_labels}
             on_change={on_change}
         />
     );

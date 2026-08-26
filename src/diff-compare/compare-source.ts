@@ -156,11 +156,13 @@ export function diff_column_names(
     return changed;
 }
 
-/** A cell whose text differs between the sides; `base` is the original text. */
+/** A cell whose value differs between the sides. `base` is original raw text;
+ * `formattedBase` lets the renderer honor Formatting without changing identity. */
 export interface ChangedCell {
     readonly row: number;
     readonly col: number;
     readonly base: string;
+    readonly formattedBase?: string;
 }
 
 /** `moved` is a paired row that the aligner re-matched across a change of

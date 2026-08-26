@@ -8,11 +8,16 @@ type RowDataMsg = Extract<HostMessage, { type: 'rowData' }>;
 type CompareDiffMsg = Extract<HostMessage, { type: 'compareDiff' }>;
 type Row = (RenderedCell | null)[];
 
-/** One display row's git-compare diff: its band, and the original-side text of
- *  its changed cells keyed by canonical source column. */
+interface CompareCellBase {
+    readonly raw: string;
+    readonly formatted: string;
+}
+
+/** One display row's git-compare diff: its band, and the original-side raw and
+ * formatted text of changed cells keyed by canonical source column. */
 export interface CompareRowDiff {
     readonly status?: Exclude<CompareRowStatus, 'same'>;
-    readonly bases?: ReadonlyMap<number, string>;
+    readonly bases?: ReadonlyMap<number, CompareCellBase>;
 }
 
 interface CachedPage {
@@ -332,7 +337,7 @@ export class RowLoader {
         if (page === undefined || page.request_id !== msg.requestId) return false;
         if (!Array.isArray(msg.rowStatus) || !Array.isArray(msg.changedCells)) return false;
         const records: (
-            { status?: CompareRowDiff['status']; bases?: Map<number, string> } | undefined
+            { status?: CompareRowDiff['status']; bases?: Map<number, CompareCellBase> } | undefined
         )[] =
             new Array<undefined>(page.rows.length);
         for (let offset = 0; offset < msg.rowStatus.length && offset < page.rows.length; offset++) {
@@ -349,8 +354,14 @@ export class RowLoader {
             if (!Number.isSafeInteger(offset) || offset < 0 || offset >= page.rows.length) continue;
             if (!Number.isSafeInteger(cell.col) || cell.col < 0) continue;
             if (typeof cell.base !== 'string') continue;
+            const formatted = typeof cell.formattedBase === 'string'
+                ? cell.formattedBase
+                : cell.base;
             const record = records[offset] ?? (records[offset] = {});
-            (record.bases ?? (record.bases = new Map())).set(cell.col, cell.base);
+            (record.bases ?? (record.bases = new Map())).set(cell.col, {
+                raw: cell.base,
+                formatted,
+            });
         }
         page.compare_rows = records;
         this.on_change();
@@ -363,8 +374,13 @@ export class RowLoader {
     }
 
     /** Original-side text of a changed cell in git compare mode, when resident. */
-    get_compare_base(row: number, col: number): string | undefined {
-        return this.compare_row(row)?.bases?.get(col);
+    get_compare_base(
+        row: number,
+        col: number,
+        show_formatting = false,
+    ): string | undefined {
+        const base = this.compare_row(row)?.bases?.get(col);
+        return show_formatting ? base?.formatted : base?.raw;
     }
 
     private compare_row(row: number): CompareRowDiff | undefined {

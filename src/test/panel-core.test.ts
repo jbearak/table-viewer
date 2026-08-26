@@ -6,7 +6,13 @@ import {
     adopt_source_into_core,
     transform_states_equal,
 } from '../panel-core';
-import type { DataSource, RowWindow, RenderedCell, WorkbookMeta } from '../data-source/interface';
+import {
+    DEFERRED_FILTER_IDENTITY,
+    type DataSource,
+    type RenderedCell,
+    type RowWindow,
+    type WorkbookMeta,
+} from '../data-source/interface';
 import { MAX_ROW_HEIGHT_PX, MIN_ROW_HEIGHT_PX } from '../webview/row-heights';
 import type {
     HostMessage,
@@ -14,6 +20,7 @@ import type {
     SheetViewRecord,
     WebviewMessage,
 } from '../types';
+import { FILTER_DISTINCT_VALUE_BYTE_LIMIT } from '../types';
 
 class StubSource implements DataSource {
     read_rows_calls = 0;
@@ -64,6 +71,13 @@ class TrackingColumnSource implements DataSource {
         private readonly row_count = 5,
         private readonly sheet_count = 1,
         private readonly column_count = 3,
+        private readonly value_for: (
+            sheet: number,
+            column: number,
+            row: number,
+        ) => string = (sheet, column, row) => String(
+            (sheet + 1) * 1_000 + column * 100 + row,
+        ),
     ) {}
 
     meta(): WorkbookMeta {
@@ -99,7 +113,7 @@ class TrackingColumnSource implements DataSource {
             startRow: start,
             rows: Array.from({ length: end - start }, (_, offset) => (
                 columns.map((column) => {
-                    const raw = String((sheet + 1) * 1_000 + column * 100 + start + offset);
+                    const raw = this.value_for(sheet, column, start + offset);
                     return { raw, formatted: raw, bold: false, italic: false };
                 })
             )),
@@ -107,6 +121,99 @@ class TrackingColumnSource implements DataSource {
     }
 
     close(): void {}
+}
+
+class TrackingIdentityColumnSource extends TrackingColumnSource {
+    override read_columns(
+        sheet: number,
+        start: number,
+        count: number,
+        columns: readonly number[],
+    ): RowWindow {
+        const window = super.read_columns(sheet, start, count, columns);
+        return {
+            ...window,
+            rows: window.rows.map((row) => row.map((cell) => cell === null
+                ? null
+                : { ...cell, filterKey: `identity:${cell.raw}` })),
+        };
+    }
+}
+
+class TrackingDeferredIdentityColumnSource extends TrackingColumnSource {
+    resolve_calls = 0;
+
+    constructor(readonly identity: string) {
+        super(
+            2,
+            1,
+            3,
+            (_sheet, column) => String.fromCharCode('a'.charCodeAt(0) + column),
+        );
+    }
+
+    override read_columns(
+        sheet: number,
+        start: number,
+        count: number,
+        columns: readonly number[],
+    ): RowWindow {
+        const window = super.read_columns(sheet, start, count, columns);
+        return {
+            ...window,
+            rows: window.rows.map((row) => row.map((cell, offset) => {
+                if (cell === null || columns[offset] !== 0) return cell;
+                const deferred = {
+                    ...cell,
+                    rawByteLength: FILTER_DISTINCT_VALUE_BYTE_LIMIT + 1,
+                };
+                Object.defineProperty(deferred, DEFERRED_FILTER_IDENTITY, {
+                    value: {
+                        cachedKey: () => undefined,
+                        resolveKey: async () => {
+                            this.resolve_calls += 1;
+                            return this.identity;
+                        },
+                    },
+                });
+                return deferred;
+            })),
+        };
+    }
+}
+
+class TrackingRawTypeColumnSource extends TrackingColumnSource {
+    override read_columns(
+        sheet: number,
+        start: number,
+        count: number,
+        columns: readonly number[],
+    ): RowWindow {
+        const window = super.read_columns(sheet, start, count, columns);
+        return {
+            ...window,
+            rows: window.rows.map((row, row_offset) => row.map((cell, offset) => {
+                if (cell === null) return null;
+                const column = columns[offset];
+                const raw = column === 0 ? String(start + row_offset + 1) : '1';
+                return {
+                    ...cell,
+                    raw,
+                    formatted: raw,
+                    rawType: column === 0 ? 'date' as const : 'boolean' as const,
+                };
+            })),
+        };
+    }
+}
+
+class TrackingHistogramSource extends TrackingColumnSource {
+    metadata_requests = 0;
+
+    column_filter_metadata(): undefined {
+        this.metadata_requests += 1;
+        return undefined;
+    }
 }
 
 function make_panel() {
@@ -226,6 +333,57 @@ describe('ViewerPanelCore', () => {
         expect(rd.generation).toBe(core.generation);
     });
 
+    it('passes the accepted receiver epoch only after a successful rowData post', async () => {
+        const { panel, postMessage } = make_panel();
+        const served = vi.fn();
+        const core = new ViewerPanelCore(panel, new StubSource(), {
+            onRowWindowServed: served,
+        });
+        core.begin_receiver_epoch(7);
+        const request = {
+            type: 'requestRows' as const,
+            sheetIndex: 0,
+            startRow: 0,
+            count: 1,
+            generation: core.generation,
+        };
+
+        await core.handle_message({ ...request, requestId: 'accepted' });
+        expect(served).toHaveBeenCalledOnce();
+        expect(served.mock.calls[0][1]).toEqual({ startRow: 0, sourceRows: [0] });
+        expect(served.mock.calls[0][2]).toBe(7);
+
+        postMessage.mockResolvedValueOnce(false);
+        await core.handle_message({ ...request, requestId: 'not-posted' });
+        expect(served).toHaveBeenCalledOnce();
+    });
+
+    it('suppresses the served callback when the receiver turns over during rowData', async () => {
+        const row_post = deferred<boolean>();
+        const postMessage = vi.fn(() => row_post.promise);
+        const panel = { webview: { postMessage } };
+        const served = vi.fn();
+        const core = new ViewerPanelCore(panel, new StubSource(), {
+            onRowWindowServed: served,
+        });
+        core.begin_receiver_epoch(11);
+
+        const request = core.handle_message({
+            type: 'requestRows',
+            sheetIndex: 0,
+            startRow: 0,
+            count: 1,
+            requestId: 'old-receiver',
+            generation: core.generation,
+        });
+        await vi.waitFor(() => expect(postMessage).toHaveBeenCalledOnce());
+        core.begin_receiver_epoch(12);
+        row_post.resolve(true);
+        await request;
+
+        expect(served).not.toHaveBeenCalled();
+    });
+
     it('drops a requestRows whose generation is stale (post-reload)', async () => {
         const { panel, posted } = make_panel();
         const src = new StubSource();
@@ -258,7 +416,7 @@ describe('ViewerPanelCore', () => {
             requestId: 'hist-1', generation: core.generation,
             sourceGeneration: core.source_generation,
         });
-        expect(src.read_rows_calls).toBe(2);
+        expect(src.read_rows_calls).toBe(1);
         expect(posted.at(-1)).toMatchObject({
             type: 'filterHistogram', requestId: 'hist-1', sheetIndex: 0,
             columnIndex: 0, sourceGeneration: 1,
@@ -276,15 +434,162 @@ describe('ViewerPanelCore', () => {
                 schema: '["Sheet1",2,null]',
             },
         });
-        expect(src.read_rows_calls).toBe(3);
+        expect(src.read_rows_calls).toBe(1);
         await core.handle_message({
             type: 'requestFilterHistogram', sheetIndex: 0, columnIndex: 0,
             requestId: 'hist-2', generation: core.generation,
             sourceGeneration: core.source_generation,
         });
-        expect(src.read_rows_calls).toBe(3);
+        expect(src.read_rows_calls).toBe(1);
         expect(posted.at(-1)).toMatchObject({
             type: 'filterHistogram', requestId: 'hist-2', generation: core.generation,
+        });
+    });
+
+    it('reuses sorted source analysis for a later histogram', async () => {
+        const { panel, posted } = make_panel();
+        const source = new TrackingColumnSource(300);
+        const core = new ViewerPanelCore(panel, source);
+
+        await core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId: 'sort-first',
+            generation: core.generation, sourceGeneration: core.source_generation,
+            intent: 'user', state: {
+                sort: [{ colIndex: 0, direction: 'desc' }], filters: [],
+                schema: '["Sheet1",3,null]',
+            },
+        });
+        const reads_after_sort = source.column_reads.length;
+        await core.handle_message({
+            type: 'requestFilterHistogram', sheetIndex: 0, columnIndex: 0,
+            requestId: 'hist-after-sort', generation: core.generation,
+            sourceGeneration: core.source_generation,
+        });
+
+        expect(reads_after_sort).toBe(3);
+        expect(source.column_reads).toHaveLength(reads_after_sort);
+        expect(posted.at(-1)).toMatchObject({
+            type: 'filterHistogram', requestId: 'hist-after-sort',
+            columnKind: 'numeric',
+        });
+    });
+
+    it('preserves raw-type classification when histograms hit transform analyses', async () => {
+        const { panel, posted } = make_panel();
+        const source = new TrackingRawTypeColumnSource(2, 1, 2);
+        const core = new ViewerPanelCore(panel, source);
+
+        for (const column of [0, 1]) {
+            await core.handle_message({
+                type: 'setTransform', sheetIndex: 0, requestId: `sort-${column}`,
+                generation: core.generation,
+                sourceGeneration: core.source_generation,
+                intent: 'user', state: {
+                    sort: [{ colIndex: column, direction: 'asc' }], filters: [],
+                    schema: '["Sheet1",2,null]',
+                },
+            });
+        }
+        const reads_after_sorts = source.column_reads.length;
+        for (const column of [0, 1]) {
+            await core.handle_message({
+                type: 'requestFilterHistogram', sheetIndex: 0,
+                columnIndex: column, requestId: `typed-${column}`,
+                generation: core.generation,
+                sourceGeneration: core.source_generation,
+            });
+        }
+
+        expect(source.column_reads).toHaveLength(reads_after_sorts);
+        expect(posted.find((message) => message.requestId === 'typed-0'))
+            .toMatchObject({ columnKind: 'orderedText', bins: [] });
+        expect(posted.find((message) => message.requestId === 'typed-1'))
+            .toMatchObject({ columnKind: 'text', bins: [] });
+    });
+
+    it('charges retained string allocations to histogram-result admission', async () => {
+        const { panel } = make_panel();
+        const source = new TrackingHistogramSource(
+            10,
+            1,
+            1,
+            (_sheet, _column, row) => String.fromCharCode('a'.charCodeAt(0) + row),
+        );
+        const core = new ViewerPanelCore(panel, source, {
+            maxCachedHistogramBytes: 1_200,
+        });
+        const request = async (requestId: string) => {
+            await core.handle_message({
+                type: 'requestFilterHistogram', sheetIndex: 0, columnIndex: 0,
+                requestId, generation: core.generation,
+                sourceGeneration: core.source_generation,
+            });
+        };
+
+        await request('first');
+        await request('second');
+
+        expect(source.metadata_requests).toBe(2);
+        expect(source.column_reads.map((read) => read.columns)).toEqual([[0]]);
+    });
+
+    it('evicts completed histograms without discarding shared source analyses', async () => {
+        const { panel } = make_panel();
+        const source = new TrackingHistogramSource(
+            2,
+            1,
+            2,
+            (_sheet, column) => String(column + 1),
+        );
+        const core = new ViewerPanelCore(panel, source, {
+            maxCachedHistogramBytes: 450,
+        });
+        const histogram = async (columnIndex: number, requestId: string) => {
+            await core.handle_message({
+                type: 'requestFilterHistogram', sheetIndex: 0, columnIndex,
+                requestId, generation: core.generation,
+                sourceGeneration: core.source_generation,
+            });
+        };
+
+        await histogram(0, 'zero');
+        await histogram(0, 'zero-cached');
+        expect(source.metadata_requests).toBe(1);
+        await histogram(1, 'one');
+        await histogram(0, 'zero-recomputed');
+
+        expect(source.metadata_requests).toBe(3);
+        expect(source.column_reads.map((read) => read.columns)).toEqual([[0], [1]]);
+    });
+
+    it('does not retain a histogram analysis cancelled during acquisition', async () => {
+        const { panel, posted } = make_panel();
+        const source = new TrackingColumnSource(300);
+        const core = new ViewerPanelCore(panel, source);
+        source.on_read = () => {
+            source.on_read = undefined;
+            void core.handle_message({
+                type: 'cancelFilterHistogram', requestId: 'cancelled',
+            });
+        };
+
+        await core.handle_message({
+            type: 'requestFilterHistogram', sheetIndex: 0, columnIndex: 0,
+            requestId: 'cancelled', generation: core.generation,
+            sourceGeneration: core.source_generation,
+        });
+        const reads_after_cancel = source.column_reads.length;
+        await core.handle_message({
+            type: 'requestFilterHistogram', sheetIndex: 0, columnIndex: 0,
+            requestId: 'retry', generation: core.generation,
+            sourceGeneration: core.source_generation,
+        });
+
+        expect(reads_after_cancel).toBe(1);
+        expect(source.column_reads).toHaveLength(4);
+        expect(posted.some((message) => message.requestId === 'cancelled')).toBe(false);
+        expect(posted.at(-1)).toMatchObject({
+            type: 'filterHistogram', requestId: 'retry',
         });
     });
 
@@ -302,8 +607,8 @@ describe('ViewerPanelCore', () => {
             type: 'requestFilterHistogram', sheetIndex: 0, columnIndex: 0,
             requestId: 'second', generation: 2, sourceGeneration: 2,
         });
-        expect(first.read_rows_calls).toBe(2);
-        expect(second.read_rows_calls).toBe(2);
+        expect(first.read_rows_calls).toBe(1);
+        expect(second.read_rows_calls).toBe(1);
     });
 
     it('finishes and caches a source-valid histogram across a concurrent view generation bump', async () => {
@@ -1392,6 +1697,182 @@ describe('ViewerPanelCore', () => {
 
         expect(source.column_reads.map((read) => read.columns)).toEqual([
             [0], [1], [2], [1],
+        ]);
+    });
+
+    it('charges retained string allocations to analysis admission', async () => {
+        const { panel } = make_panel();
+        const source = new TrackingColumnSource(
+            10,
+            1,
+            1,
+            (_sheet, _column, row) => String.fromCharCode('a'.charCodeAt(0) + row),
+        );
+        const core = new ViewerPanelCore(panel, source, {
+            maxCachedTransformCells: 100,
+            maxCachedTransformBytes: 2_000,
+        });
+        const apply = async (direction: 'asc' | 'desc', requestId: string) => {
+            await core.handle_message({
+                type: 'setTransform', sheetIndex: 0, requestId,
+                generation: core.generation, sourceGeneration: core.source_generation,
+                intent: 'user', state: {
+                    sort: [{ colIndex: 0, direction }], filters: [],
+                    schema: '["Sheet1",1,null]',
+                },
+            });
+        };
+
+        await apply('asc', 'first');
+        await apply('desc', 'second');
+
+        expect(source.column_reads.map((read) => read.columns)).toEqual([[0], [0]]);
+    });
+
+    it('rejects an individually oversized analysis without evicting retained entries', async () => {
+        const { panel } = make_panel();
+        const source = new TrackingColumnSource(
+            2,
+            1,
+            2,
+            (_sheet, column) => column === 0 ? 'x' : 'x'.repeat(200),
+        );
+        const core = new ViewerPanelCore(panel, source, {
+            maxCachedTransformCells: 100,
+            maxCachedTransformBytes: 1_500,
+        });
+        const apply = async (column: number, requestId: string) => {
+            await core.handle_message({
+                type: 'setTransform', sheetIndex: 0, requestId,
+                generation: core.generation, sourceGeneration: core.source_generation,
+                intent: 'user', state: {
+                    sort: [{ colIndex: column, direction: 'asc' }], filters: [],
+                    schema: '["Sheet1",2,null]',
+                },
+            });
+        };
+
+        await apply(0, 'short');
+        await apply(1, 'long');
+        await apply(0, 'short-cached');
+        await apply(1, 'long-reread');
+
+        expect(source.column_reads.map((read) => read.columns)).toEqual([
+            [0], [1], [1],
+        ]);
+    });
+
+    it('bounds aggregate analysis bytes with LRU recency', async () => {
+        const { panel } = make_panel();
+        const lengths = [1, 20, 30];
+        const source = new TrackingColumnSource(
+            2,
+            1,
+            3,
+            (_sheet, column) => 'x'.repeat(lengths[column]),
+        );
+        const core = new ViewerPanelCore(panel, source, {
+            maxCachedTransformCells: 100,
+            maxCachedTransformBytes: 1_500,
+        });
+        const apply = async (column: number, requestId: string) => {
+            await core.handle_message({
+                type: 'setTransform', sheetIndex: 0, requestId,
+                generation: core.generation, sourceGeneration: core.source_generation,
+                intent: 'user', state: {
+                    sort: [{ colIndex: column, direction: 'asc' }], filters: [],
+                    schema: '["Sheet1",3,null]',
+                },
+            });
+        };
+
+        await apply(0, 'zero');
+        await apply(1, 'one');
+        await apply(0, 'touch-zero');
+        await apply(2, 'two');
+        await apply(1, 'one-reread');
+
+        expect(source.column_reads.map((read) => read.columns)).toEqual([
+            [0], [1], [2], [1],
+        ]);
+    });
+
+    it('does not touch an incomplete entry when an oversized upgrade is rejected', async () => {
+        const { panel } = make_panel();
+        const identity = `identity:${'i'.repeat(400)}`;
+        const source = new TrackingDeferredIdentityColumnSource(identity);
+        const core = new ViewerPanelCore(panel, source, {
+            maxCachedTransformCells: 100,
+            maxCachedTransformBytes: 1_300,
+        });
+        const sort = async (column: number, requestId: string) => {
+            await core.handle_message({
+                type: 'setTransform', sheetIndex: 0, requestId,
+                generation: core.generation, sourceGeneration: core.source_generation,
+                intent: 'user', state: {
+                    sort: [{ colIndex: column, direction: 'asc' }], filters: [],
+                    schema: '["Sheet1",3,null]',
+                },
+            });
+        };
+
+        await sort(0, 'incomplete-a');
+        await sort(1, 'retain-b');
+        await core.handle_message({
+            type: 'setTransform', sheetIndex: 0, requestId: 'upgrade-a',
+            generation: core.generation, sourceGeneration: core.source_generation,
+            intent: 'user', state: {
+                sort: [], filters: [{
+                    id: 'identity-a', colIndex: 0, operator: 'isOneOf',
+                    excludedValues: [identity], caseSensitive: false, enabled: true,
+                }], schema: '["Sheet1",3,null]',
+            },
+        });
+        await sort(2, 'admit-c');
+        await sort(1, 'reuse-b');
+
+        expect(source.resolve_calls).toBe(2);
+        expect(source.column_reads.map((read) => read.columns)).toEqual([
+            [0], [1], [0], [2],
+        ]);
+    });
+
+    it('charges filter-identity slots to the transform-column cache bound', async () => {
+        const { panel } = make_panel();
+        const source = new TrackingIdentityColumnSource(3);
+        const core = new ViewerPanelCore(panel, source, {
+            // One three-row column with both values arrays exactly fills the cache.
+            maxCachedTransformCells: 6,
+        });
+        const apply = async (
+            column: number,
+            requestId: string,
+            categorical: boolean,
+        ) => {
+            await core.handle_message({
+                type: 'setTransform', sheetIndex: 0, requestId,
+                generation: core.generation, sourceGeneration: core.source_generation,
+                intent: 'user', state: {
+                    sort: categorical ? [] : [{ colIndex: column, direction: 'asc' }],
+                    filters: categorical ? [{
+                        id: `filter-${column}`,
+                        colIndex: column,
+                        operator: 'isOneOf',
+                        excludedValues: ['identity:missing'],
+                        caseSensitive: false,
+                        enabled: true,
+                    }] : [],
+                    schema: '["Sheet1",3,null]',
+                },
+            });
+        };
+
+        await apply(0, 'identity-zero', true);
+        await apply(1, 'identity-one', false);
+        await apply(0, 'identity-zero-again', true);
+
+        expect(source.column_reads.map((read) => read.columns)).toEqual([
+            [0], [1], [0],
         ]);
     });
 
