@@ -70,7 +70,7 @@ It also removes other friction from reading tables:
 - **Diffing a spreadsheet in Git shows you a wall of text.** Click a changed `.xlsx`, `.xls`, `.csv`, `.tsv`, or `.dta` file in VS Code's Source Control or Timeline view and Table Viewer opens the comparison as a table: added and deleted rows banded, changed cells showing before and after in place. The desktop app also compares any two files.
 - **Comparing a Git LFS file shows you the pointer, not the table.** An LFS-tracked file is stored in Git as a small pointer naming the real object, so the version you want to compare against is often not on your machine at all. Table Viewer recognizes the pointer on either side of a comparison and offers to download the object.
 
-The flip side is that Table Viewer is deliberately *not* a full spreadsheet editor. You can't create files or sheets, add cells beyond the file's existing bounds, or change formatting. Editing `.xlsx`, CSV, and TSV files is limited to the cells the file already has; legacy `.xls` workbooks and `.dta` datasets are read-only. That constraint is intentional: you can hand it any output file and explore it freely, knowing the file will only change if you explicitly edit and save it.
+**Limitations:** Table Viewer is *not* a full spreadsheet editor. You can't create files or sheets, add cells beyond the file's existing bounds, or recalculate formulas.
 
 ## Features
 
