@@ -17,7 +17,6 @@ import {
     parse_metadata,
     parse_value_labels,
 } from '@jbearak/dta-parser';
-import { MAX_SHEET_ROWS } from '../spreadsheet-safety';
 import type {
     ColumnFilterMetadata,
     ColumnWindow,
@@ -38,6 +37,7 @@ import type {
  * budget to a source that never materializes the full table.
  */
 export const MAX_FILE_BACKED_DTA_COLUMNS = 10_000;
+const MAX_FILE_BACKED_DTA_ROWS = 0xffff_ffff;
 const MAX_FILE_BACKED_DTA_METADATA_BYTES = 64 * 1024 * 1024;
 const MAX_FILE_BACKED_DTA_VALUE_LABEL_BYTES = 16 * 1024 * 1024;
 const MAX_FILE_BACKED_DTA_VALUE_LABEL_ENTRIES = 65_536;
@@ -475,9 +475,13 @@ export class FileDtaDataSource implements DataSource {
         private readonly file: DtaFile,
         private readonly file_path: string,
     ) {
-        if (file.nobs > MAX_SHEET_ROWS) {
+        // Canonical/projected row maps use Uint32Array and reserve 0xffff_ffff
+        // as an absent-row sentinel. Unlike eager workbook sources, this source
+        // does not retain one object per logical cell, so the materialized-sheet
+        // one-million-row budget does not apply.
+        if (file.nobs > MAX_FILE_BACKED_DTA_ROWS) {
             throw new Error(
-                `Worksheet has too many rows to open safely (max ${MAX_SHEET_ROWS})`,
+                'Stata dataset has too many observations for 32-bit row indexing',
             );
         }
         if (file.nvar > MAX_FILE_BACKED_DTA_COLUMNS) {

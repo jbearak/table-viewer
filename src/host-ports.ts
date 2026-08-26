@@ -139,7 +139,8 @@ export function file_size_limit_dialog_detail(
 /** User-facing notifications and modal decision dialogs. */
 export interface HostUiPort {
     show_warning(message: string): void;
-    show_error(message: string): void;
+    /** When asynchronous, resolves after the host has dismissed the error. */
+    show_error(message: string): void | Promise<void>;
     /** Modal "Leave edit mode?" dialog with Save Edits / Discard Edits / cancel. */
     show_save_discard_dialog(): Promise<SaveDialogChoice>;
     show_file_size_limit_dialog(

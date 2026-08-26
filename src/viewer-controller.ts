@@ -5133,14 +5133,19 @@ export function attach_viewer(
         return disposed ? { type: 'disposed' } : { type: 'superseded' };
     }
 
-    function report_refresh_failure(
+    async function report_refresh_failure(
         error: unknown,
         initial: boolean,
+        request: Pick<PanelLoadRequest, 'seq' | 'refreshEvent'>,
         post_save = false,
-    ): void {
+    ): Promise<void> {
         if (initial) {
-            host.ui.show_error(
-                error instanceof Error ? error.message : String(error));
+            await host.ui.show_error(
+                error instanceof Error ? error.message : String(error),
+            );
+            if (load_is_current(request.seq, request.refreshEvent)) {
+                await options.requestClose?.();
+            }
             return;
         }
         log_sanitized_failure('Failed to reload table viewer data', error);
@@ -5151,7 +5156,7 @@ export function attach_viewer(
             host.ui.show_warning(
                 `The file was saved, but Table Viewer could not refresh the table view. ${message}`);
         } else {
-            host.ui.show_error(message);
+            void host.ui.show_error(message);
         }
     }
 
@@ -5302,9 +5307,10 @@ export function attach_viewer(
                     attempts = 0;
                     continue;
                 }
-                report_refresh_failure(
+                await report_refresh_failure(
                     last_error,
                     initial,
+                    request,
                     request.refreshEvent?.reason === 'postSave',
                 );
                 return { type: 'failed', error: last_error };
@@ -5356,11 +5362,14 @@ export function attach_viewer(
                             false,
                         );
                     }
-                    report_refresh_failure(
+                    dispose_unadopted_candidate(candidate);
+                    candidate = undefined;
+                    await report_refresh_failure(
                         currency === 'comparison-stale'
                             ? unstable_comparison_error()
                             : new Error('The file changed while it was being refreshed.'),
                         initial,
+                        request,
                     );
                 }
                 return false;
@@ -5389,9 +5398,12 @@ export function attach_viewer(
                     )
                     && load_is_current(request.seq)
                 ) {
-                    report_refresh_failure(
+                    dispose_unadopted_candidate(candidate);
+                    candidate = undefined;
+                    await report_refresh_failure(
                         new Error('The file authority changed while it was refreshed.'),
                         initial,
+                        request,
                     );
                 }
                 return false;
@@ -5410,9 +5422,12 @@ export function attach_viewer(
                     )
                     && load_is_current(request.seq)
                 ) {
-                    report_refresh_failure(
+                    dispose_unadopted_candidate(candidate);
+                    candidate = undefined;
+                    await report_refresh_failure(
                         new Error('The file authority changed while it was refreshed.'),
                         initial,
+                        request,
                     );
                 }
                 return false;
@@ -5440,7 +5455,9 @@ export function attach_viewer(
                 initial,
                 include_compare_original,
             )) {
-                report_refresh_failure(error, initial);
+                dispose_unadopted_candidate(candidate);
+                candidate = undefined;
+                await report_refresh_failure(error, initial, request);
             }
             return false;
         } finally {
@@ -5603,7 +5620,7 @@ export function attach_viewer(
     }
     function show_owner_error(message: string): void {
         if (disposed) return;
-        host.ui.show_error(message);
+        void host.ui.show_error(message);
     }
 
     function finish_save_failure(

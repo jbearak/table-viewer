@@ -1361,25 +1361,59 @@ describe('CSV reload races', () => {
         vi.useRealTimers();
     });
 
-    it('reports initial-load failure after stale verification exhausts local retries', async () => {
+    it('reports initial-load failure and closes the empty viewer after retries', async () => {
         vi.useFakeTimers();
         let mtime = 0;
         vscode_mock.__setStatImplementation(async () => ({ size: 100, mtime: ++mtime }));
         vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
         const close_spy = vi.spyOn(CsvDataSource.prototype, 'close');
-        const error_spy = vi.spyOn(vscode_mock.window, 'showErrorMessage');
+        const error_dismissed = deferred<undefined>();
+        const error_spy = vi.spyOn(vscode_mock.window, 'showErrorMessage')
+            .mockReturnValue(error_dismissed.promise);
         open_csv_table(uri('/tmp/stale-initial-retry.csv'));
         const panel = vscode_mock.__getPanels()[0];
+        const panel_close = vi.spyOn(panel, 'dispose');
 
         await panel.__receive({ type: 'ready' });
-        await vi.advanceTimersByTimeAsync(200);
+        await vi.waitFor(() => expect(error_spy).toHaveBeenCalledOnce());
 
         expect(initial_snapshots(panel)).toHaveLength(0);
         expect(close_spy).toHaveBeenCalledTimes(4);
-        expect(error_spy).toHaveBeenCalledOnce();
         expect(error_spy).toHaveBeenCalledWith(
             'The file changed while it was being refreshed.',
         );
+        expect(panel_close).not.toHaveBeenCalled();
+        error_dismissed.resolve(undefined);
+        await flush_promises();
+        expect(panel_close).toHaveBeenCalledOnce();
+        vi.useRealTimers();
+    });
+
+    it('does not close a recovered viewer when a stale load error is dismissed', async () => {
+        vi.useFakeTimers();
+        let unstable = true;
+        let mtime = 0;
+        vscode_mock.__setStatImplementation(async () => ({
+            size: 100,
+            mtime: unstable ? ++mtime : 10_000,
+        }));
+        vscode_mock.__setReadFileImplementation(async () => enc.encode('h\na\n'));
+        const error_dismissed = deferred<undefined>();
+        const error_spy = vi.spyOn(vscode_mock.window, 'showErrorMessage')
+            .mockReturnValue(error_dismissed.promise);
+        const panel = open_csv_table(uri('/tmp/recovered-during-error.csv'));
+        const panel_close = vi.spyOn(panel, 'dispose');
+
+        await panel.__receive({ type: 'ready' });
+        await vi.waitFor(() => expect(error_spy).toHaveBeenCalledOnce());
+        unstable = false;
+        await panel.__receive({ type: 'ready' });
+        expect(initial_snapshots(panel)).toHaveLength(1);
+
+        error_dismissed.resolve(undefined);
+        await flush_promises();
+        expect(panel_close).not.toHaveBeenCalled();
+        panel.dispose();
         vi.useRealTimers();
     });
 

@@ -2,7 +2,7 @@ import * as fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { DtaDataSource } from '../data-source/dta-source';
 import {
     FileDtaDataSource,
@@ -138,6 +138,27 @@ describe('FileDtaDataSource', () => {
             nvar: 0,
             variables: [],
         }, fixture)).toThrow(/parser.*random-access file interface/u);
+    });
+
+    it('accepts paged datasets beyond the eager worksheet row budget', () => {
+        const close = vi.fn();
+        const UnsafeConstructor = FileDtaDataSource as unknown as new (
+            file: unknown,
+            file_path: string,
+        ) => FileDtaDataSource;
+        const source = new UnsafeConstructor({
+            nobs: 1_274_250,
+            nvar: 0,
+            variables: [],
+            close,
+            _fd: 1,
+            _metadata: { obs_length: 0 },
+            _read_rows_range: () => [],
+        }, fixture);
+
+        expect(source.meta().sheets[0].rowCount).toBe(1_274_250);
+        source.close();
+        expect(close).toHaveBeenCalledOnce();
     });
 
     it('preserves reordered and duplicate sparse column projections', async () => {
