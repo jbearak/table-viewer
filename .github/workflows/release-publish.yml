@@ -540,8 +540,11 @@ jobs:
           # The tap starts without branch protection, so --auto can merge
           # immediately even while its non-required test is still running.
           # Observe the check first, require it to pass, then merge directly.
+          # GitHub may defer creating the check run while a macOS runner is
+          # unavailable. Keep polling the PR's observable check rollup long
+          # enough to cover that queueing delay before deciding it never ran.
           TAP_TEST_CHECKS=0
-          for _ in {1..60}; do
+          for _ in {1..360}; do
             TAP_TEST_CHECKS=$(gh pr view "$BRANCH" --json statusCheckRollup \
               --jq '[.statusCheckRollup[] | select(.name == "test" and .workflowName == "tests")] | length')
             [[ "$TAP_TEST_CHECKS" -gt 0 ]] && break
