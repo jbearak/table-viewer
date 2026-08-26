@@ -72,6 +72,23 @@ export function assert_file_backed_dta_row_size(metadata: DtaMetadata): void {
     }
 }
 
+/** Enforce file-backed limits that depend only on parsed metadata and file size. */
+export function assert_file_backed_dta_layout(
+    metadata: DtaMetadata,
+    file_size: number,
+): void {
+    if (
+        file_size > MAX_WHOLE_FILE_READ_BYTES
+        && metadata.variables.some((variable) => variable.type === 'strL')
+    ) {
+        throw new Error(
+            'Stata files larger than 2 GiB that contain strL variables '
+            + 'are not supported yet.',
+        );
+    }
+    assert_file_backed_dta_row_size(metadata);
+}
+
 interface SynchronousDtaFileReader {
     readonly _fd: number | null;
     readonly _metadata: DtaMetadata;
@@ -81,6 +98,33 @@ interface SynchronousDtaFileReader {
         columnStart?: number,
         columnEnd?: number,
     ): Row[];
+}
+
+function require_synchronous_dta_file_reader(file: DtaFile): SynchronousDtaFileReader {
+    const candidate = file as unknown as {
+        readonly _fd?: unknown;
+        readonly _metadata?: unknown;
+        readonly _read_rows_range?: unknown;
+    };
+    const metadata = candidate._metadata;
+    if (
+        typeof candidate._fd !== 'number'
+        || !Number.isSafeInteger(candidate._fd)
+        || candidate._fd < 0
+        || metadata === null
+        || typeof metadata !== 'object'
+        || !('obs_length' in metadata)
+        || typeof metadata.obs_length !== 'number'
+        || !Number.isSafeInteger(metadata.obs_length)
+        || metadata.obs_length < 0
+        || typeof candidate._read_rows_range !== 'function'
+    ) {
+        throw new Error(
+            'Installed @jbearak/dta-parser does not expose the required '
+            + 'random-access file interface.',
+        );
+    }
+    return candidate as unknown as SynchronousDtaFileReader;
 }
 
 interface OwnedDtaFileConstructor {
@@ -447,7 +491,7 @@ export class FileDtaDataSource implements DataSource {
         // The grid's DataSource contract is synchronous for visible pages, so use
         // that primitive here and the public metadata/value-label API everywhere
         // else. This adapter is pinned to the parser version in package-lock.json.
-        this.reader = file as unknown as SynchronousDtaFileReader;
+        this.reader = require_synchronous_dta_file_reader(file);
         this.all_column_indices = file.variables.map((_, index) => index);
         this._meta = {
             hasFormatting: true,
@@ -480,16 +524,7 @@ export class FileDtaDataSource implements DataSource {
             if (is_cancelled()) throw abort_error();
             preflight = preflight_metadata(file_path);
             const { metadata } = preflight;
-            if (
-                preflight.stat.size > MAX_WHOLE_FILE_READ_BYTES
-                && metadata.variables.some((variable) => variable.type === 'strL')
-            ) {
-                throw new Error(
-                    'Stata files larger than 2 GiB that contain strL variables '
-                    + 'are not supported yet.',
-                );
-            }
-            assert_file_backed_dta_row_size(metadata);
+            assert_file_backed_dta_layout(metadata, preflight.stat.size);
             if (is_cancelled()) throw abort_error();
             const label_start = metadata.section_offsets.value_labels;
             const label_bytes = preflight.value_label_bytes;

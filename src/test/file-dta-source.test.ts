@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { DtaDataSource } from '../data-source/dta-source';
 import {
     FileDtaDataSource,
+    assert_file_backed_dta_layout,
     assert_file_backed_dta_row_size,
 } from '../data-source/file-dta-source';
 import { parse_metadata } from '@jbearak/dta-parser';
@@ -119,19 +120,24 @@ describe('FileDtaDataSource', () => {
         })).toThrow(/per-row safety limit/u);
     });
 
-    it('rejects an oversized strL file before the parser can load its strL section', async () => {
-        const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'tv-file-dta-'));
-        const sparse = path.join(directory, 'oversized-strl.dta');
-        try {
-            fs.copyFileSync(fixture, sparse);
-            fs.truncateSync(sparse, 2 * 1024 * 1024 * 1024);
+    it('rejects oversized strL layouts before the parser can load their strL section', () => {
+        const metadata = parse_metadata(new Uint8Array(fs.readFileSync(fixture)).buffer);
+        expect(() => assert_file_backed_dta_layout(
+            metadata,
+            2 * 1024 * 1024 * 1024,
+        )).toThrow(/larger than 2 GiB.*strL variables/u);
+    });
 
-            await expect(FileDtaDataSource.open_observed(sparse)).rejects.toThrow(
-                /larger than 2 GiB.*strL variables/u,
-            );
-        } finally {
-            fs.rmSync(directory, { recursive: true, force: true });
-        }
+    it('fails clearly when the parser random-access interface is unavailable', () => {
+        const UnsafeConstructor = FileDtaDataSource as unknown as new (
+            file: unknown,
+            file_path: string,
+        ) => FileDtaDataSource;
+        expect(() => new UnsafeConstructor({
+            nobs: 0,
+            nvar: 0,
+            variables: [],
+        }, fixture)).toThrow(/parser.*random-access file interface/u);
     });
 
     it('preserves reordered and duplicate sparse column projections', async () => {
