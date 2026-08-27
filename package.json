@@ -272,7 +272,7 @@
     "package": "vsce package --no-dependencies"
   },
   "dependencies": {
-    "@jbearak/dta-parser": "^0.5.0",
+    "@jbearak/dta-parser": "^0.6.0",
     "canvas-hypertxt": "^1.0.3",
     "cfb": "^1.2.2",
     "electron-updater": "6.8.9",

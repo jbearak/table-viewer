@@ -2685,10 +2685,17 @@ describe('DtaDataSource', () => {
         expect(internals.gso_scan_position).toBe(records[1_025].start);
     });
 
-    it('decodes release 119 strL pointers with the 3+5-byte layout', async () => {
-        const source = await DtaDataSource.create(build_release119_strl_fixture());
-        expect(source.read_rows(0, 0, 1).rows[0][0]?.raw).toBe('hello');
-    });
+    it.each([
+        ['117', build_release117_fixture, 1, 'café'],
+        ['118', build_dta_fixture, 4, 'a long first value'],
+        ['119', build_release119_strl_fixture, 0, 'hello'],
+    ] as const)(
+        'reads release %s strL data through the parser integration',
+        async (_release, build_fixture, column, expected) => {
+            const source = await DtaDataSource.create(build_fixture());
+            expect(source.read_rows(0, 0, 1).rows[0][column]?.raw).toBe(expected);
+        },
+    );
 
     it('rejects release 119 pointers to a non-strL variable', async () => {
         const fixture = build_release119_strl_rows_fixture([
@@ -2697,9 +2704,7 @@ describe('DtaDataSource', () => {
         fixture[find_tag_end(fixture, '<data>') + 1] = 1;
         const source = await DtaDataSource.create(fixture);
 
-        expect(() => source.read_rows(0, 0, 1)).toThrow(
-            'Corrupt .dta file: strL pointer variable 1 is not strL',
-        );
+        expect(() => source.read_rows(0, 0, 1)).toThrow('Invalid strL pointer 1:1');
     });
 
     it('does not consume the strls closing tag as binary GSO content', async () => {
