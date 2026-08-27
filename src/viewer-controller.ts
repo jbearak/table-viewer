@@ -308,6 +308,8 @@ interface ViewerProfileBase {
         state: PerFileState,
         options?: ViewerSourceBuildOptions,
     ): Promise<FileSourceBuildResult>;
+    /** Prefer the file-backed reader even when a whole-file read is possible. */
+    prefer_file_source?: boolean;
     /** Sets previewMode on the meta envelope (read-only synced preview). */
     previewMode?: boolean;
     /** Called after each (re)load adopts a source — preview refreshes its line map. */
@@ -805,6 +807,7 @@ function excel_profile(file_path: string): ViewerProfile {
 function dta_profile(): ViewerProfile {
     return {
         editing: false,
+        prefer_file_source: true,
         build_source(raw, file_path) {
             return build_source_from_buffer(raw, file_path);
         },
@@ -3782,8 +3785,8 @@ export function attach_viewer(
         if (!bypassFileSizeLimit) assert_safe_file_size(stat.size, max_mib);
         const fingerprint = `${stat.mtime}:${stat.size}`;
         const use_file_backed_source = uri.scheme.toLowerCase() === 'file'
-            && stat.size > MAX_WHOLE_FILE_READ_BYTES
-            && profile.build_file_source !== undefined;
+            && profile.build_file_source !== undefined
+            && (profile.prefer_file_source || stat.size > MAX_WHOLE_FILE_READ_BYTES);
         let observation: PhysicalSourceObservation;
         let raw: Uint8Array | undefined;
         let file_backed_source: DataSource | undefined;
