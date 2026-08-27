@@ -964,6 +964,42 @@ describe('CSV reload races', () => {
         panel.dispose();
     });
 
+    it('uses a preferred file-backed source even when the Stata file is small', async () => {
+        const source = await CsvDataSource.create(enc.encode('h\na\n'), ',', 10, {
+            firstRowIsHeader: true,
+        });
+        const build_from_file = vi.fn(async () => ({
+            source,
+            digest: 'file-backed-digest',
+            size: 1_024,
+            mtime: 1,
+        }));
+        const build_from_buffer = vi.fn(async () => {
+            throw new Error('whole-file builder should not run');
+        });
+        const profile: ViewerProfile = {
+            editing: false,
+            build_source: build_from_buffer,
+            build_file_source: build_from_file,
+            prefer_file_source: true,
+        };
+        vscode_mock.__setStatImplementation(async () => ({ size: 1_024, mtime: 1 }));
+        const read = vi.fn(async () => {
+            throw new Error('whole-file read should not run');
+        });
+        vscode_mock.__setReadFileImplementation(read);
+        const panel = open_csv_table(uri('/tmp/wide.dta'), undefined, profile);
+
+        await panel.__receive({ type: 'ready' });
+        await flush_promises();
+
+        expect(build_from_file).toHaveBeenCalledOnce();
+        expect(build_from_buffer).not.toHaveBeenCalled();
+        expect(read).not.toHaveBeenCalled();
+        expect(initial_snapshots(panel)).toHaveLength(1);
+        panel.dispose();
+    });
+
     it('observes authority advancement returned by finalization without a receipt', async () => {
         const versioned = versioned_state_store();
         const base = with_in_memory_authority_transactions(versioned.store);
