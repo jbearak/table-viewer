@@ -187,6 +187,58 @@ describe('FileDtaDataSource', () => {
         expect(close).toHaveBeenCalledOnce();
     });
 
+    it('decodes large row ranges in bounded byte batches', () => {
+        const observation_bytes = 4096;
+        const count = 3000;
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'tv-dta-batches-'));
+        const data_file = path.join(directory, 'observations.dta');
+        fs.writeFileSync(data_file, Buffer.alloc(count * observation_bytes + '<data>'.length));
+        const fd = fs.openSync(data_file, 'r');
+        const decode_range = vi.fn((
+            data: Uint8Array,
+            start: number,
+            batch_count: number,
+            _column_start: number,
+            _column_end: number,
+            out: string[][],
+            out_offset: number,
+        ) => {
+            for (let index = 0; index < batch_count; index += 1) {
+                out[out_offset + index] = [`${start + index}`];
+            }
+            expect(data.byteLength).toBeLessThanOrEqual(8 * 1024 * 1024);
+        });
+        const UnsafeConstructor = FileDtaDataSource as unknown as new (
+            file: unknown,
+            file_path: string,
+        ) => FileDtaDataSource;
+        const source = new UnsafeConstructor({
+            nobs: count,
+            nvar: 1,
+            variables: [{ name: 'value' }],
+            close: () => fs.closeSync(fd),
+            _fd: fd,
+            _metadata: {
+                format_version: 117,
+                obs_length: observation_bytes,
+                section_offsets: { data: 0 },
+            },
+            _decode_rows_range: decode_range,
+        }, fixture);
+        try {
+            expect(source.read_raw_columns(0, 0, count, [0])).toMatchObject({
+                rows: Array.from({ length: count }, (_, index) => [{ raw: `${index}` }]),
+            });
+            expect(decode_range).toHaveBeenCalledTimes(2);
+            for (const [data] of decode_range.mock.calls) {
+                expect((data as Uint8Array).byteLength).toBeLessThanOrEqual(8 * 1024 * 1024);
+            }
+        } finally {
+            source.close();
+            fs.rmSync(directory, { recursive: true, force: true });
+        }
+    });
+
     it('bounds paged rows by whole-sheet rendering and transform work', () => {
         const UnsafeConstructor = FileDtaDataSource as unknown as new (
             file: unknown,

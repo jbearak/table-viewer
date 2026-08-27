@@ -893,39 +893,51 @@ export class FileDtaDataSource implements DataSource {
         const { obs_length, format_version, section_offsets } = this.reader._metadata;
         const data_start = section_offsets.data
             + (is_legacy_format(format_version) ? 0 : MODERN_DATA_TAG_BYTES);
-        const position = data_start + start * obs_length;
-        const byte_length = count * obs_length;
         if (
-            !Number.isSafeInteger(position)
-            || !Number.isSafeInteger(byte_length)
-            || position < 0
-            || byte_length < 0
+            !Number.isSafeInteger(data_start)
+            || data_start < 0
         ) {
             throw new Error('Invalid Stata observation range');
         }
-        const data = Buffer.allocUnsafe(byte_length);
-        let bytes_read = 0;
-        while (bytes_read < byte_length) {
-            const read = fs.readSync(
-                fd,
-                data,
-                bytes_read,
-                byte_length - bytes_read,
-                position + bytes_read,
-            );
-            if (read === 0) throw new Error('Unexpected EOF while reading Stata observations');
-            bytes_read += read;
-        }
         const rows = new Array<Row>(count);
-        this.reader._decode_rows_range(
-            data,
-            start,
-            count,
-            column_start,
-            column_end,
-            rows,
-            0,
-        );
+        const rows_per_batch = obs_length === 0
+            ? count
+            : Math.max(1, Math.floor(MAX_ASYNC_READ_BYTES / obs_length));
+        for (let offset = 0; offset < count; offset += rows_per_batch) {
+            const batch_count = Math.min(rows_per_batch, count - offset);
+            const position = data_start + (start + offset) * obs_length;
+            const byte_length = batch_count * obs_length;
+            if (
+                !Number.isSafeInteger(position)
+                || !Number.isSafeInteger(byte_length)
+                || position < 0
+                || byte_length < 0
+            ) {
+                throw new Error('Invalid Stata observation range');
+            }
+            const data = Buffer.allocUnsafe(byte_length);
+            let bytes_read = 0;
+            while (bytes_read < byte_length) {
+                const read = fs.readSync(
+                    fd,
+                    data,
+                    bytes_read,
+                    byte_length - bytes_read,
+                    position + bytes_read,
+                );
+                if (read === 0) throw new Error('Unexpected EOF while reading Stata observations');
+                bytes_read += read;
+            }
+            this.reader._decode_rows_range(
+                data,
+                start + offset,
+                batch_count,
+                column_start,
+                column_end,
+                rows,
+                offset,
+            );
+        }
         return rows;
     }
 
