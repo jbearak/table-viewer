@@ -6,12 +6,12 @@ lives primarily in `src/data-source/dta-source.ts`, with the indexed raw-read
 contract in `src/data-source/interface.ts` and comparison changes in
 `src/diff-compare/`.
 
-## Parser 0.5 encoding parity and retained workarounds
+## Parser 0.6 encoding parity and retained workarounds
 
 `DtaDataSource.create` passes explicit text-encoding options through to
-`@jbearak/dta-parser` 0.5.0 and resolves one source encoding from
+`@jbearak/dta-parser` 0.6.0 and resolves one source encoding from
 `metadata.text_encoding ?? resolve_text_encoding(metadata.format_version)`.
-Parser 0.5 now owns fixed-string observation decoding for every supported
+The parser owns fixed-string observation decoding for every supported
 release, so the source consumes those strings directly instead of rereading and
 redecoding pre-118 observation bytes. Synchronous nonbinary GSO decoding also
 delegates to `decode_gso_entry` with that resolved encoding. Large text `strL`
@@ -24,14 +24,14 @@ ISO-8859-1 is decoded directly as byte-to-code-point mapping. The Web
 Windows-1252; byte `0x80` must remain U+0080 under true ISO-8859-1 and become
 `€` only under Windows-1252.
 
-The local release-aware legacy expansion-field pre-scan remains. Parser 0.5
+The local release-aware legacy expansion-field pre-scan remains. The parser
 rejects malformed fields, but it does not impose a host-work bound on long
 sequences of valid zero-length fields, so the source caps expansion fields at
-10,000 before metadata parsing. The release-119 pointer shim also remains:
-parser 0.5 uses a 2+6-byte layout for every non-117 pointer, while release 119
-requires 3+5 bytes. Upstream GSO indexing and value-label parsing consume whole
-sections synchronously, so the source retains its bounded lazy GSO scanner and
-selective, cancellable value-label discovery and decoding.
+10,000 before metadata parsing. Parser 0.6 owns release 117, 118, and 119 `strL`
+pointer decoding, so the release-119 pointer shim has been removed. Upstream GSO
+indexing and value-label parsing consume whole sections synchronously, so the
+source retains its bounded lazy GSO scanner and selective, cancellable
+value-label discovery and decoding.
 
 ## Indexed asynchronous raw reads
 

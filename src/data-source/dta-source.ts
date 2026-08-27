@@ -1456,13 +1456,12 @@ export class DtaDataSource implements DataSource {
         for (const row of rows) {
             const row_base = this.data_start + row * this.metadata.obs_length;
             for (const variable of this.strl_variables) {
-                const pointer = read_strl_cell_pointer(
+                const pointer = read_strl_pointer(
                     view,
                     this.metadata,
                     row_base + variable.byte_offset,
                 );
                 if (pointer === null) continue;
-                validate_gso_identifier(pointer.v, pointer.o, this.metadata, 'strL pointer');
                 const key = gso_key(pointer.v, pointer.o);
                 if (!targets.has(key)) {
                     targets.set(key, {
@@ -1506,7 +1505,7 @@ export class DtaDataSource implements DataSource {
             const cell_base = row_offset * columns.length;
             for (const { index, variable } of strl_columns) {
                 const cell_index = cell_base + index;
-                const pointer = read_strl_cell_pointer(
+                const pointer = read_strl_pointer(
                     view,
                     this.metadata,
                     row_base + variable.byte_offset,
@@ -1515,7 +1514,6 @@ export class DtaDataSource implements DataSource {
                     cells[cell_index] = '';
                     continue;
                 }
-                validate_gso_identifier(pointer.v, pointer.o, this.metadata, 'strL pointer');
                 const key = gso_key(pointer.v, pointer.o);
                 const prefetched = prefetched_gsos?.get(key);
                 let target = prefetched ?? targets.get(key);
@@ -1735,7 +1733,7 @@ export class DtaDataSource implements DataSource {
             observation = view.getUint32(position + 4, false);
             position += 8;
         }
-        validate_gso_identifier(variable, observation, this.metadata, 'strL object');
+        validate_gso_object_identifier(variable, observation, this.metadata);
         const type = bytes[position++];
         const content_length = view.getUint32(position, little_endian);
         position += 4;
@@ -2855,38 +2853,10 @@ function validate_legacy_expansion_fields(buffer: ArrayBuffer): void {
     }
 }
 
-/** dta-parser 0.5 fixes release 118's 2+6-byte pointer, but still applies that
- * layout to release 119. Keep the 3+5 override until the upstream helper
- * handles release 119, then delegate every release to read_strl_pointer. */
-function read_strl_cell_pointer(
-    view: DataView,
-    metadata: DtaMetadata,
-    pointer_offset: number,
-): { v: number; o: number } | null {
-    if (metadata.format_version !== 119) {
-        return read_strl_pointer(view, metadata, pointer_offset);
-    }
-    const little_endian = metadata.byte_order === 'LSF';
-    const variable = little_endian
-        ? view.getUint16(pointer_offset, true)
-            + view.getUint8(pointer_offset + 2) * 0x1_0000
-        : view.getUint8(pointer_offset) * 0x1_0000
-            + view.getUint16(pointer_offset + 1, false);
-    const observation = little_endian
-        ? view.getUint32(pointer_offset + 3, true)
-            + view.getUint8(pointer_offset + 7) * 0x1_0000_0000
-        : view.getUint8(pointer_offset + 3) * 0x1_0000_0000
-            + view.getUint32(pointer_offset + 4, false);
-    return variable === 0 && observation === 0
-        ? null
-        : { v: variable, o: observation };
-}
-
-function validate_gso_identifier(
+function validate_gso_object_identifier(
     variable: number,
     observation: number,
     metadata: DtaMetadata,
-    source: 'strL pointer' | 'strL object',
 ): void {
     if (
         !Number.isInteger(variable)
@@ -2897,13 +2867,13 @@ function validate_gso_identifier(
         || observation > metadata.nobs
     ) {
         throw new Error(
-            `Corrupt .dta file: ${source} id (${variable}, ${observation}) is outside `
+            `Corrupt .dta file: strL object id (${variable}, ${observation}) is outside `
             + `the dataset range (1..${metadata.nvar}, 1..${metadata.nobs})`,
         );
     }
     if (metadata.variables[variable - 1].type !== 'strL') {
         throw new Error(
-            `Corrupt .dta file: ${source} variable ${variable} is not strL`,
+            `Corrupt .dta file: strL object variable ${variable} is not strL`,
         );
     }
 }

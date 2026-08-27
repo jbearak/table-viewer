@@ -143,7 +143,14 @@ describe('FileDtaDataSource', () => {
 
     it('accepts paged datasets beyond the eager worksheet row budget', () => {
         const close = vi.fn();
-        const read_range = vi.fn(() => [['tail']]);
+        const decode_range = vi.fn((
+            _data: Uint8Array,
+            _start: number,
+            _count: number,
+            _column_start: number,
+            _column_end: number,
+            out: string[][],
+        ) => { out[0] = ['tail']; });
         const UnsafeConstructor = FileDtaDataSource as unknown as new (
             file: unknown,
             file_path: string,
@@ -154,8 +161,12 @@ describe('FileDtaDataSource', () => {
             variables: [{ name: 'value' }],
             close,
             _fd: 1,
-            _metadata: { obs_length: 1 },
-            _read_rows_range: read_range,
+            _metadata: {
+                format_version: 118,
+                obs_length: 0,
+                section_offsets: { data: 0 },
+            },
+            _decode_rows_range: decode_range,
         }, fixture);
 
         expect(source.meta().sheets[0].rowCount).toBe(1_274_250);
@@ -163,7 +174,15 @@ describe('FileDtaDataSource', () => {
             startRow: 1_274_249,
             rows: [[{ raw: 'tail' }]],
         });
-        expect(read_range).toHaveBeenCalledWith(1_274_249, 1, 0, 1);
+        expect(decode_range).toHaveBeenCalledWith(
+            expect.any(Uint8Array),
+            1_274_249,
+            1,
+            0,
+            1,
+            expect.any(Array),
+            0,
+        );
         source.close();
         expect(close).toHaveBeenCalledOnce();
     });

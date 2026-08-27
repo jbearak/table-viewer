@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import {
     DtaFile,
     apply_display_format,
+    is_legacy_format,
     is_missing_value_object,
     missing_type_to_label_key,
     type DtaMetadata,
@@ -52,6 +53,7 @@ const MAX_ASYNC_READ_BYTES = 8 * 1024 * 1024;
 const MAX_ASYNC_READ_CELLS = 64 * 1024;
 const MAX_ASYNC_READ_ROWS = 128;
 const MAX_COLUMN_RUNS_PER_READ = 8;
+const MODERN_DATA_TAG_BYTES = '<data>'.length;
 
 interface PreflightDta {
     readonly fd: number;
@@ -96,19 +98,22 @@ export function assert_file_backed_dta_layout(
 interface SynchronousDtaFileReader {
     readonly _fd: number | null;
     readonly _metadata: DtaMetadata;
-    _read_rows_range(
+    _decode_rows_range(
+        dataBuffer: ArrayBuffer | Uint8Array,
         start: number,
         count: number,
-        columnStart?: number,
-        columnEnd?: number,
-    ): Row[];
+        columnStart: number,
+        columnEnd: number,
+        out: Row[],
+        outOffset: number,
+    ): void;
 }
 
 function require_synchronous_dta_file_reader(file: DtaFile): SynchronousDtaFileReader {
     const candidate = file as unknown as {
         readonly _fd?: unknown;
         readonly _metadata?: unknown;
-        readonly _read_rows_range?: unknown;
+        readonly _decode_rows_range?: unknown;
     };
     const metadata = candidate._metadata;
     if (
@@ -121,7 +126,16 @@ function require_synchronous_dta_file_reader(file: DtaFile): SynchronousDtaFileR
         || typeof metadata.obs_length !== 'number'
         || !Number.isSafeInteger(metadata.obs_length)
         || metadata.obs_length < 0
-        || typeof candidate._read_rows_range !== 'function'
+        || !('format_version' in metadata)
+        || typeof metadata.format_version !== 'number'
+        || !('section_offsets' in metadata)
+        || metadata.section_offsets === null
+        || typeof metadata.section_offsets !== 'object'
+        || !('data' in metadata.section_offsets)
+        || typeof metadata.section_offsets.data !== 'number'
+        || !Number.isSafeInteger(metadata.section_offsets.data)
+        || metadata.section_offsets.data < 0
+        || typeof candidate._decode_rows_range !== 'function'
     ) {
         throw new Error(
             'Installed @jbearak/dta-parser does not expose the required '
@@ -492,10 +506,11 @@ export class FileDtaDataSource implements DataSource {
             );
         }
         // DtaFile's public read_rows method is Promise-shaped so large scans can
-        // opt into cancellation, but its bounded range primitive is synchronous.
-        // The grid's DataSource contract is synchronous for visible pages, so use
-        // that primitive here and the public metadata/value-label API everywhere
-        // else. This adapter is pinned to the parser version in package-lock.json.
+        // opt into cancellation, but its chunk decoder is synchronous. The grid's
+        // DataSource contract is synchronous for visible pages, so read bounded
+        // observation bytes from DtaFile's descriptor and pass that chunk through
+        // the same decoder used by its public row path. This adapter is pinned to
+        // the parser version in package-lock.json.
         this.reader = require_synchronous_dta_file_reader(file);
         this.all_column_indices = file.variables.map((_, index) => index);
         this._meta = {
@@ -849,7 +864,7 @@ export class FileDtaDataSource implements DataSource {
             () => new Array<RenderedCell | RawCell | null>(columns.length),
         );
         for (const { first, last } of runs) {
-            const rows = this.reader._read_rows_range(start, count, first, last);
+            const rows = this.decode_rows_range(start, count, first, last);
             rows.forEach((row, row_index) => {
                 for (let column = first; column < last; column += 1) {
                     const requested_positions = positions.get(column);
@@ -865,6 +880,53 @@ export class FileDtaDataSource implements DataSource {
             });
         }
         return output;
+    }
+
+    private decode_rows_range(
+        start: number,
+        count: number,
+        column_start: number,
+        column_end: number,
+    ): Row[] {
+        const fd = this.reader._fd;
+        if (fd === null) throw new Error('Stata source is closed');
+        const { obs_length, format_version, section_offsets } = this.reader._metadata;
+        const data_start = section_offsets.data
+            + (is_legacy_format(format_version) ? 0 : MODERN_DATA_TAG_BYTES);
+        const position = data_start + start * obs_length;
+        const byte_length = count * obs_length;
+        if (
+            !Number.isSafeInteger(position)
+            || !Number.isSafeInteger(byte_length)
+            || position < 0
+            || byte_length < 0
+        ) {
+            throw new Error('Invalid Stata observation range');
+        }
+        const data = Buffer.allocUnsafe(byte_length);
+        let bytes_read = 0;
+        while (bytes_read < byte_length) {
+            const read = fs.readSync(
+                fd,
+                data,
+                bytes_read,
+                byte_length - bytes_read,
+                position + bytes_read,
+            );
+            if (read === 0) throw new Error('Unexpected EOF while reading Stata observations');
+            bytes_read += read;
+        }
+        const rows = new Array<Row>(count);
+        this.reader._decode_rows_range(
+            data,
+            start,
+            count,
+            column_start,
+            column_end,
+            rows,
+            0,
+        );
+        return rows;
     }
 
     private render_cell(cell: RowCell, column: number): RenderedCell {
