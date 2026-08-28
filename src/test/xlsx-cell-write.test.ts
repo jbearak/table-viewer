@@ -223,6 +223,32 @@ describe('apply_cell_edits', () => {
         expect(out).toContain('<c r="I5"><f>E5*F5</f><v>58.5</v></c>');
     });
 
+    it('writes an entered formula instead of a literal string', () => {
+        const out = apply_cell_edits(
+            doc('<row r="5"><c r="I5" s="16"><f>E5*F5</f><v>58.5</v></c></row>'),
+            [{ row: 4, col: 8, value: '=E5*F5+1' }],
+            OPTS,
+        );
+        expect(out).toContain('<c r="I5" s="16"><f>E5*F5+1</f></c>');
+        expect(out).not.toContain('&equals;');
+        expect(out).not.toContain('inlineStr');
+    });
+
+    it('writes an edited shared follower as an explicit formula', () => {
+        const out = apply_cell_edits(
+            doc(
+                '<row r="2"><c r="I2"><f t="shared" ref="I2:I15" si="0">E2*F2</f><v>2</v></c></row>'
+                + '<row r="5"><c r="I5" s="16"><f t="shared" si="0"/><v>58.5</v></c></row>'
+                + '<row r="6"><c r="I6"><f t="shared" si="0"/><v>65.78</v></c></row>',
+            ),
+            [{ row: 4, col: 8, value: '=E5*F5+1' }],
+            OPTS,
+        );
+        expect(out).toContain('<c r="I5" s="16"><f>E5*F5+1</f></c>');
+        expect(out).toContain('<f t="shared" ref="I2:I15" si="0">E2*F2</f>');
+        expect(out).toContain('<c r="I6"><f t="shared" si="0"/><v>65.78</v></c>');
+    });
+
     it('refuses an array-formula cell', () => {
         expect(() => apply_cell_edits(
             doc('<row r="1"><c r="A1"><f t="array" ref="A1:B1">SUM(C1:D1)</f><v>3</v></c></row>'),
@@ -2356,6 +2382,24 @@ describe('write_xlsx_cell_edits', () => {
 
             const out = write_xlsx_cell_edits(raw, 2, [{ row: 1, col: 1, value: '42' }]);
 
+            expect(part(out, '/xl/calcChain.xml')).toBeNull();
+            expect(text_part(out, '/[Content_Types].xml')).not.toContain('/xl/calcChain.xml');
+            expect(text_part(out, '/xl/_rels/workbook.xml.rels')).not.toContain('calcChain.xml');
+        });
+
+        it('is detached completely when an edit changes a formula', () => {
+            const raw = with_calc_chain(
+                with_formula_at_b2(readFileSync(SAMPLE)),
+            );
+
+            const out = write_xlsx_cell_edits(raw, 2, [{
+                row: 1,
+                col: 1,
+                value: '=1+2',
+            }]);
+
+            expect(text_part(out, '/xl/worksheets/sheet3.xml'))
+                .toContain('<c r="B2"><f>1+2</f></c>');
             expect(part(out, '/xl/calcChain.xml')).toBeNull();
             expect(text_part(out, '/[Content_Types].xml')).not.toContain('/xl/calcChain.xml');
             expect(text_part(out, '/xl/_rels/workbook.xml.rels')).not.toContain('calcChain.xml');

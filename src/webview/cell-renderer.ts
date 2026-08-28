@@ -475,6 +475,15 @@ export function build_grid_cell(
 ): GridCell {
     const c = cells?.[col];
     if (!c && !overlay) return BLANK;
+    // A formula cell paints its cached result, but editing is an operation on
+    // the formula itself. Supplying edit_value leaves displayData and copyData
+    // on the result while Glide's overlay opens with the leading `=` formula.
+    const effective_overlay = c?.formula !== undefined
+        && overlay?.editable
+        && overlay.dirty_value === undefined
+        && overlay.edit_value === undefined
+        ? { ...overlay, edit_value: c.formula }
+        : overlay;
     // Rich *text styling* is a Formatting-on display concern, like bold/italic
     // on the Text path; the hyperlink presentation (link color, underline,
     // pointer) is semantic and survives the toggle. Either way the rich
@@ -495,12 +504,12 @@ export function build_grid_cell(
         return rich_cell(
             c ?? EMPTY_CELL,
             show_formatting,
-            overlay,
+            effective_overlay,
             font_size_px,
             soft_wrap,
             link_modifier_held,
             diff_colors,
         );
     }
-    return text_cell(c ?? EMPTY_CELL, show_formatting, overlay, font_size_px, soft_wrap);
+    return text_cell(c ?? EMPTY_CELL, show_formatting, effective_overlay, font_size_px, soft_wrap);
 }

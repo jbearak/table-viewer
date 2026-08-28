@@ -36,6 +36,7 @@ import {
     type ParsedXlsxString,
 } from './xlsx-rich-text';
 import { parse_relationships, rels_path_for_part, type OoxmlRelationship } from './ooxml-relationships';
+import { translate_a1_formula } from './xlsx-formula';
 
 // The XML scanning primitives live in ./ooxml-xml so the rich-text and
 // hyperlink parsers (and the writer) share the exact same scans.
@@ -52,9 +53,11 @@ import {
     find_first_element,
     find_tag_end,
     get_tag_attr,
+    ignorable_ranges,
     index_of_bytes,
     is_self_closing,
     is_tag_boundary,
+    live_tags,
     scan_rows,
     utf8_text,
     worksheet_scan_input,
@@ -527,6 +530,63 @@ function parse_worksheet_core(
 
     const sheet_data = find_first_element(xml, 'sheetData');
     if (sheet_data) {
+        const shared_formulas = new Map<
+            string,
+            { readonly row: number; readonly col: number; readonly text: string }
+        >();
+        // Followers contain no formula text, so collect their masters before the
+        // normal cell pass. Avoid doubling the cell scan for worksheets without a
+        // live shared formula; large sheets commonly contain the word "shared" in
+        // cell text, comments, or extension metadata.
+        let has_shared_formula = false;
+        const has_shared_value = index_of_bytes(
+            xml,
+            '"shared"',
+            sheet_data.inner_start,
+            sheet_data.inner_end,
+        ) !== -1 || index_of_bytes(
+            xml,
+            "'shared'",
+            sheet_data.inner_start,
+            sheet_data.inner_end,
+        ) !== -1;
+        if (has_shared_value) {
+            const formula_ignorable = ignorable_ranges(
+                xml,
+                sheet_data.inner_start,
+                sheet_data.inner_end,
+            );
+            for (const tag of live_tags(
+                xml,
+                'f',
+                sheet_data.inner_start,
+                sheet_data.inner_end,
+                formula_ignorable,
+            )) {
+                if (get_tag_attr(xml, tag.start, tag.end, 't') !== 'shared') continue;
+                has_shared_formula = true;
+                break;
+            }
+        }
+        if (has_shared_formula) {
+            scan_rows(xml, sheet_data.inner_start, sheet_data.inner_end, {
+                on_cell: (row, col, cell_span) => {
+                    const formula = find_first_element(
+                        xml,
+                        'f',
+                        cell_span.inner_start,
+                        cell_span.inner_end,
+                    );
+                    if (!formula) return;
+                    const type = get_tag_attr(xml, formula.start, formula.inner_start, 't');
+                    const reference = get_tag_attr(xml, formula.start, formula.inner_start, 'ref');
+                    const shared_index = get_tag_attr(xml, formula.start, formula.inner_start, 'si');
+                    if (type !== 'shared' || reference === null || shared_index === null) return;
+                    const text = decode_xml(utf8_text(xml, formula.inner_start, formula.inner_end));
+                    if (text !== '') shared_formulas.set(shared_index, { row, col, text });
+                },
+            });
+        }
         scan_rows(xml, sheet_data.inner_start, sheet_data.inner_end, {
             on_cell: (row, col, cell_span) => {
                 if (row + 1 > max_row) max_row = row + 1;
@@ -548,6 +608,39 @@ function parse_worksheet_core(
                 let formatted = '';
                 let rawType: CellData['rawType'];
                 let richText: RichText | undefined;
+                let effective_formula: string | undefined;
+
+                const formula = find_first_element(
+                    xml,
+                    'f',
+                    cell_span.inner_start,
+                    cell_span.inner_end,
+                );
+                if (formula) {
+                    const type = get_tag_attr(xml, formula.start, formula.inner_start, 't');
+                    const reference = get_tag_attr(xml, formula.start, formula.inner_start, 'ref');
+                    const text = decode_xml(utf8_text(xml, formula.inner_start, formula.inner_end));
+                    if (type === 'shared' && reference === null) {
+                        const shared_index = get_tag_attr(
+                            xml,
+                            formula.start,
+                            formula.inner_start,
+                            'si',
+                        );
+                        const master = shared_index === null
+                            ? undefined
+                            : shared_formulas.get(shared_index);
+                        if (master) {
+                            effective_formula = '=' + translate_a1_formula(
+                                master.text,
+                                row - master.row,
+                                col - master.col,
+                            );
+                        }
+                    } else if (text !== '') {
+                        effective_formula = `=${text}`;
+                    }
+                }
 
                 if (t === 's') {
                     // Shared string (already decoded during SST parsing)
@@ -617,7 +710,18 @@ function parse_worksheet_core(
                     }
                 }
 
-                const cell: CellData = { raw, formatted, rawType, ...style };
+                if (effective_formula !== undefined && raw === null) {
+                    raw = effective_formula;
+                    formatted = effective_formula;
+                    rawType = 'string';
+                }
+                const cell: CellData = {
+                    raw,
+                    formatted,
+                    rawType,
+                    ...(effective_formula !== undefined ? { formula: effective_formula } : {}),
+                    ...style,
+                };
                 if (number_format) cell.numberFormat = number_format;
                 if (t === 'd') cell.xlsxIsoDate = true;
                 if (richText) cell.richText = richText;

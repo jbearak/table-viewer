@@ -272,7 +272,7 @@ export function write_xlsx_workbook_cell_edits(
     const parts = worksheet_part_paths_from_package(zip);
     const { is_date_style, cell_font_style, run_font_base } = read_style_write_context(zip);
     const datemode = read_datemode(zip);
-    let removed_formula = false;
+    let calculation_chain_stale = false;
     const replacements: Array<
         | { path: string; bytes: Uint8Array }
         | { path: string; text: string; created?: boolean }
@@ -310,7 +310,7 @@ export function write_xlsx_workbook_cell_edits(
                 created: rels_xml === null,
             });
         }
-        removed_formula ||= result.formula_removed;
+        calculation_chain_stale ||= result.calculation_chain_stale;
         replacements.push({ path, bytes: result.worksheet_xml });
     }
 
@@ -327,7 +327,7 @@ export function write_xlsx_workbook_cell_edits(
             : write_part_text(zip, replacement.path, replacement.text);
         if (!written) throw new Error('Could not update a worksheet to save');
     }
-    if (removed_formula) remove_part(zip, '/xl/calcChain.xml');
+    if (calculation_chain_stale) remove_part(zip, '/xl/calcChain.xml');
 
     // `xl/sharedStrings.xml` is deliberately not touched, including its `count`.
     // Values are written inline, so no shared-string table entry changes.

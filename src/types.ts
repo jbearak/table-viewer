@@ -53,6 +53,8 @@ export interface SheetData {
 export interface CellData extends RichCellFields, XlsxCellFormatFields {
     raw: string | number | boolean | null;
     formatted: string;
+    /** Effective A1 formula, including the leading `=` used by the editor. */
+    formula?: string;
     bold: boolean;
     italic: boolean;
     rawType?: 'string' | 'number' | 'boolean' | 'date' | 'empty';

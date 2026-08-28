@@ -42,6 +42,13 @@ describe('cell_edit_text', () => {
         // A plain cell's markdown is its text with literals escaped.
         expect(cell_edit_text({ raw: '2*3' }, 'markdown')).toBe('2\\*3');
     });
+
+    it('uses a formula as the edit text and conflict base', () => {
+        const cell = { raw: '58.5', formula: '=E5*F5' };
+        expect(cell_edit_text(cell, 'markdown')).toBe('=E5*F5');
+        expect(cell_edit_base(cell)).toEqual({ text: '=E5*F5' });
+        expect(parse_cell_edit('=E5*F5', 'markdown')).toEqual({ text: '=E5*F5' });
+    });
 });
 
 describe('parse_cell_edit / cell_edits_equal', () => {

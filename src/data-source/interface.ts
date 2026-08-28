@@ -37,6 +37,8 @@ export interface RenderedCell extends
     DeferredIdentityFields {
     raw: string | null;       // null = empty cell
     formatted: string;        // display text (== raw for CSV)
+    /** Effective A1 formula, including the leading `=` used by the editor. */
+    formula?: string;
     bold: boolean;
     italic: boolean;
     /** Original scalar category retained for correct numeric sorting. */

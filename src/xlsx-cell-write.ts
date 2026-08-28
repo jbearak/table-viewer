@@ -121,6 +121,14 @@ function encode_xml(s: string): string {
     );
 }
 
+/** A user-entered XLSX formula. CSV/TSV never call this writer. */
+function is_formula_edit(edit: XlsxCellEdit): boolean {
+    return edit.force_text !== true
+        && edit.runs === undefined
+        && edit.value.startsWith('=')
+        && edit.value.length > 1;
+}
+
 /** Convert a 0-based column index to its letter form (0 → A, 26 → AA). */
 export function col_index_to_letter(index: number): string {
     let n = index + 1;
@@ -192,6 +200,9 @@ function build_cell_xml(
     const { value } = edit;
     const ref = `${col_index_to_letter(col)}${row + 1}`;
     const style_attr = xf_index !== null && xf_index !== 0 ? ` s="${xf_index}"` : '';
+    if (is_formula_edit(edit)) {
+        return `<c r="${ref}"${style_attr}><f>${encode_xml(value.slice(1))}</f></c>`;
+    }
     // A rich edit whose runs still carry styling beyond the cell's own font is
     // written as a rich inline string — checked ahead of the scalar paths
     // because styled text is text: `**2024-01-15**` must not become a serial.
@@ -337,9 +348,9 @@ const CELL_RANGE_RE = /^([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?$/;
  * per-cell check below cannot see them, and an edit to one would drop a member
  * of the group without ever meeting a formula. Shared followers do carry an
  * `<f>`, but the range check also catches sparse or missing follower cells.
- * Although OOXML permits a literal override inside a shared range, Table Viewer
- * shows the cached result rather than the formula. Allowing that override would
- * let a user unknowingly replace a calculated cell with a fixed value.
+ * A normal formula can override one shared follower without changing the other
+ * members. Literal replacement remains refused here: this writer only detaches
+ * a shared follower when the edit is unambiguously another formula.
  *
  * Kept as bounds rather than expanded into a set of coordinates: a `ref` is
  * whatever the writing application put there, and a whole-column or
@@ -404,21 +415,32 @@ function grouped_range_kind(
 /**
  * The group kind when the cell's own `<f>` belongs to a multi-cell group.
  *
- * Shared masters and followers both count. Even though OOXML permits replacing
- * one follower, the grid does not expose the formula and must not silently turn
- * its displayed result into a fixed value.
+ * Shared masters and followers both count. A follower can safely override its
+ * master with a normal formula; editing the master itself would change or orphan
+ * every follower, so it remains a grouped edit that this writer refuses.
  */
+interface GroupedCellFormula {
+    readonly kind: GroupedFormulaKind;
+    readonly shared_master: boolean;
+}
+
 function grouped_formula_kind(
     xml: Uint8Array,
     from: number,
     to: number,
-): GroupedFormulaKind | null {
+): GroupedCellFormula | null {
     // Only the cell's *live* `<f>`: an array formula quoted in a comment inside an
     // ordinary cell refused a literal edit that was never part of a group.
     const ignorable = ignorable_ranges(xml, from, to);
     for (const tag of live_tags(xml, 'f', from, to, ignorable)) {
         const kind = get_tag_attr(xml, tag.start, tag.end, 't');
-        return is_grouped_formula_kind(kind) ? kind : null;
+        return is_grouped_formula_kind(kind)
+            ? {
+                kind,
+                shared_master: kind === 'shared'
+                    && get_tag_attr(xml, tag.start, tag.end, 'ref') !== null,
+            }
+            : null;
     }
     return null;
 }
@@ -1146,7 +1168,9 @@ function apply_cell_edits_bytes(
     const merged = merged_follower_ranges(xml);
     for (const e of edits) {
         const grouped = grouped_range_kind(grouped_ranges, e.row, e.col);
-        if (grouped) throw grouped_formula_error(e.row, e.col, grouped);
+        if (grouped && !(grouped === 'shared' && is_formula_edit(e))) {
+            throw grouped_formula_error(e.row, e.col, grouped);
+        }
         // Same sweep, same reason: a merged follower usually has no `<c>` of its
         // own, so nothing downstream would ever meet it.
         if (is_merged_follower(merged, e.row, e.col)) {
@@ -1192,15 +1216,20 @@ function apply_cell_edits_bytes(
                 // behavior, where writing a value replaces the formula.
                 //
                 // Grouped formulas are different. Replacing a master can break
-                // other cells. Replacing a shared follower is legal OOXML, but the
-                // grid only showed its cached result, so accepting the edit would
-                // silently turn a formula into a fixed value.
+                // other cells. A shared follower may be detached only by an
+                // explicit formula edit; literals remain refused.
                 const grouped = grouped_formula_kind(
                     xml,
                     cell_span.inner_start,
                     cell_span.inner_end,
                 );
-                if (grouped) throw grouped_formula_error(e.row, e.col, grouped);
+                if (grouped && !(
+                    grouped.kind === 'shared'
+                    && !grouped.shared_master
+                    && is_formula_edit(e)
+                )) {
+                    throw grouped_formula_error(e.row, e.col, grouped.kind);
+                }
                 const cell_open_tag = opening_tag_text(xml, cell_span);
                 const xf = existing_style(cell_open_tag);
                 const existing_type = get_attr(cell_open_tag, 't');

@@ -162,6 +162,20 @@ describe('build_grid_cell — edit overlay (CSV edit mode)', () => {
         expect((c as { allowOverlay: boolean }).allowOverlay).toBe(true);
     });
 
+    it('opens a formula cell with its formula while displaying its result', () => {
+        const formula_cell = {
+            ...rc('58.5'),
+            formula: '=E5*F5',
+        } as RenderedCell & { formula: string };
+        const c = build_grid_cell(0, [formula_cell], true, { editable: true });
+
+        expect(c).toMatchObject({
+            data: '=E5*F5',
+            displayData: '58.5',
+            allowOverlay: true,
+        });
+    });
+
     it('stays read-only (allowOverlay false) with no overlay', () => {
         const c = build_grid_cell(1, plain_rows, true);
         expect((c as { allowOverlay: boolean }).allowOverlay).toBe(false);

@@ -70,10 +70,20 @@ export function apply_worksheet_edits(request: WorksheetEditRequest): WorksheetE
         relationships_xml = result.rels_xml;
     }
 
+    const formula_removed = cell_edits.length > 0
+        && formula_count(worksheet_xml) < formula_count(request.worksheet_xml);
     return {
         worksheet_xml,
         relationships_xml,
-        formula_removed: cell_edits.length > 0
-            && formula_count(worksheet_xml) < formula_count(request.worksheet_xml),
+        formula_removed,
+        calculation_chain_stale: cell_edits.length > 0 && (
+            formula_removed
+            || cell_edits.some((edit) => (
+                edit.force_text !== true
+                && edit.runs === undefined
+                && edit.value.startsWith('=')
+                && edit.value.length > 1
+            ))
+        ),
     };
 }

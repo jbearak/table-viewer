@@ -68,6 +68,43 @@ function build_test_xlsx(sheet_xml: string, opts?: { styles_xml?: string; sst_xm
 }
 
 describe('parse_xlsx', () => {
+    it('exposes the effective formula for a shared-formula follower', async () => {
+        const sheet = `<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="E2:I5"/>
+  <sheetData>
+    <row r="2">
+      <c r="I2"><f t="shared" ref="I2:I5" si="0">E2*F2</f><v>2</v></c>
+    </row>
+    <row r="5">
+      <c r="I5"><f t="shared" si="0"/><v>58.5</v></c>
+    </row>
+  </sheetData>
+</worksheet>`;
+        const bytes = build_test_xlsx(sheet);
+        const { data } = await parse_xlsx(bytes);
+
+        expect(data.sheets[0].rows[1][8]).toMatchObject({
+            raw: 2,
+            formula: '=E2*F2',
+        });
+        expect(data.sheets[0].rows[4][8]).toMatchObject({
+            raw: 58.5,
+            formula: '=E5*F5',
+        });
+
+        const streaming = await parse_xlsx_streaming(bytes);
+        const builder = new ColumnarStore.Builder(
+            streaming.sheets[0].rowCount,
+            streaming.sheets[0].columnCount,
+        );
+        streaming.sheets[0].fill(builder);
+        expect(builder.build().read_window(4, 1)[0][8]).toMatchObject({
+            raw: '58.5',
+            formula: '=E5*F5',
+        });
+    });
+
     it('exposes the OOXML sheetId as worksheet identity', async () => {
         const sheet = `<?xml version="1.0" encoding="UTF-8"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">

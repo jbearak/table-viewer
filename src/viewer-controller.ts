@@ -637,7 +637,7 @@ function harvest_source_bases(
                 const cell_key = `${entry.source_row}:${col}`;
                 observed_bases.set(
                     cell_key,
-                    get_raw_cell_text(cell?.raw ?? null),
+                    cell === null ? '' : cell_edit_base(cell).text,
                 );
                 if (cell !== null) {
                     const rich = cell_edit_base(cell).rich;

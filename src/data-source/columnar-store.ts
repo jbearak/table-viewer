@@ -12,6 +12,7 @@ const TYPE_STRING = 1, TYPE_NUMBER = 2, TYPE_BOOLEAN = 3, TYPE_EMPTY = 4, TYPE_D
 interface CellExtras {
     richText?: RichText;
     hyperlink?: CellHyperlink;
+    formula?: string;
 }
 
 export class ColumnarStore {
@@ -114,6 +115,7 @@ export class ColumnarStore {
             const extras = this.extras.get(index);
             if (extras?.richText) cell.richText = extras.richText;
             if (extras?.hyperlink) cell.hyperlink = extras.hyperlink;
+            if (extras?.formula) cell.formula = extras.formula;
         }
         return cell;
     }
@@ -173,12 +175,13 @@ export class ColumnarStore {
             }
             if (cell.xlsxIsoDate) flags |= XLSX_ISO_DATE;
             this.types[i] = encode_type(cell.rawType);
-            if (cell.richText || cell.hyperlink) {
+            if (cell.richText || cell.hyperlink || cell.formula) {
                 // Stored by reference: the parser hands over immutable objects
                 // (shared across cells that reuse one rich shared string).
                 const extras: CellExtras = {};
                 if (cell.richText) extras.richText = cell.richText;
                 if (cell.hyperlink) extras.hyperlink = cell.hyperlink;
+                if (cell.formula) extras.formula = cell.formula;
                 this.extras.set(i, extras);
                 flags |= HAS_EXTRAS;
             }

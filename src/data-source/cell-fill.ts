@@ -100,6 +100,7 @@ function fill_store(working: WorkingSet, sink: CellSink): void {
             const rendered: RenderedCell = {
                 raw: cell.raw === null ? '' : String(cell.raw),
                 formatted: cell.formatted,
+                ...(cell.formula !== undefined ? { formula: cell.formula } : {}),
                 bold: cell.bold,
                 italic: cell.italic,
                 rawType: cell.raw === null

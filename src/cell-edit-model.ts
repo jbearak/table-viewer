@@ -48,6 +48,8 @@ export type EditSyntax = 'plain' | 'markdown';
 export interface EditableSourceCell {
     /** Scalar cells stringify — the editor and the dirty map are text-typed. */
     readonly raw: string | number | boolean | null;
+    /** Effective XLSX formula, including the leading `=` shown in the editor. */
+    readonly formula?: string;
     readonly bold?: boolean;
     readonly italic?: boolean;
     readonly underline?: boolean;
@@ -100,6 +102,11 @@ export interface ParsedCellEdit {
 
 export function parse_cell_edit(input: string, syntax: EditSyntax): ParsedCellEdit {
     if (syntax === 'plain') return { text: input };
+    // XLSX uses the markdown edit syntax for rich text, but a leading `=` is a
+    // formula and its operators are not markdown. In particular, `E5*F5` must
+    // not acquire italic runs or lose either asterisk before it reaches the
+    // formula writer.
+    if (input.startsWith('=') && input.length > 1) return { text: input };
     const rich = markdown_to_rich_text(input);
     const text = rich_text_plain_text(rich);
     return rich_text_has_styles(rich) ? { text, rich } : { text };
@@ -140,6 +147,7 @@ export function committed_value_runs(
  * base-vs-current comparisons go through {@link cell_edits_equal}.
  */
 export function cell_edit_base(cell: EditableSourceCell): ParsedCellEdit {
+    if (cell.formula !== undefined) return { text: cell.formula };
     const rich = cell_effective_rich_text(cell);
     return rich_text_has_styles(rich)
         ? { text: raw_text(cell), rich }
@@ -150,6 +158,9 @@ export function cell_edit_base(cell: EditableSourceCell): ParsedCellEdit {
  *  or base) — markdown when the sheet edits as markdown, verbatim otherwise. */
 export function edit_display_text(edit: ParsedCellEdit, syntax: EditSyntax): string {
     if (syntax === 'plain') return edit.text;
+    if (edit.rich === undefined && edit.text.startsWith('=') && edit.text.length > 1) {
+        return edit.text;
+    }
     return rich_text_to_markdown(edit.rich ?? rich_text_from_plain(edit.text));
 }
 
