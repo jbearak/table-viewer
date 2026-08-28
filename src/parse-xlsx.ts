@@ -390,6 +390,7 @@ function parse_dimension(xml: Uint8Array): { row_count: number; col_count: numbe
 interface WorksheetWorking extends WorkingSet {
     merges: MergeRange[];
     formula_dependencies: number[];
+    pending_formula_cells: number[];
 }
 
 /** Optional probe used by tests to prove ordinary numeric values avoid decoding. */
@@ -544,6 +545,7 @@ function parse_worksheet_core(
     // Parse cells
     const cells = new Map<string, CellData>();
     const formula_dependencies: number[] = [];
+    const pending_formula_cells: number[] = [];
     let max_row = 0;
     let max_col = 0;
 
@@ -763,6 +765,7 @@ function parse_worksheet_core(
                     ...(formula_result_pending ? { formulaResultPending: true as const } : {}),
                     ...style,
                 };
+                if (formula_result_pending) pending_formula_cells.push(row, col);
                 if (number_format) cell.numberFormat = number_format;
                 if (t === 'd') cell.xlsxIsoDate = true;
                 if (richText) cell.richText = richText;
@@ -855,6 +858,7 @@ function parse_worksheet_core(
             merged_cells,
             merges: [],
             formula_dependencies,
+            pending_formula_cells,
             row_count: 0,
             col_count: 0,
         };
@@ -894,6 +898,7 @@ function parse_worksheet_core(
         merged_cells,
         merges: normalized_merges,
         formula_dependencies,
+        pending_formula_cells,
         row_count,
         col_count,
     };
@@ -1032,6 +1037,9 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookDa
             ...(working.formula_dependencies.length
                 ? { formulaDependencies: working.formula_dependencies }
                 : {}),
+            ...(working.pending_formula_cells.length
+                ? { pendingFormulaCells: working.pending_formula_cells }
+                : {}),
         });
     }
 
@@ -1085,6 +1093,7 @@ export async function parse_xlsx_streaming(buffer: Uint8Array): Promise<Streamin
             working.merges,
             entry.worksheetId,
             working.formula_dependencies,
+            working.pending_formula_cells,
         ));
     }
 

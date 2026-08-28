@@ -5194,14 +5194,68 @@ describe('edit mode save exit', () => {
         expect(impact?.has(0, 2)).toBe(true);
         expect(impact?.size).toBe(1);
 
+        const calculation_request = post_message.mock.calls
+            .map(([message]) => message as WebviewMessage)
+            .reverse()
+            .find((message) => message.type === 'requestFormulaCalculation') as
+            Extract<WebviewMessage, { type: 'requestFormulaCalculation' }>;
+        expect(calculation_request).toMatchObject({
+            edits: [{ sheetIndex: 0, row: 0, column: 0, value: 'changed' }],
+            targets: [
+                { sheetIndex: 0, row: 0, column: 2 },
+                { sheetIndex: 1, row: 0, column: 1 },
+            ],
+        });
+        await dispatch_host_message({
+            type: 'formulaCalculation',
+            requestId: calculation_request.requestId,
+            sourceGeneration: calculation_request.sourceGeneration,
+            results: [
+                { sheetIndex: 0, row: 0, column: 2, error: 'unsupported function' },
+                { sheetIndex: 1, row: 0, column: 1, value: '6' },
+            ],
+        });
+        expect((grid_shell_mock.latest_props?.formula_results as Map<string, string>)
+            .get('0:2')).toBe('?? (unsupported function)');
+
         await click_sheet_tab('Inventory');
         impact = grid_shell_mock.latest_props
             ?.pending_formula_impact as GridShellProps['pending_formula_impact'];
         expect(impact?.has(0, 1)).toBe(true);
         expect(impact?.size).toBe(1);
+        expect((grid_shell_mock.latest_props?.formula_results as Map<string, string>)
+            .get('0:1')).toBe('6');
         expect(post_message.mock.calls.filter(([message]) => (
             message?.type === 'requestEditSession'
         ))).toHaveLength(1);
+    });
+
+    it('calculates formulas whose saved cache is absent after reopen', async () => {
+        const meta = make_meta(['Sheet1'], false);
+        meta.sheets[0].pendingFormulaCells = [0, 1];
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(meta));
+
+        const request = post_message.mock.calls
+            .map(([message]) => message as WebviewMessage)
+            .find((message) => message.type === 'requestFormulaCalculation') as
+            Extract<WebviewMessage, { type: 'requestFormulaCalculation' }>;
+        expect(request.edits).toEqual([]);
+        expect(request.targets).toEqual([{ sheetIndex: 0, row: 0, column: 1 }]);
+
+        await dispatch_host_message({
+            type: 'formulaCalculation',
+            requestId: request.requestId,
+            sourceGeneration: request.sourceGeneration,
+            results: [{
+                sheetIndex: 0,
+                row: 0,
+                column: 1,
+                error: 'unsupported function',
+            }],
+        });
+        expect((grid_shell_mock.latest_props?.formula_results as Map<string, string>)
+            .get('0:1')).toBe('?? (unsupported function)');
     });
 
     it('advances the committed activation when the same session re-enters edit mode', async () => {

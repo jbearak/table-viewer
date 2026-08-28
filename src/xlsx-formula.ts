@@ -49,6 +49,11 @@ interface ParsedA1Range extends A1FormulaReference {
     readonly length: number;
 }
 
+export interface A1FormulaReferenceToken {
+    readonly reference: A1FormulaReference;
+    readonly length: number;
+}
+
 function parse_a1_cell(value: string): ParsedA1Cell | undefined {
     const match = value.match(/^\$?([A-Za-z]{1,3})\$?([1-9]\d*)/);
     if (!match) return undefined;
@@ -122,6 +127,55 @@ function sheet_prefix(value: string): SheetPrefix | undefined {
 }
 
 /**
+ * Parse one A1 cell/range token at an exact formula offset. Unlike
+ * {@link a1_formula_references}, this does not scan ahead. Formula evaluators
+ * use it as a lexer primitive so dependency discovery and calculation accept
+ * the same worksheet quoting and coordinate grammar.
+ */
+export function a1_formula_reference_at(
+    formula: string,
+    offset: number,
+): A1FormulaReferenceToken | undefined {
+    if (!Number.isInteger(offset) || offset < 0 || offset >= formula.length) return undefined;
+    const prefix = sheet_prefix(formula.slice(offset));
+    const cell_start = offset + (prefix?.length ?? 0);
+    const axis_range = parse_a1_axis_range(formula.slice(cell_start));
+    if (axis_range) {
+        return {
+            reference: {
+                ...(prefix ? { sheetName: prefix.name } : {}),
+                firstRow: axis_range.firstRow,
+                firstColumn: axis_range.firstColumn,
+                lastRow: axis_range.lastRow,
+                lastColumn: axis_range.lastColumn,
+            },
+            length: (prefix?.length ?? 0) + axis_range.length,
+        };
+    }
+    const first = parse_a1_cell(formula.slice(cell_start));
+    if (!first) return undefined;
+    let end = cell_start + first.length;
+    let last = first;
+    if (formula[end] === ':') {
+        const range_end = parse_a1_cell(formula.slice(end + 1));
+        if (range_end) {
+            last = range_end;
+            end += 1 + range_end.length;
+        }
+    }
+    return {
+        reference: {
+            ...(prefix ? { sheetName: prefix.name } : {}),
+            firstRow: Math.min(first.row, last.row),
+            firstColumn: Math.min(first.column, last.column),
+            lastRow: Math.max(first.row, last.row),
+            lastColumn: Math.max(first.column, last.column),
+        },
+        length: end - offset,
+    };
+}
+
+/**
  * Find direct A1 references and retain an optional worksheet qualifier for
  * workbook-level resolution. Strings, structured references, external books,
  * and unsupported 3D references are ignored.
@@ -179,46 +233,13 @@ export function a1_formula_references(formula: string): A1FormulaReference[] {
             continue;
         }
 
-        const prefix = sheet_prefix(formula.slice(index));
-        const cell_start = index + (prefix?.length ?? 0);
-        const axis_range = parse_a1_axis_range(formula.slice(cell_start));
-        if (axis_range) {
-            record({
-                ...(prefix ? { sheetName: prefix.name } : {}),
-                firstRow: axis_range.firstRow,
-                firstColumn: axis_range.firstColumn,
-                lastRow: axis_range.lastRow,
-                lastColumn: axis_range.lastColumn,
-            });
-            index = cell_start + axis_range.length;
-            continue;
-        }
-        const first = parse_a1_cell(formula.slice(cell_start));
-        if (!first) {
+        const token = a1_formula_reference_at(formula, index);
+        if (!token) {
             index += 1;
             continue;
         }
-        let end = cell_start + first.length;
-        let last = first;
-        if (formula[end] === ':') {
-            const range_end = parse_a1_cell(formula.slice(end + 1));
-            if (range_end) {
-                last = range_end;
-                end += 1 + range_end.length;
-            }
-        }
-        const first_row = Math.min(first.row, last.row);
-        const first_column = Math.min(first.column, last.column);
-        const last_row = Math.max(first.row, last.row);
-        const last_column = Math.max(first.column, last.column);
-        record({
-            ...(prefix ? { sheetName: prefix.name } : {}),
-            firstRow: first_row,
-            firstColumn: first_column,
-            lastRow: last_row,
-            lastColumn: last_column,
-        });
-        index = end;
+        record(token.reference);
+        index += token.length;
     }
     return references;
 }

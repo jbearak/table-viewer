@@ -122,8 +122,10 @@ describe('parse_xlsx', () => {
             formula: '=1+1',
             formulaResultPending: true,
         });
+        expect(data.sheets[0].pendingFormulaCells).toEqual([0, 0]);
 
         const streaming = await parse_xlsx_streaming(bytes);
+        expect(streaming.sheets[0].pendingFormulaCells).toEqual([0, 0]);
         const builder = new ColumnarStore.Builder(1, 1);
         streaming.sheets[0].fill(builder);
         expect(builder.build().read_window(0, 1)[0][0]).toMatchObject({
@@ -132,6 +134,10 @@ describe('parse_xlsx', () => {
             formula: '=1+1',
             formulaResultPending: true,
         });
+        const source = await XlsxDataSource.create(bytes);
+        expect(source.meta().sheets[0].pendingFormulaCells).toEqual([0, 0]);
+        expect(new ExcelHeaderDataSource(source).meta().sheets[0].pendingFormulaCells)
+            .toEqual([0, 0]);
     });
 
     it('records formula references for dependency invalidation before rows load', async () => {

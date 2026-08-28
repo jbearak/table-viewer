@@ -14,6 +14,7 @@ import type {
     ColumnWindow,
     DataSource,
     PackedFormulaDependencies,
+    PackedPendingFormulaCells,
     IndexedRows,
     RowWindow,
     WorkbookMeta,
@@ -28,6 +29,7 @@ interface SheetEntry {
     merges: MergeRange[];
     hasFormatting: boolean;
     formulaDependencies?: PackedFormulaDependencies;
+    pendingFormulaCells?: PackedPendingFormulaCells;
     store: ColumnarStore;
 }
 
@@ -53,6 +55,9 @@ export class XlsxDataSource implements DataSource {
                 ...(s.formulaDependencies?.length
                     ? { formulaDependencies: s.formulaDependencies }
                     : {}),
+                ...(s.pendingFormulaCells?.length
+                    ? { pendingFormulaCells: s.pendingFormulaCells }
+                    : {}),
             })),
         };
     }
@@ -77,6 +82,9 @@ export class XlsxDataSource implements DataSource {
                 hasFormatting: has_formatting,
                 ...(s.formulaDependencies?.length
                     ? { formulaDependencies: s.formulaDependencies }
+                    : {}),
+                ...(s.pendingFormulaCells?.length
+                    ? { pendingFormulaCells: s.pendingFormulaCells }
                     : {}),
                 store: b.build(),
             };

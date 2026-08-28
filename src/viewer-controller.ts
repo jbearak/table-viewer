@@ -45,6 +45,9 @@ import {
 } from './spreadsheet-safety';
 import { prepare_csv_serializer } from './serialize-csv';
 import { write_xlsx_workbook_cell_edits } from './xlsx-package';
+import { compile_workbook_formula_graph } from './formula-dependencies';
+import { calculate_workbook_formulas } from './formula-calculation';
+import { is_xlsx_formula_text } from './xlsx-formula';
 import type { XlsxCellEdit } from './xlsx-cell-write';
 import { validate_dirty_bases } from './csv-base-validation';
 import { cell_edit_base } from './cell-edit-model';
@@ -777,12 +780,53 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
             link_edits,
         };
     });
+    const calculation_edits = input.worksheets.flatMap(({ sheet_index, edits }) =>
+        Object.entries(edits).flatMap(([key, value]) => {
+            const [row, column] = key.split(':').map(Number);
+            return Number.isInteger(row) && Number.isInteger(column)
+                ? [{ sheetIndex: sheet_index, row, column, value }]
+                : [];
+        }));
+    const formula_impact = compile_workbook_formula_graph(src.meta().sheets).invalidatedBy(
+        calculation_edits,
+    );
+    const calculation_targets = new Map<string, {
+        sheetIndex: number;
+        row: number;
+        column: number;
+    }>();
+    src.meta().sheets.forEach((_sheet, sheetIndex) => {
+        for (const { row, column } of formula_impact.forSheet(sheetIndex).cells()) {
+            calculation_targets.set(`${sheetIndex}:${row}:${column}`, {
+                sheetIndex, row, column,
+            });
+        }
+    });
+    for (const edit of calculation_edits) {
+        if (is_xlsx_formula_text(edit.value)) {
+            calculation_targets.set(`${edit.sheetIndex}:${edit.row}:${edit.column}`, {
+                sheetIndex: edit.sheetIndex,
+                row: edit.row,
+                column: edit.column,
+            });
+        }
+    }
+    const formula_results = calculate_workbook_formulas(src, {
+        edits: calculation_edits,
+        targets: [...calculation_targets.values()],
+    }).flatMap((result) => result.value === undefined ? [] : [{
+        sheetIndex: result.sheetIndex,
+        row: result.row,
+        column: result.column,
+        value: result.value,
+    }]);
     return {
         observed_bases: planned.map(({ observed_bases }) => observed_bases),
         observed_rich: planned.map(({ observed_rich }) => observed_rich),
         observed_links: planned.map(({ observed_links }) => observed_links),
         produce: (raw) => write_xlsx_workbook_cell_edits(raw, planned, {
             formulaDependencies: src.meta().sheets,
+            formulaResults: formula_results,
         }),
     };
 }

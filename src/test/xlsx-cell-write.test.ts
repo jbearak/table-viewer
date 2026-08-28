@@ -240,6 +240,35 @@ describe('apply_cell_edits', () => {
         expect(out).toContain('<c r="D1"><f>Z1</f><v>99</v></c>');
     });
 
+    it('writes calculated values for edited and dependent formulas', () => {
+        const out = apply_cell_edits(
+            doc(
+                '<row r="1"><c r="A1"><v>2</v></c>'
+                + '<c r="B1"><f>A1*2</f><v>4</v></c>'
+                + '<c r="C1"><f>B1*3</f></c></row>',
+            ),
+            [
+                { row: 0, col: 0, value: '3' },
+                { row: 0, col: 3, value: '=C1+1' },
+            ],
+            {
+                ...OPTS,
+                formula_result_invalidations: [
+                    { row: 0, column: 1 },
+                    { row: 0, column: 2 },
+                ],
+                formula_result_updates: [
+                    { row: 0, column: 1, value: '6' },
+                    { row: 0, column: 2, value: '18' },
+                    { row: 0, column: 3, value: '19' },
+                ],
+            },
+        );
+        expect(out).toContain('<c r="B1"><f>A1*2</f><v>6</v></c>');
+        expect(out).toContain('<c r="C1"><f>B1*3</f><v>18</v></c>');
+        expect(out).toContain('<c r="D1"><f>C1+1</f><v>19</v></c>');
+    });
+
     it('invalidates the matching shared-formula follower and its dependents', () => {
         const out = apply_cell_edits(
             doc(
@@ -1830,6 +1859,25 @@ describe('write_xlsx_cell_edits', () => {
         const hinted_data = (await parse_xlsx(hinted)).data;
         expect(hinted_data.sheets[1].rows[1][1]?.formulaResultPending).toBe(true);
         expect(hinted_data.sheets[0].rows[1][2]?.formulaResultPending).toBe(true);
+
+        const calculated = write_xlsx_workbook_cell_edits(raw, [
+            { sheetIndex: 0, edits: [{ row: 1, col: 1, value: '40' }] },
+        ], {
+            formulaDependencies: parsed_source.sheets,
+            formulaResults: [
+                { sheetIndex: 1, row: 1, column: 1, value: '80' },
+                { sheetIndex: 0, row: 1, column: 2, value: '240' },
+            ],
+        });
+        const calculated_data = (await parse_xlsx(calculated)).data;
+        expect(calculated_data.sheets[1].rows[1][1]).toMatchObject({
+            raw: 80,
+            formula: '=people!B2*2',
+        });
+        expect(calculated_data.sheets[0].rows[1][2]).toMatchObject({
+            raw: 240,
+            formula: '=Inventory!B2*3',
+        });
     });
 
     it('writes several worksheets through one workbook operation', async () => {

@@ -1183,16 +1183,49 @@ describe('xlsx edit sessions', () => {
         const saved_sheet = Buffer.from(
             CFB.find(saved, '/xl/worksheets/sheet2.xml')!.content as Uint8Array,
         ).toString('utf8');
-        expect(saved_sheet).toContain('<c r="A3"><f>B3*3</f></c>');
+        expect(saved_sheet).toContain('<c r="A3"><f>B3*3</f><v>73.5</v></c>');
         expect(saved_sheet).toContain(
             '<f t="shared" ref="A2:A3" si="0">B2*2</f>',
         );
         expect((await parse_xlsx(bytes)).data.sheets[1].rows[2][0])
             .toMatchObject({
                 formula: '=B3*3',
-                formatted: '??',
-                formulaResultPending: true,
+                raw: 73.5,
+                formatted: '73.5',
             });
+    });
+
+    it('recalculates and reopens the garden-cafe shelf value after a price edit', async () => {
+        bytes = fs.readFileSync('docs/examples/garden-cafe-sample.xlsx');
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 4 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                saveRequestId: 'garden-cafe-price-edit',
+                worksheets: [{
+                    sheetIndex: 4,
+                    sheetName: 'Berry Corner',
+                    worksheetId: '5',
+                    edits: { '2:5': '5.24' },
+                    dirtyEdits: { '2:5': { value: '5.24', base: '5.25' } },
+                }],
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+        const reopened = (await parse_xlsx(bytes)).data.sheets[4];
+        expect(reopened.rows[2][4]?.raw).toBe(9);
+        expect(reopened.rows[2][5]?.raw).toBe(5.24);
+        expect(reopened.rows[2][8]).toMatchObject({
+            formula: '=E3*F3',
+            raw: 47.16,
+            formatted: '$47.16',
+        });
     });
 
     it('refuses a save whose base no longer matches the cell', async () => {

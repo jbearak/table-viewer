@@ -1,6 +1,6 @@
 import {
     element_close,
-    remove_formula_cached_values,
+    update_formula_cached_values,
     worksheet_formula_dependencies,
     type XlsxCellEdit,
 } from './xlsx-cell-write';
@@ -250,6 +250,12 @@ export interface XlsxWorkbookWriteOptions {
     readonly formulaDependencies?: readonly {
         readonly formulaDependencies?: PackedFormulaDependencies;
     }[];
+    readonly formulaResults?: readonly {
+        readonly sheetIndex: number;
+        readonly row: number;
+        readonly column: number;
+        readonly value: string;
+    }[];
 }
 
 /**
@@ -318,6 +324,16 @@ export function write_xlsx_workbook_cell_edits(
     > = [];
 
     const active_by_sheet = new Map(active.map((entry) => [entry.sheetIndex, entry]));
+    const formula_results_by_sheet = new Map<number, Array<{
+        readonly row: number;
+        readonly column: number;
+        readonly value: string;
+    }>>();
+    for (const result of options?.formulaResults ?? []) {
+        const sheet = formula_results_by_sheet.get(result.sheetIndex) ?? [];
+        sheet.push({ row: result.row, column: result.column, value: result.value });
+        formula_results_by_sheet.set(result.sheetIndex, sheet);
+    }
     const touched_sheets = new Set(active_by_sheet.keys());
     for (let sheet_index = 0; sheet_index < parts.length; sheet_index += 1) {
         if (formula_impact.forSheet(sheet_index).size > 0) touched_sheets.add(sheet_index);
@@ -339,9 +355,14 @@ export function write_xlsx_workbook_cell_edits(
             ? read_part_text(zip, rels_path)
             : null;
         const invalidations = [...formula_impact.forSheet(sheetIndex).cells()];
+        const formula_result_updates = formula_results_by_sheet.get(sheetIndex) ?? [];
         const result = active_entry === undefined
             ? {
-                worksheet_xml: remove_formula_cached_values(sheet_xml, invalidations),
+                worksheet_xml: update_formula_cached_values(
+                    sheet_xml,
+                    invalidations,
+                    formula_result_updates,
+                ),
                 relationships_xml: null,
                 calculation_chain_stale: false,
             }
@@ -357,6 +378,7 @@ export function write_xlsx_workbook_cell_edits(
                     run_font_base,
                     sheet_name: part.name,
                     formula_result_invalidations: invalidations,
+                    formula_result_updates,
                 },
             });
         if (result.relationships_xml !== null) {

@@ -398,6 +398,124 @@ afterEach(() => {
 });
 
 describe('GridShell cell wrapping', () => {
+    it('shows physical Excel row numbers after header promotion and row reordering', async () => {
+        grid_mock.source_row_for_display = (display_row: number) => [8, 1, 4][display_row];
+        await render_grid(props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 3,
+                sourceRowCount: 100_001,
+                excelFirstRowHeader: {
+                    mode: 'on',
+                    detected: false,
+                    active: true,
+                    available: true,
+                    sourceRow: 0,
+                },
+            },
+            row_count: 3,
+        }));
+
+        const row_markers = grid_mock.props!.rowMarkers as {
+            kind: string;
+            width: number;
+            getRowNumber(row: number): number;
+        };
+        expect(row_markers.kind).toBe('clickable-number');
+        expect(row_markers.width).toBe(48);
+        expect([0, 1, 2].map(row_markers.getRowNumber)).toEqual([9, 2, 5]);
+    });
+
+    it('keeps ordinary row markers for non-Excel sources', async () => {
+        await render_grid(props());
+
+        expect(grid_mock.props!.rowMarkers).toBe('clickable-number');
+    });
+
+    it('uses the promoted physical row while Excel row data is still loading', async () => {
+        grid_mock.source_row_for_display = () => undefined;
+        await render_grid(props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 4,
+                sourceRowCount: 5,
+                excelFirstRowHeader: {
+                    mode: 'on',
+                    detected: false,
+                    active: true,
+                    available: true,
+                    sourceRow: 2,
+                },
+            },
+            row_count: 4,
+        }));
+
+        const get_row_number = (grid_mock.props!.rowMarkers as {
+            getRowNumber(row: number): number;
+        }).getRowNumber;
+        expect([0, 1, 2, 3].map(get_row_number)).toEqual([1, 2, 4, 5]);
+    });
+
+    it('shows physical Excel letters over promoted column names', async () => {
+        vi.useFakeTimers();
+        const initial = props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                columnNames: ['Name', 'Hidden', 'Price'],
+                excelFirstRowHeader: {
+                    mode: 'on',
+                    detected: false,
+                    active: true,
+                    available: true,
+                    sourceRow: 0,
+                },
+            },
+            column_projection: {
+                visible_to_source: [2, 0],
+                source_to_visible: [1, undefined, 0],
+                hidden_count: 1,
+            },
+        });
+        const GridShell = await render_grid(initial);
+        const on_item_hovered = grid_mock.props!.onItemHovered as
+            (args: Record<string, unknown>) => void;
+
+        await act(async () => {
+            on_item_hovered({
+                kind: 'header', location: [0, -1], buttons: 0,
+                bounds: { x: 30, y: 0, width: 120, height: 36 },
+                localEventX: 60, localEventY: 18,
+            });
+            await vi.runAllTimersAsync();
+        });
+        expect(container!.querySelector('[role="tooltip"]')?.textContent)
+            .toBe('Excel column C');
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...initial,
+                sheet_meta: {
+                    ...initial.sheet_meta,
+                    excelFirstRowHeader: {
+                        ...initial.sheet_meta.excelFirstRowHeader!,
+                        active: false,
+                    },
+                },
+            }));
+        });
+        const on_inactive_header_hovered = grid_mock.props!.onItemHovered as
+            (args: Record<string, unknown>) => void;
+        await act(async () => {
+            on_inactive_header_hovered({
+                kind: 'header', location: [0, -1], buttons: 0,
+                bounds: { x: 30, y: 0, width: 120, height: 36 },
+                localEventX: 60, localEventY: 18,
+            });
+            await vi.runAllTimersAsync();
+        });
+        expect(container!.querySelector('[role="tooltip"]')).toBeNull();
+    });
+
     it('does not tooltip fitted produce cells when canvas scaling makes bounds fractional', async () => {
         vi.useFakeTimers();
         const canvas_context = vi.spyOn(HTMLCanvasElement.prototype, 'getContext')
@@ -2826,6 +2944,7 @@ describe('GridShell link-only edits', () => {
     });
 
     it('paints dirty XLSX formulas as cached value to unknown result', async () => {
+        const on_editing_change = vi.fn();
         grid_mock.get_row.mockImplementation(() => [{
             raw: '58.5',
             formatted: '$58.50',
@@ -2852,6 +2971,7 @@ describe('GridShell link-only edits', () => {
             edit_mode: true,
             csv_editable: true,
             edit_syntax: 'markdown',
+            on_editing_change,
             column_projection: {
                 visible_to_source: [0, 1, 2],
                 source_to_visible: [0, 1, 2],
@@ -2864,6 +2984,7 @@ describe('GridShell link-only edits', () => {
             },
         });
         const GridShell = await render_grid(initial);
+        expect(on_editing_change.mock.calls.at(-1)?.[0].conflicted).toEqual([]);
         const get_cell_content = (cell: [number, number]) => (
             grid_mock.props!.getCellContent as (cell: [number, number]) => {
                 kind: string;
@@ -2912,6 +3033,7 @@ describe('GridShell link-only edits', () => {
             italic: false,
             rawType: 'number' as const,
             formula: '=A1*2',
+            numberFormat: { code: '$0.00' },
         }, {
             raw: '12',
             formatted: '$12.00',
@@ -2919,6 +3041,7 @@ describe('GridShell link-only edits', () => {
             italic: false,
             rawType: 'number' as const,
             formula: '=B1*3',
+            numberFormat: { code: '$0.00' },
         }, {
             raw: '99',
             formatted: '$99.00',
@@ -2927,7 +3050,7 @@ describe('GridShell link-only edits', () => {
             rawType: 'number' as const,
             formula: '=Z1',
         }] as any);
-        await render_grid(props({
+        const initial = props({
             show_formatting: true,
             edit_mode: true,
             csv_editable: true,
@@ -2953,7 +3076,8 @@ describe('GridShell link-only edits', () => {
             initial_edits: {
                 '0:0': { value: '3', base: '2' },
             },
-        }));
+        });
+        const GridShell = await render_grid(initial);
         const get_cell_content = grid_mock.props!.getCellContent as
             (cell: [number, number]) => {
                 kind: string;
@@ -2971,6 +3095,18 @@ describe('GridShell link-only edits', () => {
         expect(text(1)).toBe('$4.00 → ??');
         expect(text(2)).toBe('$12.00 → ??');
         expect(text(3)).toBe('$99.00');
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...initial,
+                formula_results: new Map([
+                    ['0:1', '6'],
+                    ['0:2', '?? (unsupported function)'],
+                ]),
+            }));
+        });
+        expect(text(1)).toBe('$4.00 → $6.00');
+        expect(text(2)).toBe('$12.00 → ?? (unsupported function)');
 
     });
 

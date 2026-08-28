@@ -125,6 +125,12 @@ export interface XlsxWriteOptions {
         readonly row: number;
         readonly column: number;
     }[];
+    /** Trustworthy numeric results for invalidated or newly edited formulas. */
+    readonly formula_result_updates?: readonly {
+        readonly row: number;
+        readonly column: number;
+        readonly value: string;
+    }[];
 }
 
 function encode_xml(s: string): string {
@@ -213,12 +219,14 @@ function build_cell_xml(
     options: XlsxWriteOptions,
     was_boolean = false,
     was_iso_date = false,
+    formula_result?: string,
 ): string {
     const { value } = edit;
     const ref = `${col_index_to_letter(col)}${row + 1}`;
     const style_attr = xf_index !== null && xf_index !== 0 ? ` s="${xf_index}"` : '';
     if (is_formula_edit(edit)) {
-        return `<c r="${ref}"${style_attr}><f>${encode_xml(value.slice(1))}</f></c>`;
+        const cached = formula_result === undefined ? '' : `<v>${encode_xml(formula_result)}</v>`;
+        return `<c r="${ref}"${style_attr}><f>${encode_xml(value.slice(1))}</f>${cached}</c>`;
     }
     // A rich edit whose runs still carry styling beyond the cell's own font is
     // written as a rich inline string — checked ahead of the scalar paths
@@ -1208,16 +1216,49 @@ export function remove_formula_cached_values(
     xml: Uint8Array,
     cells: readonly { readonly row: number; readonly column: number }[],
 ): Uint8Array {
+    return update_formula_cached_values(xml, cells, []);
+}
+
+/** Replace or remove selected formula caches without changing formula source. */
+export function update_formula_cached_values(
+    xml: Uint8Array,
+    cells: readonly { readonly row: number; readonly column: number }[],
+    updates: readonly {
+        readonly row: number;
+        readonly column: number;
+        readonly value: string;
+    }[],
+): Uint8Array {
     if (cells.length === 0) return xml;
     const sheet_data = scan_worksheet_structure(xml).sheet_data;
     if (!sheet_data) return xml;
     const state = worksheet_formula_state(xml, sheet_data, undefined);
+    const values = new Map(updates.map(
+        ({ row, column, value }) => [`${row}:${column}`, value],
+    ));
     const splices: Splice[] = [];
     for (const { row, column } of cells) {
         const cell = state.cells.get(`${row}:${column}`);
         if (!cell) continue;
+        const replacement = values.get(`${row}:${column}`);
         const value = find_first_element(xml, 'v', cell.inner_start, cell.inner_end);
-        if (value) splices.push({ start: value.start, end: value.end, text: '' });
+        if (value) {
+            splices.push({
+                start: value.start,
+                end: value.end,
+                text: replacement === undefined ? '' : `<v>${encode_xml(replacement)}</v>`,
+            });
+            continue;
+        }
+        if (replacement === undefined) continue;
+        const formula = find_first_element(xml, 'f', cell.inner_start, cell.inner_end);
+        if (formula) {
+            splices.push({
+                start: formula.end,
+                end: formula.end,
+                text: `<v>${encode_xml(replacement)}</v>`,
+            });
+        }
     }
     return apply_utf8_splices(xml, splices);
 }
@@ -1325,6 +1366,11 @@ function apply_cell_edits_bytes(
         : new Set(options.formula_result_invalidations.map(
             ({ row, column }) => `${row}:${column}`,
         ));
+    const calculated_formula_results = new Map(
+        (options.formula_result_updates ?? []).map(
+            ({ row, column, value }) => [`${row}:${column}`, value],
+        ),
+    );
     // Scanned once for the whole sheet, because grouped-formula members can be
     // identifiable only from the master's `ref`.
     const grouped_ranges = grouped_formula_ranges(xml);
@@ -1363,7 +1409,16 @@ function apply_cell_edits_bytes(
             // Whole row absent: synthesize it, with its cells in column order.
             const cells = [...row_edits]
                 .sort((a, b) => a.col - b.col)
-                .map((e) => build_cell_xml(e.row, e.col, e, null, options))
+                .map((e) => build_cell_xml(
+                    e.row,
+                    e.col,
+                    e,
+                    null,
+                    options,
+                    false,
+                    false,
+                    calculated_formula_results.get(`${e.row}:${e.col}`),
+                ))
                 .join('');
             new_rows.push({ row, text: `<row r="${row + 1}">${cells}</row>` });
             continue;
@@ -1413,6 +1468,7 @@ function apply_cell_edits_bytes(
                         options,
                         existing_type === 'b',
                         existing_type === 'd',
+                        calculated_formula_results.get(`${e.row}:${e.col}`),
                     ),
                 });
             } else {
@@ -1424,7 +1480,16 @@ function apply_cell_edits_bytes(
                 inserts.push({
                     row: e.row,
                     col: e.col,
-                    text: build_cell_xml(e.row, e.col, e, null, options),
+                    text: build_cell_xml(
+                        e.row,
+                        e.col,
+                        e,
+                        null,
+                        options,
+                        false,
+                        false,
+                        calculated_formula_results.get(`${e.row}:${e.col}`),
+                    ),
                 });
             }
         }
@@ -1497,9 +1562,25 @@ function apply_cell_edits_bytes(
         if (edited_keys.has(key)) continue;
         const cell = formula_state.cells.get(key);
         if (!cell) continue;
+        const replacement = calculated_formula_results.get(key);
         const value = find_first_element(xml, 'v', cell.inner_start, cell.inner_end);
-        if (!value) continue;
-        splices.push({ start: value.start, end: value.end, text: '' });
+        if (value) {
+            splices.push({
+                start: value.start,
+                end: value.end,
+                text: replacement === undefined ? '' : `<v>${encode_xml(replacement)}</v>`,
+            });
+            continue;
+        }
+        if (replacement === undefined) continue;
+        const formula = find_first_element(xml, 'f', cell.inner_start, cell.inner_end);
+        if (formula) {
+            splices.push({
+                start: formula.end,
+                end: formula.end,
+                text: `<v>${encode_xml(replacement)}</v>`,
+            });
+        }
     }
 
     // New rows are likewise inserted in ascending row order — and sorted for the

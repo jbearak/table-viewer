@@ -35,6 +35,7 @@ import {
     type SheetViewRecord,
     type WebviewMessage,
 } from './types';
+import { calculate_workbook_formulas } from './formula-calculation';
 
 /**
  * Minimal structural view of the parts of vscode.WebviewPanel that the core
@@ -369,6 +370,7 @@ export class ViewerPanelCore {
     private readonly transforms_in_flight = new Map<number, TransformOperationToken>();
     private readonly histogram_cache: HistogramLruCache;
     private readonly histogram_operations = new Map<string, TransformOperationToken>();
+    private formula_calculation_operation = 0;
     private source_epoch = 0;
     private receiver_epoch = 0;
     private _source_generation = 1;
@@ -812,7 +814,42 @@ export class ViewerPanelCore {
             await this.handle_histogram_request(msg);
         } else if (msg.type === 'cancelFilterHistogram') {
             this.histogram_operations.delete(msg.requestId);
+        } else if (msg.type === 'requestFormulaCalculation') {
+            await this.handle_formula_calculation(msg);
         }
+    }
+
+    private async handle_formula_calculation(
+        msg: Extract<WebviewMessage, { type: 'requestFormulaCalculation' }>,
+    ): Promise<void> {
+        const receiver_epoch = this.receiver_epoch;
+        this.formula_calculation_operation += 1;
+        const operation = this.formula_calculation_operation;
+        if (msg.sourceGeneration !== this._source_generation) return;
+        let results;
+        try {
+            results = calculate_workbook_formulas(this.source, {
+                edits: msg.edits,
+                targets: msg.targets,
+            });
+        } catch {
+            results = msg.targets.map((target) => ({
+                ...target,
+                error: 'parse error' as const,
+            }));
+        }
+        if (
+            this.disposed
+            || operation !== this.formula_calculation_operation
+            || receiver_epoch !== this.receiver_epoch
+            || msg.sourceGeneration !== this._source_generation
+        ) return;
+        await this.post({
+            type: 'formulaCalculation',
+            requestId: msg.requestId,
+            sourceGeneration: msg.sourceGeneration,
+            results,
+        }, receiver_epoch);
     }
 
     private async handle_histogram_request(

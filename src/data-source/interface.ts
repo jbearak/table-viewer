@@ -79,6 +79,8 @@ export interface ColumnFilterMetadata {
  * avoids an object or inner-array allocation for every reference.
  */
 export type PackedFormulaDependencies = readonly number[];
+/** Formula cells with no trustworthy cached result, packed `[row, column]`. */
+export type PackedPendingFormulaCells = readonly number[];
 
 export interface RowWindow {
     startRow: number;                 // 0-based, absolute
@@ -144,6 +146,8 @@ export interface SheetMeta {
     hasFormatting: boolean;
     /** Workbook-resolved A1 references used to invalidate cached formula results. */
     formulaDependencies?: PackedFormulaDependencies;
+    /** Formula coordinates whose source file has no result cache. */
+    pendingFormulaCells?: PackedPendingFormulaCells;
     /** Per-column header titles. Length === columnCount; a blank entry means
      *  "no name" and the renderer falls back to the column letter. */
     columnNames?: string[];
@@ -199,6 +203,17 @@ export interface DataSource {
     read_columns?(
         sheet_index: number,
         start_row: number,
+        count: number,
+        column_indices: readonly number[],
+    ): ColumnWindow;
+    /**
+     * Read canonical physical source rows without applying a row projection.
+     * Formula coordinates use this space. Projection adapters such as promoted
+     * Excel headers implement it by delegating to their underlying source.
+     */
+    read_canonical_columns?(
+        sheet_index: number,
+        start_source_row: number,
         count: number,
         column_indices: readonly number[],
     ): ColumnWindow;

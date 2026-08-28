@@ -333,6 +333,58 @@ describe('ViewerPanelCore', () => {
         expect(rd.generation).toBe(core.generation);
     });
 
+    it('calculates requested formulas against dirty workbook values', async () => {
+        const { panel, posted } = make_panel();
+        const rows: RenderedCell[][] = [[
+            { raw: '2', formatted: '2', rawType: 'number', bold: false, italic: false },
+            {
+                raw: '4',
+                formatted: '4',
+                rawType: 'number',
+                formula: '=A1*2',
+                bold: false,
+                italic: false,
+            },
+        ]];
+        const source: DataSource = {
+            meta: () => ({
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1',
+                    rowCount: 1,
+                    sourceRowCount: 1,
+                    columnCount: 2,
+                    merges: [],
+                    hasFormatting: false,
+                }],
+            }),
+            read_rows: (_sheet, start, count) => ({
+                startRow: start,
+                rows: rows.slice(start, start + count),
+            }),
+            read_columns: (_sheet, start, count, columns) => ({
+                startRow: start,
+                rows: rows.slice(start, start + count)
+                    .map((row) => columns.map((column) => row[column] ?? null)),
+            }),
+            close: () => {},
+        };
+        const core = new ViewerPanelCore(panel, source);
+        await core.handle_message({
+            type: 'requestFormulaCalculation',
+            requestId: 'formula-1',
+            sourceGeneration: core.source_generation,
+            edits: [{ sheetIndex: 0, row: 0, column: 0, value: '3' }],
+            targets: [{ sheetIndex: 0, row: 0, column: 1 }],
+        });
+        expect(posted).toContainEqual({
+            type: 'formulaCalculation',
+            requestId: 'formula-1',
+            sourceGeneration: core.source_generation,
+            results: [{ sheetIndex: 0, row: 0, column: 1, value: '6' }],
+        });
+    });
+
     it('passes the accepted receiver epoch only after a successful rowData post', async () => {
         const { panel, postMessage } = make_panel();
         const served = vi.fn();

@@ -17,7 +17,11 @@
 import { get_raw_cell_text } from '../cell-display';
 import { rich_text_has_styles } from '../cell-content';
 import type { CellData, MergeRange } from '../types';
-import type { PackedFormulaDependencies, RenderedCell } from './interface';
+import type {
+    PackedFormulaDependencies,
+    PackedPendingFormulaCells,
+    RenderedCell,
+} from './interface';
 
 /**
  * The sparse working set for one parsed worksheet, before densification.
@@ -55,6 +59,7 @@ export interface StreamingSheet {
     columnCount: number;
     merges: MergeRange[];
     formulaDependencies?: PackedFormulaDependencies;
+    pendingFormulaCells?: PackedPendingFormulaCells;
     fill(sink: CellSink): void;
 }
 
@@ -139,6 +144,7 @@ export function make_streaming_sheet(
     merges: MergeRange[],
     worksheetId?: string,
     formulaDependencies?: PackedFormulaDependencies,
+    pendingFormulaCells?: PackedPendingFormulaCells,
 ): StreamingSheet {
     let pending: WorkingSet | null = working;
     return {
@@ -148,6 +154,7 @@ export function make_streaming_sheet(
         columnCount: working.col_count,
         merges,
         ...(formulaDependencies?.length ? { formulaDependencies } : {}),
+        ...(pendingFormulaCells?.length ? { pendingFormulaCells } : {}),
         fill(sink: CellSink): void {
             if (!pending) throw new Error('StreamingSheet.fill called after its working-set was released');
             fill_store(pending, sink);

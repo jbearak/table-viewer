@@ -49,6 +49,7 @@ import {
 } from './column-projection';
 import {
     build_grid_columns,
+    column_letter,
     LAST_COLUMN_RESIZE_GUTTER_PX,
     MAX_AUTO_FIT_COLUMN_WIDTH_PX,
     MAX_COLUMN_WIDTH_PX,
@@ -297,6 +298,20 @@ function cached_markdown_edit_text(
     return text;
 }
 
+function calculated_formula_display(
+    result: string | undefined,
+    show_formatting: boolean,
+    cell: RenderedCell | null | undefined,
+): string | undefined {
+    if (result === undefined || !show_formatting || !cell?.numberFormat || result.startsWith('??')) {
+        return result;
+    }
+    return format_xlsx_edit_preview(result, cell.numberFormat, {
+        was_boolean: false,
+        was_iso_date: cell.xlsxIsoDate,
+    });
+}
+
 /**
  * The value-edit half of a cell's paint overlay. Shared by the paint callback
  * and the hover-tooltip measurement so the two cannot disagree on what a dirty
@@ -313,22 +328,28 @@ function dirty_value_overlay_fields(
     show_formatting: boolean,
     cell: RenderedCell | null | undefined,
     xlsx_editing = false,
+    calculated_formula_result?: string,
 ): Pick<
     CellEditOverlay,
-    'dirty_value' | 'dirty_display' | 'dirty_rich' | 'diff_base' | 'formula_result_pending'
+    'dirty_value' | 'dirty_display' | 'dirty_rich' | 'diff_base'
+        | 'formula_result_pending' | 'formula_result'
 > | undefined {
     if (!dirty_entry_value_changed(dirty)) return undefined;
-    const formula_result_pending = xlsx_editing && is_xlsx_formula_text(dirty.value);
-    const presentation = !formula_result_pending && show_formatting && !diff_mode && cell
+    const formula_edit = xlsx_editing && is_xlsx_formula_text(dirty.value);
+    const formula_result_pending = formula_edit && calculated_formula_result === undefined;
+    const presentation = !formula_edit && show_formatting && !diff_mode && cell
         && (cell.numberFormat || (xlsx_editing && dirty.valueRuns))
         ? cached_dirty_presentation(dirty, cell)
         : undefined;
-    const requires_rich = !formula_result_pending
+    const requires_rich = !formula_edit
         && show_formatting && !diff_mode && xlsx_editing && dirty.valueRuns
         ? presentation?.requires_rich ?? dirty_requires_rich_text(dirty, cell)
         : false;
     return {
         dirty_value: dirty.value,
+        ...(formula_edit && calculated_formula_result !== undefined
+            ? { formula_result: calculated_formula_result }
+            : {}),
         ...(formula_result_pending ? { formula_result_pending: true as const } : {}),
         ...(presentation?.display !== undefined ? { dirty_display: presentation.display } : {}),
         ...(requires_rich ? { dirty_rich: dirty.valueRuns } : {}),
@@ -450,6 +471,8 @@ export interface GridShellProps {
     sheet_index: number;
     /** Workbook-wide recursive pending-result projection for this worksheet. */
     pending_formula_impact?: FormulaSheetImpact;
+    /** Raw calculation results keyed by canonical `row:column`. */
+    formula_results?: ReadonlyMap<string, string>;
     generation: number;
     /**
      * Effective displayed row count (may be filtered).
@@ -641,6 +664,7 @@ export function GridShell({
     sheet_meta,
     sheet_index,
     pending_formula_impact,
+    formula_results,
     generation,
     row_count = sheet_meta.rowCount,
     show_formatting,
@@ -924,6 +948,29 @@ export function GridShell({
         sample_loaded_rows,
         version,
     } = loader;
+    const row_marker_options = useMemo(() => {
+        if (sheet_meta.excelFirstRowHeader === undefined) return 'clickable-number' as const;
+        const physical_row_count = sheet_meta.sourceRowCount;
+        const promoted_source_row = sheet_meta.excelFirstRowHeader.active
+            ? sheet_meta.excelFirstRowHeader.sourceRow ?? 0
+            : undefined;
+        const width = physical_row_count > 10_000
+            ? 48
+            : physical_row_count > 1_000
+                ? 44
+                : physical_row_count > 100 ? 36 : 32;
+        return {
+            kind: 'clickable-number' as const,
+            width,
+            getRowNumber: (display_row: number) => {
+                const projected_source_row = promoted_source_row !== undefined
+                    && display_row >= promoted_source_row
+                    ? display_row + 1
+                    : display_row;
+                return (get_source_row(display_row) ?? projected_source_row) + 1;
+            },
+        };
+    }, [get_source_row, sheet_meta.excelFirstRowHeader, sheet_meta.sourceRowCount]);
     const lifecycle_operation = save_lifecycle.state === 'active'
         && save_lifecycle.operation.editSessionId === edit_session_id
         ? save_lifecycle.operation
@@ -1016,6 +1063,12 @@ export function GridShell({
         (source_row: number, c: number): string | undefined => {
             const saved = saved_edits_ref.current[`${source_row}:${c}`];
             if (saved !== undefined) return saved;
+            // A formula's editable persisted value is its source, not the
+            // numeric cache rendered in the grid. Dirty entries record that
+            // source as their base, so conflict checks must read the same side
+            // or every untouched formula looks externally modified.
+            const cell = get_cell_for_source_ref.current(source_row, c);
+            if (cell?.formula !== undefined) return cell.formula;
             // Source row not resident (evicted, not yet fetched, or filtered out of
             // the current view): undefined so conflict detection treats it as
             // unknown, never as a changed value.
@@ -1071,6 +1124,8 @@ export function GridShell({
     // effect below damages only formulas entering or leaving the set.
     const pending_formula_keys_ref = useRef(pending_formula_keys);
     pending_formula_keys_ref.current = pending_formula_keys;
+    const formula_results_ref = useRef(formula_results);
+    formula_results_ref.current = formula_results;
 
     // Tint set = what the webview can derive ∪ what the host named. The union is
     // what everything downstream consumes (the paint callback's ref, the targeted
@@ -2456,6 +2511,47 @@ export function GridShell({
         ],
     );
 
+    const schedule_header_tooltip = useCallback((
+        display_column: number,
+        bounds: { x: number; y: number; width: number; height: number },
+    ) => {
+        const source_column = source_column_for_display(display_column);
+        if (
+            sheet_meta.excelFirstRowHeader?.active !== true
+            || source_column === undefined
+        ) {
+            hide_cell_tooltip();
+            return;
+        }
+        const key = `header:${display_column}`;
+        if (cell_tooltip_key_ref.current === key) return;
+
+        clear_cell_tooltip_timer();
+        cell_tooltip_key_ref.current = key;
+        set_cell_tooltip(null);
+        const text = `Excel column ${column_letter(source_column)}`;
+        cell_tooltip_timer_ref.current = window.setTimeout(() => {
+            cell_tooltip_timer_ref.current = null;
+            if (cell_tooltip_key_ref.current !== key) return;
+            const estimated = {
+                width: Math.max(80, text.length * 7),
+                height: 28,
+            };
+            const pos = cell_tooltip_position(bounds, estimated);
+            set_cell_tooltip({
+                text,
+                bounds,
+                left: pos.left,
+                top: pos.top,
+            });
+        }, CELL_TOOLTIP_SHOW_DELAY_MS);
+    }, [
+        clear_cell_tooltip_timer,
+        hide_cell_tooltip,
+        sheet_meta.excelFirstRowHeader?.active,
+        source_column_for_display,
+    ]);
+
     // Re-measure the mounted tooltip and re-clamp into the viewport so long
     // multi-line content doesn't sit off-screen after the estimate.
     useLayoutEffect(() => {
@@ -2593,11 +2689,21 @@ export function GridShell({
             const editable = editable_cells && source_row !== undefined;
             const loaded_row = get_row(row);
             const loaded_cell = loaded_row?.[source_column];
-            const dependent_formula_pending = dirty === undefined
+            const raw_calculated_formula_result = key === undefined
+                ? undefined
+                : formula_results_ref.current?.get(key);
+            const dependent_formula_affected = dirty === undefined
                 && key !== undefined
-                && pending_formula_keys_ref.current.has(key)
                 && loaded_cell?.formula !== undefined
-                && !loaded_cell.formulaResultPending;
+                && (
+                    pending_formula_keys_ref.current.has(key)
+                    || raw_calculated_formula_result !== undefined
+                );
+            const calculated_formula_result = calculated_formula_display(
+                raw_calculated_formula_result,
+                show_formatting,
+                loaded_cell,
+            );
             // On a markdown sheet the overlay editor must open with markup, not
             // the plain projection: a dirty cell re-opens showing its committed
             // runs, a clean cell its effective rich content. Only computed when
@@ -2643,7 +2749,7 @@ export function GridShell({
                 ? compare_row_bgs[compare_status]
                 : undefined;
             let overlay: CellEditOverlay | undefined;
-            if (editable_cells || dirty || dependent_formula_pending || highlight_bg || flash_bg
+            if (editable_cells || dirty || dependent_formula_affected || highlight_bg || flash_bg
                 || compare_bg || compare_base !== undefined) {
                 overlay = {
                     editable,
@@ -2661,9 +2767,12 @@ export function GridShell({
                         show_formatting,
                         loaded_row?.[source_column],
                         edit_syntax === 'markdown',
+                        calculated_formula_result,
                     ) : {}),
-                    ...(dependent_formula_pending
-                        ? { formula_result_pending: true as const }
+                    ...(dependent_formula_affected
+                        ? calculated_formula_result === undefined
+                            ? { formula_result_pending: true as const }
+                            : { formula_result: calculated_formula_result }
                         : {}),
                     // Compare's before-text rides the Diff toggle's channel; no
                     // dirty_value, so the "after" side is the cell's own text.
@@ -3043,7 +3152,13 @@ export function GridShell({
                 hide_cell_tooltip();
                 return;
             }
-            if (args.kind !== 'cell' || args.location[0] < 0 || args.location[1] < 0) {
+            if (
+                args.kind === 'header'
+                && args.location[0] >= 0
+                && (args.buttons & 1) === 0
+            ) {
+                schedule_header_tooltip(args.location[0], args.bounds);
+            } else if (args.kind !== 'cell' || args.location[0] < 0 || args.location[1] < 0) {
                 hide_cell_tooltip();
             } else if ((args.buttons & 1) !== 0) {
                 // Primary button down (drag-select / resize) — no tooltip.
@@ -3107,6 +3222,7 @@ export function GridShell({
             row_height_overlay,
             row_markers,
             schedule_cell_tooltip,
+            schedule_header_tooltip,
             write_grid_selection,
         ],
     );
@@ -4057,6 +4173,7 @@ export function GridShell({
     const prev_dirty_keys_ref = useRef<Set<string>>(new Set());
     const prev_conflicted_keys_ref = useRef<Set<string>>(new Set());
     const prev_pending_formula_keys_ref = useRef<Set<string>>(new Set());
+    const prev_formula_results_ref = useRef<ReadonlyMap<string, string>>(new Map());
     useEffect(() => {
         const next_dirty = new Set(dirty_cells.keys());
         const changed = changed_tint_keys(
@@ -4071,8 +4188,15 @@ export function GridShell({
         for (const key of pending_formula_keys) {
             if (!prev_pending_formula_keys_ref.current.has(key)) changed.add(key);
         }
+        for (const [key, value] of prev_formula_results_ref.current) {
+            if (formula_results?.get(key) !== value) changed.add(key);
+        }
+        for (const [key, value] of formula_results ?? []) {
+            if (prev_formula_results_ref.current.get(key) !== value) changed.add(key);
+        }
         prev_dirty_keys_ref.current = next_dirty;
         prev_pending_formula_keys_ref.current = pending_formula_keys;
+        prev_formula_results_ref.current = formula_results ?? new Map();
         // conflicted_keys is a fresh useMemo Set (new identity each change, never
         // mutated in place), so it can be stashed as the snapshot directly — no copy.
         prev_conflicted_keys_ref.current = conflicted_keys;
@@ -4095,6 +4219,7 @@ export function GridShell({
         dirty_cells,
         conflicted_keys,
         pending_formula_keys,
+        formula_results,
         display_column_for_source,
         get_source_row,
         merged_ranges,
@@ -4285,7 +4410,7 @@ export function GridShell({
                 mergedRanges={merged_ranges}
                 getCellContent={get_cell_content}
                 rowHeight={get_row_height}
-                rowMarkers="clickable-number"
+                rowMarkers={row_marker_options}
                 theme={theme}
                 smoothScrollX
                 smoothScrollY

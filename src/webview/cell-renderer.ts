@@ -73,6 +73,8 @@ export interface CellEditOverlay {
     dirty_rich?: RichText;
     /** The dirty XLSX value is a formula whose calculated result is unknown. */
     formula_result_pending?: true;
+    /** Newly calculated display text for a dirty or transitively affected formula. */
+    formula_result?: string;
     /** themeOverride background tint for dirty / conflicted cells. */
     bg?: string;
     /** The "before" text to diff against the cell's current text. The Diff
@@ -187,10 +189,17 @@ export function diff_lines(
     return lines;
 }
 
-function pending_formula_lines(base: string, colors: DiffColors): RichTextLine[] {
-    return base === ''
-        ? [[{ text: UNKNOWN_XLSX_FORMULA_RESULT, diff_color: colors.added }]]
-        : diff_lines(base, UNKNOWN_XLSX_FORMULA_RESULT, 'number', colors);
+function formula_result_lines(
+    base: string,
+    result: string,
+    colors: DiffColors,
+): RichTextLine[] {
+    return base === UNKNOWN_XLSX_FORMULA_RESULT
+        && result.startsWith(UNKNOWN_XLSX_FORMULA_RESULT)
+        ? [[{ text: result, diff_color: colors.added }]]
+        : base === ''
+        ? [[{ text: result, diff_color: colors.added }]]
+        : diff_lines(base, result, 'number', colors);
 }
 
 function persisted_displayed_text(
@@ -238,11 +247,15 @@ export function displayed_text(
     show_formatting: boolean,
     overlay: CellEditOverlay | undefined,
 ): string {
-    if (overlay?.formula_result_pending) {
+    if (overlay?.formula_result !== undefined || overlay?.formula_result_pending) {
         const base = persisted_displayed_text(c, show_formatting);
-        return base === ''
-            ? UNKNOWN_XLSX_FORMULA_RESULT
-            : `${base}${DIFF_ARROW}${UNKNOWN_XLSX_FORMULA_RESULT}`;
+        const result = overlay.formula_result ?? UNKNOWN_XLSX_FORMULA_RESULT;
+        return base === UNKNOWN_XLSX_FORMULA_RESULT
+            && result.startsWith(UNKNOWN_XLSX_FORMULA_RESULT)
+            ? result
+            : base === ''
+            ? result
+            : `${base}${DIFF_ARROW}${result}`;
     }
     if (overlay?.dirty_value !== undefined) {
         return show_formatting && overlay.diff_base === undefined
@@ -267,7 +280,8 @@ function rich_cell(
     // must not be recomputed every frame.
     const can_cache = overlay?.dirty_rich === undefined
         && overlay?.dirty_value === undefined
-        && !overlay?.formula_result_pending;
+        && !overlay?.formula_result_pending
+        && overlay?.formula_result === undefined;
     const cached = can_cache ? rich_cell_cache.get(c) : undefined;
     let cell = cached !== undefined
         && cached.cell.data.font_size_px === font_size_px
@@ -311,9 +325,10 @@ function rich_cell(
         // removed original, struck through whole in the deletion color.
         const lines = overlay?.compare_deleted
             ? deleted_lines(display, diff_colors)
-            : overlay?.formula_result_pending
-            ? pending_formula_lines(
+            : overlay?.formula_result !== undefined || overlay?.formula_result_pending
+            ? formula_result_lines(
                 persisted_displayed_text(c, show_formatting),
+                overlay.formula_result ?? UNKNOWN_XLSX_FORMULA_RESULT,
                 diff_colors,
             )
             : overlay?.diff_base !== undefined
@@ -402,6 +417,7 @@ export function rich_cell_display_data(
         !(c && renders_rich(c, show_formatting))
         && !(show_formatting && overlay?.dirty_rich !== undefined)
         && !overlay?.formula_result_pending
+        && overlay?.formula_result === undefined
         && overlay?.diff_base === undefined
         && !overlay?.compare_deleted
     ) return undefined;
@@ -527,6 +543,7 @@ export function build_grid_cell(
         (c && renders_rich(c, show_formatting))
         || (show_formatting && overlay?.dirty_rich !== undefined)
         || overlay?.formula_result_pending
+        || overlay?.formula_result !== undefined
         // Diff mode paints mixed colors and strikethrough, which only the
         // rich renderer can draw — regardless of the Formatting toggle.
         || overlay?.diff_base !== undefined

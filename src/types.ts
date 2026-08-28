@@ -3,6 +3,7 @@ import type {
     WorkbookMeta,
     RenderedCell,
     PackedFormulaDependencies,
+    PackedPendingFormulaCells,
 } from './data-source/interface';
 import type { CompareRowStatus } from './diff-compare/compare-source';
 import type { XlsxCellFormatFields } from './spreadsheet-format';
@@ -35,6 +36,11 @@ import type {
     HistoryReplayPrepared,
     PrepareHistoryReplayRequest,
 } from './history-replay-protocol';
+import type {
+    FormulaCalculationAddress,
+    FormulaCalculationEdit,
+    FormulaCalculationResult,
+} from './formula-calculation';
 
 export interface WorkbookData {
     sheets: SheetData[];
@@ -50,6 +56,7 @@ export interface SheetData {
     columnCount: number;
     rowCount: number;
     formulaDependencies?: PackedFormulaDependencies;
+    pendingFormulaCells?: PackedPendingFormulaCells;
 }
 
 export interface CellData extends RichCellFields, XlsxCellFormatFields {
@@ -1892,6 +1899,7 @@ export type HostMessage =
     | { type: 'editCommand'; command: 'copy' | 'selectAll' | 'undo' | 'redo' }
     | { type: 'workbookSnapshot'; snapshot: WorkbookSnapshot }
     | { type: 'rowData'; sheetIndex: number; startRow: number; rows: (RenderedCell | null)[][]; sourceRows: number[]; requestId: string; generation: number }
+    | { type: 'formulaCalculation'; requestId: string; sourceGeneration: number; results: readonly FormulaCalculationResult[] }
     /** Git compare mode: sparse positional diff for the same page a rowData
      *  answered. `rowStatus[i]` describes row `startRow + i`; `changedCells`
      *  carries original raw (`base`) and formatted text for differing cells. */
@@ -2058,6 +2066,7 @@ export type WebviewMessage =
     | { type: 'resolveLfsObject'; requestId: string }
     | { type: 'snapshotApplied'; identity: WorkbookSnapshotIdentity; disposition: SnapshotDisposition }
     | { type: 'requestRows'; sheetIndex: number; startRow: number; count: number; requestId: string; generation: number }
+    | { type: 'requestFormulaCalculation'; requestId: string; sourceGeneration: number; edits: readonly FormulaCalculationEdit[]; targets: readonly FormulaCalculationAddress[] }
     | { type: 'stateChanged'; state: PerFileState; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity }
     | { type: 'visibleRowChanged'; row: number }
     // `sheetIndex` is optional so a single-sheet source can omit it; the host

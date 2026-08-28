@@ -3,6 +3,7 @@ import type {
     DataSource,
     ExcelHeaderOverride,
     PackedFormulaDependencies,
+    PackedPendingFormulaCells,
     IndexedRows,
     RenderedCell,
     RowWindow,
@@ -50,6 +51,7 @@ export interface ExcelHeaderPlanningSheet {
     readonly merges: readonly Readonly<MergeRange>[];
     readonly hasFormatting: boolean;
     readonly formulaDependencies?: PackedFormulaDependencies;
+    readonly pendingFormulaCells?: PackedPendingFormulaCells;
     readonly columnNames: readonly string[];
     readonly manualColumnNames?: readonly string[];
     readonly manualHeaderRow?: number;
@@ -222,6 +224,7 @@ export class ExcelHeaderDataSource implements DataSource {
                     ),
                     hasFormatting: sheet.physical.hasFormatting,
                     formulaDependencies: sheet.physical.formulaDependencies,
+                    pendingFormulaCells: sheet.physical.pendingFormulaCells,
                     columnNames: Object.freeze([...sheet.firstRowColumnNames]),
                     manualColumnNames: Object.freeze([...(selected
                         ? selected.columnNames
@@ -347,6 +350,31 @@ export class ExcelHeaderDataSource implements DataSource {
             ).rows.slice(0, after_count));
         }
         return { startRow: start, rows };
+    }
+
+    read_canonical_columns(
+        sheet_index: number,
+        start_source_row: number,
+        count: number,
+        column_indices: readonly number[],
+    ): ColumnWindow {
+        if (!this.sheets[sheet_index]) {
+            throw new RangeError(
+                `sheet index ${sheet_index} out of range (${this.sheets.length} sheets)`,
+            );
+        }
+        return this.base.read_canonical_columns?.(
+            sheet_index,
+            start_source_row,
+            count,
+            column_indices,
+        ) ?? read_source_columns(
+            this.base,
+            sheet_index,
+            start_source_row,
+            count,
+            column_indices,
+        );
     }
 
     /** Predict one sheet's projected metadata without changing live row behavior. */
@@ -481,6 +509,7 @@ function project_sheet(
         merges: sheet.physical.merges,
         hasFormatting: sheet.physical.hasFormatting,
         formulaDependencies: sheet.physical.formulaDependencies,
+        pendingFormulaCells: sheet.physical.pendingFormulaCells,
         columnNames: sheet.firstRowColumnNames,
         manualColumnNames: sheet.manualColumnNames,
         manualHeaderRow: sheet.manualHeaderRow,
@@ -529,6 +558,9 @@ export function project_excel_header_sheet(
         hasFormatting: sheet.hasFormatting,
         ...(sheet.formulaDependencies?.length
             ? { formulaDependencies: sheet.formulaDependencies }
+            : {}),
+        ...(sheet.pendingFormulaCells?.length
+            ? { pendingFormulaCells: sheet.pendingFormulaCells }
             : {}),
         columnNames: active ? [...column_names] : undefined,
         excelFirstRowHeader: {
