@@ -9,6 +9,8 @@ import {
     parse_xlsx_streaming,
 } from '../parse-xlsx';
 import { ColumnarStore } from '../data-source/columnar-store';
+import { XlsxDataSource } from '../data-source/xlsx-source';
+import { ExcelHeaderDataSource } from '../data-source/excel-header-source';
 
 const FIXTURES = path.join(__dirname, 'fixtures');
 
@@ -130,6 +132,34 @@ describe('parse_xlsx', () => {
             formula: '=1+1',
             formulaResultPending: true,
         });
+    });
+
+    it('records formula references for dependency invalidation before rows load', async () => {
+        const sheet = `<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:C2"/>
+  <sheetData>
+    <row r="1">
+      <c r="A1"><v>2</v></c>
+      <c r="B1"><f>A1*2</f><v>4</v></c>
+      <c r="C1"><f>SUM(A1:B2)</f><v>9</v></c>
+    </row>
+  </sheetData>
+</worksheet>`;
+        const bytes = build_test_xlsx(sheet);
+        const { data } = await parse_xlsx(bytes);
+        const streaming = await parse_xlsx_streaming(bytes);
+        const source = await XlsxDataSource.create(bytes);
+        const projected = new ExcelHeaderDataSource(source);
+
+        const expected = [
+            [0, 1, 0, 0, 0, 0],
+            [0, 2, 0, 0, 1, 1],
+        ];
+        expect(data.sheets[0].formulaDependencies).toEqual(expected);
+        expect(streaming.sheets[0].formulaDependencies).toEqual(expected);
+        expect(source.meta().sheets[0].formulaDependencies).toEqual(expected);
+        expect(projected.meta().sheets[0].formulaDependencies).toEqual(expected);
     });
 
     it('exposes the OOXML sheetId as worksheet identity', async () => {

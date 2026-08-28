@@ -2898,6 +2898,119 @@ describe('GridShell link-only edits', () => {
             .flat().map((part) => part.text).join('')).toBe('58.5 → ??');
     });
 
+    it('paints recursive formula dependents as cached value to unknown result', async () => {
+        grid_mock.get_row.mockImplementation(() => [{
+            raw: '2',
+            formatted: '2',
+            bold: false,
+            italic: false,
+            rawType: 'number' as const,
+        }, {
+            raw: '4',
+            formatted: '$4.00',
+            bold: false,
+            italic: false,
+            rawType: 'number' as const,
+            formula: '=A1*2',
+        }, {
+            raw: '12',
+            formatted: '$12.00',
+            bold: false,
+            italic: false,
+            rawType: 'number' as const,
+            formula: '=B1*3',
+        }, {
+            raw: '99',
+            formatted: '$99.00',
+            bold: false,
+            italic: false,
+            rawType: 'number' as const,
+            formula: '=Z1',
+        }] as any);
+        const editing_ref: React.MutableRefObject<EditingHandle | null> = { current: null };
+        await render_grid(props({
+            show_formatting: true,
+            edit_mode: true,
+            csv_editable: true,
+            edit_syntax: 'markdown',
+            sheet_meta: {
+                ...props().sheet_meta,
+                columnCount: 4,
+                formulaDependencies: [
+                    [0, 1, 0, 0, 0, 0],
+                    [0, 2, 0, 1, 0, 1],
+                    [0, 3, 0, 25, 0, 25],
+                ],
+            },
+            column_projection: {
+                visible_to_source: [0, 1, 2, 3],
+                source_to_visible: [0, 1, 2, 3],
+                hidden_count: 0,
+            },
+            initial_edits: {
+                '0:0': { value: '3', base: '2' },
+            },
+            editing_ref,
+        }));
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => {
+                kind: string;
+                displayData?: string;
+                data?: string | { lines: Array<Array<{ text: string }>> };
+            };
+        const text = (column: number) => {
+            const cell = get_cell_content([column, 0]);
+            return typeof cell.data === 'object'
+                ? cell.data.lines.flat().map((part) => part.text).join('')
+                : cell.displayData;
+        };
+
+        expect(text(0)).toBe('3');
+        expect(text(1)).toBe('$4.00 → ??');
+        expect(text(2)).toBe('$12.00 → ??');
+        expect(text(3)).toBe('$99.00');
+
+        await act(async () => editing_ref.current!.clear_dirty());
+        expect(text(1)).toBe('$4.00');
+        expect(text(2)).toBe('$12.00');
+    });
+
+    it('does not invalidate formulas for a hyperlink-only edit', async () => {
+        grid_mock.get_row.mockImplementation(() => [{
+            raw: '2', formatted: '2', bold: false, italic: false,
+        }, {
+            raw: '4', formatted: '$4.00', bold: false, italic: false,
+            formula: '=A1*2',
+        }] as any);
+        await render_grid(props({
+            show_formatting: true,
+            edit_mode: true,
+            csv_editable: true,
+            edit_syntax: 'markdown',
+            sheet_meta: {
+                ...props().sheet_meta,
+                columnCount: 2,
+                formulaDependencies: [[0, 1, 0, 0, 0, 0]],
+            },
+            column_projection: {
+                visible_to_source: [0, 1],
+                source_to_visible: [0, 1],
+                hidden_count: 0,
+            },
+            initial_edits: {
+                '0:0': {
+                    value: '2',
+                    base: '2',
+                    link: { kind: 'external', target: 'https://new.test/' },
+                    baseLink: null,
+                },
+            },
+        }));
+        const cell = (grid_mock.props!.getCellContent as
+            (location: [number, number]) => { displayData: string })([1, 0]);
+        expect(cell.displayData).toBe('$4.00');
+    });
+
     it('keeps a CSV value beginning with equals as literal text', async () => {
         await render_grid(props({
             edit_mode: true,

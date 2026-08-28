@@ -128,6 +128,10 @@ import { format_xlsx_edit_preview } from '../spreadsheet-format';
 import { xlsx_runs_require_inline_string } from '../xlsx-cell-value';
 import { is_xlsx_formula_text } from '../xlsx-formula';
 import {
+    build_formula_dependency_index,
+    transitive_formula_dependents,
+} from '../formula-dependencies';
+import {
     create_edit_session_store,
     type EditSessionStore,
 } from './edit-session-store';
@@ -1056,6 +1060,28 @@ export function GridShell({
             [version],
         ),
     });
+    const formula_dependency_index = useMemo(
+        () => build_formula_dependency_index(sheet_meta.formulaDependencies),
+        [sheet_meta.formulaDependencies],
+    );
+    const changed_formula_input_keys = useMemo(
+        () => [...dirty_cells]
+            .filter(([, entry]) => dirty_entry_value_changed(entry))
+            .map(([key]) => key),
+        [dirty_cells],
+    );
+    const pending_formula_keys = useMemo(
+        () => transitive_formula_dependents(
+            formula_dependency_index,
+            changed_formula_input_keys,
+        ),
+        [changed_formula_input_keys, formula_dependency_index],
+    );
+    // The paint callback deliberately stays stable across edits. It reads the
+    // current recursive invalidation set through this mirror, while the repaint
+    // effect below damages only formulas entering or leaving the set.
+    const pending_formula_keys_ref = useRef(pending_formula_keys);
+    pending_formula_keys_ref.current = pending_formula_keys;
 
     // Tint set = what the webview can derive ∪ what the host named. The union is
     // what everything downstream consumes (the paint callback's ref, the targeted
@@ -2577,6 +2603,12 @@ export function GridShell({
             // effect damages the cells whose tint actually changed.
             const editable = editable_cells && source_row !== undefined;
             const loaded_row = get_row(row);
+            const loaded_cell = loaded_row?.[source_column];
+            const dependent_formula_pending = dirty === undefined
+                && key !== undefined
+                && pending_formula_keys_ref.current.has(key)
+                && loaded_cell?.formula !== undefined
+                && !loaded_cell.formulaResultPending;
             // On a markdown sheet the overlay editor must open with markup, not
             // the plain projection: a dirty cell re-opens showing its committed
             // runs, a clean cell its effective rich content. Only computed when
@@ -2622,7 +2654,7 @@ export function GridShell({
                 ? compare_row_bgs[compare_status]
                 : undefined;
             let overlay: CellEditOverlay | undefined;
-            if (editable_cells || dirty || highlight_bg || flash_bg
+            if (editable_cells || dirty || dependent_formula_pending || highlight_bg || flash_bg
                 || compare_bg || compare_base !== undefined) {
                 overlay = {
                     editable,
@@ -2641,6 +2673,9 @@ export function GridShell({
                         loaded_row?.[source_column],
                         edit_syntax === 'markdown',
                     ) : {}),
+                    ...(dependent_formula_pending
+                        ? { formula_result_pending: true as const }
+                        : {}),
                     // Compare's before-text rides the Diff toggle's channel; no
                     // dirty_value, so the "after" side is the cell's own text.
                     ...(compare_base !== undefined ? { diff_base: compare_base } : {}),
@@ -4032,6 +4067,7 @@ export function GridShell({
     // every visible cell on each keystroke.
     const prev_dirty_keys_ref = useRef<Set<string>>(new Set());
     const prev_conflicted_keys_ref = useRef<Set<string>>(new Set());
+    const prev_pending_formula_keys_ref = useRef<Set<string>>(new Set());
     useEffect(() => {
         const next_dirty = new Set(dirty_cells.keys());
         const changed = changed_tint_keys(
@@ -4040,7 +4076,14 @@ export function GridShell({
             prev_conflicted_keys_ref.current,
             conflicted_keys,
         );
+        for (const key of prev_pending_formula_keys_ref.current) {
+            if (!pending_formula_keys.has(key)) changed.add(key);
+        }
+        for (const key of pending_formula_keys) {
+            if (!prev_pending_formula_keys_ref.current.has(key)) changed.add(key);
+        }
         prev_dirty_keys_ref.current = next_dirty;
+        prev_pending_formula_keys_ref.current = pending_formula_keys;
         // conflicted_keys is a fresh useMemo Set (new identity each change, never
         // mutated in place), so it can be stashed as the snapshot directly — no copy.
         prev_conflicted_keys_ref.current = conflicted_keys;
@@ -4062,6 +4105,7 @@ export function GridShell({
     }, [
         dirty_cells,
         conflicted_keys,
+        pending_formula_keys,
         display_column_for_source,
         get_source_row,
         merged_ranges,

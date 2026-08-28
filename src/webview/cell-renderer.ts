@@ -266,7 +266,8 @@ function rich_cell(
     // and participate in the cache key instead — a compare page's word diffs
     // must not be recomputed every frame.
     const can_cache = overlay?.dirty_rich === undefined
-        && overlay?.dirty_value === undefined;
+        && overlay?.dirty_value === undefined
+        && !overlay?.formula_result_pending;
     const cached = can_cache ? rich_cell_cache.get(c) : undefined;
     let cell = cached !== undefined
         && cached.cell.data.font_size_px === font_size_px

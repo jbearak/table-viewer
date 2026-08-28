@@ -70,6 +70,22 @@ export interface ColumnFilterMetadata {
     valueLabel?(raw: string): string | undefined;
 }
 
+/**
+ * One same-worksheet formula reference, encoded as
+ * `[formulaRow, formulaColumn, firstRow, firstColumn, lastRow, lastColumn]`.
+ * Coordinates use the canonical source space. A compact tuple keeps workbook
+ * snapshots proportional to the number of references without repeating field
+ * names for every formula.
+ */
+export type FormulaDependency = readonly [
+    formulaRow: number,
+    formulaColumn: number,
+    firstRow: number,
+    firstColumn: number,
+    lastRow: number,
+    lastColumn: number,
+];
+
 export interface RowWindow {
     startRow: number;                 // 0-based, absolute
     rows: (RenderedCell | null)[][];  // rows[i][col]; outer length <= requested count
@@ -132,6 +148,8 @@ export interface SheetMeta {
     estimatedRowBytes?: number;
     merges: MergeRange[];             // from types.ts (rowSpan + colSpan)
     hasFormatting: boolean;
+    /** Same-sheet A1 references used to invalidate cached formula results. */
+    formulaDependencies?: readonly FormulaDependency[];
     /** Per-column header titles. Length === columnCount; a blank entry means
      *  "no name" and the renderer falls back to the column letter. */
     columnNames?: string[];

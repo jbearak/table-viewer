@@ -37,9 +37,11 @@ import {
 } from './xlsx-rich-text';
 import { parse_relationships, rels_path_for_part, type OoxmlRelationship } from './ooxml-relationships';
 import {
+    local_a1_formula_references,
     translate_a1_formula,
     UNKNOWN_XLSX_FORMULA_RESULT,
 } from './xlsx-formula';
+import type { FormulaDependency } from './data-source/interface';
 
 // The XML scanning primitives live in ./ooxml-xml so the rich-text and
 // hyperlink parsers (and the writer) share the exact same scans.
@@ -375,6 +377,7 @@ function parse_dimension(xml: Uint8Array): { row_count: number; col_count: numbe
  */
 interface WorksheetWorking extends WorkingSet {
     merges: MergeRange[];
+    formula_dependencies: FormulaDependency[];
 }
 
 /** Optional probe used by tests to prove ordinary numeric values avoid decoding. */
@@ -483,6 +486,7 @@ function parse_worksheet_core(
     datemode: DateMode,
     budget: WorkbookBudget,
     sheet_rels: Map<string, OoxmlRelationship>,
+    sheet_name: string,
 ): WorksheetWorking {
     // Rich-run resolution cache: one shared string may be referenced by many
     // cells, but binding (run inheritance) depends only on the cell font, so
@@ -526,6 +530,7 @@ function parse_worksheet_core(
 
     // Parse cells
     const cells = new Map<string, CellData>();
+    const formula_dependencies: FormulaDependency[] = [];
     let max_row = 0;
     let max_col = 0;
 
@@ -720,6 +725,21 @@ function parse_worksheet_core(
                     rawType = 'string';
                     formula_result_pending = true;
                 }
+                if (effective_formula !== undefined) {
+                    for (const reference of local_a1_formula_references(
+                        effective_formula,
+                        sheet_name,
+                    )) {
+                        formula_dependencies.push([
+                            row,
+                            col,
+                            reference.firstRow,
+                            reference.firstColumn,
+                            reference.lastRow,
+                            reference.lastColumn,
+                        ]);
+                    }
+                }
                 const cell: CellData = {
                     raw,
                     formatted,
@@ -815,7 +835,14 @@ function parse_worksheet_core(
 
     // If no cells were found, the sheet is empty regardless of what dimension says
     if (cells.size === 0) {
-        return { cells, merged_cells, merges: [], row_count: 0, col_count: 0 };
+        return {
+            cells,
+            merged_cells,
+            merges: [],
+            formula_dependencies,
+            row_count: 0,
+            col_count: 0,
+        };
     }
 
     // Use dimension if available and non-degenerate, otherwise fall back to observed max
@@ -847,7 +874,14 @@ function parse_worksheet_core(
         }
     }
 
-    return { cells, merged_cells, merges: normalized_merges, row_count, col_count };
+    return {
+        cells,
+        merged_cells,
+        merges: normalized_merges,
+        formula_dependencies,
+        row_count,
+        col_count,
+    };
 }
 
 // --- Merge Range / Column Helpers ---
@@ -964,7 +998,7 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookDa
 
         const working = parse_worksheet_core(
             worksheet_scan_input(ws_content), sst, xfs, fonts, format_map, datemode, budget,
-            worksheet_rels(zip, sheet_path)
+            worksheet_rels(zip, sheet_path), entry.name,
         );
         workings.push(working);
 
@@ -975,6 +1009,9 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookDa
             merges: working.merges,
             columnCount: working.col_count,
             rowCount: working.row_count,
+            ...(working.formula_dependencies.length
+                ? { formulaDependencies: working.formula_dependencies }
+                : {}),
         });
     }
 
@@ -1014,10 +1051,16 @@ export async function parse_xlsx_streaming(buffer: Uint8Array): Promise<Streamin
 
         const working = parse_worksheet_core(
             worksheet_scan_input(ws_content), sst, xfs, fonts, format_map, datemode, budget,
-            worksheet_rels(zip, sheet_path)
+            worksheet_rels(zip, sheet_path), entry.name,
         );
         workings.push(working);
-        sheets.push(make_streaming_sheet(entry.name, working, working.merges, entry.worksheetId));
+        sheets.push(make_streaming_sheet(
+            entry.name,
+            working,
+            working.merges,
+            entry.worksheetId,
+            working.formula_dependencies,
+        ));
     }
 
     return { sheets, hasFormatting: working_has_formatting(workings), warnings: [] };

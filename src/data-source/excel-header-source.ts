@@ -2,6 +2,7 @@ import type {
     ColumnWindow,
     DataSource,
     ExcelHeaderOverride,
+    FormulaDependency,
     IndexedRows,
     RenderedCell,
     RowWindow,
@@ -48,6 +49,7 @@ export interface ExcelHeaderPlanningSheet {
     readonly columnCount: number;
     readonly merges: readonly Readonly<MergeRange>[];
     readonly hasFormatting: boolean;
+    readonly formulaDependencies?: readonly FormulaDependency[];
     readonly columnNames: readonly string[];
     readonly manualColumnNames?: readonly string[];
     readonly manualHeaderRow?: number;
@@ -219,6 +221,7 @@ export class ExcelHeaderDataSource implements DataSource {
                         sheet.physical.merges.map((merge) => Object.freeze({ ...merge })),
                     ),
                     hasFormatting: sheet.physical.hasFormatting,
+                    formulaDependencies: sheet.physical.formulaDependencies,
                     columnNames: Object.freeze([...sheet.firstRowColumnNames]),
                     manualColumnNames: Object.freeze([...(selected
                         ? selected.columnNames
@@ -477,6 +480,7 @@ function project_sheet(
         columnCount: sheet.physical.columnCount,
         merges: sheet.physical.merges,
         hasFormatting: sheet.physical.hasFormatting,
+        formulaDependencies: sheet.physical.formulaDependencies,
         columnNames: sheet.firstRowColumnNames,
         manualColumnNames: sheet.manualColumnNames,
         manualHeaderRow: sheet.manualHeaderRow,
@@ -523,6 +527,9 @@ export function project_excel_header_sheet(
             ? project_header_merges(sheet.merges, header_row)
             : sheet.merges.map((merge) => ({ ...merge })),
         hasFormatting: sheet.hasFormatting,
+        ...(sheet.formulaDependencies?.length
+            ? { formulaDependencies: sheet.formulaDependencies }
+            : {}),
         columnNames: active ? [...column_names] : undefined,
         excelFirstRowHeader: {
             mode: override ?? 'auto',
