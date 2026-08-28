@@ -1187,6 +1187,12 @@ describe('xlsx edit sessions', () => {
         expect(saved_sheet).toContain(
             '<f t="shared" ref="A2:A3" si="0">B2*2</f>',
         );
+        expect((await parse_xlsx(bytes)).data.sheets[1].rows[2][0])
+            .toMatchObject({
+                formula: '=B3*3',
+                formatted: '??',
+                formulaResultPending: true,
+            });
     });
 
     it('refuses a save whose base no longer matches the cell', async () => {

@@ -55,6 +55,8 @@ export interface CellData extends RichCellFields, XlsxCellFormatFields {
     formatted: string;
     /** Effective A1 formula, including the leading `=` used by the editor. */
     formula?: string;
+    /** The formula has no cached result that Table Viewer can display. */
+    formulaResultPending?: true;
     bold: boolean;
     italic: boolean;
     rawType?: 'string' | 'number' | 'boolean' | 'date' | 'empty';

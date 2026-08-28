@@ -31,6 +31,7 @@ import {
     classify_xlsx_cell_value,
     xlsx_runs_require_inline_string,
 } from './xlsx-cell-value';
+import { is_xlsx_formula_text } from './xlsx-formula';
 
 export { iso_to_serial } from './xlsx-cell-value';
 
@@ -125,8 +126,7 @@ function encode_xml(s: string): string {
 function is_formula_edit(edit: XlsxCellEdit): boolean {
     return edit.force_text !== true
         && edit.runs === undefined
-        && edit.value.startsWith('=')
-        && edit.value.length > 1;
+        && is_xlsx_formula_text(edit.value);
 }
 
 /** Convert a 0-based column index to its letter form (0 → A, 26 → AA). */
@@ -1029,9 +1029,9 @@ function assert_writable_sheet_data(
  * value". That is the distinction `parse_xlsx` draws when it decides whether a
  * `<hyperlink display=…>` supplies the cell's text: it keys every `<c r=…>`
  * into its map as it scans — value or not — and falls back to `display` only
- * for a coordinate with no entry. So a styled-but-empty `<c r="B2" s="3"/>`, or
- * a formula cell with no cached `<v>`, reads as BLANK today, and treating
- * either as display-backed would let a save invent text the user never saw.
+ * for a coordinate with no entry. A styled-but-empty `<c r="B2" s="3"/>` stays
+ * blank. A formula with no cached `<v>` displays `??`. Treating either cell as
+ * display-backed would replace its own state with the hyperlink label.
  *
  * Resolved by the same `scan_rows` cell callback an edit uses, so the answer
  * describes the cell the writer would actually splice.

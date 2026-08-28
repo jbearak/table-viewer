@@ -10,6 +10,7 @@ import {
     cleared_display_texts,
 } from '../xlsx-hyperlink-write';
 import type { WorksheetEditRequest, WorksheetEditResult } from './types';
+import { is_xlsx_formula_text } from '../xlsx-formula';
 
 /**
  * Apply cell and hyperlink changes to one worksheet part without knowing about
@@ -81,8 +82,7 @@ export function apply_worksheet_edits(request: WorksheetEditRequest): WorksheetE
             || cell_edits.some((edit) => (
                 edit.force_text !== true
                 && edit.runs === undefined
-                && edit.value.startsWith('=')
-                && edit.value.length > 1
+                && is_xlsx_formula_text(edit.value)
             ))
         ),
     };

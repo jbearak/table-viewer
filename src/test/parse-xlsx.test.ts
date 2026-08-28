@@ -105,6 +105,33 @@ describe('parse_xlsx', () => {
         });
     });
 
+    it('marks a formula with no cached value as an unknown result', async () => {
+        const sheet = `<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1"/>
+  <sheetData><row r="1"><c r="A1"><f>1+1</f></c></row></sheetData>
+</worksheet>`;
+        const bytes = build_test_xlsx(sheet);
+        const { data } = await parse_xlsx(bytes);
+
+        expect(data.sheets[0].rows[0][0]).toMatchObject({
+            raw: '=1+1',
+            formatted: '??',
+            formula: '=1+1',
+            formulaResultPending: true,
+        });
+
+        const streaming = await parse_xlsx_streaming(bytes);
+        const builder = new ColumnarStore.Builder(1, 1);
+        streaming.sheets[0].fill(builder);
+        expect(builder.build().read_window(0, 1)[0][0]).toMatchObject({
+            raw: '=1+1',
+            formatted: '??',
+            formula: '=1+1',
+            formulaResultPending: true,
+        });
+    });
+
     it('exposes the OOXML sheetId as worksheet identity', async () => {
         const sheet = `<?xml version="1.0" encoding="UTF-8"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">

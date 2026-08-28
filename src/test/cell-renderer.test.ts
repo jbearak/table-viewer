@@ -176,6 +176,70 @@ describe('build_grid_cell — edit overlay (CSV edit mode)', () => {
         });
     });
 
+    it('shows unknown for a formula with no cached result and still edits the formula', () => {
+        const formula_cell = {
+            ...rc('=A1*2'),
+            formatted: '??',
+            formula: '=A1*2',
+            formulaResultPending: true,
+        } as RenderedCell;
+
+        expect(build_grid_cell(0, [formula_cell], true)).toMatchObject({
+            data: '=A1*2',
+            displayData: '??',
+        });
+        expect(build_grid_cell(0, [formula_cell], false, { editable: true }))
+            .toMatchObject({
+                data: '=A1*2',
+                displayData: '??',
+                allowOverlay: true,
+            });
+    });
+
+    it('shows an unknown result after editing an existing formula', () => {
+        const formula_cell: RenderedCell = {
+            ...rc('58.5'),
+            formatted: '$58.50',
+            rawType: 'number',
+            formula: '=E5*F5',
+        };
+        const c = build_grid_cell(0, [formula_cell], true, {
+            editable: true,
+            dirty_value: '=E5*F5+1',
+            edit_value: '=E5*F5+1',
+            formula_result_pending: true,
+        }) as unknown as {
+            kind: unknown;
+            data: { edit_value?: string; lines: unknown[] };
+            copyData: string;
+        };
+
+        expect(c.kind).toBe(GridCellKind.Custom);
+        expect(c.data.lines).toEqual([[
+            { text: '$58.50', style: { strikethrough: true }, diff_color: 'red' },
+            { text: ' → ' },
+            { text: '??', diff_color: 'green' },
+        ]]);
+        expect(c.data.edit_value).toBe('=E5*F5+1');
+        expect(c.copyData).toBe('=E5*F5+1');
+    });
+
+    it('shows an unknown result after changing a literal cell to a formula', () => {
+        const c = build_grid_cell(0, [rc('12')], true, {
+            editable: true,
+            dirty_value: '=A1*2',
+            edit_value: '=A1*2',
+            formula_result_pending: true,
+        }) as unknown as { kind: unknown; data: { lines: unknown[] } };
+
+        expect(c.kind).toBe(GridCellKind.Custom);
+        expect(c.data.lines).toEqual([[
+            { text: '12', style: { strikethrough: true }, diff_color: 'red' },
+            { text: ' → ' },
+            { text: '??', diff_color: 'green' },
+        ]]);
+    });
+
     it('stays read-only (allowOverlay false) with no overlay', () => {
         const c = build_grid_cell(1, plain_rows, true);
         expect((c as { allowOverlay: boolean }).allowOverlay).toBe(false);

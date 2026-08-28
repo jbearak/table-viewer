@@ -39,6 +39,8 @@ export interface RenderedCell extends
     formatted: string;        // display text (== raw for CSV)
     /** Effective A1 formula, including the leading `=` used by the editor. */
     formula?: string;
+    /** The formula has no cached result that Table Viewer can display. */
+    formulaResultPending?: true;
     bold: boolean;
     italic: boolean;
     /** Original scalar category retained for correct numeric sorting. */

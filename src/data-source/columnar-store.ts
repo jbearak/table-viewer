@@ -3,7 +3,7 @@ import type { RenderedCell } from './interface';
 
 const NULL_IDX = -1;
 const BOLD = 1, ITALIC = 2, UNDERLINE = 4, STRIKETHROUGH = 8, HAS_EXTRAS = 16;
-const DATE_1904 = 64, XLSX_ISO_DATE = 128;
+const FORMULA_RESULT_PENDING = 32, DATE_1904 = 64, XLSX_ISO_DATE = 128;
 const TYPE_STRING = 1, TYPE_NUMBER = 2, TYPE_BOOLEAN = 3, TYPE_EMPTY = 4, TYPE_DATE = 5;
 
 /** Sparse per-cell metadata that only exceptional cells carry. Immutable
@@ -109,6 +109,7 @@ export class ColumnarStore {
             };
         }
         if ((flags & XLSX_ISO_DATE) !== 0) cell.xlsxIsoDate = true;
+        if ((flags & FORMULA_RESULT_PENDING) !== 0) cell.formulaResultPending = true;
         // The HAS_EXTRAS bit keeps plain-cell reads off the map entirely, so
         // one linked cell doesn't turn every read into a hash probe.
         if ((flags & HAS_EXTRAS) !== 0) {
@@ -174,6 +175,7 @@ export class ColumnarStore {
                 if (cell.numberFormat.date1904) flags |= DATE_1904;
             }
             if (cell.xlsxIsoDate) flags |= XLSX_ISO_DATE;
+            if (cell.formulaResultPending) flags |= FORMULA_RESULT_PENDING;
             this.types[i] = encode_type(cell.rawType);
             if (cell.richText || cell.hyperlink || cell.formula) {
                 // Stored by reference: the parser hands over immutable objects

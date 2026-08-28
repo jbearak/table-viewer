@@ -9,6 +9,7 @@ import {
     type RichTextSegment,
 } from './rich-text-layout';
 import { choose_diff_mode, word_diff } from './word-diff';
+import { UNKNOWN_XLSX_FORMULA_RESULT } from '../xlsx-formula';
 
 /**
  * Cell-content construction for the Glide grid. Pure (no canvas, no Glide
@@ -70,6 +71,8 @@ export interface CellEditOverlay {
     /** Parsed rich value of a dirty Markdown edit. This is the paint authority
      * while the workbook has not yet been saved and reloaded. */
     dirty_rich?: RichText;
+    /** The dirty XLSX value is a formula whose calculated result is unknown. */
+    formula_result_pending?: true;
     /** themeOverride background tint for dirty / conflicted cells. */
     bg?: string;
     /** The "before" text to diff against the cell's current text. The Diff
@@ -184,6 +187,20 @@ export function diff_lines(
     return lines;
 }
 
+function pending_formula_lines(base: string, colors: DiffColors): RichTextLine[] {
+    return base === ''
+        ? [[{ text: UNKNOWN_XLSX_FORMULA_RESULT, diff_color: colors.added }]]
+        : diff_lines(base, UNKNOWN_XLSX_FORMULA_RESULT, 'number', colors);
+}
+
+function persisted_displayed_text(
+    c: RenderedCell | null | undefined,
+    show_formatting: boolean,
+): string {
+    if (c?.formulaResultPending) return UNKNOWN_XLSX_FORMULA_RESULT;
+    return show_formatting ? c?.formatted ?? '' : c?.raw ?? '';
+}
+
 /** Visual lines for a compare-deleted cell: the whole text struck through in
  *  the deletion color, split on hard breaks like every other rich cell. */
 function deleted_lines(text: string, colors: DiffColors): RichTextLine[] {
@@ -221,12 +238,18 @@ export function displayed_text(
     show_formatting: boolean,
     overlay: CellEditOverlay | undefined,
 ): string {
+    if (overlay?.formula_result_pending) {
+        const base = persisted_displayed_text(c, show_formatting);
+        return base === ''
+            ? UNKNOWN_XLSX_FORMULA_RESULT
+            : `${base}${DIFF_ARROW}${UNKNOWN_XLSX_FORMULA_RESULT}`;
+    }
     if (overlay?.dirty_value !== undefined) {
         return show_formatting && overlay.diff_base === undefined
             ? overlay.dirty_display ?? overlay.dirty_value
             : overlay.dirty_value;
     }
-    return show_formatting ? c?.formatted ?? '' : (c?.raw ?? '');
+    return persisted_displayed_text(c, show_formatting);
 }
 
 function rich_cell(
@@ -287,6 +310,11 @@ function rich_cell(
         // removed original, struck through whole in the deletion color.
         const lines = overlay?.compare_deleted
             ? deleted_lines(display, diff_colors)
+            : overlay?.formula_result_pending
+            ? pending_formula_lines(
+                persisted_displayed_text(c, show_formatting),
+                diff_colors,
+            )
             : overlay?.diff_base !== undefined
             ? diff_lines(overlay.diff_base, display, c.rawType, diff_colors)
             : rich_text_lines(
@@ -372,6 +400,7 @@ export function rich_cell_display_data(
     if (
         !(c && renders_rich(c, show_formatting))
         && !(show_formatting && overlay?.dirty_rich !== undefined)
+        && !overlay?.formula_result_pending
         && overlay?.diff_base === undefined
         && !overlay?.compare_deleted
     ) return undefined;
@@ -496,6 +525,7 @@ export function build_grid_cell(
     if (
         (c && renders_rich(c, show_formatting))
         || (show_formatting && overlay?.dirty_rich !== undefined)
+        || overlay?.formula_result_pending
         // Diff mode paints mixed colors and strikethrough, which only the
         // rich renderer can draw — regardless of the Formatting toggle.
         || overlay?.diff_base !== undefined

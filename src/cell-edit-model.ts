@@ -23,6 +23,7 @@
  */
 
 import { get_raw_cell_text } from './cell-display';
+import { is_xlsx_formula_text } from './xlsx-formula';
 import {
     normalize_text_style,
     rich_text_from_plain,
@@ -106,7 +107,7 @@ export function parse_cell_edit(input: string, syntax: EditSyntax): ParsedCellEd
     // formula and its operators are not markdown. In particular, `E5*F5` must
     // not acquire italic runs or lose either asterisk before it reaches the
     // formula writer.
-    if (input.startsWith('=') && input.length > 1) return { text: input };
+    if (is_xlsx_formula_text(input)) return { text: input };
     const rich = markdown_to_rich_text(input);
     const text = rich_text_plain_text(rich);
     return rich_text_has_styles(rich) ? { text, rich } : { text };
@@ -158,7 +159,7 @@ export function cell_edit_base(cell: EditableSourceCell): ParsedCellEdit {
  *  or base) — markdown when the sheet edits as markdown, verbatim otherwise. */
 export function edit_display_text(edit: ParsedCellEdit, syntax: EditSyntax): string {
     if (syntax === 'plain') return edit.text;
-    if (edit.rich === undefined && edit.text.startsWith('=') && edit.text.length > 1) {
+    if (edit.rich === undefined && is_xlsx_formula_text(edit.text)) {
         return edit.text;
     }
     return rich_text_to_markdown(edit.rich ?? rich_text_from_plain(edit.text));

@@ -2,6 +2,14 @@
 const MAX_COLUMN = 16_384;
 const MAX_ROW = 1_048_576;
 
+/** Display text when an XLSX formula has no trustworthy cached result. */
+export const UNKNOWN_XLSX_FORMULA_RESULT = '??';
+
+/** Whether text entered into an XLSX cell denotes a formula. */
+export function is_xlsx_formula_text(value: string): boolean {
+    return value.startsWith('=') && value.length > 1;
+}
+
 function column_index(letters: string): number {
     let index = 0;
     for (const char of letters.toUpperCase()) {

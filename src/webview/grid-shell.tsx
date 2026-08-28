@@ -126,6 +126,7 @@ import {
 } from '../cell-edit-model';
 import { format_xlsx_edit_preview } from '../spreadsheet-format';
 import { xlsx_runs_require_inline_string } from '../xlsx-cell-value';
+import { is_xlsx_formula_text } from '../xlsx-formula';
 import {
     create_edit_session_store,
     type EditSessionStore,
@@ -300,25 +301,32 @@ function cached_markdown_edit_text(
  * replaces the displayed text — a link-only entry's `value` is the unedited
  * cell's raw text. Diff mode needs a trustworthy "before": a base_pending
  * entry's base is a placeholder until its page lands, so it shows the new
- * value alone.
+ * value alone. `xlsx_editing` enables both XLSX rich text and formula semantics;
+ * CSV/TSV use the plain edit syntax and keep a leading `=` as literal text.
  */
 function dirty_value_overlay_fields(
     dirty: DirtyEntry,
     diff_mode: boolean,
     show_formatting: boolean,
     cell: RenderedCell | null | undefined,
-    include_rich = false,
-): Pick<CellEditOverlay, 'dirty_value' | 'dirty_display' | 'dirty_rich' | 'diff_base'> | undefined {
+    xlsx_editing = false,
+): Pick<
+    CellEditOverlay,
+    'dirty_value' | 'dirty_display' | 'dirty_rich' | 'diff_base' | 'formula_result_pending'
+> | undefined {
     if (!dirty_entry_value_changed(dirty)) return undefined;
-    const presentation = show_formatting && !diff_mode && cell
-        && (cell.numberFormat || (include_rich && dirty.valueRuns))
+    const formula_result_pending = xlsx_editing && is_xlsx_formula_text(dirty.value);
+    const presentation = !formula_result_pending && show_formatting && !diff_mode && cell
+        && (cell.numberFormat || (xlsx_editing && dirty.valueRuns))
         ? cached_dirty_presentation(dirty, cell)
         : undefined;
-    const requires_rich = show_formatting && !diff_mode && include_rich && dirty.valueRuns
+    const requires_rich = !formula_result_pending
+        && show_formatting && !diff_mode && xlsx_editing && dirty.valueRuns
         ? presentation?.requires_rich ?? dirty_requires_rich_text(dirty, cell)
         : false;
     return {
         dirty_value: dirty.value,
+        ...(formula_result_pending ? { formula_result_pending: true as const } : {}),
         ...(presentation?.display !== undefined ? { dirty_display: presentation.display } : {}),
         ...(requires_rich ? { dirty_rich: dirty.valueRuns } : {}),
         ...(diff_mode && !dirty.base_pending ? { diff_base: dirty.base } : {}),

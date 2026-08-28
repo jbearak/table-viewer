@@ -2825,6 +2825,96 @@ describe('GridShell link-only edits', () => {
         expect(content().displayData).toBe('9,876.50');
     });
 
+    it('paints dirty XLSX formulas as cached value to unknown result', async () => {
+        grid_mock.get_row.mockImplementation(() => [{
+            raw: '58.5',
+            formatted: '$58.50',
+            bold: false,
+            italic: false,
+            rawType: 'number' as const,
+            formula: '=E5*F5',
+        }, {
+            raw: '12',
+            formatted: '12',
+            bold: false,
+            italic: false,
+            rawType: 'number' as const,
+        }, {
+            raw: '20',
+            formatted: '$20.00',
+            bold: false,
+            italic: false,
+            rawType: 'number' as const,
+            formula: '=A1+B1',
+        }] as any);
+        const initial = props({
+            show_formatting: true,
+            edit_mode: true,
+            csv_editable: true,
+            edit_syntax: 'markdown',
+            column_projection: {
+                visible_to_source: [0, 1, 2],
+                source_to_visible: [0, 1, 2],
+                hidden_count: 0,
+            },
+            initial_edits: {
+                '0:0': { value: '=E5*F5+1', base: '=E5*F5' },
+                '0:1': { value: '=A1*2', base: '12' },
+                '0:2': { value: '60', base: '=A1+B1' },
+            },
+        });
+        const GridShell = await render_grid(initial);
+        const get_cell_content = (cell: [number, number]) => (
+            grid_mock.props!.getCellContent as (cell: [number, number]) => {
+                kind: string;
+                displayData?: string;
+                data: { lines: Array<Array<{ text: string }>> };
+                copyData: string;
+            }
+        )(cell);
+
+        const formula = get_cell_content([0, 0]);
+        expect(formula.data.lines.flat().map((part) => part.text).join(''))
+            .toBe('$58.50 → ??');
+        expect(formula.copyData).toBe('=E5*F5+1');
+
+        const promoted = get_cell_content([1, 0]);
+        expect(promoted.data.lines.flat().map((part) => part.text).join(''))
+            .toBe('12 → ??');
+        expect(promoted.copyData).toBe('=A1*2');
+
+        expect(get_cell_content([2, 0])).toMatchObject({
+            kind: 'text',
+            displayData: '60',
+        });
+
+        await act(async () => {
+            root!.render(React.createElement(GridShell, {
+                ...initial,
+                show_formatting: false,
+            }));
+        });
+        expect(get_cell_content([0, 0]).data.lines
+            .flat().map((part) => part.text).join('')).toBe('58.5 → ??');
+    });
+
+    it('keeps a CSV value beginning with equals as literal text', async () => {
+        await render_grid(props({
+            edit_mode: true,
+            csv_editable: true,
+            edit_syntax: 'plain',
+            initial_edits: {
+                '0:0': { value: '=not a formula', base: 'source-a' },
+            },
+        }));
+        const get_cell_content = grid_mock.props!.getCellContent as
+            (cell: [number, number]) => { kind: string; displayData: string };
+        expect(get_cell_content([0, 0])).toMatchObject({
+            kind: 'text',
+            displayData: '=not a formula',
+        });
+    });
+
     it('formats dirty runs that reduce to the cell font as a scalar', async () => {
         grid_mock.get_row.mockImplementation(() => [{
             raw: '1234.5',

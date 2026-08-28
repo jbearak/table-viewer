@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { translate_a1_formula } from '../xlsx-formula';
+import { is_xlsx_formula_text, translate_a1_formula } from '../xlsx-formula';
+
+describe('is_xlsx_formula_text', () => {
+    it('requires a leading equals and a formula body', () => {
+        expect(is_xlsx_formula_text('=A1*2')).toBe(true);
+        expect(is_xlsx_formula_text('=')).toBe(false);
+        expect(is_xlsx_formula_text('A1*2')).toBe(false);
+    });
+});
 
 describe('translate_a1_formula', () => {
     it('moves relative references and preserves absolute components', () => {

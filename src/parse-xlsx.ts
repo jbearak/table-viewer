@@ -36,7 +36,10 @@ import {
     type ParsedXlsxString,
 } from './xlsx-rich-text';
 import { parse_relationships, rels_path_for_part, type OoxmlRelationship } from './ooxml-relationships';
-import { translate_a1_formula } from './xlsx-formula';
+import {
+    translate_a1_formula,
+    UNKNOWN_XLSX_FORMULA_RESULT,
+} from './xlsx-formula';
 
 // The XML scanning primitives live in ./ooxml-xml so the rich-text and
 // hyperlink parsers (and the writer) share the exact same scans.
@@ -609,6 +612,7 @@ function parse_worksheet_core(
                 let rawType: CellData['rawType'];
                 let richText: RichText | undefined;
                 let effective_formula: string | undefined;
+                let formula_result_pending = false;
 
                 const formula = find_first_element(
                     xml,
@@ -712,14 +716,16 @@ function parse_worksheet_core(
 
                 if (effective_formula !== undefined && raw === null) {
                     raw = effective_formula;
-                    formatted = effective_formula;
+                    formatted = UNKNOWN_XLSX_FORMULA_RESULT;
                     rawType = 'string';
+                    formula_result_pending = true;
                 }
                 const cell: CellData = {
                     raw,
                     formatted,
                     rawType,
                     ...(effective_formula !== undefined ? { formula: effective_formula } : {}),
+                    ...(formula_result_pending ? { formulaResultPending: true as const } : {}),
                     ...style,
                 };
                 if (number_format) cell.numberFormat = number_format;
