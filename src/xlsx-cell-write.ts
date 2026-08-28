@@ -28,10 +28,19 @@ import {
 import { OoxmlRefusalError, type OoxmlRefusalCode } from './ooxml-refusal';
 import { text_styles_equal, type CellTextStyle, type RichTextRun } from './cell-content';
 import {
+    build_formula_dependency_index,
+    transitive_formula_dependents,
+} from './formula-dependencies';
+import type { FormulaDependency } from './data-source/interface';
+import {
+    is_xlsx_formula_text,
+    local_a1_formula_references,
+    translate_a1_formula,
+} from './xlsx-formula';
+import {
     classify_xlsx_cell_value,
     xlsx_runs_require_inline_string,
 } from './xlsx-cell-value';
-import { is_xlsx_formula_text } from './xlsx-formula';
 
 export { iso_to_serial } from './xlsx-cell-value';
 
@@ -48,10 +57,12 @@ export { iso_to_serial } from './xlsx-cell-value';
  * algorithm rather than a checklist we have to keep up to date. Parts other than
  * the edited worksheet are never even read (see `xlsx-package.ts`).
  *
- * The unit of edit is one `<c>` element. For each edited cell we either splice a
- * replacement `<c>` over the existing one, or synthesize a new `<c>` (and, if
- * needed, a new `<row>`) at the correct sorted position. Everything between
- * splices is untouched original text.
+ * The unit of an explicit edit is one `<c>` element. For each edited cell we
+ * either splice a replacement `<c>` over the existing one, or synthesize a new
+ * `<c>` and, if needed, a new `<row>` at the correct sorted position. Formula
+ * dependents get one narrower change: their stale cached `<v>` is removed while
+ * the formula, style, and surrounding XML stay byte-for-byte intact. Everything
+ * between those splices is untouched original text.
  */
 
 /** A single cell edit, in canonical source coordinates (0-based, unprojected). */
@@ -108,6 +119,8 @@ export interface XlsxWriteOptions {
      * base. Absent reads as '' — correct for default-font workbooks.
      */
     readonly run_font_base?: (xf_index: number) => string;
+    /** Worksheet name used to recognize explicit same-sheet A1 qualifiers. */
+    readonly sheet_name?: string;
 }
 
 function encode_xml(s: string): string {
@@ -1066,6 +1079,105 @@ export function cells_present(
 /** One pending splice: replace `[start, end)` with `text`. */
 interface Splice { start: number; end: number; text: string }
 
+interface WorksheetFormulaCell {
+    readonly row: number;
+    readonly col: number;
+    readonly cell: Span;
+    readonly type: string | null;
+    readonly reference: string | null;
+    readonly sharedIndex: string | null;
+    readonly text: string;
+}
+
+interface WorksheetFormulaState {
+    readonly dependencies: FormulaDependency[];
+    readonly cells: ReadonlyMap<string, Span>;
+}
+
+/**
+ * Read formula coordinates and same-sheet references from the unedited part.
+ * Shared followers borrow and translate their master's text, matching the XLSX
+ * reader so the save and the reopen cannot disagree about their dependencies.
+ */
+function worksheet_formula_state(
+    xml: Uint8Array,
+    sheet_data: Span,
+    sheet_name: string | undefined,
+): WorksheetFormulaState {
+    const formulas: WorksheetFormulaCell[] = [];
+    scan_rows(xml, sheet_data.inner_start, sheet_data.inner_end, {
+        on_cell: (row, col, cell) => {
+            const formula = find_first_element(
+                xml,
+                'f',
+                cell.inner_start,
+                cell.inner_end,
+            );
+            if (!formula) return;
+            formulas.push({
+                row,
+                col,
+                cell,
+                type: get_tag_attr(xml, formula.start, formula.inner_start, 't'),
+                reference: get_tag_attr(xml, formula.start, formula.inner_start, 'ref'),
+                sharedIndex: get_tag_attr(xml, formula.start, formula.inner_start, 'si'),
+                text: decode_xml(utf8_text(xml, formula.inner_start, formula.inner_end)),
+            });
+        },
+    });
+
+    const shared_masters = new Map<
+        string,
+        { readonly row: number; readonly col: number; readonly text: string }
+    >();
+    for (const formula of formulas) {
+        if (
+            formula.type === 'shared'
+            && formula.reference !== null
+            && formula.sharedIndex !== null
+            && formula.text !== ''
+        ) {
+            shared_masters.set(formula.sharedIndex, formula);
+        }
+    }
+
+    const dependencies: FormulaDependency[] = [];
+    const cells = new Map<string, Span>();
+    for (const formula of formulas) {
+        cells.set(`${formula.row}:${formula.col}`, formula.cell);
+        let effective: string | undefined;
+        if (formula.type === 'shared' && formula.reference === null) {
+            const master = formula.sharedIndex === null
+                ? undefined
+                : shared_masters.get(formula.sharedIndex);
+            if (master) {
+                effective = '=' + translate_a1_formula(
+                    master.text,
+                    formula.row - master.row,
+                    formula.col - master.col,
+                );
+            }
+        } else if (formula.text !== '') {
+            effective = `=${formula.text}`;
+        }
+        if (effective === undefined) continue;
+        for (const reference of local_a1_formula_references(
+            effective,
+            sheet_name ?? '',
+        )) {
+            dependencies.push([
+                formula.row,
+                formula.col,
+                reference.firstRow,
+                reference.firstColumn,
+                reference.lastRow,
+                reference.lastColumn,
+            ]);
+        }
+    }
+    return { dependencies, cells };
+}
+
 /**
  * Apply cell edits to one worksheet's XML, returning the new XML.
  *
@@ -1156,6 +1268,12 @@ function apply_cell_edits_bytes(
 
     const splices: Splice[] = [];
     const new_rows: Array<{ row: number; text: string }> = [];
+    const formula_state = worksheet_formula_state(xml, sheet_data, options.sheet_name);
+    const edited_keys = new Set(edits.map((edit) => `${edit.row}:${edit.col}`));
+    const invalidated_formula_keys = transitive_formula_dependents(
+        build_formula_dependency_index(formula_state.dependencies),
+        edited_keys,
+    );
     // Scanned once for the whole sheet, because grouped-formula members can be
     // identifiable only from the master's `ref`.
     const grouped_ranges = grouped_formula_ranges(xml);
@@ -1318,6 +1436,19 @@ function apply_cell_edits_bytes(
             if (best !== undefined) at = best;
             splices.push({ start: at, end: at, text: ins.text });
         }
+    }
+
+    // An explicitly edited cell is replaced wholesale below, and a formula edit
+    // already emits no `<v>`. Every other affected formula keeps its source and
+    // formatting but loses the cached result that became stale. On reopen the
+    // reader then shows `??` instead of reviving that old number.
+    for (const key of invalidated_formula_keys) {
+        if (edited_keys.has(key)) continue;
+        const cell = formula_state.cells.get(key);
+        if (!cell) continue;
+        const value = find_first_element(xml, 'v', cell.inner_start, cell.inner_end);
+        if (!value) continue;
+        splices.push({ start: value.start, end: value.end, text: '' });
     }
 
     // New rows are likewise inserted in ascending row order — and sorted for the

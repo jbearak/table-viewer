@@ -20,7 +20,7 @@ import {
     parse_styles,
     parse_workbook_xml,
     resolve_part_path,
-    worksheet_part_paths_from_package,
+    worksheet_part_entries_from_package,
 } from './parse-xlsx';
 import type { DateMode } from './spreadsheet-format';
 import { rels_path_for_part } from './ooxml-relationships';
@@ -269,7 +269,7 @@ export function write_xlsx_workbook_cell_edits(
         throw new Error('Not a valid .xlsx file');
     }
 
-    const parts = worksheet_part_paths_from_package(zip);
+    const parts = worksheet_part_entries_from_package(zip);
     const { is_date_style, cell_font_style, run_font_base } = read_style_write_context(zip);
     const datemode = read_datemode(zip);
     let calculation_chain_stale = false;
@@ -281,12 +281,12 @@ export function write_xlsx_workbook_cell_edits(
     for (const { sheetIndex, edits, link_edits } of active) {
         const part = parts[sheetIndex];
         if (!part) throw new Error('Could not locate a worksheet to save');
-        const path = `/${part}`;
+        const path = `/${part.path}`;
         const sheet_content = read_part_bytes(zip, path);
         if (sheet_content === null) throw new Error('Could not read a worksheet to save');
         const sheet_xml = worksheet_scan_input(sheet_content);
 
-        const rels_path = `/${rels_path_for_part(part)}`;
+        const rels_path = `/${rels_path_for_part(part.path)}`;
         const rels_xml = link_edits && link_edits.length > 0
             ? read_part_text(zip, rels_path)
             : null;
@@ -300,6 +300,7 @@ export function write_xlsx_workbook_cell_edits(
                 is_date_style,
                 cell_font_style,
                 run_font_base,
+                sheet_name: part.name,
             },
         });
         if (result.relationships_xml !== null) {

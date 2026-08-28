@@ -132,8 +132,9 @@ function parse_sheet_rels(zip: ZipPackage): Map<string, string> {
 }
 
 /**
- * Worksheet part paths in the order this reader numbers the sheets — `xl/…`, no
- * leading slash — for the writer to resolve a sheet index against.
+ * Worksheet names and part paths in the order this reader numbers the sheets.
+ * Paths use `xl/…` with no leading slash. The writer needs both so a sheet index
+ * resolves to the same part and qualified formulas can be matched to its name.
  *
  * Exported so the two sides cannot disagree. The writer had its own enumeration,
  * written to the same intent but not the same code, and every difference between
@@ -146,17 +147,29 @@ function parse_sheet_rels(zip: ZipPackage): Map<string, string> {
  * here. Indexing identically is, and sharing one enumeration is the only way to
  * have it hold for the next difference nobody thought of.
  */
-export function worksheet_part_paths_from_package(
+export interface WorksheetPartEntry {
+    readonly name: string;
+    readonly path: string;
+}
+
+export function worksheet_part_entries_from_package(
     zip: ZipPackage,
-): string[] {
+): WorksheetPartEntry[] {
     const rels = parse_sheet_rels(zip);
     const workbook_xml = get_entry_text(zip, '/xl/workbook.xml');
     if (!workbook_xml) return [];
     // `parse_xlsx` drops a sheet whose relationship does not resolve *before*
     // numbering the rest, so the filter belongs here too — see its own loop.
-    return parse_workbook_xml(workbook_xml).sheets
-        .map((sheet) => rels.get(sheet.rId))
-        .filter((path): path is string => path !== undefined);
+    return parse_workbook_xml(workbook_xml).sheets.flatMap((sheet) => {
+        const path = rels.get(sheet.rId);
+        return path === undefined ? [] : [{ name: sheet.name, path }];
+    });
+}
+
+export function worksheet_part_paths_from_package(
+    zip: ZipPackage,
+): string[] {
+    return worksheet_part_entries_from_package(zip).map((entry) => entry.path);
 }
 
 export function worksheet_part_paths(buffer: Uint8Array): string[] {

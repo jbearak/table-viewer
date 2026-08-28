@@ -220,7 +220,55 @@ describe('apply_cell_edits', () => {
             OPTS,
         );
         expect(out).toContain('<c r="E5"><v>14</v></c>');
-        expect(out).toContain('<c r="I5"><f>E5*F5</f><v>58.5</v></c>');
+        expect(out).toContain('<c r="I5"><f>E5*F5</f></c>');
+        expect(out).not.toContain('<v>58.5</v>');
+    });
+
+    it('invalidates formula caches recursively and leaves unrelated caches intact', () => {
+        const out = apply_cell_edits(
+            doc(
+                '<row r="1"><c r="A1"><v>2</v></c>'
+                + '<c r="B1"><f>A1*2</f><v>4</v></c>'
+                + '<c r="C1"><f>B1*3</f><v>12</v></c>'
+                + '<c r="D1"><f>Z1</f><v>99</v></c></row>',
+            ),
+            [{ row: 0, col: 0, value: '3' }],
+            OPTS,
+        );
+        expect(out).toContain('<c r="B1"><f>A1*2</f></c>');
+        expect(out).toContain('<c r="C1"><f>B1*3</f></c>');
+        expect(out).toContain('<c r="D1"><f>Z1</f><v>99</v></c>');
+    });
+
+    it('invalidates the matching shared-formula follower and its dependents', () => {
+        const out = apply_cell_edits(
+            doc(
+                '<row r="1"><c r="A1"><v>2</v></c>'
+                + '<c r="B1"><f t="shared" ref="B1:B2" si="0">A1*2</f><v>4</v></c></row>'
+                + '<row r="2"><c r="A2"><v>3</v></c>'
+                + '<c r="B2"><f t="shared" si="0"/><v>6</v></c>'
+                + '<c r="C2"><f>B2*3</f><v>18</v></c></row>',
+            ),
+            [{ row: 1, col: 0, value: '4' }],
+            OPTS,
+        );
+        expect(out).toContain('<c r="B1"><f t="shared" ref="B1:B2" si="0">A1*2</f><v>4</v></c>');
+        expect(out).toContain('<c r="B2"><f t="shared" si="0"/></c>');
+        expect(out).toContain('<c r="C2"><f>B2*3</f></c>');
+    });
+
+    it('recognizes explicit current-sheet qualifiers without crossing worksheets', () => {
+        const out = apply_cell_edits(
+            doc(
+                '<row r="1"><c r="A1"><v>2</v></c>'
+                + '<c r="B1"><f>Sheet1!A1*2</f><v>4</v></c>'
+                + '<c r="C1"><f>Other!A1*3</f><v>6</v></c></row>',
+            ),
+            [{ row: 0, col: 0, value: '3' }],
+            { ...OPTS, sheet_name: 'Sheet1' },
+        );
+        expect(out).toContain('<c r="B1"><f>Sheet1!A1*2</f></c>');
+        expect(out).toContain('<c r="C1"><f>Other!A1*3</f><v>6</v></c>');
     });
 
     it('writes an entered formula instead of a literal string', () => {
@@ -1708,6 +1756,32 @@ describe('widen_dimension', () => {
 });
 
 describe('write_xlsx_cell_edits', () => {
+    it('reopens saved formula dependents as unknown instead of stale cached values', async () => {
+        const raw = patched_parts([[
+            '/xl/worksheets/sheet1.xml',
+            /<c r="B1"[^>]*>[\s\S]*?<\/c><c r="C1"[^>]*>[\s\S]*?<\/c>/,
+            '<c r="B1" s="2"><f>A1*2</f><v>2469.12</v></c>'
+                + '<c r="C1" s="3"><f>B1*3</f><v>7407.36</v></c>',
+        ]]);
+
+        const out = write_xlsx_cell_edits(raw, 0, [{ row: 0, col: 0, value: '2' }]);
+        const row = (await parse_xlsx(out)).data.sheets[0].rows[0];
+
+        expect(row[0]?.raw).toBe(2);
+        expect(row[1]).toMatchObject({
+            raw: '=A1*2',
+            formatted: '??',
+            formula: '=A1*2',
+            formulaResultPending: true,
+        });
+        expect(row[2]).toMatchObject({
+            raw: '=B1*3',
+            formatted: '??',
+            formula: '=B1*3',
+            formulaResultPending: true,
+        });
+    });
+
     it('writes several worksheets through one workbook operation', async () => {
         const raw = readFileSync('src/test/fixtures/basic.xlsx');
         const out = write_xlsx_workbook_cell_edits(raw, [
