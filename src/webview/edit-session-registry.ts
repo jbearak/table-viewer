@@ -38,6 +38,7 @@
  */
 
 import {
+    dirty_entry_value_changed,
     worksheet_identity,
     worksheet_target_lookup,
     type CsvDirtyMap,
@@ -47,10 +48,25 @@ import {
 import {
     create_edit_session_store,
     type DirtyEntry,
+    type EditSessionFormulaChange,
+    type EditSessionFormulaInput,
     type EditSessionStore,
 } from './edit-session-store';
 import type { StagedMutation } from './staged-mutation';
 import { collect_save_payload } from './csv-save-model';
+import { parse_cell_key } from '../cell-key';
+import { MAX_WORKBOOK_FORMULAS } from '../spreadsheet-safety';
+import type { FormulaCalculationEdit } from '../formula-calculation';
+import { rich_text_equal } from '../cell-content';
+import { xlsx_edit_writes_formula } from '../xlsx-cell-value';
+
+export interface EditSessionFormulaProjection {
+    readonly edits: readonly FormulaCalculationEdit[];
+    readonly coordinateRevision: number;
+    readonly calculationRevision: number;
+    readonly tooManyEdits: boolean;
+    readonly hasFormulaEdits: boolean;
+}
 
 export interface EditSessionSaveWorksheet {
     target: WorksheetTarget;
@@ -90,6 +106,8 @@ export interface EditSessionRegistry {
     /** Aggregate observable for value projections spanning every live sheet. */
     subscribe(listener: () => void): () => void;
     revision(): number;
+    /** Incrementally maintained formula inputs; unchanged by style/link-only writes. */
+    formula_projection(): EditSessionFormulaProjection;
     /**
      * The store for one worksheet, created on first use.
      *
@@ -212,12 +230,172 @@ export function create_edit_session_registry(
     let revision = 0;
     const listeners = new Set<() => void>();
     const subscriptions = new Map<EditSessionStore, () => void>();
+    let formula_edits: FormulaCalculationEdit[] = [];
+    let formula_value_edit_count = 0;
+    let formula_edit_count = 0;
+    let formula_coordinate_revision = 0;
+    let formula_calculation_revision = 0;
+    let too_many_formula_edits = false;
     const publish = () => {
         revision += 1;
         for (const listener of listeners) listener();
     };
+
+    const compare_formula_edits = (
+        left: FormulaCalculationEdit,
+        right: FormulaCalculationEdit,
+    ): number => (left.sheetIndex - right.sheetIndex)
+        || (left.row - right.row)
+        || (left.column - right.column);
+    const formula_edit_values_equal = (
+        left: FormulaCalculationEdit,
+        right: FormulaCalculationEdit,
+    ): boolean => {
+        if (left.value !== right.value || left.writesFormula !== right.writesFormula) return false;
+        if (left.runs === undefined || right.runs === undefined) {
+            return left.runs === right.runs;
+        }
+        return rich_text_equal({ runs: left.runs }, { runs: right.runs });
+    };
+    const formula_edit_position = (wanted: FormulaCalculationEdit): number => {
+        let low = 0;
+        let high = formula_edits.length;
+        while (low < high) {
+            const middle = (low + high) >>> 1;
+            if (compare_formula_edits(formula_edits[middle], wanted) < 0) low = middle + 1;
+            else high = middle;
+        }
+        return low;
+    };
+    const calculation_input = (input: EditSessionFormulaInput): EditSessionFormulaInput & {
+        readonly writesFormula: boolean;
+    } => {
+        const runs = input.runs;
+        const retained_runs = runs && runs.length > 0 ? runs : undefined;
+        return {
+            value: input.value,
+            writesFormula: xlsx_edit_writes_formula(input.value, retained_runs),
+            ...(retained_runs !== undefined ? { runs: retained_runs } : {}),
+        };
+    };
+    const formula_input = (entry: DirtyEntry): ReturnType<typeof calculation_input> | undefined =>
+        dirty_entry_value_changed(entry)
+            ? calculation_input({
+                value: entry.value,
+                ...(entry.valueRuns !== undefined ? { runs: entry.valueRuns.runs } : {}),
+            })
+            : undefined;
+    const current_formula_entries = (): FormulaCalculationEdit[] => {
+        const next: FormulaCalculationEdit[] = [];
+        formula_value_edit_count = 0;
+        formula_edit_count = 0;
+        for (const [sheetIndex, store] of stores) {
+            for (const [key, entry] of store.snapshot()) {
+                const input = formula_input(entry);
+                if (input === undefined) continue;
+                const cell = parse_cell_key(key);
+                if (!cell) continue;
+                formula_value_edit_count += 1;
+                formula_edit_count += input.writesFormula ? 1 : 0;
+                if (next.length >= MAX_WORKBOOK_FORMULAS) continue;
+                next.push({
+                    sheetIndex,
+                    row: cell.sourceRow,
+                    column: cell.sourceColumn,
+                    value: input.value,
+                    writesFormula: input.writesFormula,
+                    ...(input.runs !== undefined ? { runs: input.runs } : {}),
+                });
+            }
+        }
+        next.sort(compare_formula_edits);
+        return next;
+    };
+    const rebuild_formula_projection = (): void => {
+        const previous = formula_edits;
+        const previous_too_many = too_many_formula_edits;
+        const next = current_formula_entries();
+        too_many_formula_edits = formula_value_edit_count > MAX_WORKBOOK_FORMULAS;
+        if (too_many_formula_edits) next.length = 0;
+        formula_edits = next;
+
+        const coordinates_equal = !previous_too_many && !too_many_formula_edits
+            && previous.length === next.length
+            && previous.every((edit, index) => compare_formula_edits(edit, next[index]) === 0);
+        const calculations_equal = coordinates_equal
+            && previous.every((edit, index) => formula_edit_values_equal(edit, next[index]));
+        if (!coordinates_equal) formula_coordinate_revision += 1;
+        if (!calculations_equal) formula_calculation_revision += 1;
+    };
+    const apply_formula_change = (
+        sheetIndex: number,
+        change: Extract<EditSessionFormulaChange, { kind: 'entry' }>,
+    ): void => {
+        const previous = change.previous === undefined
+            ? undefined
+            : calculation_input(change.previous);
+        const value = change.value === undefined
+            ? undefined
+            : calculation_input(change.value);
+        if (change.previous !== undefined) {
+            formula_value_edit_count -= 1;
+            formula_edit_count -= previous?.writesFormula ? 1 : 0;
+        }
+        if (change.value !== undefined) {
+            formula_value_edit_count += 1;
+            formula_edit_count += value?.writesFormula ? 1 : 0;
+        }
+        formula_calculation_revision += 1;
+        if ((change.previous === undefined) !== (change.value === undefined)) {
+            formula_coordinate_revision += 1;
+        }
+
+        if (too_many_formula_edits) {
+            if (formula_value_edit_count <= MAX_WORKBOOK_FORMULAS) {
+                rebuild_formula_projection();
+            }
+            return;
+        }
+        const cell = parse_cell_key(change.key);
+        if (!cell) {
+            rebuild_formula_projection();
+            return;
+        }
+        const wanted: FormulaCalculationEdit = {
+            sheetIndex,
+            row: cell.sourceRow,
+            column: cell.sourceColumn,
+            value: value?.value ?? '',
+            writesFormula: value?.writesFormula ?? false,
+            ...(value?.runs !== undefined ? { runs: value.runs } : {}),
+        };
+        const position = formula_edit_position(wanted);
+        const existing = formula_edits[position];
+        const present = existing !== undefined && compare_formula_edits(existing, wanted) === 0;
+        if (change.value === undefined) {
+            if (present) formula_edits.splice(position, 1);
+            return;
+        }
+        if (present) formula_edits[position] = wanted;
+        else formula_edits.splice(position, 0, wanted);
+        if (formula_edits.length > MAX_WORKBOOK_FORMULAS) {
+            too_many_formula_edits = true;
+            formula_edits = [];
+        }
+    };
     const watch = (store: EditSessionStore) => {
-        if (!subscriptions.has(store)) subscriptions.set(store, store.subscribe(publish));
+        if (subscriptions.has(store)) return;
+        subscriptions.set(store, store.subscribe((change) => {
+            if (change.kind === 'reset') rebuild_formula_projection();
+            else if (change.kind === 'entry') {
+                for (const [sheetIndex, candidate] of stores) {
+                    if (candidate !== store) continue;
+                    apply_formula_change(sheetIndex, change);
+                    break;
+                }
+            }
+            publish();
+        }));
     };
     const unwatch_detached = () => {
         const retained = new Set(stores.values());
@@ -235,6 +413,13 @@ export function create_edit_session_registry(
             return () => { listeners.delete(listener); };
         },
         revision: () => revision,
+        formula_projection: () => ({
+            edits: formula_edits,
+            coordinateRevision: formula_coordinate_revision,
+            calculationRevision: formula_calculation_revision,
+            tooManyEdits: too_many_formula_edits,
+            hasFormulaEdits: formula_edit_count > 0,
+        }),
         for_sheet: (sheet_index) => {
             const existing = stores.get(sheet_index);
             if (existing) return existing;
@@ -291,6 +476,7 @@ export function create_edit_session_registry(
             }
             stores = moved;
             unwatch_detached();
+            rebuild_formula_projection();
             publish();
             return {
                 locallyRetainedIndices: locally_retained_indices,
@@ -377,6 +563,7 @@ export function create_edit_session_registry(
             stores.clear();
             parked.clear();
             unwatch_detached();
+            rebuild_formula_projection();
             publish();
         },
         stage_discard: (session_id, sheets) => {

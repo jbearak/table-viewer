@@ -22,6 +22,14 @@ describe('translate_a1_formula', () => {
         expect(translate_a1_formula('A1:B2', 1, 2)).toBe('C2:D3');
     });
 
+    it('moves relative whole-column and whole-row references', () => {
+        expect(translate_a1_formula(
+            'SUM(A:C)+SUM($D:F)+SUM(2:4)+SUM($5:7)',
+            1,
+            1,
+        )).toBe('SUM(B:D)+SUM($D:G)+SUM(3:5)+SUM($5:8)');
+    });
+
     it('does not translate quoted text, sheet names, brackets, or function names', () => {
         expect(translate_a1_formula(
             '"A1"&\'Sheet A1\'!B2+[Book1]Sheet1!C3+LOG10(A1)',
@@ -99,6 +107,17 @@ describe('a1_formula_references', () => {
     it('ignores external workbooks and unsupported 3D references', () => {
         expect(a1_formula_references('=[Book.xlsx]Sheet2!A1+Sheet1:Sheet3!B2'))
             .toEqual([]);
+    });
+
+    it('scans malformed maximum-length quoted prefixes in linear time', () => {
+        const malformed = `=${"'".repeat(8_192)}`;
+        const started = performance.now();
+        for (let iteration = 0; iteration < 16; iteration += 1) {
+            expect(a1_formula_references(malformed)).toEqual([]);
+        }
+        // The former suffix parser rescanned from every apostrophe and took
+        // well over a second for this loop. Offset parsing has ample CI margin.
+        expect(performance.now() - started).toBeLessThan(500);
     });
 });
 

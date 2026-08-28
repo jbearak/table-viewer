@@ -37,8 +37,18 @@ import {
 } from './xlsx-formula';
 import {
     classify_xlsx_cell_value,
+    xlsx_edit_writes_formula,
     xlsx_runs_require_inline_string,
 } from './xlsx-cell-value';
+import {
+    assert_safe_formula_cells,
+    assert_safe_formula_ranges,
+    assert_safe_formula_references,
+    assert_safe_xlsx_formula_text,
+    assert_safe_xlsx_formula_xml_bytes,
+    create_workbook_budget,
+    type WorkbookBudget,
+} from './spreadsheet-safety';
 
 export { iso_to_serial } from './xlsx-cell-value';
 
@@ -146,10 +156,8 @@ function encode_xml(s: string): string {
 }
 
 /** A user-entered XLSX formula. CSV/TSV never call this writer. */
-function is_formula_edit(edit: XlsxCellEdit): boolean {
-    return edit.force_text !== true
-        && edit.runs === undefined
-        && is_xlsx_formula_text(edit.value);
+export function is_xlsx_formula_edit(edit: XlsxCellEdit): boolean {
+    return xlsx_edit_writes_formula(edit.value, edit.runs, edit.force_text === true);
 }
 
 /** Convert a 0-based column index to its letter form (0 → A, 26 → AA). */
@@ -224,7 +232,8 @@ function build_cell_xml(
     const { value } = edit;
     const ref = `${col_index_to_letter(col)}${row + 1}`;
     const style_attr = xf_index !== null && xf_index !== 0 ? ` s="${xf_index}"` : '';
-    if (is_formula_edit(edit)) {
+    if (is_xlsx_formula_edit(edit)) {
+        assert_safe_xlsx_formula_text(value);
         const cached = formula_result === undefined ? '' : `<v>${encode_xml(formula_result)}</v>`;
         return `<c r="${ref}"${style_attr}><f>${encode_xml(value.slice(1))}</f>${cached}</c>`;
     }
@@ -405,6 +414,160 @@ function grouped_formula_ranges(xml: Uint8Array): GroupedRange[] {
     return ranges;
 }
 
+const GROUPED_RANGE_ROW_BASE = 1_048_576;
+const GROUPED_RANGE_LAST_COLUMN = 16_383;
+
+interface GroupedRangeBucket {
+    readonly records: number[];
+    prefixMaxEnd?: Uint32Array;
+}
+
+/** Compact two-dimensional point index for selected grouped-formula ranges. */
+class GroupedFormulaRangeIndex {
+    private readonly buckets = new Map<number, GroupedRangeBucket>();
+    private readonly coveredColumns = new Uint8Array(GROUPED_RANGE_LAST_COLUMN + 1);
+
+    constructor(ranges: readonly GroupedRange[]) {
+        const column_deltas = new Int32Array(GROUPED_RANGE_LAST_COLUMN + 2);
+        for (const range of ranges) {
+            const first_row = Math.max(0, range.start_row);
+            const last_row = Math.min(GROUPED_RANGE_ROW_BASE - 1, range.end_row);
+            if (first_row > last_row) continue;
+            const first_column = Math.max(0, range.start_col);
+            const last_column = Math.min(GROUPED_RANGE_LAST_COLUMN, range.end_col);
+            if (first_column > last_column) continue;
+            column_deltas[first_column] += 1;
+            column_deltas[last_column + 1] -= 1;
+            this.add_columns(
+                1,
+                0,
+                GROUPED_RANGE_LAST_COLUMN,
+                first_column,
+                last_column,
+                first_row,
+                last_row,
+            );
+        }
+        let column_coverage = 0;
+        for (let column = 0; column < this.coveredColumns.length; column += 1) {
+            column_coverage += column_deltas[column];
+            if (column_coverage > 0) this.coveredColumns[column] = 1;
+        }
+        for (const bucket of this.buckets.values()) {
+            bucket.records.sort((left, right) => left - right);
+            const prefix = new Uint32Array(bucket.records.length);
+            let max_end = 0;
+            for (let index = 0; index < bucket.records.length; index += 1) {
+                max_end = Math.max(
+                    max_end,
+                    bucket.records[index] % GROUPED_RANGE_ROW_BASE,
+                );
+                prefix[index] = max_end;
+            }
+            bucket.prefixMaxEnd = prefix;
+        }
+    }
+
+    private add_columns(
+        node: number,
+        first: number,
+        last: number,
+        wanted_first: number,
+        wanted_last: number,
+        first_row: number,
+        last_row: number,
+    ): void {
+        if (wanted_first > wanted_last || wanted_first > last || wanted_last < first) return;
+        if (wanted_first <= first && last <= wanted_last) {
+            const bucket = this.buckets.get(node) ?? { records: [] };
+            bucket.records.push(first_row * GROUPED_RANGE_ROW_BASE + last_row);
+            this.buckets.set(node, bucket);
+            return;
+        }
+        const middle = (first + last) >>> 1;
+        this.add_columns(
+            node * 2,
+            first,
+            middle,
+            wanted_first,
+            wanted_last,
+            first_row,
+            last_row,
+        );
+        this.add_columns(
+            node * 2 + 1,
+            middle + 1,
+            last,
+            wanted_first,
+            wanted_last,
+            first_row,
+            last_row,
+        );
+    }
+
+    private bucket_has(bucket: GroupedRangeBucket | undefined, row: number): boolean {
+        if (!bucket || bucket.records.length === 0) return false;
+        const wanted = row * GROUPED_RANGE_ROW_BASE + GROUPED_RANGE_ROW_BASE - 1;
+        let low = 0;
+        let high = bucket.records.length;
+        while (low < high) {
+            const middle = (low + high) >>> 1;
+            if (bucket.records[middle] <= wanted) low = middle + 1;
+            else high = middle;
+        }
+        return low > 0 && bucket.prefixMaxEnd![low - 1] >= row;
+    }
+
+    has(row: number, column: number): boolean {
+        if (this.coveredColumns[column] !== 1) return false;
+        let node = 1;
+        let first = 0;
+        let last = GROUPED_RANGE_LAST_COLUMN;
+        while (true) {
+            if (this.bucket_has(this.buckets.get(node), row)) return true;
+            if (first === last) return false;
+            const middle = (first + last) >>> 1;
+            if (column <= middle) {
+                node *= 2;
+                last = middle;
+            } else {
+                node = node * 2 + 1;
+                first = middle + 1;
+            }
+        }
+    }
+}
+
+/** Kind-preserving point lookup for edit refusal without ranges × edits scans. */
+class GroupedFormulaKindIndex {
+    private readonly shared: GroupedFormulaRangeIndex | undefined;
+    private readonly array: GroupedFormulaRangeIndex | undefined;
+    private readonly dataTable: GroupedFormulaRangeIndex | undefined;
+
+    constructor(ranges: readonly GroupedRange[]) {
+        const shared: GroupedRange[] = [];
+        const array: GroupedRange[] = [];
+        const data_table: GroupedRange[] = [];
+        for (const range of ranges) {
+            if (range.kind === 'shared') shared.push(range);
+            else if (range.kind === 'array') array.push(range);
+            else data_table.push(range);
+        }
+        this.shared = shared.length > 0 ? new GroupedFormulaRangeIndex(shared) : undefined;
+        this.array = array.length > 0 ? new GroupedFormulaRangeIndex(array) : undefined;
+        this.dataTable = data_table.length > 0
+            ? new GroupedFormulaRangeIndex(data_table)
+            : undefined;
+    }
+
+    kindAt(row: number, column: number): GroupedFormulaKind | null {
+        // Non-detachable groups win for malformed overlapping ranges.
+        if (this.array?.has(row, column)) return 'array';
+        if (this.dataTable?.has(row, column)) return 'dataTable';
+        return this.shared?.has(row, column) ? 'shared' : null;
+    }
+}
+
 /**
  * Why an edit inside a formula group that cannot be changed locally is refused.
  *
@@ -421,20 +584,6 @@ function grouped_formula_error(row: number, col: number, kind: GroupedFormulaKin
         `Cannot edit ${cell_reference(row, col)}: this cell is calculated by ${described}. `
         + "Edit the formula's input cells instead, or replace the formula in Excel first.",
     );
-}
-
-/** The group kind when `row`/`col` falls inside some group's `ref`. */
-function grouped_range_kind(
-    ranges: readonly GroupedRange[],
-    row: number,
-    col: number,
-): GroupedFormulaKind | null {
-    for (const r of ranges) {
-        if (row >= r.start_row && row <= r.end_row && col >= r.start_col && col <= r.end_col) {
-            return r.kind;
-        }
-    }
-    return null;
 }
 
 /**
@@ -540,20 +689,27 @@ function merged_follower_ranges(xml: Uint8Array): GroupedRange[] {
     return ranges;
 }
 
-/** True when `row`/`col` sits in a merge range but is not its anchor. */
-function is_merged_follower(
+/** Index merge coverage with each top-left anchor removed. */
+function merged_follower_index(
     ranges: readonly GroupedRange[],
-    row: number,
-    col: number,
-): boolean {
-    for (const r of ranges) {
-        if (row < r.start_row || row > r.end_row || col < r.start_col || col > r.end_col) continue;
-        // The anchor is the range's top-left, which is where the reader keeps the
-        // visible value — that cell stays editable.
-        if (row === r.start_row && col === r.start_col) continue;
-        return true;
+): GroupedFormulaRangeIndex | undefined {
+    const followers: GroupedRange[] = [];
+    for (const range of ranges) {
+        if (range.start_col < range.end_col) {
+            followers.push({
+                ...range,
+                start_col: range.start_col + 1,
+                end_row: range.start_row,
+            });
+        }
+        if (range.start_row < range.end_row) {
+            followers.push({
+                ...range,
+                start_row: range.start_row + 1,
+            });
+        }
     }
-    return false;
+    return followers.length > 0 ? new GroupedFormulaRangeIndex(followers) : undefined;
 }
 
 /** `A1`-style reference for a message a user will read. */
@@ -1094,16 +1250,122 @@ interface Splice { start: number; end: number; text: string }
 interface WorksheetFormulaCell {
     readonly row: number;
     readonly col: number;
-    readonly cell: Span;
     readonly type: string | null;
     readonly reference: string | null;
     readonly sharedIndex: string | null;
     readonly text: string;
+    readonly dataTableInputs: readonly string[];
 }
 
 interface WorksheetFormulaState {
     readonly dependencies: number[];
-    readonly cells: ReadonlyMap<string, Span>;
+}
+
+type FormulaCacheSpliceVisitor = (start: number, end: number, text: string) => void;
+
+/** Visit cache rewrites in worksheet order without retaining one object per follower. */
+function visit_formula_cache_splices(
+    xml: Uint8Array,
+    sheet_data: Span,
+    wanted: ReadonlySet<string>,
+    values: ReadonlyMap<string, string>,
+    grouped_ranges: readonly GroupedRange[],
+    visit: FormulaCacheSpliceVisitor,
+): void {
+    if (wanted.size === 0) return;
+    const selected_groups = grouped_ranges.filter((range) =>
+        range.kind !== 'shared'
+        && wanted.has(`${range.start_row}:${range.start_col}`));
+    const grouped = selected_groups.length > 0
+        ? new GroupedFormulaRangeIndex(selected_groups)
+        : undefined;
+    scan_rows(xml, sheet_data.inner_start, sheet_data.inner_end, {
+        on_cell: (row, col, cell) => {
+            let formula: Span | null = null;
+            let key: string | undefined;
+            if (grouped?.has(row, col) !== true) {
+                key = `${row}:${col}`;
+                if (!wanted.has(key)) return;
+                formula = find_first_element(
+                    xml,
+                    'f',
+                    cell.inner_start,
+                    cell.inner_end,
+                );
+                if (!formula) return;
+            }
+            key ??= `${row}:${col}`;
+            const replacement = values.get(key);
+            if (replacement !== undefined) {
+                const open_tag = utf8_text(xml, cell.start, cell.inner_start);
+                const numeric_open_tag = remove_attr(open_tag, 't');
+                if (numeric_open_tag !== open_tag) {
+                    visit(cell.start, cell.inner_start, numeric_open_tag);
+                }
+            }
+            const value = find_first_element(xml, 'v', cell.inner_start, cell.inner_end);
+            if (value) {
+                visit(
+                    value.start,
+                    value.end,
+                    replacement === undefined ? '' : `<v>${encode_xml(replacement)}</v>`,
+                );
+                return;
+            }
+            if (replacement === undefined) return;
+            formula ??= find_first_element(xml, 'f', cell.inner_start, cell.inner_end);
+            if (formula) visit(formula.end, formula.end, `<v>${encode_xml(replacement)}</v>`);
+        },
+    });
+}
+
+/** Two-pass cache rewrite: one output buffer and O(group index + update map) heap. */
+function rewrite_formula_cached_values(
+    xml: Uint8Array,
+    sheet_data: Span,
+    wanted: ReadonlySet<string>,
+    values: ReadonlyMap<string, string>,
+    grouped_ranges = grouped_formula_ranges(xml),
+): Uint8Array {
+    let delta = 0;
+    let splice_count = 0;
+    let previous_end = 0;
+    visit_formula_cache_splices(
+        xml,
+        sheet_data,
+        wanted,
+        values,
+        grouped_ranges,
+        (start, end, text) => {
+            if (start < previous_end) throw new RangeError(`Overlapping UTF-8 splice at byte ${start}`);
+            previous_end = end;
+            delta += Buffer.byteLength(text, 'utf8') - (end - start);
+            splice_count += 1;
+        },
+    );
+    if (splice_count === 0) return xml;
+
+    const out = Buffer.allocUnsafe(xml.length + delta);
+    let input_at = 0;
+    let output_at = 0;
+    visit_formula_cache_splices(
+        xml,
+        sheet_data,
+        wanted,
+        values,
+        grouped_ranges,
+        (start, end, text) => {
+            const unchanged = xml.subarray(input_at, start);
+            out.set(unchanged, output_at);
+            output_at += unchanged.length;
+            const replacement = Buffer.from(text, 'utf8');
+            out.set(replacement, output_at);
+            output_at += replacement.length;
+            input_at = end;
+        },
+    );
+    out.set(xml.subarray(input_at), output_at);
+    return out;
 }
 
 /**
@@ -1117,6 +1379,7 @@ function worksheet_formula_state(
     sheet_name: string | undefined,
     sheet_index = 0,
     sheet_names: readonly string[] = [sheet_name ?? ''],
+    formula_budget: WorkbookBudget = create_workbook_budget(),
 ): WorksheetFormulaState {
     const formulas: WorksheetFormulaCell[] = [];
     scan_rows(xml, sheet_data.inner_start, sheet_data.inner_end, {
@@ -1128,14 +1391,33 @@ function worksheet_formula_state(
                 cell.inner_end,
             );
             if (!formula) return;
+            assert_safe_formula_cells(formula_budget, 1);
+            assert_safe_xlsx_formula_xml_bytes(formula.inner_end - formula.inner_start);
+            const text = decode_xml(utf8_text(
+                xml,
+                formula.inner_start,
+                formula.inner_end,
+            ));
+            if (text !== '') assert_safe_xlsx_formula_text(text);
+            const type = get_tag_attr(xml, formula.start, formula.inner_start, 't');
             formulas.push({
                 row,
                 col,
-                cell,
-                type: get_tag_attr(xml, formula.start, formula.inner_start, 't'),
+                type,
                 reference: get_tag_attr(xml, formula.start, formula.inner_start, 'ref'),
                 sharedIndex: get_tag_attr(xml, formula.start, formula.inner_start, 'si'),
-                text: decode_xml(utf8_text(xml, formula.inner_start, formula.inner_end)),
+                text,
+                dataTableInputs: type === 'dataTable'
+                    ? ['r1', 'r2'].flatMap((attribute) => {
+                        const input = get_tag_attr(
+                            xml,
+                            formula.start,
+                            formula.inner_start,
+                            attribute,
+                        );
+                        return input === null ? [] : [`=${input}`];
+                    })
+                    : [],
             });
         },
     });
@@ -1156,9 +1438,7 @@ function worksheet_formula_state(
     }
 
     const dependencies: number[] = [];
-    const cells = new Map<string, Span>();
     for (const formula of formulas) {
-        cells.set(`${formula.row}:${formula.col}`, formula.cell);
         let effective: string | undefined;
         if (formula.type === 'shared' && formula.reference === null) {
             const master = formula.sharedIndex === null
@@ -1174,24 +1454,34 @@ function worksheet_formula_state(
         } else if (formula.text !== '') {
             effective = `=${formula.text}`;
         }
-        if (effective === undefined) continue;
-        for (const reference of workbook_a1_formula_references(
-            effective,
-            sheet_index,
-            sheet_names,
-        )) {
-            dependencies.push(
-                formula.row,
-                formula.col,
-                reference.sourceSheetIndex,
-                reference.firstRow,
-                reference.firstColumn,
-                reference.lastRow,
-                reference.lastColumn,
-            );
+        for (const formula_text of [
+            ...(effective === undefined ? [] : [effective]),
+            ...formula.dataTableInputs,
+        ]) {
+            assert_safe_xlsx_formula_text(formula_text);
+            for (const reference of workbook_a1_formula_references(
+                formula_text,
+                sheet_index,
+                sheet_names,
+            )) {
+                assert_safe_formula_references(formula_budget, 1);
+                if (
+                    reference.firstRow !== reference.lastRow
+                    || reference.firstColumn !== reference.lastColumn
+                ) assert_safe_formula_ranges(formula_budget, 1);
+                dependencies.push(
+                    formula.row,
+                    formula.col,
+                    reference.sourceSheetIndex,
+                    reference.firstRow,
+                    reference.firstColumn,
+                    reference.lastRow,
+                    reference.lastColumn,
+                );
+            }
         }
     }
-    return { dependencies, cells };
+    return { dependencies };
 }
 
 /** Read workbook-resolved dependencies without materializing worksheet cells. */
@@ -1199,6 +1489,7 @@ export function worksheet_formula_dependencies(
     xml: Uint8Array,
     sheet_index: number,
     sheet_names: readonly string[],
+    formula_budget: WorkbookBudget = create_workbook_budget(),
 ): readonly number[] {
     const sheet_data = scan_worksheet_structure(xml).sheet_data;
     if (!sheet_data) return [];
@@ -1208,6 +1499,7 @@ export function worksheet_formula_dependencies(
         sheet_names[sheet_index],
         sheet_index,
         sheet_names,
+        formula_budget,
     ).dependencies;
 }
 
@@ -1232,35 +1524,11 @@ export function update_formula_cached_values(
     if (cells.length === 0) return xml;
     const sheet_data = scan_worksheet_structure(xml).sheet_data;
     if (!sheet_data) return xml;
-    const state = worksheet_formula_state(xml, sheet_data, undefined);
+    const wanted = new Set(cells.map(({ row, column }) => `${row}:${column}`));
     const values = new Map(updates.map(
         ({ row, column, value }) => [`${row}:${column}`, value],
     ));
-    const splices: Splice[] = [];
-    for (const { row, column } of cells) {
-        const cell = state.cells.get(`${row}:${column}`);
-        if (!cell) continue;
-        const replacement = values.get(`${row}:${column}`);
-        const value = find_first_element(xml, 'v', cell.inner_start, cell.inner_end);
-        if (value) {
-            splices.push({
-                start: value.start,
-                end: value.end,
-                text: replacement === undefined ? '' : `<v>${encode_xml(replacement)}</v>`,
-            });
-            continue;
-        }
-        if (replacement === undefined) continue;
-        const formula = find_first_element(xml, 'f', cell.inner_start, cell.inner_end);
-        if (formula) {
-            splices.push({
-                start: formula.end,
-                end: formula.end,
-                text: `<v>${encode_xml(replacement)}</v>`,
-            });
-        }
-    }
-    return apply_utf8_splices(xml, splices);
+    return rewrite_formula_cached_values(xml, sheet_data, wanted, values);
 }
 
 /**
@@ -1329,6 +1597,46 @@ function apply_cell_edits_bytes(
         return apply_cell_edits_bytes(expanded, edits, options);
     }
 
+    // Formula caches are rewritten as a separate streaming pass before cell
+    // edits retain spans. Group followers may number in the millions; folding
+    // them into the ordinary splice list retained several objects per cell.
+    if (
+        options.formula_result_invalidations === undefined
+        || options.formula_result_invalidations.length > 0
+    ) {
+        assert_writable_sheet_data(xml, structure);
+        const direct_invalidated_formula_keys = options.formula_result_invalidations === undefined
+            ? new Set(compile_workbook_formula_graph([{
+                formulaDependencies: worksheet_formula_state(
+                    xml,
+                    sheet_data,
+                    options.sheet_name,
+                ).dependencies,
+            }]).invalidatedBy(edits.map((edit) => ({
+                sheetIndex: 0,
+                row: edit.row,
+                column: edit.col,
+            }))).forSheet(0).keys())
+            : new Set(options.formula_result_invalidations.map(
+                ({ row, column }) => `${row}:${column}`,
+            ));
+        const calculated_formula_results = new Map(
+            (options.formula_result_updates ?? []).map(
+                ({ row, column, value }) => [`${row}:${column}`, value],
+            ),
+        );
+        const rewritten = rewrite_formula_cached_values(
+            xml,
+            sheet_data,
+            direct_invalidated_formula_keys,
+            calculated_formula_results,
+        );
+        return apply_cell_edits_bytes(rewritten, edits, {
+            ...options,
+            formula_result_invalidations: [],
+        });
+    }
+
     // Group edits by row before scanning, so cell spans are retained only for
     // coordinates this save can touch. The scan still sees every `<c r>` once to
     // validate its owner and to capture edited coordinates without a second pass.
@@ -1353,27 +1661,15 @@ function apply_cell_edits_bytes(
 
     const splices: Splice[] = [];
     const new_rows: Array<{ row: number; text: string }> = [];
-    const formula_state = worksheet_formula_state(xml, sheet_data, options.sheet_name);
-    const edited_keys = new Set(edits.map((edit) => `${edit.row}:${edit.col}`));
-    const invalidated_formula_keys = options.formula_result_invalidations === undefined
-        ? new Set(compile_workbook_formula_graph([{
-            formulaDependencies: formula_state.dependencies,
-        }]).invalidatedBy(edits.map((edit) => ({
-            sheetIndex: 0,
-            row: edit.row,
-            column: edit.col,
-        }))).forSheet(0).keys())
-        : new Set(options.formula_result_invalidations.map(
-            ({ row, column }) => `${row}:${column}`,
-        ));
     const calculated_formula_results = new Map(
         (options.formula_result_updates ?? []).map(
             ({ row, column, value }) => [`${row}:${column}`, value],
         ),
     );
-    // Scanned once for the whole sheet, because grouped-formula members can be
-    // identifiable only from the master's `ref`.
     const grouped_ranges = grouped_formula_ranges(xml);
+    const grouped_range_index = grouped_ranges.length > 0
+        ? new GroupedFormulaKindIndex(grouped_ranges)
+        : undefined;
 
     // Ahead of every row and cell lookup, because a grouped formula's range can
     // cover coordinates that have no `<c>` — and, if the whole row is sparse, no
@@ -1381,14 +1677,15 @@ function apply_cell_edits_bytes(
     // the insertion paths instead and wrote a literal into the middle of an array
     // formula's result range, which is the corruption the refusal exists to stop.
     const merged = merged_follower_ranges(xml);
+    const merged_index = merged_follower_index(merged);
     for (const e of edits) {
-        const grouped = grouped_range_kind(grouped_ranges, e.row, e.col);
-        if (grouped && !(grouped === 'shared' && is_formula_edit(e))) {
+        const grouped = grouped_range_index?.kindAt(e.row, e.col) ?? null;
+        if (grouped && !(grouped === 'shared' && is_xlsx_formula_edit(e))) {
             throw grouped_formula_error(e.row, e.col, grouped);
         }
         // Same sweep, same reason: a merged follower usually has no `<c>` of its
         // own, so nothing downstream would ever meet it.
-        if (is_merged_follower(merged, e.row, e.col)) {
+        if (merged_index?.has(e.row, e.col)) {
             throw new Error(
                 `Cannot edit ${cell_reference(e.row, e.col)}: it is covered by a merged `
                 + 'cell, which shows the value of its top-left cell. Edit that cell '
@@ -1450,7 +1747,7 @@ function apply_cell_edits_bytes(
                 if (grouped && !(
                     grouped.kind === 'shared'
                     && !grouped.shared_master
-                    && is_formula_edit(e)
+                    && is_xlsx_formula_edit(e)
                 )) {
                     throw grouped_formula_error(e.row, e.col, grouped.kind);
                 }
@@ -1551,35 +1848,6 @@ function apply_cell_edits_bytes(
             }
             if (best !== undefined) at = best;
             splices.push({ start: at, end: at, text: ins.text });
-        }
-    }
-
-    // An explicitly edited cell is replaced wholesale below, and a formula edit
-    // already emits no `<v>`. Every other affected formula keeps its source and
-    // formatting but loses the cached result that became stale. On reopen the
-    // reader then shows `??` instead of reviving that old number.
-    for (const key of invalidated_formula_keys) {
-        if (edited_keys.has(key)) continue;
-        const cell = formula_state.cells.get(key);
-        if (!cell) continue;
-        const replacement = calculated_formula_results.get(key);
-        const value = find_first_element(xml, 'v', cell.inner_start, cell.inner_end);
-        if (value) {
-            splices.push({
-                start: value.start,
-                end: value.end,
-                text: replacement === undefined ? '' : `<v>${encode_xml(replacement)}</v>`,
-            });
-            continue;
-        }
-        if (replacement === undefined) continue;
-        const formula = find_first_element(xml, 'f', cell.inner_start, cell.inner_end);
-        if (formula) {
-            splices.push({
-                start: formula.end,
-                end: formula.end,
-                text: `<v>${encode_xml(replacement)}</v>`,
-            });
         }
     }
 

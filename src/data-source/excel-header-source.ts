@@ -51,6 +51,7 @@ export interface ExcelHeaderPlanningSheet {
     readonly merges: readonly Readonly<MergeRange>[];
     readonly hasFormatting: boolean;
     readonly formulaDependencies?: PackedFormulaDependencies;
+    readonly formulaCells?: SheetMeta['formulaCells'];
     readonly pendingFormulaCells?: PackedPendingFormulaCells;
     readonly columnNames: readonly string[];
     readonly manualColumnNames?: readonly string[];
@@ -224,6 +225,7 @@ export class ExcelHeaderDataSource implements DataSource {
                     ),
                     hasFormatting: sheet.physical.hasFormatting,
                     formulaDependencies: sheet.physical.formulaDependencies,
+                    formulaCells: sheet.physical.formulaCells,
                     pendingFormulaCells: sheet.physical.pendingFormulaCells,
                     columnNames: Object.freeze([...sheet.firstRowColumnNames]),
                     manualColumnNames: Object.freeze([...(selected
@@ -509,6 +511,7 @@ function project_sheet(
         merges: sheet.physical.merges,
         hasFormatting: sheet.physical.hasFormatting,
         formulaDependencies: sheet.physical.formulaDependencies,
+        formulaCells: sheet.physical.formulaCells,
         pendingFormulaCells: sheet.physical.pendingFormulaCells,
         columnNames: sheet.firstRowColumnNames,
         manualColumnNames: sheet.manualColumnNames,
@@ -559,6 +562,7 @@ export function project_excel_header_sheet(
         ...(sheet.formulaDependencies?.length
             ? { formulaDependencies: sheet.formulaDependencies }
             : {}),
+        ...(sheet.formulaCells?.length ? { formulaCells: sheet.formulaCells } : {}),
         ...(sheet.pendingFormulaCells?.length
             ? { pendingFormulaCells: sheet.pendingFormulaCells }
             : {}),

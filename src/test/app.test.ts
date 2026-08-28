@@ -5234,7 +5234,9 @@ describe('edit mode save exit', () => {
         const meta = make_meta(['Sheet1'], false);
         meta.sheets[0].pendingFormulaCells = [0, 1];
         const { post_message } = await render_app();
-        await dispatch_host_message(initial_snapshot_message(meta));
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
 
         const request = post_message.mock.calls
             .map(([message]) => message as WebviewMessage)
@@ -5254,8 +5256,185 @@ describe('edit mode save exit', () => {
                 error: 'unsupported function',
             }],
         });
-        expect((grid_shell_mock.latest_props?.formula_results as Map<string, string>)
+        expect((grid_shell_mock.latest_props?.source_formula_results as Map<string, string>)
             .get('0:1')).toBe('?? (unsupported function)');
+
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'pending-formula-session',
+            sheetIndex: 0,
+            pendingEdits: { '0:0': { value: 'changed', base: 'old' } },
+        });
+        expect(post_message.mock.calls.filter(([message]) => (
+            message?.type === 'requestFormulaCalculation'
+        ))).toHaveLength(1);
+        expect((grid_shell_mock.latest_props?.source_formula_results as Map<string, string>)
+            .get('0:1')).toBe('?? (unsupported function)');
+    });
+
+    it('restores source formula results when the last affecting edit is reverted', async () => {
+        const meta = make_meta(['Sheet1'], false);
+        meta.sheets[0].pendingFormulaCells = [0, 1];
+        meta.sheets[0].formulaDependencies = [0, 1, 0, 0, 0, 0, 0];
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+
+        const source_request = post_message.mock.calls
+            .map(([message]) => message as WebviewMessage)
+            .find((message) => message.type === 'requestFormulaCalculation') as
+            Extract<WebviewMessage, { type: 'requestFormulaCalculation' }>;
+        await dispatch_host_message({
+            type: 'formulaCalculation',
+            requestId: source_request.requestId,
+            sourceGeneration: source_request.sourceGeneration,
+            results: [{ sheetIndex: 0, row: 0, column: 1, value: '4' }],
+        });
+
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'formula-revert-session',
+            sheetIndex: 0,
+            pendingEdits: { '0:0': { value: '3', base: '2' } },
+        });
+        const edit_request = post_message.mock.calls
+            .map(([message]) => message as WebviewMessage)
+            .reverse()
+            .find((message) => message.type === 'requestFormulaCalculation') as
+            Extract<WebviewMessage, { type: 'requestFormulaCalculation' }>;
+        expect(edit_request).toMatchObject({
+            edits: [{ sheetIndex: 0, row: 0, column: 0, value: '3' }],
+            targets: [{ sheetIndex: 0, row: 0, column: 1 }],
+        });
+        await dispatch_host_message({
+            type: 'formulaCalculation',
+            requestId: edit_request.requestId,
+            sourceGeneration: edit_request.sourceGeneration,
+            results: [{ sheetIndex: 0, row: 0, column: 1, value: '6' }],
+        });
+        expect((grid_shell_mock.latest_props?.source_formula_results as Map<string, string>)
+            .get('0:1')).toBe('4');
+        expect((grid_shell_mock.latest_props?.formula_results as Map<string, string>)
+            .get('0:1')).toBe('6');
+
+        await act(async () => {
+            (grid_shell_mock.latest_props?.edit_session as EditSessionStore)
+                .replace('formula-revert-session', {});
+        });
+        expect(grid_shell_mock.latest_props?.formula_results).toBeUndefined();
+        expect((grid_shell_mock.latest_props?.source_formula_results as Map<string, string>)
+            .get('0:1')).toBe('4');
+    });
+
+    it('cancels formula work when the last affecting edit is reverted', async () => {
+        const meta = make_meta(['Sheet1'], false);
+        meta.sheets[0].formulaCells = [0, 1];
+        meta.sheets[0].formulaDependencies = [0, 1, 0, 0, 0, 0, 0];
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'formula-cancel-session',
+            sheetIndex: 0,
+            pendingEdits: { '0:0': { value: '3', base: '2' } },
+        });
+        const request = post_message.mock.calls
+            .map(([message]) => message as WebviewMessage)
+            .reverse()
+            .find((message) => message.type === 'requestFormulaCalculation') as
+            Extract<WebviewMessage, { type: 'requestFormulaCalculation' }>;
+
+        await act(async () => {
+            (grid_shell_mock.latest_props?.edit_session as EditSessionStore)
+                .replace('formula-cancel-session', {});
+        });
+
+        expect(post_message).toHaveBeenCalledWith({
+            type: 'cancelFormulaCalculation',
+            requestId: request.requestId,
+            sourceGeneration: request.sourceGeneration,
+        });
+    });
+
+    it('replans targets when a dirty value becomes a formula at the same coordinate', async () => {
+        const meta = make_meta(['Sheet1'], false);
+        meta.sheets[0].formulaCells = [0, 1];
+        meta.sheets[0].formulaDependencies = [0, 1, 0, 0, 0, 0, 0];
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'formula-transition-session',
+            sheetIndex: 0,
+            pendingEdits: { '0:0': { value: 'text', base: 'old' } },
+        });
+
+        await act(async () => {
+            (grid_shell_mock.latest_props?.edit_session as EditSessionStore).commit(
+                'formula-transition-session',
+                '0:0',
+                { value: '=1', base: 'old' },
+            );
+        });
+        const request = post_message.mock.calls
+            .map(([message]) => message as WebviewMessage)
+            .reverse()
+            .find((message) => message.type === 'requestFormulaCalculation') as
+            Extract<WebviewMessage, { type: 'requestFormulaCalculation' }>;
+
+        expect(request.targets).toEqual([
+            { sheetIndex: 0, row: 0, column: 0 },
+            { sheetIndex: 0, row: 0, column: 1 },
+        ]);
+    });
+
+    it('does not repeat formula calculation for a hyperlink-only store update', async () => {
+        const meta = make_meta(['Sheet1'], false);
+        meta.sheets[0].formulaCells = [0, 1];
+        meta.sheets[0].formulaDependencies = [0, 1, 0, 0, 0, 0, 0];
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'formula-link-session',
+            sheetIndex: 0,
+            pendingEdits: { '0:0': { value: 'changed', base: 'old' } },
+        });
+        const before = post_message.mock.calls.filter(([message]) =>
+            message?.type === 'requestFormulaCalculation').length;
+
+        await act(async () => {
+            (grid_shell_mock.latest_props?.edit_session as EditSessionStore).commit(
+                'formula-link-session',
+                '0:2',
+                {
+                    value: 'same',
+                    base: 'same',
+                    link: { kind: 'external', target: 'https://example.com' },
+                    baseLink: null,
+                },
+            );
+        });
+
+        expect(post_message.mock.calls.filter(([message]) =>
+            message?.type === 'requestFormulaCalculation')).toHaveLength(before);
     });
 
     it('advances the committed activation when the same session re-enters edit mode', async () => {

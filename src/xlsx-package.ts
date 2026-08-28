@@ -4,7 +4,11 @@ import {
     worksheet_formula_dependencies,
     type XlsxCellEdit,
 } from './xlsx-cell-write';
-import { compile_workbook_formula_graph } from './formula-dependencies';
+import {
+    compile_workbook_formula_graph,
+    type WorkbookFormulaPlan,
+} from './formula-dependencies';
+import type { FormulaCalculationResult } from './formula-calculation';
 import type { PackedFormulaDependencies } from './data-source/interface';
 import { worksheet_scan_input } from './ooxml-worksheet-scan';
 import {
@@ -34,6 +38,7 @@ import { rels_path_for_part } from './ooxml-relationships';
 import type { XlsxHyperlinkEdit } from './xlsx-hyperlink-write';
 import { apply_worksheet_edits } from './ooxml-surgery';
 import { ZipPackage, ZipPackageError } from './zip-package';
+import { create_workbook_budget } from './spreadsheet-safety';
 
 /**
  * Package-level (.xlsx container) side of `putexcel`-style saving.
@@ -245,17 +250,102 @@ export interface XlsxWorksheetCellEdits {
     readonly link_edits?: readonly XlsxHyperlinkEdit[];
 }
 
+export interface XlsxFormulaCacheAddress {
+    readonly sheetIndex: number;
+    readonly row: number;
+    readonly column: number;
+}
+
+export interface XlsxFormulaCacheResult extends XlsxFormulaCacheAddress {
+    readonly value: string;
+}
+
+const XLSX_FORMULA_WRITE_PLAN = Symbol('xlsx-formula-write-plan');
+
+export interface XlsxFormulaWritePlan {
+    readonly [XLSX_FORMULA_WRITE_PLAN]: {
+        readonly sheetCount: number;
+        readonly invalidations: readonly XlsxFormulaCacheAddress[];
+        readonly results: readonly XlsxFormulaCacheResult[];
+    };
+}
+
+/**
+ * Derive one immutable, complete cache-write capability from a calculation plan.
+ * Successful results supersede invalidation; every other impacted/target formula
+ * has its stale cache removed.
+ */
+export function create_xlsx_formula_write_plan(
+    plan: WorkbookFormulaPlan,
+    calculation_results: readonly FormulaCalculationResult[],
+): XlsxFormulaWritePlan {
+    if (
+        !Number.isSafeInteger(plan.sheetCount)
+        || plan.sheetCount < 0
+        || plan.formulaLimitExceeded
+    ) throw new Error('Invalid formula calculation plan');
+
+    const addresses = new Map<string, XlsxFormulaCacheAddress>();
+    const add_address = (address: XlsxFormulaCacheAddress): string => {
+        if (
+            !Number.isSafeInteger(address.sheetIndex)
+            || address.sheetIndex < 0
+            || address.sheetIndex >= plan.sheetCount
+            || !Number.isSafeInteger(address.row)
+            || address.row < 0
+            || address.row >= 1_048_576
+            || !Number.isSafeInteger(address.column)
+            || address.column < 0
+            || address.column >= 16_384
+        ) throw new Error('Invalid formula cache address');
+        const key = `${address.sheetIndex}:${address.row}:${address.column}`;
+        if (!addresses.has(key)) addresses.set(key, Object.freeze({ ...address }));
+        return key;
+    };
+    for (let sheetIndex = 0; sheetIndex < plan.sheetCount; sheetIndex += 1) {
+        for (const cell of plan.impact.forSheet(sheetIndex).cells()) {
+            add_address({ sheetIndex, row: cell.row, column: cell.column });
+        }
+    }
+    const target_keys = new Set(plan.targets.map(add_address));
+
+    const results_by_key = new Map<string, XlsxFormulaCacheResult>();
+    for (const result of calculation_results) {
+        if (result.value === undefined) continue;
+        const key = `${result.sheetIndex}:${result.row}:${result.column}`;
+        if (!target_keys.has(key) || results_by_key.has(key)) {
+            throw new Error('Formula result does not match the calculation plan');
+        }
+        if (!Number.isFinite(Number(result.value))) {
+            throw new Error('Invalid formula cache result');
+        }
+        results_by_key.set(key, Object.freeze({
+            sheetIndex: result.sheetIndex,
+            row: result.row,
+            column: result.column,
+            value: result.value,
+        }));
+    }
+    const invalidations = Object.freeze(
+        [...addresses].flatMap(([key, address]) => results_by_key.has(key) ? [] : [address]),
+    );
+    const results = Object.freeze([...results_by_key.values()]);
+    return Object.freeze({
+        [XLSX_FORMULA_WRITE_PLAN]: Object.freeze({
+            sheetCount: plan.sheetCount,
+            invalidations,
+            results,
+        }),
+    });
+}
+
 export interface XlsxWorkbookWriteOptions {
     /** Topology parsed from the verified source, in current worksheet order. */
     readonly formulaDependencies?: readonly {
         readonly formulaDependencies?: PackedFormulaDependencies;
     }[];
-    readonly formulaResults?: readonly {
-        readonly sheetIndex: number;
-        readonly row: number;
-        readonly column: number;
-        readonly value: string;
-    }[];
+    /** Opaque cache plan precomputed for this exact edit set. */
+    readonly formulaWritePlan?: XlsxFormulaWritePlan;
 }
 
 /**
@@ -274,6 +364,9 @@ export function write_xlsx_workbook_cell_edits(
         ({ edits, link_edits }) => edits.length > 0 || (link_edits?.length ?? 0) > 0,
     );
     if (active.length === 0) return raw;
+    if (options?.formulaWritePlan && options.formulaDependencies) {
+        throw new Error('Formula write plan and dependency fallback are mutually exclusive');
+    }
 
     const indices = new Set<number>();
     for (const { sheetIndex } of active) {
@@ -292,29 +385,74 @@ export function write_xlsx_workbook_cell_edits(
 
     const parts = worksheet_part_entries_from_package(zip);
     const sheet_names = parts.map((part) => part.name);
-    const has_value_edits = active.some(({ edits }) => edits.length > 0);
-    const dependency_sheets = !has_value_edits
-        ? parts.map(() => ({}))
-        : options?.formulaDependencies?.length === parts.length
-        ? options.formulaDependencies
-        : parts.map((part, sheet_index) => {
-            const content = read_part_bytes(zip, `/${part.path}`);
-            if (content === null) throw new Error('Could not read a worksheet to save');
-            return {
-                formulaDependencies: worksheet_formula_dependencies(
-                    worksheet_scan_input(content),
-                    sheet_index,
-                    sheet_names,
-                ),
-            };
-        });
-    const formula_impact = compile_workbook_formula_graph(dependency_sheets).invalidatedBy(
-        active.flatMap(({ sheetIndex, edits }) => edits.map((edit) => ({
-            sheetIndex,
-            row: edit.row,
-            column: edit.col,
-        }))),
-    );
+    const formula_invalidations_by_sheet = new Map<number, Array<{
+        readonly row: number;
+        readonly column: number;
+    }>>();
+    if (options?.formulaWritePlan !== undefined) {
+        const formula_write_plan = options.formulaWritePlan[XLSX_FORMULA_WRITE_PLAN];
+        if (!formula_write_plan) {
+            throw new Error('Invalid formula write plan');
+        }
+        if (formula_write_plan.sheetCount !== parts.length) {
+            throw new Error('Formula write plan does not match the workbook');
+        }
+        const add_formula_invalidation = (invalidation: XlsxFormulaCacheAddress): void => {
+            if (
+                !Number.isSafeInteger(invalidation.sheetIndex)
+                || invalidation.sheetIndex < 0
+                || invalidation.sheetIndex >= parts.length
+                || !Number.isSafeInteger(invalidation.row)
+                || invalidation.row < 0
+                || invalidation.row >= 1_048_576
+                || !Number.isSafeInteger(invalidation.column)
+                || invalidation.column < 0
+                || invalidation.column >= 16_384
+            ) throw new Error('Invalid formula cache invalidation');
+            const sheet = formula_invalidations_by_sheet.get(invalidation.sheetIndex) ?? [];
+            sheet.push(invalidation);
+            formula_invalidations_by_sheet.set(invalidation.sheetIndex, sheet);
+        };
+        for (const invalidation of formula_write_plan.invalidations) {
+            add_formula_invalidation(invalidation);
+        }
+        for (const result of formula_write_plan.results) {
+            if (!Number.isFinite(Number(result.value))) {
+                throw new Error('Invalid formula cache result');
+            }
+            add_formula_invalidation(result);
+        }
+    } else {
+        const has_value_edits = active.some(({ edits }) => edits.length > 0);
+        const formula_budget = create_workbook_budget();
+        const dependency_sheets = !has_value_edits
+            ? parts.map(() => ({}))
+            : options?.formulaDependencies?.length === parts.length
+            ? options.formulaDependencies
+            : parts.map((part, sheet_index) => {
+                const content = read_part_bytes(zip, `/${part.path}`);
+                if (content === null) throw new Error('Could not read a worksheet to save');
+                return {
+                    formulaDependencies: worksheet_formula_dependencies(
+                        worksheet_scan_input(content),
+                        sheet_index,
+                        sheet_names,
+                        formula_budget,
+                    ),
+                };
+            });
+        const formula_impact = compile_workbook_formula_graph(dependency_sheets).invalidatedBy(
+            active.flatMap(({ sheetIndex, edits }) => edits.map((edit) => ({
+                sheetIndex,
+                row: edit.row,
+                column: edit.col,
+            }))),
+        );
+        for (let sheet_index = 0; sheet_index < parts.length; sheet_index += 1) {
+            const cells = [...formula_impact.forSheet(sheet_index).cells()];
+            if (cells.length > 0) formula_invalidations_by_sheet.set(sheet_index, cells);
+        }
+    }
     const { is_date_style, cell_font_style, run_font_base } = read_style_write_context(zip);
     const datemode = read_datemode(zip);
     let calculation_chain_stale = false;
@@ -329,14 +467,15 @@ export function write_xlsx_workbook_cell_edits(
         readonly column: number;
         readonly value: string;
     }>>();
-    for (const result of options?.formulaResults ?? []) {
+    const formula_write_plan = options?.formulaWritePlan?.[XLSX_FORMULA_WRITE_PLAN];
+    for (const result of formula_write_plan?.results ?? []) {
         const sheet = formula_results_by_sheet.get(result.sheetIndex) ?? [];
-        sheet.push({ row: result.row, column: result.column, value: result.value });
+        sheet.push(result);
         formula_results_by_sheet.set(result.sheetIndex, sheet);
     }
     const touched_sheets = new Set(active_by_sheet.keys());
-    for (let sheet_index = 0; sheet_index < parts.length; sheet_index += 1) {
-        if (formula_impact.forSheet(sheet_index).size > 0) touched_sheets.add(sheet_index);
+    for (const sheet_index of formula_invalidations_by_sheet.keys()) {
+        touched_sheets.add(sheet_index);
     }
 
     for (const sheetIndex of [...touched_sheets].sort((left, right) => left - right)) {
@@ -354,7 +493,7 @@ export function write_xlsx_workbook_cell_edits(
         const rels_xml = link_edits && link_edits.length > 0
             ? read_part_text(zip, rels_path)
             : null;
-        const invalidations = [...formula_impact.forSheet(sheetIndex).cells()];
+        const invalidations = formula_invalidations_by_sheet.get(sheetIndex) ?? [];
         const formula_result_updates = formula_results_by_sheet.get(sheetIndex) ?? [];
         const result = active_entry === undefined
             ? {

@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import type { DataSource, SheetMeta } from './data-source/interface';
 import {
     projected_row_for_source,
@@ -35,7 +36,49 @@ import {
     type SheetViewRecord,
     type WebviewMessage,
 } from './types';
-import { calculate_workbook_formulas } from './formula-calculation';
+import {
+    calculate_workbook_formulas_cooperatively,
+    type FormulaCalculationEdit,
+    type FormulaCalculationRequest,
+    type FormulaCalculationResult,
+} from './formula-calculation';
+import { MAX_WORKBOOK_FORMULAS } from './spreadsheet-safety';
+
+const MAX_CACHED_FORMULA_RESULT_BYTES = 16 * 1024 * 1024;
+const CACHED_FORMULA_RESULT_OVERHEAD = 128;
+
+function formula_edits_key(edits: readonly FormulaCalculationEdit[]): string {
+    const hash = createHash('sha256');
+    for (const { sheetIndex, row, column, value, writesFormula, runs } of edits) {
+        hash.update(
+            `${sheetIndex}:${row}:${column}:${writesFormula ? 'f' : 'v'}:`
+            + `${Buffer.byteLength(value, 'utf8')}:`,
+        );
+        hash.update(value, 'utf8');
+        for (const run of runs ?? []) {
+            hash.update(`:${Buffer.byteLength(run.text, 'utf8')}:`);
+            hash.update(run.text, 'utf8');
+            hash.update(run.style?.bold ? 'b' : '-');
+            hash.update(run.style?.italic ? 'i' : '-');
+            hash.update(run.style?.underline ? 'u' : '-');
+            hash.update(run.style?.strikethrough ? 's' : '-');
+        }
+        hash.update('\0');
+    }
+    return hash.digest('base64url');
+}
+
+function cacheable_formula_result_bytes(
+    results: readonly FormulaCalculationResult[],
+): number | undefined {
+    let bytes = 0;
+    for (const result of results) {
+        bytes += CACHED_FORMULA_RESULT_OVERHEAD
+            + 2 * (result.value?.length ?? result.error?.length ?? 0);
+        if (bytes > MAX_CACHED_FORMULA_RESULT_BYTES) return undefined;
+    }
+    return bytes;
+}
 
 /**
  * Minimal structural view of the parts of vscode.WebviewPanel that the core
@@ -371,6 +414,16 @@ export class ViewerPanelCore {
     private readonly histogram_cache: HistogramLruCache;
     private readonly histogram_operations = new Map<string, TransformOperationToken>();
     private formula_calculation_operation = 0;
+    private active_formula_calculation?: {
+        readonly requestId: string;
+        readonly sourceGeneration: number;
+        readonly operation: number;
+    };
+    private formula_calculation_cache?: {
+        readonly sourceGeneration: number;
+        readonly editsKey: string;
+        readonly results: ReadonlyMap<string, FormulaCalculationResult>;
+    };
     private source_epoch = 0;
     private receiver_epoch = 0;
     private _source_generation = 1;
@@ -471,6 +524,27 @@ export class ViewerPanelCore {
 
     get source_generation(): number {
         return this._source_generation;
+    }
+
+    /** Reuse a completed live calculation only when it covers this exact save. */
+    cached_formula_calculation(
+        request: FormulaCalculationRequest,
+    ): readonly FormulaCalculationResult[] | undefined {
+        const cached = this.formula_calculation_cache;
+        if (
+            cached === undefined
+            || cached.sourceGeneration !== this._source_generation
+            || cached.editsKey !== formula_edits_key(request.edits)
+        ) return undefined;
+        const results: FormulaCalculationResult[] = [];
+        for (const target of request.targets) {
+            const result = cached.results.get(
+                `${target.sheetIndex}:${target.row}:${target.column}`,
+            );
+            if (result === undefined) return undefined;
+            results.push(result);
+        }
+        return results;
     }
 
     get has_transform_work(): boolean {
@@ -674,6 +748,7 @@ export class ViewerPanelCore {
         this.source_epoch += 1;
         this._generation += 1;
         this._source_generation += 1;
+        this.formula_calculation_cache = undefined;
         this.transform_indices.clear();
         this.inverse_transform_indices.clear();
         // Every sheet's mapping moved, so no sheet keeps a per-sheet exemption and the
@@ -797,6 +872,7 @@ export class ViewerPanelCore {
         this.column_analysis_cache.clear();
         this.clear_row_cache();
         this.row_height_projection_memo = undefined;
+        this.formula_calculation_cache = undefined;
         // Dropped here for the memory rather than for correctness — unlike the small
         // numbers above, these entries retain a projection per sheet, and a pre-cap legacy
         // map makes that the largest thing this core holds.
@@ -816,22 +892,63 @@ export class ViewerPanelCore {
             this.histogram_operations.delete(msg.requestId);
         } else if (msg.type === 'requestFormulaCalculation') {
             await this.handle_formula_calculation(msg);
+        } else if (msg.type === 'cancelFormulaCalculation') {
+            this.cancel_formula_calculation(msg);
         }
+    }
+
+    private cancel_formula_calculation(
+        msg: Extract<WebviewMessage, { type: 'cancelFormulaCalculation' }>,
+    ): void {
+        const active = this.active_formula_calculation;
+        if (
+            msg.sourceGeneration !== this._source_generation
+            || active?.sourceGeneration !== msg.sourceGeneration
+            || active.requestId !== msg.requestId
+        ) return;
+        this.formula_calculation_operation += 1;
+        this.active_formula_calculation = undefined;
     }
 
     private async handle_formula_calculation(
         msg: Extract<WebviewMessage, { type: 'requestFormulaCalculation' }>,
     ): Promise<void> {
         const receiver_epoch = this.receiver_epoch;
+        if (msg.sourceGeneration !== this._source_generation) return;
+        if (
+            msg.targets.length > MAX_WORKBOOK_FORMULAS
+            || msg.edits.length > MAX_WORKBOOK_FORMULAS
+        ) {
+            await this.post({
+                type: 'formulaCalculation',
+                requestId: msg.requestId,
+                sourceGeneration: msg.sourceGeneration,
+                results: [],
+            }, receiver_epoch);
+            return;
+        }
         this.formula_calculation_operation += 1;
         const operation = this.formula_calculation_operation;
-        if (msg.sourceGeneration !== this._source_generation) return;
+        this.active_formula_calculation = {
+            requestId: msg.requestId,
+            sourceGeneration: msg.sourceGeneration,
+            operation,
+        };
         let results;
         try {
-            results = calculate_workbook_formulas(this.source, {
-                edits: msg.edits,
-                targets: msg.targets,
-            });
+            results = await calculate_workbook_formulas_cooperatively(
+                this.source,
+                {
+                    edits: msg.edits,
+                    targets: msg.targets,
+                },
+                {
+                    isCancelled: () => this.disposed
+                        || operation !== this.formula_calculation_operation
+                        || receiver_epoch !== this.receiver_epoch
+                        || msg.sourceGeneration !== this._source_generation,
+                },
+            );
         } catch {
             results = msg.targets.map((target) => ({
                 ...target,
@@ -839,11 +956,28 @@ export class ViewerPanelCore {
             }));
         }
         if (
+            results === undefined
+            ||
             this.disposed
             || operation !== this.formula_calculation_operation
             || receiver_epoch !== this.receiver_epoch
             || msg.sourceGeneration !== this._source_generation
         ) return;
+        if (this.active_formula_calculation?.operation === operation) {
+            this.active_formula_calculation = undefined;
+        }
+        if (cacheable_formula_result_bytes(results) !== undefined) {
+            this.formula_calculation_cache = {
+                sourceGeneration: msg.sourceGeneration,
+                editsKey: formula_edits_key(msg.edits),
+                results: new Map(results.map((result) => [
+                    `${result.sheetIndex}:${result.row}:${result.column}`,
+                    result,
+                ])),
+            };
+        } else {
+            this.formula_calculation_cache = undefined;
+        }
         await this.post({
             type: 'formulaCalculation',
             requestId: msg.requestId,

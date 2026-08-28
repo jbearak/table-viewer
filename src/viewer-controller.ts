@@ -42,13 +42,26 @@ import {
     assert_safe_file_size,
     FileSizeLimitExceededError,
     MAX_CSV_ROWS,
+    MAX_WORKBOOK_FORMULAS,
 } from './spreadsheet-safety';
 import { prepare_csv_serializer } from './serialize-csv';
-import { write_xlsx_workbook_cell_edits } from './xlsx-package';
-import { compile_workbook_formula_graph } from './formula-dependencies';
-import { calculate_workbook_formulas } from './formula-calculation';
-import { is_xlsx_formula_text } from './xlsx-formula';
-import type { XlsxCellEdit } from './xlsx-cell-write';
+import {
+    create_xlsx_formula_write_plan,
+    write_xlsx_workbook_cell_edits,
+    type XlsxFormulaWritePlan,
+} from './xlsx-package';
+import {
+    all_workbook_formula_cells_impact,
+    assert_safe_workbook_formula_edits,
+    plan_workbook_formula_recalculation,
+} from './formula-dependencies';
+import {
+    calculate_workbook_formulas_bounded,
+    type FormulaCalculationRequest,
+    type FormulaCalculationResult,
+} from './formula-calculation';
+import { is_xlsx_formula_edit, type XlsxCellEdit } from './xlsx-cell-write';
+import { xlsx_edit_writes_formula } from './xlsx-cell-value';
 import { validate_dirty_bases } from './csv-base-validation';
 import { cell_edit_base } from './cell-edit-model';
 import { get_raw_cell_text } from './cell-display';
@@ -211,6 +224,9 @@ export interface SavePlanInput {
     readonly source: DataSource;
     readonly file_path: string;
     readonly worksheets: readonly SavePlanWorksheetInput[];
+    readonly cached_formula_calculation?: (
+        request: FormulaCalculationRequest,
+    ) => readonly FormulaCalculationResult[] | undefined;
 }
 
 export interface SavePlan {
@@ -780,54 +796,85 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
             link_edits,
         };
     });
-    const calculation_edits = input.worksheets.flatMap(({ sheet_index, edits }) =>
-        Object.entries(edits).flatMap(([key, value]) => {
-            const [row, column] = key.split(':').map(Number);
-            return Number.isInteger(row) && Number.isInteger(column)
-                ? [{ sheetIndex: sheet_index, row, column, value }]
-                : [];
-        }));
-    const formula_impact = compile_workbook_formula_graph(src.meta().sheets).invalidatedBy(
-        calculation_edits,
-    );
-    const calculation_targets = new Map<string, {
+    const calculation_edits: Array<{
         sheetIndex: number;
         row: number;
         column: number;
-    }>();
-    src.meta().sheets.forEach((_sheet, sheetIndex) => {
-        for (const { row, column } of formula_impact.forSheet(sheetIndex).cells()) {
-            calculation_targets.set(`${sheetIndex}:${row}:${column}`, {
-                sheetIndex, row, column,
-            });
-        }
-    });
-    for (const edit of calculation_edits) {
-        if (is_xlsx_formula_text(edit.value)) {
-            calculation_targets.set(`${edit.sheetIndex}:${edit.row}:${edit.column}`, {
-                sheetIndex: edit.sheetIndex,
+        value: string;
+        writesFormula: boolean;
+        runs?: XlsxCellEdit['runs'];
+    }> = [];
+    let too_many_calculation_edits = false;
+    calculation_scan: for (const sheet of planned) {
+        for (const edit of sheet.edits) {
+            if (calculation_edits.length >= MAX_WORKBOOK_FORMULAS) {
+                too_many_calculation_edits = true;
+                calculation_edits.length = 0;
+                break calculation_scan;
+            }
+            calculation_edits.push({
+                sheetIndex: sheet.sheetIndex,
                 row: edit.row,
-                column: edit.column,
+                column: edit.col,
+                value: edit.value,
+                writesFormula: is_xlsx_formula_edit(edit),
+                ...(edit.runs !== undefined ? { runs: edit.runs } : {}),
             });
         }
     }
-    const formula_results = calculate_workbook_formulas(src, {
-        edits: calculation_edits,
-        targets: [...calculation_targets.values()],
-    }).flatMap((result) => result.value === undefined ? [] : [{
-        sheetIndex: result.sheetIndex,
-        row: result.row,
-        column: result.column,
-        value: result.value,
-    }]);
+    calculation_edits.sort((left, right) => (left.sheetIndex - right.sheetIndex)
+        || (left.row - right.row)
+        || (left.column - right.column));
+    let formula_write_plan: XlsxFormulaWritePlan | undefined;
+    if (too_many_calculation_edits || calculation_edits.length > 0) {
+        const sheets = src.meta().sheets;
+        assert_safe_workbook_formula_edits(
+            sheets,
+            input.worksheets.map(({ sheet_index, edits, dirty_edits }) => ({
+                sheetIndex: sheet_index,
+                values: edits,
+                isFormulaValue: (key: string, value: string) => {
+                    const runs = dirty_edits?.[key]?.valueRuns?.runs;
+                    return xlsx_edit_writes_formula(
+                        value,
+                        runs && runs.length > 0 ? runs : undefined,
+                    );
+                },
+            })),
+        );
+        const formula_plan = too_many_calculation_edits
+            ? {
+                sheetCount: sheets.length,
+                impact: all_workbook_formula_cells_impact(sheets),
+                targets: [],
+                formulaLimitExceeded: false,
+            }
+            : plan_workbook_formula_recalculation(sheets, calculation_edits);
+        if (formula_plan.formulaLimitExceeded) {
+            throw new Error('Workbook would contain too many formulas to save safely.');
+        }
+        const formula_request = {
+            edits: calculation_edits,
+            targets: formula_plan.targets,
+        } satisfies FormulaCalculationRequest;
+        const calculated_results = too_many_calculation_edits
+            ? []
+            : input.cached_formula_calculation?.(formula_request)
+                ?? calculate_workbook_formulas_bounded(src, formula_request);
+        formula_write_plan = create_xlsx_formula_write_plan(
+            formula_plan,
+            calculated_results,
+        );
+    }
     return {
         observed_bases: planned.map(({ observed_bases }) => observed_bases),
         observed_rich: planned.map(({ observed_rich }) => observed_rich),
         observed_links: planned.map(({ observed_links }) => observed_links),
-        produce: (raw) => write_xlsx_workbook_cell_edits(raw, planned, {
-            formulaDependencies: src.meta().sheets,
-            formulaResults: formula_results,
-        }),
+        produce: (raw) => write_xlsx_workbook_cell_edits(
+            raw,
+            planned,
+            formula_write_plan ? { formulaWritePlan: formula_write_plan } : undefined,
+        ),
     };
 }
 
@@ -5894,6 +5941,7 @@ export function attach_viewer(
             || transform_work_in_flight()
             || !editing_supported
             || !src
+            || !core
             || !!src.truncationMessage
             || expected_digest === undefined
             || expected_observation === undefined
@@ -5913,11 +5961,14 @@ export function attach_viewer(
             return;
         }
 
+        const save_core = core;
         let plan: SavePlan;
         try {
             plan = profile.plan_save({
                 source: src,
                 file_path,
+                cached_formula_calculation: (request) =>
+                    save_core.cached_formula_calculation(request),
                 worksheets: identity.worksheets.map((worksheet) => ({
                     sheet_index: worksheet.sheetIndex,
                     edits: worksheet.edits,

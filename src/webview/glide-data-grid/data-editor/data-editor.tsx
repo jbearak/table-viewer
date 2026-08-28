@@ -92,7 +92,8 @@ export interface RowMarkerOptions {
     checkboxStyle?: "circle" | "square";
     startIndex?: number;
     /** Returns the number displayed for a zero-based grid row. Takes precedence over `startIndex`. */
-    getRowNumber?: (row: number) => number;
+    /** Return undefined while the display-to-source mapping is still loading. */
+    getRowNumber?: (row: number) => number | undefined;
     width?: number;
     theme?: Partial<Theme>;
 }
@@ -1349,7 +1350,9 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                     checkboxStyle: rowMarkerCheckboxStyle,
                     checked: gridSelection?.rows.hasIndex(row) === true,
                     markerKind: rowMarkers === "clickable-number" ? "number" : rowMarkers,
-                    row: getRowMarkerNumber?.(row) ?? rowMarkerStartIndex + row,
+                    row: getRowMarkerNumber === undefined
+                        ? rowMarkerStartIndex + row
+                        : getRowMarkerNumber(row),
                     drawHandle: onRowMoved !== undefined,
                     cursor: rowMarkers === "clickable-number" ? "pointer" : undefined,
                 };

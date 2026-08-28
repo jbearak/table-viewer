@@ -456,6 +456,38 @@ describe('GridShell cell wrapping', () => {
         expect([0, 1, 2, 3].map(get_row_number)).toEqual([1, 2, 4, 5]);
     });
 
+    it('leaves Excel row markers blank until a transformed mapping loads', async () => {
+        grid_mock.source_row_for_display = () => undefined;
+        await render_grid(props({
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 3,
+                sourceRowCount: 100,
+                excelFirstRowHeader: {
+                    mode: 'on',
+                    detected: false,
+                    active: true,
+                    available: true,
+                    sourceRow: 0,
+                },
+            },
+            row_count: 3,
+            transform_state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+            },
+        }));
+
+        const get_row_number = (grid_mock.props!.rowMarkers as {
+            getRowNumber(row: number): number | undefined;
+        }).getRowNumber;
+        expect([0, 1, 2].map(get_row_number)).toEqual([
+            undefined,
+            undefined,
+            undefined,
+        ]);
+    });
+
     it('shows physical Excel letters over promoted column names', async () => {
         vi.useFakeTimers();
         const initial = props({
@@ -3076,6 +3108,10 @@ describe('GridShell link-only edits', () => {
             initial_edits: {
                 '0:0': { value: '3', base: '2' },
             },
+            source_formula_results: new Map([
+                ['0:1', '4'],
+                ['0:2', '12'],
+            ]),
         });
         const GridShell = await render_grid(initial);
         const get_cell_content = grid_mock.props!.getCellContent as
@@ -3160,6 +3196,33 @@ describe('GridShell link-only edits', () => {
             kind: 'text',
             displayData: '=not a formula',
         });
+    });
+
+    it('keeps formula-shaped XLSX rich text literal even if a result is present', async () => {
+        await render_grid(props({
+            show_formatting: true,
+            edit_mode: true,
+            csv_editable: true,
+            edit_syntax: 'markdown',
+            initial_edits: {
+                '0:0': {
+                    value: '=1+1',
+                    base: 'source-a',
+                    valueRuns: {
+                        runs: [{ text: '=1+1', style: { bold: true } }],
+                    },
+                },
+            },
+            formula_results: new Map([['0:0', '2']]),
+        }));
+        const cell = (grid_mock.props!.getCellContent as
+            (location: [number, number]) => {
+                copyData: string;
+                data: { lines: Array<Array<{ text: string }>> };
+            })([0, 0]);
+
+        expect(cell.copyData).toBe('=1+1');
+        expect(cell.data.lines.flat().map((part) => part.text).join('')).toBe('=1+1');
     });
 
     it('formats dirty runs that reduce to the cell font as a scalar', async () => {

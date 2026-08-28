@@ -370,19 +370,200 @@ describe('ViewerPanelCore', () => {
             close: () => {},
         };
         const core = new ViewerPanelCore(panel, source);
-        await core.handle_message({
+        const request = {
             type: 'requestFormulaCalculation',
             requestId: 'formula-1',
             sourceGeneration: core.source_generation,
-            edits: [{ sheetIndex: 0, row: 0, column: 0, value: '3' }],
+            edits: [{
+                sheetIndex: 0,
+                row: 0,
+                column: 0,
+                value: '3',
+                writesFormula: false,
+            }],
             targets: [{ sheetIndex: 0, row: 0, column: 1 }],
-        });
+        } as const;
+        await core.handle_message(request);
         expect(posted).toContainEqual({
             type: 'formulaCalculation',
             requestId: 'formula-1',
             sourceGeneration: core.source_generation,
             results: [{ sheetIndex: 0, row: 0, column: 1, value: '6' }],
         });
+        expect(core.cached_formula_calculation(request)).toEqual([
+            { sheetIndex: 0, row: 0, column: 1, value: '6' },
+        ]);
+        expect(core.cached_formula_calculation({
+            edits: [{
+                sheetIndex: 0,
+                row: 0,
+                column: 0,
+                value: '4',
+                writesFormula: false,
+            }],
+            targets: request.targets,
+        })).toBeUndefined();
+        expect(core.cached_formula_calculation({
+            edits: [{
+                sheetIndex: 0,
+                row: 0,
+                column: 0,
+                value: '3',
+                writesFormula: true,
+            }],
+            targets: request.targets,
+        })).toBeUndefined();
+        expect(core.cached_formula_calculation({
+            edits: [{
+                sheetIndex: 0,
+                row: 0,
+                column: 0,
+                value: '3',
+                writesFormula: false,
+                runs: [{ text: '3', style: { bold: true } }],
+            }],
+            targets: request.targets,
+        })).toBeUndefined();
+        core.dispose();
+        expect(core.cached_formula_calculation(request)).toBeUndefined();
+    });
+
+    it('does not let a stale-generation formula request cancel valid work', async () => {
+        const { panel, posted } = make_panel();
+        let column_reads = 0;
+        const source: DataSource = {
+            meta: () => ({
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1',
+                    rowCount: 1_000_000,
+                    sourceRowCount: 1_000_000,
+                    columnCount: 2,
+                    merges: [],
+                    hasFormatting: false,
+                }],
+            }),
+            read_rows: (_sheet, start) => ({ startRow: start, rows: [] }),
+            read_columns: (_sheet, start, count, columns) => {
+                column_reads += 1;
+                return {
+                    startRow: start,
+                    rows: Array.from({ length: count }, (_, offset) => columns.map((column) => (
+                        column === 1 && start + offset === 0
+                            ? {
+                                raw: '0',
+                                formatted: '0',
+                                rawType: 'number' as const,
+                                formula: '=SUM(A1:A1000000)',
+                                bold: false,
+                                italic: false,
+                            }
+                            : {
+                                raw: '1',
+                                formatted: '1',
+                                rawType: 'number' as const,
+                                bold: false,
+                                italic: false,
+                            }
+                    ))),
+                };
+            },
+            close: () => {},
+        };
+        const core = new ViewerPanelCore(panel, source);
+        const valid = core.handle_message({
+            type: 'requestFormulaCalculation',
+            requestId: 'valid-formula',
+            sourceGeneration: core.source_generation,
+            edits: [],
+            targets: [{ sheetIndex: 0, row: 0, column: 1 }],
+        });
+        await vi.waitFor(() => {
+            expect(column_reads).toBeGreaterThan(1);
+            expect(posted.some((message) => (
+                message.type === 'formulaCalculation'
+                && message.requestId === 'valid-formula'
+            ))).toBe(false);
+        });
+        await core.handle_message({
+            type: 'cancelFormulaCalculation',
+            requestId: 'stale-formula',
+            sourceGeneration: core.source_generation - 1,
+        });
+        await valid;
+
+        expect(posted).toContainEqual({
+            type: 'formulaCalculation',
+            requestId: 'valid-formula',
+            sourceGeneration: core.source_generation,
+            results: [{ sheetIndex: 0, row: 0, column: 1, value: '1000000' }],
+        });
+    });
+
+    it('cancels matching cooperative formula work between bounded reads', async () => {
+        const { panel, posted } = make_panel();
+        let column_reads = 0;
+        const source: DataSource = {
+            meta: () => ({
+                hasFormatting: false,
+                sheets: [{
+                    name: 'Sheet1',
+                    rowCount: 1_000_000,
+                    sourceRowCount: 1_000_000,
+                    columnCount: 2,
+                    merges: [],
+                    hasFormatting: false,
+                }],
+            }),
+            read_rows: (_sheet, start) => ({ startRow: start, rows: [] }),
+            read_columns: (_sheet, start, count, columns) => {
+                column_reads += 1;
+                return {
+                    startRow: start,
+                    rows: Array.from({ length: count }, (_, offset) => columns.map((column) => (
+                        column === 1 && start + offset === 0
+                            ? {
+                                raw: '0',
+                                formatted: '0',
+                                rawType: 'number' as const,
+                                formula: '=SUM(A1:A1000000)',
+                                bold: false,
+                                italic: false,
+                            }
+                            : {
+                                raw: '1',
+                                formatted: '1',
+                                rawType: 'number' as const,
+                                bold: false,
+                                italic: false,
+                            }
+                    ))),
+                };
+            },
+            close: () => {},
+        };
+        const core = new ViewerPanelCore(panel, source);
+        const calculation = core.handle_message({
+            type: 'requestFormulaCalculation',
+            requestId: 'cancelled-formula',
+            sourceGeneration: core.source_generation,
+            edits: [],
+            targets: [{ sheetIndex: 0, row: 0, column: 1 }],
+        });
+        await vi.waitFor(() => expect(column_reads).toBeGreaterThan(1));
+
+        await core.handle_message({
+            type: 'cancelFormulaCalculation',
+            requestId: 'cancelled-formula',
+            sourceGeneration: core.source_generation,
+        });
+        await calculation;
+
+        expect(column_reads).toBeLessThan(124);
+        expect(posted.some((message) => (
+            message.type === 'formulaCalculation'
+            && message.requestId === 'cancelled-formula'
+        ))).toBe(false);
     });
 
     it('passes the accepted receiver epoch only after a successful rowData post', async () => {

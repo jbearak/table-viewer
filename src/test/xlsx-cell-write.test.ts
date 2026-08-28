@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'fs';
 import CFB from 'cfb';
 import {
+    create_xlsx_formula_write_plan,
     write_xlsx_cell_edits,
     write_xlsx_workbook_cell_edits,
 } from '../xlsx-package';
@@ -18,6 +19,7 @@ import { OoxmlRefusalError, type OoxmlRefusalCode } from '../ooxml-refusal';
 import { format_xlsx_edit_preview } from '../spreadsheet-format';
 import { classify_xlsx_cell_value } from '../xlsx-cell-value';
 import { ZipPackage } from '../zip-package';
+import { plan_workbook_formula_recalculation } from '../formula-dependencies';
 
 const FORMATTED = 'src/test/fixtures/formatted.xlsx';
 const EMPTY = 'src/test/fixtures/empty-sheet.xlsx';
@@ -240,6 +242,57 @@ describe('apply_cell_edits', () => {
         expect(out).toContain('<c r="D1"><f>Z1</f><v>99</v></c>');
     });
 
+    it('invalidates cache-only followers of an affected array formula', () => {
+        const out = apply_cell_edits(
+            doc(
+                '<row r="1"><c r="A1"><v>1</v></c>'
+                + '<c r="B1"><f t="array" ref="B1:C1">A1*2</f><v>2</v></c>'
+                + '<c r="C1"><v>2</v></c></row>',
+            ),
+            [{ row: 0, col: 0, value: '2' }],
+            OPTS,
+        );
+
+        expect(out).toContain('<c r="B1"><f t="array" ref="B1:C1">A1*2</f></c>');
+        expect(out).toContain('<c r="C1"></c>');
+    });
+
+    it('keeps unrelated shared-formula follower caches exact', () => {
+        const out = apply_cell_edits(
+            doc(
+                '<row r="1"><c r="A1"><v>1</v></c>'
+                + '<c r="B1"><f t="shared" ref="B1:B2" si="0">A1*2</f><v>2</v></c></row>'
+                + '<row r="2"><c r="A2"><v>3</v></c>'
+                + '<c r="B2"><f t="shared" si="0"/><v>6</v></c></row>',
+            ),
+            [{ row: 0, col: 0, value: '2' }],
+            OPTS,
+        );
+
+        expect(out).toContain(
+            '<c r="B1"><f t="shared" ref="B1:B2" si="0">A1*2</f></c>',
+        );
+        expect(out).toContain('<c r="B2"><f t="shared" si="0"/><v>6</v></c>');
+    });
+
+    it('invalidates every what-if data-table cache when an input changes', () => {
+        const out = apply_cell_edits(
+            doc(
+                '<row r="1"><c r="A1"><f t="dataTable" ref="A1:B2" r1="$D$1"/><v>1</v></c>'
+                + '<c r="B1"><v>2</v></c><c r="D1"><v>5</v></c></row>'
+                + '<row r="2"><c r="A2"><v>3</v></c><c r="B2"><v>4</v></c></row>',
+            ),
+            [{ row: 0, col: 3, value: '6' }],
+            OPTS,
+        );
+
+        expect(out).toContain('<c r="A1"><f t="dataTable" ref="A1:B2" r1="$D$1"/></c>');
+        expect(out).toContain('<c r="B1"></c>');
+        expect(out).toContain('<c r="A2"></c>');
+        expect(out).toContain('<c r="B2"></c>');
+        expect(out).toContain('<c r="D1"><v>6</v></c>');
+    });
+
     it('writes calculated values for edited and dependent formulas', () => {
         const out = apply_cell_edits(
             doc(
@@ -267,6 +320,32 @@ describe('apply_cell_edits', () => {
         expect(out).toContain('<c r="B1"><f>A1*2</f><v>6</v></c>');
         expect(out).toContain('<c r="C1"><f>B1*3</f><v>18</v></c>');
         expect(out).toContain('<c r="D1"><f>C1+1</f><v>19</v></c>');
+    });
+
+    it('removes stale formula result types when writing numeric caches', () => {
+        const out = apply_cell_edits(
+            doc(
+                '<row r="1"><c r="A1"><v>1</v></c>'
+                + '<c r="B1" s="2" t="e"><f>A1+1</f><v>#VALUE!</v></c>'
+                + '<c r="C1" t="str"><f>A1+2</f><v>old</v></c></row>',
+            ),
+            [{ row: 0, col: 0, value: '2' }],
+            {
+                ...OPTS,
+                formula_result_invalidations: [
+                    { row: 0, column: 1 },
+                    { row: 0, column: 2 },
+                ],
+                formula_result_updates: [
+                    { row: 0, column: 1, value: '3' },
+                    { row: 0, column: 2, value: '4' },
+                ],
+            },
+        );
+        expect(out).toContain('<c r="B1" s="2"><f>A1+1</f><v>3</v></c>');
+        expect(out).toContain('<c r="C1"><f>A1+2</f><v>4</v></c>');
+        expect(out).not.toContain('t="e"');
+        expect(out).not.toContain('t="str"');
     });
 
     it('invalidates the matching shared-formula follower and its dependents', () => {
@@ -309,6 +388,14 @@ describe('apply_cell_edits', () => {
         expect(out).toContain('<c r="I5" s="16"><f>E5*F5+1</f></c>');
         expect(out).not.toContain('&equals;');
         expect(out).not.toContain('inlineStr');
+    });
+
+    it('refuses to write an overlong formula through the low-level seam', () => {
+        expect(() => apply_cell_edits(
+            doc('<row r="1"><c r="A1"><v>1</v></c></row>'),
+            [{ row: 0, col: 0, value: `=${'1'.repeat(8_193)}` }],
+            OPTS,
+        )).toThrow('Formula exceeds Excel\'s maximum length');
     });
 
     it('writes an edited shared follower as an explicit formula', () => {
@@ -1863,11 +1950,18 @@ describe('write_xlsx_cell_edits', () => {
         const calculated = write_xlsx_workbook_cell_edits(raw, [
             { sheetIndex: 0, edits: [{ row: 1, col: 1, value: '40' }] },
         ], {
-            formulaDependencies: parsed_source.sheets,
-            formulaResults: [
+            formulaWritePlan: create_xlsx_formula_write_plan(
+                plan_workbook_formula_recalculation(parsed_source.sheets, [{
+                    sheetIndex: 0,
+                    row: 1,
+                    column: 1,
+                    value: '40',
+                    writesFormula: false,
+                }]), [
                 { sheetIndex: 1, row: 1, column: 1, value: '80' },
                 { sheetIndex: 0, row: 1, column: 2, value: '240' },
-            ],
+                ],
+            ),
         });
         const calculated_data = (await parse_xlsx(calculated)).data;
         expect(calculated_data.sheets[1].rows[1][1]).toMatchObject({

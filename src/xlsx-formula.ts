@@ -26,6 +26,19 @@ function column_letters(index: number): string {
     return out;
 }
 
+function translated_axis(
+    absolute: string,
+    value: number,
+    delta: number,
+    limit: number,
+    render: (value: number) => string,
+): string {
+    const translated = absolute === '$' ? value : value + delta;
+    return translated < 1 || translated > limit
+        ? '#REF!'
+        : `${absolute}${render(translated)}`;
+}
+
 function identifier_character(char: string | undefined): boolean {
     return char !== undefined && /[\p{L}\p{N}_.]/u.test(char);
 }
@@ -54,76 +67,129 @@ export interface A1FormulaReferenceToken {
     readonly length: number;
 }
 
-function parse_a1_cell(value: string): ParsedA1Cell | undefined {
-    const match = value.match(/^\$?([A-Za-z]{1,3})\$?([1-9]\d*)/);
-    if (!match) return undefined;
-    const column = column_index(match[1]);
-    const row = Number(match[2]);
-    if (column < 1 || column > MAX_COLUMN || row > MAX_ROW) return undefined;
-    if (identifier_character(value[match[0].length]) || value[match[0].length] === '(') {
-        return undefined;
-    }
-    return { row: row - 1, column: column - 1, length: match[0].length };
-}
-
-function parse_a1_axis_range(value: string): ParsedA1Range | undefined {
-    const columns = value.match(/^\$?([A-Za-z]{1,3}):\$?([A-Za-z]{1,3})/);
-    if (columns && !identifier_character(value[columns[0].length])) {
-        const first = column_index(columns[1]);
-        const last = column_index(columns[2]);
-        if (first <= MAX_COLUMN && last <= MAX_COLUMN) {
-            return {
-                firstRow: 0,
-                firstColumn: Math.min(first, last) - 1,
-                lastRow: MAX_ROW - 1,
-                lastColumn: Math.max(first, last) - 1,
-                length: columns[0].length,
-            };
-        }
-    }
-    const rows = value.match(/^\$?([1-9]\d*):\$?([1-9]\d*)/);
-    if (rows && !identifier_character(value[rows[0].length])) {
-        const first = Number(rows[1]);
-        const last = Number(rows[2]);
-        if (first <= MAX_ROW && last <= MAX_ROW) {
-            return {
-                firstRow: Math.min(first, last) - 1,
-                firstColumn: 0,
-                lastRow: Math.max(first, last) - 1,
-                lastColumn: MAX_COLUMN - 1,
-                length: rows[0].length,
-            };
-        }
-    }
-    return undefined;
-}
-
 interface SheetPrefix {
     readonly name: string;
     readonly length: number;
 }
 
-function sheet_prefix(value: string): SheetPrefix | undefined {
-    if (value[0] === "'") {
-        let name = '';
-        for (let index = 1; index < value.length; index++) {
+interface SheetPrefixAttempt {
+    readonly prefix?: SheetPrefix;
+    /** First character that cannot belong to this prefix attempt. */
+    readonly scannedEnd: number;
+}
+
+function sheet_prefix_at(value: string, offset: number): SheetPrefixAttempt {
+    if (value[offset] === "'") {
+        for (let index = offset + 1; index < value.length; index++) {
             if (value[index] !== "'") {
-                name += value[index];
                 continue;
             }
             if (value[index + 1] === "'") {
-                name += "'";
                 index += 1;
                 continue;
             }
-            return value[index + 1] === '!'
-                ? { name, length: index + 2 }
-                : undefined;
+            if (value[index + 1] !== '!') return { scannedEnd: index + 1 };
+            return {
+                prefix: {
+                    name: value.slice(offset + 1, index).replace(/''/g, "'"),
+                    length: index + 2 - offset,
+                },
+                scannedEnd: index + 2,
+            };
         }
-        return undefined;
+        return { scannedEnd: value.length };
     }
-    const match = value.match(/^([A-Za-z_\\][\p{L}\p{N}_.\\]*)!/u);
-    return match ? { name: match[1], length: match[0].length } : undefined;
+
+    if (!/[A-Za-z_\\]/.test(value[offset] ?? '')) return { scannedEnd: offset };
+    let end = offset + 1;
+    while (end < value.length) {
+        const code_point = value.codePointAt(end);
+        if (code_point === undefined) break;
+        const char = String.fromCodePoint(code_point);
+        if (char !== '\\' && !identifier_character(char)) break;
+        end += char.length;
+    }
+    return value[end] === '!'
+        ? {
+            prefix: { name: value.slice(offset, end), length: end + 1 - offset },
+            scannedEnd: end + 1,
+        }
+        : { scannedEnd: end };
+}
+
+interface ParsedA1Axis {
+    readonly value: number;
+    readonly end: number;
+}
+
+function parse_a1_column_at(value: string, offset: number): ParsedA1Axis | undefined {
+    let end = value[offset] === '$' ? offset + 1 : offset;
+    const letters_start = end;
+    let column = 0;
+    while (end < value.length && end - letters_start < 3) {
+        const code = value.charCodeAt(end);
+        const upper = code >= 97 && code <= 122 ? code - 32 : code;
+        if (upper < 65 || upper > 90) break;
+        column = column * 26 + upper - 64;
+        end += 1;
+    }
+    if (end === letters_start || column > MAX_COLUMN) return undefined;
+    return { value: column, end };
+}
+
+function parse_a1_row_at(value: string, offset: number): ParsedA1Axis | undefined {
+    let end = value[offset] === '$' ? offset + 1 : offset;
+    if (value.charCodeAt(end) < 49 || value.charCodeAt(end) > 57) return undefined;
+    let row = 0;
+    while (end < value.length) {
+        const code = value.charCodeAt(end);
+        if (code < 48 || code > 57) break;
+        row = Math.min(MAX_ROW + 1, row * 10 + code - 48);
+        end += 1;
+    }
+    return row <= MAX_ROW ? { value: row, end } : undefined;
+}
+
+function parse_a1_cell_at(value: string, offset: number): ParsedA1Cell | undefined {
+    const column = parse_a1_column_at(value, offset);
+    if (!column) return undefined;
+    const row = parse_a1_row_at(value, column.end);
+    if (!row || identifier_character(value[row.end]) || value[row.end] === '(') return undefined;
+    return {
+        row: row.value - 1,
+        column: column.value - 1,
+        length: row.end - offset,
+    };
+}
+
+function parse_a1_axis_range_at(value: string, offset: number): ParsedA1Range | undefined {
+    const first_column = parse_a1_column_at(value, offset);
+    if (first_column && value[first_column.end] === ':') {
+        const last_column = parse_a1_column_at(value, first_column.end + 1);
+        if (last_column && !identifier_character(value[last_column.end])) {
+            return {
+                firstRow: 0,
+                firstColumn: Math.min(first_column.value, last_column.value) - 1,
+                lastRow: MAX_ROW - 1,
+                lastColumn: Math.max(first_column.value, last_column.value) - 1,
+                length: last_column.end - offset,
+            };
+        }
+    }
+    const first_row = parse_a1_row_at(value, offset);
+    if (first_row && value[first_row.end] === ':') {
+        const last_row = parse_a1_row_at(value, first_row.end + 1);
+        if (last_row && !identifier_character(value[last_row.end])) {
+            return {
+                firstRow: Math.min(first_row.value, last_row.value) - 1,
+                firstColumn: 0,
+                lastRow: Math.max(first_row.value, last_row.value) - 1,
+                lastColumn: MAX_COLUMN - 1,
+                length: last_row.end - offset,
+            };
+        }
+    }
+    return undefined;
 }
 
 /**
@@ -137,9 +203,9 @@ export function a1_formula_reference_at(
     offset: number,
 ): A1FormulaReferenceToken | undefined {
     if (!Number.isInteger(offset) || offset < 0 || offset >= formula.length) return undefined;
-    const prefix = sheet_prefix(formula.slice(offset));
+    const prefix = sheet_prefix_at(formula, offset).prefix;
     const cell_start = offset + (prefix?.length ?? 0);
-    const axis_range = parse_a1_axis_range(formula.slice(cell_start));
+    const axis_range = parse_a1_axis_range_at(formula, cell_start);
     if (axis_range) {
         return {
             reference: {
@@ -152,12 +218,12 @@ export function a1_formula_reference_at(
             length: (prefix?.length ?? 0) + axis_range.length,
         };
     }
-    const first = parse_a1_cell(formula.slice(cell_start));
+    const first = parse_a1_cell_at(formula, cell_start);
     if (!first) return undefined;
     let end = cell_start + first.length;
     let last = first;
     if (formula[end] === ':') {
-        const range_end = parse_a1_cell(formula.slice(end + 1));
+        const range_end = parse_a1_cell_at(formula, end + 1);
         if (range_end) {
             last = range_end;
             end += 1 + range_end.length;
@@ -235,7 +301,11 @@ export function a1_formula_references(formula: string): A1FormulaReference[] {
 
         const token = a1_formula_reference_at(formula, index);
         if (!token) {
-            index += 1;
+            // A failed sheet-prefix candidate may have consumed a long quoted
+            // or identifier span. Nothing inside that span can begin a free A1
+            // token, so skip it once instead of rescanning every apostrophe or
+            // backslash as another possible prefix.
+            index = Math.max(index + 1, sheet_prefix_at(formula, index).scannedEnd);
             continue;
         }
         record(token.reference);
@@ -351,6 +421,44 @@ export function translate_a1_formula(
             out += char;
             index += 1;
             continue;
+        }
+
+        const column_range = formula.slice(index).match(
+            /^(\$?)([A-Za-z]{1,3}):(\$?)([A-Za-z]{1,3})/,
+        );
+        if (column_range && !identifier_character(formula[index + column_range[0].length])) {
+            const first = column_index(column_range[2]);
+            const last = column_index(column_range[4]);
+            if (first <= MAX_COLUMN && last <= MAX_COLUMN) {
+                out += translated_axis(
+                    column_range[1], first, column_delta, MAX_COLUMN, column_letters,
+                );
+                out += ':';
+                out += translated_axis(
+                    column_range[3], last, column_delta, MAX_COLUMN, column_letters,
+                );
+                index += column_range[0].length;
+                continue;
+            }
+        }
+
+        const row_range = formula.slice(index).match(
+            /^(\$?)([1-9]\d*):(\$?)([1-9]\d*)/,
+        );
+        if (row_range && !identifier_character(formula[index + row_range[0].length])) {
+            const first = Number(row_range[2]);
+            const last = Number(row_range[4]);
+            if (first <= MAX_ROW && last <= MAX_ROW) {
+                out += translated_axis(
+                    row_range[1], first, row_delta, MAX_ROW, String,
+                );
+                out += ':';
+                out += translated_axis(
+                    row_range[3], last, row_delta, MAX_ROW, String,
+                );
+                index += row_range[0].length;
+                continue;
+            }
         }
 
         const match = formula.slice(index).match(/^(\$?)([A-Za-z]{1,3})(\$?)([1-9]\d*)/);

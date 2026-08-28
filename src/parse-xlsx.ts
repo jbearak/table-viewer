@@ -2,8 +2,14 @@ import { ZipPackage, ZipPackageError } from './zip-package';
 import {
     assert_safe_sheet_count,
     assert_safe_sheet_shape,
+    assert_safe_formula_cells,
+    assert_safe_formula_ranges,
+    assert_safe_formula_references,
+    assert_safe_xlsx_formula_text,
+    assert_safe_xlsx_formula_xml_bytes,
     create_workbook_budget,
     MAX_WORKBOOK_CELLS,
+    MAX_WORKBOOK_FORMULAS,
     type WorkbookBudget,
 } from './spreadsheet-safety';
 import {
@@ -23,6 +29,7 @@ import {
     get_style,
     number_format_is_date,
 } from './spreadsheet-format';
+import { iso_to_serial } from './xlsx-cell-value';
 import type { FontEntry, XfEntry, DateMode } from './spreadsheet-format';
 import type { WorkbookData, SheetData, CellData, MergeRange } from './types';
 import type { CellHyperlink, RichText } from './cell-content';
@@ -390,6 +397,7 @@ function parse_dimension(xml: Uint8Array): { row_count: number; col_count: numbe
 interface WorksheetWorking extends WorkingSet {
     merges: MergeRange[];
     formula_dependencies: number[];
+    formula_cells: number[];
     pending_formula_cells: number[];
 }
 
@@ -523,7 +531,17 @@ function parse_worksheet_core(
     const dim = parse_dimension(xml);
     if (dim && dim.row_count > 0 && dim.col_count > 0) {
         // Check row/col limits without mutating budget — full budget check happens after parsing
-        assert_safe_sheet_shape({ total_cells: 0 }, dim.row_count, dim.col_count, 0);
+        assert_safe_sheet_shape(
+            {
+                total_cells: 0,
+                total_formulas: 0,
+                total_formula_references: 0,
+                total_formula_ranges: 0,
+            },
+            dim.row_count,
+            dim.col_count,
+            0,
+        );
     }
 
     // Parse merge cells
@@ -544,7 +562,9 @@ function parse_worksheet_core(
 
     // Parse cells
     const cells = new Map<string, CellData>();
+    const opaque_formula_cells = new Set<string>();
     const formula_dependencies: number[] = [];
+    const formula_cells: number[] = [];
     const pending_formula_cells: number[] = [];
     let max_row = 0;
     let max_col = 0;
@@ -557,6 +577,7 @@ function parse_worksheet_core(
             string,
             { readonly row: number; readonly col: number; readonly text: string }
         >();
+        let shared_master_count = 0;
         // Followers contain no formula text, so collect their masters before the
         // normal cell pass. Avoid doubling the cell scan for worksheets without a
         // live shared formula; large sheets commonly contain the word "shared" in
@@ -605,8 +626,25 @@ function parse_worksheet_core(
                     const reference = get_tag_attr(xml, formula.start, formula.inner_start, 'ref');
                     const shared_index = get_tag_attr(xml, formula.start, formula.inner_start, 'si');
                     if (type !== 'shared' || reference === null || shared_index === null) return;
-                    const text = decode_xml(utf8_text(xml, formula.inner_start, formula.inner_end));
-                    if (text !== '') shared_formulas.set(shared_index, { row, col, text });
+                    if (formula.inner_end > formula.inner_start) shared_master_count += 1;
+                    if (shared_master_count > MAX_WORKBOOK_FORMULAS) {
+                        throw new Error(
+                            'Workbook has too many formulas to calculate safely '
+                            + `(max ${MAX_WORKBOOK_FORMULAS.toLocaleString()})`,
+                        );
+                    }
+                    assert_safe_xlsx_formula_xml_bytes(
+                        formula.inner_end - formula.inner_start,
+                    );
+                    const text = decode_xml(utf8_text(
+                        xml,
+                        formula.inner_start,
+                        formula.inner_end,
+                    ));
+                    if (text !== '') {
+                        assert_safe_xlsx_formula_text(text);
+                        shared_formulas.set(shared_index, { row, col, text });
+                    }
                 },
             });
         }
@@ -632,6 +670,8 @@ function parse_worksheet_core(
                 let rawType: CellData['rawType'];
                 let richText: RichText | undefined;
                 let effective_formula: string | undefined;
+                let data_table_inputs: string[] = [];
+                let formula_is_data_table = false;
                 let formula_result_pending = false;
 
                 const formula = find_first_element(
@@ -643,7 +683,14 @@ function parse_worksheet_core(
                 if (formula) {
                     const type = get_tag_attr(xml, formula.start, formula.inner_start, 't');
                     const reference = get_tag_attr(xml, formula.start, formula.inner_start, 'ref');
-                    const text = decode_xml(utf8_text(xml, formula.inner_start, formula.inner_end));
+                    assert_safe_xlsx_formula_xml_bytes(
+                        formula.inner_end - formula.inner_start,
+                    );
+                    const text = decode_xml(utf8_text(
+                        xml,
+                        formula.inner_start,
+                        formula.inner_end,
+                    ));
                     if (type === 'shared' && reference === null) {
                         const shared_index = get_tag_attr(
                             xml,
@@ -664,6 +711,19 @@ function parse_worksheet_core(
                     } else if (text !== '') {
                         effective_formula = `=${text}`;
                     }
+                    if (type === 'dataTable') {
+                        formula_is_data_table = true;
+                        opaque_formula_cells.add(`${row}:${col}`);
+                        data_table_inputs = ['r1', 'r2'].flatMap((attribute) => {
+                            const input = get_tag_attr(
+                                xml,
+                                formula.start,
+                                formula.inner_start,
+                                attribute,
+                            );
+                            return input === null ? [] : [`=${input}`];
+                        });
+                    }
                 }
 
                 if (t === 's') {
@@ -677,12 +737,18 @@ function parse_worksheet_core(
                     formatted = raw !== null ? String(raw) : '';
                 } else if (t === 'b') {
                     // Boolean
-                    raw = v_bytes?.length === 1 && v_bytes[0] === 0x31;
-                    formatted = raw ? 'TRUE' : 'FALSE';
+                    if (
+                        v_bytes?.length === 1
+                        && (v_bytes[0] === 0x30 || v_bytes[0] === 0x31)
+                    ) {
+                        raw = v_bytes[0] === 0x31;
+                        formatted = raw ? 'TRUE' : 'FALSE';
+                    }
                 } else if (t === 'e') {
                     // Error
                     raw = v_bytes !== null ? decode_xml(utf8_text(v_bytes)) : null;
                     formatted = raw !== null ? String(raw) : '';
+                    rawType = 'error';
                 } else if (t === 'str') {
                     // Inline formula string result
                     raw = v_bytes !== null ? decode_xml(utf8_text(v_bytes)) : null;
@@ -740,21 +806,33 @@ function parse_worksheet_core(
                     rawType = 'string';
                     formula_result_pending = true;
                 }
-                if (effective_formula !== undefined) {
-                    for (const reference of workbook_a1_formula_references(
-                        effective_formula,
-                        sheet_index,
-                        sheet_names,
-                    )) {
-                        formula_dependencies.push(
-                            row,
-                            col,
-                            reference.sourceSheetIndex,
-                            reference.firstRow,
-                            reference.firstColumn,
-                            reference.lastRow,
-                            reference.lastColumn,
-                        );
+                if (effective_formula !== undefined || formula_is_data_table) {
+                    assert_safe_formula_cells(budget, 1);
+                    for (const formula_text of [
+                        ...(effective_formula === undefined ? [] : [effective_formula]),
+                        ...data_table_inputs,
+                    ]) {
+                        assert_safe_xlsx_formula_text(formula_text);
+                        for (const reference of workbook_a1_formula_references(
+                            formula_text,
+                            sheet_index,
+                            sheet_names,
+                        )) {
+                            assert_safe_formula_references(budget, 1);
+                            if (
+                                reference.firstRow !== reference.lastRow
+                                || reference.firstColumn !== reference.lastColumn
+                            ) assert_safe_formula_ranges(budget, 1);
+                            formula_dependencies.push(
+                                row,
+                                col,
+                                reference.sourceSheetIndex,
+                                reference.firstRow,
+                                reference.firstColumn,
+                                reference.lastRow,
+                                reference.lastColumn,
+                            );
+                        }
                     }
                 }
                 const cell: CellData = {
@@ -765,6 +843,12 @@ function parse_worksheet_core(
                     ...(formula_result_pending ? { formulaResultPending: true as const } : {}),
                     ...style,
                 };
+                if (rawType === 'date' && v_bytes !== null) {
+                    const parsed_number = parse_finite_number_utf8(v_bytes);
+                    const date_number = parsed_number
+                        ?? (typeof raw === 'string' ? iso_to_serial(raw, datemode) : null);
+                    if (date_number !== null) cell.numericRaw = date_number;
+                }
                 if (formula_result_pending) pending_formula_cells.push(row, col);
                 if (number_format) cell.numberFormat = number_format;
                 if (t === 'd') cell.xlsxIsoDate = true;
@@ -851,6 +935,17 @@ function parse_worksheet_core(
         });
     }
 
+    const sorted_formula_cells: number[] = [];
+    for (const [key, cell] of cells) {
+        if (cell.formula === undefined && !opaque_formula_cells.has(key)) continue;
+        const [row, column] = key.split(':').map(Number);
+        sorted_formula_cells.push(row * 16_384 + column);
+    }
+    sorted_formula_cells.sort((left, right) => left - right);
+    for (const number of sorted_formula_cells) {
+        formula_cells.push(Math.floor(number / 16_384), number % 16_384);
+    }
+
     // If no cells were found, the sheet is empty regardless of what dimension says
     if (cells.size === 0) {
         return {
@@ -858,6 +953,7 @@ function parse_worksheet_core(
             merged_cells,
             merges: [],
             formula_dependencies,
+            formula_cells,
             pending_formula_cells,
             row_count: 0,
             col_count: 0,
@@ -898,6 +994,7 @@ function parse_worksheet_core(
         merged_cells,
         merges: normalized_merges,
         formula_dependencies,
+        formula_cells,
         pending_formula_cells,
         row_count,
         col_count,
@@ -1037,6 +1134,9 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookDa
             ...(working.formula_dependencies.length
                 ? { formulaDependencies: working.formula_dependencies }
                 : {}),
+            ...(working.formula_cells.length
+                ? { formulaCells: working.formula_cells }
+                : {}),
             ...(working.pending_formula_cells.length
                 ? { pendingFormulaCells: working.pending_formula_cells }
                 : {}),
@@ -1093,6 +1193,7 @@ export async function parse_xlsx_streaming(buffer: Uint8Array): Promise<Streamin
             working.merges,
             entry.worksheetId,
             working.formula_dependencies,
+            working.formula_cells,
             working.pending_formula_cells,
         ));
     }

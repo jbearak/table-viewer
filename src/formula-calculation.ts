@@ -8,9 +8,25 @@ import {
     a1_formula_reference_at,
     is_xlsx_formula_text,
 } from './xlsx-formula';
+import { number_format_is_date } from './spreadsheet-format';
+import {
+    classify_xlsx_cell_value,
+    iso_to_serial,
+    xlsx_runs_require_inline_string,
+} from './xlsx-cell-value';
+import type { RichTextRun } from './cell-content';
+import { cell_whole_style } from './cell-edit-model';
 
 const MAX_RANGE_CELLS_PER_READ = 8_192;
 const MAX_RANGE_COLUMNS_PER_READ = 256;
+const PARSER_WORK_PER_CHECKPOINT = 1_024;
+// Excel's documented formula-text limit, plus the editor's leading '='.
+const MAX_CALCULATED_FORMULA_LENGTH = 8_193;
+// A save runs on the extension host. Keep its cache-refresh fallback below one
+// broad event-loop stall; formulas left unfinished have their stale caches
+// removed and Excel recalculates them when the saved workbook opens.
+const MAX_SYNCHRONOUS_CALCULATION_WORK = 262_144;
+const CALCULATION_WORK_EXHAUSTED = Symbol('calculation-work-exhausted');
 
 export interface FormulaCalculationAddress {
     readonly sheetIndex: number;
@@ -20,6 +36,9 @@ export interface FormulaCalculationAddress {
 
 export interface FormulaCalculationEdit extends FormulaCalculationAddress {
     readonly value: string;
+    /** Exact classification chosen by the eventual XLSX writer. */
+    readonly writesFormula: boolean;
+    readonly runs?: readonly RichTextRun[];
 }
 
 export type FormulaCalculationError =
@@ -39,11 +58,22 @@ export interface FormulaCalculationRequest {
     readonly targets: readonly FormulaCalculationAddress[];
 }
 
+export interface FormulaCalculationSchedule {
+    /** Stop before doing more source reads when this request has become stale. */
+    readonly isCancelled: () => boolean;
+    /** Scheduling seam used by the host and deterministic unit tests. */
+    readonly yieldControl?: () => Promise<void>;
+    /** Maximum wall-clock work between scheduling points. */
+    readonly workSliceMs?: number;
+}
+
+type CalculationSteps<T> = Generator<void, T, void>;
+
 type Scalar =
     | { readonly kind: 'number'; readonly value: number }
     | { readonly kind: 'boolean'; readonly value: 0 | 1 }
     | { readonly kind: 'blank' }
-    | { readonly kind: 'text' }
+    | { readonly kind: 'text'; readonly value: string }
     | { readonly kind: 'unknown'; readonly error: FormulaCalculationError };
 
 interface RangeValue {
@@ -64,7 +94,6 @@ const UNSUPPORTED_FUNCTION: Scalar = Object.freeze({
 const CYCLE: Scalar = Object.freeze({ kind: 'unknown', error: 'cycle' });
 const NUMERIC_ERROR: Scalar = Object.freeze({ kind: 'unknown', error: 'numeric error' });
 const BLANK: Scalar = Object.freeze({ kind: 'blank' });
-const TEXT: Scalar = Object.freeze({ kind: 'text' });
 
 function address_key(address: FormulaCalculationAddress): string {
     return `${address.sheetIndex}:${address.row}:${address.column}`;
@@ -76,7 +105,7 @@ function finite_number(value: number): Scalar {
 
 function numeric_text(value: string): number | undefined {
     const trimmed = value.trim();
-    if (!/^[+-]?(?:(?:0|[1-9]\d*)(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(trimmed)) {
+    if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(trimmed)) {
         return undefined;
     }
     const number = Number(trimmed);
@@ -92,9 +121,10 @@ function numeric_text(value: string): number | undefined {
 function scalar_from_cell(cell: RenderedCell | null | undefined): Scalar {
     if (!cell || cell.raw === null || cell.raw === '' || cell.rawType === 'empty') return BLANK;
     if (cell.rawType === 'number' || cell.rawType === 'date') {
-        const value = Number(cell.raw);
+        const value = cell.numericRaw ?? Number(cell.raw);
         return finite_number(value);
     }
+    if (cell.rawType === 'error') return NUMERIC_ERROR;
     if (cell.rawType === 'boolean') {
         if (cell.raw === '1' || cell.raw.toUpperCase() === 'TRUE') {
             return { kind: 'boolean', value: 1 };
@@ -104,24 +134,62 @@ function scalar_from_cell(cell: RenderedCell | null | undefined): Scalar {
         }
         return NUMERIC_ERROR;
     }
-    return TEXT;
+    return { kind: 'text', value: cell.raw };
 }
 
-function scalar_from_edit(value: string, cell: RenderedCell | null | undefined): Scalar {
-    if (value === '') return BLANK;
-    if (cell?.rawType === 'boolean') {
-        const upper = value.trim().toUpperCase();
-        if (upper === 'TRUE') return { kind: 'boolean', value: 1 };
-        if (upper === 'FALSE') return { kind: 'boolean', value: 0 };
+function scalar_from_edit(
+    edit: FormulaCalculationEdit,
+    cell: RenderedCell | null | undefined,
+): Scalar {
+    const { value } = edit;
+    if (
+        edit.runs !== undefined
+        && edit.runs.length > 0
+        && xlsx_runs_require_inline_string(
+            edit.runs,
+            cell ? cell_whole_style(cell) : undefined,
+        )
+    ) return { kind: 'text', value };
+    let date_mode: 0 | 1 = cell?.numberFormat?.date1904 ? 1 : 0;
+    if (
+        date_mode === 0
+        && cell?.xlsxIsoDate === true
+        && cell.numericRaw !== undefined
+        && typeof cell.raw === 'string'
+    ) {
+        const serial_1904 = iso_to_serial(cell.raw, 1);
+        if (
+            serial_1904 !== null
+            && Math.abs(serial_1904 - cell.numericRaw) < 1e-9
+        ) date_mode = 1;
     }
-    const number = numeric_text(value);
-    return number === undefined ? TEXT : finite_number(number);
+    const classified = classify_xlsx_cell_value(value, {
+        datemode: date_mode,
+        was_boolean: cell?.rawType === 'boolean',
+        was_iso_date: cell?.xlsxIsoDate === true,
+        is_date_style: (serial) => cell?.numberFormat !== undefined
+            && number_format_is_date(cell.numberFormat, serial),
+    });
+    if (classified.kind === 'empty') return BLANK;
+    if (classified.kind === 'boolean') {
+        return { kind: 'boolean', value: classified.text === '1' ? 1 : 0 };
+    }
+    if (classified.kind === 'number') return finite_number(Number(classified.text));
+    if (classified.kind === 'iso-date') {
+        const serial = iso_to_serial(classified.text, date_mode);
+        return serial === null ? { kind: 'text', value } : finite_number(serial);
+    }
+    return { kind: 'text', value: classified.text };
 }
 
 function arithmetic_number(value: FormulaValue): number | Scalar {
     if (value.kind === 'number') return value.value;
     if (value.kind === 'boolean') return value.value;
     if (value.kind === 'blank') return 0;
+    if (value.kind === 'text') {
+        const number = numeric_text(value.value);
+        return number === undefined ? NUMERIC_ERROR : number;
+    }
     if (value.kind === 'unknown') return value;
     return NUMERIC_ERROR;
 }
@@ -142,20 +210,37 @@ function result_text(value: number): string {
  *
  * The interface names only edits and targets. Formula parsing, recursion,
  * cross-sheet lookup, range streaming, memoization, and error containment stay
- * behind this seam. Memory is O(targets + direct point references + edits +
- * one 8K-cell range chunk), not O(workbook size).
+ * behind this seam. Memory is O(targets + edits + one 8K-cell range chunk),
+ * not O(the workbook or the request's point-reference count).
  */
-export function calculate_workbook_formulas(
+function* calculate_workbook_formula_steps(
     source: DataSource,
     request: FormulaCalculationRequest,
-): readonly FormulaCalculationResult[] {
+    max_work?: number,
+): CalculationSteps<readonly FormulaCalculationResult[]> {
     const sheets = source.meta().sheets;
     const sheet_names = sheets.map((sheet) => sheet.name);
     const sheet_lookup = new Map(sheet_names.map((name, index) => [name.toUpperCase(), index]));
-    const edits = new Map(request.edits.map((edit) => [address_key(edit), edit.value]));
+    const edits = new Map(request.edits.map((edit) => [address_key(edit), edit]));
     const targets = new Set(request.targets.map(address_key));
     const memo = new Map<string, Scalar>();
     const visiting = new Set<string>();
+    let parser_work = 0;
+    let work_remaining = max_work;
+
+    const consume_work = (units: number): void => {
+        if (work_remaining === undefined) return;
+        if (units > work_remaining) throw CALCULATION_WORK_EXHAUSTED;
+        work_remaining -= units;
+    };
+
+    const parser_checkpoint = function* (): CalculationSteps<void> {
+        parser_work += 1;
+        if (parser_work >= PARSER_WORK_PER_CHECKPOINT) {
+            parser_work = 0;
+            yield;
+        }
+    };
 
     const valid_address = (address: FormulaCalculationAddress): boolean => {
         const sheet = sheets[address.sheetIndex];
@@ -174,6 +259,7 @@ export function calculate_workbook_formulas(
         count: number,
         columns: readonly number[],
     ): (RenderedCell | null)[][] => {
+        consume_work(count * columns.length);
         const canonical = source.read_canonical_columns?.(
             sheet_index, start_row, count, columns,
         );
@@ -189,7 +275,7 @@ export function calculate_workbook_formulas(
     let evaluate_cell!: (
         address: FormulaCalculationAddress,
         supplied?: RenderedCell | null,
-    ) => Scalar;
+    ) => CalculationSteps<Scalar>;
 
     class Parser {
         private offset = 1;
@@ -199,10 +285,14 @@ export function calculate_workbook_formulas(
             private readonly formula_sheet_index: number,
         ) {}
 
-        parse(): Scalar {
-            if (!is_xlsx_formula_text(this.formula)) return PARSE_ERROR;
-            const value = this.additive();
-            this.whitespace();
+        *parse(): CalculationSteps<Scalar> {
+            if (
+                !is_xlsx_formula_text(this.formula)
+                || this.formula.length > MAX_CALCULATED_FORMULA_LENGTH
+            ) return PARSE_ERROR;
+            consume_work(this.formula.length);
+            const value = yield* this.additive();
+            yield* this.whitespace();
             if (this.offset !== this.formula.length || value.kind === 'range') {
                 return value.kind === 'unknown' && value.error === 'unsupported function'
                     ? value
@@ -211,18 +301,26 @@ export function calculate_workbook_formulas(
             return value;
         }
 
-        private whitespace(): void {
-            while (/\s/.test(this.formula[this.offset] ?? '')) this.offset += 1;
+        private *whitespace(): CalculationSteps<void> {
+            let scanned = 0;
+            while (/\s/.test(this.formula[this.offset] ?? '')) {
+                this.offset += 1;
+                scanned += 1;
+                if (scanned >= PARSER_WORK_PER_CHECKPOINT) {
+                    scanned = 0;
+                    yield;
+                }
+            }
         }
 
-        private additive(): FormulaValue {
-            let left = this.multiplicative();
+        private *additive(): CalculationSteps<FormulaValue> {
+            let left = yield* this.multiplicative();
             while (true) {
-                this.whitespace();
+                yield* this.whitespace();
                 const operator = this.formula[this.offset];
                 if (operator !== '+' && operator !== '-') return left;
                 this.offset += 1;
-                const right = this.multiplicative();
+                const right = yield* this.multiplicative();
                 const a = arithmetic_number(left);
                 const b = arithmetic_number(right);
                 left = arithmetic_error(a) ?? arithmetic_error(b)
@@ -231,14 +329,14 @@ export function calculate_workbook_formulas(
             }
         }
 
-        private multiplicative(): FormulaValue {
-            let left = this.power();
+        private *multiplicative(): CalculationSteps<FormulaValue> {
+            let left = yield* this.power();
             while (true) {
-                this.whitespace();
+                yield* this.whitespace();
                 const operator = this.formula[this.offset];
                 if (operator !== '*' && operator !== '/') return left;
                 this.offset += 1;
-                const right = this.power();
+                const right = yield* this.power();
                 const a = arithmetic_number(left);
                 const b = arithmetic_number(right);
                 left = arithmetic_error(a) ?? arithmetic_error(b)
@@ -250,12 +348,12 @@ export function calculate_workbook_formulas(
             }
         }
 
-        private power(): FormulaValue {
-            let left = this.unary();
-            this.whitespace();
+        private *power(): CalculationSteps<FormulaValue> {
+            let left = yield* this.unary();
+            yield* this.whitespace();
             if (this.formula[this.offset] !== '^') return left;
             this.offset += 1;
-            const right = this.power();
+            const right = yield* this.power();
             const a = arithmetic_number(left);
             const b = arithmetic_number(right);
             left = arithmetic_error(a) ?? arithmetic_error(b)
@@ -263,43 +361,37 @@ export function calculate_workbook_formulas(
             return left;
         }
 
-        private unary(): FormulaValue {
-            this.whitespace();
+        private *unary(): CalculationSteps<FormulaValue> {
+            yield* this.whitespace();
             const operator = this.formula[this.offset];
             if (operator === '+' || operator === '-') {
                 this.offset += 1;
-                const value = arithmetic_number(this.unary());
+                const value = arithmetic_number(yield* this.unary());
                 return arithmetic_error(value)
                     ?? finite_number(operator === '-' ? -(value as number) : value as number);
             }
-            let value = this.primary();
-            this.whitespace();
+            let value = yield* this.primary();
+            yield* this.whitespace();
             while (this.formula[this.offset] === '%') {
                 const number = arithmetic_number(value);
                 value = arithmetic_error(number) ?? finite_number((number as number) / 100);
                 this.offset += 1;
-                this.whitespace();
+                yield* parser_checkpoint();
+                yield* this.whitespace();
             }
             return value;
         }
 
-        private primary(): FormulaValue {
-            this.whitespace();
+        private *primary(): CalculationSteps<FormulaValue> {
+            yield* parser_checkpoint();
+            yield* this.whitespace();
             if (this.formula[this.offset] === '(') {
                 this.offset += 1;
-                const value = this.additive();
-                this.whitespace();
+                const value = yield* this.additive();
+                yield* this.whitespace();
                 if (this.formula[this.offset] !== ')') return PARSE_ERROR;
                 this.offset += 1;
                 return value;
-            }
-
-            const number = this.formula.slice(this.offset).match(
-                /^(?:(?:0|[1-9]\d*)(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?/,
-            );
-            if (number) {
-                this.offset += number[0].length;
-                return finite_number(Number(number[0]));
             }
 
             const reference = a1_formula_reference_at(this.formula, this.offset);
@@ -322,7 +414,7 @@ export function calculate_workbook_formulas(
                     return BLANK;
                 }
                 if (single_cell) {
-                    return evaluate_cell({
+                    return yield* evaluate_cell({
                         sheetIndex: source_sheet,
                         row: first_row,
                         column: first_column,
@@ -338,16 +430,24 @@ export function calculate_workbook_formulas(
                 };
             }
 
+            const number = this.formula.slice(this.offset).match(
+                /^(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?/,
+            );
+            if (number) {
+                this.offset += number[0].length;
+                return finite_number(Number(number[0]));
+            }
+
             const identifier = this.formula.slice(this.offset).match(/^([A-Za-z_][A-Za-z0-9_.]*)/);
             if (!identifier) return PARSE_ERROR;
             this.offset += identifier[0].length;
-            this.whitespace();
+            yield* this.whitespace();
             if (this.formula[this.offset] !== '(') return PARSE_ERROR;
             this.offset += 1;
-            return this.call(identifier[1].toUpperCase());
+            return yield* this.call(identifier[1].toUpperCase());
         }
 
-        private call(name: string): FormulaValue {
+        private *call(name: string): CalculationSteps<FormulaValue> {
             if (name !== 'SUM' && name !== 'AVERAGE') {
                 // Consume nothing else. The outer full-input check will reject
                 // this formula without accidentally recognizing references
@@ -356,24 +456,25 @@ export function calculate_workbook_formulas(
             }
             let total = 0;
             let count = 0;
-            this.whitespace();
+            let calculation_error: Scalar | undefined;
+            yield* this.whitespace();
             if (this.formula[this.offset] === ')') {
                 this.offset += 1;
                 return name === 'SUM' ? finite_number(0) : NUMERIC_ERROR;
             }
             while (true) {
-                const argument = this.additive();
+                const argument = yield* this.additive();
                 const error = argument.kind === 'range'
-                    ? this.aggregate_range(argument, (number) => {
+                    ? yield* this.aggregate_range(argument, (number) => {
                         total += number;
                         count += 1;
                     })
                     : argument.kind === 'number'
                     ? (total += argument.value, count += 1, undefined)
                     : argument.kind === 'unknown' ? argument : undefined;
-                if (error) return error;
+                calculation_error ??= error;
                 if (!Number.isFinite(total)) return NUMERIC_ERROR;
-                this.whitespace();
+                yield* this.whitespace();
                 if (this.formula[this.offset] === ')') {
                     this.offset += 1;
                     break;
@@ -381,15 +482,16 @@ export function calculate_workbook_formulas(
                 if (this.formula[this.offset] !== ',') return PARSE_ERROR;
                 this.offset += 1;
             }
+            if (calculation_error) return calculation_error;
             return name === 'AVERAGE'
                 ? count === 0 ? NUMERIC_ERROR : finite_number(total / count)
                 : finite_number(total);
         }
 
-        private aggregate_range(
+        private *aggregate_range(
             range: RangeValue,
             accept: (number: number) => void,
-        ): Scalar | undefined {
+        ): CalculationSteps<Scalar | undefined> {
             for (
                 let column_start = range.firstColumn;
                 column_start <= range.lastColumn;
@@ -415,18 +517,22 @@ export function calculate_workbook_formulas(
                                 row: row_start + row_offset,
                                 column: columns[column_offset],
                             };
-                            const scalar = evaluate_cell(address, rows[row_offset]?.[column_offset] ?? null);
+                            const scalar = yield* evaluate_cell(
+                                address,
+                                rows[row_offset]?.[column_offset] ?? null,
+                            );
                             if (scalar.kind === 'unknown') return scalar;
                             if (scalar.kind === 'number') accept(scalar.value);
                         }
                     }
+                    yield;
                 }
             }
             return undefined;
         }
     }
 
-    evaluate_cell = (address, supplied) => {
+    evaluate_cell = function* (address, supplied): CalculationSteps<Scalar> {
         if (!valid_address(address)) return PARSE_ERROR;
         const key = address_key(address);
         const cached = memo.get(key);
@@ -435,42 +541,112 @@ export function calculate_workbook_formulas(
 
         const edit = edits.get(key);
         const cell = supplied === undefined ? read_cell(address) : supplied;
-        const formula = edit !== undefined && is_xlsx_formula_text(edit)
-            ? edit
+        const formula = edit?.writesFormula === true
+            ? edit.value
             : edit === undefined ? cell?.formula : undefined;
-        if (
-            formula !== undefined
-            && (edit !== undefined || targets.has(key) || cell?.formulaResultPending === true)
-        ) {
+        // Some OOXML formula producers (notably what-if data tables) expose a
+        // dependency target but no evaluable formula text. A requested target
+        // without source text is opaque, not the cached literal currently in
+        // its `<v>`; returning that literal would preserve the stale cache.
+        if (edit === undefined && targets.has(key) && formula === undefined) {
+            memo.set(key, UNSUPPORTED_FUNCTION);
+            return UNSUPPORTED_FUNCTION;
+        }
+        const evaluates_formula = formula !== undefined
+            && (edit !== undefined || targets.has(key) || cell?.formulaResultPending === true);
+        if (evaluates_formula) {
             visiting.add(key);
-            const value = new Parser(formula, address.sheetIndex).parse();
+            const value = yield* new Parser(formula, address.sheetIndex).parse();
             visiting.delete(key);
             memo.set(key, value);
             return value;
         }
         const value = edit === undefined ? scalar_from_cell(cell) : scalar_from_edit(edit, cell);
-        // A streamed range supplies its current chunk's cell. Do not retain
-        // ordinary literals from that path, or SUM over a million cells would
-        // quietly turn the memo into a second copy of the range. Point reads,
-        // edits, targets, and formulas are bounded by the dependency topology
-        // and do benefit from reuse.
-        if (
-            supplied === undefined
-            || edit !== undefined
-            || targets.has(key)
-            || cell?.formula !== undefined
-        ) memo.set(key, value);
+        // Retain request-owned edits and targets, but not ordinary source
+        // literals. A legal request can contain a million distinct point
+        // references; memoizing those values would turn calculation into a
+        // second in-memory copy of that part of the workbook. Formula values
+        // were handled above and remain memoized for recursive dependents.
+        if (edit !== undefined || targets.has(key)) memo.set(key, value);
         return value;
     };
 
-    return request.targets.map((target): FormulaCalculationResult => {
-        const calculated = evaluate_cell(target);
-        return calculated.kind === 'number'
+    const results: FormulaCalculationResult[] = [];
+    for (const target of request.targets) {
+        let calculated: Scalar;
+        try {
+            calculated = yield* evaluate_cell(target);
+        } catch (error) {
+            if (error === CALCULATION_WORK_EXHAUSTED) return results;
+            throw error;
+        }
+        results.push(calculated.kind === 'number'
             ? { ...target, value: result_text(calculated.value) }
             : { ...target, error: calculated.kind === 'unknown'
                 ? calculated.error
-                : 'numeric error' };
-    });
+                : 'numeric error' });
+        yield;
+    }
+    return results;
+}
+
+/** Calculate synchronously for save planning and focused callers. */
+export function calculate_workbook_formulas(
+    source: DataSource,
+    request: FormulaCalculationRequest,
+): readonly FormulaCalculationResult[] {
+    const steps = calculate_workbook_formula_steps(source, request);
+    let step = steps.next();
+    while (!step.done) step = steps.next();
+    return step.value;
+}
+
+/**
+ * Calculate as much trustworthy cache data as a synchronous save can afford.
+ * Missing results intentionally mean "invalidate only" to the XLSX write-plan
+ * factory, so work beyond the budget is delegated to Excel after reopen.
+ */
+export function calculate_workbook_formulas_bounded(
+    source: DataSource,
+    request: FormulaCalculationRequest,
+): readonly FormulaCalculationResult[] {
+    const steps = calculate_workbook_formula_steps(
+        source,
+        request,
+        MAX_SYNCHRONOUS_CALCULATION_WORK,
+    );
+    let step = steps.next();
+    while (!step.done) step = steps.next();
+    return step.value;
+}
+
+/**
+ * Calculate without monopolizing the host event loop. Range reads stay bounded,
+ * and stale live requests stop between chunks instead of finishing discarded work.
+ */
+export async function calculate_workbook_formulas_cooperatively(
+    source: DataSource,
+    request: FormulaCalculationRequest,
+    schedule: FormulaCalculationSchedule,
+): Promise<readonly FormulaCalculationResult[] | undefined> {
+    const steps = calculate_workbook_formula_steps(source, request);
+    const work_slice_ms = Math.max(0, schedule.workSliceMs ?? 8);
+    const yield_control = schedule.yieldControl ?? (() => new Promise<void>((resolve) => {
+        globalThis.setTimeout(resolve, 0);
+    }));
+    if (schedule.isCancelled()) return undefined;
+    let slice_started = performance.now();
+    let step = steps.next();
+    while (!step.done) {
+        if (schedule.isCancelled()) return undefined;
+        if (performance.now() - slice_started >= work_slice_ms) {
+            await yield_control();
+            if (schedule.isCancelled()) return undefined;
+            slice_started = performance.now();
+        }
+        step = steps.next();
+    }
+    return schedule.isCancelled() ? undefined : step.value;
 }
 
 /** Wire/UI spelling for a missing calculation. */

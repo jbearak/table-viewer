@@ -4,7 +4,8 @@ import type { RenderedCell } from './interface';
 const NULL_IDX = -1;
 const BOLD = 1, ITALIC = 2, UNDERLINE = 4, STRIKETHROUGH = 8, HAS_EXTRAS = 16;
 const FORMULA_RESULT_PENDING = 32, DATE_1904 = 64, XLSX_ISO_DATE = 128;
-const TYPE_STRING = 1, TYPE_NUMBER = 2, TYPE_BOOLEAN = 3, TYPE_EMPTY = 4, TYPE_DATE = 5;
+const TYPE_STRING = 1, TYPE_NUMBER = 2, TYPE_BOOLEAN = 3, TYPE_EMPTY = 4, TYPE_DATE = 5,
+    TYPE_ERROR = 6;
 
 /** Sparse per-cell metadata that only exceptional cells carry. Immutable
  *  objects supplied by the parser are stored by reference and shared with
@@ -23,6 +24,8 @@ export class ColumnarStore {
         private readonly rawIdx: Int32Array,
         private readonly fmtIdx: Int32Array,
         private readonly numberFormatIdx: Int32Array | undefined,
+        /** Lazily allocated for display-text cells with an underlying scalar. */
+        private readonly numericRaw: Float64Array | undefined,
         private readonly flags: Uint8Array,
         private readonly types: Uint8Array,
         /** Keyed by linear cell index (row * cols + col). */
@@ -110,6 +113,8 @@ export class ColumnarStore {
         }
         if ((flags & XLSX_ISO_DATE) !== 0) cell.xlsxIsoDate = true;
         if ((flags & FORMULA_RESULT_PENDING) !== 0) cell.formulaResultPending = true;
+        const numeric_raw = this.numericRaw?.[index] ?? Number.NaN;
+        if (!Number.isNaN(numeric_raw)) cell.numericRaw = numeric_raw;
         // The HAS_EXTRAS bit keeps plain-cell reads off the map entirely, so
         // one linked cell doesn't turn every read into a hash probe.
         if ((flags & HAS_EXTRAS) !== 0) {
@@ -127,6 +132,7 @@ export class ColumnarStore {
         private readonly rawIdx: Int32Array;
         private readonly fmtIdx: Int32Array;
         private numberFormatIdx: Int32Array | undefined;
+        private numericRaw: Float64Array | undefined;
         private readonly flags: Uint8Array;
         private readonly types: Uint8Array;
         private readonly extras = new Map<number, CellExtras>();
@@ -154,6 +160,7 @@ export class ColumnarStore {
             // the sparse cleanup when this index actually held optional data.
             if ((this.flags[i] & HAS_EXTRAS) !== 0) this.extras.delete(i);
             if (this.numberFormatIdx) this.numberFormatIdx[i] = NULL_IDX;
+            if (this.numericRaw) this.numericRaw[i] = Number.NaN;
             if (cell === null) {
                 this.rawIdx[i] = NULL_IDX;
                 this.fmtIdx[i] = NULL_IDX;
@@ -176,6 +183,15 @@ export class ColumnarStore {
             }
             if (cell.xlsxIsoDate) flags |= XLSX_ISO_DATE;
             if (cell.formulaResultPending) flags |= FORMULA_RESULT_PENDING;
+            if (cell.numericRaw !== undefined) {
+                if (!Number.isFinite(cell.numericRaw)) {
+                    throw new Error('numericRaw must be finite');
+                }
+                if (!this.numericRaw) {
+                    this.numericRaw = new Float64Array(this.rawIdx.length).fill(Number.NaN);
+                }
+                this.numericRaw[i] = cell.numericRaw;
+            }
             this.types[i] = encode_type(cell.rawType);
             if (cell.richText || cell.hyperlink || cell.formula) {
                 // Stored by reference: the parser hands over immutable objects
@@ -193,7 +209,7 @@ export class ColumnarStore {
         build(): ColumnarStore {
             return new ColumnarStore(
                 this.rows, this.cols, this.pool,
-                this.rawIdx, this.fmtIdx, this.numberFormatIdx,
+                this.rawIdx, this.fmtIdx, this.numberFormatIdx, this.numericRaw,
                 this.flags, this.types, this.extras,
             );
         }
@@ -206,6 +222,7 @@ function encode_type(type: RenderedCell['rawType']): number {
         case 'number': return TYPE_NUMBER;
         case 'boolean': return TYPE_BOOLEAN;
         case 'date': return TYPE_DATE;
+        case 'error': return TYPE_ERROR;
         case 'empty': return TYPE_EMPTY;
         default: return 0;
     }
@@ -217,6 +234,7 @@ function decode_type(type: number): RenderedCell['rawType'] {
         case TYPE_NUMBER: return 'number';
         case TYPE_BOOLEAN: return 'boolean';
         case TYPE_DATE: return 'date';
+        case TYPE_ERROR: return 'error';
         case TYPE_EMPTY: return 'empty';
         default: return undefined;
     }

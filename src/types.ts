@@ -3,6 +3,7 @@ import type {
     WorkbookMeta,
     RenderedCell,
     PackedFormulaDependencies,
+    PackedFormulaCells,
     PackedPendingFormulaCells,
 } from './data-source/interface';
 import type { CompareRowStatus } from './diff-compare/compare-source';
@@ -56,6 +57,7 @@ export interface SheetData {
     columnCount: number;
     rowCount: number;
     formulaDependencies?: PackedFormulaDependencies;
+    formulaCells?: PackedFormulaCells;
     pendingFormulaCells?: PackedPendingFormulaCells;
 }
 
@@ -66,9 +68,11 @@ export interface CellData extends RichCellFields, XlsxCellFormatFields {
     formula?: string;
     /** The formula has no cached result that Table Viewer can display. */
     formulaResultPending?: true;
+    /** Underlying finite numeric scalar when display-safe `raw` is text. */
+    numericRaw?: number;
     bold: boolean;
     italic: boolean;
-    rawType?: 'string' | 'number' | 'boolean' | 'date' | 'empty';
+    rawType?: 'string' | 'number' | 'boolean' | 'date' | 'error' | 'empty';
 }
 
 export interface MergeRange {
@@ -2067,6 +2071,7 @@ export type WebviewMessage =
     | { type: 'snapshotApplied'; identity: WorkbookSnapshotIdentity; disposition: SnapshotDisposition }
     | { type: 'requestRows'; sheetIndex: number; startRow: number; count: number; requestId: string; generation: number }
     | { type: 'requestFormulaCalculation'; requestId: string; sourceGeneration: number; edits: readonly FormulaCalculationEdit[]; targets: readonly FormulaCalculationAddress[] }
+    | { type: 'cancelFormulaCalculation'; requestId: string; sourceGeneration: number }
     | { type: 'stateChanged'; state: PerFileState; sourceGeneration: number; snapshotIdentity: WorkbookSnapshotIdentity }
     | { type: 'visibleRowChanged'; row: number }
     // `sheetIndex` is optional so a single-sheet source can omit it; the host

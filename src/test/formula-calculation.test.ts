@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
     calculate_workbook_formulas,
+    calculate_workbook_formulas_bounded,
+    calculate_workbook_formulas_cooperatively,
     displayed_formula_result,
     type FormulaCalculationAddress,
 } from '../formula-calculation';
@@ -93,6 +95,283 @@ describe('calculate_workbook_formulas', () => {
             count * columns.length <= 8_192)).toBe(true);
     });
 
+    it('calculates an unqualified whole-row range that starts with a digit', () => {
+        const source = workbook([{ name: 'Sheet1', rows: [
+            [cell('0', { formula: '=SUM(2:2)' })],
+            [cell('2'), cell('3')],
+        ] }]);
+
+        expect(calculate_workbook_formulas(source, {
+            edits: [],
+            targets: [target(0, 0, 0)],
+        })).toEqual([{ ...target(0, 0, 0), value: '5' }]);
+    });
+
+    it('does not retain ordinary point values across a broad calculation', () => {
+        const row_count = 4_096;
+        let first_literal_reads = 0;
+        const meta: WorkbookMeta = {
+            hasFormatting: false,
+            sheets: [{
+                name: 'Sheet1',
+                rowCount: row_count,
+                sourceRowCount: row_count,
+                columnCount: 2,
+                merges: [],
+                hasFormatting: false,
+            }],
+        };
+        const source: DataSource = {
+            meta: () => meta,
+            read_rows: () => { throw new Error('formula calculation used display rows'); },
+            read_columns: (_sheet, start, count, columns) => ({
+                startRow: start,
+                rows: Array.from({ length: count }, (_, row_offset) => {
+                    const row = start + row_offset;
+                    return columns.map((column) => {
+                        if (column === 0) {
+                            if (row === 0) first_literal_reads += 1;
+                            return cell(String(row + 1));
+                        }
+                        return cell('0', {
+                            formula: row === row_count - 1 ? '=A1' : `=A${row + 1}`,
+                        });
+                    });
+                }),
+            }),
+            close: () => {},
+        };
+
+        const results = calculate_workbook_formulas(source, {
+            edits: [],
+            targets: Array.from({ length: row_count }, (_, row) => target(0, row, 1)),
+        });
+
+        expect(results).toHaveLength(row_count);
+        expect(results.at(-1)).toEqual({ ...target(0, row_count - 1, 1), value: '1' });
+        // A1 is read for the first and last target. If ordinary point values
+        // leaked into the request-long formula memo, the second read would hit it.
+        expect(first_literal_reads).toBe(2);
+    });
+
+    it('bounds synchronous fallback work and returns only completed results', () => {
+        const row_count = 1_000_000;
+        const meta: WorkbookMeta = {
+            hasFormatting: false,
+            sheets: [{
+                name: 'Sheet1',
+                rowCount: row_count,
+                sourceRowCount: row_count,
+                columnCount: 2,
+                merges: [],
+                hasFormatting: false,
+            }],
+        };
+        const read_columns: NonNullable<DataSource['read_columns']> = vi.fn((
+            _sheet: number,
+            start: number,
+            count: number,
+            columns: readonly number[],
+        ): ColumnWindow => ({
+            startRow: start,
+            rows: Array.from({ length: count }, (_, row_offset) => columns.map((column) => {
+                const row = start + row_offset;
+                if (column === 1 && row === 0) return cell('0', { formula: '=1' });
+                if (column === 1 && row === 1) {
+                    return cell('0', { formula: '=SUM(A1:A1000000)' });
+                }
+                return cell('1');
+            })),
+        }));
+        const source: DataSource = {
+            meta: () => meta,
+            read_rows: () => { throw new Error('formula calculation used display rows'); },
+            read_columns,
+            close: () => {},
+        };
+
+        expect(calculate_workbook_formulas_bounded(source, {
+            edits: [],
+            targets: [target(0, 0, 1), target(0, 1, 1)],
+        })).toEqual([{ ...target(0, 0, 1), value: '1' }]);
+
+        const source_cells_read = vi.mocked(read_columns).mock.calls.reduce(
+            (total, [, , count, columns]) => total + count * columns.length,
+            0,
+        );
+        expect(source_cells_read).toBeLessThanOrEqual(262_144);
+    });
+
+    it('cancels stale range work between bounded source reads', async () => {
+        const rows = Array.from({ length: 50_000 }, () => [cell('1')]);
+        rows[0].push(cell('0', { formula: '=SUM(A1:A50000)' }));
+        const source = workbook([{ name: 'Sheet1', rows }]);
+        const read_columns = vi.spyOn(source, 'read_columns');
+        let cancelled = false;
+
+        const result = await calculate_workbook_formulas_cooperatively(source, {
+            edits: [],
+            targets: [target(0, 0, 1)],
+        }, {
+            isCancelled: () => cancelled,
+            workSliceMs: 0,
+            yieldControl: async () => { cancelled = true; },
+        });
+
+        expect(result).toBeUndefined();
+        expect(read_columns.mock.calls.length).toBe(2);
+        expect(read_columns.mock.calls[1][2] * read_columns.mock.calls[1][3].length)
+            .toBeLessThanOrEqual(8_192);
+    });
+
+    it('propagates worksheet errors through arithmetic and aggregate ranges', () => {
+        const source = workbook([{ name: 'Sheet1', rows: [[
+            cell('#DIV/0!', { rawType: 'error' as any }),
+            cell('1'),
+            cell('0', { formula: '=SUM(A1:B1)' }),
+            cell('0', { formula: '=AVERAGE(A1:B1)' }),
+            cell('0', { formula: '=A1+1' }),
+        ]] }]);
+
+        expect(calculate_workbook_formulas(source, {
+            edits: [],
+            targets: [target(0, 0, 2), target(0, 0, 3), target(0, 0, 4)],
+        })).toEqual([
+            { ...target(0, 0, 2), error: 'numeric error' },
+            { ...target(0, 0, 3), error: 'numeric error' },
+            { ...target(0, 0, 4), error: 'numeric error' },
+        ]);
+    });
+
+    it('coerces numeric text for arithmetic but not aggregate references', () => {
+        const source = workbook([{ name: 'Sheet1', rows: [[
+            cell('2', { rawType: 'string' }),
+            cell('0', { formula: '=A1+1' }),
+            cell('0', { formula: '=SUM(A1)' }),
+        ]] }]);
+
+        expect(calculate_workbook_formulas(source, {
+            edits: [],
+            targets: [target(0, 0, 1), target(0, 0, 2)],
+        })).toEqual([
+            { ...target(0, 0, 1), value: '3' },
+            { ...target(0, 0, 2), value: '0' },
+        ]);
+    });
+
+    it('uses the underlying numeric serial for displayed date cells', () => {
+        const source = workbook([{ name: 'Sheet1', rows: [[
+            cell('2024-01-15T00:00:00.000Z', {
+                rawType: 'date',
+                numericRaw: 45_306,
+            } as any),
+            cell('0', { formula: '=A1+1' }),
+        ]] }]);
+
+        expect(calculate_workbook_formulas(source, {
+            edits: [],
+            targets: [target(0, 0, 1)],
+        })).toEqual([{ ...target(0, 0, 1), value: '45307' }]);
+    });
+
+    it('coerces leading-zero numeric text in references and literals', () => {
+        const source = workbook([{ name: 'Sheet1', rows: [[
+            cell('0012', { rawType: 'string' }),
+            cell('0', { formula: '=A1+1' }),
+            cell('0', { formula: '=0012+1' }),
+        ]] }]);
+
+        expect(calculate_workbook_formulas(source, {
+            edits: [],
+            targets: [target(0, 0, 1), target(0, 0, 2)],
+        })).toEqual([
+            { ...target(0, 0, 1), value: '13' },
+            { ...target(0, 0, 2), value: '13' },
+        ]);
+    });
+
+    it('keeps dirty leading-zero text out of aggregate references', () => {
+        const source = workbook([{ name: 'Sheet1', rows: [[
+            cell('', { rawType: 'string' }),
+            cell('0', { formula: '=A1+1' }),
+            cell('0', { formula: '=SUM(A1)' }),
+        ]] }]);
+
+        expect(calculate_workbook_formulas(source, {
+            edits: [{ ...target(0, 0, 0), value: '0012', writesFormula: false }],
+            targets: [target(0, 0, 1), target(0, 0, 2)],
+        })).toEqual([
+            { ...target(0, 0, 1), value: '13' },
+            { ...target(0, 0, 2), value: '0' },
+        ]);
+    });
+
+    it('treats a rich numeric edit as text when the writer will use inlineStr', () => {
+        const source = workbook([{ name: 'Sheet1', rows: [[
+            cell('12', { rawType: 'number' }),
+            cell('12', { formula: '=SUM(A1)' }),
+        ]] }]);
+
+        expect(calculate_workbook_formulas(source, {
+            edits: [{
+                ...target(0, 0, 0),
+                value: '12',
+                writesFormula: false,
+                runs: [{ text: '12', style: { bold: true } }],
+            }],
+            targets: [target(0, 0, 1)],
+        })).toEqual([{ ...target(0, 0, 1), value: '0' }]);
+    });
+
+    it('treats formula-shaped rich text as text for recursive dependents', () => {
+        const source = workbook([{ name: 'Sheet1', rows: [[
+            cell('old', { rawType: 'string' }),
+            cell('0', { formula: '=SUM(A1)' }),
+        ]] }]);
+
+        expect(calculate_workbook_formulas(source, {
+            edits: [{
+                ...target(0, 0, 0),
+                value: '=1+1',
+                writesFormula: false,
+                runs: [{ text: '=1+1', style: { bold: true } }],
+            }],
+            targets: [target(0, 0, 1)],
+        })).toEqual([{ ...target(0, 0, 1), value: '0' }]);
+    });
+
+    it('uses the saved serial semantics for dirty ISO date values', () => {
+        const source = workbook([{ name: 'Sheet1', rows: [[
+            cell('2024-01-15T00:00:00.000Z', {
+                rawType: 'date',
+                numericRaw: 45_306,
+                numberFormat: { code: 'm/d/yyyy' },
+            }),
+            cell('0', { formula: '=A1+1' }),
+        ]] }]);
+
+        expect(calculate_workbook_formulas(source, {
+            edits: [{ ...target(0, 0, 0), value: '2024-01-16', writesFormula: false }],
+            targets: [target(0, 0, 1)],
+        })).toEqual([{ ...target(0, 0, 1), value: '45308' }]);
+    });
+
+    it('infers the 1904 epoch for dirty native ISO date cells without a style', () => {
+        const source = workbook([{ name: 'Sheet1', rows: [[
+            cell('2024-01-15T00:00:00.000Z', {
+                rawType: 'date',
+                numericRaw: 43_844,
+                xlsxIsoDate: true,
+            }),
+            cell('0', { formula: '=A1+1' }),
+        ]] }]);
+
+        expect(calculate_workbook_formulas(source, {
+            edits: [{ ...target(0, 0, 0), value: '2024-01-16', writesFormula: false }],
+            targets: [target(0, 0, 1)],
+        })).toEqual([{ ...target(0, 0, 1), value: '43846' }]);
+    });
+
     it('uses dirty values and recalculates recursively across quoted sheets', () => {
         const source = workbook([
             { name: "People's data", rows: [[cell('2')], [cell('4')]] },
@@ -102,7 +381,7 @@ describe('calculate_workbook_formulas', () => {
             ]] },
         ]);
         expect(calculate_workbook_formulas(source, {
-            edits: [{ ...target(0, 0, 0), value: '5' }],
+            edits: [{ ...target(0, 0, 0), value: '5', writesFormula: false }],
             targets: [target(1, 0, 0), target(1, 0, 1)],
         })).toEqual([
             { ...target(1, 0, 0), value: '9' },
@@ -115,7 +394,7 @@ describe('calculate_workbook_formulas', () => {
             rawType: 'string',
         })]] }]);
         expect(calculate_workbook_formulas(source, {
-            edits: [{ ...target(0, 0, 1), value: '=A1/2' }],
+            edits: [{ ...target(0, 0, 1), value: '=A1/2', writesFormula: true }],
             targets: [target(0, 0, 1)],
         })).toEqual([{ ...target(0, 0, 1), value: '2' }]);
     });
@@ -166,7 +445,7 @@ describe('calculate_workbook_formulas', () => {
         expect(calculate_workbook_formulas(source, {
             // Excel row 3 is not in the displayed projection, but A3 still
             // resolves to it and sees its canonical dirty value.
-            edits: [{ ...target(0, 2, 0), value: '200' }],
+            edits: [{ ...target(0, 2, 0), value: '200', writesFormula: false }],
             targets: [target(0, 1, 1)],
         })).toEqual([{ ...target(0, 1, 1), value: '280' }]);
         expect(source.read_columns).not.toHaveBeenCalled();

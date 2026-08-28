@@ -126,8 +126,10 @@ import {
     type EditSyntax,
 } from '../cell-edit-model';
 import { format_xlsx_edit_preview } from '../spreadsheet-format';
-import { xlsx_runs_require_inline_string } from '../xlsx-cell-value';
-import { is_xlsx_formula_text } from '../xlsx-formula';
+import {
+    xlsx_edit_writes_formula,
+    xlsx_runs_require_inline_string,
+} from '../xlsx-cell-value';
 import {
     type FormulaSheetImpact,
 } from '../formula-dependencies';
@@ -335,7 +337,10 @@ function dirty_value_overlay_fields(
         | 'formula_result_pending' | 'formula_result'
 > | undefined {
     if (!dirty_entry_value_changed(dirty)) return undefined;
-    const formula_edit = xlsx_editing && is_xlsx_formula_text(dirty.value);
+    const dirty_runs = dirty.valueRuns?.runs;
+    const retained_runs = dirty_runs && dirty_runs.length > 0 ? dirty_runs : undefined;
+    const formula_edit = xlsx_editing
+        && xlsx_edit_writes_formula(dirty.value, retained_runs);
     const formula_result_pending = formula_edit && calculated_formula_result === undefined;
     const presentation = !formula_edit && show_formatting && !diff_mode && cell
         && (cell.numberFormat || (xlsx_editing && dirty.valueRuns))
@@ -473,6 +478,8 @@ export interface GridShellProps {
     pending_formula_impact?: FormulaSheetImpact;
     /** Raw calculation results keyed by canonical `row:column`. */
     formula_results?: ReadonlyMap<string, string>;
+    /** Source-pending results retained beneath the current edit overlay. */
+    source_formula_results?: ReadonlyMap<string, string>;
     generation: number;
     /**
      * Effective displayed row count (may be filtered).
@@ -665,6 +672,7 @@ export function GridShell({
     sheet_index,
     pending_formula_impact,
     formula_results,
+    source_formula_results,
     generation,
     row_count = sheet_meta.rowCount,
     show_formatting,
@@ -954,6 +962,10 @@ export function GridShell({
         const promoted_source_row = sheet_meta.excelFirstRowHeader.active
             ? sheet_meta.excelFirstRowHeader.sourceRow ?? 0
             : undefined;
+        const mapping_changes_rows = transform_state.sort.length > 0
+            || transform_state.filters.length > 0
+            || (transform_state.hiddenRows?.length ?? 0) > 0
+            || transform_state.onlyChangedRows === true;
         const width = physical_row_count > 10_000
             ? 48
             : physical_row_count > 1_000
@@ -963,14 +975,25 @@ export function GridShell({
             kind: 'clickable-number' as const,
             width,
             getRowNumber: (display_row: number) => {
+                const source_row = get_source_row(display_row);
+                if (source_row !== undefined) return source_row + 1;
+                if (mapping_changes_rows) return undefined;
                 const projected_source_row = promoted_source_row !== undefined
                     && display_row >= promoted_source_row
                     ? display_row + 1
                     : display_row;
-                return (get_source_row(display_row) ?? projected_source_row) + 1;
+                return projected_source_row + 1;
             },
         };
-    }, [get_source_row, sheet_meta.excelFirstRowHeader, sheet_meta.sourceRowCount]);
+    }, [
+        get_source_row,
+        sheet_meta.excelFirstRowHeader,
+        sheet_meta.sourceRowCount,
+        transform_state.filters.length,
+        transform_state.hiddenRows?.length,
+        transform_state.onlyChangedRows,
+        transform_state.sort.length,
+    ]);
     const lifecycle_operation = save_lifecycle.state === 'active'
         && save_lifecycle.operation.editSessionId === edit_session_id
         ? save_lifecycle.operation
@@ -1115,17 +1138,15 @@ export function GridShell({
             [version],
         ),
     });
-    const pending_formula_keys = useMemo(
-        () => new Set(pending_formula_impact?.keys() ?? []),
-        [pending_formula_impact],
-    );
     // The paint callback deliberately stays stable across edits. It reads the
     // current recursive invalidation set through this mirror, while the repaint
     // effect below damages only formulas entering or leaving the set.
-    const pending_formula_keys_ref = useRef(pending_formula_keys);
-    pending_formula_keys_ref.current = pending_formula_keys;
+    const pending_formula_impact_ref = useRef(pending_formula_impact);
+    pending_formula_impact_ref.current = pending_formula_impact;
     const formula_results_ref = useRef(formula_results);
     formula_results_ref.current = formula_results;
+    const source_formula_results_ref = useRef(source_formula_results);
+    source_formula_results_ref.current = source_formula_results;
 
     // Tint set = what the webview can derive ∪ what the host named. The union is
     // what everything downstream consumes (the paint callback's ref, the targeted
@@ -2689,14 +2710,21 @@ export function GridShell({
             const editable = editable_cells && source_row !== undefined;
             const loaded_row = get_row(row);
             const loaded_cell = loaded_row?.[source_column];
+            const formula_is_affected = key !== undefined
+                && source_row !== undefined
+                && pending_formula_impact_ref.current?.has(source_row, source_column) === true;
             const raw_calculated_formula_result = key === undefined
                 ? undefined
-                : formula_results_ref.current?.get(key);
+                : formula_results_ref.current?.get(key)
+                    ?? (formula_is_affected
+                        ? undefined
+                        : source_formula_results_ref.current?.get(key));
             const dependent_formula_affected = dirty === undefined
                 && key !== undefined
+                && source_row !== undefined
                 && loaded_cell?.formula !== undefined
                 && (
-                    pending_formula_keys_ref.current.has(key)
+                    formula_is_affected
                     || raw_calculated_formula_result !== undefined
                 );
             const calculated_formula_result = calculated_formula_display(
@@ -4172,8 +4200,9 @@ export function GridShell({
     // every visible cell on each keystroke.
     const prev_dirty_keys_ref = useRef<Set<string>>(new Set());
     const prev_conflicted_keys_ref = useRef<Set<string>>(new Set());
-    const prev_pending_formula_keys_ref = useRef<Set<string>>(new Set());
+    const prev_pending_formula_impact_ref = useRef<FormulaSheetImpact>();
     const prev_formula_results_ref = useRef<ReadonlyMap<string, string>>(new Map());
+    const prev_source_formula_results_ref = useRef<ReadonlyMap<string, string>>(new Map());
     useEffect(() => {
         const next_dirty = new Set(dirty_cells.keys());
         const changed = changed_tint_keys(
@@ -4182,21 +4211,39 @@ export function GridShell({
             prev_conflicted_keys_ref.current,
             conflicted_keys,
         );
-        for (const key of prev_pending_formula_keys_ref.current) {
-            if (!pending_formula_keys.has(key)) changed.add(key);
+        const previous_formula_impact = prev_pending_formula_impact_ref.current;
+        if (previous_formula_impact !== pending_formula_impact) {
+            for (const { row, column } of previous_formula_impact?.cells() ?? []) {
+                if (pending_formula_impact?.has(row, column) !== true) {
+                    changed.add(`${row}:${column}`);
+                }
+            }
+            for (const { row, column } of pending_formula_impact?.cells() ?? []) {
+                if (previous_formula_impact?.has(row, column) !== true) {
+                    changed.add(`${row}:${column}`);
+                }
+            }
+            prev_pending_formula_impact_ref.current = pending_formula_impact;
         }
-        for (const key of pending_formula_keys) {
-            if (!prev_pending_formula_keys_ref.current.has(key)) changed.add(key);
+        if (prev_formula_results_ref.current !== formula_results) {
+            for (const [key, value] of prev_formula_results_ref.current) {
+                if (formula_results?.get(key) !== value) changed.add(key);
+            }
+            for (const [key, value] of formula_results ?? []) {
+                if (prev_formula_results_ref.current.get(key) !== value) changed.add(key);
+            }
+            prev_formula_results_ref.current = formula_results ?? new Map();
         }
-        for (const [key, value] of prev_formula_results_ref.current) {
-            if (formula_results?.get(key) !== value) changed.add(key);
-        }
-        for (const [key, value] of formula_results ?? []) {
-            if (prev_formula_results_ref.current.get(key) !== value) changed.add(key);
+        if (prev_source_formula_results_ref.current !== source_formula_results) {
+            for (const [key, value] of prev_source_formula_results_ref.current) {
+                if (source_formula_results?.get(key) !== value) changed.add(key);
+            }
+            for (const [key, value] of source_formula_results ?? []) {
+                if (prev_source_formula_results_ref.current.get(key) !== value) changed.add(key);
+            }
+            prev_source_formula_results_ref.current = source_formula_results ?? new Map();
         }
         prev_dirty_keys_ref.current = next_dirty;
-        prev_pending_formula_keys_ref.current = pending_formula_keys;
-        prev_formula_results_ref.current = formula_results ?? new Map();
         // conflicted_keys is a fresh useMemo Set (new identity each change, never
         // mutated in place), so it can be stashed as the snapshot directly — no copy.
         prev_conflicted_keys_ref.current = conflicted_keys;
@@ -4218,8 +4265,9 @@ export function GridShell({
     }, [
         dirty_cells,
         conflicted_keys,
-        pending_formula_keys,
+        pending_formula_impact,
         formula_results,
+        source_formula_results,
         display_column_for_source,
         get_source_row,
         merged_ranges,

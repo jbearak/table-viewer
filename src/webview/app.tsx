@@ -27,7 +27,6 @@ import {
     type CellHighlightState,
     type HighlightCellDelta,
     dirty_entries_equal,
-    dirty_entry_value_changed,
     type CsvDirtyEntry,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
@@ -46,7 +45,12 @@ import {
     type WorksheetTarget,
 } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
-import { compile_workbook_formula_graph } from '../formula-dependencies';
+import {
+    all_workbook_formula_cells_impact,
+    compile_workbook_formula_graph,
+    pending_workbook_formula_targets,
+    plan_workbook_formula_recalculation,
+} from '../formula-dependencies';
 import {
     displayed_formula_result,
     type FormulaCalculationEdit,
@@ -579,43 +583,20 @@ export function App(): React.JSX.Element {
             () => csv_edit_session_id_ref.current,
         );
     }
-    const edit_registry_revision = useSyncExternalStore(
+    useSyncExternalStore(
         edit_session_registry_ref.current.subscribe,
         edit_session_registry_ref.current.revision,
         edit_session_registry_ref.current.revision,
     );
-    const formula_roots_projection = useMemo(() => {
-        const roots: Array<{ sheetIndex: number; row: number; column: number }> = [];
-        const edits: FormulaCalculationEdit[] = [];
-        for (const [sheetIndex, store] of edit_session_registry_ref.current!.entries()) {
-            for (const [key, entry] of store.snapshot()) {
-                if (!dirty_entry_value_changed(entry)) continue;
-                const [row, column] = key.split(':').map(Number);
-                if (Number.isSafeInteger(row) && Number.isSafeInteger(column)) {
-                    roots.push({ sheetIndex, row, column });
-                    edits.push({ sheetIndex, row, column, value: entry.value });
-                }
-            }
-        }
-        roots.sort((left, right) => (left.sheetIndex - right.sheetIndex)
-            || (left.row - right.row) || (left.column - right.column));
-        edits.sort((left, right) => (left.sheetIndex - right.sheetIndex)
-            || (left.row - right.row) || (left.column - right.column));
-        return {
-            roots,
-            edits,
-            signature: roots.map(
-                ({ sheetIndex, row, column }) => `${sheetIndex}:${row}:${column}`,
-            ).join('|'),
-            calculationSignature: JSON.stringify(edits.map(
-                ({ sheetIndex, row, column, value }) => [sheetIndex, row, column, value],
-            )),
-        };
-    }, [edit_registry_revision]);
-    const formula_roots = formula_roots_projection.roots;
-    const formula_root_signature = formula_roots_projection.signature;
+    const formula_roots_projection = edit_session_registry_ref.current.formula_projection();
     const formula_calculation_edits = formula_roots_projection.edits;
-    const formula_calculation_edit_signature = formula_roots_projection.calculationSignature;
+    const formula_roots = formula_calculation_edits;
+    const formula_root_signature = formula_roots_projection.tooManyEdits
+        ? 'too-many-edits'
+        : `${formula_roots_projection.coordinateRevision}`;
+    const formula_calculation_edit_signature
+        = formula_roots_projection.calculationRevision;
+    const too_many_formula_calculation_edits = formula_roots_projection.tooManyEdits;
     const [edit_mode, set_edit_mode_state] = useState(false);
     // Diff toggle (before/after view of dirty cells). Deliberately never reset
     // when edit mode exits: the button hides with edit mode, but the choice
@@ -1033,6 +1014,15 @@ export function App(): React.JSX.Element {
         };
     }
     const workbook_formula_graph = formula_graph_cache_ref.current.graph;
+    const source_has_formula_work = (meta?.sheets ?? []).some((sheet) =>
+        (sheet.formulaCells?.length ?? 0) > 0
+        || (sheet.pendingFormulaCells?.length ?? 0) > 0
+        || (sheet.formulaDependencies?.length ?? 0) > 0);
+    const has_formula_work = source_has_formula_work
+        || formula_roots_projection.hasFormulaEdits;
+    const dependency_root_signature = has_formula_work
+        ? formula_root_signature
+        : 'no-formula-work';
     // Changing the text of an already-dirty cell keeps the same dependency
     // roots, so the common typing path avoids retraversing the graph.
     const formula_impact_cache_ref = useRef<{
@@ -1043,74 +1033,113 @@ export function App(): React.JSX.Element {
     if (
         formula_impact_cache_ref.current === undefined
         || formula_impact_cache_ref.current.graph !== workbook_formula_graph
-        || formula_impact_cache_ref.current.roots !== formula_root_signature
+        || formula_impact_cache_ref.current.roots !== dependency_root_signature
     ) {
         formula_impact_cache_ref.current = {
             graph: workbook_formula_graph,
-            roots: formula_root_signature,
-            impact: workbook_formula_graph.invalidatedBy(formula_roots),
+            roots: dependency_root_signature,
+            impact: too_many_formula_calculation_edits
+                ? all_workbook_formula_cells_impact(meta?.sheets ?? [])
+                : has_formula_work
+                    ? workbook_formula_graph.invalidatedBy(formula_roots)
+                    : all_workbook_formula_cells_impact([]),
         };
     }
-    const formula_impact = formula_impact_cache_ref.current.impact;
-    const formula_calculation_targets = useMemo(() => {
-        const targets = new Map<string, { sheetIndex: number; row: number; column: number }>();
-        for (let sheetIndex = 0; sheetIndex < (meta?.sheets.length ?? 0); sheetIndex += 1) {
-            for (const { row, column } of formula_impact.forSheet(sheetIndex).cells()) {
-                targets.set(`${sheetIndex}:${row}:${column}`, { sheetIndex, row, column });
-            }
-            const pending = meta?.sheets[sheetIndex]?.pendingFormulaCells ?? [];
-            for (let offset = 0; offset + 1 < pending.length; offset += 2) {
-                const row = pending[offset];
-                const column = pending[offset + 1];
-                targets.set(`${sheetIndex}:${row}:${column}`, { sheetIndex, row, column });
-            }
-        }
-        for (const edit of formula_calculation_edits) {
-            if (is_xlsx_formula_text(edit.value)) {
-                targets.set(`${edit.sheetIndex}:${edit.row}:${edit.column}`, {
-                    sheetIndex: edit.sheetIndex,
-                    row: edit.row,
-                    column: edit.column,
-                });
-            }
-        }
-        return [...targets.values()].sort((left, right) =>
-            (left.sheetIndex - right.sheetIndex)
-            || (left.row - right.row)
-            || (left.column - right.column));
-    }, [formula_impact, formula_calculation_edits, meta?.sheets.length]);
+    const dependency_formula_impact = formula_impact_cache_ref.current.impact;
     const formula_calculation_key = `${formula_graph_key}:`
         + `${formula_calculation_edit_signature}`;
-    const formula_calculation_sequence_ref = useRef(0);
-    const active_formula_calculation_ref = useRef<{
-        readonly requestId: string;
+    const source_pending_formula_targets_cache_ref = useRef<{
         readonly key: string;
+        readonly targets: ReturnType<typeof pending_workbook_formula_targets>;
     }>();
-    const [formula_calculation, set_formula_calculation] = useState<{
+    if (source_pending_formula_targets_cache_ref.current?.key !== formula_graph_key) {
+        source_pending_formula_targets_cache_ref.current = {
+            key: formula_graph_key,
+            targets: pending_workbook_formula_targets(meta?.sheets ?? []),
+        };
+    }
+    const source_pending_formula_targets
+        = source_pending_formula_targets_cache_ref.current.targets;
+    const formula_calculation_plan = useMemo(() => {
+        if (too_many_formula_calculation_edits || !has_formula_work) {
+            return {
+                sheetCount: meta?.sheets.length ?? 0,
+                impact: dependency_formula_impact,
+                targets: [],
+                formulaLimitExceeded: too_many_formula_calculation_edits,
+            };
+        }
+        return plan_workbook_formula_recalculation(
+            meta?.sheets ?? [],
+            formula_calculation_edits,
+            { impact: dependency_formula_impact },
+        );
+    }, [
+        dependency_formula_impact,
+        formula_calculation_edits,
+        formula_calculation_edit_signature,
+        has_formula_work,
+        meta?.sheets.length,
+        too_many_formula_calculation_edits,
+    ]);
+    const formula_impact = formula_calculation_plan.impact;
+    const formula_calculation_targets = formula_calculation_plan.targets;
+    const [source_formula_calculation, set_source_formula_calculation] = useState<{
+        readonly graphKey: string;
+        readonly bySheet: readonly ReadonlyMap<string, string>[];
+    }>();
+    const [edit_formula_calculation, set_edit_formula_calculation] = useState<{
         readonly key: string;
         readonly bySheet: readonly ReadonlyMap<string, string>[];
     }>();
     useEffect(() => {
-        if (formula_calculation_targets.length === 0) {
+        set_source_formula_calculation((current) => current?.graphKey === formula_graph_key
+            ? current
+            : undefined);
+        set_edit_formula_calculation(undefined);
+    }, [formula_graph_key]);
+    const source_formulas_ready = source_pending_formula_targets.length === 0
+        || source_formula_calculation?.graphKey === formula_graph_key;
+    const formula_calculation_sequence_ref = useRef(0);
+    const active_formula_calculation_ref = useRef<{
+        readonly requestId: string;
+        readonly key: string;
+        readonly kind: 'source' | 'edit';
+    }>();
+    useEffect(() => {
+        const kind = source_formulas_ready ? 'edit' : 'source';
+        const targets = kind === 'source'
+            ? source_pending_formula_targets
+            : formula_calculation_targets;
+        const edits = kind === 'source' ? [] : formula_calculation_edits;
+        if (targets.length === 0) {
             active_formula_calculation_ref.current = undefined;
+            if (kind === 'edit') set_edit_formula_calculation(undefined);
             return;
         }
         formula_calculation_sequence_ref.current += 1;
         const requestId = `formula-calculation:${load_epoch}:`
             + `${formula_calculation_sequence_ref.current}`;
+        const sourceGeneration = source_generation_ref.current;
         active_formula_calculation_ref.current = {
             requestId,
-            key: formula_calculation_key,
+            key: kind === 'source' ? formula_graph_key : formula_calculation_key,
+            kind,
         };
         host_bridge.postMessage({
             type: 'requestFormulaCalculation',
             requestId,
-            sourceGeneration: source_generation_ref.current,
-            edits: formula_calculation_edits,
-            targets: formula_calculation_targets,
+            sourceGeneration,
+            edits,
+            targets,
         });
         return () => {
             if (active_formula_calculation_ref.current?.requestId === requestId) {
+                host_bridge.postMessage({
+                    type: 'cancelFormulaCalculation',
+                    requestId,
+                    sourceGeneration,
+                });
                 active_formula_calculation_ref.current = undefined;
             }
         };
@@ -1119,6 +1148,8 @@ export function App(): React.JSX.Element {
         formula_calculation_targets,
         formula_calculation_edits,
         load_epoch,
+        source_formulas_ready,
+        source_pending_formula_targets,
     ]);
     useEffect(() => {
         const on_message = (event: MessageEvent) => {
@@ -1133,13 +1164,27 @@ export function App(): React.JSX.Element {
                 if (!sheet) continue;
                 sheet.set(`${result.row}:${result.column}`, displayed_formula_result(result));
             }
-            set_formula_calculation({ key: active.key, bySheet });
+            if (active.kind === 'source') {
+                set_source_formula_calculation({
+                    graphKey: active.key,
+                    bySheet,
+                });
+            } else {
+                set_edit_formula_calculation({ key: active.key, bySheet });
+            }
+            if (active_formula_calculation_ref.current?.requestId === msg.requestId) {
+                active_formula_calculation_ref.current = undefined;
+            }
         };
         window.addEventListener('message', on_message);
         return () => window.removeEventListener('message', on_message);
-    }, [meta?.sheets]);
-    const active_formula_results = formula_calculation?.key === formula_calculation_key
-        ? formula_calculation.bySheet[active_sheet_index]
+    }, [formula_graph_key, meta?.sheets]);
+    const active_source_formula_results = source_formula_calculation?.graphKey
+        === formula_graph_key
+        ? source_formula_calculation.bySheet[active_sheet_index]
+        : undefined;
+    const active_formula_results = edit_formula_calculation?.key === formula_calculation_key
+        ? edit_formula_calculation.bySheet[active_sheet_index]
         : undefined;
     const mapping_generations_ref = useRef<number[]>([]);
     const histogram_cache_ref = useRef(new Map<string, FilterHistogramReady>());
@@ -5797,6 +5842,7 @@ export function App(): React.JSX.Element {
             sheet_index={active_sheet_index}
             pending_formula_impact={formula_impact.forSheet(active_sheet_index)}
             formula_results={active_formula_results}
+            source_formula_results={active_source_formula_results}
             generation={generation}
             row_count={effective_row_count}
             show_formatting={show_formatting}

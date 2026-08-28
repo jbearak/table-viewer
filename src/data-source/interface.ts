@@ -41,10 +41,12 @@ export interface RenderedCell extends
     formula?: string;
     /** The formula has no cached result that Table Viewer can display. */
     formulaResultPending?: true;
+    /** Underlying finite numeric scalar when display-safe `raw` is text. */
+    numericRaw?: number;
     bold: boolean;
     italic: boolean;
     /** Original scalar category retained for correct numeric sorting. */
-    rawType?: 'string' | 'number' | 'boolean' | 'date' | 'empty';
+    rawType?: 'string' | 'number' | 'boolean' | 'date' | 'error' | 'empty';
     /** Internal identity used by comparisons when display-safe `raw` is lossy. */
     comparisonKey?: string;
     /** Canonical filter identity when display-safe `raw` is lossy. Matching and
@@ -79,6 +81,11 @@ export interface ColumnFilterMetadata {
  * avoids an object or inner-array allocation for every reference.
  */
 export type PackedFormulaDependencies = readonly number[];
+/**
+ * All formula coordinates, packed `[row, column]` in strictly increasing
+ * row-major order. Pairs are unique; graph compilation validates this seam.
+ */
+export type PackedFormulaCells = readonly number[];
 /** Formula cells with no trustworthy cached result, packed `[row, column]`. */
 export type PackedPendingFormulaCells = readonly number[];
 
@@ -146,6 +153,8 @@ export interface SheetMeta {
     hasFormatting: boolean;
     /** Workbook-resolved A1 references used to invalidate cached formula results. */
     formulaDependencies?: PackedFormulaDependencies;
+    /** Every formula coordinate, including formulas with no references. */
+    formulaCells?: PackedFormulaCells;
     /** Formula coordinates whose source file has no result cache. */
     pendingFormulaCells?: PackedPendingFormulaCells;
     /** Per-column header titles. Length === columnCount; a blank entry means

@@ -15,10 +15,16 @@
 import {
     copy_dirty_entry,
     dirty_entries_equal,
+    dirty_entry_value_changed,
     sanitized_wire_dirty_entry,
     type CsvDirtyEntry,
 } from '../types';
-import { hyperlinks_equal, type CellHyperlink } from '../cell-content';
+import {
+    hyperlinks_equal,
+    rich_text_equal,
+    type CellHyperlink,
+    type RichTextRun,
+} from '../cell-content';
 import { is_plain_record } from '../plain-record';
 import { stage_mutation, type StagedMutation } from './staged-mutation';
 
@@ -124,12 +130,48 @@ export interface EditSessionIdentity {
     readonly session_id: string | undefined;
 }
 
+/** Formula-input delta carried with the ordinary store notification. */
+export type EditSessionFormulaChange =
+    | { readonly kind: 'none' }
+    | {
+        readonly kind: 'entry';
+        readonly key: string;
+        readonly previous?: EditSessionFormulaInput;
+        readonly value?: EditSessionFormulaInput;
+    }
+    | { readonly kind: 'reset' };
+
+export interface EditSessionFormulaInput {
+    readonly value: string;
+    readonly runs?: readonly RichTextRun[];
+}
+
+function formula_input(entry: DirtyEntry | undefined): EditSessionFormulaInput | undefined {
+    if (!entry || !dirty_entry_value_changed(entry)) return undefined;
+    return {
+        value: entry.value,
+        ...(entry.valueRuns !== undefined ? { runs: entry.valueRuns.runs } : {}),
+    };
+}
+
+function formula_inputs_equal(
+    left: EditSessionFormulaInput | undefined,
+    right: EditSessionFormulaInput | undefined,
+): boolean {
+    if (left === undefined || right === undefined) return left === right;
+    if (left.value !== right.value) return false;
+    if (left.runs === undefined || right.runs === undefined) {
+        return left.runs === right.runs;
+    }
+    return rich_text_equal({ runs: left.runs }, { runs: right.runs });
+}
+
 export interface EditSessionStore {
     // reads
     /** Copy-on-write: identical reference until the next mutation, so it is a
      *  valid useSyncExternalStore getSnapshot. */
     snapshot(): ReadonlyMap<string, DirtyEntry>;
-    subscribe(listener: () => void): () => void;
+    subscribe(listener: (change: EditSessionFormulaChange) => void): () => void;
     /** The stamped session, or null for a store that has never been given one. */
     identity(): EditSessionIdentity | null;
     /** Single-key read for the Glide hot paths, which must not take the
@@ -361,11 +403,12 @@ export function create_edit_session_store(
 ): EditSessionStore {
     let stamp: EditSessionIdentity | null = identity ?? null;
     let state = normalize(edits) ?? { entries: new Map<string, DirtyEntry>(), pending_base: false };
-    const listeners = new Set<() => void>();
+    const listeners = new Set<(change: EditSessionFormulaChange) => void>();
+    const RESET_FORMULA_INPUTS = { kind: 'reset' } as const;
 
-    const notify = (): void => {
+    const notify = (change: EditSessionFormulaChange = RESET_FORMULA_INPUTS): void => {
         // Copy first: a listener may unsubscribe during the walk.
-        for (const listener of [...listeners]) listener();
+        for (const listener of [...listeners]) listener(change);
     };
 
     // The pending-base flag lives here rather than in the hook because a
@@ -387,6 +430,7 @@ export function create_edit_session_store(
         entries: Map<string, DirtyEntry>,
         pending_base: boolean,
         force_notify = false,
+        formula_change: EditSessionFormulaChange = RESET_FORMULA_INPUTS,
     ): void => {
         // Every mutator funnels through here, so this one guard covers all of
         // them: an identical-value commit, a clear on an empty map, remove_keys
@@ -419,7 +463,7 @@ export function create_edit_session_store(
             return;
         }
         state = { entries, pending_base };
-        notify();
+        notify(formula_change);
     };
 
     // The map a set of writes produces, built without publishing anything.
@@ -461,9 +505,12 @@ export function create_edit_session_store(
     // effect, so it re-ran the scan on every page load and every keystroke for the
     // rest of the session. Cheap to keep honest: these paths already walk or copy
     // the map. Only ever narrows, never sets the flag where it was false.
-    const set_entries_recomputed = (entries: Map<string, DirtyEntry>): void => {
+    const set_entries_recomputed = (
+        entries: Map<string, DirtyEntry>,
+        formula_change: EditSessionFormulaChange = RESET_FORMULA_INPUTS,
+    ): void => {
         if (!state.pending_base) {
-            set_entries(entries, false);
+            set_entries(entries, false, false, formula_change);
             return;
         }
         let pending_base = false;
@@ -473,12 +520,12 @@ export function create_edit_session_store(
                 break;
             }
         }
-        set_entries(entries, pending_base);
+        set_entries(entries, pending_base, false, formula_change);
     };
 
     return {
         snapshot: () => state.entries,
-        subscribe: (listener: () => void) => {
+        subscribe: (listener: (change: EditSessionFormulaChange) => void) => {
             listeners.add(listener);
             return () => listeners.delete(listener);
         },
@@ -515,15 +562,23 @@ export function create_edit_session_store(
 
         commit: (session_id, key, entry) => {
             if (!owns(session_id)) return;
+            const previous = formula_input(state.entries.get(key));
+            const copied = copy_dirty_entry(entry);
+            const value = formula_input(copied);
             const next = new Map(state.entries);
-            next.set(key, copy_dirty_entry(entry));
-            set_entries(next, state.pending_base);
+            next.set(key, copied);
+            set_entries(next, state.pending_base, false, formula_inputs_equal(previous, value)
+                ? { kind: 'none' }
+                : { kind: 'entry', key, previous, value });
         },
         remove: (session_id, key) => {
             if (!owns(session_id) || !state.entries.has(key)) return;
+            const previous = formula_input(state.entries.get(key));
             const next = new Map(state.entries);
             next.delete(key);
-            set_entries_recomputed(next);
+            set_entries_recomputed(next, previous === undefined
+                ? { kind: 'none' }
+                : { kind: 'entry', key, previous });
         },
         remove_keys: (session_id, keys) => {
             if (!owns(session_id)) return;
@@ -568,7 +623,7 @@ export function create_edit_session_store(
                     if (changed) state = next;
                     return changed;
                 },
-                notify,
+                () => notify(),
             );
         },
         stage_clear: (session_id) => {
@@ -581,7 +636,7 @@ export function create_edit_session_store(
                     state = { entries: new Map(), pending_base: false };
                     return true;
                 },
-                notify,
+                () => notify(),
             );
         },
         resolve_pending_bases: (session_id, get_cell_raw) => {

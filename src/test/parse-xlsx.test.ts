@@ -70,6 +70,30 @@ function build_test_xlsx(sheet_xml: string, opts?: { styles_xml?: string; sst_xm
 }
 
 describe('parse_xlsx', () => {
+    it('rejects an overlong source formula before dependency parsing', async () => {
+        const formula = "'".repeat(8_193);
+        const sheet = `<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1"/>
+  <sheetData><row r="1"><c r="A1"><f>${formula}</f><v>0</v></c></row></sheetData>
+</worksheet>`;
+
+        await expect(parse_xlsx(build_test_xlsx(sheet)))
+            .rejects.toThrow('Formula exceeds Excel\'s maximum length');
+    });
+
+    it('rejects entity-heavy source formula markup before decoding it', async () => {
+        const formula = '&amp;'.repeat(14_000);
+        const sheet = `<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1"/>
+  <sheetData><row r="1"><c r="A1"><f>${formula}</f><v>0</v></c></row></sheetData>
+</worksheet>`;
+
+        await expect(parse_xlsx(build_test_xlsx(sheet)))
+            .rejects.toThrow('Formula XML encoding exceeds the safe length limit');
+    });
+
     it('exposes the effective formula for a shared-formula follower', async () => {
         const sheet = `<?xml version="1.0" encoding="UTF-8"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
@@ -107,6 +131,20 @@ describe('parse_xlsx', () => {
         });
     });
 
+    it('translates whole-axis references for shared-formula followers', async () => {
+        const sheet = `<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="B1:C1"/>
+  <sheetData><row r="1">
+    <c r="B1"><f t="shared" ref="B1:C1" si="0">SUM(A:A)+SUM(1:1)</f><v>1</v></c>
+    <c r="C1"><f t="shared" si="0"/><v>2</v></c>
+  </row></sheetData>
+</worksheet>`;
+        const { data } = await parse_xlsx(build_test_xlsx(sheet));
+
+        expect(data.sheets[0].rows[0][2]?.formula).toBe('=SUM(B:B)+SUM(1:1)');
+    });
+
     it('marks a formula with no cached value as an unknown result', async () => {
         const sheet = `<?xml version="1.0" encoding="UTF-8"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
@@ -123,9 +161,11 @@ describe('parse_xlsx', () => {
             formulaResultPending: true,
         });
         expect(data.sheets[0].pendingFormulaCells).toEqual([0, 0]);
+        expect(data.sheets[0].formulaCells).toEqual([0, 0]);
 
         const streaming = await parse_xlsx_streaming(bytes);
         expect(streaming.sheets[0].pendingFormulaCells).toEqual([0, 0]);
+        expect(streaming.sheets[0].formulaCells).toEqual([0, 0]);
         const builder = new ColumnarStore.Builder(1, 1);
         streaming.sheets[0].fill(builder);
         expect(builder.build().read_window(0, 1)[0][0]).toMatchObject({
@@ -136,8 +176,27 @@ describe('parse_xlsx', () => {
         });
         const source = await XlsxDataSource.create(bytes);
         expect(source.meta().sheets[0].pendingFormulaCells).toEqual([0, 0]);
+        expect(source.meta().sheets[0].formulaCells).toEqual([0, 0]);
         expect(new ExcelHeaderDataSource(source).meta().sheets[0].pendingFormulaCells)
             .toEqual([0, 0]);
+        expect(new ExcelHeaderDataSource(source).meta().sheets[0].formulaCells)
+            .toEqual([0, 0]);
+    });
+
+    it('does not fabricate false for a boolean formula with no cached value', async () => {
+        const sheet = `<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1"/>
+  <sheetData><row r="1"><c r="A1" t="b"><f>B1=1</f></c></row></sheetData>
+</worksheet>`;
+        const { data } = await parse_xlsx(build_test_xlsx(sheet));
+
+        expect(data.sheets[0].rows[0][0]).toMatchObject({
+            raw: '=B1=1',
+            formatted: '??',
+            formulaResultPending: true,
+        });
+        expect(data.sheets[0].pendingFormulaCells).toEqual([0, 0]);
     });
 
     it('records formula references for dependency invalidation before rows load', async () => {
@@ -166,6 +225,26 @@ describe('parse_xlsx', () => {
         expect(streaming.sheets[0].formulaDependencies).toEqual(expected);
         expect(source.meta().sheets[0].formulaDependencies).toEqual(expected);
         expect(projected.meta().sheets[0].formulaDependencies).toEqual(expected);
+    });
+
+    it('records what-if data-table inputs as dependencies of the table master', async () => {
+        const sheet = `<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:D1"/>
+  <sheetData><row r="1">
+    <c r="A1"><f t="dataTable" ref="A1:B2" r1="$D$1"/><v>1</v></c>
+    <c r="D1"><v>5</v></c>
+  </row></sheetData>
+</worksheet>`;
+        const bytes = build_test_xlsx(sheet);
+        const { data } = await parse_xlsx(bytes);
+        const streaming = await parse_xlsx_streaming(bytes);
+
+        const expected = [0, 0, 0, 0, 3, 0, 3];
+        expect(data.sheets[0].formulaDependencies).toEqual(expected);
+        expect(streaming.sheets[0].formulaDependencies).toEqual(expected);
+        expect(data.sheets[0].formulaCells).toEqual([0, 0]);
+        expect(streaming.sheets[0].formulaCells).toEqual([0, 0]);
     });
 
     it('exposes the OOXML sheetId as worksheet identity', async () => {
@@ -322,6 +401,21 @@ describe('parse_xlsx', () => {
             expect(typeof joined).toBe('string');
             expect(String(joined)).toContain('2024-01-15');
             expect(people.rows[1][3]?.rawType).toBe('date');
+            expect(people.rows[1][3]?.numericRaw).toBe(45_306);
+        });
+
+        it('retains formula error typing', async () => {
+            const sheet = `<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <dimension ref="A1:A1"/>
+  <sheetData><row r="1"><c r="A1" t="e"><v>#DIV/0!</v></c></row></sheetData>
+</worksheet>`;
+            const { data } = await parse_xlsx(build_test_xlsx(sheet));
+
+            expect(data.sheets[0].rows[0][0]).toMatchObject({
+                raw: '#DIV/0!',
+                rawType: 'error',
+            });
         });
 
         it('preserves native OOXML date typing', async () => {
@@ -336,6 +430,7 @@ describe('parse_xlsx', () => {
                 raw: '2024-03-01T00:00:00Z',
                 rawType: 'date',
                 xlsxIsoDate: true,
+                numericRaw: 45_352,
             });
         });
 
@@ -522,6 +617,7 @@ describe('parse_xlsx', () => {
             expect(data.sheets[0].rows[0][0]).toMatchObject({
                 raw: '2024-01-15T00:00:00.000Z',
                 rawType: 'date',
+                numericRaw: 45_306,
                 formatted: '2024-01-15',
             });
         });

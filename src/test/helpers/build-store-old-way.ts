@@ -1,4 +1,5 @@
 import { ColumnarStore } from '../../data-source/columnar-store';
+import type { RenderedCell } from '../../data-source/interface';
 import type { CellData } from '../../types';
 
 /**
@@ -18,15 +19,24 @@ export function build_store_old_way(
         const row = rows[r] ?? [];
         for (let c = 0; c < colCount; c++) {
             const cell = row[c] ?? null;
-            b.set(r, c, cell === null ? null : {
+            if (cell === null) {
+                b.set(r, c, null);
+                continue;
+            }
+            const rendered: RenderedCell = {
                 raw: cell.raw === null ? '' : String(cell.raw),
                 formatted: cell.formatted,
+                ...(cell.formula !== undefined ? { formula: cell.formula } : {}),
+                ...(cell.formulaResultPending ? { formulaResultPending: true as const } : {}),
+                ...(cell.numericRaw !== undefined ? { numericRaw: cell.numericRaw } : {}),
                 bold: cell.bold,
                 italic: cell.italic,
                 rawType: cell.raw === null
                     ? 'empty'
                     : cell.rawType === 'date'
                         ? 'date'
+                    : cell.rawType === 'error'
+                        ? 'error'
                     : typeof cell.raw === 'number'
                         ? 'number'
                         : typeof cell.raw === 'boolean'
@@ -34,7 +44,12 @@ export function build_store_old_way(
                             : 'string',
                 ...(cell.numberFormat ? { numberFormat: cell.numberFormat } : {}),
                 ...(cell.xlsxIsoDate ? { xlsxIsoDate: true as const } : {}),
-            });
+                ...(cell.underline ? { underline: true as const } : {}),
+                ...(cell.strikethrough ? { strikethrough: true as const } : {}),
+                ...(cell.richText ? { richText: cell.richText } : {}),
+                ...(cell.hyperlink ? { hyperlink: cell.hyperlink } : {}),
+            };
+            b.set(r, c, rendered);
         }
     }
     return b.build();

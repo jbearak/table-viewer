@@ -473,6 +473,41 @@ describe('xlsx edit sessions', () => {
         });
     });
 
+    it('admits formula-shaped rich text under the writer\'s text rules', async () => {
+        const panel = await open_ready_xlsx(file_path);
+        await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
+        const session = latest_edit_session(panel)!.editSessionId!;
+        const value = `=${'x'.repeat(8_193)}`;
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session,
+                saveRequestId: 'save-formula-shaped-rich-text',
+                worksheets: [{
+                    sheetIndex: 0,
+                    sheetName: 'People',
+                    worksheetId: '1',
+                    edits: { '1:0': value },
+                    dirtyEdits: {
+                        '1:0': {
+                            value,
+                            base: 'Alice',
+                            valueRuns: {
+                                runs: [{ text: value, style: { bold: true } }],
+                            },
+                        },
+                    },
+                }],
+            },
+        });
+        await wait_for_observable(() => save_results(panel).length > 0);
+
+        expect(save_results(panel).at(-1)).toMatchObject({ success: true });
+        const after = await parse_xlsx(bytes);
+        expect(after.data.sheets[0].rows[1][0]).toMatchObject({ raw: value });
+    });
+
     it('writes a hyperlink-only edit without rewriting the cell', async () => {
         const panel = await open_ready_xlsx(file_path);
         await panel.__receive({ type: 'requestEditSession', requestId: 'x', sheetIndex: 0 });
