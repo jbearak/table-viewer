@@ -311,14 +311,7 @@ export function element_close(
     return { inner, end: end_tag[1] };
 }
 
-/**
- * Formula kinds whose `<f>` governs cells other than its own.
- *
- * `shared` names a definition its followers reference by `si`; `array` and
- * `dataTable` each carry a `ref` spanning a range whose other cells hold only a
- * cached value. Writing a literal into any of them leaves the group pointing at
- * a definition that is gone, so all three are refused the same way.
- */
+/** Formula kinds whose `<f>` can govern cells other than its own. */
 type GroupedFormulaKind = 'shared' | 'array' | 'dataTable';
 
 function is_grouped_formula_kind(value: string | null): value is GroupedFormulaKind {
@@ -337,14 +330,16 @@ interface GroupedRange {
 const CELL_RANGE_RE = /^([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?$/;
 
 /**
- * The `ref` range of every shared/array formula on the sheet.
+ * The `ref` range of every shared formula, array formula, and data table.
  *
  * An array formula writes one `<f t="array" ref="A1:B2">` on its top-left cell;
  * the other cells in that range hold a value and no `<f>` at all. So the
  * per-cell check below cannot see them, and an edit to one would drop a member
- * of the group without ever meeting a formula. A shared master's `ref` spans its
- * followers the same way — those *do* carry an `<f>`, but scanning the range
- * catches them uniformly and costs one pass either way.
+ * of the group without ever meeting a formula. Shared followers do carry an
+ * `<f>`, but the range check also catches sparse or missing follower cells.
+ * Although OOXML permits a literal override inside a shared range, Table Viewer
+ * shows the cached result rather than the formula. Allowing that override would
+ * let a user unknowingly replace a calculated cell with a fixed value.
  *
  * Kept as bounds rather than expanded into a set of coordinates: a `ref` is
  * whatever the writing application put there, and a whole-column or
@@ -375,23 +370,20 @@ function grouped_formula_ranges(xml: Uint8Array): GroupedRange[] {
 }
 
 /**
- * Why an edit inside a shared or array formula is refused.
+ * Why an edit inside a formula group that cannot be changed locally is refused.
  *
- * Its `<f>` is not local to the cell: a shared master defines the formula its
- * followers reference by `si`, and an array formula's `ref` spans a range.
- * Dropping either leaves the rest of the group pointing at a definition that no
- * longer exists — cells that silently stop calculating, or a workbook Excel
- * offers to repair. Handling those groups properly means rewriting cells the
- * user did not edit, which is the opposite of a surgical save, so this refuses
- * and says why instead of quietly corrupting the sheet.
+ * A shared master defines the formula its followers reference by `si`; array
+ * formulas and data tables govern every cell in their `ref`. Dropping one of
+ * those definitions leaves cells that silently stop calculating, or a workbook
+ * Excel offers to repair.
  */
 function grouped_formula_error(row: number, col: number, kind: GroupedFormulaKind): Error {
     const described = kind === 'array'
         ? 'an array formula'
         : kind === 'dataTable' ? 'a data table' : 'a shared formula';
     return new Error(
-        `Cannot edit ${cell_reference(row, col)}: it is part of ${described}. `
-        + 'Clear the formula in Excel first.',
+        `Cannot edit ${cell_reference(row, col)}: this cell is calculated by ${described}. `
+        + "Edit the formula's input cells instead, or replace the formula in Excel first.",
     );
 }
 
@@ -412,8 +404,9 @@ function grouped_range_kind(
 /**
  * The group kind when the cell's own `<f>` belongs to a multi-cell group.
  *
- * Both a shared master (`t="shared"` with an `si`) and a shared *follower* (an
- * empty `<f t="shared" si="..."/>`) count: replacing either breaks the group.
+ * Shared masters and followers both count. Even though OOXML permits replacing
+ * one follower, the grid does not expose the formula and must not silently turn
+ * its displayed result into a fixed value.
  */
 function grouped_formula_kind(
     xml: Uint8Array,
@@ -1141,8 +1134,8 @@ function apply_cell_edits_bytes(
 
     const splices: Splice[] = [];
     const new_rows: Array<{ row: number; text: string }> = [];
-    // Scanned once for the whole sheet, because an array formula's members are
-    // only identifiable from the master's `ref` — see `grouped_formula_ranges`.
+    // Scanned once for the whole sheet, because grouped-formula members can be
+    // identifiable only from the master's `ref`.
     const grouped_ranges = grouped_formula_ranges(xml);
 
     // Ahead of every row and cell lookup, because a grouped formula's range can
@@ -1198,18 +1191,10 @@ function apply_cell_edits_bytes(
                 // plain `<f>` it carried is dropped with it — the agreed putexcel
                 // behavior, where writing a value replaces the formula.
                 //
-                // A *shared* or *array* formula is different, and refused. Its `<f>`
-                // is not local to the cell: a shared master defines the formula its
-                // followers reference by `si`, and an array formula's `ref` spans a
-                // range of cells. Dropping either leaves the rest of the group
-                // pointing at a definition that no longer exists — cells that
-                // silently stop calculating, or a workbook Excel offers to repair.
-                // Handling those groups properly means rewriting cells the user did
-                // not edit, which is the opposite of a surgical save, so this
-                // refuses and says why instead of quietly corrupting the sheet.
-                // The range sweep above already covered every cell a group's `ref`
-                // names. This catches the one it cannot see: a shared *follower*,
-                // whose `<f t="shared" si="…"/>` carries no `ref` of its own.
+                // Grouped formulas are different. Replacing a master can break
+                // other cells. Replacing a shared follower is legal OOXML, but the
+                // grid only showed its cached result, so accepting the edit would
+                // silently turn a formula into a fixed value.
                 const grouped = grouped_formula_kind(
                     xml,
                     cell_span.inner_start,

@@ -195,12 +195,32 @@ describe('apply_cell_edits', () => {
         )).toThrow(/A1.*shared formula/);
     });
 
-    it('refuses a shared-formula follower too', () => {
+    it('refuses to replace a shared-formula follower with a fixed value', () => {
         expect(() => apply_cell_edits(
-            doc('<row r="2"><c r="A2"><f t="shared" si="0"/><v>4</v></c></row>'),
-            [{ row: 1, col: 0, value: '9' }],
+            doc(
+                '<row r="2"><c r="I2"><f t="shared" ref="I2:I15" si="0">E2*F2</f><v>2</v></c></row>'
+                + '<row r="5"><c r="I5" s="16"><f t="shared" si="0"/><v>18.13</v></c></row>'
+                + '<row r="6"><c r="I6"><f t="shared" si="0"/><v>65.78</v></c></row>',
+            ),
+            [{ row: 4, col: 8, value: '19' }],
             OPTS,
-        )).toThrow(/A2.*shared formula/);
+        )).toThrow(
+            'Cannot edit I5: this cell is calculated by a shared formula. '
+            + "Edit the formula's input cells instead, or replace the formula in Excel first.",
+        );
+    });
+
+    it('edits an input cell referenced by a formula without replacing the formula', () => {
+        const out = apply_cell_edits(
+            doc(
+                '<row r="5"><c r="E5"><v>13</v></c><c r="F5"><v>4.5</v></c>'
+                + '<c r="I5"><f>E5*F5</f><v>58.5</v></c></row>',
+            ),
+            [{ row: 4, col: 4, value: '14' }],
+            OPTS,
+        );
+        expect(out).toContain('<c r="E5"><v>14</v></c>');
+        expect(out).toContain('<c r="I5"><f>E5*F5</f><v>58.5</v></c>');
     });
 
     it('refuses an array-formula cell', () => {
