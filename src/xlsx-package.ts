@@ -1,4 +1,11 @@
-import { element_close, type XlsxCellEdit } from './xlsx-cell-write';
+import {
+    element_close,
+    remove_formula_cached_values,
+    worksheet_formula_dependencies,
+    type XlsxCellEdit,
+} from './xlsx-cell-write';
+import { compile_workbook_formula_graph } from './formula-dependencies';
+import type { PackedFormulaDependencies } from './data-source/interface';
 import { worksheet_scan_input } from './ooxml-worksheet-scan';
 import {
     create_number_format_resolver,
@@ -31,11 +38,11 @@ import { ZipPackage, ZipPackageError } from './zip-package';
 /**
  * Package-level (.xlsx container) side of `putexcel`-style saving.
  *
- * The ZIP package is indexed lazily. Only the workbook metadata and worksheet
- * parts needed for an edit are inflated; when the package is emitted, every
- * unchanged local ZIP record is copied verbatim. Charts, images, pivot tables,
- * macros, and other opaque parts are therefore neither decompressed nor
- * recompressed.
+ * The ZIP package is indexed lazily. With verified formula topology, only
+ * explicitly edited worksheets and worksheets containing invalidated formula
+ * caches are inflated. Standalone callers without that hint scan worksheet
+ * formulas one part at a time for correctness. Every unchanged local ZIP record
+ * is copied verbatim, including opaque charts, images, pivots, and custom XML.
  */
 
 function read_part_bytes(zip: ZipPackage, path: string): Uint8Array | null {
@@ -238,6 +245,13 @@ export interface XlsxWorksheetCellEdits {
     readonly link_edits?: readonly XlsxHyperlinkEdit[];
 }
 
+export interface XlsxWorkbookWriteOptions {
+    /** Topology parsed from the verified source, in current worksheet order. */
+    readonly formulaDependencies?: readonly {
+        readonly formulaDependencies?: PackedFormulaDependencies;
+    }[];
+}
+
 /**
  * Rewrite several worksheets inside one .xlsx package and serialize it once.
  *
@@ -248,6 +262,7 @@ export interface XlsxWorksheetCellEdits {
 export function write_xlsx_workbook_cell_edits(
     raw: Uint8Array,
     worksheets: readonly XlsxWorksheetCellEdits[],
+    options?: XlsxWorkbookWriteOptions,
 ): Uint8Array {
     const active = worksheets.filter(
         ({ edits, link_edits }) => edits.length > 0 || (link_edits?.length ?? 0) > 0,
@@ -270,6 +285,30 @@ export function write_xlsx_workbook_cell_edits(
     }
 
     const parts = worksheet_part_entries_from_package(zip);
+    const sheet_names = parts.map((part) => part.name);
+    const has_value_edits = active.some(({ edits }) => edits.length > 0);
+    const dependency_sheets = !has_value_edits
+        ? parts.map(() => ({}))
+        : options?.formulaDependencies?.length === parts.length
+        ? options.formulaDependencies
+        : parts.map((part, sheet_index) => {
+            const content = read_part_bytes(zip, `/${part.path}`);
+            if (content === null) throw new Error('Could not read a worksheet to save');
+            return {
+                formulaDependencies: worksheet_formula_dependencies(
+                    worksheet_scan_input(content),
+                    sheet_index,
+                    sheet_names,
+                ),
+            };
+        });
+    const formula_impact = compile_workbook_formula_graph(dependency_sheets).invalidatedBy(
+        active.flatMap(({ sheetIndex, edits }) => edits.map((edit) => ({
+            sheetIndex,
+            row: edit.row,
+            column: edit.col,
+        }))),
+    );
     const { is_date_style, cell_font_style, run_font_base } = read_style_write_context(zip);
     const datemode = read_datemode(zip);
     let calculation_chain_stale = false;
@@ -278,7 +317,16 @@ export function write_xlsx_workbook_cell_edits(
         | { path: string; text: string; created?: boolean }
     > = [];
 
-    for (const { sheetIndex, edits, link_edits } of active) {
+    const active_by_sheet = new Map(active.map((entry) => [entry.sheetIndex, entry]));
+    const touched_sheets = new Set(active_by_sheet.keys());
+    for (let sheet_index = 0; sheet_index < parts.length; sheet_index += 1) {
+        if (formula_impact.forSheet(sheet_index).size > 0) touched_sheets.add(sheet_index);
+    }
+
+    for (const sheetIndex of [...touched_sheets].sort((left, right) => left - right)) {
+        const active_entry = active_by_sheet.get(sheetIndex);
+        const edits = active_entry?.edits ?? [];
+        const link_edits = active_entry?.link_edits;
         const part = parts[sheetIndex];
         if (!part) throw new Error('Could not locate a worksheet to save');
         const path = `/${part.path}`;
@@ -290,19 +338,27 @@ export function write_xlsx_workbook_cell_edits(
         const rels_xml = link_edits && link_edits.length > 0
             ? read_part_text(zip, rels_path)
             : null;
-        const result = apply_worksheet_edits({
-            worksheet_xml: sheet_xml,
-            relationships_xml: rels_xml,
-            cell_edits: edits,
-            hyperlink_edits: link_edits,
-            write_options: {
-                datemode,
-                is_date_style,
-                cell_font_style,
-                run_font_base,
-                sheet_name: part.name,
-            },
-        });
+        const invalidations = [...formula_impact.forSheet(sheetIndex).cells()];
+        const result = active_entry === undefined
+            ? {
+                worksheet_xml: remove_formula_cached_values(sheet_xml, invalidations),
+                relationships_xml: null,
+                calculation_chain_stale: false,
+            }
+            : apply_worksheet_edits({
+                worksheet_xml: sheet_xml,
+                relationships_xml: rels_xml,
+                cell_edits: edits,
+                hyperlink_edits: link_edits,
+                write_options: {
+                    datemode,
+                    is_date_style,
+                    cell_font_style,
+                    run_font_base,
+                    sheet_name: part.name,
+                    formula_result_invalidations: invalidations,
+                },
+            });
         if (result.relationships_xml !== null) {
             replacements.push({
                 path: rels_path,
@@ -312,7 +368,9 @@ export function write_xlsx_workbook_cell_edits(
             });
         }
         calculation_chain_stale ||= result.calculation_chain_stale;
-        replacements.push({ path, bytes: result.worksheet_xml });
+        if (active_entry !== undefined || result.worksheet_xml !== sheet_xml) {
+            replacements.push({ path, bytes: result.worksheet_xml });
+        }
     }
 
     for (const replacement of replacements) {

@@ -2927,7 +2927,6 @@ describe('GridShell link-only edits', () => {
             rawType: 'number' as const,
             formula: '=Z1',
         }] as any);
-        const editing_ref: React.MutableRefObject<EditingHandle | null> = { current: null };
         await render_grid(props({
             show_formatting: true,
             edit_mode: true,
@@ -2936,11 +2935,15 @@ describe('GridShell link-only edits', () => {
             sheet_meta: {
                 ...props().sheet_meta,
                 columnCount: 4,
-                formulaDependencies: [
-                    [0, 1, 0, 0, 0, 0],
-                    [0, 2, 0, 1, 0, 1],
-                    [0, 3, 0, 25, 0, 25],
-                ],
+            },
+            pending_formula_impact: {
+                size: 2,
+                has: (row, column) => row === 0 && (column === 1 || column === 2),
+                *keys() { yield '0:1'; yield '0:2'; },
+                *cells() {
+                    yield { row: 0, column: 1 };
+                    yield { row: 0, column: 2 };
+                },
             },
             column_projection: {
                 visible_to_source: [0, 1, 2, 3],
@@ -2950,7 +2953,6 @@ describe('GridShell link-only edits', () => {
             initial_edits: {
                 '0:0': { value: '3', base: '2' },
             },
-            editing_ref,
         }));
         const get_cell_content = grid_mock.props!.getCellContent as
             (cell: [number, number]) => {
@@ -2970,9 +2972,6 @@ describe('GridShell link-only edits', () => {
         expect(text(2)).toBe('$12.00 → ??');
         expect(text(3)).toBe('$99.00');
 
-        await act(async () => editing_ref.current!.clear_dirty());
-        expect(text(1)).toBe('$4.00');
-        expect(text(2)).toBe('$12.00');
     });
 
     it('does not invalidate formulas for a hyperlink-only edit', async () => {
@@ -2990,7 +2989,6 @@ describe('GridShell link-only edits', () => {
             sheet_meta: {
                 ...props().sheet_meta,
                 columnCount: 2,
-                formulaDependencies: [[0, 1, 0, 0, 0, 0]],
             },
             column_projection: {
                 visible_to_source: [0, 1],

@@ -13,7 +13,7 @@ import { ColumnarStore } from './columnar-store';
 import type {
     ColumnWindow,
     DataSource,
-    FormulaDependency,
+    PackedFormulaDependencies,
     IndexedRows,
     RowWindow,
     WorkbookMeta,
@@ -27,7 +27,7 @@ interface SheetEntry {
     columnCount: number;
     merges: MergeRange[];
     hasFormatting: boolean;
-    formulaDependencies?: readonly FormulaDependency[];
+    formulaDependencies?: PackedFormulaDependencies;
     store: ColumnarStore;
 }
 

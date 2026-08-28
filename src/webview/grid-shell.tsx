@@ -128,8 +128,7 @@ import { format_xlsx_edit_preview } from '../spreadsheet-format';
 import { xlsx_runs_require_inline_string } from '../xlsx-cell-value';
 import { is_xlsx_formula_text } from '../xlsx-formula';
 import {
-    build_formula_dependency_index,
-    transitive_formula_dependents,
+    type FormulaSheetImpact,
 } from '../formula-dependencies';
 import {
     create_edit_session_store,
@@ -449,6 +448,8 @@ interface RowResizePreview {
 export interface GridShellProps {
     sheet_meta: SheetMeta;
     sheet_index: number;
+    /** Workbook-wide recursive pending-result projection for this worksheet. */
+    pending_formula_impact?: FormulaSheetImpact;
     generation: number;
     /**
      * Effective displayed row count (may be filtered).
@@ -639,6 +640,7 @@ export interface GridShellProps {
 export function GridShell({
     sheet_meta,
     sheet_index,
+    pending_formula_impact,
     generation,
     row_count = sheet_meta.rowCount,
     show_formatting,
@@ -1060,22 +1062,9 @@ export function GridShell({
             [version],
         ),
     });
-    const formula_dependency_index = useMemo(
-        () => build_formula_dependency_index(sheet_meta.formulaDependencies),
-        [sheet_meta.formulaDependencies],
-    );
-    const changed_formula_input_keys = useMemo(
-        () => [...dirty_cells]
-            .filter(([, entry]) => dirty_entry_value_changed(entry))
-            .map(([key]) => key),
-        [dirty_cells],
-    );
     const pending_formula_keys = useMemo(
-        () => transitive_formula_dependents(
-            formula_dependency_index,
-            changed_formula_input_keys,
-        ),
-        [changed_formula_input_keys, formula_dependency_index],
+        () => new Set(pending_formula_impact?.keys() ?? []),
+        [pending_formula_impact],
     );
     // The paint callback deliberately stays stable across edits. It reads the
     // current recursive invalidation set through this mirror, while the repaint

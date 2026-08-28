@@ -87,6 +87,9 @@ export interface StagedDiscard {
 }
 
 export interface EditSessionRegistry {
+    /** Aggregate observable for value projections spanning every live sheet. */
+    subscribe(listener: () => void): () => void;
+    revision(): number;
     /**
      * The store for one worksheet, created on first use.
      *
@@ -206,8 +209,32 @@ export function create_edit_session_registry(
         target: WorksheetTarget;
         store: EditSessionStore;
     }>();
+    let revision = 0;
+    const listeners = new Set<() => void>();
+    const subscriptions = new Map<EditSessionStore, () => void>();
+    const publish = () => {
+        revision += 1;
+        for (const listener of listeners) listener();
+    };
+    const watch = (store: EditSessionStore) => {
+        if (!subscriptions.has(store)) subscriptions.set(store, store.subscribe(publish));
+    };
+    const unwatch_detached = () => {
+        const retained = new Set(stores.values());
+        for (const { store } of parked.values()) retained.add(store);
+        for (const [store, unsubscribe] of subscriptions) {
+            if (retained.has(store)) continue;
+            unsubscribe();
+            subscriptions.delete(store);
+        }
+    };
 
     return {
+        subscribe: (listener) => {
+            listeners.add(listener);
+            return () => { listeners.delete(listener); };
+        },
+        revision: () => revision,
         for_sheet: (sheet_index) => {
             const existing = stores.get(sheet_index);
             if (existing) return existing;
@@ -215,6 +242,7 @@ export function create_edit_session_registry(
                 session_id: current_session_id(),
             });
             stores.set(sheet_index, created);
+            watch(created);
             return created;
         },
         reconcile_sheets: (previous, next, retain_removed) => {
@@ -262,6 +290,8 @@ export function create_edit_session_registry(
                 retry_publications.push(entry);
             }
             stores = moved;
+            unwatch_detached();
+            publish();
             return {
                 locallyRetainedIndices: locally_retained_indices,
                 retryPublications: retry_publications,
@@ -269,6 +299,8 @@ export function create_edit_session_registry(
         },
         retire_parked: () => {
             parked.clear();
+            unwatch_detached();
+            publish();
         },
         publication_entries: function* (sheets) {
             for (const [sheet_index, store] of stores) {
@@ -344,6 +376,8 @@ export function create_edit_session_registry(
         replace_document: () => {
             stores.clear();
             parked.clear();
+            unwatch_detached();
+            publish();
         },
         stage_discard: (session_id, sheets) => {
             const mutations: StagedMutation[] = [];

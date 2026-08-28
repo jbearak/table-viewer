@@ -2,7 +2,7 @@ import type {
     ColumnWindow,
     DataSource,
     ExcelHeaderOverride,
-    FormulaDependency,
+    PackedFormulaDependencies,
     IndexedRows,
     RenderedCell,
     RowWindow,
@@ -49,7 +49,7 @@ export interface ExcelHeaderPlanningSheet {
     readonly columnCount: number;
     readonly merges: readonly Readonly<MergeRange>[];
     readonly hasFormatting: boolean;
-    readonly formulaDependencies?: readonly FormulaDependency[];
+    readonly formulaDependencies?: PackedFormulaDependencies;
     readonly columnNames: readonly string[];
     readonly manualColumnNames?: readonly string[];
     readonly manualHeaderRow?: number;

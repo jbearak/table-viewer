@@ -781,7 +781,9 @@ function plan_xlsx_save(input: SavePlanInput): SavePlan {
         observed_bases: planned.map(({ observed_bases }) => observed_bases),
         observed_rich: planned.map(({ observed_rich }) => observed_rich),
         observed_links: planned.map(({ observed_links }) => observed_links),
-        produce: (raw) => write_xlsx_workbook_cell_edits(raw, planned),
+        produce: (raw) => write_xlsx_workbook_cell_edits(raw, planned, {
+            formulaDependencies: src.meta().sheets,
+        }),
     };
 }
 

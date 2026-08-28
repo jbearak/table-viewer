@@ -31,6 +31,8 @@ function identifier_character(char: string | undefined): boolean {
 }
 
 export interface A1FormulaReference {
+    /** Absent for an unqualified reference to the formula's own worksheet. */
+    readonly sheetName?: string;
     readonly firstRow: number;
     readonly firstColumn: number;
     readonly lastRow: number;
@@ -120,19 +122,16 @@ function sheet_prefix(value: string): SheetPrefix | undefined {
 }
 
 /**
- * Find A1 cell and rectangular range references that point into the formula's
- * own worksheet. Strings, structured references, external workbooks, and
- * references to another worksheet are ignored because they cannot establish a
- * same-sheet dependency edge.
+ * Find direct A1 references and retain an optional worksheet qualifier for
+ * workbook-level resolution. Strings, structured references, external books,
+ * and unsupported 3D references are ignored.
  */
-export function local_a1_formula_references(
-    formula: string,
-    sheet_name: string,
-): A1FormulaReference[] {
+export function a1_formula_references(formula: string): A1FormulaReference[] {
     const references: A1FormulaReference[] = [];
     const seen = new Set<string>();
     const record = (reference: A1FormulaReference) => {
-        const key = `${reference.firstRow}:${reference.firstColumn}:`
+        const key = `${reference.sheetName ?? ''}:`
+            + `${reference.firstRow}:${reference.firstColumn}:`
             + `${reference.lastRow}:${reference.lastColumn}`;
         if (seen.has(key)) return;
         seen.add(key);
@@ -174,6 +173,7 @@ export function local_a1_formula_references(
             || identifier_character(formula[index - 1])
             || formula[index - 1] === '!'
             || formula[index - 1] === ']'
+            || formula[index - 1] === ':'
         ) {
             index += 1;
             continue;
@@ -183,16 +183,13 @@ export function local_a1_formula_references(
         const cell_start = index + (prefix?.length ?? 0);
         const axis_range = parse_a1_axis_range(formula.slice(cell_start));
         if (axis_range) {
-            if (!prefix || prefix.name.localeCompare(sheet_name, undefined, {
-                sensitivity: 'accent',
-            }) === 0) {
-                record({
-                    firstRow: axis_range.firstRow,
-                    firstColumn: axis_range.firstColumn,
-                    lastRow: axis_range.lastRow,
-                    lastColumn: axis_range.lastColumn,
-                });
-            }
+            record({
+                ...(prefix ? { sheetName: prefix.name } : {}),
+                firstRow: axis_range.firstRow,
+                firstColumn: axis_range.firstColumn,
+                lastRow: axis_range.lastRow,
+                lastColumn: axis_range.lastColumn,
+            });
             index = cell_start + axis_range.length;
             continue;
         }
@@ -210,23 +207,74 @@ export function local_a1_formula_references(
                 end += 1 + range_end.length;
             }
         }
-        if (!prefix || prefix.name.localeCompare(sheet_name, undefined, {
-            sensitivity: 'accent',
-        }) === 0) {
-            const first_row = Math.min(first.row, last.row);
-            const first_column = Math.min(first.column, last.column);
-            const last_row = Math.max(first.row, last.row);
-            const last_column = Math.max(first.column, last.column);
-            record({
-                firstRow: first_row,
-                firstColumn: first_column,
-                lastRow: last_row,
-                lastColumn: last_column,
-            });
-        }
+        const first_row = Math.min(first.row, last.row);
+        const first_column = Math.min(first.column, last.column);
+        const last_row = Math.max(first.row, last.row);
+        const last_column = Math.max(first.column, last.column);
+        record({
+            ...(prefix ? { sheetName: prefix.name } : {}),
+            firstRow: first_row,
+            firstColumn: first_column,
+            lastRow: last_row,
+            lastColumn: last_column,
+        });
         index = end;
     }
     return references;
+}
+
+/** Backward-compatible projection used by worksheet-only callers and tests. */
+export function local_a1_formula_references(
+    formula: string,
+    sheet_name: string,
+): A1FormulaReference[] {
+    return a1_formula_references(formula).flatMap((reference) => {
+        if (
+            reference.sheetName !== undefined
+            && reference.sheetName.localeCompare(sheet_name, undefined, {
+                sensitivity: 'accent',
+            }) !== 0
+        ) return [];
+        return [{
+            firstRow: reference.firstRow,
+            firstColumn: reference.firstColumn,
+            lastRow: reference.lastRow,
+            lastColumn: reference.lastColumn,
+        }];
+    });
+}
+
+export interface WorkbookA1FormulaReference {
+    readonly sourceSheetIndex: number;
+    readonly firstRow: number;
+    readonly firstColumn: number;
+    readonly lastRow: number;
+    readonly lastColumn: number;
+}
+
+/** Resolve supported A1 qualifiers once against the workbook's sheet slots. */
+export function workbook_a1_formula_references(
+    formula: string,
+    formula_sheet_index: number,
+    sheet_names: readonly string[],
+): WorkbookA1FormulaReference[] {
+    return a1_formula_references(formula).flatMap((reference) => {
+        const source_sheet_index = reference.sheetName === undefined
+            ? formula_sheet_index
+            : sheet_names.findIndex((name) => name.localeCompare(
+                reference.sheetName!,
+                undefined,
+                { sensitivity: 'accent' },
+            ) === 0);
+        if (source_sheet_index < 0 || source_sheet_index >= sheet_names.length) return [];
+        return [{
+            sourceSheetIndex: source_sheet_index,
+            firstRow: reference.firstRow,
+            firstColumn: reference.firstColumn,
+            lastRow: reference.lastRow,
+            lastColumn: reference.lastColumn,
+        }];
+    });
 }
 
 /**

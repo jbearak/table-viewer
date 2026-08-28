@@ -5165,6 +5165,45 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-mount-id')).toBe(first_mount_id);
     });
 
+    it('projects recursive formula invalidations across worksheet switches', async () => {
+        const meta = make_meta(['People', 'Inventory'], false);
+        meta.sheets[0].formulaDependencies = [
+            // People!C1 depends on Inventory!B1.
+            0, 2, 1, 0, 1, 0, 1,
+        ];
+        meta.sheets[1].formulaDependencies = [
+            // Inventory!B1 depends on People!A1.
+            0, 1, 0, 0, 0, 0, 0,
+        ];
+        const { post_message } = await render_app();
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+
+        await click_button('Edit');
+        await dispatch_host_message({
+            type: 'editSessionResult',
+            granted: true,
+            editSessionId: 'formula-session',
+            sheetIndex: 0,
+            pendingEdits: { '0:0': { value: 'changed', base: 'old' } },
+        });
+
+        let impact = grid_shell_mock.latest_props
+            ?.pending_formula_impact as GridShellProps['pending_formula_impact'];
+        expect(impact?.has(0, 2)).toBe(true);
+        expect(impact?.size).toBe(1);
+
+        await click_sheet_tab('Inventory');
+        impact = grid_shell_mock.latest_props
+            ?.pending_formula_impact as GridShellProps['pending_formula_impact'];
+        expect(impact?.has(0, 1)).toBe(true);
+        expect(impact?.size).toBe(1);
+        expect(post_message.mock.calls.filter(([message]) => (
+            message?.type === 'requestEditSession'
+        ))).toHaveLength(1);
+    });
+
     it('advances the committed activation when the same session re-enters edit mode', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(

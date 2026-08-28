@@ -2,7 +2,7 @@ import type {
     ExcelHeaderOverride,
     WorkbookMeta,
     RenderedCell,
-    FormulaDependency,
+    PackedFormulaDependencies,
 } from './data-source/interface';
 import type { CompareRowStatus } from './diff-compare/compare-source';
 import type { XlsxCellFormatFields } from './spreadsheet-format';
@@ -49,7 +49,7 @@ export interface SheetData {
     merges: MergeRange[];
     columnCount: number;
     rowCount: number;
-    formulaDependencies?: readonly FormulaDependency[];
+    formulaDependencies?: PackedFormulaDependencies;
 }
 
 export interface CellData extends RichCellFields, XlsxCellFormatFields {

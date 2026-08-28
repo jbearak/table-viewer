@@ -28,14 +28,12 @@ import {
 import { OoxmlRefusalError, type OoxmlRefusalCode } from './ooxml-refusal';
 import { text_styles_equal, type CellTextStyle, type RichTextRun } from './cell-content';
 import {
-    build_formula_dependency_index,
-    transitive_formula_dependents,
+    compile_workbook_formula_graph,
 } from './formula-dependencies';
-import type { FormulaDependency } from './data-source/interface';
 import {
     is_xlsx_formula_text,
-    local_a1_formula_references,
     translate_a1_formula,
+    workbook_a1_formula_references,
 } from './xlsx-formula';
 import {
     classify_xlsx_cell_value,
@@ -54,8 +52,9 @@ export { iso_to_serial } from './xlsx-cell-value';
  * sparklines, pivot caches, drawing anchors, autofilter state, protection,
  * custom XML) is silently dropped on save. Here, an untouched byte range of the
  * worksheet XML is copied through verbatim, so preservation is a property of the
- * algorithm rather than a checklist we have to keep up to date. Parts other than
- * the edited worksheet are never even read (see `xlsx-package.ts`).
+ * algorithm rather than a checklist we have to keep up to date. Package-level
+ * planning may inspect formula structures on other sheets, but it replaces only
+ * edited worksheets and worksheets whose formula caches became stale.
  *
  * The unit of an explicit edit is one `<c>` element. For each edited cell we
  * either splice a replacement `<c>` over the existing one, or synthesize a new
@@ -121,6 +120,11 @@ export interface XlsxWriteOptions {
     readonly run_font_base?: (xf_index: number) => string;
     /** Worksheet name used to recognize explicit same-sheet A1 qualifiers. */
     readonly sheet_name?: string;
+    /** Workbook-planned formula cells whose cached `<v>` result is stale. */
+    readonly formula_result_invalidations?: readonly {
+        readonly row: number;
+        readonly column: number;
+    }[];
 }
 
 function encode_xml(s: string): string {
@@ -1090,12 +1094,12 @@ interface WorksheetFormulaCell {
 }
 
 interface WorksheetFormulaState {
-    readonly dependencies: FormulaDependency[];
+    readonly dependencies: number[];
     readonly cells: ReadonlyMap<string, Span>;
 }
 
 /**
- * Read formula coordinates and same-sheet references from the unedited part.
+ * Read formula coordinates and workbook-resolved references from the unedited part.
  * Shared followers borrow and translate their master's text, matching the XLSX
  * reader so the save and the reopen cannot disagree about their dependencies.
  */
@@ -1103,6 +1107,8 @@ function worksheet_formula_state(
     xml: Uint8Array,
     sheet_data: Span,
     sheet_name: string | undefined,
+    sheet_index = 0,
+    sheet_names: readonly string[] = [sheet_name ?? ''],
 ): WorksheetFormulaState {
     const formulas: WorksheetFormulaCell[] = [];
     scan_rows(xml, sheet_data.inner_start, sheet_data.inner_end, {
@@ -1141,7 +1147,7 @@ function worksheet_formula_state(
         }
     }
 
-    const dependencies: FormulaDependency[] = [];
+    const dependencies: number[] = [];
     const cells = new Map<string, Span>();
     for (const formula of formulas) {
         cells.set(`${formula.row}:${formula.col}`, formula.cell);
@@ -1161,21 +1167,59 @@ function worksheet_formula_state(
             effective = `=${formula.text}`;
         }
         if (effective === undefined) continue;
-        for (const reference of local_a1_formula_references(
+        for (const reference of workbook_a1_formula_references(
             effective,
-            sheet_name ?? '',
+            sheet_index,
+            sheet_names,
         )) {
-            dependencies.push([
+            dependencies.push(
                 formula.row,
                 formula.col,
+                reference.sourceSheetIndex,
                 reference.firstRow,
                 reference.firstColumn,
                 reference.lastRow,
                 reference.lastColumn,
-            ]);
+            );
         }
     }
     return { dependencies, cells };
+}
+
+/** Read workbook-resolved dependencies without materializing worksheet cells. */
+export function worksheet_formula_dependencies(
+    xml: Uint8Array,
+    sheet_index: number,
+    sheet_names: readonly string[],
+): readonly number[] {
+    const sheet_data = scan_worksheet_structure(xml).sheet_data;
+    if (!sheet_data) return [];
+    return worksheet_formula_state(
+        xml,
+        sheet_data,
+        sheet_names[sheet_index],
+        sheet_index,
+        sheet_names,
+    ).dependencies;
+}
+
+/** Remove only cached results for formula cells selected by workbook planning. */
+export function remove_formula_cached_values(
+    xml: Uint8Array,
+    cells: readonly { readonly row: number; readonly column: number }[],
+): Uint8Array {
+    if (cells.length === 0) return xml;
+    const sheet_data = scan_worksheet_structure(xml).sheet_data;
+    if (!sheet_data) return xml;
+    const state = worksheet_formula_state(xml, sheet_data, undefined);
+    const splices: Splice[] = [];
+    for (const { row, column } of cells) {
+        const cell = state.cells.get(`${row}:${column}`);
+        if (!cell) continue;
+        const value = find_first_element(xml, 'v', cell.inner_start, cell.inner_end);
+        if (value) splices.push({ start: value.start, end: value.end, text: '' });
+    }
+    return apply_utf8_splices(xml, splices);
 }
 
 /**
@@ -1270,10 +1314,17 @@ function apply_cell_edits_bytes(
     const new_rows: Array<{ row: number; text: string }> = [];
     const formula_state = worksheet_formula_state(xml, sheet_data, options.sheet_name);
     const edited_keys = new Set(edits.map((edit) => `${edit.row}:${edit.col}`));
-    const invalidated_formula_keys = transitive_formula_dependents(
-        build_formula_dependency_index(formula_state.dependencies),
-        edited_keys,
-    );
+    const invalidated_formula_keys = options.formula_result_invalidations === undefined
+        ? new Set(compile_workbook_formula_graph([{
+            formulaDependencies: formula_state.dependencies,
+        }]).invalidatedBy(edits.map((edit) => ({
+            sheetIndex: 0,
+            row: edit.row,
+            column: edit.col,
+        }))).forSheet(0).keys())
+        : new Set(options.formula_result_invalidations.map(
+            ({ row, column }) => `${row}:${column}`,
+        ));
     // Scanned once for the whole sheet, because grouped-formula members can be
     // identifiable only from the master's `ref`.
     const grouped_ranges = grouped_formula_ranges(xml);

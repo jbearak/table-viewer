@@ -153,8 +153,8 @@ describe('parse_xlsx', () => {
         const projected = new ExcelHeaderDataSource(source);
 
         const expected = [
-            [0, 1, 0, 0, 0, 0],
-            [0, 2, 0, 0, 1, 1],
+            0, 1, 0, 0, 0, 0, 0,
+            0, 2, 0, 0, 0, 1, 1,
         ];
         expect(data.sheets[0].formulaDependencies).toEqual(expected);
         expect(streaming.sheets[0].formulaDependencies).toEqual(expected);

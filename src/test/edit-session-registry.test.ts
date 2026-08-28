@@ -12,6 +12,18 @@ function make_session_ref(initial?: string) {
 }
 
 describe('edit session registry', () => {
+    it('publishes mutations from inactive worksheet stores through one revision', () => {
+        const { registry } = make_session_ref('session');
+        const revisions: number[] = [];
+        const unsubscribe = registry.subscribe(() => revisions.push(registry.revision()));
+
+        registry.for_sheet(1).commit('session', '4:2', { value: 'changed', base: 'old' });
+        registry.for_sheet(0).commit('session', '0:0', { value: 'front', base: 'back' });
+        unsubscribe();
+
+        expect(revisions).toEqual([1, 2]);
+    });
+
     it('returns the same store for the same sheet across calls', () => {
         const { registry } = make_session_ref('session');
 

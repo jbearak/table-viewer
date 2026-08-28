@@ -6,6 +6,7 @@ import React, {
     useCallback,
     useMemo,
     useLayoutEffect,
+    useSyncExternalStore,
 } from 'react';
 import {
     EMPTY_TRANSFORM,
@@ -26,6 +27,7 @@ import {
     type CellHighlightState,
     type HighlightCellDelta,
     dirty_entries_equal,
+    dirty_entry_value_changed,
     type CsvDirtyEntry,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
@@ -44,6 +46,7 @@ import {
     type WorksheetTarget,
 } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
+import { compile_workbook_formula_graph } from '../formula-dependencies';
 import {
     classify_snapshot,
     normalize_complete_per_file_state,
@@ -571,6 +574,33 @@ export function App(): React.JSX.Element {
             () => csv_edit_session_id_ref.current,
         );
     }
+    const edit_registry_revision = useSyncExternalStore(
+        edit_session_registry_ref.current.subscribe,
+        edit_session_registry_ref.current.revision,
+        edit_session_registry_ref.current.revision,
+    );
+    const formula_roots_projection = useMemo(() => {
+        const roots: Array<{ sheetIndex: number; row: number; column: number }> = [];
+        for (const [sheetIndex, store] of edit_session_registry_ref.current!.entries()) {
+            for (const [key, entry] of store.snapshot()) {
+                if (!dirty_entry_value_changed(entry)) continue;
+                const [row, column] = key.split(':').map(Number);
+                if (Number.isSafeInteger(row) && Number.isSafeInteger(column)) {
+                    roots.push({ sheetIndex, row, column });
+                }
+            }
+        }
+        roots.sort((left, right) => (left.sheetIndex - right.sheetIndex)
+            || (left.row - right.row) || (left.column - right.column));
+        return {
+            roots,
+            signature: roots.map(
+                ({ sheetIndex, row, column }) => `${sheetIndex}:${row}:${column}`,
+            ).join('|'),
+        };
+    }, [edit_registry_revision]);
+    const formula_roots = formula_roots_projection.roots;
+    const formula_root_signature = formula_roots_projection.signature;
     const [edit_mode, set_edit_mode_state] = useState(false);
     // Diff toggle (before/after view of dirty cells). Deliberately never reset
     // when edit mode exits: the button hides with edit mode, but the choice
@@ -970,6 +1000,43 @@ export function App(): React.JSX.Element {
     const restore_abandoned_ref = useRef<boolean[]>([]);
     const generation_ref = useRef(1);
     const source_generation_ref = useRef(1);
+    // Metadata is cloned into every host delivery, but formula topology changes
+    // only when the adopted source changes. Key the compiled graph to that fact,
+    // plus the document epoch that disambiguates a new file restarting counters.
+    const formula_graph_cache_ref = useRef<{
+        key: string;
+        graph: ReturnType<typeof compile_workbook_formula_graph>;
+    }>();
+    const formula_graph_key = `${load_epoch}:${source_generation_ref.current}`;
+    if (
+        formula_graph_cache_ref.current === undefined
+        || formula_graph_cache_ref.current.key !== formula_graph_key
+    ) {
+        formula_graph_cache_ref.current = {
+            key: formula_graph_key,
+            graph: compile_workbook_formula_graph(meta?.sheets ?? []),
+        };
+    }
+    const workbook_formula_graph = formula_graph_cache_ref.current.graph;
+    // Changing the text of an already-dirty cell keeps the same dependency
+    // roots, so the common typing path avoids retraversing the graph.
+    const formula_impact_cache_ref = useRef<{
+        graph: typeof workbook_formula_graph;
+        roots: string;
+        impact: ReturnType<typeof workbook_formula_graph.invalidatedBy>;
+    }>();
+    if (
+        formula_impact_cache_ref.current === undefined
+        || formula_impact_cache_ref.current.graph !== workbook_formula_graph
+        || formula_impact_cache_ref.current.roots !== formula_root_signature
+    ) {
+        formula_impact_cache_ref.current = {
+            graph: workbook_formula_graph,
+            roots: formula_root_signature,
+            impact: workbook_formula_graph.invalidatedBy(formula_roots),
+        };
+    }
+    const formula_impact = formula_impact_cache_ref.current.impact;
     const mapping_generations_ref = useRef<number[]>([]);
     const histogram_cache_ref = useRef(new Map<string, FilterHistogramReady>());
     const pending_histogram_ref = useRef<{
@@ -5624,6 +5691,7 @@ export function App(): React.JSX.Element {
             key={`${active_sheet_index}:${current_sheet.worksheetId ?? current_sheet.name}:${load_epoch}:${generation}`}
             sheet_meta={current_sheet}
             sheet_index={active_sheet_index}
+            pending_formula_impact={formula_impact.forSheet(active_sheet_index)}
             generation={generation}
             row_count={effective_row_count}
             show_formatting={show_formatting}

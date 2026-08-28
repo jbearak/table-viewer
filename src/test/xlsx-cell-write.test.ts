@@ -1782,6 +1782,56 @@ describe('write_xlsx_cell_edits', () => {
         });
     });
 
+    it('reopens recursive cross-sheet formula dependents as unknown', async () => {
+        const raw = patched_basic([
+            [
+                '/xl/worksheets/sheet1.xml',
+                '<c r="B2"><v>30</v></c><c r="C2" t="b"><v>1</v></c>',
+                '<c r="B2"><v>30</v></c>'
+                    + '<c r="C2"><f>Inventory!B2*3</f><v>60</v></c>',
+            ],
+            [
+                '/xl/worksheets/sheet2.xml',
+                '<c r="B2"><v>9.99</v></c>',
+                '<c r="B2"><f>people!B2*2</f><v>20</v></c>',
+            ],
+        ]);
+
+        const parsed_source = (await parse_xlsx(raw)).data;
+        expect(parsed_source.sheets[0].formulaDependencies).toEqual([
+            1, 2, 1, 1, 1, 1, 1,
+        ]);
+        expect(parsed_source.sheets[1].formulaDependencies).toEqual([
+            1, 1, 0, 1, 1, 1, 1,
+        ]);
+
+        const out = write_xlsx_workbook_cell_edits(raw, [
+            { sheetIndex: 0, edits: [{ row: 1, col: 1, value: '40' }] },
+        ]);
+        const { data } = await parse_xlsx(out);
+
+        expect(data.sheets[0].rows[1][1]?.raw).toBe(40);
+        expect(data.sheets[1].rows[1][1]).toMatchObject({
+            raw: '=people!B2*2',
+            formatted: '??',
+            formula: '=people!B2*2',
+            formulaResultPending: true,
+        });
+        expect(data.sheets[0].rows[1][2]).toMatchObject({
+            raw: '=Inventory!B2*3',
+            formatted: '??',
+            formula: '=Inventory!B2*3',
+            formulaResultPending: true,
+        });
+
+        const hinted = write_xlsx_workbook_cell_edits(raw, [
+            { sheetIndex: 0, edits: [{ row: 1, col: 1, value: '40' }] },
+        ], { formulaDependencies: parsed_source.sheets });
+        const hinted_data = (await parse_xlsx(hinted)).data;
+        expect(hinted_data.sheets[1].rows[1][1]?.formulaResultPending).toBe(true);
+        expect(hinted_data.sheets[0].rows[1][2]?.formulaResultPending).toBe(true);
+    });
+
     it('writes several worksheets through one workbook operation', async () => {
         const raw = readFileSync('src/test/fixtures/basic.xlsx');
         const out = write_xlsx_workbook_cell_edits(raw, [
@@ -2281,8 +2331,9 @@ describe('write_xlsx_cell_edits', () => {
     it('leaves every part it did not edit byte-identical', () => {
         const raw = readFileSync(SAMPLE);
         const out = write_xlsx_cell_edits(raw, 2, [{ row: 1, col: 1, value: '42' }]);
-        // This is the core putexcel guarantee: parts we never touch are never
-        // even parsed, so unmodelled features survive by construction.
+        // This is the core putexcel guarantee: dependency discovery may inspect
+        // worksheet formula structures, but parts with no edit or invalidated
+        // cache keep their original ZIP record byte-for-byte.
         for (const path of [
             '/xl/styles.xml',
             '/xl/theme/theme1.xml',

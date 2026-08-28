@@ -71,20 +71,14 @@ export interface ColumnFilterMetadata {
 }
 
 /**
- * One same-worksheet formula reference, encoded as
- * `[formulaRow, formulaColumn, firstRow, firstColumn, lastRow, lastColumn]`.
- * Coordinates use the canonical source space. A compact tuple keeps workbook
- * snapshots proportional to the number of references without repeating field
- * names for every formula.
+ * Formula references packed seven numbers at a time on the worksheet that owns
+ * the formula:
+ * `[formulaRow, formulaColumn, sourceSheetIndex,
+ * firstRow, firstColumn, lastRow, lastColumn]`.
+ * Coordinates use canonical physical source space. One flat array per sheet
+ * avoids an object or inner-array allocation for every reference.
  */
-export type FormulaDependency = readonly [
-    formulaRow: number,
-    formulaColumn: number,
-    firstRow: number,
-    firstColumn: number,
-    lastRow: number,
-    lastColumn: number,
-];
+export type PackedFormulaDependencies = readonly number[];
 
 export interface RowWindow {
     startRow: number;                 // 0-based, absolute
@@ -148,8 +142,8 @@ export interface SheetMeta {
     estimatedRowBytes?: number;
     merges: MergeRange[];             // from types.ts (rowSpan + colSpan)
     hasFormatting: boolean;
-    /** Same-sheet A1 references used to invalidate cached formula results. */
-    formulaDependencies?: readonly FormulaDependency[];
+    /** Workbook-resolved A1 references used to invalidate cached formula results. */
+    formulaDependencies?: PackedFormulaDependencies;
     /** Per-column header titles. Length === columnCount; a blank entry means
      *  "no name" and the renderer falls back to the column letter. */
     columnNames?: string[];

@@ -37,11 +37,10 @@ import {
 } from './xlsx-rich-text';
 import { parse_relationships, rels_path_for_part, type OoxmlRelationship } from './ooxml-relationships';
 import {
-    local_a1_formula_references,
+    workbook_a1_formula_references,
     translate_a1_formula,
     UNKNOWN_XLSX_FORMULA_RESULT,
 } from './xlsx-formula';
-import type { FormulaDependency } from './data-source/interface';
 
 // The XML scanning primitives live in ./ooxml-xml so the rich-text and
 // hyperlink parsers (and the writer) share the exact same scans.
@@ -390,7 +389,7 @@ function parse_dimension(xml: Uint8Array): { row_count: number; col_count: numbe
  */
 interface WorksheetWorking extends WorkingSet {
     merges: MergeRange[];
-    formula_dependencies: FormulaDependency[];
+    formula_dependencies: number[];
 }
 
 /** Optional probe used by tests to prove ordinary numeric values avoid decoding. */
@@ -499,7 +498,8 @@ function parse_worksheet_core(
     datemode: DateMode,
     budget: WorkbookBudget,
     sheet_rels: Map<string, OoxmlRelationship>,
-    sheet_name: string,
+    sheet_index: number,
+    sheet_names: readonly string[],
 ): WorksheetWorking {
     // Rich-run resolution cache: one shared string may be referenced by many
     // cells, but binding (run inheritance) depends only on the cell font, so
@@ -543,7 +543,7 @@ function parse_worksheet_core(
 
     // Parse cells
     const cells = new Map<string, CellData>();
-    const formula_dependencies: FormulaDependency[] = [];
+    const formula_dependencies: number[] = [];
     let max_row = 0;
     let max_col = 0;
 
@@ -739,18 +739,20 @@ function parse_worksheet_core(
                     formula_result_pending = true;
                 }
                 if (effective_formula !== undefined) {
-                    for (const reference of local_a1_formula_references(
+                    for (const reference of workbook_a1_formula_references(
                         effective_formula,
-                        sheet_name,
+                        sheet_index,
+                        sheet_names,
                     )) {
-                        formula_dependencies.push([
+                        formula_dependencies.push(
                             row,
                             col,
+                            reference.sourceSheetIndex,
                             reference.firstRow,
                             reference.firstColumn,
                             reference.lastRow,
                             reference.lastColumn,
-                        ]);
+                        );
                     }
                 }
                 const cell: CellData = {
@@ -991,9 +993,14 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookDa
     const sheets: SheetData[] = [];
     const workings: WorksheetWorking[] = [];
 
-    for (const entry of sheet_entries) {
-        const sheet_path = rels.get(entry.rId);
-        if (!sheet_path) continue;
+    const present_entries = sheet_entries.flatMap((entry) => {
+        const path = rels.get(entry.rId);
+        return path === undefined ? [] : [{ entry, path }];
+    });
+    const sheet_names = present_entries.map(({ entry }) => entry.name);
+
+    for (let sheet_index = 0; sheet_index < present_entries.length; sheet_index += 1) {
+        const { entry, path: sheet_path } = present_entries[sheet_index];
 
         const ws_content = get_entry_bytes(zip, `/${sheet_path}`);
         if (!ws_content) {
@@ -1011,7 +1018,7 @@ export async function parse_xlsx(buffer: Uint8Array): Promise<{ data: WorkbookDa
 
         const working = parse_worksheet_core(
             worksheet_scan_input(ws_content), sst, xfs, fonts, format_map, datemode, budget,
-            worksheet_rels(zip, sheet_path), entry.name,
+            worksheet_rels(zip, sheet_path), sheet_index, sheet_names,
         );
         workings.push(working);
 
@@ -1045,9 +1052,14 @@ export async function parse_xlsx_streaming(buffer: Uint8Array): Promise<Streamin
     const sheets: StreamingSheet[] = [];
     const workings: WorksheetWorking[] = [];
 
-    for (const entry of sheet_entries) {
-        const sheet_path = rels.get(entry.rId);
-        if (!sheet_path) continue;
+    const present_entries = sheet_entries.flatMap((entry) => {
+        const path = rels.get(entry.rId);
+        return path === undefined ? [] : [{ entry, path }];
+    });
+    const sheet_names = present_entries.map(({ entry }) => entry.name);
+
+    for (let sheet_index = 0; sheet_index < present_entries.length; sheet_index += 1) {
+        const { entry, path: sheet_path } = present_entries[sheet_index];
 
         const ws_content = get_entry_bytes(zip, `/${sheet_path}`);
         if (!ws_content) {
@@ -1064,7 +1076,7 @@ export async function parse_xlsx_streaming(buffer: Uint8Array): Promise<Streamin
 
         const working = parse_worksheet_core(
             worksheet_scan_input(ws_content), sst, xfs, fonts, format_map, datemode, budget,
-            worksheet_rels(zip, sheet_path), entry.name,
+            worksheet_rels(zip, sheet_path), sheet_index, sheet_names,
         );
         workings.push(working);
         sheets.push(make_streaming_sheet(

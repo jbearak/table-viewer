@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
+    a1_formula_references,
     is_xlsx_formula_text,
     local_a1_formula_references,
     translate_a1_formula,
+    workbook_a1_formula_references,
 } from '../xlsx-formula';
 
 describe('is_xlsx_formula_text', () => {
@@ -72,6 +74,55 @@ describe('local_a1_formula_references', () => {
         )).toEqual([
             { firstRow: 0, firstColumn: 0, lastRow: 0, lastColumn: 0 },
             { firstRow: 6, firstColumn: 6, lastRow: 6, lastColumn: 6 },
+        ]);
+    });
+});
+
+describe('a1_formula_references', () => {
+    it('retains cross-sheet qualifiers and decodes quoted apostrophes', () => {
+        expect(a1_formula_references(
+            '=Sheet2!A1+\'Sales Q1\'!B2+\'Director\'\'s Cut\'!C3+D4',
+        )).toEqual([
+            { sheetName: 'Sheet2', firstRow: 0, firstColumn: 0, lastRow: 0, lastColumn: 0 },
+            { sheetName: 'Sales Q1', firstRow: 1, firstColumn: 1, lastRow: 1, lastColumn: 1 },
+            {
+                sheetName: "Director's Cut",
+                firstRow: 2,
+                firstColumn: 2,
+                lastRow: 2,
+                lastColumn: 2,
+            },
+            { firstRow: 3, firstColumn: 3, lastRow: 3, lastColumn: 3 },
+        ]);
+    });
+
+    it('ignores external workbooks and unsupported 3D references', () => {
+        expect(a1_formula_references('=[Book.xlsx]Sheet2!A1+Sheet1:Sheet3!B2'))
+            .toEqual([]);
+    });
+});
+
+describe('workbook_a1_formula_references', () => {
+    it('resolves qualified names case-insensitively and drops unknown sheets', () => {
+        expect(workbook_a1_formula_references(
+            '=people!A1+Missing!B2+C3',
+            1,
+            ['People', 'Inventory'],
+        )).toEqual([
+            {
+                sourceSheetIndex: 0,
+                firstRow: 0,
+                firstColumn: 0,
+                lastRow: 0,
+                lastColumn: 0,
+            },
+            {
+                sourceSheetIndex: 1,
+                firstRow: 2,
+                firstColumn: 2,
+                lastRow: 2,
+                lastColumn: 2,
+            },
         ]);
     });
 });
