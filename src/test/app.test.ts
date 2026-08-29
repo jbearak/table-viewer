@@ -6930,7 +6930,7 @@ describe('edit mode save exit', () => {
         expect(grid_shell_mock.flush_live_edit).not.toHaveBeenCalled();
     });
 
-    it('restores the worksheet scroll position after a save snapshot remounts the grid', async () => {
+    it('keeps the worksheet grid mounted across a save snapshot', async () => {
         await render_app();
         const meta = make_meta(['People'], false);
         await dispatch_host_message(initial_snapshot_message(meta, {
@@ -6955,11 +6955,36 @@ describe('edit mode save exit', () => {
             },
         }));
 
-        expect(grid_stub().getAttribute('data-mount-id')).not.toBe(before_mount);
+        expect(grid_stub().getAttribute('data-mount-id')).toBe(before_mount);
+        expect(grid_stub().getAttribute('data-generation')).toBe('2');
         expect(grid_shell_mock.latest_props?.initial_scroll_position).toEqual({
             left: 640,
             top: 1280,
         });
+    });
+
+    it('remounts a transformed worksheet when a save snapshot resets its row mapping', async () => {
+        const { post_message } = await render_app();
+        const sorted = {
+            sort: [{ colIndex: 0, direction: 'asc' as const }],
+            filters: [],
+            schema: '["Sheet1",1,null]',
+        };
+        await load_acknowledged_transform(post_message, sorted);
+        const before_mount = grid_stub().getAttribute('data-mount-id');
+
+        await dispatch_host_message(refresh_snapshot_message(
+            make_meta(['Sheet1']),
+            {
+                generation: 3,
+                sourceGeneration: 2,
+                reason: 'save',
+                state: { transforms: [sorted] },
+            },
+        ));
+
+        expect(grid_stub().getAttribute('data-mount-id')).not.toBe(before_mount);
+        expect(latest_transform_request(post_message).state).toEqual(sorted);
     });
 
     it('keeps scroll positions with their identified worksheets across a reorder', async () => {

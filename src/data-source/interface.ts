@@ -190,6 +190,10 @@ export interface DataSource {
         sheet_index: number,
         source_row: number,
     ): number | undefined;
+    /** Opaque identity for one sheet's projected-to-source row mapping. Sources
+     * with a non-identity mapping must implement this to prove that two rebuilt
+     * instances expose the same display-row identities. */
+    row_projection_signature?(sheet_index: number): string | undefined;
     /** Materialize a window of rows for one sheet. count may overshoot rowCount. */
     read_rows(sheet_index: number, start_row: number, count: number): RowWindow;
     /** Materialize arbitrary absolute rows in requested order without reading
@@ -283,6 +287,22 @@ export interface DataSource {
     headerLine?: string;
     /** CSV save path: detected line terminator, so re-serialization round-trips. */
     lineEnding?: '\r\n' | '\r' | '\n';
+}
+
+/** Return a comparable row-projection identity. Omitting all row-mapping
+ * methods is the DataSource contract's identity mapping; a custom mapper that
+ * supplies no signature deliberately cannot prove stability across rebuilds. */
+export function source_row_projection_signature(
+    source: DataSource,
+    sheet_index: number,
+): string | undefined {
+    if (!source.meta().sheets[sheet_index]) return undefined;
+    if (source.row_projection_signature) {
+        return source.row_projection_signature(sheet_index);
+    }
+    return source.source_row_indices || source.projected_row_index
+        ? undefined
+        : 'data-source:identity:v1';
 }
 
 /** Map projected DataSource rows to canonical source rows. Identity sources

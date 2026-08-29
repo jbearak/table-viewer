@@ -198,6 +198,8 @@ export interface FileRefreshEvent {
     readonly episode: number;
     readonly reason: FileRefreshReason;
     readonly priority: 'normal' | 'high';
+    /** The exact bytes written by the save that requested this episode. */
+    readonly savedDigest?: string;
 }
 
 export type FileRefreshSubscriberResult =
@@ -218,7 +220,7 @@ export interface FileRefreshSubscription {
     /** Hold watcher dispatch across the final checked-write boundary. A following
      * postSave request absorbs the held batch; cancel releases it normally. */
     reserve_post_save(): { cancel(): void };
-    request(reason: 'postSave'): Promise<FileRefreshRequestResult>;
+    request(reason: 'postSave', savedDigest: string): Promise<FileRefreshRequestResult>;
     dispose(): void;
 }
 
@@ -371,12 +373,14 @@ function dispatch_refresh(
     reason: FileRefreshReason,
     priority: 'normal' | 'high',
     requester?: RefreshSubscriberState,
+    saved_digest?: string,
 ): { event: FileRefreshEvent; completion?: Promise<void> } {
     const event = deep_clone_and_freeze({
         refreshRevision: revision,
         episode: ++entry.refreshEpisode,
         reason,
         priority,
+        ...(saved_digest !== undefined ? { savedDigest: saved_digest } : {}),
     });
     return {
         event,
@@ -1469,7 +1473,7 @@ export function acquire_file_coordinator(
                         },
                     };
                 },
-                request(reason) {
+                request(reason, saved_digest) {
                     if (subscriber.disposed || !entry.refreshSubscribers.has(subscriber)) {
                         return Promise.resolve({ type: 'disposed' });
                     }
@@ -1507,6 +1511,7 @@ export function acquire_file_coordinator(
                             reason,
                             'high',
                             subscriber,
+                            saved_digest,
                         );
                         void Promise.resolve(dispatched.completion).then(
                             () => {
