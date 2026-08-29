@@ -514,7 +514,9 @@ export function write_xlsx_workbook_cell_edits(
                 `${move.order ?? 0}:${move.sheetIndex}:${move.sourceRow}:${move.sourceColumn}`,
             );
             const source_edit = edits_by_address.get(source_key);
-            if (!destination_in_operation && (
+            const source_rewritten_after_move = source_edit?.valueEditOrder !== undefined
+                && source_edit.valueEditOrder > (move.order ?? 0);
+            if (!destination_in_operation && !source_rewritten_after_move && (
                 source_edit === undefined ? content_sources.has(source_key) : source_edit.value !== ''
             )) {
                 throw new Error('A move source was not cleared');

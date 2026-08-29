@@ -18,7 +18,11 @@ import {
 const grid_mock = vi.hoisted(() => ({
     props: null as null | {
         onCellsEdited?: (
-            items: readonly { location: [number, number]; value: { kind: string; data: string } }[],
+            items: readonly {
+                location: [number, number];
+                value: { kind: string; data: string };
+                movedFrom?: [number, number];
+            }[],
             source: string,
         ) => boolean | void;
         onGridSelectionChange?: (selection: unknown) => void;
@@ -49,6 +53,7 @@ const grid_mock = vi.hoisted(() => ({
     // attached to the right row however the mapping is permuted.
     source_row_for_display: null as null | ((display_row: number) => number | undefined),
     text_for_source_row: null as null | ((source_row: number) => readonly string[]),
+    formula_for_source_cell: null as null | ((source_row: number, column: number) => string | undefined),
 }));
 
 vi.mock('../webview/glide-data-grid', () => {
@@ -108,11 +113,14 @@ vi.mock('../webview/use-row-loader', () => ({
             // Page not resident: the real loader returns undefined, which
             // get_cell_raw must forward as "unknown", never as a blank cell.
             if (source_row === undefined) return undefined;
-            return source_row_text(source_row).map((raw) => ({
+            return source_row_text(source_row).map((raw, column) => ({
                 raw,
                 formatted: raw,
                 bold: false,
                 italic: false,
+                ...(grid_mock.formula_for_source_cell?.(source_row, column) === undefined
+                    ? {}
+                    : { formula: grid_mock.formula_for_source_cell(source_row, column) }),
             }));
         },
         get_source_row: (display_row: number) => (
@@ -129,7 +137,14 @@ vi.mock('../webview/use-row-loader', () => ({
             if (resident_display_row(source_row) === undefined) return undefined;
             const raw = source_row_text(source_row)[col];
             if (raw === undefined) return null;
-            return { raw, formatted: raw, bold: false, italic: false };
+            const formula = grid_mock.formula_for_source_cell?.(source_row, col);
+            return {
+                raw,
+                formatted: raw,
+                bold: false,
+                italic: false,
+                ...(formula === undefined ? {} : { formula }),
+            };
         },
         has_source_row: (source_row: number) => resident_display_row(source_row) !== undefined,
         sample_loaded_rows: () => [],
@@ -198,6 +213,13 @@ async function render_grid(
         on_save_request?: () => CsvSaveOperation | undefined;
         initial_scroll_position?: { left: number; top: number };
         on_scroll_position_change?: (position: { left: number; top: number }) => void;
+        edit_syntax?: 'plain' | 'markdown';
+        value_edit_order_floor?: number;
+        formula_move_retargeter?: (
+            formula: string,
+            sheet_index: number,
+            after_order?: number,
+        ) => string;
     } = {},
 ) {
     vi.resetModules();
@@ -400,6 +422,7 @@ afterEach(() => {
     // which source row every later test's edits land on.
     grid_mock.source_row_for_display = null;
     grid_mock.text_for_source_row = null;
+    grid_mock.formula_for_source_cell = null;
     vi.unstubAllGlobals();
 });
 
@@ -1393,9 +1416,202 @@ describe('GridShell source-keyed save payloads', () => {
             },
         });
     });
+
+    it('commit_live_edit preserves a deliberate choice made against a retargeted formula', async () => {
+        permute_display_0_to_source_5();
+        grid_mock.text_for_source_row = (source_row: number) => (
+            source_row === 5 ? ['=A1', 'five-b', 'five-c'] : ['', '', '']
+        );
+        grid_mock.formula_for_source_cell = (source_row, column) => (
+            source_row === 5 && column === 0 ? '=A1' : undefined
+        );
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        const { editing_ref } = await render_grid(undefined, {
+            edit_session: store,
+            edit_syntax: 'markdown',
+            formula_move_retargeter: (formula, _sheet_index, after_order) => (
+                after_order === undefined ? '=B1' : formula
+            ),
+        });
+
+        // The editor opened on the effective =B1. The user explicitly chose the
+        // persisted spelling =A1 again, then a remount boundary folded the live
+        // editor before Glide's ordinary finish callback.
+        await open_overlay('=A1', [0, 0]);
+        editing_ref.current!.commit_live_edit();
+
+        expect(store.get('5:0')).toMatchObject({
+            value: '=A1',
+            base: '=A1',
+            formattingKnown: true,
+            valueEditOrder: expect.any(Number),
+        });
+    });
 });
 
 describe('GridShell host-rejected save keys', () => {
+    it('gives a cut source and destination the same move order', async () => {
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        await render_grid({
+            visible_to_source: [0, 1],
+            source_to_visible: [0, 1, undefined],
+            hidden_count: 1,
+        }, {
+            edit_session: store,
+            edit_syntax: 'markdown',
+        });
+
+        await act(async () => {
+            grid_mock.props!.onCellsEdited!([
+                { location: [0, 0], value: { kind: 'text', data: '' } },
+                {
+                    location: [1, 0],
+                    value: { kind: 'text', data: 'base' },
+                    movedFrom: [0, 0],
+                },
+            ], 'paste');
+        });
+
+        const source = store.snapshot().get('0:0');
+        const destination = store.snapshot().get('0:1');
+        expect(source?.valueEditOrder).toBeDefined();
+        expect(destination?.valueEditOrder).toBe(source?.valueEditOrder);
+        expect(destination?.movedFrom).toEqual({
+            row: 0,
+            col: 0,
+            order: source?.valueEditOrder,
+        });
+    });
+
+    it('orders an explicit same-formula paste after a move but ignores an unchanged edit close', async () => {
+        grid_mock.text_for_source_row = () => ['source', 'destination', '=A1'];
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        await render_grid({
+            visible_to_source: [0, 1, 2],
+            source_to_visible: [0, 1, 2],
+            hidden_count: 0,
+        }, {
+            edit_session: store,
+            edit_syntax: 'markdown',
+        });
+
+        await act(async () => {
+            grid_mock.props!.onCellsEdited!([
+                { location: [0, 0], value: { kind: 'text', data: '' } },
+                {
+                    location: [1, 0],
+                    value: { kind: 'text', data: 'source' },
+                    movedFrom: [0, 0],
+                },
+            ], 'paste');
+        });
+        const move_order = store.get('0:1')?.valueEditOrder;
+        expect(move_order).toBeDefined();
+
+        await act(async () => {
+            grid_mock.props!.onCellsEdited!([
+                { location: [2, 0], value: { kind: 'text', data: '=A1' } },
+            ], 'edit');
+        });
+        expect(store.get('0:2')).toBeUndefined();
+
+        await act(async () => {
+            grid_mock.props!.onCellsEdited!([
+                { location: [2, 0], value: { kind: 'text', data: '=A1' } },
+            ], 'paste');
+        });
+        expect(store.get('0:2')).toMatchObject({
+            value: '=A1',
+            base: '=A1',
+            formattingKnown: true,
+        });
+        expect(store.get('0:2')?.valueEditOrder).toBeGreaterThan(move_order!);
+    });
+
+    it('floors new edit orders above restored durable move provenance', async () => {
+        grid_mock.text_for_source_row = () => ['source', 'destination', '=A1'];
+        const restored_order = Date.now() * 1_000 + 1_000_000;
+        const store = create_edit_session_store({ session_id: 'session-1' }, {
+            '0:0': { value: '', base: 'source', valueEditOrder: restored_order },
+            '0:1': {
+                value: 'source',
+                base: 'destination',
+                movedFrom: { row: 0, col: 0, order: restored_order },
+                valueEditOrder: restored_order,
+            },
+        });
+        await render_grid({
+            visible_to_source: [0, 1, 2],
+            source_to_visible: [0, 1, 2],
+            hidden_count: 0,
+        }, {
+            edit_session: store,
+            edit_syntax: 'markdown',
+        });
+
+        await act(async () => {
+            grid_mock.props!.onCellsEdited!([
+                { location: [0, 0], value: { kind: 'text', data: 'replacement' } },
+            ], 'edit');
+        });
+        const refill_order = store.get('0:0')?.valueEditOrder;
+        expect(refill_order).toBeGreaterThan(restored_order);
+
+        await act(async () => {
+            grid_mock.props!.onCellsEdited!([
+                { location: [2, 0], value: { kind: 'text', data: '=A1' } },
+            ], 'paste');
+        });
+        expect(store.get('0:2')?.valueEditOrder).toBeGreaterThan(refill_order!);
+    });
+
+    it('floors formula orders above provenance restored on another worksheet', async () => {
+        grid_mock.text_for_source_row = () => ['base', 'middle', '=A1'];
+        const workbook_floor = Date.now() * 1_000 + 1_000_000;
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        await render_grid({
+            visible_to_source: [0, 1, 2],
+            source_to_visible: [0, 1, 2],
+            hidden_count: 0,
+        }, {
+            edit_session: store,
+            edit_syntax: 'markdown',
+            value_edit_order_floor: workbook_floor,
+        });
+
+        await act(async () => {
+            grid_mock.props!.onCellsEdited!([
+                { location: [2, 0], value: { kind: 'text', data: '=A1' } },
+            ], 'paste');
+        });
+
+        expect(store.get('0:2')?.valueEditOrder).toBeGreaterThan(workbook_floor);
+    });
+
+    it('discard_keys removes both halves of a pending move', async () => {
+        const store = create_edit_session_store({ session_id: 'session-1' });
+        store.install(
+            { session_id: 'session-1' },
+            {
+                '0:0': { value: '', base: 'base', valueEditOrder: 7 },
+                '0:1': {
+                    value: 'base',
+                    base: 'other',
+                    movedFrom: { row: 0, col: 0, order: 7 },
+                    valueEditOrder: 7,
+                },
+            },
+        );
+        const { editing_ref } = await render_grid(undefined, {
+            edit_session: store,
+            generation: 1,
+        });
+
+        await act(async () => { editing_ref.current!.discard_keys(['0:1']); });
+
+        expect(Object.fromEntries(store.snapshot())).toEqual({});
+    });
+
     it('discard_keys drops a host-named edit that discard_conflicted retains', async () => {
         // Display row 0 shows source row 5, and source row 5's text still matches
         // the edit's base, so is_entry_conflicted is false for it — the residency /

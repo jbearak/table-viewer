@@ -41,6 +41,21 @@ describe('edit session registry', () => {
             destinationColumn: 3,
             order: 7,
         }]);
+        expect(registry.value_edit_order_floor()).toBe(7);
+    });
+
+    it('retains a workbook-wide order floor from inactive worksheet edits', () => {
+        const { registry } = make_session_ref('session');
+        registry.for_sheet(1).commit('session', '2:3', {
+            value: 'moved',
+            base: 'old',
+            movedFrom: { row: 0, col: 1, order: 90 },
+            valueEditOrder: 91,
+        });
+        registry.for_sheet(1).clear('session');
+
+        expect(registry.value_edit_order_floor()).toBe(91);
+        expect(registry.for_sheet(0).size()).toBe(0);
     });
 
     it('caches move projections until a store changes', () => {

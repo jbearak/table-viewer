@@ -31,6 +31,8 @@ import type { RenderedCell, SheetMeta } from '../data-source/interface';
 import {
     EMPTY_TRANSFORM,
     dirty_entry_value_dimension_present,
+    dirty_keys_with_move_closure,
+    latest_dirty_value_edit_order,
     type CellHighlightColor,
     type CellHighlightMutation,
     type CellHighlightSelection,
@@ -101,9 +103,13 @@ import {
 } from './cell-renderer';
 
 let last_value_edit_order = 0;
-function next_value_edit_order(): number {
+function next_value_edit_order(after_order = 0): number {
     const clock = Date.now() * 1_000;
-    last_value_edit_order = Math.max(clock, last_value_edit_order + 1);
+    const next = Math.max(clock, last_value_edit_order + 1, after_order + 1);
+    if (!Number.isSafeInteger(next)) {
+        throw new RangeError('Pending edit order exceeds the safe integer range');
+    }
+    last_value_edit_order = next;
     return last_value_edit_order;
 }
 import { is_rich_text_cell, rich_text_cell_renderer } from './rich-text-cell-renderer';
@@ -602,6 +608,8 @@ export interface GridShellProps {
     /** How this sheet's cells are edited ('markdown' for xlsx). Default 'plain'. */
     edit_syntax?: EditSyntax;
     edit_session_id?: string;
+    /** Workbook-wide durable order high-water mark, including inactive sheets. */
+    value_edit_order_floor?: number;
     /** App-owned operation survives generation-keyed GridShell remounts. */
     save_operation?: CsvSaveOperation;
     save_lifecycle?: CsvSaveLifecycle;
@@ -739,6 +747,7 @@ export function GridShell({
     highlight_in_flight = false,
     edit_syntax = 'plain',
     edit_session_id,
+    value_edit_order_floor = 0,
     save_operation,
     save_lifecycle = { revision: 0, state: 'idle' },
     on_save_request = () => undefined,
@@ -1168,6 +1177,13 @@ export function GridShell({
             history: history_store,
         }
     ), [history_store, sheet_index, sheet_meta.name, sheet_meta.worksheetId]);
+    const issue_value_edit_order = useCallback(
+        () => next_value_edit_order(Math.max(
+            value_edit_order_floor,
+            latest_dirty_value_edit_order(store.snapshot()),
+        )),
+        [store, value_edit_order_floor],
+    );
 
     const {
         dirty_cells,
@@ -1192,7 +1208,7 @@ export function GridShell({
                 ? formula_move_retargeter?.(text, sheet_index, after_order) ?? text
                 : text;
         },
-        next_value_edit_order,
+        next_value_edit_order: issue_value_edit_order,
         // Same identity discipline as get_cell_raw: rebinds with `version` so
         // freshly-loaded pages refresh markdown edit text and bases.
         get_cell: useCallback(
@@ -1929,6 +1945,7 @@ export function GridShell({
         source_column: number;
         edit_session_id: string | undefined;
         pin: symbol;
+        opened_value?: string;
     } | null>(null);
     // Remains raised while an overlay lifetime is revoked, then clears when
     // editing reopens or a newly mounted tracking editor captures admission.
@@ -2131,7 +2148,7 @@ export function GridShell({
         if (live && live.value !== live.original) {
             const [source_row, source_column] = live.key.split(':').map(Number);
             if (Number.isInteger(source_row) && Number.isInteger(source_column)) {
-                commit_edit(source_row, source_column, live.value);
+                commit_edit(source_row, source_column, live.value, live.original);
             }
         }
         const operation = on_save_request();
@@ -2264,7 +2281,7 @@ export function GridShell({
             // commit_edit's first parameter is a source row. No conversion here.
             const [source_row, source_column] = live.key.split(':').map(Number);
             if (Number.isInteger(source_row) && Number.isInteger(source_column)) {
-                commit_edit(source_row, source_column, live.value);
+                commit_edit(source_row, source_column, live.value, live.original);
                 // The display row for the same cell, read from the same selection
                 // `read_live_edit` derived `live.key` from and in the same
                 // synchronous block — so the two name one cell in the two spaces,
@@ -3185,7 +3202,26 @@ export function GridShell({
             if (gestures_admitted !== undefined && !gestures_admitted()) return true;
 
             const edits: CellValueEdit[] = [];
-            const edit_order = next_value_edit_order();
+            // A cut batch needs one shared explicit order on both its source
+            // clears and destinations. Paste/fill formula intent needs an order
+            // even when its text happens to equal the persisted formula: it was
+            // still chosen after any earlier pending move. Overlay edits remain
+            // lazy so closing an unchanged editor is a genuine no-op.
+            const move_gesture = edit_syntax === 'markdown'
+                && items.some((item) => item.movedFrom !== undefined);
+            const formula_gesture = edit_syntax === 'markdown'
+                && source !== 'edit'
+                && items.some(({ value }) => {
+                    const text = value.kind === GridCellKind.Text
+                        ? value.data ?? ''
+                        : value.kind === GridCellKind.Custom && is_rich_text_cell(value)
+                            ? value.data.edit_value ?? ''
+                            : '';
+                    return xlsx_edit_writes_formula(text, undefined);
+                });
+            const explicit_gesture_order = move_gesture || formula_gesture
+                ? issue_value_edit_order()
+                : undefined;
             const damaged: { cell: Item }[] = [];
             const grown_rows = new Set<number>();
             // Rectangular gestures repeat each display row across every column
@@ -3237,13 +3273,23 @@ export function GridShell({
                     : value.kind === GridCellKind.Custom && is_rich_text_cell(value)
                         ? value.data.edit_value ?? ''
                         : '';
+                const explicitly_ordered = move_gesture
+                    || (
+                        formula_gesture
+                        && xlsx_edit_writes_formula(text, undefined)
+                    );
                 edits.push({
                     source_row,
                     source_col: source_column,
                     value: text,
-                    ...(edit_syntax === 'markdown' && (
-                        movedFrom !== undefined || xlsx_edit_writes_formula(text, undefined)
-                    ) ? { editOrder: edit_order } : {}),
+                    ...(captured_matches && captured.opened_value !== undefined
+                        ? { openedValue: captured.opened_value }
+                        : {}),
+                    ...(
+                        explicit_gesture_order === undefined || !explicitly_ordered
+                            ? {}
+                            : { editOrder: explicit_gesture_order }
+                    ),
                     ...(movedFrom === undefined ? {} : {
                         movedFrom: {
                             source_row: movedFrom[1],
@@ -3307,6 +3353,7 @@ export function GridShell({
             editable_cells_ref,
             edit_session_id_ref,
             gestures_admitted,
+            issue_value_edit_order,
             source_column_for_display,
             commit_source_row,
             save_in_flight_ref,
@@ -3330,6 +3377,13 @@ export function GridShell({
         function TrackingCsvCellEditor(props: CsvCellEditorProps): React.JSX.Element {
             useEffect(() => {
                 capture_open_overlay_row();
+                const opened_value = read_live_edit_ref.current()?.original;
+                if (
+                    opened_value !== undefined
+                    && open_overlay_row_ref.current !== null
+                ) {
+                    open_overlay_row_ref.current.opened_value = opened_value;
+                }
                 refresh_live_uncommitted();
                 return () => {
                     // Ordering matters: on_cells_edited already ran by the time Glide
@@ -4708,6 +4762,16 @@ export function GridShell({
         // than guessing: it is also the case where discard_edit would have no key to
         // remove, so hiding "Discard edit" is the consistent answer.
         const menu_source_row = get_source_row(row);
+        const menu_dirty_key = menu_source_row === undefined
+            ? undefined
+            : cell_key(menu_source_row, source_col);
+        const discard_edit_cell_count = menu_dirty_key !== undefined
+            && dirty_cells.has(menu_dirty_key)
+            ? dirty_keys_with_move_closure(
+                dirty_cells,
+                new Set([menu_dirty_key]),
+            ).size
+            : 0;
         const menu_link_url = external_link_url(display_col, row);
         // Hyperlinks are a workbook concept: offered on the sheets that edit as
         // markdown (Excel), never on CSV/TSV, and only where the cell is
@@ -4730,8 +4794,8 @@ export function GridShell({
                     has_hyperlink: cell_hyperlink(display_col, row) !== undefined,
                 }
                 : {}),
-            dirty: menu_source_row !== undefined
-                && dirty_cells.has(`${menu_source_row}:${source_col}`),
+            dirty: discard_edit_cell_count > 0,
+            discard_edit_cell_count,
             has_distinct_copy_selection: has_explicit_column_selection
                 || has_explicit_row_selection
                 || has_distinct_copy_selection(

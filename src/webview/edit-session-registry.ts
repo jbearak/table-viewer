@@ -39,6 +39,7 @@
 
 import {
     dirty_entry_value_dimension_present,
+    latest_dirty_value_edit_order,
     worksheet_identity,
     worksheet_target_lookup,
     type CsvDirtyMap,
@@ -110,6 +111,8 @@ export interface EditSessionRegistry {
     revision(): number;
     /** Incrementally maintained formula inputs; unchanged by style/link-only writes. */
     formula_projection(): EditSessionFormulaProjection;
+    /** Highest value/move order observed anywhere in this workbook session. */
+    value_edit_order_floor(): number;
     /**
      * The store for one worksheet, created on first use.
      *
@@ -239,6 +242,9 @@ export function create_edit_session_registry(
     let formula_calculation_revision = 0;
     let too_many_formula_edits = false;
     let formula_moves: XlsxFormulaCellMove[] = [];
+    // Monotonic on purpose: removed/discarded edits do not make an already
+    // issued order reusable, and keeping the high-water mark makes lookup O(1).
+    let value_edit_order_floor = 0;
     const publish = () => {
         revision += 1;
         for (const listener of listeners) listener();
@@ -427,6 +433,10 @@ export function create_edit_session_registry(
     const watch = (store: EditSessionStore) => {
         if (subscriptions.has(store)) return;
         subscriptions.set(store, store.subscribe((change) => {
+            value_edit_order_floor = Math.max(
+                value_edit_order_floor,
+                latest_dirty_value_edit_order(store.snapshot()),
+            );
             if (change.kind === 'reset') rebuild_formula_projection();
             else if (change.kind === 'entry') {
                 for (const [sheetIndex, candidate] of stores) {
@@ -466,6 +476,7 @@ export function create_edit_session_registry(
             hasFormulaEdits: formula_edit_count > 0,
             moves: formula_moves,
         }),
+        value_edit_order_floor: () => value_edit_order_floor,
         for_sheet: (sheet_index) => {
             const existing = stores.get(sheet_index);
             if (existing) return existing;

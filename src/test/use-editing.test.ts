@@ -428,6 +428,31 @@ describe('pending edits affected by file changes', () => {
         expect(hook_result!.dirty_cells.has('0:1')).toBe(true);
     });
 
+    it('discard_edit removes every cell in a connected move chain', async () => {
+        await render();
+        await act(async () => {
+            hook_result!.replace_dirty({
+                '0:0': { value: '', base: 'a', valueEditOrder: 1 },
+                '0:1': {
+                    value: '',
+                    base: 'b',
+                    movedFrom: { row: 0, col: 0, order: 1 },
+                    valueEditOrder: 2,
+                },
+                '0:2': {
+                    value: 'a',
+                    base: 'c',
+                    movedFrom: { row: 0, col: 1, order: 2 },
+                    valueEditOrder: 2,
+                },
+            });
+        });
+
+        await act(async () => { hook_result!.discard_edit('0:1'); });
+
+        expect(hook_result!.dirty_cells.size).toBe(0);
+    });
+
     it('discard_conflicted removes only conflicted entries', async () => {
         await render(base_rows, 0);
         await act(async () => { hook_result!.toggle_edit_mode(); });
@@ -875,7 +900,7 @@ describe('use_editing — markdown syntax', () => {
         expect(hook_result!.dirty_cells.get('0:2')?.valueEditOrder).toBe(42);
     });
 
-    it('orders an explicit recommit of a loaded formula', async () => {
+    it('does not turn closing an unchanged formula editor into a pending edit', async () => {
         let order = 40;
         const formula_rows: (CellData | null)[][] = [[{
             raw: 2,
@@ -888,11 +913,132 @@ describe('use_editing — markdown syntax', () => {
 
         await act(async () => { hook_result!.commit_edit(0, 0, '=1+1'); });
 
+        expect(hook_result!.dirty_cells.has('0:0')).toBe(false);
+        expect(order).toBe(40);
+    });
+
+    it('keeps a deliberate change back from the formula shown when the editor opened', async () => {
+        let order = 40;
+        const formula_rows: (CellData | null)[][] = [[{
+            raw: 2,
+            formatted: '2',
+            formula: '=A1',
+            bold: false,
+            italic: false,
+        }]];
+        await render_markdown(formula_rows, () => ++order);
+
+        await act(async () => {
+            hook_result!.commit_edits([{
+                source_row: 0,
+                source_col: 0,
+                value: '=A1',
+                openedValue: '=B1',
+            }]);
+        });
+
         expect(hook_result!.dirty_cells.get('0:0')).toEqual({
-            value: '=1+1',
-            base: '=1+1',
+            value: '=A1',
+            base: '=A1',
+            formattingKnown: true,
             valueEditOrder: 41,
         });
+        expect(order).toBe(41);
+    });
+
+    it('ignores an unchanged effective formula that differs from its persisted source', async () => {
+        const formula_rows: (CellData | null)[][] = [[{
+            raw: 2,
+            formatted: '2',
+            formula: '=A1',
+            bold: false,
+            italic: false,
+        }]];
+        await render_markdown(formula_rows);
+
+        await act(async () => {
+            hook_result!.commit_edits([{
+                source_row: 0,
+                source_col: 0,
+                value: '=B1',
+                openedValue: '=B1',
+            }]);
+        });
+
+        expect(hook_result!.dirty_cells.has('0:0')).toBe(false);
+    });
+
+    it('records known plain formatting for an equal-value cut destination', async () => {
+        const move_rows: (CellData | null)[][] = [[cell('x'), cell('x')]];
+        await render_markdown(move_rows);
+
+        await act(async () => {
+            hook_result!.commit_edits([{
+                source_row: 0,
+                source_col: 0,
+                value: 'x',
+                editOrder: 7,
+                movedFrom: { source_row: 0, source_col: 1 },
+            }], 'Paste');
+        });
+
+        expect(hook_result!.dirty_cells.get('0:0')).toEqual({
+            value: 'x',
+            base: 'x',
+            formattingKnown: true,
+            movedFrom: { row: 0, col: 1, order: 7 },
+            valueEditOrder: 7,
+        });
+
+        move_rows[0][0] = {
+            raw: 'x',
+            formatted: 'x',
+            bold: true,
+            italic: false,
+        };
+        await act(async () => {
+            root!.render(React.createElement(MarkdownHarness, { rows: move_rows }));
+        });
+        expect(hook_result!.conflicted_keys.has('0:0')).toBe(true);
+        expect(hook_result!.dirty_cells.get('0:0')?.observedBase).toEqual({
+            value: 'x',
+            runs: { runs: [{ text: 'x', style: { bold: true } }] },
+        });
+    });
+
+    it('orders a literal refill of a pending move source after the move', async () => {
+        let order = 1;
+        const move_rows: (CellData | null)[][] = [[cell('source'), cell('destination')]];
+        await render_markdown(move_rows, () => ++order);
+        await act(async () => {
+            hook_result!.commit_edits([
+                {
+                    source_row: 0,
+                    source_col: 0,
+                    value: '',
+                    editOrder: 1,
+                },
+                {
+                    source_row: 0,
+                    source_col: 1,
+                    value: 'source',
+                    editOrder: 1,
+                    movedFrom: { source_row: 0, source_col: 0 },
+                },
+            ], 'Paste');
+            hook_result!.commit_edit(0, 0, 'replacement');
+        });
+
+        expect(hook_result!.dirty_cells.get('0:0')).toMatchObject({
+            value: 'replacement',
+            base: 'source',
+            valueEditOrder: 2,
+        });
+        expect(hook_result!.dirty_cells.get('0:1')).toMatchObject({
+            movedFrom: { row: 0, col: 0, order: 1 },
+            valueEditOrder: 1,
+        });
+        expect(order).toBe(2);
     });
 
     it('shares one order across every formula in a batch', async () => {
@@ -1207,8 +1353,21 @@ describe('use_editing — history capture', () => {
         });
 
         expect(hook_result!.dirty_cells.get('0:0')).toEqual({
-            value: 'a', base: 'a', valueEditOrder: 9,
+            value: 'a', base: 'a', formattingKnown: true, valueEditOrder: 9,
         });
+    });
+
+    it('drops stale formula order when ordinary text reverts to the file value', async () => {
+        await render_capturing();
+        await act(async () => {
+            hook_result!.commit_edits([{
+                source_row: 0, source_col: 0, value: '=A1', editOrder: 9,
+            }], 'Edit cell');
+            hook_result!.commit_edit(0, 0, 'a');
+        });
+
+        expect(hook_result!.dirty_cells.has('0:0')).toBe(false);
+        expect(undo_stack()).toHaveLength(2);
     });
 
     it('keeps canonical cut provenance even when the destination text is unchanged', async () => {
@@ -1226,6 +1385,7 @@ describe('use_editing — history capture', () => {
         expect(hook_result!.dirty_cells.get('0:0')).toEqual({
             value: 'a',
             base: 'a',
+            formattingKnown: true,
             movedFrom: { row: 4, col: 3, order: 1 },
             valueEditOrder: 1,
         });

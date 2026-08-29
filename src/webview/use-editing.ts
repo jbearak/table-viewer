@@ -13,6 +13,8 @@ import {
     dirty_entry_observed_base,
     dirty_entry_value_changed,
     dirty_entry_with_observed_file_base,
+    dirty_keys_with_move_closure,
+    latest_dirty_move_source_orders,
     make_dirty_entry,
     make_observed_file_base,
     type CsvDirtyEntry,
@@ -149,6 +151,9 @@ export interface CellValueEdit {
     readonly source_row: number;
     readonly source_col: number;
     readonly value: string;
+    /** Editor text shown when this commit began. Distinguishes an unchanged
+     * close from deliberately choosing a pre-move formula again. */
+    readonly openedValue?: string;
     readonly editOrder?: number;
     readonly movedFrom?: {
         readonly source_row: number;
@@ -256,7 +261,20 @@ function plan_value_write(
                 ],
             }),
         };
-    const value_edit_order = edit?.editOrder ?? before_entry?.valueEditOrder;
+    const same_as_pending_value = before_entry !== undefined && cell_edits_equal(parsed, {
+        text: before_entry.value,
+        rich: before_entry.valueRuns,
+    });
+    // A new ordinary edit replaces formula-order metadata. Keep the old order
+    // only when the commit leaves the pending value itself unchanged; otherwise
+    // a formula followed by a plain-text revert can survive as a phantom edit
+    // solely because its old order is still present.
+    const value_edit_order = edit?.editOrder
+        ?? (
+            same_as_pending_value || before_entry?.movedFrom !== undefined
+                ? before_entry?.valueEditOrder
+                : undefined
+        );
 
     // Semantic comparison: retyping a bold cell's own `**markup**`, however
     // spelled, is a revert; deleting the `**` is an edit.
@@ -275,7 +293,10 @@ function plan_value_write(
                 undefined,
                 undefined,
                 undefined,
-                undefined,
+                persisted_formatting_known
+                    && (moved_from !== undefined || value_edit_order !== undefined)
+                    ? true
+                    : undefined,
                 moved_from,
                 value_edit_order,
             ),
@@ -719,31 +740,76 @@ export function use_editing(
      */
     const commit_edits = useCallback(
         (edits: readonly CellValueEdit[], label = 'Edit cell'): void => {
-            let gesture_order: number | undefined;
+            let gesture_order = edits.find((edit) => edit.editOrder !== undefined)?.editOrder;
             const next_edit_order = options?.next_value_edit_order;
-            const ordered_edits = next_edit_order === undefined
-                ? edits
-                : edits.map((edit): CellValueEdit => {
-                    if (edit.editOrder !== undefined) return edit;
-                    const parsed = parse_cell_edit(edit.value, syntax);
-                    if (!xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs)) return edit;
-                    gesture_order ??= next_edit_order();
-                    return { ...edit, editOrder: gesture_order };
-                });
-            run_edit_gesture(ordered_edits, label, (edit, before_entry, _before_overlay, persisted) =>
-                plan_value_write(
+            const pending_entries = active_store.snapshot();
+            const pending_move_source_orders = syntax === 'markdown'
+                && next_edit_order !== undefined
+                ? latest_dirty_move_source_orders(pending_entries)
+                : new Map<string, number>();
+            run_edit_gesture(edits, label, (edit, before_entry, _before_overlay, persisted) => {
+                const parsed = parse_cell_edit(edit.value, syntax);
+                const explicitly_opened = edit.openedValue === undefined
+                    ? undefined
+                    : parse_cell_edit(edit.openedValue, syntax);
+                // Overlay finishes are reported even when their text never
+                // changed. This remains a no-op when pending moves made the
+                // effective formula shown by the editor differ from disk.
+                if (
+                    explicitly_opened !== undefined
+                    && cell_edits_equal(parsed, explicitly_opened)
+                ) return undefined;
+                let ordered_edit = edit;
+                if (edit.editOrder === undefined && next_edit_order !== undefined) {
+                    const current = before_entry === undefined
+                        ? persisted.base
+                        : { text: before_entry.value, rich: before_entry.valueRuns };
+                    const opened = explicitly_opened ?? current;
+                    const source_key = [edit.source_row, edit.source_col].join(':');
+                    const pending_move_source_order = pending_move_source_orders.get(source_key);
+                    const value_changed = !cell_edits_equal(parsed, opened);
+                    const opened_was_retargeted = edit.openedValue !== undefined
+                        && !cell_edits_equal(opened, current);
+                    const value_survives = !cell_edits_equal(parsed, persisted.base)
+                        || pending_move_source_order !== undefined
+                        || opened_was_retargeted;
+                    // Glide finishes an overlay even when its text never changed.
+                    // Such a close is a no-op, not a new formula decision. A
+                    // genuinely changed formula still receives the gesture's
+                    // shared order so pending moves apply on the correct side of
+                    // that edit. A reused move source also needs a later order:
+                    // its final nonblank value was written after the cut cleared
+                    // it, not evidence that the cut was malformed.
+                    if (
+                        syntax === 'markdown'
+                        && value_changed
+                        && value_survives
+                        && (
+                            xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs)
+                            || pending_move_source_order !== undefined
+                        )
+                    ) {
+                        gesture_order ??= next_edit_order();
+                        ordered_edit = { ...edit, editOrder: gesture_order };
+                    }
+                }
+                return plan_value_write(
                     before_entry,
-                    edit.value,
+                    ordered_edit.value,
                     persisted.base,
                     persisted.history !== undefined
                         ? persisted.history.hyperlink
-                        : get_cell?.(edit.source_row, edit.source_col)?.hyperlink ?? null,
+                        : get_cell?.(
+                            ordered_edit.source_row,
+                            ordered_edit.source_col,
+                        )?.hyperlink ?? null,
                     persisted.history !== undefined,
                     syntax,
-                    edit,
-                ));
+                    ordered_edit,
+                );
+            });
         },
-        [get_cell, options?.next_value_edit_order, run_edit_gesture, syntax],
+        [active_store, get_cell, options?.next_value_edit_order, run_edit_gesture, syntax],
     );
 
     /**
@@ -779,7 +845,12 @@ export function use_editing(
             if (!editing_cell) return;
             const { source_row, source_col } = editing_cell;
             set_editing_cell(null);
-            commit_edits([{ source_row, source_col, value: new_value }]);
+            commit_edits([{
+                source_row,
+                source_col,
+                value: new_value,
+                openedValue: editing_cell.value,
+            }]);
         },
         [editing_cell, commit_edits],
     );
@@ -790,13 +861,23 @@ export function use_editing(
     // The caller resolves Glide's display row to a source row first, so both
     // arguments are already source coordinates here.
     const commit_edit = useCallback(
-        (source_row: number, source_col: number, new_value: string) => {
+        (
+            source_row: number,
+            source_col: number,
+            new_value: string,
+            opened_value?: string,
+        ) => {
             set_editing_cell((prev) =>
                 prev && prev.source_row === source_row && prev.source_col === source_col
                     ? null
                     : prev,
             );
-            commit_edits([{ source_row, source_col, value: new_value }]);
+            commit_edits([{
+                source_row,
+                source_col,
+                value: new_value,
+                ...(opened_value === undefined ? {} : { openedValue: opened_value }),
+            }]);
         },
         [commit_edits],
     );
@@ -814,7 +895,14 @@ export function use_editing(
     }, [active_store, session_id]);
 
     const clear_dirty_keys = useCallback((keys: Set<string>) => {
-        active_store.remove_keys(session_id, keys);
+        const expanded = dirty_keys_with_move_closure(active_store.snapshot(), keys);
+        set_editing_cell((current) => (
+            current !== null
+            && expanded.has([current.source_row, current.source_col].join(':'))
+                ? null
+                : current
+        ));
+        active_store.remove_keys(session_id, expanded);
     }, [active_store, session_id]);
 
     const clear_dirty_saved_edits = useCallback((edits: Record<string, string>) => {
@@ -833,31 +921,18 @@ export function use_editing(
 
     const discard_edit = useCallback(
         (key: string) => {
-            if (
-                editing_cell
-                && `${editing_cell.source_row}:${editing_cell.source_col}` === key
-            ) {
-                set_editing_cell(null);
-            }
-            active_store.remove(session_id, key);
+            clear_dirty_keys(new Set([key]));
         },
-        [active_store, editing_cell, session_id],
+        [clear_dirty_keys],
     );
 
     const discard_conflicted = useCallback(() => {
-        if (editing_cell) {
-            const active_key =
-                `${editing_cell.source_row}:${editing_cell.source_col}`;
-            const active_entry = dirty_cells.get(active_key);
-            if (active_entry?.observedBase !== undefined) {
-                set_editing_cell(null);
-            }
+        const conflicted = new Set<string>();
+        for (const [key, entry] of dirty_cells) {
+            if (entry.observedBase !== undefined) conflicted.add(key);
         }
-        active_store.retain(
-            session_id,
-            (_key, entry) => entry.observedBase === undefined,
-        );
-    }, [active_store, editing_cell, dirty_cells, session_id]);
+        clear_dirty_keys(conflicted);
+    }, [clear_dirty_keys, dirty_cells]);
 
     // Resolve deferred bases for old-format restores: once a pending entry's page
     // becomes resident, capture its true on-disk value as the base. Runs whenever

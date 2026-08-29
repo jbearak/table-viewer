@@ -3674,7 +3674,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                     );
                 if (data !== undefined && copyBufferContainsCut(data) && cutSources === undefined) {
                     onClipboardPasteError?.(
-                        "Cut cells cannot be moved after switching worksheets or changing the table layout. Cut them again in the current view."
+                        "This cut is no longer active. Cut the cells again."
                     );
                     return;
                 }

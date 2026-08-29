@@ -2059,6 +2059,68 @@ describe('write_xlsx_cell_edits', () => {
         expect(data.sheets[0].rows[1][3]?.formula).toBe('=A1');
     });
 
+    it('allows a move source to be refilled by a later literal edit', async () => {
+        const raw = patched_basic([[
+            '/xl/worksheets/sheet1.xml',
+            '<c r="B2"><v>30</v></c><c r="C2" t="b"><v>1</v></c>',
+            '<c r="A1"><v>10</v></c>'
+                + '<c r="D1"><f>A1</f><v>10</v></c>',
+        ]]);
+        const out = write_xlsx_workbook_cell_edits(raw, [{
+            sheetIndex: 0,
+            edits: [
+                { row: 0, col: 0, value: 'replacement', valueEditOrder: 2 },
+                {
+                    row: 0,
+                    col: 1,
+                    value: '10',
+                    movedFrom: { row: 0, col: 0, order: 1 },
+                    valueEditOrder: 1,
+                },
+            ],
+        }]);
+        const { data } = await parse_xlsx(out);
+
+        expect(data.sheets[0].rows[0][0]?.raw).toBe('replacement');
+        expect(data.sheets[0].rows[0][1]?.raw).toBe(10);
+        expect(data.sheets[0].rows[0][3]?.formula).toBe('=B1');
+    });
+
+    it('allows a moved source to become a later move destination', async () => {
+        const raw = patched_basic([[
+            '/xl/worksheets/sheet1.xml',
+            '<c r="B2"><v>30</v></c><c r="C2" t="b"><v>1</v></c>',
+            '<c r="A1"><v>10</v></c><c r="C1"><v>20</v></c>'
+                + '<c r="D1"><f>A1+C1</f><v>30</v></c>',
+        ]]);
+        const out = write_xlsx_workbook_cell_edits(raw, [{
+            sheetIndex: 0,
+            edits: [
+                {
+                    row: 0,
+                    col: 0,
+                    value: '20',
+                    movedFrom: { row: 0, col: 2, order: 2 },
+                    valueEditOrder: 2,
+                },
+                {
+                    row: 0,
+                    col: 1,
+                    value: '10',
+                    movedFrom: { row: 0, col: 0, order: 1 },
+                    valueEditOrder: 1,
+                },
+                { row: 0, col: 2, value: '', valueEditOrder: 2 },
+            ],
+        }]);
+        const { data } = await parse_xlsx(out);
+
+        expect(data.sheets[0].rows[0][0]?.raw).toBe(20);
+        expect(data.sheets[0].rows[0][1]?.raw).toBe(10);
+        expect(data.sheets[0].rows[0][2]?.raw).toBeNull();
+        expect(data.sheets[0].rows[0][3]?.formula).toBe('=B1+A1');
+    });
+
     it('refuses a move that would retarget a what-if data table input', () => {
         const raw = patched_basic([[
             '/xl/worksheets/sheet1.xml',

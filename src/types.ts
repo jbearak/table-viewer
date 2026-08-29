@@ -1525,6 +1525,165 @@ export interface CellMoveIntent {
     readonly order: number;
 }
 
+interface DirtyMoveIndex {
+    readonly allKeys: ReadonlySet<string>;
+    readonly ordersByKey: ReadonlyMap<string, ReadonlySet<number>>;
+    readonly keysByOrder: ReadonlyMap<number, ReadonlySet<string>>;
+}
+
+function dirty_move_index(
+    entries: Iterable<readonly [string, CsvDirtyEntry]>,
+): DirtyMoveIndex {
+    const all_keys = new Set<string>();
+    const orders_by_key = new Map<string, Set<number>>();
+    const keys_by_order = new Map<number, Set<string>>();
+    const add_move = (source_key: string, destination_key: string, order: number): void => {
+        for (const key of [source_key, destination_key]) {
+            let orders = orders_by_key.get(key);
+            if (orders === undefined) {
+                orders = new Set();
+                orders_by_key.set(key, orders);
+            }
+            orders.add(order);
+        }
+        let keys = keys_by_order.get(order);
+        if (keys === undefined) {
+            keys = new Set();
+            keys_by_order.set(order, keys);
+        }
+        keys.add(source_key);
+        keys.add(destination_key);
+    };
+
+    for (const [destination_key, entry] of entries) {
+        all_keys.add(destination_key);
+        const moved_from = entry.movedFrom;
+        if (moved_from === undefined) continue;
+        add_move(
+            `${moved_from.row}:${moved_from.col}`,
+            destination_key,
+            moved_from.order,
+        );
+        for (const previous of moved_from.previous ?? []) {
+            add_move(
+                `${previous.sourceRow}:${previous.sourceCol}`,
+                `${previous.destinationRow}:${previous.destinationCol}`,
+                previous.order,
+            );
+        }
+    }
+    return {
+        allKeys: all_keys,
+        ordersByKey: orders_by_key,
+        keysByOrder: keys_by_order,
+    };
+}
+
+/** Greatest durable value/move order currently present in pending edits. */
+export function latest_dirty_value_edit_order(
+    entries: Iterable<readonly [string, CsvDirtyEntry]>,
+): number {
+    let latest = 0;
+    for (const [, entry] of entries) {
+        latest = Math.max(
+            latest,
+            entry.valueEditOrder ?? 0,
+            entry.movedFrom?.order ?? 0,
+        );
+        for (const previous of entry.movedFrom?.previous ?? []) {
+            latest = Math.max(latest, previous.order);
+        }
+    }
+    return latest;
+}
+
+/** Latest pending move order for every source cell, built once per gesture. */
+export function latest_dirty_move_source_orders(
+    entries: Iterable<readonly [string, CsvDirtyEntry]>,
+): ReadonlyMap<string, number> {
+    const latest = new Map<string, number>();
+    const add = (source_key: string, order: number): void => {
+        const previous = latest.get(source_key);
+        if (previous === undefined || order > previous) latest.set(source_key, order);
+    };
+    for (const [, entry] of entries) {
+        const moved_from = entry.movedFrom;
+        if (moved_from === undefined) continue;
+        add(`${moved_from.row}:${moved_from.col}`, moved_from.order);
+        for (const previous of moved_from.previous ?? []) {
+            add(`${previous.sourceRow}:${previous.sourceCol}`, previous.order);
+        }
+    }
+    return latest;
+}
+
+/**
+ * Expand selected dirty keys through every connected cut operation.
+ *
+ * A move is one atomic pending edit even though the flattened store has a
+ * source-clear entry and one or more destination entries. Operations sharing a
+ * cell are connected as well, so discarding any one half cannot leave a chain
+ * whose source or destination is missing.
+ */
+export function dirty_keys_with_move_closure(
+    entries: Iterable<readonly [string, CsvDirtyEntry]>,
+    selected: ReadonlySet<string>,
+): ReadonlySet<string> {
+    const index = dirty_move_index(entries);
+    const keys = new Set(selected);
+    const pending_keys = [...selected];
+    const visited_orders = new Set<number>();
+    while (pending_keys.length > 0) {
+        const key = pending_keys.pop();
+        if (key === undefined) break;
+        for (const order of index.ordersByKey.get(key) ?? []) {
+            if (visited_orders.has(order)) continue;
+            visited_orders.add(order);
+            for (const related_key of index.keysByOrder.get(order) ?? []) {
+                if (keys.has(related_key)) continue;
+                keys.add(related_key);
+                pending_keys.push(related_key);
+            }
+        }
+    }
+    return new Set([...keys].filter((key) => index.allKeys.has(key)));
+}
+
+/** Number of pending cells discarded with each dirty cell in a move component. */
+export function dirty_move_component_sizes(
+    entries: Iterable<readonly [string, CsvDirtyEntry]>,
+): ReadonlyMap<string, number> {
+    const index = dirty_move_index(entries);
+    const sizes = new Map<string, number>();
+    const remaining = new Set(index.allKeys);
+    while (remaining.size > 0) {
+        const first = remaining.values().next().value as string | undefined;
+        if (first === undefined) break;
+        const component = new Set<string>([first]);
+        const pending_keys = [first];
+        const visited_orders = new Set<number>();
+        while (pending_keys.length > 0) {
+            const key = pending_keys.pop();
+            if (key === undefined) break;
+            for (const order of index.ordersByKey.get(key) ?? []) {
+                if (visited_orders.has(order)) continue;
+                visited_orders.add(order);
+                for (const related_key of index.keysByOrder.get(order) ?? []) {
+                    if (component.has(related_key)) continue;
+                    component.add(related_key);
+                    pending_keys.push(related_key);
+                }
+            }
+        }
+        const dirty_component = [...component].filter((key) => index.allKeys.has(key));
+        for (const key of component) remaining.delete(key);
+        for (const key of dirty_component) {
+            sizes.set(key, dirty_component.length);
+        }
+    }
+    return sizes;
+}
+
 function sanitized_cell_move_intent(value: unknown): CellMoveIntent | undefined {
     if (!is_plain_record(value)) return undefined;
     const coordinates = [value.sourceRow, value.sourceCol, value.destinationRow, value.destinationCol];

@@ -31,6 +31,7 @@ import {
     dirty_entry_base_formatting_unknown,
     dirty_entry_value_dimension_present,
     dirty_entry_with_observed_file_base,
+    dirty_move_component_sizes,
     type CsvDirtyEntry,
     type CsvObservedFileBase,
     type CsvSaveLifecycle,
@@ -721,6 +722,7 @@ export function App(): React.JSX.Element {
         edit_session_registry_ref.current.revision,
     );
     const formula_roots_projection = edit_session_registry_ref.current.formula_projection();
+    const value_edit_order_floor = edit_session_registry_ref.current.value_edit_order_floor();
     const formula_calculation_edits = formula_roots_projection.edits;
     const formula_roots = formula_calculation_edits;
     const formula_root_signature = formula_roots_projection.tooManyEdits
@@ -6240,6 +6242,15 @@ export function App(): React.JSX.Element {
             )
             : entry.value
     );
+    const external_change_discard_counts = dirty_move_component_sizes(
+        Object.entries(live_edits ?? {}),
+    );
+    const external_change_discard_label = (key: string): string => {
+        const count = external_change_discard_counts.get(key) ?? 1;
+        return count > 1
+            ? `Discard all pending edits in ${count} related cells`
+            : 'Discard my pending edit';
+    };
 
     // The overlay only ever applies to the sheet and the arrangement it was recorded
     // against.
@@ -6318,6 +6329,7 @@ export function App(): React.JSX.Element {
             csv_editable={csv_editable}
             edit_syntax={edit_syntax}
             edit_session_id={csv_edit_session_id}
+            value_edit_order_floor={value_edit_order_floor}
             // Save lifecycle is workbook-scoped so it fences every grid; edit
             // stores remain worksheet-scoped so cell keys never cross sheets.
             save_operation={save_operation}
@@ -6686,6 +6698,7 @@ export function App(): React.JSX.Element {
                         {changed_items.map(({ key, entry, observed }) => {
                             const coordinates = parse_cell_key(key);
                             const location = external_change_location(key);
+                            const discard_label = external_change_discard_label(key);
                             const value_pending = dirty_entry_value_dimension_present(entry);
                             const original_formatting_is_known =
                                 !dirty_entry_base_formatting_unknown(entry);
@@ -6718,10 +6731,13 @@ export function App(): React.JSX.Element {
                                 && !hyperlinks_equal(entry.baseLink ?? null, observed.link);
                             const pending_formatting_involved = value_pending && (
                                 original_formatting_is_known
-                                    ? [entry.baseRuns, entry.valueRuns, observed?.runs]
-                                        .some((runs) => (
-                                            runs !== undefined && rich_text_has_styles(runs)
-                                        ))
+                                    ? review_formatting_changed(
+                                        entry.base,
+                                        entry.baseRuns,
+                                        entry.value,
+                                        entry.valueRuns,
+                                        external_change_formatting_budget,
+                                    )
                                     : entry.valueRuns !== undefined
                                         && [entry.valueRuns, observed?.runs].some((runs) => (
                                             runs !== undefined && rich_text_has_styles(runs)
@@ -6906,9 +6922,9 @@ export function App(): React.JSX.Element {
                                                 editing_ref.current?.discard_keys([key]);
                                                 set_external_change_navigation_status('');
                                             }}
-                                            aria-label={`Discard my pending edit for ${location}`}
+                                            aria-label={discard_label + ' for ' + location}
                                         >
-                                            Discard my pending edit
+                                            {discard_label}
                                         </button>
                                     </div>
                                 </ExternalChangeItem>
@@ -6916,15 +6932,19 @@ export function App(): React.JSX.Element {
                         })}
                         {removed_items.map(({ key, entry }) => {
                             const location = external_change_location(key);
+                            const discard_label = external_change_discard_label(key);
                             const value_pending = dirty_entry_value_dimension_present(entry);
                             const original_formatting_is_known =
                                 !dirty_entry_base_formatting_unknown(entry);
                             const formatting_involved = original_formatting_is_known
                                 && value_pending
-                                && [entry.baseRuns, entry.valueRuns]
-                                .some((runs) => (
-                                    runs !== undefined && rich_text_has_styles(runs)
-                                ));
+                                && review_formatting_changed(
+                                    entry.base,
+                                    entry.baseRuns,
+                                    entry.value,
+                                    entry.valueRuns,
+                                    external_change_formatting_budget,
+                                );
                             const pending_formatting_involved = value_pending && (
                                 formatting_involved
                                 || (!original_formatting_is_known
@@ -7011,9 +7031,9 @@ export function App(): React.JSX.Element {
                                                 editing_ref.current?.discard_keys([key]);
                                                 set_external_change_navigation_status('');
                                             }}
-                                            aria-label={`Discard my pending edit for ${location}`}
+                                            aria-label={discard_label + ' for ' + location}
                                         >
-                                            Discard my pending edit
+                                            {discard_label}
                                         </button>
                                     </div>
                                 </ExternalChangeItem>

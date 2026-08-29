@@ -8872,6 +8872,35 @@ describe('edit mode save exit', () => {
             .toContain('Your pending edit=C3');
     });
 
+    it('discloses every pending cell removed by a move-related discard', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }),
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, ['0:1'], {
+            '0:0': {
+                value: 'replacement typed after the move',
+                base: 'source',
+                valueEditOrder: 8,
+            },
+            '0:1': {
+                value: 'source',
+                base: 'destination',
+                observedBase: { value: 'changed destination' },
+                movedFrom: { row: 0, col: 0, order: 7 },
+                valueEditOrder: 7,
+            },
+        });
+
+        await click_button('Review changes');
+        await click_button('Discard all pending edits in 2 related cells');
+
+        expect(grid_shell_mock.discard_keys).toHaveBeenCalledWith(['0:1']);
+    });
+
     it('keeps a save rejection when adoption returns to the original file value', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(
@@ -9535,8 +9564,10 @@ describe('edit mode save exit', () => {
             },
         });
         await click_button('Review changes');
-        expect(container!.querySelector('.external-change-review')?.textContent)
-            .toContain('Cell formatting also changed in the file.');
+        const review_text = container!
+            .querySelector('.external-change-review')?.textContent ?? '';
+        expect(review_text).toContain('Cell formatting also changed in the file.');
+        expect(review_text).not.toContain('Your pending formatting');
     });
 
     it('omits Go to cell when the current projection cannot locate it', async () => {

@@ -2804,6 +2804,7 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
             };
         };
         const editSpy = vi.fn();
+        const errorSpy = vi.fn();
         vi.useFakeTimers();
         render(
             <EventedDataEditor
@@ -2811,6 +2812,7 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
                 getCellContent={cell}
                 onPaste={true}
                 onCellsEdited={editSpy}
+                onClipboardPasteError={errorSpy}
             />,
             { wrapper: Context }
         );
@@ -2863,6 +2865,12 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
                 movedFrom: [2, 2],
             },
         ], "paste");
+
+        fireEvent.paste(window);
+        await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+            "This cut is no longer active. Cut the cells again."
+        ));
+        expect(editSpy).toHaveBeenCalledOnce();
     });
 
     test("cut paste clears a merged source through its anchor", async () => {
