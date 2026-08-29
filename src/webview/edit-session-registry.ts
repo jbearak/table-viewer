@@ -434,8 +434,11 @@ export function create_edit_session_registry(
                     apply_formula_change(sheetIndex, change);
                     break;
                 }
-                formula_moves = current_moves();
             }
+            // A store can change move provenance without changing its formula
+            // input (for example, a same-text cut destination). Those changes
+            // deliberately arrive as `none`, but they still invalidate moves.
+            if (change.kind !== 'reset') formula_moves = current_moves();
             publish();
         }));
     };

@@ -60,6 +60,29 @@ describe('edit session registry', () => {
         expect(moved).toHaveLength(1);
     });
 
+    it('refreshes cached moves when only move provenance changes', () => {
+        const { registry } = make_session_ref('session');
+        const store = registry.for_sheet(0);
+
+        store.commit('session', '2:3', {
+            value: 'same',
+            base: 'same',
+            movedFrom: { row: 0, col: 1, order: 7 },
+            valueEditOrder: 7,
+        });
+        expect(registry.formula_projection().moves).toEqual([{
+            sheetIndex: 0,
+            sourceRow: 0,
+            sourceColumn: 1,
+            destinationRow: 2,
+            destinationColumn: 3,
+            order: 7,
+        }]);
+
+        store.commit('session', '2:3', { value: 'same', base: 'same' });
+        expect(registry.formula_projection().moves).toEqual([]);
+    });
+
     it('updates formula inputs incrementally without revisiting unchanged dirty cells', () => {
         const { registry } = make_session_ref('session');
         const store = registry.for_sheet(0);

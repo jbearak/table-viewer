@@ -804,6 +804,19 @@ export function history_replay_proposal_digest(
                 // runs.
                 'link' in write.entry ? ['set', write.entry.link] : ['absent'],
                 'baseLink' in write.entry ? ['set', write.entry.baseLink] : ['absent'],
+                write.entry.movedFrom === undefined ? null : [
+                    write.entry.movedFrom.row,
+                    write.entry.movedFrom.col,
+                    write.entry.movedFrom.order,
+                    (write.entry.movedFrom.previous ?? []).map((move) => [
+                        move.sourceRow,
+                        move.sourceCol,
+                        move.destinationRow,
+                        move.destinationCol,
+                        move.order,
+                    ]),
+                ],
+                write.entry.valueEditOrder ?? null,
             ],
         ]);
     const highlights = [...request.highlights]

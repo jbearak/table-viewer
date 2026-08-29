@@ -533,6 +533,35 @@ describe('history_replay_proposal_digest', () => {
             .not.toBe(history_replay_proposal_digest(cleared!));
     });
 
+    it('separates move provenance and formula edit orders', () => {
+        const plain = sanitized_commit_history_replay_request(commit_request({
+            cells: [{ ordinal: 0, entry: { value: 'typed', base: 'disk' } }],
+        }));
+        const moved = sanitized_commit_history_replay_request(commit_request({
+            cells: [{
+                ordinal: 0,
+                entry: {
+                    value: 'typed',
+                    base: 'disk',
+                    movedFrom: { row: 1, col: 2, order: 7 },
+                },
+            }],
+        }));
+        const ordered = sanitized_commit_history_replay_request(commit_request({
+            cells: [{
+                ordinal: 0,
+                entry: { value: 'typed', base: 'disk', valueEditOrder: 8 },
+            }],
+        }));
+
+        expect(history_replay_proposal_digest(plain!))
+            .not.toBe(history_replay_proposal_digest(moved!));
+        expect(history_replay_proposal_digest(plain!))
+            .not.toBe(history_replay_proposal_digest(ordered!));
+        expect(history_replay_proposal_digest(moved!))
+            .not.toBe(history_replay_proposal_digest(ordered!));
+    });
+
     it('separates a legacy string from an entry whose value equals it', () => {
         // The two differ only in whether the base was observed, which is exactly
         // the fact a proposal must not blur.

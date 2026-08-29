@@ -682,7 +682,14 @@ describe('use_editing — markdown syntax', () => {
         rows: (CellData | null)[][];
         next_edit_order?: () => number;
     }) {
-        hook_result = use_editing(make_get_cell_raw(rows), 0, undefined, undefined, {
+        const get_cell_raw = (r: number, c: number): string | undefined => {
+            const row = rows[r];
+            if (row === undefined) return undefined;
+            const cell = row[c];
+            if (cell?.formula !== undefined) return cell.formula;
+            return cell != null ? String(cell.raw ?? '') : '';
+        };
+        hook_result = use_editing(get_cell_raw, 0, undefined, undefined, {
             syntax: 'markdown',
             next_value_edit_order: next_edit_order,
             get_cell: (r, c) => {
@@ -760,6 +767,42 @@ describe('use_editing — markdown syntax', () => {
         await act(async () => { hook_result!.start_editing(0, 2); });
         await act(async () => { hook_result!.confirm_edit('=B1'); });
         expect(hook_result!.dirty_cells.get('0:2')?.valueEditOrder).toBe(42);
+    });
+
+    it('orders an explicit recommit of a loaded formula', async () => {
+        let order = 40;
+        const formula_rows: (CellData | null)[][] = [[{
+            raw: 2,
+            formatted: '2',
+            formula: '=1+1',
+            bold: false,
+            italic: false,
+        }]];
+        await render_markdown(formula_rows, () => ++order);
+
+        await act(async () => { hook_result!.commit_edit(0, 0, '=1+1'); });
+
+        expect(hook_result!.dirty_cells.get('0:0')).toEqual({
+            value: '=1+1',
+            base: '=1+1',
+            valueEditOrder: 41,
+        });
+    });
+
+    it('shares one order across every formula in a batch', async () => {
+        let order = 40;
+        await render_markdown(rich_rows, () => ++order);
+
+        await act(async () => {
+            hook_result!.commit_edits([
+                { source_row: 0, source_col: 0, value: '=A1' },
+                { source_row: 0, source_col: 1, value: '=B1' },
+            ], 'Paste');
+        });
+
+        expect(hook_result!.dirty_cells.get('0:0')?.valueEditOrder).toBe(41);
+        expect(hook_result!.dirty_cells.get('0:1')?.valueEditOrder).toBe(41);
+        expect(order).toBe(41);
     });
 
     it('a dirty cell re-opens showing its committed runs as markup', async () => {
