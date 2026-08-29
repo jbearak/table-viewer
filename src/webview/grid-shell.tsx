@@ -39,6 +39,7 @@ import {
     type CsvSaveOperation,
     type DisplayRowInterval,
     type MergeRange,
+    type ScrollPosition,
     type SheetCellHighlightState,
     type SheetTransformState,
     type SortDirection,
@@ -640,6 +641,10 @@ export interface GridShellProps {
     on_preview_scroll_applied?: (sequence: number) => void;
     /** Reports the latest user-visible preview row to App across remounts. */
     on_preview_visible_row_change?: (row: number) => void;
+    /** Pixel offset captured by App before this generation-keyed mount. */
+    initial_scroll_position?: ScrollPosition;
+    /** Reports the worksheet's exact pixel offset so App can restore a remount. */
+    on_scroll_position_change?: (position: ScrollPosition) => void;
     transform_state?: SheetTransformState;
     transform_sections?: boolean;
     transform_pending?: boolean;
@@ -720,6 +725,8 @@ export function GridShell({
     pending_preview_scroll = null,
     on_preview_scroll_applied = () => {},
     on_preview_visible_row_change = () => {},
+    initial_scroll_position,
+    on_scroll_position_change = () => {},
     transform_state = EMPTY_TRANSFORM,
     transform_sections = false,
     transform_pending = false,
@@ -4174,6 +4181,17 @@ export function GridShell({
     const on_visible_region_changed = useCallback(
         (range: Rectangle) => {
             visible_ref.current = range;
+            if (!preview_mode) {
+                const scroller = grid_root_ref.current?.querySelector<HTMLElement>(
+                    '.dvn-scroller',
+                );
+                if (scroller) {
+                    on_scroll_position_change({
+                        left: scroller.scrollLeft,
+                        top: scroller.scrollTop,
+                    });
+                }
+            }
             // Scroll moves cells under the cursor; drop any open tooltip so it
             // can't float over the wrong content mid-scroll.
             hide_cell_tooltip();
@@ -4218,6 +4236,7 @@ export function GridShell({
             ensure_rows_loaded,
             hide_cell_tooltip,
             on_preview_visible_row_change,
+            on_scroll_position_change,
             pending_preview_scroll,
             preview_mode,
             restore_pending_preview_row,
@@ -4540,6 +4559,8 @@ export function GridShell({
                 theme={theme}
                 smoothScrollX
                 smoothScrollY
+                scrollOffsetX={initial_scroll_position?.left}
+                scrollOffsetY={initial_scroll_position?.top}
                 getCellsForSelection={true}
                 gridSelection={grid_selection}
                 onGridSelectionChange={on_grid_selection_change}

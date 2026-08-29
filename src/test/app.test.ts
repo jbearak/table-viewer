@@ -260,6 +260,20 @@ vi.mock('../webview/grid-shell', () => ({
                 },
                 'resize'
             ),
+            React.createElement(
+                'button',
+                {
+                    className: 'stub-scroll',
+                    onClick: () => (
+                        props as GridShellProps & {
+                            on_scroll_position_change?: (
+                                position: { left: number; top: number },
+                            ) => void;
+                        }
+                    ).on_scroll_position_change?.({ left: 640, top: 1280 }),
+                },
+                'scroll'
+            ),
             // Stands in for the grid consuming a focus request. Two buttons,
             // because App's two jobs here are clearing the request it holds and
             // reporting a region the view is hiding.
@@ -6914,6 +6928,69 @@ describe('edit mode save exit', () => {
             .toBe('After');
         expect(grid_shell_mock.commit_live_edit).not.toHaveBeenCalled();
         expect(grid_shell_mock.flush_live_edit).not.toHaveBeenCalled();
+    });
+
+    it('restores the worksheet scroll position after a save snapshot remounts the grid', async () => {
+        await render_app();
+        const meta = make_meta(['People'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'save-session',
+            },
+        }));
+        await act(async () => {
+            (container!.querySelector('.stub-scroll') as HTMLButtonElement).click();
+        });
+        const before_mount = grid_stub().getAttribute('data-mount-id');
+
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            generation: 2,
+            sourceGeneration: 2,
+            reason: 'save',
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+            },
+        }));
+
+        expect(grid_stub().getAttribute('data-mount-id')).not.toBe(before_mount);
+        expect(grid_shell_mock.latest_props?.initial_scroll_position).toEqual({
+            left: 640,
+            top: 1280,
+        });
+    });
+
+    it('keeps scroll positions with their identified worksheets across a reorder', async () => {
+        await render_app();
+        const before = make_meta(['People', 'Inventory'], false);
+        before.sheets[0].worksheetId = 'people-id';
+        before.sheets[1].worksheetId = 'inventory-id';
+        await dispatch_host_message(initial_snapshot_message(before));
+
+        const report_scroll = (left: number, top: number) => {
+            const report = grid_shell_mock.latest_props?.on_scroll_position_change as
+                ((position: { left: number; top: number }) => void) | undefined;
+            report?.({ left, top });
+        };
+        report_scroll(640, 1280);
+        await click_sheet_tab('Inventory');
+        report_scroll(80, 160);
+
+        const after = make_meta(['Inventory', 'People'], false);
+        after.sheets[0].worksheetId = 'inventory-id';
+        after.sheets[1].worksheetId = 'people-id';
+        await dispatch_host_message(refresh_snapshot_message(after, {
+            generation: 2,
+            sourceGeneration: 2,
+        }));
+
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+        expect(grid_shell_mock.latest_props?.initial_scroll_position).toEqual({
+            left: 640,
+            top: 1280,
+        });
     });
 
     it("keeps one worksheet's dirty cells out of another's store", async () => {

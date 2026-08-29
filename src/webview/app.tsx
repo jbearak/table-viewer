@@ -20,6 +20,7 @@ import {
     transform_schema_for_sheet,
     with_pending_edits_for_sheet,
     worksheet_target_index,
+    worksheet_target_key,
     worksheet_target_lookup,
     type CellHighlightColor,
     type CellHighlightMutation,
@@ -33,6 +34,7 @@ import {
     type CsvSaveWorksheetOperation,
     type DisplayRowInterval,
     type PerFileState,
+    type ScrollPosition,
     type SheetPendingEditCells,
     type HistoryMenuProjection,
     type HostMessage,
@@ -548,6 +550,10 @@ export function App(): React.JSX.Element {
     }, [update_pending_auto_fit_sheets]);
     const [truncation_message, set_truncation_message] = useState<string | null>(null);
     const [preview_mode, set_preview_mode] = useState(false);
+    // GridShell is keyed by generation because a new data view needs a fresh
+    // loader. Keep the live pixel offsets above that boundary so a save refresh
+    // replaces the data without replacing the user's place in the worksheet.
+    const grid_scroll_positions_ref = useRef<Map<string, ScrollPosition>>(new Map());
     const [csv_editable, set_csv_editable] = useState(false);
     const [csv_editing_supported, set_csv_editing_supported] = useState(false);
     // 'markdown' on xlsx: cell text edits as inline markup (see cell-edit-model).
@@ -2277,14 +2283,28 @@ export function App(): React.JSX.Element {
                     if (snapshot.presentation === 'initial') {
                         set_diff_mode(snapshot.configuration.diffOnByDefault);
                         diff_mode_initialized_ref.current = false;
+                        grid_scroll_positions_ref.current = new Map();
                         last_preview_visible_row_ref.current = null;
                         clear_pending_preview_scroll();
-                    } else if (
-                        preview_mode_ref.current
-                        && pending_preview_scroll_ref.current === null
-                        && last_preview_visible_row_ref.current !== null
-                    ) {
-                        queue_preview_scroll(last_preview_visible_row_ref.current);
+                    } else {
+                        const retained_scroll_positions = new Map<string, ScrollPosition>();
+                        snapshot.meta.sheets.forEach((sheet, sheet_index) => {
+                            const key = worksheet_target_key({
+                                sheetIndex: sheet_index,
+                                sheetName: sheet.name,
+                                worksheetId: sheet.worksheetId,
+                            });
+                            const position = grid_scroll_positions_ref.current.get(key);
+                            if (position) retained_scroll_positions.set(key, position);
+                        });
+                        grid_scroll_positions_ref.current = retained_scroll_positions;
+                        if (
+                            preview_mode_ref.current
+                            && pending_preview_scroll_ref.current === null
+                            && last_preview_visible_row_ref.current !== null
+                        ) {
+                            queue_preview_scroll(last_preview_visible_row_ref.current);
+                        }
                     }
                     preview_mode_ref.current = snapshot.configuration.previewMode;
                     set_preview_mode(snapshot.configuration.previewMode);
@@ -5810,6 +5830,11 @@ export function App(): React.JSX.Element {
         && overlay_for_active_sheet.generation === generation
             ? overlay_for_active_sheet.layers
             : undefined;
+    const active_scroll_position_key = worksheet_target_key({
+        sheetIndex: active_sheet_index,
+        sheetName: current_sheet.name,
+        worksheetId: current_sheet.worksheetId,
+    });
 
     const grid = (
         <GridShell
@@ -5877,6 +5902,12 @@ export function App(): React.JSX.Element {
             pending_preview_scroll={pending_preview_scroll}
             on_preview_scroll_applied={handle_preview_scroll_applied}
             on_preview_visible_row_change={handle_preview_visible_row_change}
+            initial_scroll_position={
+                grid_scroll_positions_ref.current.get(active_scroll_position_key)
+            }
+            on_scroll_position_change={(position) => {
+                grid_scroll_positions_ref.current.set(active_scroll_position_key, position);
+            }}
             transform_state={visible_transform}
             transform_sections={!transform_ui_blocked}
             transform_pending={transform_pending}

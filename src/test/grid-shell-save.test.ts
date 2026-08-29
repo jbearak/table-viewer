@@ -24,6 +24,14 @@ const grid_mock = vi.hoisted(() => ({
         };
         onPaste?: boolean | ((target: [number, number], values: readonly (readonly string[])[]) => boolean);
         fillHandle?: boolean;
+        onVisibleRegionChanged?: (range: {
+            x: number;
+            y: number;
+            width: number;
+            height: number;
+        }) => void;
+        scrollOffsetX?: number;
+        scrollOffsetY?: number;
     },
     // Display row → canonical source row, and source row → that row's raw text.
     //
@@ -49,7 +57,11 @@ vi.mock('../webview/glide-data-grid', () => {
                 scrollTo: vi.fn(),
                 dismissOverlay: vi.fn(),
             }));
-            return React.createElement('div', { className: 'data-editor-stub' });
+            return React.createElement(
+                'div',
+                { className: 'data-editor-stub' },
+                React.createElement('div', { className: 'dvn-scroller' }),
+            );
         }),
         GridCellKind: { Text: 'text' },
     };
@@ -178,6 +190,8 @@ async function render_grid(
         generation?: number;
         highlight_in_flight?: boolean;
         on_save_request?: () => CsvSaveOperation | undefined;
+        initial_scroll_position?: { left: number; top: number };
+        on_scroll_position_change?: (position: { left: number; top: number }) => void;
     } = {},
 ) {
     vi.resetModules();
@@ -384,6 +398,34 @@ afterEach(() => {
 });
 
 describe('GridShell CSV save', () => {
+    it('restores and reports the worksheet pixel scroll position', async () => {
+        const on_scroll_position_change = vi.fn();
+        await render_grid(undefined, {
+            initial_scroll_position: { left: 640, top: 1280 },
+            on_scroll_position_change,
+        });
+
+        expect(grid_mock.props?.scrollOffsetX).toBe(640);
+        expect(grid_mock.props?.scrollOffsetY).toBe(1280);
+
+        const scroller = container!.querySelector<HTMLElement>('.dvn-scroller')!;
+        scroller.scrollLeft = 720;
+        scroller.scrollTop = 1440;
+        act(() => {
+            grid_mock.props?.onVisibleRegionChanged?.({
+                x: 8,
+                y: 48,
+                width: 5,
+                height: 20,
+            });
+        });
+
+        expect(on_scroll_position_change).toHaveBeenLastCalledWith({
+            left: 720,
+            top: 1440,
+        });
+    });
+
     it('saves a projected display edit under its source-column key', async () => {
         const { post_message, editing_ref } = await render_grid({
             visible_to_source: [2],
