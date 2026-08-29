@@ -420,6 +420,21 @@ describe('sanitized_commit_history_replay_request', () => {
             .toBe('typed');
     });
 
+    it('retains move and edit-order metadata while copying an entry', () => {
+        const entry = {
+            value: 'typed',
+            base: 'disk',
+            movedFrom: { row: 1, col: 2, order: 7 },
+            valueEditOrder: 8,
+        };
+        const parsed = sanitized_commit_history_replay_request(
+            commit_request({ cells: [{ ordinal: 0, entry }] }),
+        );
+
+        expect(parsed?.cells[0].entry).toEqual(entry);
+        expect(parsed?.cells[0].entry).not.toBe(entry);
+    });
+
     it('rejects sparse and duplicate ordinals', () => {
         expect(sanitized_commit_history_replay_request(
             commit_request({ cells: [{ ordinal: 4, entry: null }] }),

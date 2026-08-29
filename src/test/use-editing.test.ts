@@ -675,9 +675,16 @@ describe('use_editing — markdown syntax', () => {
         { raw: '2*3', formatted: '2*3', bold: false, italic: false },
     ]];
 
-    function MarkdownHarness({ rows }: { rows: (CellData | null)[][] }) {
+    function MarkdownHarness({
+        rows,
+        next_edit_order,
+    }: {
+        rows: (CellData | null)[][];
+        next_edit_order?: () => number;
+    }) {
         hook_result = use_editing(make_get_cell_raw(rows), 0, undefined, undefined, {
             syntax: 'markdown',
+            next_value_edit_order: next_edit_order,
             get_cell: (r, c) => {
                 const row = rows[r];
                 if (row === undefined) return undefined;
@@ -687,12 +694,15 @@ describe('use_editing — markdown syntax', () => {
         return null;
     }
 
-    async function render_markdown(rows: (CellData | null)[][] = rich_rows) {
+    async function render_markdown(
+        rows: (CellData | null)[][] = rich_rows,
+        next_edit_order?: () => number,
+    ) {
         container = document.createElement('div');
         document.body.appendChild(container);
         root = createRoot(container);
         await act(async () => {
-            root!.render(React.createElement(MarkdownHarness, { rows }));
+            root!.render(React.createElement(MarkdownHarness, { rows, next_edit_order }));
         });
         await act(async () => { hook_result!.toggle_edit_mode(); });
     }
@@ -738,6 +748,18 @@ describe('use_editing — markdown syntax', () => {
             base: '2*3',
             valueRuns: { runs: [{ text: '6', style: { bold: true } }] },
         });
+    });
+
+    it('orders formula edits committed through both single-cell paths', async () => {
+        let order = 40;
+        await render_markdown(rich_rows, () => ++order);
+
+        await act(async () => { hook_result!.commit_edit(0, 1, '=A1'); });
+        expect(hook_result!.dirty_cells.get('0:1')?.valueEditOrder).toBe(41);
+
+        await act(async () => { hook_result!.start_editing(0, 2); });
+        await act(async () => { hook_result!.confirm_edit('=B1'); });
+        expect(hook_result!.dirty_cells.get('0:2')?.valueEditOrder).toBe(42);
     });
 
     it('a dirty cell re-opens showing its committed runs as markup', async () => {

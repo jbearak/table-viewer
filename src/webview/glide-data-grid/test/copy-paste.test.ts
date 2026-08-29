@@ -140,10 +140,13 @@ describe("copy-paste", () => {
             operationId,
             expected,
         )).toBeUndefined();
-        expect(cutSourceGridLocations([[{
-            ...cutCell([2, 3]),
-            clipboardData: { ...cutCell([2, 3]).clipboardData!, action: "copy" },
-        }]], "workbook-1/sheet-1/projection-4", operationId, expected)).toBeUndefined();
+        expect(cutSourceGridLocations([[
+            {
+                ...cutCell([2, 3]),
+                clipboardData: { ...cutCell([2, 3]).clipboardData!, action: "copy" },
+            },
+            cutCell([3, 3]),
+        ]], "workbook-1/sheet-1/projection-4", operationId, expected)).toBeUndefined();
     });
 
     test("decode html", () => {

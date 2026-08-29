@@ -3779,6 +3779,7 @@ const DataEditorImpl: React.ForwardRefRenderFunction<DataEditorRef, DataEditorPr
                         const mangledSourceCol = sourceCol + rowMarkerOffset;
                         const key = `${mangledSourceCol}:${sourceRow}`;
                         if (destinations.has(key) || seen.has(key)) continue;
+                        if (mergedCells?.isCovered(mangledSourceCol, sourceRow) === true) continue;
                         const before = deletions.length;
                         collectRangeDeletions({
                             x: mangledSourceCol,

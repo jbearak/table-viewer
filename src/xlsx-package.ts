@@ -391,6 +391,15 @@ export function write_xlsx_workbook_cell_edits(
     }
 
     const parts = worksheet_part_entries_from_package(zip);
+    const worksheet_bytes = new Map<number, Uint8Array>();
+    const read_worksheet_bytes = (sheet_index: number, error: string): Uint8Array => {
+        const cached = worksheet_bytes.get(sheet_index);
+        if (cached !== undefined) return cached;
+        const content = read_part_bytes(zip, `/${parts[sheet_index].path}`);
+        if (content === null) throw new Error(error);
+        worksheet_bytes.set(sheet_index, content);
+        return content;
+    };
     const sheet_names = parts.map((part) => part.name);
     const moves: XlsxFormulaCellMove[] = [];
     const moved_sources = new Map<string, string>();
@@ -484,8 +493,10 @@ export function write_xlsx_workbook_cell_edits(
         for (let sheet_index = 0; sheet_index < parts.length; sheet_index += 1) {
             const sheet_moves = moves_by_sheet.get(sheet_index) ?? [];
             if (sheet_moves.length === 0) continue;
-            const content = read_part_bytes(zip, `/${parts[sheet_index].path}`);
-            if (content === null) throw new Error('Could not read a worksheet to validate a move');
+            const content = read_worksheet_bytes(
+                sheet_index,
+                'Could not read a worksheet to validate a move',
+            );
             for (const key of worksheet_content_cells(
                 worksheet_scan_input(content),
                 sheet_moves.map((move) => ({ row: move.sourceRow, col: move.sourceColumn })),
@@ -519,7 +530,7 @@ export function write_xlsx_workbook_cell_edits(
                     value: retarget_formula(
                         edit.value,
                         worksheet.sheetIndex,
-                        edit.valueEditOrder ?? Number.POSITIVE_INFINITY,
+                        edit.valueEditOrder ?? 0,
                     ),
                 };
             }),
@@ -527,8 +538,7 @@ export function write_xlsx_workbook_cell_edits(
         const formula_budget = create_workbook_budget();
         const active_by_index = new Map(active.map((entry) => [entry.sheetIndex, entry]));
         for (let sheet_index = 0; sheet_index < parts.length; sheet_index += 1) {
-            const content = read_part_bytes(zip, `/${parts[sheet_index].path}`);
-            if (content === null) throw new Error('Could not read a worksheet to save');
+            const content = read_worksheet_bytes(sheet_index, 'Could not read a worksheet to save');
             const current = active_by_index.get(sheet_index);
             const excluded = new Set((current?.edits ?? []).map(
                 (edit) => `${edit.row}:${edit.col}`,
@@ -597,8 +607,10 @@ export function write_xlsx_workbook_cell_edits(
             : options?.formulaDependencies?.length === parts.length
             ? options.formulaDependencies
             : parts.map((part, sheet_index) => {
-                const content = read_part_bytes(zip, `/${part.path}`);
-                if (content === null) throw new Error('Could not read a worksheet to save');
+                const content = read_worksheet_bytes(
+                    sheet_index,
+                    'Could not read a worksheet to save',
+                );
                 return {
                     formulaDependencies: worksheet_formula_dependencies(
                         worksheet_scan_input(content),
@@ -655,8 +667,10 @@ export function write_xlsx_workbook_cell_edits(
         const part = parts[sheetIndex];
         if (!part) throw new Error('Could not locate a worksheet to save');
         const path = `/${part.path}`;
-        const sheet_content = read_part_bytes(zip, path);
-        if (sheet_content === null) throw new Error('Could not read a worksheet to save');
+        const sheet_content = read_worksheet_bytes(
+            sheetIndex,
+            'Could not read a worksheet to save',
+        );
         const sheet_xml = worksheet_scan_input(sheet_content);
 
         const rels_path = `/${rels_path_for_part(part.path)}`;

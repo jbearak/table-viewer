@@ -268,6 +268,8 @@ export function overlay_state_from_dirty_entry(
     const value_untouched = link_present
         && !base_pending
         && value_intent !== 'in-overlay'
+        && entry.movedFrom === undefined
+        && entry.valueEditOrder === undefined
         && (value_intent === 'link-only' || !dirty_entry_value_changed(entry));
 
     if (value_untouched) {

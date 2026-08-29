@@ -1272,9 +1272,9 @@ export function worksheet_content_cells(
     const sheet_data = scan_worksheet_structure(xml).sheet_data;
     if (!sheet_data || wanted.size === 0) return found;
     scan_rows(xml, sheet_data.inner_start, sheet_data.inner_end, {
+        capture_cell: (row, col) => wanted.has(`${row}:${col}`),
         on_cell: (row, col, cell) => {
             const key = `${row}:${col}`;
-            if (!wanted.has(key)) return;
             if (find_first_element(xml, 'f', cell.inner_start, cell.inner_end)
                 || find_first_element(xml, 'v', cell.inner_start, cell.inner_end)
                 || find_first_element(xml, 'is', cell.inner_start, cell.inner_end)) found.add(key);

@@ -69,6 +69,7 @@ import { is_valid_hyperlink } from './pending-changes';
 import { sanitize_cell_highlight_color } from './cell-highlights';
 import {
     is_strict_wire_dirty_entry,
+    copy_dirty_entry,
     make_dirty_entry,
     sanitized_wire_dirty_entry,
     sanitized_wire_worksheet_target,
@@ -741,18 +742,11 @@ export function sanitized_commit_history_replay_request(
         // user's styled text with the styling quietly stripped is a wrong undo,
         // and refusing the whole replay leaves history where it was.
         if (!is_strict_wire_dirty_entry(raw.entry)) return undefined;
-        // Copied through `make_dirty_entry` rather than retained: the guard
-        // proves the shape, it does not make the caller's object ours.
+        // The guard proves the shape, but it does not make the caller's object
+        // ours. Copy every dimension, including move and edit-order metadata.
         return Object.freeze({
             ordinal: raw.ordinal,
-            entry: make_dirty_entry(
-                raw.entry.value,
-                raw.entry.base,
-                raw.entry.valueRuns,
-                raw.entry.baseRuns,
-                raw.entry.link,
-                raw.entry.baseLink,
-            ),
+            entry: copy_dirty_entry(raw.entry),
         });
     });
     if (cells === undefined) return undefined;

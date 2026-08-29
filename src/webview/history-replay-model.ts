@@ -143,28 +143,6 @@ export function plan_history_replay(
     // store for both would look for B, find C, and refuse a replay that is
     // perfectly consistent with itself.
     const planned_state = new Map<string, CellReplayState>();
-    if (direction === 'undo') {
-        for (const change of action_replay_changes(action, direction)) {
-            if (change.kind !== 'cell') continue;
-            const after = overlay_for_direction(change.delta, 'redo');
-            if (after.kind === 'absent' || after.value.kind !== 'present') continue;
-            const moved = after.value.movedFrom;
-            if (moved === undefined) continue;
-            const { worksheet, sourceRow, sourceColumn } = change.delta;
-            if (read_state(worksheet, sourceRow, sourceColumn)?.overlay.kind === 'absent') {
-                // Once saved, reversing only the address mapping would also
-                // rewrite formulas that already referred to the destination.
-                // Refuse instead of corrupting those independent references.
-                return {
-                    kind: 'refused',
-                    reason: 'conflict',
-                    worksheet,
-                    sourceRow,
-                    sourceColumn,
-                };
-            }
-        }
-    }
     const read_planned: ReadCellState = (worksheet, row, column) =>
         planned_state.get(cell_address(worksheet, row, column))
             ?? read_state(worksheet, row, column);
@@ -174,6 +152,29 @@ export function plan_history_replay(
         if (change.kind === 'highlight') {
             highlights.push(change.delta);
             continue;
+        }
+        if (direction === 'undo') {
+            const after = overlay_for_direction(change.delta, 'redo');
+            const moved = after.kind === 'present' && after.value.kind === 'present'
+                ? after.value.movedFrom
+                : undefined;
+            const { worksheet, sourceRow, sourceColumn } = change.delta;
+            if (
+                moved !== undefined
+                && read_planned(worksheet, sourceRow, sourceColumn)?.overlay.kind === 'absent'
+            ) {
+                // Once saved, reversing only the address mapping would also
+                // rewrite formulas that already referred to the destination.
+                // Read the evolving plan so an earlier reverse step can restore
+                // an overlapping destination before this check.
+                return {
+                    kind: 'refused',
+                    reason: 'conflict',
+                    worksheet,
+                    sourceRow,
+                    sourceColumn,
+                };
+            }
         }
         const planned = plan_cell_replay(change.delta, direction, read_planned);
         if (planned.kind === 'refused') return planned;

@@ -107,6 +107,20 @@ describe('overlay_state_from_dirty_entry', () => {
         expect(state.hyperlink.kind).toBe('present');
     });
 
+    it('keeps move metadata on unchanged text with a hyperlink change', () => {
+        const entry = make_dirty_entry(
+            'A', 'A', undefined, undefined, LINK, null,
+            { row: 4, col: 3, order: 9 }, 9,
+        );
+        const state = present(overlay_state_from_dirty_entry(entry));
+
+        expect(state.value.kind).toBe('present');
+        if (state.value.kind !== 'present') throw new Error('unreachable');
+        expect(state.value.movedFrom).toEqual({ row: 4, col: 3, order: 9 });
+        expect(state.value.valueEditOrder).toBe(9);
+        expect(dirty_entry_from_overlay_state(state)).toEqual(entry);
+    });
+
     it('keeps a present value dimension for a resolved legacy no-op entry', () => {
         // resolve_pending_bases captures a true base and drops base_pending,
         // so a legacy entry can become {value: A, base: A} with no link. It is

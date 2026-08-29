@@ -142,6 +142,21 @@ describe('planning an undo', () => {
         expect(refusal.reason).toBe('conflict');
     });
 
+    it('checks an overlapping move destination after earlier reverse steps restore it', () => {
+        const moved = value_only_overlay(
+            value('source'), value('destination'), false, { row: 0, col: 0, order: 1 },
+        );
+        const move = delta({ before: absent_overlay(), after: moved, row: 2, column: 3 });
+        const later_removal = delta({ before: moved, after: absent_overlay(), row: 2, column: 3 });
+        const plan = plan_of(
+            [cell(move), cell(later_removal)],
+            'undo',
+            overlays({ '0:2:3': absent_overlay() }),
+        );
+
+        expect(plan.writes.map((write) => write.entry?.value)).toEqual(['source', undefined]);
+    });
+
     it('restores the entry the cell held before the edit', () => {
         const before = value_only_overlay(value('first'), value('disk'));
         const after = value_only_overlay(value('second'), value('disk'));

@@ -59,17 +59,27 @@ function pending_base_change(
     before_text: string,
     after_text: string,
     before_runs?: RichText,
+    before_move?: {
+        readonly movedFrom: { readonly row: number; readonly col: number; readonly order: number };
+        readonly valueEditOrder: number;
+    },
 ): HistoryChange {
-    const pending = (text: string, runs?: RichText) => value_only_overlay(
+    const pending = (
+        text: string,
+        runs?: RichText,
+        move?: typeof before_move,
+    ) => value_only_overlay(
         history_value(text, runs),
         history_value(''),
         true,
+        move?.movedFrom,
+        move?.valueEditOrder,
     );
     const delta = build_cell_history_delta({
         worksheet: SHEET,
         sourceRow: 3,
         sourceColumn: 4,
-        before: pending(before_text, before_runs),
+        before: pending(before_text, before_runs, before_move),
         after: pending(after_text),
         persistedValue: history_value(''),
         persistedHyperlink: null,
@@ -356,6 +366,18 @@ describe('build_commit_request', () => {
         const changes = [pending_base_change('typed', 'retyped', BOLD)];
         const request = prepare(changes)!;
         const prepared = prepared_for(request);
+        expect(build_commit_request(prepared, plan_for(changes, prepared), 'm-1', 0))
+            .toBeUndefined();
+    });
+
+    it('refuses to collapse base-pending move metadata into a legacy string', () => {
+        const changes = [pending_base_change('typed', 'retyped', undefined, {
+            movedFrom: { row: 1, col: 2, order: 7 },
+            valueEditOrder: 7,
+        })];
+        const request = prepare(changes)!;
+        const prepared = prepared_for(request);
+
         expect(build_commit_request(prepared, plan_for(changes, prepared), 'm-1', 0))
             .toBeUndefined();
     });

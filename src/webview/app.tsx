@@ -610,6 +610,8 @@ export function App(): React.JSX.Element {
         = formula_roots_projection.calculationRevision;
     const formula_moves = formula_roots_projection.moves;
     const has_formula_moves = formula_moves.length > 0;
+    const formula_sheet_names = (meta?.sheets ?? []).map((sheet) => sheet.name);
+    const formula_sheet_name_signature = JSON.stringify(formula_sheet_names);
     const formula_move_signature = formula_moves.map((move) => [
         move.order ?? 0,
         move.sheetIndex,
@@ -620,12 +622,13 @@ export function App(): React.JSX.Element {
     ].join(':')).join(';');
     const formula_move_retargeter = useMemo(
         () => compile_a1_formula_move_retargeter(
-            (meta?.sheets ?? []).map((sheet) => sheet.name),
+            formula_sheet_names,
             formula_moves,
         ),
-        // The signature names provenance independently of formula value edits.
+        // The signatures name provenance and sheet qualifiers independently of
+        // formula value edits and the arrays allocated by this render.
         // eslint-disable-next-line react-hooks/exhaustive-deps
-        [load_epoch, formula_move_signature],
+        [load_epoch, formula_move_signature, formula_sheet_name_signature],
     );
     const too_many_formula_calculation_edits = formula_roots_projection.tooManyEdits;
     const [edit_mode, set_edit_mode_state] = useState(false);

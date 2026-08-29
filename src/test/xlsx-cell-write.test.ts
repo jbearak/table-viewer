@@ -1989,13 +1989,31 @@ describe('write_xlsx_cell_edits', () => {
             ],
         ]);
 
-        const out = write_xlsx_workbook_cell_edits(raw, [{
-            sheetIndex: 0,
-            edits: [
-                { row: 0, col: 0, value: '' },
-                { row: 2, col: 2, value: '10', movedFrom: { row: 0, col: 0 } },
-            ],
-        }]);
+        const worksheet_reads: string[] = [];
+        const actual_read = ZipPackage.prototype.read;
+        const read_spy = vi.spyOn(ZipPackage.prototype, 'read').mockImplementation(function (
+            this: ZipPackage,
+            path: string,
+        ) {
+            if (path.startsWith('/xl/worksheets/')) worksheet_reads.push(path);
+            return actual_read.call(this, path);
+        });
+        let out: Uint8Array;
+        try {
+            out = write_xlsx_workbook_cell_edits(raw, [{
+                sheetIndex: 0,
+                edits: [
+                    { row: 0, col: 0, value: '' },
+                    { row: 2, col: 2, value: '10', movedFrom: { row: 0, col: 0 } },
+                ],
+            }]);
+        } finally {
+            read_spy.mockRestore();
+        }
+        expect(worksheet_reads).toEqual([
+            '/xl/worksheets/sheet1.xml',
+            '/xl/worksheets/sheet2.xml',
+        ]);
         const { data } = await parse_xlsx(out);
 
         expect(data.sheets[0].rows[2][2]?.raw).toBe(10);

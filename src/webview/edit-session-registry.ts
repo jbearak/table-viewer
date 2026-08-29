@@ -238,6 +238,7 @@ export function create_edit_session_registry(
     let formula_coordinate_revision = 0;
     let formula_calculation_revision = 0;
     let too_many_formula_edits = false;
+    let formula_moves: XlsxFormulaCellMove[] = [];
     const publish = () => {
         revision += 1;
         for (const listener of listeners) listener();
@@ -328,6 +329,7 @@ export function create_edit_session_registry(
             && previous.every((edit, index) => formula_edit_values_equal(edit, next[index]));
         if (!coordinates_equal) formula_coordinate_revision += 1;
         if (!calculations_equal) formula_calculation_revision += 1;
+        formula_moves = current_moves();
     };
     const current_moves = (): XlsxFormulaCellMove[] => {
         const moves = new Map<string, XlsxFormulaCellMove>();
@@ -432,6 +434,7 @@ export function create_edit_session_registry(
                     apply_formula_change(sheetIndex, change);
                     break;
                 }
+                formula_moves = current_moves();
             }
             publish();
         }));
@@ -458,7 +461,7 @@ export function create_edit_session_registry(
             calculationRevision: formula_calculation_revision,
             tooManyEdits: too_many_formula_edits,
             hasFormulaEdits: formula_edit_count > 0,
-            moves: current_moves(),
+            moves: formula_moves,
         }),
         for_sheet: (sheet_index) => {
             const existing = stores.get(sheet_index);

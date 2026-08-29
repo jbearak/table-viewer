@@ -43,6 +43,23 @@ describe('edit session registry', () => {
         }]);
     });
 
+    it('caches move projections until a store changes', () => {
+        const { registry } = make_session_ref('session');
+        const empty = registry.formula_projection().moves;
+        expect(registry.formula_projection().moves).toBe(empty);
+
+        registry.for_sheet(0).commit('session', '2:3', {
+            value: 'moved',
+            base: 'old',
+            movedFrom: { row: 0, col: 1, order: 7 },
+        });
+        const moved = registry.formula_projection().moves;
+
+        expect(moved).not.toBe(empty);
+        expect(registry.formula_projection().moves).toBe(moved);
+        expect(moved).toHaveLength(1);
+    });
+
     it('updates formula inputs incrementally without revisiting unchanged dirty cells', () => {
         const { registry } = make_session_ref('session');
         const store = registry.for_sheet(0);

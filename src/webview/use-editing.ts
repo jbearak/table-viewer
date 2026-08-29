@@ -39,6 +39,7 @@ import {
     type EditSyntax,
     type ParsedCellEdit,
 } from '../cell-edit-model';
+import { xlsx_edit_writes_formula } from '../xlsx-cell-value';
 
 // Re-exported so consumers keep importing the edit vocabulary from the hook they
 // already use; the definitions moved to the store because it, not the hook, owns
@@ -122,6 +123,8 @@ export interface UseEditingOptions {
         text: string,
         afterOrder?: number,
     ) => string;
+    /** One workbook-wide order for a formula edit gesture. */
+    readonly next_value_edit_order?: () => number;
 }
 
 /** What capturing an edit into the workbook's history needs. */
@@ -473,7 +476,7 @@ export function use_editing(
                         source_row,
                         source_col,
                         value,
-                        dirty_entry.valueEditOrder ?? Number.POSITIVE_INFINITY,
+                        dirty_entry.valueEditOrder ?? 0,
                     ) ?? value,
                 });
                 return;
@@ -626,7 +629,18 @@ export function use_editing(
      */
     const commit_edits = useCallback(
         (edits: readonly CellValueEdit[], label = 'Edit cell'): void => {
-            run_edit_gesture(edits, label, (edit, before_entry, _before_overlay, persisted) =>
+            let gesture_order: number | undefined;
+            const next_edit_order = options?.next_value_edit_order;
+            const ordered_edits = next_edit_order === undefined
+                ? edits
+                : edits.map((edit): CellValueEdit => {
+                    if (edit.editOrder !== undefined) return edit;
+                    const parsed = parse_cell_edit(edit.value, syntax);
+                    if (!xlsx_edit_writes_formula(parsed.text, parsed.rich?.runs)) return edit;
+                    gesture_order ??= next_edit_order();
+                    return { ...edit, editOrder: gesture_order };
+                });
+            run_edit_gesture(ordered_edits, label, (edit, before_entry, _before_overlay, persisted) =>
                 plan_value_write(
                     before_entry,
                     edit.value,
@@ -635,7 +649,7 @@ export function use_editing(
                     edit,
                 ));
         },
-        [run_edit_gesture, syntax],
+        [options?.next_value_edit_order, run_edit_gesture, syntax],
     );
 
     /**

@@ -1166,6 +1166,7 @@ export function GridShell({
                 ? formula_move_retargeter?.(text, sheet_index, after_order) ?? text
                 : text;
         },
+        next_value_edit_order,
         // Same identity discipline as get_cell_raw: rebinds with `version` so
         // freshly-loaded pages refresh markdown edit text and bases.
         get_cell: useCallback(
@@ -1987,7 +1988,7 @@ export function GridShell({
                 original = formula_move_retargeter?.(
                     original,
                     sheet_index,
-                    dirty.valueEditOrder ?? Number.POSITIVE_INFINITY,
+                    dirty.valueEditOrder ?? 0,
                 ) ?? original;
             }
         } else if (edit_syntax === 'markdown') {
@@ -2891,7 +2892,7 @@ export function GridShell({
                         edit_value = formula_move_retargeter?.(
                             edit_value,
                             sheet_index,
-                            dirty.valueEditOrder ?? Number.POSITIVE_INFINITY,
+                            dirty.valueEditOrder ?? 0,
                         ) ?? edit_value;
                     }
                 } else {
@@ -2991,7 +2992,7 @@ export function GridShell({
                 : formula_move_retargeter?.(
                     dirty_formula_source,
                     sheet_index,
-                    dirty?.valueEditOrder ?? Number.POSITIVE_INFINITY,
+                    dirty?.valueEditOrder ?? 0,
                 ) ?? dirty_formula_source;
             const loaded_formula = loaded_cell?.formula === undefined
                 ? undefined

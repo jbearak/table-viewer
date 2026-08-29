@@ -313,7 +313,9 @@ function wire_entry_for_destination(
         && entry.baseRuns === undefined
         && entry.base === ''
         && entry.link === undefined
-        && entry.baseLink === undefined;
+        && entry.baseLink === undefined
+        && entry.movedFrom === undefined
+        && entry.valueEditOrder === undefined;
     return plain ? entry.value : undefined;
 }
 
