@@ -1799,7 +1799,12 @@ describe('CSV edit sessions', () => {
                     })],
                 }),
             }),
-            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['0:0'] },
+            rejection: {
+                reason: 'baseMismatch',
+                worksheetOperationIndex: 0,
+                keys: ['0:0'],
+                observedBases: { '0:0': { value: 'current' } },
+            },
         });
         expect(sheet_cells(state.get_state('/tmp/rehydrated-mismatch.csv').pendingEdits))
             .toEqual(pendingEdits);
@@ -1867,7 +1872,15 @@ describe('CSV edit sessions', () => {
         ))).toBe(true);
         expect(panel.__messages).toContainEqual(expect.objectContaining({
             type: 'saveResult',
-            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['0:0', '500:0'] },
+            rejection: {
+                reason: 'baseMismatch',
+                worksheetOperationIndex: 0,
+                keys: ['0:0', '500:0'],
+                observedBases: {
+                    '0:0': { value: 'row 0' },
+                    '500:0': { value: 'row 500' },
+                },
+            },
         }));
     });
 
@@ -2086,7 +2099,7 @@ describe('CSV edit sessions', () => {
         await panel.__receive({ type: 'saveCsv', operation });
 
         expect(write).not.toHaveBeenCalled();
-        expect(warning).toHaveBeenCalled();
+        expect(warning).not.toHaveBeenCalled();
         expect(panel.__messages).toContainEqual({
             type: 'saveResult',
             success: false,
@@ -2099,7 +2112,12 @@ describe('CSV edit sessions', () => {
             }),
             // Only the drifted key: the honest edit stays saveable once the user
             // resolves this one.
-            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['0:0'] },
+            rejection: {
+                reason: 'baseMismatch',
+                worksheetOperationIndex: 0,
+                keys: ['0:0'],
+                observedBases: { '0:0': { value: 'a' } },
+            },
         });
     });
 
@@ -7949,9 +7967,14 @@ describe('CSV edit sessions', () => {
             expect(panel.__messages).toContainEqual(expect.objectContaining({
                 type: 'saveResult',
                 success: false,
-                rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['2:0'] },
+                rejection: {
+                    reason: 'baseMismatch',
+                    worksheetOperationIndex: 0,
+                    keys: ['2:0'],
+                    observedBases: { '2:0': { value: 'b' } },
+                },
             }));
-            expect(warning).toHaveBeenCalled();
+            expect(warning).not.toHaveBeenCalled();
         });
     });
 

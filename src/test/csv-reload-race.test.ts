@@ -2383,7 +2383,7 @@ describe('CSV reload races', () => {
         expect(writes).toEqual([]);
         // And the user must be told, not silently clobbered.
         expect(warning_spy).toHaveBeenCalledWith(
-            expect.stringContaining('modified externally'),
+            expect.stringContaining('No pending edits were written'),
         );
         // A detected race is a conflict, never a generic save failure.
         expect(error_spy).not.toHaveBeenCalled();
@@ -2427,7 +2427,7 @@ describe('CSV reload races', () => {
 
         expect(writes).toEqual([]);
         expect(warning_spy).toHaveBeenCalledWith(
-            expect.stringContaining('modified externally'),
+            expect.stringContaining('No pending edits were written'),
         );
         expect(error_spy).not.toHaveBeenCalled();
         // The refusal's recovery refresh arms a bounded reload retry; dispose
@@ -2444,7 +2444,7 @@ describe('CSV reload races', () => {
             reads += 1;
             if (reads > 2) {
                 expect(warning_spy).toHaveBeenCalledWith(
-                    expect.stringContaining('modified externally'),
+                    expect.stringContaining('No pending edits were written'),
                 );
             }
             return enc.encode('h\na\n');
@@ -2463,7 +2463,7 @@ describe('CSV reload races', () => {
             success: false,
         }));
         expect(warning_spy).toHaveBeenCalledWith(
-            expect.stringContaining('modified externally'),
+            expect.stringContaining('No pending edits were written'),
         );
     });
 
@@ -2486,7 +2486,7 @@ describe('CSV reload races', () => {
 
         expect(panel.__messages).toContainEqual(expect.objectContaining({ type: 'saveResult', success: false }));
         expect(warning_spy).toHaveBeenCalledWith(
-            expect.stringContaining('modified externally'),
+            expect.stringContaining('No pending edits were written'),
         );
     });
 
@@ -2583,7 +2583,7 @@ describe('CSV reload races', () => {
             ),
         );
         expect(results).toEqual([expect.objectContaining({ type: 'saveResult', success: false })]);
-        // Only the "modified externally" warning — no generic save-failure error.
+        // Only the retry warning — no generic save-failure error.
         expect(error_spy).not.toHaveBeenCalled();
     });
 

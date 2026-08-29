@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { create_edit_session_store } from '../webview/edit-session-store';
+import { collect_save_payload } from '../webview/csv-save-model';
 
 // Models the paged cache: a row absent from `rows` is a page that is NOT
 // resident and yields undefined, distinct from a loaded-but-blank cell ('').
@@ -8,6 +9,14 @@ function make_get_cell_raw(rows: Record<number, string[]>) {
         const row = rows[r];
         if (row === undefined) return undefined;
         return row[c] ?? '';
+    };
+}
+
+function make_get_cell_base(rows: Record<number, string[]>) {
+    const get_raw = make_get_cell_raw(rows);
+    return (r: number, c: number) => {
+        const value = get_raw(r, c);
+        return value === undefined ? undefined : { value };
     };
 }
 
@@ -160,20 +169,136 @@ describe('edit session store', () => {
         const notifications = count_notifications(store);
 
         // Row 1 not resident: nothing to capture, so nothing to notify about —
-        // get_cell_raw rebinds on every page load, so a notification here would
+        // get_cell_base rebinds on every page load, so a notification here would
         // re-render on every scroll.
-        store.resolve_pending_bases('s', make_get_cell_raw({ 0: ['a'] }));
+        store.resolve_pending_bases('s', make_get_cell_base({ 0: ['a'] }));
         expect(notifications.n).toBe(0);
         expect(store.has_pending_base()).toBe(true);
 
-        store.resolve_pending_bases('s', make_get_cell_raw({ 0: ['a'], 1: ['d'] }));
+        store.resolve_pending_bases('s', make_get_cell_base({ 0: ['a'], 1: ['d'] }));
         expect(notifications.n).toBe(1);
         expect(store.has_pending_base()).toBe(false);
-        expect(store.get('1:0')).toEqual({ value: 'D', base: 'd' });
+        expect(store.get('1:0')).toEqual({
+            value: 'D', base: 'd', formattingKnown: true,
+        });
 
         // Nothing pending left: a further call must not notify.
-        store.resolve_pending_bases('s', make_get_cell_raw({ 0: ['a'], 1: ['d'] }));
+        store.resolve_pending_bases('s', make_get_cell_base({ 0: ['a'], 1: ['d'] }));
         expect(notifications.n).toBe(1);
+    });
+
+    it('writes a resolved equal-value legacy entry after the file moves', () => {
+        const store = create_edit_session_store({ session_id: 's' }, { '1:0': 'A' });
+        store.resolve_pending_bases('s', make_get_cell_base({ 1: ['A'] }));
+        expect(store.get('1:0')).toEqual({
+            value: 'A', base: 'A', formattingKnown: true,
+        });
+
+        store.observe_file_bases('s', new Map([['1:0', { value: 'C' }]]));
+        expect(store.get('1:0')).toEqual({
+            value: 'A',
+            base: 'A',
+            formattingKnown: true,
+            observedBase: { value: 'C' },
+        });
+        const payload = collect_save_payload(store.snapshot());
+        expect(payload.status).toBe('ready');
+        if (payload.status !== 'ready') throw new Error('expected ready save payload');
+        expect(payload.edits).toEqual({ '1:0': 'A' });
+    });
+
+    it('captures rich formatting when resolving a legacy base', () => {
+        const store = create_edit_session_store({ session_id: 's' }, { '1:0': 'A' });
+        const rich = { runs: [{ text: 'A', style: { bold: true as const } }] };
+        store.resolve_pending_bases('s', () => ({ value: 'A', runs: rich }));
+
+        expect(store.get('1:0')).toEqual({
+            value: 'A',
+            base: 'A',
+            valueRuns: rich,
+            baseRuns: rich,
+            formattingKnown: true,
+        });
+        store.observe_file_bases('s', new Map([[
+            '1:0',
+            { value: 'A', runs: rich },
+        ]]));
+        expect(store.get('1:0')?.observedBase).toBeUndefined();
+        const payload = collect_save_payload(store.snapshot());
+        expect(payload.status).toBe('ready');
+        if (payload.status !== 'ready') throw new Error('expected ready save payload');
+        expect(payload.edits).toEqual({});
+    });
+
+    it('does not invent a formatting change for an older resolved equal-value entry', () => {
+        const store = create_edit_session_store(
+            { session_id: 's' },
+            { '1:0': { value: 'A', base: 'A' } },
+        );
+        const rich = { runs: [{ text: 'A', style: { bold: true as const } }] };
+
+        store.observe_file_bases('s', new Map([[
+            '1:0',
+            { value: 'A', runs: rich },
+        ]]));
+
+        expect(store.get('1:0')).toEqual({ value: 'A', base: 'A' });
+        const payload = collect_save_payload(store.snapshot());
+        expect(payload.status).toBe('ready');
+        if (payload.status !== 'ready') throw new Error('expected ready save payload');
+        expect(payload.edits).toEqual({});
+    });
+
+    it('does not invent a formatting change for an older changed-text entry', () => {
+        const store = create_edit_session_store(
+            { session_id: 's' },
+            { '1:0': { value: 'B', base: 'A' } },
+        );
+        const rich = { runs: [{ text: 'A', style: { bold: true as const } }] };
+
+        store.observe_file_bases('s', new Map([[
+            '1:0',
+            { value: 'A', runs: rich },
+        ]]));
+
+        expect(store.get('1:0')).toEqual({ value: 'B', base: 'A' });
+        const payload = collect_save_payload(store.snapshot());
+        expect(payload.status).toBe('ready');
+        if (payload.status !== 'ready') throw new Error('expected ready save payload');
+        expect(payload.edits).toEqual({ '1:0': 'B' });
+    });
+
+    it('keeps formatting drift visible for an explicit equal-value write', () => {
+        const store = create_edit_session_store(
+            { session_id: 's' },
+            {
+                '1:0': {
+                    value: 'A',
+                    base: 'A',
+                    observedBase: { value: 'C' },
+                    writeValue: true,
+                    formattingKnown: true,
+                },
+            },
+        );
+        const rich = { runs: [{ text: 'A', style: { bold: true as const } }] };
+
+        store.observe_file_bases('s', new Map([[
+            '1:0',
+            { value: 'A', runs: rich },
+        ]]));
+
+        expect(store.get('1:0')).toEqual({
+            value: 'A',
+            base: 'A',
+            observedBase: { value: 'A', runs: rich },
+            writeValue: true,
+            formattingKnown: true,
+        });
+        const payload = collect_save_payload(store.snapshot());
+        expect(payload.status).toBe('ready');
+        if (payload.status !== 'ready') throw new Error('expected ready save payload');
+        expect(payload.edits).toEqual({ '1:0': 'A' });
     });
 
     it('replace clears the pending-base flag', () => {

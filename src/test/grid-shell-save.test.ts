@@ -3,7 +3,12 @@
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { CsvSaveLifecycle, CsvSaveOperation } from '../types';
+import type {
+    CsvDirtyEntry,
+    CsvObservedFileBase,
+    CsvSaveLifecycle,
+    CsvSaveOperation,
+} from '../types';
 import type { EditingHandle } from '../webview/grid-shell';
 import {
     create_edit_session_store,
@@ -176,10 +181,11 @@ async function render_grid(
     save_props: {
         save_operation?: CsvSaveOperation;
         save_lifecycle?: CsvSaveLifecycle;
-        initial_edits?: Record<string, string | { value: string; base: string }>;
+        initial_edits?: Record<string, string | CsvDirtyEntry>;
         edit_session?: EditSessionStore;
         use_fallback_store?: boolean;
         host_rejected_keys?: readonly string[];
+        host_observed_bases?: Readonly<Record<string, CsvObservedFileBase>>;
         on_editing_change?: (status: {
             is_dirty: boolean;
             has_live_uncommitted: boolean;
@@ -602,7 +608,11 @@ describe('GridShell CSV save', () => {
         post_message.mockClear();
         await edit_cell('second');
         expect(pending_edit_messages(post_message)).toEqual([
-            { edits: { '0:0': { value: 'second', base: 'base' } } },
+            {
+                edits: {
+                    '0:0': { value: 'second', base: 'base', formattingKnown: true },
+                },
+            },
         ]);
     });
 
@@ -683,7 +693,9 @@ describe('GridShell CSV save', () => {
             type: 'saveCsv', edits: { '0:0': 'open editor value' },
         }]);
         expect(post_message.mock.calls.at(-1)?.[0].operation.worksheets[0].dirtyEdits).toEqual({
-            '0:0': { value: 'open editor value', base: 'base' },
+            '0:0': {
+                value: 'open editor value', base: 'base', formattingKnown: true,
+            },
         });
         await edit_cell('too late');
         expect(save_messages(post_message)).toHaveLength(1);
@@ -723,7 +735,65 @@ describe('GridShell CSV save', () => {
         });
         expect(await request_save(editing_ref)).toBe(true);
         expect(post_message.mock.calls.at(-1)?.[0].operation.worksheets[0].dirtyEdits).toEqual({
-            '0:0': { value: 'overlay', base: 'exact-conflict-base' },
+            '0:0': {
+                value: 'overlay',
+                base: 'exact-conflict-base',
+                observedBase: { value: 'base' },
+            },
+        });
+    });
+
+    it('adopts a host-observed base and includes it in the retry payload', async () => {
+        // Keep the rejected source nonresident so only the host observation
+        // path can supply its newer file side. This is the seam the host payload
+        // exists to cover: the grid cannot independently read an unloaded row.
+        grid_mock.source_row_for_display = () => 1;
+        const dirty: Record<string, CsvDirtyEntry> = {
+            '0:0': { value: 'pending', base: 'original' },
+        };
+        const store = create_edit_session_store({ session_id: 'session-1' }, dirty);
+        const { post_message, editing_ref } = await render_grid(undefined, {
+            initial_edits: dirty,
+            edit_session: store,
+            host_rejected_keys: ['0:0'],
+            host_observed_bases: { '0:0': { value: 'host current' } },
+        });
+
+        expect(store.get('0:0')).toEqual({
+            value: 'pending',
+            base: 'original',
+            observedBase: { value: 'host current' },
+        });
+        expect(await request_save(editing_ref)).toBe(true);
+        expect(posted_save(post_message)?.worksheets[0].dirtyEdits).toEqual({
+            '0:0': {
+                value: 'pending',
+                base: 'original',
+                observedBase: { value: 'host current' },
+            },
+        });
+    });
+
+    it('saves restored equal-value write intent instead of treating it as a no-op', async () => {
+        grid_mock.text_for_source_row = () => ['C'];
+        const restored: Record<string, CsvDirtyEntry> = {
+            '0:0': {
+                value: 'A',
+                base: 'A',
+                observedBase: { value: 'C' },
+                writeValue: true,
+            },
+        };
+        const store = create_edit_session_store({ session_id: 'session-1' }, restored);
+        const { post_message, editing_ref } = await render_grid(undefined, {
+            initial_edits: restored,
+            edit_session: store,
+        });
+
+        expect(await request_save(editing_ref)).toBe(true);
+        expect(posted_save(post_message)?.worksheets[0]).toMatchObject({
+            edits: { '0:0': 'A' },
+            dirtyEdits: restored,
         });
     });
 
@@ -915,7 +985,7 @@ describe('GridShell CSV save', () => {
     });
 
     it('does not hydrate a failed operation into a different current session', async () => {
-        const newer = { '0:0': { value: 'newer', base: 'new-base' } };
+        const newer = { '0:0': { value: 'newer', base: 'base' } };
         const failed: CsvSaveOperation = {
             editSessionId: 'old-session',
         saveRequestId: 'old-failure',
@@ -936,7 +1006,7 @@ describe('GridShell CSV save', () => {
     });
 
     it('preserves a newer session across an older succeeded lifecycle', async () => {
-        const newer = { '0:0': { value: 'newer', base: 'new-base' } };
+        const newer = { '0:0': { value: 'newer', base: 'base' } };
         const succeeded: CsvSaveOperation = {
             editSessionId: 'old-session',
         saveRequestId: 'old-success',
@@ -957,7 +1027,7 @@ describe('GridShell CSV save', () => {
     });
 
     it('ignores a live failed lifecycle from a different session', async () => {
-        const newer = { '0:0': { value: 'newer', base: 'new-base' } };
+        const newer = { '0:0': { value: 'newer', base: 'base' } };
         const failed: CsvSaveOperation = {
             editSessionId: 'old-session',
         saveRequestId: 'old-failure',
@@ -1142,6 +1212,7 @@ describe('GridShell edits across a generation bump', () => {
         expect(store.snapshot().get('0:0')).toEqual({
             value: 'typed but not closed',
             base: 'base',
+            formattingKnown: true,
         });
     });
 
@@ -1175,12 +1246,15 @@ describe('GridShell edits across a generation bump', () => {
         expect(store.snapshot().get('0:0')).toEqual({
             value: 'typed but not closed',
             base: 'base',
+            formattingKnown: true,
         });
         expect(post_message).toHaveBeenCalledWith({
             type: 'pendingEditsChanged',
             editSessionId: 'session-1',
             edits: {
-                '0:0': { value: 'typed but not closed', base: 'base' },
+                '0:0': {
+                    value: 'typed but not closed', base: 'base', formattingKnown: true,
+                },
             },
             sequence: expect.any(Number),
             sheetIndex: 0,
@@ -1268,7 +1342,7 @@ describe('GridShell source-keyed save payloads', () => {
         const operation = posted_save(post_message)!;
         expect(operation.worksheets[0].edits).toEqual({ '5:0': 'typed' });
         expect(operation.worksheets[0].dirtyEdits).toEqual({
-            '5:0': { value: 'typed', base: 'five-a' },
+            '5:0': { value: 'typed', base: 'five-a', formattingKnown: true },
         });
     });
 
@@ -1284,7 +1358,7 @@ describe('GridShell source-keyed save payloads', () => {
         const operation = posted_save(post_message)!;
         expect(operation.worksheets[0].edits).toEqual({ '5:0': 'overlay-text' });
         expect(operation.worksheets[0].dirtyEdits).toEqual({
-            '5:0': { value: 'overlay-text', base: 'five-a' },
+            '5:0': { value: 'overlay-text', base: 'five-a', formattingKnown: true },
         });
     });
 
@@ -1314,7 +1388,9 @@ describe('GridShell source-keyed save payloads', () => {
         // Outside act on purpose, as in the identity-mapped test above: the
         // write-through is synchronous.
         expect(Object.fromEntries(store.snapshot())).toEqual({
-            '5:0': { value: 'typed but not closed', base: 'five-a' },
+            '5:0': {
+                value: 'typed but not closed', base: 'five-a', formattingKnown: true,
+            },
         });
     });
 });

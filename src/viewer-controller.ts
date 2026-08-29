@@ -1735,6 +1735,14 @@ export function attach_viewer(
             || save_lifecycle.state === 'active';
     }
 
+    /** A prepared or committing undo/redo owns the same durable pending-edit
+     * projection a save snapshots and later clears. Neither operation may start
+     * while the other owns that projection. */
+    function history_replay_blocks_save(): boolean {
+        return replay_preparation_in_flight
+            || replay_leases.current(Date.now()) !== undefined;
+    }
+
     /**
      * Transform work is mid-flight across state I/O somewhere on this file:
      * `compute_transform` yields at cancellation checkpoints and publishes the
@@ -3289,8 +3297,23 @@ export function attach_viewer(
         return {
             dirtyEdits: dirty_edits,
             rejection: validation.type === 'removedRows'
-                ? { reason: 'rowsRemoved', worksheetOperationIndex: 0, keys: validation.keys }
-                : { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: validation.keys },
+                ? {
+                    reason: 'rowsRemoved',
+                    worksheetOperationIndex: 0,
+                    keys: [...validation.keys, ...(validation.changedKeys ?? [])],
+                    ...(validation.changedKeys !== undefined
+                        ? {
+                            removedKeys: validation.keys,
+                            observedBases: validation.observedBases,
+                        }
+                        : {}),
+                }
+                : {
+                    reason: 'baseMismatch',
+                    worksheetOperationIndex: 0,
+                    keys: validation.keys,
+                    observedBases: validation.observedBases,
+                },
         };
     }
 
@@ -5936,9 +5959,11 @@ export function attach_viewer(
         // matches this gate's existing shape: the save reports a failed lifecycle
         // the webview already knows how to restore from, and transform work is
         // short, so a retry costs the user one keystroke.
+        const history_replay_in_flight = history_replay_blocks_save();
         if (
             edit_cleanup_blocked()
             || transform_work_in_flight()
+            || history_replay_in_flight
             || !editing_supported
             || !src
             || !core
@@ -5955,6 +5980,8 @@ export function attach_viewer(
             show_owner_warning(
                 transform_work_in_flight()
                     ? 'Wait for sorting and filtering to finish, then save again.'
+                    : history_replay_in_flight
+                    ? 'Wait for undo or redo to finish, then save again.'
                     : 'The table view is still refreshing. Please try saving again.',
             );
             void post_to_receiver({ type: 'saveResult', success: false, lifecycle });
@@ -6019,11 +6046,30 @@ export function attach_viewer(
                         ? (source_row, col) => plan.observed_links?.[index]?.get(`${source_row}:${col}`)
                         : undefined,
                 )
-                : { type: 'baseMismatch' as const, keys: Object.keys(worksheet.dirtyEdits) };
+                : {
+                    type: 'conflicts' as const,
+                    keys: Object.keys(worksheet.dirtyEdits),
+                    observedBases: {},
+                };
             if (validation.type === 'valid') continue;
             rejection = validation.type === 'removedRows'
-                ? { reason: 'rowsRemoved', worksheetOperationIndex: index, keys: validation.keys }
-                : { reason: 'baseMismatch', worksheetOperationIndex: index, keys: validation.keys };
+                ? {
+                    reason: 'rowsRemoved',
+                    worksheetOperationIndex: index,
+                    keys: [...validation.keys, ...(validation.changedKeys ?? [])],
+                    ...(validation.changedKeys !== undefined
+                        ? {
+                            removedKeys: validation.keys,
+                            observedBases: validation.observedBases,
+                        }
+                        : {}),
+                }
+                : {
+                    reason: 'baseMismatch',
+                    worksheetOperationIndex: index,
+                    keys: validation.keys,
+                    observedBases: validation.observedBases,
+                };
             break;
         }
         if (rejection) {
@@ -6032,14 +6078,10 @@ export function attach_viewer(
             // operation and restores the precise dirty map it submitted.
             const active = begin_save_lifecycle(identity);
             const lifecycle = finish_save_lifecycle(active.operation, 'failed');
-            // Warning, not error, matching the digest-check path: an externally
-            // changed file is an expected condition the user resolves, not a
-            // failure of ours.
-            show_owner_warning(
-                rejection.reason === 'rowsRemoved'
-                    ? 'File shrank externally. Some edited rows no longer exist, so the save was cancelled.'
-                    : 'File was modified externally. Some edits no longer match the file, so the save was cancelled.',
-            );
+            // The renderer owns this expected condition: it can show the original,
+            // current and pending values together and offer a per-cell discard.
+            // A host warning would duplicate that notice and becomes a modal dialog
+            // in the desktop app, turning an informational event into an alarm.
             void post_to_receiver({
                 type: 'saveResult',
                 success: false,
@@ -6086,11 +6128,11 @@ export function attach_viewer(
             operation.phase = 'accepted';
 
             // Shared refusal path: the adopted-source check, full verification,
-            // and final pre-write re-stat must report a conflict identically, so a
+            // and final pre-write re-stat must report the retry identically, so a
             // detected race never surfaces as a generic "Failed to save" error.
             const refuse_as_external_change = async (): Promise<void> => {
                 show_owner_warning(
-                    'File was modified externally. Please review the changes and try again.',
+                    'The file changed before the save could finish. No pending edits were written; try saving again.',
                 );
                 if (!disposed) await refresh_panel_source(true, 'recovery');
                 if (!save_operation_owns_lifecycle(operation)) return;
@@ -8283,7 +8325,11 @@ export function attach_viewer(
                 // document the other is moving. The renderer serializes too, so
                 // reaching this is a stale request rather than a race worth
                 // queueing.
-                if (replay_preparation_in_flight || replay_leases.current(Date.now()) !== undefined) {
+                if (
+                    active_save_operation !== undefined
+                    || replay_preparation_in_flight
+                    || replay_leases.current(Date.now()) !== undefined
+                ) {
                     refuse('busy');
                     return;
                 }
@@ -9110,6 +9156,7 @@ export function attach_viewer(
                 sourceColumn: cell.sourceColumn,
                 overlay: cell.overlay,
                 persisted: cell.persisted,
+                persistedHyperlink: cell.persistedHyperlink,
             })) return false;
         }
         return true;

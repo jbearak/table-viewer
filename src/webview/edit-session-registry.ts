@@ -38,7 +38,7 @@
  */
 
 import {
-    dirty_entry_value_changed,
+    dirty_entry_value_dimension_present,
     worksheet_identity,
     worksheet_target_lookup,
     type CsvDirtyMap,
@@ -279,7 +279,7 @@ export function create_edit_session_registry(
         };
     };
     const formula_input = (entry: DirtyEntry): ReturnType<typeof calculation_input> | undefined =>
-        dirty_entry_value_changed(entry)
+        dirty_entry_value_dimension_present(entry)
             ? calculation_input({
                 value: entry.value,
                 ...(entry.valueRuns !== undefined ? { runs: entry.valueRuns.runs } : {}),

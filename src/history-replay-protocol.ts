@@ -114,6 +114,9 @@ export interface WirePresentValueDimension {
     readonly value: WireHistoryValue;
     readonly base: WireHistoryValue;
     readonly basePending: boolean;
+    readonly writeValue?: true;
+    readonly retainValue?: true;
+    readonly formattingKnown?: true;
 }
 
 export interface WireUntouchedHyperlinkDimension {
@@ -445,6 +448,9 @@ function sanitized_wire_value_dimension(
     }
     if (value.kind !== 'present') return undefined;
     if (typeof value.basePending !== 'boolean') return undefined;
+    if (value.writeValue !== undefined && value.writeValue !== true) return undefined;
+    if (value.retainValue !== undefined && value.retainValue !== true) return undefined;
+    if (value.formattingKnown !== undefined && value.formattingKnown !== true) return undefined;
     const present = sanitized_wire_history_value(value.value);
     const base = sanitized_wire_history_value(value.base);
     if (present === undefined || base === undefined) return undefined;
@@ -453,6 +459,9 @@ function sanitized_wire_value_dimension(
         value: present,
         base,
         basePending: value.basePending,
+        ...(value.writeValue === true ? { writeValue: true as const } : {}),
+        ...(value.retainValue === true ? { retainValue: true as const } : {}),
+        ...(value.formattingKnown === true ? { formattingKnown: true as const } : {}),
     });
 }
 
@@ -736,6 +745,10 @@ export function sanitized_commit_history_replay_request(
                 raw.entry.baseRuns,
                 raw.entry.link,
                 raw.entry.baseLink,
+                raw.entry.observedBase,
+                raw.entry.writeValue,
+                raw.entry.retainValue,
+                raw.entry.formattingKnown,
             ),
         });
     });
@@ -794,6 +807,19 @@ export function history_replay_proposal_digest(
                 // runs.
                 'link' in write.entry ? ['set', write.entry.link] : ['absent'],
                 'baseLink' in write.entry ? ['set', write.entry.baseLink] : ['absent'],
+                write.entry.observedBase === undefined ? ['absent'] : [
+                    'observed',
+                    write.entry.observedBase.value,
+                    write.entry.observedBase.runs ?? null,
+                    'link' in write.entry.observedBase
+                        ? ['set', write.entry.observedBase.link]
+                        : ['absent'],
+                ],
+                write.entry.writeValue === true ? ['write-value'] : ['infer-value'],
+                write.entry.retainValue === true ? ['retain-value'] : ['infer-membership'],
+                write.entry.formattingKnown === true
+                    ? ['known-formatting']
+                    : ['unknown-formatting'],
             ],
         ]);
     const highlights = [...request.highlights]

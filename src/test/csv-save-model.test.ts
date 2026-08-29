@@ -47,6 +47,26 @@ describe('collect_save_payload', () => {
             reason: 'unresolvedBases',
         });
     });
+
+    it('writes explicit pending formatting against a known observed side', () => {
+        const payload = collect_save_payload(new Map([
+            ['0:0', {
+                value: 'current',
+                base: 'original',
+                valueRuns: { runs: [{ text: 'current' }] },
+                observedBase: {
+                    value: 'current',
+                    runs: {
+                        runs: [{ text: 'current', style: { bold: true as const } }],
+                    },
+                },
+            }],
+        ]));
+
+        expect(payload.status).toBe('ready');
+        if (payload.status !== 'ready') throw new Error('expected ready');
+        expect(payload.edits).toEqual({ '0:0': 'current' });
+    });
 });
 
 describe('collect_save_payload — hyperlink edits', () => {
@@ -80,6 +100,35 @@ describe('collect_save_payload — hyperlink edits', () => {
             link,
             baseLink: null,
         });
+    });
+
+    it('writes a retained value dimension after the observed file text moves', () => {
+        const payload = collect_save_payload(new Map([
+            ['1:1', {
+                value: 'A',
+                base: 'A',
+                link,
+                baseLink: null,
+                observedBase: { value: 'C', link: null },
+                retainValue: true as const,
+            }],
+        ]));
+        if (payload.status !== 'ready') throw new Error('expected ready');
+        expect(payload.edits).toEqual({ '1:1': 'A' });
+    });
+
+    it('does not turn a true link-only entry into a text write after observation', () => {
+        const payload = collect_save_payload(new Map([
+            ['1:1', {
+                value: 'A',
+                base: 'A',
+                link,
+                baseLink: null,
+                observedBase: { value: 'C', link: null },
+            }],
+        ]));
+        if (payload.status !== 'ready') throw new Error('expected ready');
+        expect(payload.edits).toEqual({});
     });
 
     it('carries a clear (link: null against a linked base)', () => {

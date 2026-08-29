@@ -114,6 +114,70 @@ export function rich_text_equal(left: RichText, right: RichText): boolean {
     return true;
 }
 
+/**
+ * Whether the formatting of text retained across an edit stayed the same.
+ *
+ * Formatting is only reported as changed when the two values give us evidence
+ * of it. Equal text can be compared exactly. For changed text, the length of
+ * a longest retained character sequence is compared with the longest sequence
+ * that also preserves style. This matters for repeated characters: deleting the
+ * first bold `A` from `AA` may retain the second plain `A`, so greedily pairing
+ * the two first characters would invent a formatting change. Inserted or deleted
+ * characters do not count as formatting changes by themselves.
+ */
+export function rich_text_formatting_equal(left: RichText, right: RichText): boolean {
+    const a = normalize_rich_text(left);
+    const b = normalize_rich_text(right);
+    const a_text = rich_text_plain_text(a);
+    const b_text = rich_text_plain_text(b);
+    if (a_text === b_text) return rich_text_equal(a, b);
+    // With no retained character there is no formatting evidence to compare.
+    if (a_text === '' || b_text === '') return true;
+
+    // The common case for a text-only external edit needs no alignment at all.
+    // It also keeps large plain cells from allocating one object per code point
+    // merely to prove that neither side carries formatting.
+    if (!rich_text_has_styles(a) && !rich_text_has_styles(b)) return true;
+
+    // Check the budget before expanding into code points. UTF-16 length is an
+    // upper bound on code-point count, so this may conservatively omit a note for
+    // astral-heavy text but can never invent a formatting change.
+    if (a_text.length * b_text.length > 1_000_000) return true;
+
+    const expand = (value: RichText): Array<{
+        readonly character: string;
+        readonly style: CellTextStyle | undefined;
+    }> => value.runs.flatMap((run) => Array.from(run.text, (character) => ({
+        character,
+        style: run.style,
+    })));
+    const a_characters = expand(a);
+    const b_characters = expand(b);
+
+    const lcs_length = (styles_must_match: boolean): number => {
+        const [rows, columns] = a_characters.length >= b_characters.length
+            ? [a_characters, b_characters]
+            : [b_characters, a_characters];
+        let previous = new Uint32Array(columns.length + 1);
+        let current = new Uint32Array(columns.length + 1);
+        for (const row of rows) {
+            current.fill(0);
+            for (let column = 0; column < columns.length; column += 1) {
+                const candidate = columns[column];
+                const matches = row.character === candidate.character
+                    && (!styles_must_match || text_styles_equal(row.style, candidate.style));
+                current[column + 1] = matches
+                    ? previous[column] + 1
+                    : Math.max(previous[column + 1], current[column]);
+            }
+            [previous, current] = [current, previous];
+        }
+        return previous[columns.length];
+    };
+
+    return lcs_length(false) === lcs_length(true);
+}
+
 export function rich_text_plain_text(value: RichText): string {
     let text = '';
     for (const run of value.runs) text += run.text;

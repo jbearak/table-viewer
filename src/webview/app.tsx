@@ -1,4 +1,4 @@
-import { cell_key } from '../cell-key';
+import { cell_key, parse_cell_key } from '../cell-key';
 import React, {
     useState,
     useEffect,
@@ -28,7 +28,11 @@ import {
     type CellHighlightState,
     type HighlightCellDelta,
     dirty_entries_equal,
+    dirty_entry_base_formatting_unknown,
+    dirty_entry_value_dimension_present,
+    dirty_entry_with_observed_file_base,
     type CsvDirtyEntry,
+    type CsvObservedFileBase,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
     type CsvSaveWorksheetOperation,
@@ -47,6 +51,15 @@ import {
     type WorksheetTarget,
 } from '../types';
 import type { WorkbookMeta } from '../data-source/interface';
+import {
+    hyperlinks_equal,
+    normalize_rich_text,
+    rich_text_formatting_equal,
+    rich_text_from_plain,
+    rich_text_has_styles,
+    type CellHyperlink,
+    type RichText,
+} from '../cell-content';
 import {
     all_workbook_formula_cells_impact,
     compile_workbook_formula_graph,
@@ -197,6 +210,90 @@ type FilterHistogramState = FilterHistogramStatus;
 
 const GRID_FOCUS_RESTORE_MAX_ATTEMPTS = 8;
 const GRID_FOCUS_RESTORE_RETRY_MS = 16;
+const EXTERNAL_CHANGE_FORMATTING_COMPARISON_BUDGET = 1_000_000;
+
+function review_value(value: string): string {
+    return value === '' ? '(empty)' : value;
+}
+
+function review_link(link: CellHyperlink | null): string {
+    if (link === null) return 'No link';
+    const destination = link.kind === 'external'
+        ? `External link: ${link.target}`
+        : `Workbook link: ${link.location}`;
+    return link.tooltip ? `${destination} (tooltip: ${link.tooltip})` : destination;
+}
+
+function review_formatting_changed(
+    before_value: string,
+    before: RichText | undefined,
+    after_value: string,
+    after: RichText | undefined,
+    budget: { remaining: number },
+): boolean {
+    const before_rich = before ?? rich_text_from_plain(before_value);
+    const after_rich = after ?? rich_text_from_plain(after_value);
+    if (!rich_text_has_styles(before_rich) && !rich_text_has_styles(after_rich)) {
+        return false;
+    }
+    const cost = before_value === after_value
+        ? Math.max(before_value.length, after_value.length)
+        : before_value.length * after_value.length;
+    // One review can contain many medium-sized cells. Bound their TOTAL work,
+    // not only each comparison: uncertainty omits an informational note rather
+    // than freezing the panel or falsely claiming formatting changed.
+    if (!Number.isSafeInteger(cost) || cost > budget.remaining) return false;
+    budget.remaining -= cost;
+    return !rich_text_formatting_equal(
+        before_rich,
+        after_rich,
+    );
+}
+
+/** Canonical identity for one observed file side. Unknown extra wire fields are
+ * deliberately ignored, and equivalent plain-run/link encodings agree. */
+function external_change_observation_signature(
+    observed: CsvObservedFileBase | undefined,
+): string {
+    if (observed === undefined) return 'unavailable';
+    const normalized = observed.runs === undefined
+        ? undefined
+        : normalize_rich_text(observed.runs);
+    const effective_runs = normalized !== undefined && rich_text_has_styles(normalized)
+        ? normalized.runs.map((run) => (
+            [
+                run.text,
+                run.style?.bold === true,
+                run.style?.italic === true,
+                run.style?.underline === true,
+                run.style?.strikethrough === true,
+            ] as const
+        ))
+        : null;
+    const link = observed.link === undefined
+        ? ['absent'] as const
+        : observed.link === null
+            ? ['set', null] as const
+            : observed.link.kind === 'external'
+                ? ['set', 'external', observed.link.target, observed.link.tooltip ?? ''] as const
+                : ['set', 'internal', observed.link.location, observed.link.tooltip ?? ''] as const;
+    return JSON.stringify([observed.value, effective_runs, link]);
+}
+
+function review_formatting(value: string, formatting: RichText | undefined): string {
+    const rich = formatting ?? rich_text_from_plain(value);
+    if (rich.runs.length === 0) return 'Plain';
+    return rich.runs.map((run) => {
+        const styles = [
+            ...(run.style?.bold ? ['bold'] : []),
+            ...(run.style?.italic ? ['italic'] : []),
+            ...(run.style?.underline ? ['underline'] : []),
+            ...(run.style?.strikethrough ? ['strikethrough'] : []),
+        ];
+        const label = styles.length > 0 ? styles.join(', ') : 'plain';
+        return `${label}: ${review_value(run.text)}`;
+    }).join('; ');
+}
 
 /** Whether a live control currently owns focus (as opposed to a remount leaving it on body). */
 function has_surviving_focus_target(): boolean {
@@ -445,6 +542,28 @@ function transform_reconciliation_required(
 
 /** Shared so clearing an already-empty auto-fit queue is not a state change. */
 const EMPTY_PENDING_AUTO_FIT: ReadonlySet<number> = new Set<number>();
+
+function ExternalChangeItem({
+    source_key,
+    on_detach,
+    children,
+}: {
+    source_key: string;
+    on_detach: (source_key: string, element: HTMLLIElement) => void;
+    children: React.ReactNode;
+}): React.JSX.Element {
+    const element_ref = useRef<HTMLLIElement | null>(null);
+    const mount = useCallback((element: HTMLLIElement | null) => {
+        const previous = element_ref.current;
+        element_ref.current = element;
+        if (element === null && previous !== null) on_detach(source_key, previous);
+    }, [on_detach, source_key]);
+    return (
+        <li className="external-change-item" ref={mount}>
+            {children}
+        </li>
+    );
+}
 
 /** Webview root for snapshot metadata plus paginated row delivery. */
 export function App(): React.JSX.Element {
@@ -867,6 +986,8 @@ export function App(): React.JSX.Element {
     } | null>(null);
     const [source_epoch, set_source_epoch] = useState(0);
     const [editing_status, set_editing_status] = useState<EditingStatus | null>(null);
+    const [editing_status_sheet_index, set_editing_status_sheet_index] =
+        useState<number | null>(null);
     const [cell_highlights, set_cell_highlights] = useState<CellHighlightState>();
     const [active_highlight_color, set_active_highlight_color] =
         useState<CellHighlightColor>('yellow');
@@ -874,10 +995,93 @@ export function App(): React.JSX.Element {
         useState(false);
     const [highlight_request_pending, set_highlight_request_pending] = useState(false);
     const [highlight_status, set_highlight_status] = useState('');
-    // Conflict signature the user dismissed ("Keep All"); the banner reappears only
-    // if a *different* set of cells later conflicts.
-    const [dismissed_conflict_signature, set_dismissed_conflict_signature] =
+    // Last dismissed occurrence per worksheet. Keeping this per sheet prevents
+    // acknowledging one tab from resurrecting an unchanged notice on another.
+    const [dismissed_external_change_occurrences, set_dismissed_external_change_occurrences] =
+        useState<Readonly<Record<string, number>>>({});
+    const [open_external_change_occurrence, set_open_external_change_occurrence] =
         useState<string | null>(null);
+    const [external_change_navigation_status, set_external_change_navigation_status] =
+        useState('');
+    const [external_change_navigation_pending_key, set_external_change_navigation_pending_key] =
+        useState<string | null>(null);
+    const external_change_navigation_pending_ref = useRef<string | null>(null);
+    const external_change_navigation_request_ref = useRef(0);
+    const external_change_navigation_context_ref = useRef<string | null>(null);
+    const cancel_external_change_navigation = useCallback(() => {
+        external_change_navigation_request_ref.current += 1;
+        external_change_navigation_context_ref.current = null;
+        external_change_navigation_pending_ref.current = null;
+        set_external_change_navigation_pending_key(null);
+    }, []);
+    const external_change_review_button_ref = useRef<HTMLButtonElement | null>(null);
+    const external_change_review_ref = useRef<HTMLElement | null>(null);
+    const mount_external_change_review = useCallback((element: HTMLElement | null) => {
+        const previous = external_change_review_ref.current;
+        const restore_after_removal = element === null
+            && previous !== null
+            && previous.contains(document.activeElement);
+        external_change_review_ref.current = element;
+        if (element !== null) {
+            element.focus();
+            return;
+        }
+        if (!restore_after_removal) return;
+        // Ref cleanup runs during the commit that removes the focused panel.
+        // Defer until the same commit has installed either the newer banner or
+        // the grid that remains after the notice resolves. A focus move made by
+        // another handler in the meantime wins and is never overwritten.
+        queueMicrotask(() => {
+            if (external_change_review_ref.current !== null) return;
+            if (
+                document.activeElement !== document.body
+                && document.activeElement !== document.documentElement
+            ) return;
+            const review_button = external_change_review_button_ref.current;
+            if (review_button?.isConnected) review_button.focus();
+            else grid_focus_ref.current?.focus();
+        });
+    }, []);
+    const handle_external_change_item_detach = useCallback((
+        key: string,
+        previous: HTMLLIElement,
+    ) => {
+        const restore_review_focus = previous.contains(document.activeElement);
+        const pending_navigation = external_change_navigation_pending_ref.current;
+        const cancel_item_navigation = pending_navigation?.endsWith(`\u0000${key}`)
+            === true;
+        if (cancel_item_navigation) {
+            external_change_navigation_request_ref.current += 1;
+            external_change_navigation_pending_ref.current = null;
+        }
+        if (!restore_review_focus && !cancel_item_navigation) return;
+        queueMicrotask(() => {
+            if (cancel_item_navigation) {
+                set_external_change_navigation_pending_key((current) => (
+                    current === pending_navigation ? null : current
+                ));
+                set_external_change_navigation_status('');
+            }
+            if (!restore_review_focus) return;
+            if (
+                document.activeElement !== document.body
+                && document.activeElement !== document.documentElement
+            ) return;
+            external_change_review_ref.current?.focus();
+        });
+    }, []);
+    const external_change_occurrences_ref = useRef(new Map<string, {
+        active: boolean;
+        occurrence: number;
+        observations: ReadonlyMap<string, string>;
+        observedBases: ReadonlyMap<string, CsvObservedFileBase>;
+        priorObservedBases: ReadonlyMap<string, CsvObservedFileBase>;
+    }>());
+    // A background save rejection may switch tabs while the keyboard still
+    // belongs to the outgoing grid. Arm restoration through a ref so it is not
+    // cleared by an intermediate native-message render before the target sheet
+    // has mounted.
+    const rejected_sheet_grid_focus_ref = useRef<GridFocusRestoreState | null>(null);
     // Stale-view signature the user acknowledged ("Dismiss"). Purely informational:
     // the banner it silences states that the displayed order does not recompute
     // mid-edit, which is intended, so acknowledging it must not touch the view. It
@@ -886,12 +1090,9 @@ export function App(): React.JSX.Element {
     const [acknowledged_stale_signature, set_acknowledged_stale_signature] =
         useState<string | undefined>(undefined);
     // Keys the *host* refused a save over, from a saveResult's `rejection`. These
-    // exist because the webview cannot derive them: is_entry_conflicted is
-    // residency-gated, so an edit on a filtered-out row, an evicted page, or a row
-    // past the current row count is never in `conflicted_keys`. Without this state a
-    // rejected save would be permanently unrecoverable — the banner would not
-    // render, the cell would not exist to right-click, and Discard Conflicted (a
-    // retain over is_entry_conflicted) would keep the very entry blocking the save.
+    // exist because the webview cannot inspect a filtered-out row, an evicted page,
+    // or a row past the current row count. Without this state the review could not
+    // explain or discard the pending edit that blocked the save.
     //
     // Stamped with the session it belongs to and with the *exact entries* it was a
     // verdict over. Both are load-bearing. The session stamp is what stops a
@@ -910,11 +1111,13 @@ export function App(): React.JSX.Element {
         sheet_name: string | undefined;
         worksheet_id: string | undefined;
         entries: Record<string, CsvDirtyEntry>;
+        observed_bases?: Readonly<Record<string, CsvObservedFileBase>>;
+        removed_keys?: readonly string[];
     } | null>(null);
 
     const state_ref = useRef<PerFileState>({});
     // GridShell populates this with imperative save/discard actions (the dirty map
-    // lives next to the loader); App calls them from the toolbar + conflict banner.
+    // lives next to the loader); App calls them from the toolbar + file-change review.
     const editing_ref = useRef<EditingHandle | null>(null);
     // GridShell populates this with a measure function returning fitted column
     // widths (null when nothing is loaded); App calls it from the auto-fit toggle.
@@ -1315,23 +1518,14 @@ export function App(): React.JSX.Element {
         });
     }, []);
 
-    /**
-     * Drop the host's save verdict and any banner dismissal together.
-     *
-     * They must move as a pair, because the banner now honours the dismissal for a
-     * host rejection too (see `show_conflict_banner`). `conflict_signature` covers
-     * only the webview-derived conflicts, so a "Keep All" pressed over a rejection
-     * with no derived conflicts records the empty signature — and leaving that
-     * behind would silently suppress the *next* rejection, which would also present
-     * with no derived conflicts. Conversely, clearing the rejection while keeping
-     * the dismissal is what lets a stale dismissal outlive the thing it dismissed.
-     * Every caller is a point where the map or the session the verdict described is
-     * replaced, which is exactly when both facts stop being true.
-     */
+    /** Drop a save verdict and any informational notice tied to that verdict. */
     const clear_save_verdict = useCallback(() => {
         set_save_rejection(null);
-        set_dismissed_conflict_signature(null);
-    }, []);
+        set_dismissed_external_change_occurrences({});
+        cancel_external_change_navigation();
+        set_open_external_change_occurrence(null);
+        set_external_change_navigation_status('');
+    }, [cancel_external_change_navigation]);
 
     const fence_edit_session_exit = useCallback((edit_session_id: string) => {
         // Fence both the document-level final publication and every mounted-grid
@@ -1447,7 +1641,7 @@ export function App(): React.JSX.Element {
             host_bridge.postMessage({
                 type: 'showWarning',
                 message: preflight.reason === 'unresolvedBases'
-                    ? 'Load every edited row before saving so its conflict base can be verified.'
+                    ? 'Load every edited row before saving so its current file value can be verified.'
                     : 'A worksheet containing unsaved edits was removed. Restore it or discard the workbook edit session before saving.',
             });
             return undefined;
@@ -2573,6 +2767,7 @@ export function App(): React.JSX.Element {
                         diff_mode_initialized_ref.current = enters_edit_mode;
                         set_edit_mode(enters_edit_mode);
                         set_editing_status(null);
+                        set_editing_status_sheet_index(null);
                         // A fresh document: the rejection and the dismissal go
                         // together. The install above deliberately does not clear the
                         // verdict (a same-session refresh reinstalls the very map the
@@ -3530,6 +3725,9 @@ export function App(): React.JSX.Element {
             set_filter_editor(null);
             set_grid_focus_restore(null);
             set_toolbar_focus_restore(null);
+            cancel_external_change_navigation();
+            set_open_external_change_occurrence(null);
+            set_external_change_navigation_status('');
             set_active_sheet_index(sheet_index);
             state_ref.current = {
                 ...state_ref.current,
@@ -3537,8 +3735,15 @@ export function App(): React.JSX.Element {
             };
             persist_immediate();
         },
-        [persist_immediate]
+        [cancel_external_change_navigation, persist_immediate]
     );
+
+    useLayoutEffect(() => {
+        const pending = rejected_sheet_grid_focus_ref.current;
+        if (!pending || pending.sheet_index !== active_sheet_index) return;
+        rejected_sheet_grid_focus_ref.current = null;
+        set_grid_focus_restore(pending);
+    }, [active_sheet_index, set_grid_focus_restore]);
 
     const handle_sheet_context_menu = useCallback((
         sheet_index: number,
@@ -4794,7 +4999,34 @@ export function App(): React.JSX.Element {
                                 submitted[key] ?? { value: '', base: '' },
                             ]),
                         ),
+                        ...(rejection.observedBases !== undefined
+                            ? { observed_bases: rejection.observedBases }
+                            : {}),
+                        ...(rejection.removedKeys !== undefined
+                            ? { removed_keys: rejection.removedKeys }
+                            : {}),
                     });
+                    // Saving is workbook-wide. If validation found the affected
+                    // draft on another worksheet, move there so the informational
+                    // review is visible instead of leaving the user on a clean tab
+                    // with no explanation for the failed save.
+                    const rejected_sheet_index = worksheet_target_index(
+                        meta_ref.current?.sheets ?? [],
+                        submitted_worksheet,
+                    );
+                    if (
+                        rejected_sheet_index !== undefined
+                        && rejected_sheet_index !== state_ref.current.activeSheetIndex
+                    ) {
+                        if (grid_focus_ref.current?.has_focus() === true) {
+                            rejected_sheet_grid_focus_ref.current = {
+                                sheet_index: rejected_sheet_index,
+                                generation: generation_ref.current,
+                                document_epoch: document_epoch_ref.current,
+                            };
+                        }
+                        handle_sheet_select(rejected_sheet_index);
+                    }
                 }
             }
         };
@@ -4852,8 +5084,9 @@ export function App(): React.JSX.Element {
     // document-scoped because every grid receives the same workbook lifecycle.
     const handle_editing_change = useCallback((status: EditingStatus) => {
         save_in_flight_ref.current = status.save_in_flight;
+        set_editing_status_sheet_index(active_sheet_index);
         set_editing_status(status);
-    }, []);
+    }, [active_sheet_index]);
 
     const handle_highlight_selection = useCallback((
         selection: CellHighlightSelection,
@@ -5387,7 +5620,11 @@ export function App(): React.JSX.Element {
     // goes down to GridShell where it feeds the tint union's useMemo, so a fresh
     // identity every render would rebuild that Set and re-run the targeted repaint
     // effect for no change.
-    const live_edits = editing_status?.edits;
+    const editing_status_is_for_active_sheet =
+        editing_status_sheet_index === active_sheet_index;
+    const live_edits = editing_status_is_for_active_sheet
+        ? editing_status?.edits
+        : undefined;
     const live_rejected_keys = useMemo(
         () => {
             if (!save_rejection) return [];
@@ -5415,7 +5652,19 @@ export function App(): React.JSX.Element {
                 // a corrected value over the same stale base, and the run sides
                 // catch a formatting-only replacement.
                 const judged = save_rejection.entries[key];
-                return dirty_entries_equal(live, judged);
+                if (dirty_entries_equal(live, judged)) return true;
+                const observed = save_rejection.observed_bases?.[key];
+                if (observed === undefined) return false;
+                // A host observation is handed to GridShell on the first render
+                // after rejection. Until the shell reports the adopted entry back,
+                // the live map still has the exact submitted identity above; after
+                // adoption it has this enriched identity. Both are the same judged
+                // edit. Anything else is a fresh, unsubmitted edit and expires the
+                // verdict.
+                return dirty_entries_equal(
+                    live,
+                    dirty_entry_with_observed_file_base(judged, observed),
+                );
             });
         },
         [
@@ -5427,6 +5676,16 @@ export function App(): React.JSX.Element {
             current_sheet?.worksheetId,
         ],
     );
+    const live_host_observed_bases = useMemo(() => {
+        if (!save_rejection?.observed_bases || live_rejected_keys.length === 0) {
+            return undefined;
+        }
+        const entries = live_rejected_keys.flatMap((key) => {
+            const observed = save_rejection.observed_bases?.[key];
+            return observed === undefined ? [] : [[key, observed] as const];
+        });
+        return entries.length === 0 ? undefined : Object.fromEntries(entries);
+    }, [live_rejected_keys, save_rejection]);
 
     if (!meta) {
         return compare_progress
@@ -5726,7 +5985,7 @@ export function App(): React.JSX.Element {
     //
     // Both are statements, not prompts: they say what the view is doing and where the
     // unsaved work is, and nothing about doing anything with either. Noun and verb in
-    // the second are pluralized as one phrase, as in conflict_banner_message, so
+    // the second are pluralized as one phrase, as in the file-change notice, so
     // "1 edited cells are" cannot be written.
     //
     // "doesn't show" rather than "hides" because the host names every edited row the
@@ -5744,63 +6003,140 @@ export function App(): React.JSX.Element {
             : []),
     ].join(' ');
 
-    // Conflict banner: a stable signature of the conflicted cell set, so dismissing
-    // it ("Keep All") sticks until a *different* set of cells drifts.
-    const conflicted_keys = editing_status?.conflicted ?? [];
-    const conflict_signature = [...conflicted_keys].sort().join(',');
+    const externally_changed_keys = editing_status_is_for_active_sheet
+        ? editing_status?.conflicted ?? []
+        : [];
     const show_host_rejection = edit_mode_on_active_sheet
         && live_rejected_keys.length > 0;
-    // A host rejection is an *independent* reason to render, because the keys it
-    // names are exactly the ones the webview's residency-gated detection cannot
-    // flag: requiring conflicted_keys.length > 0 would leave the banner (and every
-    // exit it offers) unreachable in precisely the case that needs it.
-    //
-    // The dismissal gate applies to both reasons, not just the derived one. With the
-    // rejection short-circuiting ahead of it, "Keep All" was a no-op for a host
-    // rejection — it recorded a signature nothing consulted, and the banner stayed
-    // up with no way to put it away short of discarding the edits. A dismissal here
-    // is safe because it cannot outlive the verdict: every save result clears both
-    // (see clear_save_verdict).
-    const show_conflict_banner =
-        edit_mode_on_active_sheet
-        && (show_host_rejection || conflicted_keys.length > 0)
-        && conflict_signature !== dismissed_conflict_signature;
-    // Conflicts the *webview* derived and the host did not name. `conflicted_keys` is
-    // already the union of both sources (GridShell merges them so one set drives all
-    // tinting), so this difference is what's left for discard_conflicted to do once
-    // discard_keys has taken the host's share — including nothing, when the rejection
-    // is the only reason the banner is up.
-    const derived_only_conflicts = show_host_rejection
-        ? conflicted_keys.filter((key) => !live_rejected_keys.includes(key))
-        : conflicted_keys;
-    const removed_rows = show_host_rejection
+    const removed_keys = show_host_rejection
         && save_rejection?.reason === 'rowsRemoved'
-        ? rejected_rows(live_rejected_keys)
+        ? live_rejected_keys.filter((key) => (
+            save_rejection.removed_keys ?? save_rejection.keys
+        ).includes(key))
         : [];
-    const conflict_banner_message = removed_rows.length > 0
-        // Name the rows. For a removed row there is nothing to highlight — the grid
-        // is given the shrunk row count, so the cell does not exist to paint — and
-        // for the same reason the *values* cannot be shown either. The row numbers
-        // are all the user has to go on. Counted in rows, not keys: several edits on
-        // one vanished row are one row lost.
-        // Verb agrees with the count, so the noun and the verb are pluralized as one
-        // phrase rather than the noun alone ("1 edited row no longer exist").
-        ? `File shrank externally. ${
-            removed_rows.length === 1
-                ? '1 edited row no longer exists'
-                : `${removed_rows.length} edited rows no longer exist`
-        } — save was cancelled. Affected row${
-            removed_rows.length === 1 ? '' : 's'
-        }: ${removed_rows.join(', ')}.`
-        : show_host_rejection
-            ? `File changed externally. ${
-                live_rejected_keys.length === 1
-                    ? '1 edit no longer matches'
-                    : `${live_rejected_keys.length} edits no longer match`
-            } the file — save was cancelled. Highlighted cells show conflicts.`
-            : `File changed externally. ${conflicted_keys.length} edit${
-                conflicted_keys.length === 1 ? '' : 's'
-            } may be affected — highlighted cells show conflicts.`;
+    const removed_key_set = new Set(removed_keys);
+    const changed_key_set = new Set([...externally_changed_keys, ...live_rejected_keys]);
+    const changed_items = [...changed_key_set]
+        .filter((key) => !removed_key_set.has(key))
+        .flatMap((key) => {
+            const entry = live_edits?.[key];
+            if (!entry) return [];
+            const observed = entry.observedBase ?? live_host_observed_bases?.[key];
+            return [{ key, entry, observed }];
+        });
+    const removed_items = removed_keys.flatMap((key) => {
+        const entry = live_edits?.[key];
+        return entry ? [{ key, entry }] : [];
+    });
+    const external_change_location = (key: string): string => {
+        const coordinates = parse_cell_key(key);
+        if (!coordinates) return key;
+        const column = column_letter(coordinates.sourceColumn);
+        const name = current_sheet.columnNames?.[coordinates.sourceColumn];
+        const sheet = current_sheet.name ? `${current_sheet.name}, ` : '';
+        return `${sheet}row ${coordinates.sourceRow + 1}, column ${column}${
+            name ? ` (${name})` : ''
+        }`;
+    };
+    const removed_rows = rejected_rows(removed_keys);
+    const external_change_item_count = changed_items.length + removed_items.length;
+    const external_change_is_active = external_change_item_count > 0;
+    const external_change_worksheet_key = worksheet_target_key({
+        sheetIndex: active_sheet_index,
+        sheetName: current_sheet.name,
+        ...(current_sheet.worksheetId !== undefined
+            ? { worksheetId: current_sheet.worksheetId }
+            : {}),
+    });
+    const previous_external_change = external_change_occurrences_ref.current.get(
+        external_change_worksheet_key,
+    ) ?? {
+        active: false,
+        occurrence: 0,
+        observations: new Map<string, string>(),
+        observedBases: new Map<string, CsvObservedFileBase>(),
+        priorObservedBases: new Map<string, CsvObservedFileBase>(),
+    };
+    let external_change_occurrence = previous_external_change.occurrence;
+    let prior_external_change_observed_bases =
+        previous_external_change.priorObservedBases;
+    if (editing_status_is_for_active_sheet) {
+        const observations = new Map<string, string>([
+            ...changed_items.map(({ key, observed }) => [
+                `changed:${key}`,
+                external_change_observation_signature(observed),
+            ] as const),
+            ...removed_items.map(({ key }) => [`removed:${key}`, 'removed'] as const),
+        ]);
+        const has_new_observation = [...observations].some(([key, value]) => (
+            previous_external_change.observations.get(key) !== value
+        ));
+        if (
+            external_change_is_active
+            && (!previous_external_change.active || has_new_observation)
+        ) {
+            external_change_occurrence += 1;
+        }
+        const observed_bases = new Map<string, CsvObservedFileBase>();
+        const prior_observed_bases = new Map<string, CsvObservedFileBase>();
+        for (const { key, observed } of changed_items) {
+            if (observed !== undefined) observed_bases.set(key, observed);
+            const observation_key = `changed:${key}`;
+            if (
+                previous_external_change.observations.get(observation_key)
+                === observations.get(observation_key)
+            ) {
+                const retained = previous_external_change.priorObservedBases.get(key);
+                if (retained !== undefined) prior_observed_bases.set(key, retained);
+            } else {
+                const prior = previous_external_change.observedBases.get(key);
+                if (prior !== undefined) prior_observed_bases.set(key, prior);
+            }
+        }
+        prior_external_change_observed_bases = prior_observed_bases;
+        external_change_occurrences_ref.current.set(external_change_worksheet_key, {
+            active: external_change_is_active,
+            occurrence: external_change_occurrence,
+            observations,
+            observedBases: observed_bases,
+            priorObservedBases: prior_observed_bases,
+        });
+    }
+    const external_change_occurrence_key = JSON.stringify([
+        external_change_worksheet_key,
+        external_change_occurrence,
+    ]);
+    const review_external_changes = external_change_is_active
+        && open_external_change_occurrence === external_change_occurrence_key;
+    external_change_navigation_context_ref.current = review_external_changes
+        ? external_change_occurrence_key
+        : null;
+    const external_change_navigation_pending_for_review =
+        external_change_navigation_pending_key?.startsWith(
+            `${external_change_occurrence_key}\u0000`,
+        ) === true;
+    const show_external_change_banner = edit_mode_on_active_sheet
+        && (changed_items.length > 0 || removed_items.length > 0)
+        && dismissed_external_change_occurrences[external_change_worksheet_key]
+            !== external_change_occurrence;
+    const external_change_message = [
+        show_host_rejection
+            ? 'The file changed before it could be saved.'
+            : 'The file changed.',
+        ...(changed_items.length > 0
+            ? [changed_items.length === 1
+                ? '1 cell with a pending edit also changed.'
+                : `${changed_items.length} cells with pending edits also changed.`]
+            : []),
+        ...(removed_rows.length > 0
+            ? [removed_rows.length === 1
+                ? '1 row with pending edits is no longer in the file.'
+                : `${removed_rows.length} rows with pending edits are no longer in the file.`]
+            : []),
+    ].join(' ');
+    const external_change_formatting_budget = {
+        remaining: EXTERNAL_CHANGE_FORMATTING_COMPARISON_BUDGET,
+    };
 
     // The overlay only ever applies to the sheet and the arrangement it was recorded
     // against.
@@ -5889,6 +6225,7 @@ export function App(): React.JSX.Element {
             history_store={history_store_ref.current!}
             gestures_admitted={edit_gestures_admitted}
             host_rejected_keys={live_rejected_keys}
+            host_observed_bases={live_host_observed_bases}
             on_editing_change={handle_editing_change}
             editing_ref={editing_ref}
             auto_fit_ref={auto_fit_ref}
@@ -6186,50 +6523,399 @@ export function App(): React.JSX.Element {
                     </div>
                 </div>
             )}
-            {show_conflict_banner && (
-                <div className="conflict-banner">
-                    {conflict_banner_message}
-                    <div className="conflict-banner-actions">
+            {show_external_change_banner && (
+                <div className="external-change-banner" role="status">
+                    {external_change_message}
+                    <div className="external-change-banner-actions">
                         <button
-                            onClick={() =>
-                                set_dismissed_conflict_signature(conflict_signature)
-                            }
+                            ref={external_change_review_button_ref}
+                            aria-expanded={review_external_changes}
+                            aria-controls="external-change-review"
+                            onClick={() => {
+                                cancel_external_change_navigation();
+                                set_open_external_change_occurrence(
+                                    external_change_occurrence_key,
+                                );
+                                set_external_change_navigation_status('');
+                            }}
                         >
-                            Keep All
+                            Review changes
                         </button>
                         <button
                             onClick={() => {
-                                // Two mechanisms, one label — and both may be needed
-                                // in the same press. discard_conflicted is a retain
-                                // over is_entry_conflicted, which is false for every
-                                // host-named key, so it alone would keep the entry
-                                // that is blocking the save; discard_keys names only
-                                // the host's. The grid tints the *union* of the two
-                                // sets, so a press that cleared only one of them
-                                // would leave the banner up over still-tinted cells
-                                // and demand a second press for the other half.
-                                //
-                                // Ordering is safe in either direction: both store
-                                // operations read the live entry map rather than a
-                                // captured snapshot, so the retain sees the map with
-                                // the host keys already gone.
-                                if (show_host_rejection) {
-                                    editing_ref.current?.discard_keys(live_rejected_keys);
-                                }
-                                if (derived_only_conflicts.length > 0) {
-                                    editing_ref.current?.discard_conflicted();
-                                }
+                                grid_focus_ref.current?.focus();
+                                cancel_external_change_navigation();
+                                set_dismissed_external_change_occurrences((current) => ({
+                                    ...current,
+                                    [external_change_worksheet_key]: external_change_occurrence,
+                                }));
+                                set_open_external_change_occurrence(null);
+                                set_external_change_navigation_status('');
                             }}
+                            aria-label="Dismiss file-change notice"
                         >
-                            Discard Conflicted
-                        </button>
-                        <button
-                            onClick={() => { discard_edit_session(); }}
-                        >
-                            Discard All
+                            Dismiss
                         </button>
                     </div>
                 </div>
+            )}
+            {review_external_changes
+                && (changed_items.length > 0 || removed_items.length > 0) && (
+                <section
+                    id="external-change-review"
+                    ref={mount_external_change_review}
+                    tabIndex={-1}
+                    className="external-change-review"
+                    aria-label="File changes affecting pending edits"
+                >
+                    <div className="external-change-review-header">
+                        <h2>File changes affecting pending edits</h2>
+                        <button onClick={() => {
+                            external_change_review_button_ref.current?.focus();
+                            cancel_external_change_navigation();
+                            set_open_external_change_occurrence(null);
+                        }}>
+                            Close
+                        </button>
+                    </div>
+                    <ul className="external-change-list">
+                        {changed_items.map(({ key, entry, observed }) => {
+                            const coordinates = parse_cell_key(key);
+                            const location = external_change_location(key);
+                            const value_pending = dirty_entry_value_dimension_present(entry);
+                            const original_formatting_is_known =
+                                !dirty_entry_base_formatting_unknown(entry);
+                            const prior_observed =
+                                prior_external_change_observed_bases.get(key);
+                            const formatting_baseline = original_formatting_is_known
+                                ? {
+                                    label: 'Original file formatting',
+                                    value: entry.base,
+                                    runs: entry.baseRuns,
+                                }
+                                : prior_observed !== undefined
+                                    ? {
+                                        label: 'Previous file formatting',
+                                        value: prior_observed.value,
+                                        runs: prior_observed.runs,
+                                    }
+                                    : undefined;
+                            const formatting_changed = formatting_baseline !== undefined
+                                && observed !== undefined
+                                && review_formatting_changed(
+                                    formatting_baseline.value,
+                                    formatting_baseline.runs,
+                                    observed.value,
+                                    observed.runs,
+                                    external_change_formatting_budget,
+                                );
+                            const link_changed = entry.link !== undefined
+                                && observed?.link !== undefined
+                                && !hyperlinks_equal(entry.baseLink ?? null, observed.link);
+                            const pending_formatting_involved = value_pending && (
+                                original_formatting_is_known
+                                    ? [entry.baseRuns, entry.valueRuns, observed?.runs]
+                                        .some((runs) => (
+                                            runs !== undefined && rich_text_has_styles(runs)
+                                        ))
+                                    : entry.valueRuns !== undefined
+                                        && [entry.valueRuns, observed?.runs].some((runs) => (
+                                            runs !== undefined && rich_text_has_styles(runs)
+                                        ))
+                            );
+                            const show_formatting_values = formatting_changed
+                                || pending_formatting_involved;
+                            const can_navigate = coordinates !== undefined
+                                && editing_ref.current?.can_reveal_source_cell(
+                                    coordinates.sourceRow,
+                                    coordinates.sourceColumn,
+                                ) === true;
+                            const navigation_key = [
+                                external_change_occurrence_key,
+                                key,
+                            ].join('\u0000');
+                            return (
+                                <ExternalChangeItem
+                                    key={key}
+                                    source_key={key}
+                                    on_detach={handle_external_change_item_detach}
+                                >
+                                    <h3>{location}</h3>
+                                    {observed ? (
+                                        <div className="external-change-values">
+                                            <div className="external-change-value-row">
+                                                <span>Original file value</span>
+                                                <code>{review_value(entry.base)}</code>
+                                            </div>
+                                            <div className="external-change-value-row">
+                                                <span>Current file value</span>
+                                                <code>{review_value(observed.value)}</code>
+                                            </div>
+                                            {formatting_changed && (
+                                                <div className="external-change-detail">
+                                                    {original_formatting_is_known
+                                                        ? 'Cell formatting also changed in the file.'
+                                                        : 'Cell formatting changed again in the file.'}
+                                                </div>
+                                            )}
+                                            {link_changed && observed.link !== undefined && (
+                                                <>
+                                                    <div className="external-change-value-row">
+                                                        <span>Original file link</span>
+                                                        <code>{review_link(entry.baseLink ?? null)}</code>
+                                                    </div>
+                                                    <div className="external-change-value-row">
+                                                        <span>Current file link</span>
+                                                        <code>{review_link(observed.link)}</code>
+                                                    </div>
+                                                </>
+                                            )}
+                                            {show_formatting_values && (
+                                                <>
+                                                    {formatting_baseline !== undefined && (
+                                                        <div className="external-change-value-row">
+                                                            <span>{formatting_baseline.label}</span>
+                                                            <code>{review_formatting(
+                                                                formatting_baseline.value,
+                                                                formatting_baseline.runs,
+                                                            )}</code>
+                                                        </div>
+                                                    )}
+                                                    <div className="external-change-value-row">
+                                                        <span>Current file formatting</span>
+                                                        <code>{review_formatting(
+                                                            observed.value,
+                                                            observed.runs,
+                                                        )}</code>
+                                                    </div>
+                                                </>
+                                            )}
+                                        </div>
+                                    ) : (
+                                        <div className="external-change-values">
+                                            <div className="external-change-value-row">
+                                                <span>Original file value</span>
+                                                <code>{review_value(entry.base)}</code>
+                                            </div>
+                                            <div className="external-change-value-row">
+                                                <span>Current file value</span>
+                                                <code>(unavailable)</code>
+                                            </div>
+                                            {show_formatting_values && (
+                                                <>
+                                                    {formatting_baseline !== undefined && (
+                                                        <div className="external-change-value-row">
+                                                            <span>{formatting_baseline.label}</span>
+                                                            <code>{review_formatting(
+                                                                formatting_baseline.value,
+                                                                formatting_baseline.runs,
+                                                            )}</code>
+                                                        </div>
+                                                    )}
+                                                    <div className="external-change-value-row">
+                                                        <span>Current file formatting</span>
+                                                        <code>(unavailable)</code>
+                                                    </div>
+                                                </>
+                                            )}
+                                        </div>
+                                    )}
+                                    <div className="external-change-pending">
+                                        {value_pending && (
+                                            <>
+                                                <span>Your pending edit</span>
+                                                <code>{review_value(entry.value)}</code>
+                                            </>
+                                        )}
+                                        {pending_formatting_involved && (
+                                            <>
+                                                <span>Your pending formatting</span>
+                                                <code>{review_formatting(
+                                                    entry.value,
+                                                    entry.valueRuns,
+                                                )}</code>
+                                            </>
+                                        )}
+                                        {entry.link !== undefined && (
+                                            <>
+                                                <span>Your pending link</span>
+                                                <code>{review_link(entry.link)}</code>
+                                            </>
+                                        )}
+                                    </div>
+                                    <div className="external-change-item-actions">
+                                        {can_navigate && (
+                                            <button
+                                                onClick={async () => {
+                                                    if (!coordinates) return;
+                                                    const request_id =
+                                                        ++external_change_navigation_request_ref.current;
+                                                    set_external_change_navigation_pending_key(
+                                                        navigation_key,
+                                                    );
+                                                    external_change_navigation_pending_ref.current =
+                                                        navigation_key;
+                                                    const is_current = () => (
+                                                        external_change_navigation_request_ref.current
+                                                            === request_id
+                                                        && external_change_navigation_context_ref.current
+                                                            === external_change_occurrence_key
+                                                    );
+                                                    const shown = await editing_ref.current
+                                                        ?.reveal_source_cell(
+                                                            coordinates.sourceRow,
+                                                            coordinates.sourceColumn,
+                                                            is_current,
+                                                        );
+                                                    if (!is_current()) return;
+                                                    external_change_navigation_pending_ref.current = null;
+                                                    set_external_change_navigation_pending_key(null);
+                                                    set_external_change_navigation_status(shown
+                                                        ? ''
+                                                        : 'That cell is not available in the current view.');
+                                                }}
+                                                aria-label={`Go to ${location}`}
+                                                aria-busy={
+                                                    external_change_navigation_pending_key
+                                                        === navigation_key
+                                                }
+                                                disabled={
+                                                    external_change_navigation_pending_for_review
+                                                }
+                                            >
+                                                {external_change_navigation_pending_key
+                                                    === navigation_key
+                                                    ? 'Going…'
+                                                    : 'Go to cell'}
+                                            </button>
+                                        )}
+                                        <button
+                                            onClick={() => {
+                                                cancel_external_change_navigation();
+                                                if (external_change_item_count === 1) {
+                                                    grid_focus_ref.current?.focus();
+                                                } else {
+                                                    external_change_review_ref.current?.focus();
+                                                }
+                                                editing_ref.current?.discard_keys([key]);
+                                                set_external_change_navigation_status('');
+                                            }}
+                                            aria-label={`Discard my pending edit for ${location}`}
+                                        >
+                                            Discard my pending edit
+                                        </button>
+                                    </div>
+                                </ExternalChangeItem>
+                            );
+                        })}
+                        {removed_items.map(({ key, entry }) => {
+                            const location = external_change_location(key);
+                            const value_pending = dirty_entry_value_dimension_present(entry);
+                            const original_formatting_is_known =
+                                !dirty_entry_base_formatting_unknown(entry);
+                            const formatting_involved = original_formatting_is_known
+                                && value_pending
+                                && [entry.baseRuns, entry.valueRuns]
+                                .some((runs) => (
+                                    runs !== undefined && rich_text_has_styles(runs)
+                                ));
+                            const pending_formatting_involved = value_pending && (
+                                formatting_involved
+                                || (!original_formatting_is_known
+                                    && entry.valueRuns !== undefined)
+                            );
+                            return (
+                                <ExternalChangeItem
+                                    key={`removed:${key}`}
+                                    source_key={key}
+                                    on_detach={handle_external_change_item_detach}
+                                >
+                                    <h3>{location}</h3>
+                                    <div className="external-change-values">
+                                        <div className="external-change-value-row">
+                                            <span>Original file value</span>
+                                            <code>{review_value(entry.base)}</code>
+                                        </div>
+                                        <div className="external-change-value-row">
+                                            <span>Current file value</span>
+                                            <code>(row no longer in file)</code>
+                                        </div>
+                                        {formatting_involved && (
+                                            <>
+                                                <div className="external-change-value-row">
+                                                    <span>Original file formatting</span>
+                                                    <code>{review_formatting(
+                                                        entry.base,
+                                                        entry.baseRuns,
+                                                    )}</code>
+                                                </div>
+                                                <div className="external-change-value-row">
+                                                    <span>Current file formatting</span>
+                                                    <code>(row no longer in file)</code>
+                                                </div>
+                                            </>
+                                        )}
+                                        {entry.link !== undefined && (
+                                            <>
+                                                <div className="external-change-value-row">
+                                                    <span>Original file link</span>
+                                                    <code>{review_link(entry.baseLink ?? null)}</code>
+                                                </div>
+                                                <div className="external-change-value-row">
+                                                    <span>Current file link</span>
+                                                    <code>(row no longer in file)</code>
+                                                </div>
+                                            </>
+                                        )}
+                                    </div>
+                                    <div className="external-change-pending">
+                                        {value_pending && (
+                                            <>
+                                                <span>Your pending edit</span>
+                                                <code>{review_value(entry.value)}</code>
+                                            </>
+                                        )}
+                                        {pending_formatting_involved && (
+                                            <>
+                                                <span>Your pending formatting</span>
+                                                <code>{review_formatting(
+                                                    entry.value,
+                                                    entry.valueRuns,
+                                                )}</code>
+                                            </>
+                                        )}
+                                        {entry.link !== undefined && (
+                                            <>
+                                                <span>Your pending link</span>
+                                                <code>{review_link(entry.link)}</code>
+                                            </>
+                                        )}
+                                    </div>
+                                    <div className="external-change-item-actions">
+                                        <button
+                                            onClick={() => {
+                                                cancel_external_change_navigation();
+                                                if (external_change_item_count === 1) {
+                                                    grid_focus_ref.current?.focus();
+                                                } else {
+                                                    external_change_review_ref.current?.focus();
+                                                }
+                                                editing_ref.current?.discard_keys([key]);
+                                                set_external_change_navigation_status('');
+                                            }}
+                                            aria-label={`Discard my pending edit for ${location}`}
+                                        >
+                                            Discard my pending edit
+                                        </button>
+                                    </div>
+                                </ExternalChangeItem>
+                            );
+                        })}
+                    </ul>
+                    <div className="external-change-review-status" aria-live="polite">
+                        {external_change_navigation_status}
+                    </div>
+                </section>
             )}
             {/* Above the tabs, because the comparison spans the whole workbook. */}
             {compare_strip}

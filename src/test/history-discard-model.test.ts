@@ -216,9 +216,10 @@ describe('undoing a captured discard', () => {
         if (result.kind !== 'plan') throw new Error(`refused: ${result.reason}`);
         expect(result.writes.map((write) => [write.key, write.entry])).toEqual([
             // Backwards: undo walks the gesture in reverse, so the discard's last
-            // removal is the first restoration.
-            ['3:4', { value: 'b', base: 'B' }],
-            ['0:0', { value: 'a', base: 'A' }],
+            // removal is the first restoration. The restored entries retain the
+            // current file side separately from the original edit base.
+            ['3:4', { value: 'b', base: 'B', observedBase: { value: 'disk' } }],
+            ['0:0', { value: 'a', base: 'A', observedBase: { value: 'disk' } }],
         ]);
     });
 

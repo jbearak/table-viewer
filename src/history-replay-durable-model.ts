@@ -41,7 +41,9 @@ import type {
 } from './history-replay-protocol';
 import {
     dirty_entries_equal,
+    dirty_entry_with_observed_file_base,
     make_dirty_entry,
+    make_observed_file_base,
     type CellHighlightColor,
     type CsvDirtyEntry,
     type SheetPendingEditCells,
@@ -135,6 +137,10 @@ export function entry_from_wire_overlay(
         base.runs,
         link.kind === 'present' ? link.value : undefined,
         link.kind === 'present' ? link.base : undefined,
+        undefined,
+        dimension.kind === 'present' ? dimension.writeValue : undefined,
+        dimension.kind === 'present' ? dimension.retainValue : undefined,
+        dimension.kind === 'present' ? dimension.formattingKnown : undefined,
     );
     return { kind: 'entry', entry };
 }
@@ -154,7 +160,18 @@ export function stored_entry(
 ): CsvDirtyEntry | undefined {
     if (stored === undefined) return undefined;
     if (typeof stored !== 'string') return stored;
-    return make_dirty_entry(stored, persisted.text, undefined, persisted.runs);
+    return make_dirty_entry(
+        stored,
+        persisted.text,
+        stored === persisted.text ? persisted.runs : undefined,
+        persisted.runs,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        true,
+    );
 }
 
 /** What one cell must currently hold for its replay write to be authorized. */
@@ -166,6 +183,20 @@ export interface ReplayCellExpectation {
     readonly overlay: WireCellOverlayState;
     /** The cell's content in the verified source, for canonicalizing legacy slots. */
     readonly persisted: WireHistoryValue;
+    /** The cell's current persisted link, when the host prepared the replay. */
+    readonly persistedHyperlink?: CellHyperlink | null;
+}
+
+function entry_with_persisted_side(
+    entry: CsvDirtyEntry,
+    expectation: ReplayCellExpectation,
+): CsvDirtyEntry {
+    if (entry.link !== undefined && expectation.persistedHyperlink === undefined) return entry;
+    return dirty_entry_with_observed_file_base(entry, make_observed_file_base(
+        expectation.persisted.text,
+        expectation.persisted.runs,
+        entry.link !== undefined ? expectation.persistedHyperlink : undefined,
+    ));
 }
 
 /**
@@ -198,10 +229,13 @@ export function replay_cell_matches(
     // A legacy expectation is canonicalized against the same persisted content a
     // legacy STORED slot is, so the two forms of the one fact compare equal
     // rather than one of them reading as a conflict.
-    const expected_entry = expected.kind === 'legacy'
+    let expected_entry = expected.kind === 'legacy'
         ? stored_entry(expected.value, expectation.persisted)
         : expected.entry;
     if (expected_entry === undefined) return false;
+    if (expected.kind === 'entry') {
+        expected_entry = entry_with_persisted_side(expected_entry, expectation);
+    }
     return dirty_entries_equal(expected_entry, actual);
 }
 

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { validate_dirty_bases } from '../csv-base-validation';
 import type { CellHyperlink, RichText } from '../cell-content';
-import type { CsvDirtyMap } from '../types';
+import type { CsvDirtyEntry, CsvDirtyMap } from '../types';
 
 /** A raw reader over a dense grid of source text, `undefined` past either edge — the
  *  same contract `viewer-controller`'s harvested `observed_bases` map presents. */
@@ -10,7 +10,7 @@ function reader(grid: readonly (readonly string[])[]) {
         grid[source_row]?.[col];
 }
 
-function edits(entries: Record<string, { value: string; base: string; baseRuns?: RichText }>): CsvDirtyMap {
+function edits(entries: Record<string, CsvDirtyEntry>): CsvDirtyMap {
     return entries;
 }
 
@@ -40,7 +40,36 @@ describe('validate_dirty_bases', () => {
             2,
             reader([['a', 'b'], ['c', 'd']]),
         );
-        expect(outcome).toEqual({ type: 'conflicts', keys: ['0:1'] });
+        expect(outcome).toMatchObject({ type: 'conflicts', keys: ['0:1'] });
+        expect(outcome).toMatchObject({
+            observedBases: { '0:1': { value: 'b' } },
+        });
+    });
+
+    it('validates a later save against the latest observed file value', () => {
+        const pending = edits({
+            '0:1': {
+                value: 'my pending edit',
+                base: 'value when editing began',
+                observedBase: { value: 'value now on disk' },
+            },
+        });
+
+        expect(validate_dirty_bases(
+            pending,
+            1,
+            reader([['a', 'value now on disk']]),
+        )).toEqual({ type: 'valid' });
+
+        expect(validate_dirty_bases(
+            pending,
+            1,
+            reader([['a', 'changed again']]),
+        )).toMatchObject({
+            type: 'conflicts',
+            keys: ['0:1'],
+            observedBases: { '0:1': { value: 'changed again' } },
+        });
     });
 
     it('treats an unreadable cell as empty, so filling a blank trailing cell is valid', () => {
@@ -60,7 +89,7 @@ describe('validate_dirty_bases', () => {
             2,
             reader([['a', 'b'], ['c']]),
         );
-        expect(claimed_text).toEqual({ type: 'conflicts', keys: ['1:1'] });
+        expect(claimed_text).toMatchObject({ type: 'conflicts', keys: ['1:1'] });
     });
 
     it('classifies a row past the source row count as removed, not conflicted', () => {
@@ -72,7 +101,7 @@ describe('validate_dirty_bases', () => {
         expect(outcome).toEqual({ type: 'removedRows', keys: ['5:0'] });
     });
 
-    it('lets a removed row outrank a base mismatch', () => {
+    it('reports a removed row and a base mismatch together', () => {
         const outcome = validate_dirty_bases(
             edits({
                 '0:0': { value: 'X', base: 'stale' },
@@ -81,7 +110,12 @@ describe('validate_dirty_bases', () => {
             2,
             reader([['a', 'b'], ['c', 'd']]),
         );
-        expect(outcome).toEqual({ type: 'removedRows', keys: ['9:0'] });
+        expect(outcome).toEqual({
+            type: 'removedRows',
+            keys: ['9:0'],
+            changedKeys: ['0:0'],
+            observedBases: { '0:0': { value: 'a' } },
+        });
     });
 
     it('accepts an empty map', () => {
@@ -143,8 +177,12 @@ describe('validate_dirty_bases', () => {
             2,
             reader([['a', 'b'], ['c', 'd']]),
         );
-        // removedRows outranks the mismatch, so the malformed key cannot be masked.
-        expect(outcome).toEqual({ type: 'removedRows', keys: ['a:b'] });
+        expect(outcome).toEqual({
+            type: 'removedRows',
+            keys: ['a:b'],
+            changedKeys: ['0:0'],
+            observedBases: { '0:0': { value: 'a' } },
+        });
     });
 });
 
@@ -166,17 +204,20 @@ describe('validate_dirty_bases formatting', () => {
             grid,
             rich_reader({ '0:0': underlined('a') }),
         );
-        expect(outcome).toEqual({ type: 'conflicts', keys: ['0:0'] });
+        expect(outcome).toMatchObject({ type: 'conflicts', keys: ['0:0'] });
+        expect(outcome).toMatchObject({
+            observedBases: { '0:0': { value: 'a', runs: underlined('a') } },
+        });
     });
 
     it('conflicts a plain-based edit when the source gained formatting, and vice versa', () => {
         const source_gained = validate_dirty_bases(
-            edits({ '0:0': { value: 'X', base: 'a' } }),
+            edits({ '0:0': { value: 'X', base: 'a', formattingKnown: true } }),
             2,
             grid,
             rich_reader({ '0:0': bold('a') }),
         );
-        expect(source_gained).toEqual({ type: 'conflicts', keys: ['0:0'] });
+        expect(source_gained).toMatchObject({ type: 'conflicts', keys: ['0:0'] });
 
         const source_lost = validate_dirty_bases(
             edits({ '0:0': { value: 'X', base: 'a', baseRuns: bold('a') } }),
@@ -184,7 +225,86 @@ describe('validate_dirty_bases formatting', () => {
             grid,
             rich_reader({}),
         );
-        expect(source_lost).toEqual({ type: 'conflicts', keys: ['0:0'] });
+        expect(source_lost).toMatchObject({ type: 'conflicts', keys: ['0:0'] });
+    });
+
+    it('does not invent a formatting base for an older resolved equal-value draft', () => {
+        const outcome = validate_dirty_bases(
+            edits({ '0:0': { value: 'a', base: 'a' } }),
+            2,
+            grid,
+            rich_reader({ '0:0': bold('a') }),
+        );
+        expect(outcome).toEqual({ type: 'valid' });
+    });
+
+    it('does not invent a formatting base for an older changed-text draft', () => {
+        const outcome = validate_dirty_bases(
+            edits({ '0:0': { value: 'B', base: 'a' } }),
+            2,
+            grid,
+            rich_reader({ '0:0': bold('a') }),
+        );
+        expect(outcome).toEqual({ type: 'valid' });
+    });
+
+    it('does not treat pending runs as proof that a legacy formatting base was captured', () => {
+        const outcome = validate_dirty_bases(
+            edits({
+                '0:0': {
+                    value: 'B',
+                    base: 'a',
+                    valueRuns: { runs: [{ text: 'B' }] },
+                    writeValue: true,
+                },
+            }),
+            2,
+            grid,
+            rich_reader({ '0:0': bold('a') }),
+        );
+        expect(outcome).toEqual({ type: 'valid' });
+    });
+
+    it('checks formatting after an older draft has acquired an observed side', () => {
+        const outcome = validate_dirty_bases(
+            edits({
+                '0:0': {
+                    value: 'B',
+                    base: 'a',
+                    observedBase: { value: 'c', runs: bold('c') },
+                },
+            }),
+            2,
+            reader([['c']]),
+            rich_reader({ '0:0': underlined('c') }),
+        );
+        expect(outcome).toMatchObject({
+            type: 'conflicts',
+            keys: ['0:0'],
+            observedBases: { '0:0': { value: 'c', runs: underlined('c') } },
+        });
+    });
+
+    it('does not hide formatting drift from an explicit equal-value write', () => {
+        const outcome = validate_dirty_bases(
+            edits({
+                '0:0': {
+                    value: 'a',
+                    base: 'a',
+                    observedBase: { value: 'c' },
+                    writeValue: true,
+                    formattingKnown: true,
+                },
+            }),
+            2,
+            grid,
+            rich_reader({ '0:0': bold('a') }),
+        );
+        expect(outcome).toMatchObject({
+            type: 'conflicts',
+            keys: ['0:0'],
+            observedBases: { '0:0': { value: 'a', runs: bold('a') } },
+        });
     });
 
     it('accepts matching formatting, including a formally-rich but style-free side', () => {
@@ -223,7 +343,7 @@ describe('validate_dirty_bases formatting', () => {
             grid,
             rich_reader({ '0:0': underlined('a') }),
         );
-        expect(outcome).toEqual({ type: 'conflicts', keys: ['0:0'] });
+        expect(outcome).toMatchObject({ type: 'conflicts', keys: ['0:0'] });
     });
 });
 
@@ -266,7 +386,10 @@ describe('validate_dirty_bases hyperlinks', () => {
             undefined,
             link_reader({ '0:0': other }),
         );
-        expect(outcome).toEqual({ type: 'conflicts', keys: ['0:0'] });
+        expect(outcome).toMatchObject({ type: 'conflicts', keys: ['0:0'] });
+        expect(outcome).toMatchObject({
+            observedBases: { '0:0': { value: 'a', link: other } },
+        });
     });
 
     it('conflicts on a link gained or lost under a text-equal base', () => {
@@ -277,7 +400,7 @@ describe('validate_dirty_bases hyperlinks', () => {
             undefined,
             link_reader({ '0:0': other }),
         );
-        expect(source_gained).toEqual({ type: 'conflicts', keys: ['0:0'] });
+        expect(source_gained).toMatchObject({ type: 'conflicts', keys: ['0:0'] });
 
         const source_lost = validate_dirty_bases(
             link_edits({ '0:0': { value: 'a', base: 'a', link: null, baseLink: site } }),
@@ -286,7 +409,7 @@ describe('validate_dirty_bases hyperlinks', () => {
             undefined,
             link_reader({ '0:0': null }),
         );
-        expect(source_lost).toEqual({ type: 'conflicts', keys: ['0:0'] });
+        expect(source_lost).toMatchObject({ type: 'conflicts', keys: ['0:0'] });
     });
 
     it('fails closed when the cell was never observed', () => {
@@ -299,7 +422,11 @@ describe('validate_dirty_bases hyperlinks', () => {
             undefined,
             link_reader({}),
         );
-        expect(outcome).toEqual({ type: 'conflicts', keys: ['0:0'] });
+        expect(outcome).toEqual({
+            type: 'conflicts',
+            keys: ['0:0'],
+            observedBases: {},
+        });
     });
 
     it('ignores the link reader for entries carrying no link dimension', () => {
@@ -322,7 +449,11 @@ describe('validate_dirty_bases hyperlinks', () => {
             2,
             grid,
         );
-        expect(outcome).toEqual({ type: 'conflicts', keys: ['0:0'] });
+        expect(outcome).toEqual({
+            type: 'conflicts',
+            keys: ['0:0'],
+            observedBases: {},
+        });
     });
 
     it('does not double-report a key that already conflicted on text', () => {
@@ -333,6 +464,6 @@ describe('validate_dirty_bases hyperlinks', () => {
             undefined,
             link_reader({ '0:0': other }),
         );
-        expect(outcome).toEqual({ type: 'conflicts', keys: ['0:0'] });
+        expect(outcome).toMatchObject({ type: 'conflicts', keys: ['0:0'] });
     });
 });

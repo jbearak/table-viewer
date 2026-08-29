@@ -162,6 +162,43 @@ async function replay_highlight(
     return commits()[0];
 }
 
+async function prepare_one_highlight(
+    panel: ReturnType<typeof open_csv_table>,
+    suffix: string,
+): Promise<Extract<HostMessage, { type: 'historyReplayPrepared' }>['prepared']> {
+    await panel.__receive({
+        type: 'prepareHistoryReplay',
+        request: {
+            requestId: `prepare-${suffix}`,
+            replayId: `replay-${suffix}`,
+            cells: [],
+            highlights: [{
+                ordinal: 0,
+                worksheet: SHEET,
+                sourceRow: 0,
+                sourceColumn: 0,
+                expected: null,
+                desired: 'yellow',
+            }],
+            focus: {
+                worksheet: SHEET,
+                sourceRowStart: 0,
+                sourceRowEnd: 0,
+                sourceColumnStart: 0,
+                sourceColumnEnd: 0,
+            },
+        },
+    } satisfies Extract<WebviewMessage, { type: 'prepareHistoryReplay' }>);
+    await vi.waitFor(() => expect(
+        messages_of(panel, 'historyReplayPrepared').some(
+            (message) => message.prepared.replayId === `replay-${suffix}`,
+        ),
+    ).toBe(true));
+    return messages_of(panel, 'historyReplayPrepared').find(
+        (message) => message.prepared.replayId === `replay-${suffix}`,
+    )!.prepared;
+}
+
 beforeEach(() => {
     for (const panel of vscode_mock.__getPanels()) panel.dispose();
     vi.restoreAllMocks();
@@ -230,5 +267,112 @@ describe('the display focus a committed replay reports', () => {
 
         expect(after.committed.displayFocus?.mappingGeneration)
             .toBeGreaterThan(before.committed.displayFocus!.mappingGeneration);
+    });
+});
+
+describe('save and history replay serialization', () => {
+    it('refuses a save while a prepared replay lease owns the durable projection', async () => {
+        const warning = vi.spyOn(vscode_mock.window, 'showWarningMessage');
+        const write = vi.fn(async () => {});
+        vscode_mock.__setWriteFileImplementation(write);
+        const panel = open_csv_table(versioned_state_store().store);
+        await ready(panel);
+        await panel.__receive({ type: 'requestEditSession' } as never);
+        const session_id = messages_of(panel, 'editSessionResult').at(-1)!.editSessionId!;
+        const prepared = await prepare_one_highlight(panel, 'blocks-save');
+
+        await panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session_id,
+                saveRequestId: 'save-during-replay',
+                worksheets: [{
+                    sheetIndex: 0,
+                    sheetName: 'Sheet1',
+                    edits: { '0:0': 'saved' },
+                    dirtyEdits: { '0:0': { value: 'saved', base: 'a' } },
+                }],
+            },
+        } satisfies Extract<WebviewMessage, { type: 'saveCsv' }>);
+
+        await vi.waitFor(() => expect(messages_of(panel, 'saveResult').some((message) => (
+            message.success === false
+            && 'operation' in message.lifecycle
+            && message.lifecycle.operation.saveRequestId === 'save-during-replay'
+        ))).toBe(true));
+        expect(write).not.toHaveBeenCalled();
+        expect(warning).toHaveBeenCalledWith(expect.stringContaining('undo or redo'));
+
+        await panel.__receive({
+            type: 'abandonHistoryReplay',
+            request: {
+                requestId: prepared.requestId,
+                replayId: prepared.replayId,
+                leaseId: prepared.leaseId,
+            },
+        } satisfies Extract<WebviewMessage, { type: 'abandonHistoryReplay' }>);
+    });
+
+    it('refuses replay preparation while a save owns the durable projection', async () => {
+        let bytes = enc.encode(CONTENT);
+        let release_write: (() => void) | undefined;
+        const write_gate = new Promise<void>((resolve) => { release_write = resolve; });
+        vscode_mock.__setStatImplementation(async () => ({ size: bytes.byteLength, mtime: 1 }));
+        vscode_mock.__setReadFileImplementation(async () => bytes);
+        vscode_mock.__setWriteFileImplementation(async (_uri, content) => {
+            await write_gate;
+            bytes = new Uint8Array(content);
+        });
+        const panel = open_csv_table(versioned_state_store().store);
+        await ready(panel);
+        await panel.__receive({ type: 'requestEditSession' } as never);
+        const session_id = messages_of(panel, 'editSessionResult').at(-1)!.editSessionId!;
+        const save = panel.__receive({
+            type: 'saveCsv',
+            operation: {
+                editSessionId: session_id,
+                saveRequestId: 'save-blocks-replay',
+                worksheets: [{
+                    sheetIndex: 0,
+                    sheetName: 'Sheet1',
+                    edits: { '0:0': 'saved' },
+                    dirtyEdits: { '0:0': { value: 'saved', base: 'a' } },
+                }],
+            },
+        } satisfies Extract<WebviewMessage, { type: 'saveCsv' }>);
+        await vi.waitFor(() => expect(messages_of(panel, 'saveOperationStarted').some(
+            (message) => message.lifecycle.operation.saveRequestId === 'save-blocks-replay',
+        )).toBe(true));
+
+        await panel.__receive({
+            type: 'prepareHistoryReplay',
+            request: {
+                requestId: 'prepare-during-save',
+                replayId: 'replay-during-save',
+                cells: [],
+                highlights: [{
+                    ordinal: 0,
+                    worksheet: SHEET,
+                    sourceRow: 0,
+                    sourceColumn: 0,
+                    expected: null,
+                    desired: 'yellow',
+                }],
+                focus: {
+                    worksheet: SHEET,
+                    sourceRowStart: 0,
+                    sourceRowEnd: 0,
+                    sourceColumnStart: 0,
+                    sourceColumnEnd: 0,
+                },
+            },
+        } satisfies Extract<WebviewMessage, { type: 'prepareHistoryReplay' }>);
+        await vi.waitFor(() => expect(messages_of(panel, 'historyReplayPrepareRefused').some(
+            (message) => message.refusal.replayId === 'replay-during-save'
+                && message.refusal.reason === 'busy',
+        )).toBe(true));
+
+        release_write?.();
+        await save;
     });
 });

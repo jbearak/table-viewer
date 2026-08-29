@@ -131,6 +131,44 @@ describe('overlay round trip', () => {
         expect(back.kind === 'present' && back.value.kind === 'present'
             && back.value.basePending).toBe(true);
     });
+
+    it('preserves an explicit equal-value write marker', () => {
+        const wire = wire_overlay_from_cell_overlay_state(
+            value_only_overlay(history_value('A'), history_value('A'), false, true),
+        );
+        const back = cell_overlay_state_from_wire(wire);
+        expect(back.kind === 'present' && back.value.kind === 'present'
+            && back.value.writeValue).toBe(true);
+    });
+
+    it('preserves retained value membership without adding write intent', () => {
+        const wire = wire_overlay_from_cell_overlay_state(
+            value_only_overlay(
+                history_value('A'),
+                history_value('A'),
+                false,
+                undefined,
+                true,
+            ),
+        );
+        const back = cell_overlay_state_from_wire(wire);
+        expect(back.kind === 'present' && back.value.kind === 'present'
+            && back.value.retainValue).toBe(true);
+        expect(back.kind === 'present' && back.value.kind === 'present'
+            && back.value.writeValue).toBeUndefined();
+    });
+
+    it('preserves known plain-formatting provenance', () => {
+        const wire = wire_overlay_from_cell_overlay_state(
+            value_only_overlay(
+                history_value('B'), history_value('A'), false,
+                undefined, undefined, true,
+            ),
+        );
+        const back = cell_overlay_state_from_wire(wire);
+        expect(back.kind === 'present' && back.value.kind === 'present'
+            && back.value.formattingKnown).toBe(true);
+    });
 });
 
 describe('replay_cell_address', () => {

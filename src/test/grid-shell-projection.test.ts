@@ -112,7 +112,7 @@ const grid_mock = vi.hoisted(() => ({
     // durable edit-key row space is non-vacuous.
     source_row_for_display: null as null | ((display_row: number) => number | undefined),
     ensure_rows: vi.fn(),
-    ensure_rows_loaded: vi.fn(async () => true),
+    ensure_rows_loaded: vi.fn(async (_start?: number, _end?: number) => true),
     trim_rows: vi.fn(),
     // Eviction holds. Recorded rather than simulated: what the loader does with a
     // pin is pinned by use-row-loader.test.ts; what matters here is that GridShell
@@ -163,6 +163,7 @@ vi.mock('../webview/glide-data-grid', () => {
 // bounded display window stands in for the loader's source→page index; the harness
 // only ever renders a handful of rows.
 const SCANNED_DISPLAY_ROWS = vi.hoisted(() => 64);
+const additionally_loaded_source_rows = vi.hoisted(() => new Map<number, number>());
 const resident_display_row = vi.hoisted(() => (source_row: number): number | undefined => {
     for (let display_row = 0; display_row < SCANNED_DISPLAY_ROWS; display_row++) {
         const claimed = grid_mock.source_row_for_display
@@ -210,7 +211,13 @@ vi.mock('../webview/use-row-loader', () => ({
                 return grid_mock.get_row(display_row)?.[col] ?? null;
             },
             has_source_row: (source_row: number) => (
-                resident_display_row(source_row) !== undefined
+                additionally_loaded_source_rows.has(source_row)
+                || resident_display_row(source_row) !== undefined
+            ),
+            get_display_row_for_source: (source_row: number) => (
+                additionally_loaded_source_rows.has(source_row)
+                    ? additionally_loaded_source_rows.get(source_row)
+                    : resident_display_row(source_row)
             ),
             get_compare_status: (row: number) => grid_mock.compare_status[row],
             get_compare_base: (row: number, col: number) =>
@@ -364,6 +371,7 @@ afterEach(() => {
     // Back to identity: a leaked permutation would silently change which source
     // row every later test's edits land on.
     grid_mock.source_row_for_display = null;
+    additionally_loaded_source_rows.clear();
     grid_mock.row_resize_props = null;
     grid_mock.row_resize_set_target.mockReset();
     grid_mock.update_cells.mockReset();
@@ -1135,7 +1143,7 @@ describe('GridShell column projection', () => {
         const on_cell_edited = edit_one(grid_mock.props!.onCellsEdited);
         await act(async () => on_cell_edited([0, 0], { kind: 'text', data: 'typed' }));
         expect(Object.fromEntries(store.snapshot())).toEqual({
-            '0:0': { value: 'typed', base: 'source-a' },
+            '0:0': { value: 'typed', base: 'source-a', formattingKnown: true },
         });
 
         await close_overlay();
@@ -1355,7 +1363,9 @@ describe('GridShell column projection', () => {
         await act(async () => editing_ref.current?.commit_live_edit());
         const latest_status = on_editing_change.mock.calls.at(-1)![0];
         expect(latest_status.edits).toEqual({
-            '0:2': { value: 'typed but not closed', base: 'source-c' },
+            '0:2': {
+                value: 'typed but not closed', base: 'source-c', formattingKnown: true,
+            },
         });
         expect(editing_ref.current?.has_uncommitted_changes()).toBe(true);
 
@@ -2898,6 +2908,135 @@ describe('GridShell column projection', () => {
     });
 });
 
+describe('GridShell pending-edit Diff painting', () => {
+    it('loads and reveals a nonresident source row in an identity view', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        grid_mock.ensure_rows_loaded.mockImplementation(async (start = 0, end = start) => {
+            for (let row = start; row <= end; row += 1) {
+                additionally_loaded_source_rows.set(row, row);
+            }
+            return true;
+        });
+        await render_grid(props({
+            editing_ref,
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 100,
+                sourceRowCount: 100,
+            },
+        }));
+
+        await expect(editing_ref.current!.reveal_source_cell(75, 0)).resolves.toBe(true);
+        expect(grid_mock.ensure_rows_loaded).toHaveBeenCalledWith(75, 75);
+        expect(grid_mock.scroll_to).toHaveBeenCalledWith(0, 75);
+        expect(document.activeElement).toBe(container!.querySelector('.data-editor-stub'));
+    });
+
+    it('does not focus a row after its navigation request was cancelled while loading', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        let finish_loading: (() => void) | undefined;
+        grid_mock.ensure_rows_loaded.mockImplementation(async (start = 0, end = start) => {
+            await new Promise<void>((resolve) => { finish_loading = resolve; });
+            for (let row = start; row <= end; row += 1) {
+                additionally_loaded_source_rows.set(row, row);
+            }
+            return true;
+        });
+        await render_grid(props({
+            editing_ref,
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 100,
+                sourceRowCount: 100,
+            },
+        }));
+        let current = true;
+        const reveal = editing_ref.current!.reveal_source_cell(75, 0, () => current);
+        current = false;
+        finish_loading?.();
+
+        await expect(reveal).resolves.toBe(false);
+        expect(grid_mock.scroll_to).not.toHaveBeenCalled();
+        expect(grid_mock.focus).not.toHaveBeenCalled();
+    });
+
+    it('maps the last physical row around a promoted header before loading it', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        grid_mock.ensure_rows_loaded.mockImplementation(async (start = 0, end = start) => {
+            expect([start, end]).toEqual([99, 99]);
+            additionally_loaded_source_rows.set(100, 99);
+            return true;
+        });
+        await render_grid(props({
+            editing_ref,
+            row_count: 100,
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 100,
+                sourceRowCount: 101,
+                excelFirstRowHeader: {
+                    mode: 'on',
+                    detected: true,
+                    active: true,
+                    available: true,
+                    sourceRow: 0,
+                },
+            },
+        }));
+
+        expect(editing_ref.current!.can_reveal_source_cell(100, 0)).toBe(true);
+        await expect(editing_ref.current!.reveal_source_cell(100, 0)).resolves.toBe(true);
+        expect(grid_mock.ensure_rows_loaded).toHaveBeenCalledWith(99, 99);
+        expect(grid_mock.scroll_to).toHaveBeenCalledWith(0, 99);
+    });
+
+    it('does not offer navigation for a projected nonresident source row', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        await render_grid(props({
+            editing_ref,
+            row_count: 100,
+            sheet_meta: {
+                ...props().sheet_meta,
+                rowCount: 100,
+                sourceRowCount: 100,
+            },
+            transform_state: {
+                sort: [{ colIndex: 0, direction: 'asc' }],
+                filters: [],
+            },
+        }));
+
+        expect(editing_ref.current!.can_reveal_source_cell(75, 0)).toBe(false);
+        await expect(editing_ref.current!.reveal_source_cell(75, 0)).resolves.toBe(false);
+        expect(grid_mock.ensure_rows_loaded).not.toHaveBeenCalled();
+    });
+
+    it('shows the current file value after that cell changed', async () => {
+        await render_grid(props({
+            diff_mode: true,
+            edit_mode: true,
+            csv_editable: true,
+            initial_edits: {
+                '0:0': {
+                    value: 'my pending edit',
+                    base: 'value when editing began',
+                    observedBase: { value: 'source-a' },
+                },
+            },
+        }));
+
+        const cell = (grid_mock.props!.getCellContent as (
+            location: [number, number],
+        ) => { data: string | { lines: { text: string }[][] } })([0, 0]);
+        expect(cell.data).toMatchObject({ kind: 'rich-text' });
+        const text = (cell.data as { lines: { text: string }[][] })
+            .lines.flat().map((run) => run.text).join('');
+        expect(text).toContain('source-a');
+        expect(text).toContain('my pending edit');
+        expect(text).not.toContain('value when editing began');
+    });
+});
+
 describe('GridShell link-only edits', () => {
     it('keeps the formatted display when only the hyperlink changed', async () => {
         // A link-only entry's `value` is the unedited cell's raw text, and the
@@ -3687,6 +3826,7 @@ describe('GridShell edit-admission lifetime', () => {
         expect(store.snapshot().get('0:0')).toEqual({
             value: 'typed',
             base: 'source-a',
+            formattingKnown: true,
         });
         expect(changed).toHaveBeenCalledTimes(1);
 

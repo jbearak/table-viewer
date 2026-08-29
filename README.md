@@ -164,7 +164,7 @@ It also removes other friction from reading tables:
 - Rows keep their position for the whole edit session, so a cell stays under your cursor while you work on it. You can enter edit mode with a sort or filter already applied, and add or change one while editing; neither moves the rows you are working on. A row you edit so that it no longer matches an active filter stays visible until you save; the view reflects your new values once the file is saved and reloaded
 - When exiting edit mode with unsaved changes, you're prompted to save or discard
 - Unsaved changes are cached, so you won't lose your work if you close the tab, window, or app
-- If the file changes on disk while you have unsaved edits, a banner appears. Conflicted edits — where the underlying cell also changed externally — are flagged with warning-colored text on top of the usual background highlight; you can keep all edits, discard only the conflicted ones, or discard all
+- If a cell changes in the file while you have a pending edit for that cell, an informational banner appears and the cell gets a neutral blue highlight. **Review changes** shows the original file value, the current file value, and your pending edit. You can go to the cell, dismiss the notice without changing anything, or discard that pending edit individually
 
 **Diffing**
 
@@ -202,7 +202,7 @@ Table Viewer uses VS Code's editor font (`editor.fontFamily` and `editor.fontSiz
 | `tableViewer.fontFamily` | empty (editor font) | Font family used in table views. Leave empty to follow `editor.fontFamily`. |
 | `tableViewer.fontSize` | `0` (editor size) | Font size in pixels used in table views. Set to `0` to follow `editor.fontSize`. |
 | `tableViewer.tabOrientation` | `horizontal` | Default worksheet tab orientation (`horizontal` or `vertical`). Can be overridden per file. |
-| `tableViewer.diffOnByDefault` | `false` | Turn the **Diff** toggle on when edit mode is entered, so each edited cell keeps showing its original value beside the new one. Can be overridden per viewer from the toolbar. |
+| `tableViewer.diffOnByDefault` | `false` | Turn the **Diff** toggle on when edit mode is entered, so each edited cell shows the file value it would replace beside the pending edit. If that cell changes in the file, Diff updates to the current file value. Can be overridden per viewer from the toolbar. |
 | `tableViewer.maxStoredFiles` | `10000` | Maximum number of files whose layout state is remembered. Least recently used entries are evicted first. |
 | `tableViewer.csvMaxRows` | `1000000` | Rows to display by default for CSV/TSV files. A banner on larger files lets you change the limit or load all rows for that view. |
 | `tableViewer.maxFileSizeMiB` | `256` | File-size threshold in MiB. Above it, Table Viewer asks before opening the file and offers **Open Anyway**. |

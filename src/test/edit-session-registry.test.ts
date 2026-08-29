@@ -119,6 +119,26 @@ describe('edit session registry', () => {
         expect(after.edits).toEqual(after_runs.edits);
     });
 
+    it('keeps a resolved equal-value formula projected across file observation', () => {
+        const { registry } = make_session_ref('session');
+        const store = registry.for_sheet(0);
+        store.install({ session_id: 'session' }, { '0:0': '=1' });
+        store.resolve_pending_bases('session', () => ({ value: '=1' }));
+        const resolved = registry.formula_projection();
+        expect(resolved.edits).toEqual([{
+            sheetIndex: 0,
+            row: 0,
+            column: 0,
+            value: '=1',
+            writesFormula: true,
+        }]);
+
+        store.observe_file_bases('session', new Map([['0:0', { value: '=2' }]]));
+        const observed = registry.formula_projection();
+        expect(observed.edits).toEqual(resolved.edits);
+        expect(observed.calculationRevision).toBe(resolved.calculationRevision);
+    });
+
     it('returns the same store for the same sheet across calls', () => {
         const { registry } = make_session_ref('session');
 

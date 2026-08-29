@@ -30,11 +30,12 @@ import {
 import type { RenderedCell, SheetMeta } from '../data-source/interface';
 import {
     EMPTY_TRANSFORM,
-    dirty_entry_value_changed,
+    dirty_entry_value_dimension_present,
     type CellHighlightColor,
     type CellHighlightMutation,
     type CellHighlightSelection,
     type CsvDirtyMap,
+    type CsvObservedFileBase,
     type CsvSaveLifecycle,
     type CsvSaveOperation,
     type DisplayRowInterval,
@@ -343,7 +344,7 @@ function dirty_value_overlay_fields(
     'dirty_value' | 'dirty_display' | 'dirty_rich' | 'diff_base'
         | 'formula_result_pending' | 'formula_result'
 > | undefined {
-    if (!dirty_entry_value_changed(dirty)) return undefined;
+    if (!dirty_entry_value_dimension_present(dirty)) return undefined;
     const dirty_runs = dirty.valueRuns?.runs;
     const retained_runs = dirty_runs && dirty_runs.length > 0 ? dirty_runs : undefined;
     const formula_edit = xlsx_editing
@@ -365,7 +366,9 @@ function dirty_value_overlay_fields(
         ...(formula_result_pending ? { formula_result_pending: true as const } : {}),
         ...(presentation?.display !== undefined ? { dirty_display: presentation.display } : {}),
         ...(requires_rich ? { dirty_rich: dirty.valueRuns } : {}),
-        ...(diff_mode && !dirty.base_pending ? { diff_base: dirty.base } : {}),
+        ...(diff_mode && !dirty.base_pending
+            ? { diff_base: dirty.observedBase?.value ?? dirty.base }
+            : {}),
     };
 }
 
@@ -387,7 +390,7 @@ import './glide-data-grid/styles.css';
 
 /**
  * Editing snapshot reported up to {@link App} so it can drive the toolbar dirty
- * indicator, persist pending edits, and surface the conflict banner — all
+ * indicator, persist pending edits, and surface file-change information — all
  * App-level concerns, while the dirty map itself lives next to the loader here.
  */
 export interface EditingStatus {
@@ -406,7 +409,7 @@ export interface EditingStatus {
 
 /**
  * Imperative editing actions GridShell exposes to {@link App} (the toolbar
- * toggle and conflict banner live in App's layout, but the dirty map lives here
+ * toggle and file-change notice live in App's layout, but the dirty map lives here
  * next to the loader). Populated into a ref App provides.
  */
 export interface EditingHandle {
@@ -414,17 +417,23 @@ export interface EditingHandle {
     request_save(): boolean;
     /** Drop every dirty edit. */
     clear_dirty(): void;
-    /** Drop only edits whose underlying cell drifted (conflict resolution). */
+    /** Legacy bulk action: drop edits whose underlying file-side cell changed. */
     discard_conflicted(): void;
     /**
      * Drop exactly the named source-keyed edits. Separate from
-     * {@link discard_conflicted}, whose meaning is defined by
-     * `is_entry_conflicted` and is therefore residency-gated: the keys the *host*
-     * names on a rejected save are precisely the ones that predicate cannot see
-     * (a filtered-out row, an evicted page, a row past the row count), so
-     * overloading it would leave the blocking entry in place.
-     */
+     * {@link discard_conflicted}, which uses renderer observations and is therefore
+     * residency-gated. Keys the host names for a filtered-out row, evicted page, or
+     * removed row use this explicit path instead.
+    */
     discard_keys(keys: readonly string[]): void;
+    /** Whether this mounted view can locate a source-keyed cell. */
+    can_reveal_source_cell(source_row: number, source_column: number): boolean;
+    /** Reveal and select a source-keyed cell, loading its row when its position is derivable. */
+    reveal_source_cell(
+        source_row: number,
+        source_column: number,
+        is_current?: () => boolean,
+    ): Promise<boolean>;
     /** Fence every renderer-side mutation before a host close/reload flush. */
     stop_edit_admission(): void;
     /** Snapshot the current Glide overlay into the source-keyed dirty map. */
@@ -599,15 +608,17 @@ export interface GridShellProps {
     gestures_admitted?: () => boolean;
     /**
      * Source-keyed keys the host refused the last save over. Unioned into the
-     * conflict tint so a `baseMismatch` cell is visibly marked even though the
-     * webview's own residency-gated conflict detection cannot flag it. A
+     * informational tint so a `baseMismatch` cell is visibly marked even when the
+     * webview cannot inspect its non-resident row. A
      * `rowsRemoved` key has no cell to tint (its row is past `row_count`), which is
      * why the banner names its row numbers instead.
      */
     host_rejected_keys?: readonly string[];
+    /** Current file sides returned by save-time validation for non-resident edits. */
+    host_observed_bases?: Readonly<Record<string, CsvObservedFileBase>>;
     on_editing_change?: (status: EditingStatus) => void;
     // App provides this ref; GridShell populates it with imperative save/discard
-    // actions so App's toolbar + conflict banner can drive editing that lives here.
+    // actions so App's toolbar + file-change review can drive editing that lives here.
     editing_ref?: MutableRefObject<EditingHandle | null>;
     // App provides this ref; GridShell populates it with a function that measures
     // loaded rows and returns fitted column widths (null when nothing is loaded).
@@ -713,6 +724,7 @@ export function GridShell({
     history_store,
     gestures_admitted,
     host_rejected_keys,
+    host_observed_bases,
     on_editing_change,
     editing_ref,
     auto_fit_ref,
@@ -964,6 +976,7 @@ export function GridShell({
         get_source_row,
         get_cell_raw_for_source,
         get_cell_for_source,
+        get_display_row_for_source,
         get_compare_status,
         get_compare_base,
         sample_loaded_rows,
@@ -1077,7 +1090,7 @@ export function GridShell({
 
     // Read a cell's persisted raw text from the paged cache for the editing hook.
     // Stabilized against the loader's per-render callback identities; `version` in
-    // the deps makes conflict detection re-run as freshly-loaded pages arrive.
+    // the deps makes file-change observation re-run as freshly-loaded pages arrive.
     // `get_row_ref` is still the copy path's reader (display-keyed, by design).
     const get_row_ref = useRef(get_row);
     get_row_ref.current = get_row;
@@ -1087,7 +1100,7 @@ export function GridShell({
     get_cell_for_source_ref.current = get_cell_for_source;
     // First parameter is a **canonical source row**, not a display row: durable
     // edit keys are source-keyed, and the store hands the row component of a key
-    // straight to this reader (is_entry_conflicted / resolve_pending_bases).
+    // straight to this reader (file-change observation / resolve_pending_bases).
     //
     // The `saved_edits_ref` lookup below is the subtle part. Those keys come from
     // the in-flight save operation's edits, which are source-keyed after this PR,
@@ -1151,6 +1164,13 @@ export function GridShell({
             [version],
         ),
     });
+    useEffect(() => {
+        if (!host_observed_bases) return;
+        store.observe_file_bases(
+            edit_session_id,
+            new Map(Object.entries(host_observed_bases)),
+        );
+    }, [edit_session_id, host_observed_bases, store]);
     // The paint callback deliberately stays stable across edits. It reads the
     // current recursive invalidation set through this mirror, while the repaint
     // effect below damages only formulas entering or leaving the set.
@@ -1226,9 +1246,9 @@ export function GridShell({
     // already-discarded edit must not keep tinting, and `dirty_cells` is what
     // decides whether a cell is painted with an overlay at all.
     //
-    // `conflicted` reported up to App stays this union too. That is deliberate: a
-    // host-named mismatch *is* a conflict from the user's point of view, and the
-    // alternative (App reconciling two sets) would put the same union in two places.
+    // The legacy `conflicted` field reported up to App stays this union too. It now
+    // means only "pending edits whose file side changed"; retaining the wire-shaped
+    // name keeps this refactor local while the UI uses accurate language.
     const conflicted_keys = useMemo(() => {
         if (!host_rejected_keys || host_rejected_keys.length === 0) {
             return derived_conflicted_keys;
@@ -1507,6 +1527,63 @@ export function GridShell({
         write_grid_selection(selection);
         grid_ref.current?.scrollTo(cell[0], cell[1]);
     }, [merges, write_grid_selection]);
+    const rows_are_projected = transform_state.sort.length > 0
+        || transform_state.filters.length > 0
+        || (transform_state.hiddenRows?.length ?? 0) > 0
+        || transform_state.onlyChangedRows === true;
+    const unloaded_display_row_for_source = useCallback((source_row: number) => {
+        if (rows_are_projected || source_row < 0) return undefined;
+        const header = sheet_meta.excelFirstRowHeader;
+        if (header?.active === true) {
+            const promoted = header.sourceRow ?? 0;
+            if (source_row === promoted) return undefined;
+            const display_row = source_row < promoted ? source_row : source_row - 1;
+            return display_row < row_count ? display_row : undefined;
+        }
+        return source_row < row_count ? source_row : undefined;
+    }, [row_count, rows_are_projected, sheet_meta.excelFirstRowHeader]);
+    const can_reveal_source_cell = useCallback((
+        source_row: number,
+        source_column: number,
+    ): boolean => {
+        if (display_column_for_source(source_column) === undefined) return false;
+        return get_display_row_for_source(source_row) !== undefined
+            || unloaded_display_row_for_source(source_row) !== undefined;
+    }, [
+        display_column_for_source,
+        get_display_row_for_source,
+        unloaded_display_row_for_source,
+    ]);
+    const reveal_source_cell = useCallback(async (
+        source_row: number,
+        source_column: number,
+        is_current?: () => boolean,
+    ): Promise<boolean> => {
+        if (is_current?.() === false) return false;
+        const display_column = display_column_for_source(source_column);
+        if (display_column === undefined) return false;
+        let display_row = get_display_row_for_source(source_row);
+        if (display_row === undefined) {
+            const unloaded_display_row = unloaded_display_row_for_source(source_row);
+            if (unloaded_display_row === undefined) return false;
+            const loaded = await ensure_rows_loaded(unloaded_display_row, unloaded_display_row);
+            if (!loaded) return false;
+            if (is_current?.() === false) return false;
+            display_row = get_display_row_for_source(source_row);
+        }
+        if (display_row === undefined) return false;
+        if (is_current?.() === false) return false;
+        select_active_display_cell([display_column, display_row]);
+        focus_grid();
+        return true;
+    }, [
+        display_column_for_source,
+        ensure_rows_loaded,
+        focus_grid,
+        get_display_row_for_source,
+        select_active_display_cell,
+        unloaded_display_row_for_source,
+    ]);
     // The flash lives in a ref, not state: `get_cell_content` reads it during
     // paint, and a re-render is neither needed nor wanted — the visible cells are
     // damaged explicitly, twice, on entry and at the deadline.
@@ -2214,6 +2291,8 @@ export function GridShell({
             clear_dirty: guarded_clear_dirty,
             discard_conflicted: guarded_discard_conflicted,
             discard_keys: guarded_discard_keys,
+            can_reveal_source_cell,
+            reveal_source_cell,
             stop_edit_admission() {
                 fenced_edit_activation_ref.current = edit_activation_id;
                 set_fenced_edit_activation(edit_activation_id);
@@ -2232,6 +2311,8 @@ export function GridShell({
         guarded_clear_dirty,
         guarded_discard_conflicted,
         guarded_discard_keys,
+        can_reveal_source_cell,
+        reveal_source_cell,
         edit_activation_id,
         commit_live_edit,
         commit_live_edit_at_close_barrier,

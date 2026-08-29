@@ -137,34 +137,33 @@ describe('build_edit_tints_from_vars', () => {
         build_edit_tints_from_vars((name) => vars[name] ?? '');
     const dirty = (value: string) =>
         from({ '--vscode-editorWarning-foreground': value }).dirtyBg;
-    const conflict = (value: string) =>
-        from({ '--vscode-errorForeground': value }).conflictBg;
+    const externally_changed = (value: string) =>
+        from({ '--vscode-editorInfo-foreground': value }).conflictBg;
 
-    it('derives both tints from the theme warning/error colors', () => {
+    it('derives both tints from the theme warning/info colors', () => {
         const tints = from({
             '--vscode-editorWarning-foreground': '#df8e1d',
-            '--vscode-errorForeground': '#d20f39',
+            '--vscode-editorInfo-foreground': '#1e66f5',
         });
         expect(tints.dirtyBg).toBe('rgba(223, 142, 29, 0.16)');
-        expect(tints.conflictBg).toBe('rgba(210, 15, 57, 0.22)');
+        expect(tints.conflictBg).toBe('rgba(30, 102, 245, 0.18)');
     });
 
-    it('keeps the historical VS Code appearance when the vars are unset', () => {
+    it('uses a neutral blue fallback when the vars are unset', () => {
         // In the VS Code webview these variables are ambient rather than
-        // injected, so they routinely read blank. The tints there must stay
-        // byte-identical to the previously hard-coded amber/red.
+        // injected, so they routinely read blank.
         const tints = build_edit_tints_from_vars(() => '');
         expect(tints.dirtyBg).toBe('rgba(204, 167, 0, 0.16)');
-        expect(tints.conflictBg).toBe('rgba(229, 75, 75, 0.22)');
+        expect(tints.conflictBg).toBe('rgba(0, 122, 204, 0.18)');
     });
 
     it('treats whitespace-only values as unset', () => {
         const tints = from({
             '--vscode-editorWarning-foreground': '   ',
-            '--vscode-errorForeground': '\t\n',
+            '--vscode-editorInfo-foreground': '\t\n',
         });
         expect(tints.dirtyBg).toBe('rgba(204, 167, 0, 0.16)');
-        expect(tints.conflictBg).toBe('rgba(229, 75, 75, 0.22)');
+        expect(tints.conflictBg).toBe('rgba(0, 122, 204, 0.18)');
     });
 
     it('discards any alpha carried by the source color', () => {
@@ -178,7 +177,8 @@ describe('build_edit_tints_from_vars', () => {
     });
 
     it('accepts rgb()/rgba() and replaces their alpha', () => {
-        expect(conflict('rgba(229, 75, 75, 0.9)')).toBe('rgba(229, 75, 75, 0.22)');
+        expect(externally_changed('rgba(30, 102, 245, 0.9)'))
+            .toBe('rgba(30, 102, 245, 0.18)');
         expect(dirty('rgb(1 2 3 / 50%)')).toBe('rgba(1, 2, 3, 0.16)');
     });
 

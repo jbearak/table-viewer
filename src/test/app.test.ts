@@ -4,6 +4,7 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type {
+    CsvDirtyEntry,
     CsvSaveOperation,
     HostMessage,
     SheetTransformState,
@@ -25,11 +26,17 @@ const grid_shell_mock = vi.hoisted(() => ({
     save_in_flight: false,
     has_uncommitted_changes: false,
     mount_count: 0,
-    on_editing_change: null as null | ((status: { is_dirty: boolean; has_live_uncommitted: boolean; save_in_flight: boolean; edits: Record<string, { value: string; base: string }>; conflicted: string[] }) => void),
+    on_editing_change: null as null | ((status: { is_dirty: boolean; has_live_uncommitted: boolean; save_in_flight: boolean; edits: Record<string, CsvDirtyEntry>; conflicted: string[] }) => void),
     request_save: vi.fn(() => false),
     clear_dirty: vi.fn(),
     discard_conflicted: vi.fn(),
     discard_keys: vi.fn((_keys: readonly string[]) => {}),
+    can_reveal_source_cell: vi.fn(() => true),
+    reveal_source_cell: vi.fn(async (
+        _row: number,
+        _column: number,
+        _is_current?: () => boolean,
+    ) => true),
     commit_live_edit: vi.fn(),
     commit_live_edit_at_close_barrier: vi.fn(),
     flush_live_edit: vi.fn(),
@@ -41,6 +48,8 @@ const grid_shell_mock = vi.hoisted(() => ({
     copy_selection: vi.fn(),
     auto_fit_result: { 0: 120 } as Record<number, number> | null,
     latest_props: null as Record<string, unknown> | null,
+    mount_edits: null as Record<string, CsvDirtyEntry> | null,
+    mount_conflicted: null as string[] | null,
     emit_pending_edits_on_mount: false,
     write_on_session_change: false,
     listen_for_save_result: false,
@@ -163,8 +172,11 @@ vi.mock('../webview/grid-shell', () => ({
                 is_dirty: grid_shell_mock.is_dirty,
                 has_live_uncommitted: grid_shell_mock.has_live_uncommitted,
                 save_in_flight: grid_shell_mock.save_in_flight,
-                edits: grid_shell_mock.is_dirty ? { '0:0': { value: 'dirty', base: 'base' } } : {},
-                conflicted: [],
+                edits: grid_shell_mock.mount_edits
+                    ?? (grid_shell_mock.is_dirty
+                        ? { '0:0': { value: 'dirty', base: 'base' } }
+                        : {}),
+                conflicted: grid_shell_mock.mount_conflicted ?? [],
             });
             if (
                 grid_shell_mock.emit_pending_edits_on_mount
@@ -195,6 +207,8 @@ vi.mock('../webview/grid-shell', () => ({
                 clear_dirty: grid_shell_mock.clear_dirty,
                 discard_conflicted: grid_shell_mock.discard_conflicted,
                 discard_keys: grid_shell_mock.discard_keys,
+                can_reveal_source_cell: grid_shell_mock.can_reveal_source_cell,
+                reveal_source_cell: grid_shell_mock.reveal_source_cell,
                 stop_edit_admission: grid_shell_mock.stop_edit_admission,
                 commit_live_edit: grid_shell_mock.commit_live_edit,
                 commit_live_edit_at_close_barrier:
@@ -743,7 +757,7 @@ async function enter_edit_mode(
 }
 
 function seed_mounted_store(
-    edits: Record<string, { value: string; base: string; base_pending?: boolean }> = {
+    edits: Record<string, CsvDirtyEntry & { base_pending?: boolean }> = {
         '0:0': { value: 'dirty', base: 'base' },
     },
 ) {
@@ -760,7 +774,7 @@ async function report_grid_editing(
     dirty: boolean,
     uncommitted = dirty,
     conflicted: string[] = [],
-    edits: Record<string, { value: string; base: string }> = dirty
+    edits: Record<string, CsvDirtyEntry> = dirty
         ? { '0:0': { value: 'dirty', base: 'base' } }
         : {},
     save_in_flight = false,
@@ -932,6 +946,10 @@ function cleanup() {
     grid_shell_mock.clear_dirty.mockReset();
     grid_shell_mock.discard_conflicted.mockReset();
     grid_shell_mock.discard_keys.mockReset();
+    grid_shell_mock.can_reveal_source_cell.mockReset();
+    grid_shell_mock.can_reveal_source_cell.mockReturnValue(true);
+    grid_shell_mock.reveal_source_cell.mockReset();
+    grid_shell_mock.reveal_source_cell.mockResolvedValue(true);
     grid_shell_mock.commit_live_edit.mockReset();
     grid_shell_mock.commit_live_edit_at_close_barrier.mockReset();
     grid_shell_mock.flush_live_edit.mockReset();
@@ -943,6 +961,8 @@ function cleanup() {
     grid_shell_mock.copy_sheet.mockReset();
     grid_shell_mock.copy_selection.mockReset();
     grid_shell_mock.auto_fit_result = { 0: 120 };
+    grid_shell_mock.mount_edits = null;
+    grid_shell_mock.mount_conflicted = null;
     grid_shell_mock.emit_pending_edits_on_mount = false;
     grid_shell_mock.write_on_session_change = false;
     grid_shell_mock.listen_for_save_result = false;
@@ -8499,7 +8519,7 @@ describe('edit mode save exit', () => {
         expect(grid_stub().getAttribute('data-edit-mode')).toBe('true');
     });
 
-    it('discard all from the conflict banner releases edit ownership', async () => {
+    it('discarding from the edit-exit dialog releases edit ownership', async () => {
         grid_shell_mock.is_dirty = true;
         grid_shell_mock.has_uncommitted_changes = true;
 
@@ -8514,9 +8534,11 @@ describe('edit mode save exit', () => {
         );
         await enter_edit_mode(post_message);
         await report_grid_editing(true, true, ['0:0']);
+        seed_mounted_store();
 
         post_message.mockClear();
-        await click_button('Discard All');
+        await click_button('Edit');
+        await dispatch_host_message({ type: 'saveDialogResult', choice: 'discard' });
 
         expect(grid_stub().getAttribute('data-store-edits')).toBe('{}');
         expect(grid_shell_mock.stop_edit_admission).toHaveBeenCalledTimes(1);
@@ -8550,9 +8572,11 @@ describe('edit mode save exit', () => {
         );
         await enter_edit_mode(post_message);
         await report_grid_editing(true, true, ['0:0']);
+        seed_mounted_store();
 
         post_message.mockClear();
-        await click_button('Discard All');
+        await click_button('Edit');
+        await dispatch_host_message({ type: 'saveDialogResult', choice: 'discard' });
 
         expect(grid_shell_mock.stop_edit_admission).not.toHaveBeenCalled();
         expect(post_message).not.toHaveBeenCalledWith(
@@ -8576,6 +8600,7 @@ describe('edit mode save exit', () => {
         );
         await enter_edit_mode(post_message);
         await report_grid_editing(true, true, ['0:0']);
+        seed_mounted_store();
 
         await click_button('Highlight');
         await click_button('Clear all highlights');
@@ -8586,7 +8611,8 @@ describe('edit mode save exit', () => {
         // across the round trip it would land ahead of the highlight the user made
         // first, and the first undo would repaint cells rather than restore the
         // discarded edits.
-        await click_button('Discard All');
+        await click_button('Edit');
+        await dispatch_host_message({ type: 'saveDialogResult', choice: 'discard' });
 
         expect(post_message).not.toHaveBeenCalledWith(
             expect.objectContaining({ type: 'discardEditSession' }),
@@ -8607,9 +8633,8 @@ describe('edit mode save exit', () => {
         expect(JSON.parse(grid_stub().getAttribute('data-undo-labels')!)).toEqual([]);
     });
 
-    // Host-rejected saves. These are the deadlock case: the keys the host names are
-    // exactly the ones the webview's residency-gated `is_entry_conflicted` cannot
-    // flag, so every one of these tests reports NO webview-derived conflicts.
+    // Save-time file changes. These keys can name rows the webview has not loaded,
+    // so the host supplies the current file side for the informational review.
     it('does not replace newer edits for a host-generated rehydration rejection', async () => {
         await render_app();
         const restored = { '4:1': { value: 'edited', base: 'stale' } };
@@ -8656,7 +8681,7 @@ describe('edit mode save exit', () => {
         });
     });
 
-    it('shows the conflict banner for a host base mismatch with no derived conflicts', async () => {
+    it('shows an informational review for a save-time file change', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(
             initial_snapshot_message(make_meta(['Sheet1'], false), {
@@ -8667,7 +8692,7 @@ describe('edit mode save exit', () => {
         await report_grid_editing(true, true, [], {
             '4:1': { value: 'edited', base: 'stale' },
         });
-        expect(container!.querySelector('.conflict-banner')).toBeNull();
+        expect(container!.querySelector('.external-change-banner')).toBeNull();
 
         await dispatch_host_message({
             type: 'saveResult',
@@ -8685,23 +8710,754 @@ describe('edit mode save exit', () => {
                     }],
                 },
             },
-            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['4:1'] },
+            rejection: {
+                reason: 'baseMismatch',
+                worksheetOperationIndex: 0,
+                keys: ['4:1'],
+                observedBases: {
+                    '4:1': {
+                        value: 'current file value',
+                        runs: { runs: [{ text: 'current file value' }] },
+                    },
+                },
+            },
         });
 
-        // The real shell restores the submitted dirty map on a failed lifecycle and
-        // then reports it; the stub's mount effect re-emits its default status
-        // instead, so replay the report to model the post-rejection state.
-        await report_grid_editing(true, true, [], {
-            '4:1': { value: 'edited', base: 'stale' },
-        });
-
-        const banner = container!.querySelector('.conflict-banner');
-        expect(banner).not.toBeNull();
-        expect(banner!.textContent).toContain('1 edit no longer matches');
-        expect(banner!.textContent).toContain('save was cancelled');
-        // The host keys reach the grid so the cell is tinted like a derived conflict.
+        // Before GridShell has adopted and reported the host observation, the
+        // submitted identity must remain live so filtered-out and nonresident
+        // cells receive the observation instead of losing the verdict.
         expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
             .toEqual(['4:1']);
+        expect(container!.querySelector('.external-change-banner')).not.toBeNull();
+
+        // The real shell restores the submitted map, adopts the host-observed
+        // side, and then reports that enriched entry. Model the steady state —
+        // the save verdict must keep owning the same edit after that enrichment.
+        await report_grid_editing(true, true, [], {
+            '4:1': {
+                value: 'edited',
+                base: 'stale',
+                observedBase: {
+                    value: 'current file value',
+                    runs: { runs: [{ text: 'current file value' }] },
+                },
+            },
+        });
+
+        const banner = container!.querySelector('.external-change-banner');
+        expect(banner).not.toBeNull();
+        expect(banner!.textContent).toContain('The file changed before it could be saved.');
+        expect(banner!.textContent).toContain('1 cell with a pending edit also changed.');
+        expect(banner!.textContent).not.toContain('conflict');
+        const review_button = get_button('Review changes');
+        expect(review_button.getAttribute('aria-expanded')).toBe('false');
+        await click_button('Review changes');
+        const review = container!.querySelector('.external-change-review');
+        expect(review_button.getAttribute('aria-expanded')).toBe('true');
+        expect(document.activeElement).toBe(review);
+        expect(review?.textContent).toContain('Original file value');
+        expect(review?.textContent).toContain('Current file value');
+        expect(review?.textContent).toContain('Your pending edit');
+        expect(review?.textContent).toContain('stale');
+        expect(review?.textContent).toContain('current file value');
+        expect(review?.textContent).toContain('edited');
+        expect(review?.textContent).not.toContain('formatting also changed');
+        await click_button('Go to cell');
+        expect(grid_shell_mock.reveal_source_cell).toHaveBeenCalledWith(
+            4,
+            1,
+            expect.any(Function),
+        );
+        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
+            .toEqual(['4:1']);
+    });
+
+    it('keeps a save rejection when adoption returns to the original file value', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }),
+        );
+        await enter_edit_mode(post_message);
+        const submitted = {
+            '4:1': {
+                value: 'edited',
+                base: 'original',
+                observedBase: { value: 'intermediate file value' },
+            },
+        };
+        await report_grid_editing(true, true, ['4:1'], submitted);
+
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 901,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-returned-to-original',
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: { '4:1': 'edited' },
+                        dirtyEdits: submitted,
+                    }],
+                },
+            },
+            rejection: {
+                reason: 'baseMismatch',
+                worksheetOperationIndex: 0,
+                keys: ['4:1'],
+                observedBases: { '4:1': { value: 'original' } },
+            },
+        });
+        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
+            .toEqual(['4:1']);
+
+        // GridShell canonicalizes an observation equal to the historical base
+        // by clearing observedBase. That is still the same submitted edit, not
+        // a replacement that should erase the explanation for the failed save.
+        await report_grid_editing(true, true, [], {
+            '4:1': { value: 'edited', base: 'original' },
+        });
+        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
+            .toEqual(['4:1']);
+        expect(container!.querySelector('.external-change-banner')).not.toBeNull();
+    });
+
+    it('does not present a link-only anchor as a pending value or formatting edit', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }),
+        );
+        await enter_edit_mode(post_message);
+        const original_runs = {
+            runs: [{ text: 'Anchor', style: { bold: true as const } }],
+        };
+        await report_grid_editing(true, true, ['4:1'], {
+            '4:1': {
+                value: 'Anchor',
+                base: 'Anchor',
+                valueRuns: original_runs,
+                baseRuns: original_runs,
+                link: { kind: 'external', target: 'https://example.com/pending' },
+                baseLink: null,
+                observedBase: {
+                    value: 'Current file text',
+                    runs: {
+                        runs: [{
+                            text: 'Current file text',
+                            style: { italic: true },
+                        }],
+                    },
+                    link: null,
+                },
+            },
+        });
+
+        await click_button('Review changes');
+        const review_text = container!
+            .querySelector('.external-change-review')?.textContent ?? '';
+        expect(review_text).toContain('Original file value');
+        expect(review_text).toContain('Current file value');
+        expect(review_text).toContain('Your pending link');
+        expect(review_text).toContain('https://example.com/pending');
+        expect(review_text).not.toContain('Your pending edit');
+        expect(review_text).not.toContain('Your pending formatting');
+    });
+
+    it('cancels an in-flight cell navigation when the review closes', async () => {
+        let finish_navigation: (() => void) | undefined;
+        let navigation_is_current: (() => boolean) | undefined;
+        grid_shell_mock.reveal_source_cell.mockImplementation(
+            async (_row, _column, is_current?: () => boolean) => {
+                navigation_is_current = is_current;
+                await new Promise<void>((resolve) => { finish_navigation = resolve; });
+                if (is_current?.() === false) return false;
+                grid_shell_mock.focus_grid();
+                return true;
+            },
+        );
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }),
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, ['4:1'], {
+            '4:1': {
+                value: 'edited', base: 'stale',
+                observedBase: { value: 'current' },
+            },
+        });
+        await click_button('Review changes');
+        await click_button('Go to cell');
+        expect(get_button('Going…').hasAttribute('disabled')).toBe(true);
+
+        await click_button('Close');
+        const newer_focus = document.createElement('button');
+        document.body.appendChild(newer_focus);
+        newer_focus.focus();
+        expect(navigation_is_current?.()).toBe(false);
+        const focus_calls_before_completion = grid_shell_mock.focus_grid.mock.calls.length;
+        await act(async () => { finish_navigation?.(); });
+
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledTimes(focus_calls_before_completion);
+        expect(document.activeElement).toBe(newer_focus);
+    });
+
+    it('keeps a dismissal across equivalent observed formatting encodings', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }),
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, ['0:0'], {
+            '0:0': {
+                value: 'pending', base: 'original',
+                observedBase: {
+                    value: 'current',
+                    runs: { runs: [{ text: 'current', style: {} }] },
+                },
+            },
+        });
+        const dismiss = get_button('Dismiss');
+        expect(dismiss.getAttribute('aria-label')).toBe('Dismiss file-change notice');
+        await click_button('Dismiss');
+
+        await report_grid_editing(true, true, ['0:0'], {
+            '0:0': {
+                value: 'pending', base: 'original',
+                observedBase: { value: 'current' },
+            },
+        });
+        expect(container!.querySelector('.external-change-banner')).toBeNull();
+    });
+
+    it('bounds formatting comparison work across the whole review', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }),
+        );
+        await enter_edit_mode(post_message);
+        const original = 'A'.repeat(800);
+        const current = `${'A'.repeat(799)}B`;
+        const entry = (row: number): CsvDirtyEntry => ({
+            value: `pending ${row}`,
+            base: original,
+            baseRuns: { runs: [{ text: original, style: { bold: true } }] },
+            observedBase: { value: current },
+        });
+        await report_grid_editing(true, true, ['0:0', '1:0'], {
+            '0:0': entry(0),
+            '1:0': entry(1),
+        });
+        await click_button('Review changes');
+
+        expect(container!.querySelectorAll('.external-change-detail')).toHaveLength(1);
+    });
+
+    it('shows a repeated file-change event after the first occurrence was dismissed', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            })
+        );
+        await enter_edit_mode(post_message);
+        const ordinary = { '0:0': { value: 'pending', base: 'original' } };
+        const affected = {
+            '0:0': {
+                value: 'pending',
+                base: 'original',
+                observedBase: { value: 'same later value' },
+            },
+        };
+
+        await report_grid_editing(true, true, ['0:0'], affected);
+        expect(container!.querySelector('.external-change-banner')).not.toBeNull();
+        await click_button('Dismiss');
+        expect(container!.querySelector('.external-change-banner')).toBeNull();
+
+        await report_grid_editing(true, true, [], ordinary);
+        expect(container!.querySelector('.external-change-banner')).toBeNull();
+        await report_grid_editing(true, true, ['0:0'], affected);
+        expect(container!.querySelector('.external-change-banner')).not.toBeNull();
+    });
+
+    it('keeps independent dismissals while visiting other worksheets', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1', 'Sheet2'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }),
+        );
+        await enter_edit_mode(post_message);
+        const first = {
+            '0:0': {
+                value: 'pending one', base: 'original one',
+                observedBase: { value: 'current one' },
+            },
+        };
+        const second = {
+            '0:0': {
+                value: 'pending two', base: 'original two',
+                observedBase: { value: 'current two' },
+            },
+        };
+
+        await report_grid_editing(true, true, ['0:0'], first);
+        await click_button('Dismiss');
+        grid_shell_mock.is_dirty = true;
+        grid_shell_mock.mount_edits = second;
+        grid_shell_mock.mount_conflicted = ['0:0'];
+        await click_sheet_tab('Sheet2');
+        expect(container!.querySelector('.external-change-banner')).not.toBeNull();
+        await click_button('Dismiss');
+
+        grid_shell_mock.mount_edits = first;
+        await click_sheet_tab('Sheet1');
+        expect(container!.querySelector('.external-change-banner')).toBeNull();
+        grid_shell_mock.mount_edits = second;
+        await click_sheet_tab('Sheet2');
+        expect(container!.querySelector('.external-change-banner')).toBeNull();
+    });
+
+    it('does not reopen a dismissed occurrence when one affected item resolves', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }),
+        );
+        await enter_edit_mode(post_message);
+        const first = {
+            value: 'pending one', base: 'original one',
+            observedBase: { value: 'current one' },
+        };
+        const second = {
+            value: 'pending two', base: 'original two',
+            observedBase: { value: 'current two' },
+        };
+        await report_grid_editing(true, true, ['0:0', '1:0'], {
+            '0:0': first,
+            '1:0': second,
+        });
+        await click_button('Dismiss');
+
+        await report_grid_editing(true, true, ['1:0'], { '1:0': second });
+        expect(container!.querySelector('.external-change-banner')).toBeNull();
+
+        await report_grid_editing(true, true, ['1:0'], {
+            '1:0': { ...second, observedBase: { value: 'newer current two' } },
+        });
+        expect(container!.querySelector('.external-change-banner')).not.toBeNull();
+    });
+
+    it('starts a later occurrence closed after the previous review resolved', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }),
+        );
+        await enter_edit_mode(post_message);
+        const ordinary = { '0:0': { value: 'pending', base: 'original' } };
+        const affected = {
+            '0:0': {
+                value: 'pending', base: 'original',
+                observedBase: { value: 'current' },
+            },
+        };
+        await report_grid_editing(true, true, ['0:0'], affected);
+        await click_button('Review changes');
+        expect(container!.querySelector('.external-change-review')).not.toBeNull();
+
+        await report_grid_editing(true, true, [], ordinary);
+        expect(container!.querySelector('.external-change-review')).toBeNull();
+        const focus_target = document.createElement('button');
+        document.body.appendChild(focus_target);
+        focus_target.focus();
+        await report_grid_editing(true, true, ['0:0'], affected);
+        expect(container!.querySelector('.external-change-banner')).not.toBeNull();
+        expect(container!.querySelector('.external-change-review')).toBeNull();
+        expect(get_button('Review changes').getAttribute('aria-expanded')).toBe('false');
+        expect(document.activeElement).toBe(focus_target);
+    });
+
+    it('restores grid focus when the focused file-change review resolves', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }),
+        );
+        await enter_edit_mode(post_message);
+        const ordinary = { '0:0': { value: 'pending', base: 'original' } };
+        await report_grid_editing(true, true, ['0:0'], {
+            '0:0': {
+                ...ordinary['0:0'],
+                observedBase: { value: 'current' },
+            },
+        });
+        await click_button('Review changes');
+        expect(document.activeElement).toBe(
+            container!.querySelector('.external-change-review'),
+        );
+
+        grid_shell_mock.focus_grid.mockClear();
+        await report_grid_editing(true, true, [], ordinary);
+
+        expect(container!.querySelector('.external-change-review')).toBeNull();
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledTimes(1);
+    });
+
+    it('focuses a newer notice when it replaces the focused review', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }),
+        );
+        await enter_edit_mode(post_message);
+        const affected = {
+            '0:0': {
+                value: 'pending',
+                base: 'original',
+                observedBase: { value: 'current' },
+            },
+        };
+        await report_grid_editing(true, true, ['0:0'], affected);
+        await click_button('Review changes');
+
+        await report_grid_editing(true, true, ['0:0'], {
+            '0:0': {
+                ...affected['0:0'],
+                observedBase: { value: 'newer current' },
+            },
+        });
+
+        expect(container!.querySelector('.external-change-review')).toBeNull();
+        expect(document.activeElement).toBe(get_button('Review changes'));
+    });
+
+    it('fences navigation and restores panel focus when its item resolves', async () => {
+        let finish_navigation: (() => void) | undefined;
+        let navigation_is_current: (() => boolean) | undefined;
+        grid_shell_mock.reveal_source_cell.mockImplementation(
+            async (_row, _column, is_current?: () => boolean) => {
+                navigation_is_current = is_current;
+                await new Promise<void>((resolve) => { finish_navigation = resolve; });
+                if (is_current?.() === false) return false;
+                grid_shell_mock.focus_grid();
+                return true;
+            },
+        );
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }),
+        );
+        await enter_edit_mode(post_message);
+        const second = {
+            value: 'pending two',
+            base: 'original two',
+            observedBase: { value: 'current two' },
+        };
+        await report_grid_editing(true, true, ['0:0', '1:0'], {
+            '0:0': {
+                value: 'pending one',
+                base: 'original one',
+                observedBase: { value: 'current one' },
+            },
+            '1:0': second,
+        });
+        await click_button('Review changes');
+        const first_go = get_button('Go to cell');
+        first_go.focus();
+        await act(async () => { first_go.click(); });
+        expect(navigation_is_current?.()).toBe(true);
+
+        await report_grid_editing(true, true, ['1:0'], { '1:0': second });
+
+        expect(navigation_is_current?.()).toBe(false);
+        expect(document.activeElement).toBe(
+            container!.querySelector('.external-change-review'),
+        );
+        const remaining_go = get_button('Go to cell');
+        expect(remaining_go.hasAttribute('disabled')).toBe(false);
+
+        const focus_calls_before_completion = grid_shell_mock.focus_grid.mock.calls.length;
+        await act(async () => { finish_navigation?.(); });
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledTimes(
+            focus_calls_before_completion,
+        );
+    });
+
+    it('keeps navigation live after a changed card returns from the removed variant', async () => {
+        let finish_navigation: (() => void) | undefined;
+        let navigation_is_current: (() => boolean) | undefined;
+        grid_shell_mock.reveal_source_cell.mockImplementation(
+            async (_row, _column, is_current?: () => boolean) => {
+                navigation_is_current = is_current;
+                await new Promise<void>((resolve) => { finish_navigation = resolve; });
+                return is_current?.() !== false;
+            },
+        );
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }),
+        );
+        await enter_edit_mode(post_message);
+        const submitted = { '0:0': { value: 'pending', base: 'original' } };
+        await report_grid_editing(true, true, [], submitted);
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 904,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-card-variant',
+                    worksheets: [{
+                        sheetIndex: 0,
+                        edits: { '0:0': 'pending' },
+                        dirtyEdits: submitted,
+                    }],
+                },
+            },
+            rejection: {
+                reason: 'rowsRemoved',
+                worksheetOperationIndex: 0,
+                keys: ['0:0'],
+            },
+        });
+        await report_grid_editing(true, true, [], submitted);
+        await click_button('Review changes');
+        expect(container!.querySelector('.external-change-review')?.textContent)
+            .toContain('row no longer in file');
+
+        const restored = {
+            '0:0': {
+                value: 'replacement pending',
+                base: 'restored',
+                observedBase: { value: 'changed after restore' },
+            },
+        };
+        await report_grid_editing(true, true, ['0:0'], restored);
+        await click_button('Review changes');
+        const go_to_cell = get_button('Go to cell');
+        go_to_cell.focus();
+        await act(async () => { go_to_cell.click(); });
+        expect(navigation_is_current?.()).toBe(true);
+
+        // The pending-state render must reuse the callback installed by the
+        // restored changed card. A callback lost during changed/removed key
+        // replacement runs ref cleanup here and cancels its own request.
+        await report_grid_editing(true, true, ['0:0'], restored);
+        expect(navigation_is_current?.()).toBe(true);
+        expect(get_button('Going…').hasAttribute('disabled')).toBe(true);
+
+        await act(async () => { finish_navigation?.(); });
+    });
+
+    it('does not describe explicit plain runs as formatting', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }),
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, ['0:0'], {
+            '0:0': {
+                value: 'Applefff',
+                base: 'Apple',
+                valueRuns: { runs: [{ text: 'Applefff' }] },
+                baseRuns: { runs: [{ text: 'Apple' }] },
+                observedBase: {
+                    value: 'Applefff',
+                    runs: { runs: [{ text: 'Applefff' }] },
+                },
+            },
+        });
+        await click_button('Review changes');
+        expect(container!.querySelector('.external-change-review')?.textContent)
+            .not.toContain('formatting');
+    });
+
+    it('does not claim formatting changed for an older sparse equal-value draft', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }),
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, ['0:0'], {
+            '0:0': {
+                value: 'Apple',
+                base: 'Apple',
+                observedBase: {
+                    value: 'Apple',
+                    runs: { runs: [{ text: 'Apple', style: { bold: true } }] },
+                },
+            },
+        });
+        await click_button('Review changes');
+        expect(container!.querySelector('.external-change-review')?.textContent)
+            .not.toContain('formatting');
+    });
+
+    it('does not claim formatting changed for an older sparse changed-text draft', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }),
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, ['0:0'], {
+            '0:0': {
+                value: 'Banana',
+                base: 'Apple',
+                observedBase: {
+                    value: 'Apple',
+                    runs: {
+                        runs: [{ text: 'Apple', style: { bold: true } }],
+                    },
+                },
+            },
+        });
+        await click_button('Review changes');
+        expect(container!.querySelector('.external-change-review')?.textContent)
+            .not.toContain('formatting');
+    });
+
+    it('does not invent original formatting after a legacy draft gains pending runs', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }),
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, ['0:0'], {
+            '0:0': {
+                value: 'Dragonfruit',
+                base: 'Apple',
+                valueRuns: { runs: [{ text: 'Dragonfruit' }] },
+                observedBase: {
+                    value: 'Cherry',
+                    runs: { runs: [{ text: 'Cherry', style: { bold: true } }] },
+                },
+            },
+        });
+        await click_button('Review changes');
+        const review_text = container!
+            .querySelector('.external-change-review')?.textContent ?? '';
+        expect(review_text).not.toContain('Cell formatting also changed in the file.');
+        expect(review_text).not.toContain('Original file formatting');
+        expect(review_text).toContain('Current file formattingbold: Cherry');
+        expect(review_text).toContain('Your pending formattingplain: Dragonfruit');
+    });
+
+    it('compares later formatting changes with the last observed file formatting', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }),
+        );
+        await enter_edit_mode(post_message);
+        const legacy_entry = {
+            value: 'Banana',
+            base: 'Apple',
+            observedBase: {
+                value: 'Cherry',
+                runs: { runs: [{ text: 'Cherry', style: { bold: true as const } }] },
+            },
+        };
+        await report_grid_editing(true, true, ['0:0'], { '0:0': legacy_entry });
+        await click_button('Dismiss');
+
+        await report_grid_editing(true, true, ['0:0'], {
+            '0:0': {
+                ...legacy_entry,
+                observedBase: {
+                    value: 'Cherry',
+                    runs: { runs: [{ text: 'Cherry', style: { italic: true } }] },
+                },
+            },
+        });
+        expect(container!.querySelector('.external-change-banner')).not.toBeNull();
+        await click_button('Review changes');
+        const review_text = container!
+            .querySelector('.external-change-review')?.textContent ?? '';
+        expect(review_text).toContain('Cell formatting changed again in the file.');
+        expect(review_text).toContain('Previous file formattingbold: Cherry');
+        expect(review_text).toContain('Current file formattingitalic: Cherry');
+        expect(review_text).not.toContain('Original file formatting');
+    });
+
+    it('shows formatting drift for an explicit equal-value write', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }),
+        );
+        await enter_edit_mode(post_message);
+        await report_grid_editing(true, true, ['0:0'], {
+            '0:0': {
+                value: 'Apple',
+                base: 'Apple',
+                writeValue: true,
+                formattingKnown: true,
+                observedBase: {
+                    value: 'Apple',
+                    runs: {
+                        runs: [{ text: 'Apple', style: { bold: true } }],
+                    },
+                },
+            },
+        });
+        await click_button('Review changes');
+        expect(container!.querySelector('.external-change-review')?.textContent)
+            .toContain('Cell formatting also changed in the file.');
+    });
+
+    it('omits Go to cell when the current projection cannot locate it', async () => {
+        const { post_message } = await render_app();
+        await dispatch_host_message(
+            initial_snapshot_message(make_meta(['Sheet1'], false), {
+                capabilities: { csvEditable: true, csvEditingSupported: true },
+            }),
+        );
+        await enter_edit_mode(post_message);
+        grid_shell_mock.can_reveal_source_cell.mockReturnValue(false);
+        await report_grid_editing(true, true, ['75:0'], {
+            '75:0': {
+                value: 'pending', base: 'original',
+                observedBase: { value: 'current' },
+            },
+        });
+        await click_button('Review changes');
+        expect(Array.from(container!.querySelectorAll('button')).some(
+            (button) => button.textContent === 'Go to cell',
+        )).toBe(false);
     });
 
     it('names the affected row numbers when the file shrank under an edit', async () => {
@@ -8712,8 +9468,17 @@ describe('edit mode save exit', () => {
             })
         );
         await enter_edit_mode(post_message);
+        const orphan_with_link: CsvDirtyEntry = {
+            value: 'orphan',
+            base: 'gone',
+            valueRuns: {
+                runs: [{ text: 'orphan', style: { bold: true } }],
+            },
+            link: { kind: 'external', target: 'https://example.com/pending' },
+            baseLink: null,
+        };
         await report_grid_editing(true, true, [], {
-            '7:0': { value: 'orphan', base: 'gone' },
+            '7:0': orphan_with_link,
             '7:2': { value: 'orphan too', base: 'gone' },
         });
 
@@ -8730,7 +9495,7 @@ describe('edit mode save exit', () => {
                         sheetIndex: 0,
                         edits: { '7:0': 'orphan', '7:2': 'orphan too' },
                         dirtyEdits: {
-                        '7:0': { value: 'orphan', base: 'gone' },
+                        '7:0': orphan_with_link,
                         '7:2': { value: 'orphan too', base: 'gone' },
                     },
                     }],
@@ -8743,16 +9508,23 @@ describe('edit mode save exit', () => {
         // then reports it; the stub's mount effect re-emits its default status
         // instead, so replay the report to model the post-rejection state.
         await report_grid_editing(true, true, [], {
-            '7:0': { value: 'orphan', base: 'gone' },
+            '7:0': orphan_with_link,
             '7:2': { value: 'orphan too', base: 'gone' },
         });
 
-        const banner = container!.querySelector('.conflict-banner');
+        const banner = container!.querySelector('.external-change-banner');
         expect(banner).not.toBeNull();
         // Two edits on one removed row is one row to report, 1-based.
-        expect(banner!.textContent).toContain('File shrank externally');
-        expect(banner!.textContent).toContain('1 edited row no longer exists');
-        expect(banner!.textContent).toContain('Affected row: 8');
+        expect(banner!.textContent).toContain('1 row with pending edits is no longer in the file');
+        await click_button('Review changes');
+        const review_text = container!.querySelector('.external-change-review')?.textContent;
+        expect(review_text).toContain('Sheet1, row 8');
+        expect(review_text).toContain('Original file link');
+        expect(review_text).toContain('Your pending link');
+        expect(review_text).toContain('https://example.com/pending');
+        expect(review_text).not.toContain('Original file linkOriginal file link');
+        expect(review_text).not.toContain('Original file formatting');
+        expect(review_text).toContain('Your pending formattingbold: orphan');
     });
 
     it('discards exactly the host-named keys from the banner', async () => {
@@ -8800,7 +9572,8 @@ describe('edit mode save exit', () => {
             '0:0': { value: 'fine', base: 'a' },
         });
 
-        await click_button('Discard Conflicted');
+        await click_button('Review changes');
+        await click_button('Discard my pending edit');
 
         // Not discard_conflicted: that predicate is false for every host-named key,
         // so it would leave the entry that is blocking the save.
@@ -8809,7 +9582,7 @@ describe('edit mode save exit', () => {
         expect(grid_shell_mock.discard_keys).toHaveBeenCalledWith(['4:1']);
     });
 
-    it('scopes same-key host save rejections by worksheet operation ordinal', async () => {
+    it('moves to the background worksheet whose pending edit blocked the save', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(
             initial_snapshot_message(make_meta(['People', 'Inventory'], false), {
@@ -8820,6 +9593,9 @@ describe('edit mode save exit', () => {
         const people_edits = { '4:1': { value: 'Bob', base: 'Alice' } };
         const inventory_edits = { '4:1': { value: 'Gadget', base: 'stale' } };
         await report_grid_editing(true, true, [], people_edits);
+        grid_shell_mock.mount_edits = inventory_edits;
+        grid_shell_mock.mount_conflicted = ['4:1'];
+        grid_shell_mock.focus_grid.mockClear();
         await dispatch_host_message({
             type: 'saveResult',
             success: false,
@@ -8847,17 +9623,16 @@ describe('edit mode save exit', () => {
             },
             rejection: { reason: 'baseMismatch', worksheetOperationIndex: 1, keys: ['4:1'] },
         });
-        await report_grid_editing(true, true, [], people_edits);
-        expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
-            .toEqual([]);
-        expect(document.querySelector('.conflict-banner')).toBeNull();
-
-        await click_sheet_tab('Inventory');
         await report_grid_editing(true, true, ['4:1'], inventory_edits);
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
         expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
             .toEqual(['4:1']);
-        expect(document.querySelector('.conflict-banner')).not.toBeNull();
+        expect(document.querySelector('.external-change-banner')).not.toBeNull();
+        await vi.waitUntil(() => grid_shell_mock.focus_grid.mock.calls.length > 0);
+        expect(grid_shell_mock.focus_grid).toHaveBeenCalledOnce();
 
+        grid_shell_mock.mount_edits = people_edits;
+        grid_shell_mock.mount_conflicted = [];
         await click_sheet_tab('People');
         await report_grid_editing(true, true, [], people_edits);
         expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
@@ -8894,12 +9669,12 @@ describe('edit mode save exit', () => {
         });
         await report_grid_editing(true, true, [], edits);
 
-        expect(document.querySelector('.conflict-banner')).toBeNull();
+        expect(document.querySelector('.external-change-banner')).toBeNull();
         expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
             .toEqual([]);
     });
 
-    it('clears host-named and derived conflicts in one press', async () => {
+    it('discards one reviewed pending edit at a time', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(
             initial_snapshot_message(make_meta(['Sheet1'], false), {
@@ -8940,13 +9715,24 @@ describe('edit mode save exit', () => {
             '9:3': { value: 'local', base: 'drifted' },
         });
 
-        await click_button('Discard Conflicted');
+        await click_button('Review changes');
+        const host_card = Array.from(
+            container!.querySelectorAll<HTMLLIElement>('.external-change-item'),
+        ).find((card) => card.querySelector('h3')?.textContent?.includes('row 5'));
+        expect(host_card).toBeDefined();
+        await act(async () => {
+            host_card!.querySelector<HTMLButtonElement>('button[aria-label^="Discard"]')!.click();
+        });
+        await report_grid_editing(true, true, ['9:3'], {
+            '9:3': { value: 'local', base: 'drifted' },
+        });
 
-        // Both mechanisms fire: discard_keys can only reach the host's key, and
-        // discard_conflicted can only reach the derived one. Dropping either call
-        // would leave half the tinted cells dirty and the banner still up.
         expect(grid_shell_mock.discard_keys).toHaveBeenCalledWith(['4:1']);
-        expect(grid_shell_mock.discard_conflicted).toHaveBeenCalledTimes(1);
+        expect(grid_shell_mock.discard_conflicted).not.toHaveBeenCalled();
+        expect(container!.querySelector('.external-change-review')?.textContent)
+            .not.toContain('row 5');
+        expect(container!.querySelector('.external-change-review')?.textContent)
+            .toContain('row 10');
     });
 
     it('dismisses a host rejection once its edits leave the dirty map', async () => {
@@ -8991,7 +9777,7 @@ describe('edit mode save exit', () => {
             '0:0': { value: 'fine', base: 'a' },
         });
 
-        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+        expect(container!.querySelector('.external-change-banner')).not.toBeNull();
 
         // The rejected entry is gone (discarded here, but any route out of the map
         // counts) while an unrelated edit remains: the banner and the tint must both
@@ -9000,7 +9786,7 @@ describe('edit mode save exit', () => {
             '0:0': { value: 'fine', base: 'a' },
         });
 
-        expect(container!.querySelector('.conflict-banner')).toBeNull();
+        expect(container!.querySelector('.external-change-banner')).toBeNull();
         expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
             .toEqual([]);
     });
@@ -9043,11 +9829,11 @@ describe('edit mode save exit', () => {
         await report_grid_editing(true, true, [], {
             '4:1': { value: 'edited', base: 'stale' },
         });
-        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+        expect(container!.querySelector('.external-change-banner')).not.toBeNull();
 
-        // Discard Conflicted drops '4:1'…
+        // Removing the reviewed edit drops '4:1'…
         await report_grid_editing(false, false, [], {});
-        expect(container!.querySelector('.conflict-banner')).toBeNull();
+        expect(container!.querySelector('.external-change-banner')).toBeNull();
 
         // …and the user retypes into that very cell. Same key, new edit: a fresh
         // value over a base read from the current file.
@@ -9055,7 +9841,7 @@ describe('edit mode save exit', () => {
             '4:1': { value: 'retyped', base: 'their-text' },
         });
 
-        expect(container!.querySelector('.conflict-banner')).toBeNull();
+        expect(container!.querySelector('.external-change-banner')).toBeNull();
         expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
             .toEqual([]);
     });
@@ -9103,7 +9889,7 @@ describe('edit mode save exit', () => {
         await report_grid_editing(true, true, [], {
             '4:1': { value: 'edited', base: 'stale' },
         });
-        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+        expect(container!.querySelector('.external-change-banner')).not.toBeNull();
 
         await dispatch_host_message(refresh_snapshot_message(meta, {
             generation: 3,
@@ -9120,7 +9906,7 @@ describe('edit mode save exit', () => {
             '4:1': { value: 'edited', base: 'stale' },
         });
 
-        expect(container!.querySelector('.conflict-banner')).toBeNull();
+        expect(container!.querySelector('.external-change-banner')).toBeNull();
         expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
             .toEqual([]);
     });
@@ -9165,7 +9951,7 @@ describe('edit mode save exit', () => {
         await report_grid_editing(true, true, [], {
             '4:1': { value: 'edited', base: 'stale' },
         });
-        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+        expect(container!.querySelector('.external-change-banner')).not.toBeNull();
         expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
             .toEqual(['4:1']);
 
@@ -9190,7 +9976,7 @@ describe('edit mode save exit', () => {
             '4:1': { value: 'edited', base: 'stale' },
         });
 
-        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+        expect(container!.querySelector('.external-change-banner')).not.toBeNull();
         expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
             .toEqual(['4:1']);
     });
@@ -9230,7 +10016,7 @@ describe('edit mode save exit', () => {
         await report_grid_editing(true, true, [], {
             '4:1': { value: 'edited', base: 'stale' },
         });
-        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+        expect(container!.querySelector('.external-change-banner')).not.toBeNull();
 
         // A refusal before base validation says nothing new about the existing
         // mismatch. Once the host explicitly reports that it validated the same
@@ -9257,7 +10043,7 @@ describe('edit mode save exit', () => {
             '4:1': { value: 'edited', base: 'stale' },
         });
 
-        expect(container!.querySelector('.conflict-banner') !== null)
+        expect(container!.querySelector('.external-change-banner') !== null)
             .toBe(rejection_remains);
         expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
             .toEqual(rejection_remains ? ['4:1'] : []);
@@ -9330,7 +10116,7 @@ describe('edit mode save exit', () => {
             },
         } as never);
 
-        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+        expect(container!.querySelector('.external-change-banner')).not.toBeNull();
         expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
             .toEqual(['4:1']);
     });
@@ -9410,7 +10196,7 @@ describe('edit mode save exit', () => {
         await report_grid_editing(true, true, [], dirty);
 
         expect(grid_shell_mock.latest_props?.save_operation).toBeUndefined();
-        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+        expect(container!.querySelector('.external-change-banner')).not.toBeNull();
         expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
             .toEqual(['4:1']);
     });
@@ -9454,7 +10240,7 @@ describe('edit mode save exit', () => {
         await report_grid_editing(true, true, [], {
             '4:1': { value: 'edited', base: 'stale' },
         });
-        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+        expect(container!.querySelector('.external-change-banner')).not.toBeNull();
 
         await dispatch_host_message({
             type: 'saveResult',
@@ -9475,16 +10261,12 @@ describe('edit mode save exit', () => {
             ...(stale_rejection ? { rejection: stale_rejection } : {}),
         });
 
-        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+        expect(container!.querySelector('.external-change-banner')).not.toBeNull();
         expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
             .toEqual(['4:1']);
     });
 
-    it('lets Keep All dismiss a host rejection', async () => {
-        // Keep All was a no-op for a host rejection: `show_host_rejection`
-        // short-circuited ahead of the dismissal check, so the button recorded a
-        // signature nothing consulted and the banner stayed up with no way to put it
-        // away short of discarding the edits.
+    it('lets Dismiss hide a host file-change notice without discarding edits', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(
             initial_snapshot_message(make_meta(['Sheet1'], false), {
@@ -9516,11 +10298,11 @@ describe('edit mode save exit', () => {
         await report_grid_editing(true, true, [], {
             '4:1': { value: 'edited', base: 'stale' },
         });
-        expect(container!.querySelector('.conflict-banner')).not.toBeNull();
+        expect(container!.querySelector('.external-change-banner')).not.toBeNull();
 
-        await click_button('Keep All');
+        await click_button('Dismiss');
 
-        expect(container!.querySelector('.conflict-banner')).toBeNull();
+        expect(container!.querySelector('.external-change-banner')).toBeNull();
         // Dismissed, not resolved: the tint stays so the cell is still identifiable,
         // and the edit is still there to save or discard.
         expect(JSON.parse(grid_stub().getAttribute('data-host-rejected-keys')!))
@@ -12772,7 +13554,7 @@ describe('stale-view banner', () => {
         expect_no_call_to_action();
     });
 
-    it('reads consistently beside the shrink conflict banner over the same row', async () => {
+    it('reads consistently beside the removed-row file-change notice', async () => {
         // The two notices can stand together, and they are about the same vanished row:
         // this one says unsaved work is in a row the view does not show, the conflict
         // banner says the save was cancelled because that row is gone. Checked rather
@@ -12812,12 +13594,12 @@ describe('stale-view banner', () => {
         });
         await report_grid_editing(true, true, [], removed);
 
-        // Both up, neither restated as the other, and only the conflict banner offers a
+        // Both up, neither restated as the other, and only the file-change notice offers a
         // way out — the stale-view notice is still informational.
-        expect(container!.querySelector('.conflict-banner')?.textContent)
-            .toContain('1 edited row no longer exists');
-        expect(container!.querySelector('.conflict-banner')?.textContent)
-            .toContain('Affected row: 8');
+        expect(container!.querySelector('.external-change-banner')?.textContent)
+            .toContain('1 row with pending edits is no longer in the file');
+        expect(container!.querySelector('.external-change-banner')?.textContent)
+            .not.toContain('row 8');
         expect(banner()?.textContent)
             .toContain('1 edited cell is in a row this view doesn\'t show.');
         expect(banner()?.textContent).not.toContain('cancelled');

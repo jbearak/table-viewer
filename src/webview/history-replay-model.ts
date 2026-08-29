@@ -40,8 +40,12 @@ import {
     type HighlightHistoryDelta,
     type HistoryAction,
 } from './history-stack-model';
-import { hyperlinks_equal } from '../cell-content';
-import type { WorksheetTarget } from '../types';
+import { hyperlinks_equal, type CellHyperlink } from '../cell-content';
+import {
+    dirty_entry_with_observed_file_base,
+    make_observed_file_base,
+    type WorksheetTarget,
+} from '../types';
 
 /** What a cell holds right now: its overlay, and the content underneath it. */
 export interface CellReplayState {
@@ -54,6 +58,8 @@ export interface CellReplayState {
      * recorded.
      */
     readonly persisted: HistoryValue;
+    /** Current persisted link; prepared host reads always provide it. */
+    readonly persistedHyperlink?: CellHyperlink | null;
 }
 
 /**
@@ -241,17 +247,45 @@ function plan_cell_replay(
 
     const result = merge_replayed_dimensions(delta, state, overlay_for_direction(delta, direction));
     if (result === undefined) return refuse('base-pending');
+    let entry = result.kind === 'absent' ? undefined : dirty_entry_from_overlay_state(result);
+    if (entry !== undefined) entry = entry_with_persisted_side(entry, state);
     return {
         kind: 'planned',
-        result: { overlay: result, persisted: state.persisted },
+        result: {
+            overlay: result,
+            persisted: state.persisted,
+            ...(state.persistedHyperlink !== undefined
+                ? { persistedHyperlink: state.persistedHyperlink }
+                : {}),
+        },
         write: {
             worksheet,
             sourceRow,
             sourceColumn,
             key: cell_key(sourceRow, sourceColumn),
-            entry: result.kind === 'absent' ? undefined : dirty_entry_from_overlay_state(result),
+            entry,
         },
     };
+}
+
+/** Preserve the latest file side independently of the historical overlay being
+ * replayed. Undo changes user intent; it must not make the acknowledged file
+ * value stale again. */
+function entry_with_persisted_side(
+    entry: HistoryDirtyEntry,
+    state: CellReplayState,
+): HistoryDirtyEntry {
+    // A legacy bare-string entry means its original base was never observed.
+    // Without that original there is no meaningful A -> C comparison to
+    // preserve, and adding an observed side would also make the entry
+    // impossible to encode back into its only lossless durable form.
+    if (entry.base_pending === true) return entry;
+    if (entry.link !== undefined && state.persistedHyperlink === undefined) return entry;
+    return dirty_entry_with_observed_file_base(entry, make_observed_file_base(
+        state.persisted.text,
+        state.persisted.runs,
+        entry.link !== undefined ? state.persistedHyperlink : undefined,
+    ));
 }
 
 /**
@@ -279,6 +313,9 @@ function value_dimension_matches(
     if (recorded === undefined || recorded.kind !== 'present') return current?.kind !== 'present';
     if (current?.kind !== 'present') return false;
     return current.basePending === recorded.basePending
+        && current.writeValue === recorded.writeValue
+        && current.retainValue === recorded.retainValue
+        && current.formattingKnown === recorded.formattingKnown
         && history_values_equal(current.value, recorded.value)
         && history_values_equal(current.base, recorded.base);
 }

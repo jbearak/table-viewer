@@ -11,10 +11,12 @@ import {
 import {
     decode_stored_per_file_state,
     dirty_entries_equal,
+    is_wire_csv_save_rejection,
     sanitized_dirty_entry,
     sanitized_wire_dirty_entry,
     sanitized_wire_save_maps,
     sanitized_wire_string_record,
+    stringify_stored_per_file_state,
     type PerFileState,
 } from '../types';
 
@@ -117,6 +119,17 @@ describe('dirty_entries_equal', () => {
             { value: 'x', base: 'x', valueRuns: { runs: [{ text: 'x', style: { bold: true } }] } },
         )).toBe(true);
     });
+
+    it('includes the latest observed file side in durable identity', () => {
+        expect(dirty_entries_equal(
+            { value: 'mine', base: 'old', observedBase: { value: 'current' } },
+            { value: 'mine', base: 'old', observedBase: { value: 'current' } },
+        )).toBe(true);
+        expect(dirty_entries_equal(
+            { value: 'mine', base: 'old', observedBase: { value: 'current' } },
+            { value: 'mine', base: 'old', observedBase: { value: 'newer' } },
+        )).toBe(false);
+    });
 });
 
 describe('sanitized_dirty_entry', () => {
@@ -153,6 +166,20 @@ describe('sanitized_dirty_entry', () => {
         expect(sanitized_dirty_entry({ ...base, link: { kind: 'nope', target: 'x' }, baseLink: null }))
             .toEqual(base);
     });
+
+    it('keeps a valid observed file side and drops malformed observations', () => {
+        const observed = {
+            value: 'now',
+            runs: { runs: [{ text: 'now', style: { italic: true as const } }] },
+        };
+        const base = { value: 'mine', base: 'then' };
+        expect(sanitized_dirty_entry({ ...base, observedBase: observed }))
+            .toEqual({ ...base, observedBase: observed });
+        expect(sanitized_dirty_entry({
+            ...base,
+            observedBase: { value: 'now', runs: { runs: [{ text: 'different' }] } },
+        })).toEqual(base);
+    });
 });
 
 describe('sanitized_wire_dirty_entry', () => {
@@ -176,6 +203,18 @@ describe('sanitized_wire_dirty_entry', () => {
             .toEqual({ value: 'x', base: 'x', link, baseLink: null });
         expect(sanitized_wire_dirty_entry({ value: 'x', base: 'x', link: 'junk', baseLink: null }))
             .toEqual({ value: 'x', base: 'x' });
+    });
+
+    it('carries the observed file side across the wire', () => {
+        expect(sanitized_wire_dirty_entry({
+            value: 'mine',
+            base: 'then',
+            observedBase: { value: 'now' },
+        })).toEqual({
+            value: 'mine',
+            base: 'then',
+            observedBase: { value: 'now' },
+        });
     });
 });
 
@@ -203,7 +242,33 @@ describe('sanitized_wire_save_maps', () => {
     );
 });
 
-describe('durable pendingEdits with runs', () => {
+describe('is_wire_csv_save_rejection', () => {
+    it('accepts current file sides for the rejected keys', () => {
+        expect(is_wire_csv_save_rejection({
+            reason: 'baseMismatch',
+            worksheetOperationIndex: 0,
+            keys: ['0:0'],
+            observedBases: { '0:0': { value: 'now' } },
+        })).toBe(true);
+    });
+
+    it('rejects observations for other keys or removed rows', () => {
+        expect(is_wire_csv_save_rejection({
+            reason: 'baseMismatch',
+            worksheetOperationIndex: 0,
+            keys: ['0:0'],
+            observedBases: { '1:0': { value: 'now' } },
+        })).toBe(false);
+        expect(is_wire_csv_save_rejection({
+            reason: 'rowsRemoved',
+            worksheetOperationIndex: 0,
+            keys: ['0:0'],
+            observedBases: { '0:0': { value: 'now' } },
+        })).toBe(false);
+    });
+});
+
+describe('durable pendingEdits metadata', () => {
     const pending = (state: unknown) =>
         (decode_stored_per_file_state(state as object) as PerFileState).pendingEdits;
 
@@ -235,6 +300,50 @@ describe('durable pendingEdits with runs', () => {
         expect(() => pending({
             pendingEdits: [{
                 cells: { '0:0': { value: 'x', base: 'x', valueRuns: { runs: 'nope' } } },
+            }],
+        })).toThrow();
+    });
+
+    it('round-trips the original and latest observed file sides', () => {
+        const entry = {
+            value: 'mine',
+            base: 'then',
+            observedBase: {
+                value: 'now',
+                runs: { runs: [{ text: 'now', style: { underline: true } }] },
+            },
+        };
+        const decoded = pending({ pendingEdits: [{ cells: { '0:0': entry } }] });
+        expect(decoded?.[0]?.cells['0:0']).toEqual(entry);
+    });
+
+    it('persists equal-value write intent with both file-side observations', () => {
+        const entry = {
+            value: 'A',
+            base: 'A',
+            observedBase: { value: 'C' },
+            writeValue: true as const,
+        };
+        const encoded = stringify_stored_per_file_state({
+            pendingEdits: [{ cells: { '0:0': entry } }],
+        });
+        const decoded = pending(JSON.parse(encoded));
+        expect(decoded?.[0]?.cells['0:0']).toEqual(entry);
+    });
+
+    it('rejects an observed run side whose text does not match its value', () => {
+        expect(() => pending({
+            pendingEdits: [{
+                cells: {
+                    '0:0': {
+                        value: 'mine',
+                        base: 'then',
+                        observedBase: {
+                            value: 'now',
+                            runs: { runs: [{ text: 'not now' }] },
+                        },
+                    },
+                },
             }],
         })).toThrow();
     });

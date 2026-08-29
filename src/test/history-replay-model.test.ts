@@ -623,3 +623,64 @@ describe('links whose own dimension moved', () => {
         expect(plan.writes[0]?.entry?.baseLink).toEqual(LINK);
     });
 });
+
+describe('latest observed file side', () => {
+    it('survives replay independently of the historical overlay', () => {
+        const before = absent_overlay();
+        const after = value_only_overlay(value('pending'), value('original'));
+        const plan = plan_of(
+            [cell(delta({ before, after, persisted: 'original' }))],
+            'redo',
+            overlays({ '0:0:0': before }, undefined, { '0:0:0': 'current file' }),
+        );
+
+        expect(plan.writes[0]?.entry).toEqual({
+            value: 'pending',
+            base: 'original',
+            observedBase: { value: 'current file' },
+        });
+    });
+
+    it('does not overwrite a concurrent change to equal-value write intent', () => {
+        const recorded = value_only_overlay(
+            value('A'),
+            value('A'),
+            false,
+            true,
+        );
+        const current = value_only_overlay(value('A'), value('A'));
+        const result = plan_history_replay(
+            history_action('Edit', [cell(delta({
+                before: absent_overlay(),
+                after: recorded,
+                persisted: 'C',
+            }))]),
+            'undo',
+            overlays({ '0:0:0': current }, undefined, { '0:0:0': 'C' }),
+        );
+
+        expect(result).toMatchObject({ kind: 'refused', reason: 'conflict' });
+    });
+
+    it('restores an older equal sparse entry over styled text without a false observation', () => {
+        const before = value_only_overlay(value('A'), value('A'));
+        const action = history_action('Discard pending edit', [cell(delta({
+            before,
+            after: absent_overlay(),
+            persisted: 'A',
+        }))]);
+        const result = plan_history_replay(action, 'undo', () => ({
+            overlay: absent_overlay(),
+            persisted: history_value('A', {
+                runs: [{ text: 'A', style: { bold: true } }],
+            }),
+        }));
+
+        expect(result).toMatchObject({
+            kind: 'plan',
+            writes: [{ entry: { value: 'A', base: 'A' } }],
+        });
+        if (result.kind !== 'plan') throw new Error('expected replay plan');
+        expect(result.writes[0]?.entry?.observedBase).toBeUndefined();
+    });
+});

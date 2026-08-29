@@ -870,6 +870,33 @@ function validate_edit_cells(value: unknown): Record<string, string | CsvDirtyEn
             if (side === undefined || side === null) continue;
             if (!is_valid_hyperlink(side)) invalid_leaf('pendingEdits');
         }
+        if (entry.observedBase !== undefined) {
+            const observed = entry.observedBase;
+            if (!is_plain_record(observed) || typeof observed.value !== 'string') {
+                invalid_leaf('pendingEdits');
+            }
+            if (
+                observed.runs !== undefined
+                && !is_matching_rich_text(observed.runs, observed.value)
+            ) invalid_leaf('pendingEdits');
+            if ((entry.link !== undefined) !== (observed.link !== undefined)) {
+                invalid_leaf('pendingEdits');
+            }
+            if (
+                observed.link !== undefined
+                && observed.link !== null
+                && !is_valid_hyperlink(observed.link)
+            ) invalid_leaf('pendingEdits');
+        }
+        if (entry.writeValue !== undefined && entry.writeValue !== true) {
+            invalid_leaf('pendingEdits');
+        }
+        if (entry.retainValue !== undefined && entry.retainValue !== true) {
+            invalid_leaf('pendingEdits');
+        }
+        if (entry.formattingKnown !== undefined && entry.formattingKnown !== true) {
+            invalid_leaf('pendingEdits');
+        }
     }
     return value as Record<string, string | CsvDirtyEntry>;
 }
@@ -1402,7 +1429,7 @@ export function reconcile_pending_edit_sheets(
     return next.length === 0 ? undefined : next;
 }
 
-/** Exact conflict-preserving entry durably owned by the CSV edit session.
+/** Exact pending-edit entry durably owned by the CSV edit session.
  *
  *  `value`/`base` are always the plain-text projection, which is what every
  *  string-typed consumer (the CSV serializer, wire dedupe, legacy durable
@@ -1430,13 +1457,56 @@ export interface CsvDirtyEntry {
     /** The link the change was made against (`null` = cell had none).
      *  Present exactly when `link` is. */
     readonly baseLink?: CellHyperlink | null;
+    /**
+     * Latest file content observed after this pending edit was created.
+     *
+     * `base` remains the edit's original history anchor. Once the same cell
+     * changes in the file, `observedBase` becomes the comparison used by Diff
+     * mode and by the next save's compare-and-set validation. Keeping the two
+     * facts separate lets the UI explain `base -> observedBase` without making
+     * undo forget what the edit was originally made against.
+     *
+     * Absent until the file side changes. `link` is present exactly when the
+     * pending entry carries a link edit, including `null` for an observed cell
+     * with no link.
+     */
+    readonly observedBase?: CsvObservedFileBase;
+    /**
+     * The value dimension must be written even though it happens to equal the
+     * original `base`. This only needs to be present for the otherwise ambiguous
+     * case where the file moved A -> C and the user changed their pending value
+     * back to A: A is still a pending write against current C. Older entries and
+     * ordinary edits continue to infer value intent from value/base inequality.
+     */
+    readonly writeValue?: true;
+    /**
+     * The value dimension belongs to this overlay even though it is equal to
+     * its base and the entry also carries a hyperlink change. This resolves an
+     * otherwise ambiguous legacy shape for undo/redo without requesting a text
+     * write; `writeValue` remains the sole explicit save-write marker.
+     */
+    readonly retainValue?: true;
+    /**
+     * Absent run sides are known to mean plain formatting. Older durable
+     * entries predate rich-base capture and omit this marker, so their absent
+     * runs mean "unknown" instead. Run-bearing entries are inherently known;
+     * the marker disambiguates only the sparse plain shape.
+     */
+    readonly formattingKnown?: true;
+}
+
+/** The latest persisted side of a cell carrying a pending edit. */
+export interface CsvObservedFileBase {
+    readonly value: string;
+    readonly runs?: RichText;
+    readonly link?: CellHyperlink | null;
 }
 
 export type CsvDirtyMap = Readonly<Record<string, CsvDirtyEntry>>;
 
 /**
  * The one constructor of the sparse dirty-entry shape: run sides present only
- * when given, so plain edits keep their exact legacy `{value, base}` form.
+ * when given, with `formattingKnown` carrying provenance for modern plain edits.
  * Every layer that copies an entry into an owned object (store commit, wire
  * payload, save payload, durable persist) goes through here, so a future
  * optional field is added in one place rather than per copy site.
@@ -1448,6 +1518,10 @@ export function make_dirty_entry(
     baseRuns?: RichText,
     link?: CellHyperlink | null,
     baseLink?: CellHyperlink | null,
+    observedBase?: CsvObservedFileBase,
+    writeValue?: true,
+    retainValue?: true,
+    formattingKnown?: true,
 ): CsvDirtyEntry {
     return {
         value,
@@ -1456,6 +1530,10 @@ export function make_dirty_entry(
         ...(baseRuns !== undefined ? { baseRuns } : {}),
         ...(link !== undefined ? { link } : {}),
         ...(baseLink !== undefined ? { baseLink } : {}),
+        ...(observedBase !== undefined ? { observedBase } : {}),
+        ...(writeValue === true ? { writeValue: true as const } : {}),
+        ...(retainValue === true ? { retainValue: true as const } : {}),
+        ...(formattingKnown === true ? { formattingKnown: true as const } : {}),
     };
 }
 
@@ -1481,7 +1559,60 @@ export function copy_dirty_entry(
         merged.baseRuns,
         merged.link,
         merged.baseLink,
+        merged.observedBase,
+        merged.writeValue,
+        merged.retainValue,
+        merged.formattingKnown,
     );
+}
+
+/** Build the owned sparse shape used for an observed file side. */
+export function make_observed_file_base(
+    value: string,
+    runs?: RichText,
+    link?: CellHyperlink | null,
+): CsvObservedFileBase {
+    return {
+        value,
+        ...(runs !== undefined ? { runs } : {}),
+        ...(link !== undefined ? { link } : {}),
+    };
+}
+
+/** File side the next save must still find. */
+export function dirty_entry_observed_base(entry: CsvDirtyEntry): CsvObservedFileBase {
+    return entry.observedBase ?? make_observed_file_base(
+        entry.base,
+        entry.baseRuns,
+        entry.link !== undefined ? entry.baseLink ?? null : undefined,
+    );
+}
+
+/** Adopt a newly read file side using the dirty store's canonical shape. */
+export function dirty_entry_with_observed_file_base(
+    entry: CsvDirtyEntry,
+    observed: CsvObservedFileBase,
+): CsvDirtyEntry {
+    // A link edit needs both observed dimensions to remain compare-and-set safe.
+    if (entry.link !== undefined && observed.link === undefined) return entry;
+    const owned_observed = make_observed_file_base(
+        observed.value,
+        observed.runs,
+        entry.link !== undefined ? observed.link : undefined,
+    );
+    const original = make_observed_file_base(
+        entry.base,
+        dirty_entry_base_formatting_unknown(entry)
+            && observed.value === entry.base
+            ? observed.runs
+            : entry.baseRuns,
+        entry.link !== undefined ? entry.baseLink ?? null : undefined,
+    );
+    return copy_dirty_entry(entry, {
+        observedBase: observed_file_bases_equal(owned_observed, original)
+            ? undefined
+            : owned_observed,
+    });
 }
 
 /**
@@ -1504,6 +1635,10 @@ export function sanitized_dirty_entry(entry: {
     readonly baseRuns?: unknown;
     readonly link?: unknown;
     readonly baseLink?: unknown;
+    readonly observedBase?: unknown;
+    readonly writeValue?: unknown;
+    readonly retainValue?: unknown;
+    readonly formattingKnown?: unknown;
 }): CsvDirtyEntry {
     const keep = (runs: unknown, text: string): RichText | undefined => (
         is_matching_rich_text(runs, text) ? runs : undefined
@@ -1517,6 +1652,26 @@ export function sanitized_dirty_entry(entry: {
         && is_nullable_hyperlink(entry.link)
         && entry.baseLink !== undefined
         && is_nullable_hyperlink(entry.baseLink);
+    const observed = is_plain_record(entry.observedBase)
+        && typeof entry.observedBase.value === 'string'
+        && (
+            entry.observedBase.runs === undefined
+            || is_matching_rich_text(entry.observedBase.runs, entry.observedBase.value)
+        )
+        && (
+            keep_link
+                ? entry.observedBase.link !== undefined
+                    && is_nullable_hyperlink(entry.observedBase.link)
+                : entry.observedBase.link === undefined
+        )
+        ? make_observed_file_base(
+            entry.observedBase.value,
+            entry.observedBase.runs as RichText | undefined,
+            keep_link
+                ? entry.observedBase.link as CellHyperlink | null
+                : undefined,
+        )
+        : undefined;
     return make_dirty_entry(
         entry.value,
         entry.base,
@@ -1524,6 +1679,10 @@ export function sanitized_dirty_entry(entry: {
         keep(entry.baseRuns, entry.base),
         keep_link ? entry.link as CellHyperlink | null : undefined,
         keep_link ? entry.baseLink as CellHyperlink | null : undefined,
+        observed,
+        entry.writeValue === true ? true : undefined,
+        entry.retainValue === true ? true : undefined,
+        entry.formattingKnown === true ? true : undefined,
     );
 }
 
@@ -1548,6 +1707,10 @@ export function sanitized_wire_dirty_entry(entry: unknown): CsvDirtyEntry | unde
         readonly baseRuns?: unknown;
         readonly link?: unknown;
         readonly baseLink?: unknown;
+        readonly observedBase?: unknown;
+        readonly writeValue?: unknown;
+        readonly retainValue?: unknown;
+        readonly formattingKnown?: unknown;
     });
 }
 
@@ -1567,14 +1730,29 @@ export function is_strict_wire_dirty_entry(value: unknown): value is CsvDirtyEnt
         value.baseRuns !== undefined
         && !is_matching_rich_text(value.baseRuns, value.base)
     ) return false;
+    if (value.writeValue !== undefined && value.writeValue !== true) return false;
+    if (value.retainValue !== undefined && value.retainValue !== true) return false;
+    if (value.formattingKnown !== undefined && value.formattingKnown !== true) return false;
 
     const has_link = value.link !== undefined || value.baseLink !== undefined;
-    return !has_link || (
+    if (has_link && !(
         value.link !== undefined
         && value.baseLink !== undefined
         && is_nullable_hyperlink(value.link)
         && is_nullable_hyperlink(value.baseLink)
-    );
+    )) return false;
+    if (value.observedBase === undefined) return true;
+    if (
+        !is_plain_record(value.observedBase)
+        || typeof value.observedBase.value !== 'string'
+        || (
+            value.observedBase.runs !== undefined
+            && !is_matching_rich_text(value.observedBase.runs, value.observedBase.value)
+        )
+        || has_link !== (value.observedBase.link !== undefined)
+    ) return false;
+    return value.observedBase.link === undefined
+        || is_nullable_hyperlink(value.observedBase.link);
 }
 
 function sanitized_wire_record<T>(
@@ -1633,28 +1811,86 @@ export function dirty_entries_equal(
         && optional_runs_equal(left.valueRuns, right.valueRuns)
         && optional_runs_equal(left.baseRuns, right.baseRuns)
         && optional_links_equal(left.link, right.link)
-        && optional_links_equal(left.baseLink, right.baseLink);
+        && optional_links_equal(left.baseLink, right.baseLink)
+        && observed_file_bases_equal(left.observedBase, right.observedBase)
+        && left.writeValue === right.writeValue
+        && left.retainValue === right.retainValue
+        && left.formattingKnown === right.formattingKnown;
+}
+
+export function observed_file_bases_equal(
+    left: CsvObservedFileBase | undefined,
+    right: CsvObservedFileBase | undefined,
+): boolean {
+    if (left === undefined || right === undefined) return left === right;
+    return left.value === right.value
+        && optional_runs_equal(left.runs, right.runs)
+        && optional_links_equal(left.link, right.link);
 }
 
 /**
- * Whether the entry's VALUE dimension differs from its base. False for a
- * link-only entry, whose text and runs are the unedited cell content — the
- * save must not emit a text edit for it (rewriting an unedited cell's `<c>`
- * breaks the unedited-cells-keep-original-XML invariant), and a text-identical
- * echo must not read as a value revert.
+ * Whether the entry's VALUE dimension needs a file write, comparing against
+ * the latest observed file side when one exists. False for a link-only entry,
+ * whose text and runs are only the unedited cell anchor — rewriting its `<c>`
+ * would break the unedited-cells-keep-original-XML invariant.
  */
-export function dirty_entry_value_changed(entry: CsvDirtyEntry): boolean {
-    if (entry.value !== entry.base) return true;
-    return !optional_runs_equal(entry.valueRuns, entry.baseRuns);
+/** Whether the sparse entry carries a pending value dimension at all. */
+export function dirty_entry_value_dimension_present(entry: CsvDirtyEntry): boolean {
+    const changed_from_original = entry.value !== entry.base
+        || !optional_runs_equal(entry.valueRuns, entry.baseRuns);
+    // Equal text/runs beside a link is normally only the untouched anchor. The
+    // durable membership marker is the exception: it says an older value entry
+    // was extended with a link and must keep behaving as a value dimension.
+    return entry.link === undefined
+        || entry.retainValue === true
+        || entry.writeValue === true
+        || changed_from_original;
 }
 
-/** Whether the entry carries a link change whose value differs from its base.
- *  (An entry constructed with `link` equal to `baseLink` should not exist —
- *  commit paths drop the dimension on revert — but the save path must not
- *  trust that.) */
+/**
+ * A sparse entry produced before rich-base capture cannot say whether absent
+ * run sides meant "plain" or "not captured". Suppress formatting claims for
+ * that ambiguous shape; text and hyperlink changes are still observed normally.
+ */
+export function dirty_entry_base_formatting_unknown(entry: CsvDirtyEntry): boolean {
+    return dirty_entry_value_dimension_present(entry)
+        && entry.baseRuns === undefined
+        && entry.formattingKnown !== true;
+}
+
+export function dirty_entry_value_changed(entry: CsvDirtyEntry): boolean {
+    if (!dirty_entry_value_dimension_present(entry)) return false;
+    const changed_from_original = entry.value !== entry.base
+        || !optional_runs_equal(entry.valueRuns, entry.baseRuns);
+
+    const observed = entry.observedBase;
+    if (observed !== undefined) {
+        if (entry.value !== observed.value) return true;
+        // A resolved legacy text entry knows its original/current text but did
+        // not capture character-level formatting. Treat that narrow ambiguous
+        // shape as "formatting not edited". An explicit pending run side is
+        // independently known, however, and must still be compared with the
+        // observed file side even though the historical base remains unknown.
+        if (
+            dirty_entry_base_formatting_unknown(entry)
+            && entry.valueRuns === undefined
+        ) {
+            return false;
+        }
+        return !optional_runs_equal(entry.valueRuns, observed.runs);
+    }
+    if (entry.writeValue === true) return true;
+    return changed_from_original;
+}
+
+/** Whether the entry carries a link write.
+ *
+ * Presence is authoritative. Usually the written link differs from its original
+ * base, but after the file moves A -> C a user may deliberately choose A again.
+ * That entry keeps `{link: A, baseLink: A, observedBase.link: C}` and must still
+ * write A; semantic inequality alone would silently discard the user's choice. */
 export function dirty_entry_link_changed(entry: CsvDirtyEntry): boolean {
-    if (entry.link === undefined) return false;
-    return !hyperlinks_equal(entry.link, entry.baseLink ?? null);
+    return entry.link !== undefined;
 }
 
 /** An absent link dimension ("no link change") differs from a present one —
@@ -1690,17 +1926,50 @@ export interface CsvSaveRejection {
     /** Ordinal of the rejected worksheet in lifecycle.operation.worksheets. */
     readonly worksheetOperationIndex: number;
     readonly keys: readonly string[];
+    /** Removed subset when a save found removed rows and changed cells together. */
+    readonly removedKeys?: readonly string[];
+    /** Current file sides the renderer can adopt for a later save. Absent for
+     * removed rows and for a source side the host could not observe safely. */
+    readonly observedBases?: Readonly<Record<string, CsvObservedFileBase>>;
 }
 
 export function is_wire_csv_save_rejection(
     value: unknown,
 ): value is CsvSaveRejection {
-    return is_plain_record(value)
+    if (!(is_plain_record(value)
         && (value.reason === 'baseMismatch' || value.reason === 'rowsRemoved')
         && Number.isSafeInteger(value.worksheetOperationIndex)
         && (value.worksheetOperationIndex as number) >= 0
         && Array.isArray(value.keys)
-        && value.keys.every((key) => typeof key === 'string');
+        && value.keys.every((key) => typeof key === 'string')
+    )) return false;
+    const keys = value.keys as readonly string[];
+    if (value.removedKeys !== undefined && !(
+        value.reason === 'rowsRemoved'
+        && Array.isArray(value.removedKeys)
+        && value.removedKeys.every((key) => typeof key === 'string' && keys.includes(key))
+    )) return false;
+    if (value.observedBases === undefined) return true;
+    if (!is_plain_record(value.observedBases)) return false;
+    if (value.reason === 'rowsRemoved' && value.removedKeys === undefined) return false;
+    const removed_keys = value.removedKeys as readonly string[] | undefined;
+    for (const [key, observed] of Object.entries(value.observedBases)) {
+        if (
+            !keys.includes(key)
+            || removed_keys?.includes(key) === true
+            || !is_plain_record(observed)
+        ) return false;
+        if (typeof observed.value !== 'string') return false;
+        if (
+            observed.runs !== undefined
+            && !is_matching_rich_text(observed.runs, observed.value)
+        ) return false;
+        if (
+            observed.link !== undefined
+            && !is_nullable_hyperlink(observed.link)
+        ) return false;
+    }
+    return true;
 }
 
 /** One worksheet-local payload inside an atomic workbook save. */

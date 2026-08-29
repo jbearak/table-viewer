@@ -2,7 +2,6 @@ import { useState, useCallback, useEffect, useRef, useMemo, useSyncExternalStore
 import { read_overlay_editor_value } from './live-editor';
 import {
     create_edit_session_store,
-    is_entry_conflicted,
     type DirtyEntry,
     type EditSessionStore,
     type GetCellRaw,
@@ -10,8 +9,14 @@ import {
 } from './edit-session-store';
 import {
     copy_dirty_entry,
+    dirty_entry_base_formatting_unknown,
+    dirty_entry_observed_base,
+    dirty_entry_value_changed,
+    dirty_entry_with_observed_file_base,
     make_dirty_entry,
+    make_observed_file_base,
     type CsvDirtyEntry,
+    type CsvObservedFileBase,
     type WorksheetTarget,
 } from '../types';
 import {
@@ -70,7 +75,7 @@ export interface EditingCell {
  * through {@link GetCellRaw} (the paged cache) rather than a materialized array.
  * `reload_token` is an opaque counter the consumer bumps whenever the underlying
  * data reloads (external file change or our own save-triggered reload); a change
- * closes the open editor while preserving dirty edits, and conflict detection
+ * closes the open editor while preserving pending edits, and file-change tracking
  * then flags any entry whose base drifted.
  *
  * The dirty map lives in `store`, whose lifetime is the edit session rather than
@@ -85,7 +90,7 @@ export interface UseEditingOptions {
     readonly syntax?: EditSyntax;
     /**
      * The full loaded cell by source coordinates, for markdown mode only:
-     * edit text and conflict bases derive from the cell's effective rich
+     * edit text and file-side bases derive from the cell's effective rich
      * content, which the plain-text reader cannot carry. Same residency
      * contract as {@link GetCellRaw} (`null` = resident-but-blank,
      * `undefined` = not resident).
@@ -178,6 +183,22 @@ function planned(entry: DirtyEntry, intent: ValueDimensionIntent): PlannedOverla
     return { entry, overlay: overlay_state_from_dirty_entry(entry, intent) };
 }
 
+/** Attach the current persisted side only when it differs from an entry's
+ * original side, adapting the optional link field to the dimensions the entry
+ * now carries. Text and hyperlink planners both use this so adding/removing a
+ * link cannot leave an invalid observedBase shape. */
+function with_current_file_side(
+    entry: CsvDirtyEntry,
+    current: ParsedCellEdit,
+    current_link: CellHyperlink | null,
+): CsvDirtyEntry {
+    return dirty_entry_with_observed_file_base(entry, make_observed_file_base(
+        current.text,
+        current.rich,
+        entry.link !== undefined ? current_link : undefined,
+    ));
+}
+
 /**
  * What a text commit should leave in the store — decided, not applied.
  *
@@ -189,7 +210,9 @@ function planned(entry: DirtyEntry, intent: ValueDimensionIntent): PlannedOverla
 function plan_value_write(
     before_entry: DirtyEntry | undefined,
     input: string,
-    base: ParsedCellEdit,
+    persisted: ParsedCellEdit,
+    persisted_link: CellHyperlink | null,
+    persisted_formatting_known: boolean,
     syntax: EditSyntax,
 ): PlannedOverlayWrite {
     const parsed = parse_cell_edit(input, syntax);
@@ -201,7 +224,7 @@ function plan_value_write(
 
     // Semantic comparison: retyping a bold cell's own `**markup**`, however
     // spelled, is a revert; deleting the `**` is an edit.
-    if (cell_edits_equal(parsed, base)) {
+    if (cell_edits_equal(parsed, persisted)) {
         if (link_dimension === undefined) {
             return { entry: undefined, overlay: absent_overlay() };
         }
@@ -209,22 +232,57 @@ function plan_value_write(
         // its value dimension back at the base — and `link-only` is exactly
         // what the overlay has to say, since the entry it writes is the
         // ambiguous `{value: A, base: A, link}` shape.
-        return planned(
+        return planned(with_current_file_side(
             make_dirty_entry(
-                base.text, base.text, base.rich, base.rich,
+                persisted.text, persisted.text, persisted.rich, persisted.rich,
                 link_dimension.link, link_dimension.baseLink,
             ),
+            persisted,
+            persisted_link,
+        ),
             'link-only',
         );
     }
 
+    // An older sparse entry has no formatting provenance. If the resident
+    // cell still has its historical base text, enrich that base before applying
+    // the new value. Unchanged resident styling then stays the original side,
+    // while markup removed by this commit is still a pending formatting edit.
+    const historical_base_formatting_known = before_entry !== undefined
+        && (before_entry.baseRuns !== undefined
+            || before_entry.formattingKnown === true);
+    const can_enrich_legacy_base = before_entry !== undefined
+        && !historical_base_formatting_known
+        && persisted.text === before_entry.base
+        && persisted_formatting_known;
+    const original = before_entry === undefined
+        ? persisted
+        : {
+            text: before_entry.base,
+            rich: can_enrich_legacy_base ? persisted.rich : before_entry.baseRuns,
+        };
+    const formatting_known = (before_entry !== undefined
+        && (historical_base_formatting_known || can_enrich_legacy_base))
+        || (before_entry === undefined && persisted_formatting_known)
+        ? true
+        : undefined;
     // Explicit plain runs when the user stripped a styled base's markup — see
     // committed_value_runs.
-    return planned(
+    return planned(with_current_file_side(
         make_dirty_entry(
-            parsed.text, base.text, committed_value_runs(parsed, base), base.rich,
+            parsed.text,
+            original.text,
+            committed_value_runs(parsed, persisted),
+            original.rich,
             link_dimension?.link, link_dimension?.baseLink,
+            undefined,
+            cell_edits_equal(parsed, original) ? true : undefined,
+            undefined,
+            formatting_known,
         ),
+        persisted,
+        persisted_link,
+    ),
         'in-overlay',
     );
 }
@@ -234,7 +292,7 @@ function plan_value_write(
  *
  * `persisted_link` is the cell's link on disk. The base recorded is the already
  * pending `baseLink` when there is one, never the pending value, so re-editing
- * one cell's link keeps a single honest conflict base.
+ * one cell's link keeps a single honest file-side base.
  *
  * Whether the value dimension survives is read off `before_overlay`, never off
  * whether the entry's value differs from its base. Membership and semantic
@@ -262,28 +320,57 @@ function plan_hyperlink_write(
         && before_overlay.value.kind === 'present'
         ? 'in-overlay'
         : 'link-only';
+    const preserve_value_membership = (entry: DirtyEntry): DirtyEntry => (
+        value_intent === 'in-overlay' && !dirty_entry_value_changed(entry)
+            ? copy_dirty_entry(entry, { retainValue: true })
+            : entry
+    );
 
-    if (hyperlinks_equal(next, base_link)) {
-        // Link reverted. Drop the dimension, keep any value dimension.
+    if (hyperlinks_equal(next, persisted_link)) {
+        // The requested link now matches the file. Drop the dimension, keeping
+        // any value edit. Comparing with the ORIGINAL base would be wrong after
+        // an external A -> C change: choosing A is then a real pending write
+        // against current C, even though it equals the historical review base.
         if (value_intent !== 'in-overlay') {
             return { entry: undefined, overlay: absent_overlay() };
         }
         return planned(
-            copy_dirty_entry(before_entry!, { link: undefined, baseLink: undefined }),
+            with_current_file_side(
+                preserve_value_membership(copy_dirty_entry(
+                    before_entry!,
+                    { link: undefined, baseLink: undefined },
+                )),
+                base,
+                persisted_link,
+            ),
             'in-overlay',
         );
     }
 
     if (before_entry !== undefined) {
         return planned(
-            copy_dirty_entry(before_entry, { link: next, baseLink: base_link }),
+            with_current_file_side(
+                preserve_value_membership(copy_dirty_entry(
+                    before_entry,
+                    { link: next, baseLink: base_link },
+                )),
+                base,
+                persisted_link,
+            ),
             value_intent,
         );
     }
 
     // Link-only entry: value dimension pinned at the base text.
     return planned(
-        make_dirty_entry(base.text, base.text, base.rich, base.rich, next, base_link),
+        make_dirty_entry(
+            base.text,
+            base.text,
+            base.rich,
+            base.rich,
+            next,
+            base_link,
+        ),
         'link-only',
     );
 }
@@ -335,30 +422,12 @@ export function use_editing(
         set_editing_cell(null);
     }, []);
 
-    // The cell's conflict base in edit space: its effective rich content when
+    // The cell's edit base in edit space: its effective rich content when
     // the loaded cell is available in markdown mode, else the plain raw text.
     // The fallback matters even in markdown mode — `get_cell_raw` layers the
     // in-flight save's values over residency, which `get_cell` cannot see, so
     // the raw reader stays the authority on the *text* and the loaded cell
     // only contributes styling.
-    /**
-     * The cell's persisted link, for conflict detection. Only markdown-mode
-     * consumers supply `get_cell`, which is also the only place link edits can
-     * be made, so the reader is absent exactly when there are no links to
-     * check. `null` distinguishes a resident linkless cell from a
-     * non-resident row (`undefined`), which is what keeps an evicted page from
-     * reading as a conflict.
-     */
-    const get_cell_link = useMemo(
-        () => (get_cell
-            ? (source_row: number, col: number) => {
-                const cell = get_cell(source_row, col);
-                return cell === undefined ? undefined : cell?.hyperlink ?? null;
-            }
-            : undefined),
-        [get_cell],
-    );
-
     /**
      * One read of a cell's persisted side, answering both questions about it.
      *
@@ -415,6 +484,17 @@ export function use_editing(
             read_persisted_cell(source_row, source_col).base,
         [read_persisted_cell],
     );
+    const pending_base_at = useCallback((
+        source_row: number,
+        source_col: number,
+    ): CsvObservedFileBase | undefined => {
+        const persisted = read_persisted_cell(source_row, source_col);
+        if (persisted.history === undefined) return undefined;
+        return make_observed_file_base(
+            persisted.history.value.text,
+            persisted.history.value.runs,
+        );
+    }, [read_persisted_cell]);
 
     // Every coordinate below is a source coordinate. The store's keys, the
     // GetCellRaw reader and EditingCell all live in source space, so nothing on
@@ -581,9 +661,18 @@ export function use_editing(
     const commit_edits = useCallback(
         (edits: readonly CellValueEdit[], label = 'Edit cell'): void => {
             run_edit_gesture(edits, label, (edit, before_entry, _before_overlay, persisted) =>
-                plan_value_write(before_entry, edit.value, persisted.base, syntax));
+                plan_value_write(
+                    before_entry,
+                    edit.value,
+                    persisted.base,
+                    persisted.history !== undefined
+                        ? persisted.history.hyperlink
+                        : get_cell?.(edit.source_row, edit.source_col)?.hyperlink ?? null,
+                    persisted.history !== undefined,
+                    syntax,
+                ));
         },
-        [run_edit_gesture, syntax],
+        [get_cell, run_edit_gesture, syntax],
     );
 
     /**
@@ -691,30 +780,27 @@ export function use_editing(
             const active_key =
                 `${editing_cell.source_row}:${editing_cell.source_col}`;
             const active_entry = dirty_cells.get(active_key);
-            if (
-                active_entry &&
-                is_entry_conflicted(active_key, active_entry, get_cell_raw, get_cell_link)
-            ) {
+            if (active_entry?.observedBase !== undefined) {
                 set_editing_cell(null);
             }
         }
         active_store.retain(
             session_id,
-            (key, entry) => !is_entry_conflicted(key, entry, get_cell_raw, get_cell_link),
+            (_key, entry) => entry.observedBase === undefined,
         );
-    }, [active_store, get_cell_raw, get_cell_link, editing_cell, dirty_cells, session_id]);
+    }, [active_store, editing_cell, dirty_cells, session_id]);
 
     // Resolve deferred bases for old-format restores: once a pending entry's page
     // becomes resident, capture its true on-disk value as the base. Runs whenever
-    // get_cell_raw's identity changes (the consumer rebinds it as pages load) and
+    // the persisted-cell reader changes (the consumer rebinds it as pages load) and
     // whenever the map itself changes.
     //
     // `dirty_cells` is a real dependency, not defensive padding. An old-format
     // string map can now be installed into a *mounted* hook (a same-generation
     // refresh while editing), where get_cell_raw does not rebind because no page
     // loaded. Without this dep the pending entries would never be resolved for
-    // already-resident rows: is_entry_conflicted short-circuits on base_pending,
-    // so conflict detection would be silently off, and collect_save_payload
+    // already-resident rows: observation skips base_pending, so file-change
+    // tracking would be silently off, and collect_save_payload
     // would keep refusing the save with no user-reachable way to clear it.
     useEffect(() => {
         // Hot-path guard: nothing pending means nothing to resolve, so skip the
@@ -722,23 +808,61 @@ export function use_editing(
         // and every commit produces a new map, so without this the effect would
         // re-run on every scroll and every keystroke.
         if (!active_store.has_pending_base()) return;
-        active_store.resolve_pending_bases(session_id, get_cell_raw);
-    }, [active_store, get_cell_raw, session_id, dirty_cells]);
+        active_store.resolve_pending_bases(session_id, pending_base_at);
+    }, [active_store, pending_base_at, session_id, dirty_cells]);
+
+    // Observe resident file changes and keep the original edit base intact.
+    // The store owns the latest observed side so the notice survives grid
+    // remounts and persistence; this effect only supplies loader-backed reads.
+    useEffect(() => {
+        const observations = new Map<string, CsvObservedFileBase>();
+        for (const [key, entry] of dirty_cells) {
+            if (entry.base_pending) continue;
+            const [source_row, source_col] = key.split(':').map(Number);
+            const persisted = read_persisted_cell(source_row, source_col);
+            if (persisted.history === undefined) continue;
+            const expected = dirty_entry_observed_base(entry);
+            const text_changed = persisted.base.text !== expected.value;
+            // The original formatting may be unknowable for an old sparse
+            // draft, but once observedBase exists its runs are an exact CAS
+            // baseline. Suppress only the first comparison to the unknown
+            // historical side, never later observed-side changes.
+            const formatting_changed = (
+                entry.observedBase !== undefined
+                || !dirty_entry_base_formatting_unknown(entry)
+            )
+                && !cell_edits_equal(
+                    persisted.base,
+                    { text: expected.value, rich: expected.runs },
+                );
+            const text_or_format_changed = text_changed || formatting_changed;
+            const current_link = entry.link !== undefined
+                ? persisted.history.hyperlink
+                : undefined;
+            const link_changed = entry.link !== undefined
+                && !hyperlinks_equal(expected.link ?? null, current_link ?? null);
+            if (!text_or_format_changed && !link_changed) continue;
+            observations.set(key, make_observed_file_base(
+                persisted.base.text,
+                persisted.base.rich,
+                current_link,
+            ));
+        }
+        active_store.observe_file_bases(session_id, observations);
+    }, [active_store, dirty_cells, read_persisted_cell, session_id]);
 
     const conflicted_keys = useMemo(() => {
         const keys = new Set<string>();
         for (const [key, entry] of dirty_cells) {
-            if (is_entry_conflicted(key, entry, get_cell_raw, get_cell_link)) {
-                keys.add(key);
-            }
+            if (entry.observedBase !== undefined) keys.add(key);
         }
         return keys;
-    }, [dirty_cells, get_cell_raw, get_cell_link]);
+    }, [dirty_cells]);
 
     // Close any open editor when the data reloads (token bump) — whether from our
     // own save or an external change. Dirty edits are preserved either way so the
-    // user never silently loses unsaved work; conflict detection then flags any
-    // entry whose base drifted.
+    // user never silently loses unsaved work; observation then records any entry
+    // whose file-side cell changed.
     const prev_token_ref = useRef(reload_token);
     useEffect(() => {
         if (prev_token_ref.current !== reload_token && edit_mode) {

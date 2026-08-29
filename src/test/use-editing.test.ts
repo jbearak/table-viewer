@@ -3,13 +3,25 @@
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { describe, it, expect, afterEach } from 'vitest';
-import type { CellData, WorksheetTarget } from '../types';
+import {
+    dirty_entry_link_changed,
+    is_strict_wire_dirty_entry,
+    type CellData,
+    type WorksheetTarget,
+} from '../types';
 import { clear_saved_dirty_entries, use_editing } from '../webview/use-editing';
+import { collect_save_payload } from '../webview/csv-save-model';
 import {
     create_edit_session_store,
     type EditSessionStore,
 } from '../webview/edit-session-store';
 import { create_history_store, type HistoryStore } from '../webview/history-store';
+import {
+    history_value,
+    overlay_state_from_dirty_entry,
+} from '../webview/history-cell-state-model';
+import { plan_history_replay } from '../webview/history-replay-model';
+import type { RichText } from '../cell-content';
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -106,7 +118,9 @@ describe('use_editing', () => {
         await act(async () => { hook_result!.start_editing(0, 0); });
         await act(async () => { hook_result!.confirm_edit('A'); });
         expect(hook_result!.is_dirty).toBe(true);
-        expect(hook_result!.dirty_cells.get('0:0')).toEqual({ value: 'A', base: 'a' });
+        expect(hook_result!.dirty_cells.get('0:0')).toEqual({
+            value: 'A', base: 'a', formattingKnown: true,
+        });
         expect(hook_result!.editing_cell).toBe(null);
     });
 
@@ -158,7 +172,7 @@ describe('use_editing', () => {
         await act(async () => { hook_result!.start_editing(0, 0); });
         await act(async () => { hook_result!.confirm_edit('A'); });
         const entry = hook_result!.dirty_cells.get('0:0');
-        expect(entry).toEqual({ value: 'A', base: 'a' });
+        expect(entry).toEqual({ value: 'A', base: 'a', formattingKnown: true });
     });
 
     it('confirm_edit stores empty base for null cells', async () => {
@@ -167,7 +181,7 @@ describe('use_editing', () => {
         await act(async () => { hook_result!.start_editing(2, 1); });
         await act(async () => { hook_result!.confirm_edit('X'); });
         const entry = hook_result!.dirty_cells.get('2:1');
-        expect(entry).toEqual({ value: 'X', base: '' });
+        expect(entry).toEqual({ value: 'X', base: '', formattingKnown: true });
     });
 
     it('names the open cell in source space, on a row only the source reader resolves', async () => {
@@ -192,6 +206,7 @@ describe('use_editing', () => {
         expect(hook_result!.dirty_cells.get('7:0')).toEqual({
             value: 'edited',
             base: 'base',
+            formattingKnown: true,
         });
         expect(hook_result!.editing_cell).toBe(null);
     });
@@ -220,7 +235,9 @@ describe('commit_edit (location-based)', () => {
         await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.commit_edit(0, 0, 'A'); });
         expect(hook_result!.is_dirty).toBe(true);
-        expect(hook_result!.dirty_cells.get('0:0')).toEqual({ value: 'A', base: 'a' });
+        expect(hook_result!.dirty_cells.get('0:0')).toEqual({
+            value: 'A', base: 'a', formattingKnown: true,
+        });
     });
 
     it('does not mark dirty when the value equals the original', async () => {
@@ -251,12 +268,14 @@ describe('commit_edit (location-based)', () => {
         await render();
         await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.commit_edit(2, 1, 'X'); });
-        expect(hook_result!.dirty_cells.get('2:1')).toEqual({ value: 'X', base: '' });
+        expect(hook_result!.dirty_cells.get('2:1')).toEqual({
+            value: 'X', base: '', formattingKnown: true,
+        });
     });
 });
 
-describe('conflict detection', () => {
-    it('marks conflicted keys when base value changes after reload', async () => {
+describe('pending edits affected by file changes', () => {
+    it('retains the original and tracks the latest file value after reload', async () => {
         await render(base_rows, 0);
         await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.start_editing(0, 0); });
@@ -271,6 +290,60 @@ describe('conflict detection', () => {
         await rerender(new_rows, 1);
 
         expect(hook_result!.conflicted_keys.has('0:0')).toBe(true);
+        expect(hook_result!.dirty_cells.get('0:0')).toEqual({
+            value: 'A',
+            base: 'a',
+            formattingKnown: true,
+            observedBase: { value: 'z' },
+        });
+
+        const changed_again = new_rows.map((row) => [...row]);
+        changed_again[0][0] = cell('y');
+        await rerender(changed_again, 2);
+        expect(hook_result!.dirty_cells.get('0:0')).toEqual({
+            value: 'A',
+            base: 'a',
+            formattingKnown: true,
+            observedBase: { value: 'y' },
+        });
+
+        await rerender(base_rows, 3);
+        expect(hook_result!.conflicted_keys.has('0:0')).toBe(false);
+        expect(hook_result!.dirty_cells.get('0:0')).toEqual({
+            value: 'A',
+            base: 'a',
+            formattingKnown: true,
+        });
+    });
+
+    it('keeps original and current sides when the pending value is edited again', async () => {
+        await render(base_rows, 0);
+        await act(async () => { hook_result!.toggle_edit_mode(); });
+        await act(async () => { hook_result!.commit_edit(0, 0, 'first pending'); });
+        const changed = base_rows.map((row) => [...row]);
+        changed[0][0] = cell('current file');
+        await rerender(changed, 1);
+
+        await act(async () => { hook_result!.commit_edit(0, 0, 'second pending'); });
+        expect(hook_result!.dirty_cells.get('0:0')).toEqual({
+            value: 'second pending',
+            base: 'a',
+            formattingKnown: true,
+            observedBase: { value: 'current file' },
+        });
+
+        await act(async () => { hook_result!.commit_edit(0, 0, 'a'); });
+        expect(hook_result!.dirty_cells.get('0:0')).toEqual({
+            value: 'a',
+            base: 'a',
+            observedBase: { value: 'current file' },
+            writeValue: true,
+            formattingKnown: true,
+        });
+        expect(collect_save_payload(hook_result!.dirty_cells)).toMatchObject({
+            status: 'ready',
+            edits: { '0:0': 'a' },
+        });
     });
 
     it('detects a conflict on a source row the reader resolves in isolation', async () => {
@@ -416,7 +489,9 @@ describe('conflict detection with non-resident pages', () => {
         await act(async () => { hook_result!.toggle_edit_mode(); });
         await act(async () => { hook_result!.start_editing(1, 0); });
         await act(async () => { hook_result!.confirm_edit('D'); });
-        expect(hook_result!.dirty_cells.get('1:0')).toEqual({ value: 'D', base: 'd' });
+        expect(hook_result!.dirty_cells.get('1:0')).toEqual({
+            value: 'D', base: 'd', formattingKnown: true,
+        });
 
         // Page for row 1 gets evicted (reload + eviction). get_cell_raw -> undefined.
         await rerender(rows_with_row1_evicted(), 1);
@@ -463,7 +538,9 @@ describe('conflict detection with non-resident pages', () => {
 
         await act(async () => { hook_result!.discard_conflicted(); });
         expect(hook_result!.dirty_cells.has('1:0')).toBe(true);
-        expect(hook_result!.dirty_cells.get('1:0')).toEqual({ value: 'D', base: 'd' });
+        expect(hook_result!.dirty_cells.get('1:0')).toEqual({
+            value: 'D', base: 'd', formattingKnown: true,
+        });
     });
 });
 
@@ -605,7 +682,7 @@ describe('hoisted store installs', () => {
         await render_store(undefined);
         await act(async () => { hook_result!.commit_edit(0, 0, 'A'); });
         expect(Object.fromEntries(hook_result!.dirty_cells)).toEqual({
-            '0:0': { value: 'A', base: 'a' },
+            '0:0': { value: 'A', base: 'a', formattingKnown: true },
         });
         const mounts_before = mount_count.n;
 
@@ -655,7 +732,7 @@ describe('hoisted store installs', () => {
 
         expect(session_store!.has_pending_base()).toBe(false);
         expect(Object.fromEntries(hook_result!.dirty_cells)).toEqual({
-            '0:0': { value: 'A', base: 'a' },
+            '0:0': { value: 'A', base: 'a', formattingKnown: true },
         });
     });
 });
@@ -727,6 +804,7 @@ describe('use_editing — markdown syntax', () => {
             base: 'plain bold',
             valueRuns: { runs: [{ text: 'plain bold' }] },
             baseRuns: { runs: [{ text: 'plain ' }, { text: 'bold', style: { bold: true } }] },
+            formattingKnown: true,
         });
     });
 
@@ -737,6 +815,7 @@ describe('use_editing — markdown syntax', () => {
             value: '6',
             base: '2*3',
             valueRuns: { runs: [{ text: '6', style: { bold: true } }] },
+            formattingKnown: true,
         });
     });
 
@@ -820,6 +899,7 @@ describe('use_editing — commit_hyperlink', () => {
         await act(async () => { hook_result!.commit_hyperlink(0, 1, site); });
         expect(hook_result!.dirty_cells.get('0:1')).toEqual({
             value: 'renamed', base: 'plain', link: site, baseLink: null,
+            formattingKnown: true,
         });
         // Text back to base: entry survives as link-only.
         await act(async () => { hook_result!.commit_edit(0, 1, 'plain'); });
@@ -838,6 +918,7 @@ describe('use_editing — commit_hyperlink', () => {
         await act(async () => { hook_result!.commit_hyperlink(0, 1, null); });
         expect(hook_result!.dirty_cells.get('0:1')).toEqual({
             value: 'renamed', base: 'plain',
+            formattingKnown: true,
         });
     });
 
@@ -851,6 +932,33 @@ describe('use_editing — commit_hyperlink', () => {
             value: 'site', base: 'site',
             link: { kind: 'internal', location: 'B2' }, baseLink: site,
         });
+    });
+
+    it('keeps choosing the original link as a real write after the file moves', async () => {
+        const rows: (CellData | null)[][] = [[
+            { raw: 'site', formatted: 'site', bold: false, italic: false, hyperlink: site },
+        ]];
+        await render_linked(rows);
+        await act(async () => { hook_result!.commit_hyperlink(0, 0, other); });
+        const current = { kind: 'internal' as const, location: 'Sheet2!B2' };
+        rows[0][0] = {
+            raw: 'site', formatted: 'site', bold: false, italic: false,
+            hyperlink: current,
+        };
+        await act(async () => {
+            root!.render(React.createElement(LinkHarness, { rows }));
+        });
+
+        await act(async () => { hook_result!.commit_hyperlink(0, 0, site); });
+        const entry = hook_result!.dirty_cells.get('0:0')!;
+        expect(entry).toEqual({
+            value: 'site',
+            base: 'site',
+            link: site,
+            baseLink: site,
+            observedBase: { value: 'site', link: current },
+        });
+        expect(dirty_entry_link_changed(entry)).toBe(true);
     });
 
     it('flags a stale link edit as conflicted and discards it locally', async () => {
@@ -876,6 +984,28 @@ describe('use_editing — commit_hyperlink', () => {
 
         await act(async () => { hook_result!.discard_conflicted(); });
         expect(hook_result!.dirty_cells.has('0:0')).toBe(false);
+    });
+
+    it('adapts an observed text side when a link dimension is added and removed', async () => {
+        const rows: (CellData | null)[][] = [[
+            { raw: 'plain', formatted: 'plain', bold: false, italic: false },
+        ]];
+        await render_linked(rows);
+        await act(async () => { hook_result!.commit_edit(0, 0, 'pending'); });
+        rows[0][0] = { raw: 'current', formatted: 'current', bold: false, italic: false };
+        await act(async () => {
+            root!.render(React.createElement(LinkHarness, { rows }));
+        });
+
+        await act(async () => { hook_result!.commit_hyperlink(0, 0, site); });
+        const linked = hook_result!.dirty_cells.get('0:0')!;
+        expect(linked.observedBase).toEqual({ value: 'current', link: null });
+        expect(is_strict_wire_dirty_entry(linked)).toBe(true);
+
+        await act(async () => { hook_result!.commit_hyperlink(0, 0, null); });
+        const unlinked = hook_result!.dirty_cells.get('0:0')!;
+        expect(unlinked.observedBase).toEqual({ value: 'current' });
+        expect(is_strict_wire_dirty_entry(unlinked)).toBe(true);
     });
 
     it('does not flag a link edit whose row is not resident', async () => {
@@ -1167,6 +1297,7 @@ describe('use_editing — hyperlink capture', () => {
         expect(delta.hyperlink).toBeUndefined();
         expect(hook_result!.dirty_cells.get('0:1')).toEqual({
             value: 'edited', base: 'plain', link: site, baseLink: null,
+            formattingKnown: true,
         });
     });
 
@@ -1195,7 +1326,16 @@ describe('use_editing — hyperlink capture', () => {
         // equal. Membership and semantic inequality are different facts, and
         // reading membership off the comparison would record a value dimension
         // leaving an overlay it never entered.
-        await render_linked();
+        const rich_rows: (CellData | null)[][] = [[
+            linked_rows[0][0],
+            {
+                ...linked_rows[0][1]!,
+                richText: {
+                    runs: [{ text: 'plain', style: { bold: true } }],
+                },
+            },
+        ]];
+        await render_linked(rich_rows);
         await act(async () => {
             link_store!.install(
                 { session_id: undefined },
@@ -1205,11 +1345,160 @@ describe('use_editing — hyperlink capture', () => {
         await act(async () => { hook_result!.commit_hyperlink(0, 1, site); });
 
         const delta = only_change();
-        // The link moved; the value dimension did not, but it stays IN the
-        // overlay, so a later transition off this state knows it is there.
-        expect(delta.value).toBeUndefined();
+        // The durable marker disambiguates this from a link-only entry after the
+        // gesture has left the hook. Its one-time metadata transition is recorded
+        // so compare-and-swap sees exactly what the store now holds.
+        expect(delta.value).toBeDefined();
         expect(delta.afterOverlay.kind === 'present'
             && delta.afterOverlay.value.kind).toBe('present');
+        expect(link_store!.get('0:1')).toEqual({
+            value: 'plain',
+            base: 'plain',
+            link: site,
+            baseLink: null,
+            retainValue: true,
+        });
+        const save_payload = collect_save_payload(link_store!.snapshot());
+        expect(save_payload.status).toBe('ready');
+        if (save_payload.status !== 'ready') throw new Error('expected ready save payload');
+        expect(save_payload.edits).toEqual({});
+
+        // Re-read through the same inference path a later undo uses. Without the
+        // marker this becomes link-only and undo deletes the pre-existing entry.
+        const action = history!.snapshot().undoStack.at(-1)!.action;
+        const stored = overlay_state_from_dirty_entry(link_store!.get('0:1')!);
+        const undone = plan_history_replay(action, 'undo', () => ({
+            overlay: stored,
+            persisted: history_value('plain'),
+            persistedHyperlink: null,
+        }));
+        expect(undone.kind).toBe('plan');
+        if (undone.kind !== 'plan') throw new Error('expected undo plan');
+        expect(undone.writes[0]?.entry).toEqual({ value: 'plain', base: 'plain' });
+
+        const undo_entry = undone.writes[0]!.entry!;
+        const redone = plan_history_replay(action, 'redo', () => ({
+            overlay: overlay_state_from_dirty_entry(undo_entry),
+            persisted: history_value('plain'),
+            persistedHyperlink: null,
+        }));
+        expect(redone.kind).toBe('plan');
+        if (redone.kind !== 'plan') throw new Error('expected redo plan');
+        expect(redone.writes[0]?.entry).toEqual({
+            value: 'plain',
+            base: 'plain',
+            link: site,
+            baseLink: null,
+            retainValue: true,
+        });
+    });
+
+    it('preserves unknown legacy formatting when the pending text is edited again', async () => {
+        const rich_rows: (CellData | null)[][] = [[
+            linked_rows[0][0],
+            {
+                ...linked_rows[0][1]!,
+                richText: {
+                    runs: [{ text: 'plain', style: { bold: true } }],
+                },
+            },
+        ]];
+        await render_linked(rich_rows);
+        await act(async () => {
+            link_store!.install(
+                { session_id: undefined },
+                { '0:1': { value: 'plain', base: 'plain' } },
+            );
+        });
+
+        await act(async () => { hook_result!.commit_edit(0, 1, 'changed'); });
+
+        expect(link_store!.get('0:1')).toEqual({
+            value: 'changed',
+            base: 'plain',
+            valueRuns: { runs: [{ text: 'changed' }] },
+            baseRuns: {
+                runs: [{ text: 'plain', style: { bold: true } }],
+            },
+            formattingKnown: true,
+        });
+        expect(hook_result!.conflicted_keys.size).toBe(0);
+    });
+
+    it('does not promote pending-side runs into historical formatting provenance', async () => {
+        const current_runs = {
+            runs: [{ text: 'current', style: { bold: true as const } }],
+        };
+        const rows: (CellData | null)[][] = [[
+            linked_rows[0][0],
+            {
+                raw: 'current', formatted: 'current', bold: false, italic: false,
+                richText: current_runs,
+            },
+        ]];
+        await render_linked(rows);
+        await act(async () => {
+            link_store!.install(
+                { session_id: undefined },
+                {
+                    '0:1': {
+                        value: 'legacy pending',
+                        base: 'original',
+                        observedBase: { value: 'current', runs: current_runs },
+                    },
+                },
+            );
+        });
+
+        await act(async () => { hook_result!.commit_edit(0, 1, 'first rewrite'); });
+        expect(link_store!.get('0:1')).toMatchObject({
+            value: 'first rewrite',
+            base: 'original',
+            valueRuns: { runs: [{ text: 'first rewrite' }] },
+        });
+        expect(link_store!.get('0:1')?.formattingKnown).toBeUndefined();
+
+        await act(async () => { hook_result!.commit_edit(0, 1, 'second rewrite'); });
+        expect(link_store!.get('0:1')).toMatchObject({
+            value: 'second rewrite',
+            base: 'original',
+            valueRuns: { runs: [{ text: 'second rewrite' }] },
+        });
+        expect(link_store!.get('0:1')?.baseRuns).toBeUndefined();
+        expect(link_store!.get('0:1')?.formattingKnown).toBeUndefined();
+    });
+
+    it('tracks formatting changes after a legacy entry has an observed side', async () => {
+        const bold_c = { runs: [{ text: 'c', style: { bold: true as const } }] };
+        const italic_c = { runs: [{ text: 'c', style: { italic: true as const } }] };
+        const rows = (runs: RichText): (CellData | null)[][] => [[
+            linked_rows[0][0],
+            {
+                raw: 'c', formatted: 'c', bold: false, italic: false,
+                richText: runs,
+            },
+        ]];
+        await render_linked(rows(bold_c));
+        await act(async () => {
+            link_store!.install(
+                { session_id: undefined },
+                {
+                    '0:1': {
+                        value: 'B',
+                        base: 'a',
+                        observedBase: { value: 'c', runs: bold_c },
+                    },
+                },
+            );
+        });
+
+        await act(async () => {
+            root!.render(React.createElement(LinkCaptureHarness, { rows: rows(italic_c) }));
+        });
+
+        expect(link_store!.get('0:1')?.observedBase).toEqual({
+            value: 'c', runs: italic_c,
+        });
     });
 
     it('carries a value dimension written earlier in the same gesture', async () => {
@@ -1228,6 +1517,7 @@ describe('use_editing — hyperlink capture', () => {
             valueRuns: { runs: [{ text: 'plain', style: { bold: true } }] },
             link: site,
             baseLink: null,
+            formattingKnown: true,
         });
         const delta = only_change();
         expect(delta.afterOverlay.kind === 'present'
