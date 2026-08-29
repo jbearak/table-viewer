@@ -20,9 +20,10 @@ export const MAX_COLUMN_WIDTH_PX = 3200;
 /** Auto-fit should reveal useful content without letting one long value take
  *  over the viewport. Manual resizing retains the larger limit above. */
 export const MAX_AUTO_FIT_COLUMN_WIDTH_PX = MAX_COLUMN_WIDTH_PX / 4;
-/** Trailing scroll room that brings the final column's resize border just
- *  inside the viewport, where it can still be grabbed and dragged left. */
-export const LAST_COLUMN_RESIZE_GUTTER_PX = 8;
+/** Trailing scroll room for acquiring the final column's resize border and
+ *  making small outward adjustments before resize-time edge scrolling takes
+ *  over. */
+export const LAST_COLUMN_RESIZE_GUTTER_PX = 32;
 export const DEFAULT_COLUMN_WIDTH_PX = 120;
 
 /**
