@@ -342,12 +342,13 @@ export function dirty_entry_from_overlay_state(
         base.runs,
         state.hyperlink.kind === 'present' ? state.hyperlink.value : undefined,
         state.hyperlink.kind === 'present' ? state.hyperlink.base : undefined,
-        undefined,
-        state.value.kind === 'present' ? state.value.writeValue : undefined,
-        state.value.kind === 'present' ? state.value.retainValue : undefined,
-        state.value.kind === 'present' ? state.value.formattingKnown : undefined,
-        state.value.kind === 'present' ? state.value.movedFrom : undefined,
-        state.value.kind === 'present' ? state.value.valueEditOrder : undefined,
+        state.value.kind === 'present' ? {
+            writeValue: state.value.writeValue,
+            retainValue: state.value.retainValue,
+            formattingKnown: state.value.formattingKnown,
+            movedFrom: state.value.movedFrom,
+            valueEditOrder: state.value.valueEditOrder,
+        } : {},
     );
     const base_pending = state.value.kind === 'present' && state.value.basePending;
     return base_pending ? { ...entry, base_pending: true } : entry;

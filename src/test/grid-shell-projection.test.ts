@@ -4877,6 +4877,39 @@ describe('GridShell hyperlink dialog admission', () => {
         expect(grid_mock.unpin_rows).toHaveBeenCalledWith(dialog_pin);
     });
 
+    it('allows Cmd/Ctrl+S through an untouched empty hyperlink dialog', async () => {
+        const editing_ref = React.createRef<EditingHandle | null>();
+        const store = create_edit_session_store({ session_id: 'session-1' }, {
+            '0:1': { value: 'pending', base: 'middle' },
+        });
+        const on_save_request = vi.fn((): CsvSaveOperation => ({
+            editSessionId: 'session-1',
+            saveRequestId: 'save-with-untouched-link-dialog',
+            worksheets: [],
+        }));
+        await render_grid({
+            ...link_props(editing_ref),
+            edit_session: store,
+            on_save_request,
+        });
+        await open_dialog();
+
+        await act(async () => {
+            field('hyperlink-target').dispatchEvent(new KeyboardEvent('keydown', {
+                key: 's',
+                ctrlKey: true,
+                bubbles: true,
+                cancelable: true,
+            }));
+        });
+
+        expect(on_save_request).toHaveBeenCalledOnce();
+        expect(document.getElementById('hyperlink-target')).toBeNull();
+        expect(store.get('0:1')).toMatchObject({ value: 'pending', base: 'middle' });
+        expect(store.get('0:1')?.link).toBeUndefined();
+        expect(store.get('0:0')).toBeUndefined();
+    });
+
     it('keeps an invalid hyperlink draft open and blocks Cmd/Ctrl+S', async () => {
         const editing_ref = React.createRef<EditingHandle | null>();
         const on_save_request = vi.fn();

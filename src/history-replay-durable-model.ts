@@ -142,12 +142,13 @@ export function entry_from_wire_overlay(
         base.runs,
         link.kind === 'present' ? link.value : undefined,
         link.kind === 'present' ? link.base : undefined,
-        undefined,
-        dimension.kind === 'present' ? dimension.writeValue : undefined,
-        dimension.kind === 'present' ? dimension.retainValue : undefined,
-        dimension.kind === 'present' ? dimension.formattingKnown : undefined,
-        dimension.kind === 'present' ? dimension.movedFrom : undefined,
-        dimension.kind === 'present' ? dimension.valueEditOrder : undefined,
+        dimension.kind === 'present' ? {
+            writeValue: dimension.writeValue,
+            retainValue: dimension.retainValue,
+            formattingKnown: dimension.formattingKnown,
+            movedFrom: dimension.movedFrom,
+            valueEditOrder: dimension.valueEditOrder,
+        } : {},
     );
     return { kind: 'entry', entry };
 }
@@ -174,10 +175,7 @@ export function stored_entry(
         persisted.runs,
         undefined,
         undefined,
-        undefined,
-        undefined,
-        undefined,
-        true,
+        { formattingKnown: true },
     );
 }
 

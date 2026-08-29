@@ -1759,6 +1759,12 @@ export function attach_viewer(
             || replay_leases.current(Date.now()) !== undefined;
     }
 
+    /** Mirror of history_replay_blocks_save for replay admission. */
+    function save_blocks_history_replay(): boolean {
+        return active_save_operation !== undefined
+            || save_lifecycle.state === 'active';
+    }
+
     /**
      * Transform work is mid-flight across state I/O somewhere on this file:
      * `compute_transform` yields at cancellation checkpoints and publishes the
@@ -8380,7 +8386,7 @@ export function attach_viewer(
                 // reaching this is a stale request rather than a race worth
                 // queueing.
                 if (
-                    active_save_operation !== undefined
+                    save_blocks_history_replay()
                     || replay_preparation_in_flight
                     || replay_leases.current(Date.now()) !== undefined
                 ) {

@@ -101,10 +101,10 @@ describe('overlay_state_from_dirty_entry', () => {
 
     it('treats a present original-equal link as an explicit write', () => {
         const entry = make_dirty_entry('A', 'A', undefined, undefined, LINK, LINK, {
-            value: 'A',
-            link: OTHER_LINK,
+            observedBase: { value: 'A', link: OTHER_LINK },
         });
         expect(dirty_entry_link_changed(entry)).toBe(true);
+        expect(dirty_entry_link_changed(make_dirty_entry('A', 'A'))).toBe(false);
     });
 
     it('reads an entry with both dimensions as both present', () => {
@@ -129,8 +129,10 @@ describe('overlay_state_from_dirty_entry', () => {
     it('keeps move metadata on unchanged text with a hyperlink change', () => {
         const entry = make_dirty_entry(
             'A', 'A', undefined, undefined, LINK, null,
-            undefined, undefined, undefined, undefined,
-            { row: 4, col: 3, order: 9 }, 9,
+            {
+                movedFrom: { row: 4, col: 3, order: 9 },
+                valueEditOrder: 9,
+            },
         );
         const state = present(overlay_state_from_dirty_entry(entry));
 
@@ -157,8 +159,7 @@ describe('overlay_state_from_dirty_entry', () => {
     it('round-trips cut provenance through a value overlay', () => {
         const entry = make_dirty_entry(
             'moved', 'old', undefined, undefined, undefined, undefined,
-            undefined, undefined, undefined, undefined,
-            { row: 4, col: 3, order: 1 },
+            { movedFrom: { row: 4, col: 3, order: 1 } },
         );
         const state = present(overlay_state_from_dirty_entry(entry));
         expect(state.value.kind).toBe('present');

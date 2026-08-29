@@ -290,15 +290,14 @@ function plan_value_write(
             make_dirty_entry(
                 persisted.text, persisted.text, persisted.rich, persisted.rich,
                 link_dimension?.link, link_dimension?.baseLink,
-                undefined,
-                undefined,
-                undefined,
-                persisted_formatting_known
-                    && (moved_from !== undefined || value_edit_order !== undefined)
-                    ? true
-                    : undefined,
-                moved_from,
-                value_edit_order,
+                {
+                    formattingKnown: persisted_formatting_known
+                        && (moved_from !== undefined || value_edit_order !== undefined)
+                        ? true
+                        : undefined,
+                    movedFrom: moved_from,
+                    valueEditOrder: value_edit_order,
+                },
             ),
             persisted,
             persisted_link,
@@ -338,12 +337,12 @@ function plan_value_write(
             committed_value_runs(parsed, persisted),
             original.rich,
             link_dimension?.link, link_dimension?.baseLink,
-            undefined,
-            cell_edits_equal(parsed, original) ? true : undefined,
-            undefined,
-            formatting_known,
-            moved_from,
-            value_edit_order,
+            {
+                writeValue: cell_edits_equal(parsed, original) ? true : undefined,
+                formattingKnown: formatting_known,
+                movedFrom: moved_from,
+                valueEditOrder: value_edit_order,
+            },
         ),
         persisted,
         persisted_link,

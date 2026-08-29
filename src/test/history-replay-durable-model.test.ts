@@ -372,7 +372,7 @@ describe('replay_cell_matches', () => {
             undefined,
             undefined,
             undefined,
-            { value: 'current' },
+            { observedBase: { value: 'current' } },
         );
         expect(replay_cell_matches(
             cells({ '3:4': observed }),
@@ -398,7 +398,7 @@ describe('replay_cell_matches', () => {
             undefined,
             OTHER,
             LINK,
-            { value: 'current', link: null },
+            { observedBase: { value: 'current', link: null } },
         );
         expect(replay_cell_matches(
             cells({ '3:4': observed }),
@@ -412,13 +412,13 @@ describe('replay_cell_matches', () => {
         expect(replay_cell_matches(cells({
             '3:4': make_dirty_entry(
                 'A', 'A', undefined, undefined, undefined, undefined,
-                { value: 'C' }, true,
+                { observedBase: { value: 'C' }, writeValue: true },
             ),
         }), expected)).toBe(true);
         expect(replay_cell_matches(cells({
             '3:4': make_dirty_entry(
                 'A', 'A', undefined, undefined, undefined, undefined,
-                { value: 'C' },
+                { observedBase: { value: 'C' } },
             ),
         }), expected)).toBe(false);
     });

@@ -202,7 +202,7 @@
         "tableViewer.diffOnByDefault": {
           "type": "boolean",
           "default": false,
-          "description": "Turn Diff on when Edit mode is entered, so each edited cell shows the file value it would replace next to the pending edit. If that cell changes in the file, Diff updates to the current file value. Can be overridden per viewer from the toolbar."
+          "description": "Turn Diff on when Edit mode is entered, so each edited cell shows the file value it would replace next to the pending edit. If that cell changes in the file, Diff updates to the current file value. The setting can be overridden per viewer from the toolbar."
         },
         "tableViewer.maxStoredFiles": {
           "type": "integer",

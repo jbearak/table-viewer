@@ -1742,6 +1742,15 @@ export function move_provenance_equal(
 
 export type CsvDirtyMap = Readonly<Record<string, CsvDirtyEntry>>;
 
+export interface DirtyEntryOptions {
+    readonly observedBase?: CsvObservedFileBase;
+    readonly writeValue?: true;
+    readonly retainValue?: true;
+    readonly formattingKnown?: true;
+    readonly movedFrom?: CsvDirtyEntry['movedFrom'];
+    readonly valueEditOrder?: number;
+}
+
 /**
  * The one constructor of the sparse dirty-entry shape: run sides present only
  * when given, with `formattingKnown` carrying provenance for modern plain edits.
@@ -1756,12 +1765,7 @@ export function make_dirty_entry(
     baseRuns?: RichText,
     link?: CellHyperlink | null,
     baseLink?: CellHyperlink | null,
-    observedBase?: CsvObservedFileBase,
-    writeValue?: true,
-    retainValue?: true,
-    formattingKnown?: true,
-    movedFrom?: CsvDirtyEntry['movedFrom'],
-    valueEditOrder?: number,
+    options: DirtyEntryOptions = {},
 ): CsvDirtyEntry {
     return {
         value,
@@ -1770,12 +1774,14 @@ export function make_dirty_entry(
         ...(baseRuns !== undefined ? { baseRuns } : {}),
         ...(link !== undefined ? { link } : {}),
         ...(baseLink !== undefined ? { baseLink } : {}),
-        ...(observedBase !== undefined ? { observedBase } : {}),
-        ...(writeValue === true ? { writeValue: true as const } : {}),
-        ...(retainValue === true ? { retainValue: true as const } : {}),
-        ...(formattingKnown === true ? { formattingKnown: true as const } : {}),
-        ...(movedFrom !== undefined ? { movedFrom } : {}),
-        ...(valueEditOrder !== undefined ? { valueEditOrder } : {}),
+        ...(options.observedBase !== undefined ? { observedBase: options.observedBase } : {}),
+        ...(options.writeValue === true ? { writeValue: true as const } : {}),
+        ...(options.retainValue === true ? { retainValue: true as const } : {}),
+        ...(options.formattingKnown === true ? { formattingKnown: true as const } : {}),
+        ...(options.movedFrom !== undefined ? { movedFrom: options.movedFrom } : {}),
+        ...(options.valueEditOrder !== undefined
+            ? { valueEditOrder: options.valueEditOrder }
+            : {}),
     };
 }
 
@@ -1801,12 +1807,14 @@ export function copy_dirty_entry(
         merged.baseRuns,
         merged.link,
         merged.baseLink,
-        merged.observedBase,
-        merged.writeValue,
-        merged.retainValue,
-        merged.formattingKnown,
-        merged.movedFrom,
-        merged.valueEditOrder,
+        {
+            observedBase: merged.observedBase,
+            writeValue: merged.writeValue,
+            retainValue: merged.retainValue,
+            formattingKnown: merged.formattingKnown,
+            movedFrom: merged.movedFrom,
+            valueEditOrder: merged.valueEditOrder,
+        },
     );
 }
 
@@ -1949,12 +1957,14 @@ export function sanitized_dirty_entry(entry: {
         keep(entry.baseRuns, entry.base),
         keep_link ? entry.link as CellHyperlink | null : undefined,
         keep_link ? entry.baseLink as CellHyperlink | null : undefined,
-        observed,
-        entry.writeValue === true ? true : undefined,
-        entry.retainValue === true ? true : undefined,
-        entry.formattingKnown === true ? true : undefined,
-        moved_from,
-        value_edit_order,
+        {
+            observedBase: observed,
+            writeValue: entry.writeValue === true ? true : undefined,
+            retainValue: entry.retainValue === true ? true : undefined,
+            formattingKnown: entry.formattingKnown === true ? true : undefined,
+            movedFrom: moved_from,
+            valueEditOrder: value_edit_order,
+        },
     );
 }
 
@@ -2112,12 +2122,6 @@ export function observed_file_bases_equal(
         && optional_links_equal(left.link, right.link);
 }
 
-/**
- * Whether the entry's VALUE dimension needs a file write, comparing against
- * the latest observed file side when one exists. False for a link-only entry,
- * whose text and runs are only the unedited cell anchor — rewriting its `<c>`
- * would break the unedited-cells-keep-original-XML invariant.
- */
 /** Whether the sparse entry carries a pending value dimension at all. */
 export function dirty_entry_value_dimension_present(entry: CsvDirtyEntry): boolean {
     const changed_from_original = entry.value !== entry.base
@@ -2144,6 +2148,12 @@ export function dirty_entry_base_formatting_unknown(entry: CsvDirtyEntry): boole
         && entry.formattingKnown !== true;
 }
 
+/**
+ * Whether the entry's VALUE dimension needs a file write, comparing against
+ * the latest observed file side when one exists. False for a link-only entry,
+ * whose text and runs are only the unedited cell anchor — rewriting its `<c>`
+ * would break the unedited-cells-keep-original-XML invariant.
+ */
 export function dirty_entry_value_changed(entry: CsvDirtyEntry): boolean {
     if (!dirty_entry_value_dimension_present(entry)) return false;
     const changed_from_original = entry.value !== entry.base

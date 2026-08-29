@@ -584,6 +584,13 @@ export function App(): React.JSX.Element {
     // its display-row mapping before the transform is restored.
     const [grid_mount_epoch, set_grid_mount_epoch] = useState(0);
     const [active_sheet_index, set_active_sheet_index] = useState(0);
+    // The sheet React has selected, kept separate from the host-authored
+    // activeSheetIndex in state_ref. A refresh can clamp the rendered index
+    // while the durable host value still names a removed sheet.
+    const rendered_sheet_index_ref = useRef(0);
+    useLayoutEffect(() => {
+        rendered_sheet_index_ref.current = active_sheet_index;
+    }, [active_sheet_index]);
     // Per sheet, not per workbook (#154). Formatting is a view setting like the rest
     // of the right-hand toolbar group, and reading one sheet raw while another stays
     // formatted is a real thing to want. Sparse: an absent entry means the default,
@@ -1067,6 +1074,8 @@ export function App(): React.JSX.Element {
             && previous !== null
             && previous.contains(document.activeElement);
         external_change_review_ref.current = element;
+        external_change_navigation_context_ref.current =
+            element?.dataset.navigationContext ?? null;
         if (element !== null) {
             element.focus();
             return;
@@ -5104,7 +5113,7 @@ export function App(): React.JSX.Element {
                     );
                     if (
                         rejected_sheet_index !== undefined
-                        && rejected_sheet_index !== state_ref.current.activeSheetIndex
+                        && rejected_sheet_index !== rendered_sheet_index_ref.current
                     ) {
                         if (
                             grid_focus_ref.current?.has_focus() === true
@@ -5118,7 +5127,7 @@ export function App(): React.JSX.Element {
                         }
                         handle_sheet_select(rejected_sheet_index);
                     } else if (
-                        rejected_sheet_index === state_ref.current.activeSheetIndex
+                        rejected_sheet_index === rendered_sheet_index_ref.current
                         && restore_rejected_grid_focus
                     ) {
                         grid_focus_ref.current?.focus();
@@ -6204,9 +6213,6 @@ export function App(): React.JSX.Element {
     ]);
     const review_external_changes = external_change_is_active
         && open_external_change_occurrence === external_change_occurrence_key;
-    external_change_navigation_context_ref.current = review_external_changes
-        ? external_change_occurrence_key
-        : null;
     const external_change_navigation_pending_for_review =
         external_change_navigation_pending_key?.startsWith(
             `${external_change_occurrence_key}\u0000`,
@@ -6678,8 +6684,10 @@ export function App(): React.JSX.Element {
             {review_external_changes
                 && (changed_items.length > 0 || removed_items.length > 0) && (
                 <section
+                    key={external_change_occurrence_key}
                     id="external-change-review"
                     ref={mount_external_change_review}
+                    data-navigation-context={external_change_occurrence_key}
                     tabIndex={-1}
                     className="external-change-review"
                     aria-label="File changes affecting pending edits"

@@ -195,10 +195,9 @@ export interface EditSessionStore {
      */
     replace(session_id: string | undefined, entries: unknown): void;
     /**
-     * Filter in place by an arbitrary predicate. Exists so `discard_conflicted`'s
-     * predicate ({@link is_entry_conflicted} against `get_cell_raw`) stays
-     * outside the store — page residency is the loader's concern, not the
-     * session's.
+     * Filter in place by an arbitrary predicate. File-change callers decide
+     * which entries survive from their host-observed bases before reaching the
+     * store; this map does not infer file state or page residency.
      */
     retain(session_id: string | undefined, keep: (key: string, entry: DirtyEntry) => boolean): void;
     clear_saved(session_id: string | undefined, saved: Readonly<Record<string, string>>): void;

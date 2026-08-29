@@ -106,9 +106,17 @@ function HyperlinkDialog({
 
     const draft = draft_hyperlink(kind, target, tooltip);
     const commit = useCallback((): boolean => {
-        if (disabled || draft === null) return false;
+        if (disabled) return false;
+        if (draft === null) {
+            const untouched = kind === (initial?.kind ?? 'external')
+                && target === initial_target(initial)
+                && tooltip === (initial?.tooltip ?? '');
+            if (!untouched) return false;
+            on_cancel();
+            return true;
+        }
         return on_commit(draft) !== false;
-    }, [disabled, draft, on_commit]);
+    }, [disabled, draft, initial, kind, on_cancel, on_commit, target, tooltip]);
     useImperativeHandle(ref, () => ({ commit }), [commit]);
 
     return (

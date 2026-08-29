@@ -9776,6 +9776,54 @@ describe('edit mode save exit', () => {
             .toEqual([]);
     });
 
+    it('does not reselect the rendered sheet when the refreshed host pointer differs', async () => {
+        const { post_message } = await render_app();
+        const meta = make_meta(['People', 'Inventory'], false);
+        await dispatch_host_message(initial_snapshot_message(meta, {
+            state: { activeSheetIndex: 1 },
+            capabilities: { csvEditable: true, csvEditingSupported: true },
+        }));
+        await enter_edit_mode(post_message);
+        const edits = { '4:1': { value: 'Gadget', base: 'stale' } };
+        await report_grid_editing(true, true, [], edits);
+
+        // A refresh keeps the locally rendered sheet while retaining the host's
+        // different durable pointer for the next state write.
+        await dispatch_host_message(refresh_snapshot_message(meta, {
+            state: { activeSheetIndex: 0 },
+            capabilities: {
+                csvEditable: true,
+                csvEditingSupported: true,
+                csvEditSessionId: 'test-edit-session',
+            },
+        }));
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+        grid_shell_mock.commit_live_edit.mockClear();
+
+        await dispatch_host_message({
+            type: 'saveResult',
+            success: false,
+            lifecycle: {
+                revision: 905,
+                state: 'failed',
+                operation: {
+                    editSessionId: 'test-edit-session',
+                    saveRequestId: 'save-rendered-sheet',
+                    worksheets: [{
+                        sheetIndex: 1,
+                        sheetName: 'Inventory',
+                        edits: { '4:1': 'Gadget' },
+                        dirtyEdits: edits,
+                    }],
+                },
+            },
+            rejection: { reason: 'baseMismatch', worksheetOperationIndex: 0, keys: ['4:1'] },
+        });
+
+        expect(grid_stub().getAttribute('data-sheet-index')).toBe('1');
+        expect(grid_shell_mock.commit_live_edit).not.toHaveBeenCalled();
+    });
+
     it('ignores a rejection whose worksheet operation ordinal is out of bounds', async () => {
         const { post_message } = await render_app();
         await dispatch_host_message(
