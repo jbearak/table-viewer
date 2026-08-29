@@ -59,6 +59,7 @@ import { MAX_WORKBOOK_FORMULAS } from '../spreadsheet-safety';
 import type { FormulaCalculationEdit } from '../formula-calculation';
 import { rich_text_equal } from '../cell-content';
 import { xlsx_edit_writes_formula } from '../xlsx-cell-value';
+import type { XlsxFormulaCellMove } from '../xlsx-formula';
 
 export interface EditSessionFormulaProjection {
     readonly edits: readonly FormulaCalculationEdit[];
@@ -66,6 +67,7 @@ export interface EditSessionFormulaProjection {
     readonly calculationRevision: number;
     readonly tooManyEdits: boolean;
     readonly hasFormulaEdits: boolean;
+    readonly moves: readonly XlsxFormulaCellMove[];
 }
 
 export interface EditSessionSaveWorksheet {
@@ -327,6 +329,37 @@ export function create_edit_session_registry(
         if (!coordinates_equal) formula_coordinate_revision += 1;
         if (!calculations_equal) formula_calculation_revision += 1;
     };
+    const current_moves = (): XlsxFormulaCellMove[] => {
+        const moves = new Map<string, XlsxFormulaCellMove>();
+        for (const [sheetIndex, store] of stores) {
+            for (const [key, entry] of store.snapshot()) {
+                const cell = parse_cell_key(key);
+                const moved = entry.movedFrom;
+                if (!cell || moved === undefined) continue;
+                for (const previous of moved.previous ?? []) {
+                    const move = {
+                        order: previous.order,
+                        sheetIndex,
+                        sourceRow: previous.sourceRow,
+                        sourceColumn: previous.sourceCol,
+                        destinationRow: previous.destinationRow,
+                        destinationColumn: previous.destinationCol,
+                    };
+                    moves.set(JSON.stringify(move), move);
+                }
+                const move = {
+                    order: moved.order,
+                    sheetIndex,
+                    sourceRow: moved.row,
+                    sourceColumn: moved.col,
+                    destinationRow: cell.sourceRow,
+                    destinationColumn: cell.sourceColumn,
+                };
+                moves.set(JSON.stringify(move), move);
+            }
+        }
+        return [...moves.values()].sort((left, right) => (left.order ?? 0) - (right.order ?? 0));
+    };
     const apply_formula_change = (
         sheetIndex: number,
         change: Extract<EditSessionFormulaChange, { kind: 'entry' }>,
@@ -425,6 +458,7 @@ export function create_edit_session_registry(
             calculationRevision: formula_calculation_revision,
             tooManyEdits: too_many_formula_edits,
             hasFormulaEdits: formula_edit_count > 0,
+            moves: current_moves(),
         }),
         for_sheet: (sheet_index) => {
             const existing = stores.get(sheet_index);

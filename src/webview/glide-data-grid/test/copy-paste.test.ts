@@ -1,6 +1,13 @@
 /* eslint-disable sonarjs/no-duplicate-string */
 import { GridCellKind, type GridCell, BooleanIndeterminate } from "../index.js";
-import { decodeHTML, getCopyBufferContents, type CellBuffer } from "../data-editor/copy-paste.js";
+import {
+    cutSourceGridLocations,
+    copyBufferContainsCut,
+    decodeHTML,
+    getCopyBufferContents,
+    resolveCopyBufferValue,
+    type CellBuffer,
+} from "../data-editor/copy-paste.js";
 import { expect, describe, test } from "vitest";
 
 function makeCellBuffer(
@@ -16,6 +23,129 @@ function makeCellBuffer(
 }
 
 describe("copy-paste", () => {
+    const operationId = "01234567-89ab-cdef";
+    test("keeps displayed values generic while round-tripping formula copy metadata", () => {
+        const cells = [[{
+            kind: GridCellKind.Text,
+            data: "2",
+            displayData: "2",
+            copyData: "2",
+            allowOverlay: true,
+            clipboardData: {
+                source: "workbook-1/sheet-1",
+                location: [1, 0],
+                gridLocation: [1, 0],
+                formula: "=A1+B1",
+            },
+        }]] as unknown as GridCell[][];
+
+        const encoded = getCopyBufferContents(cells, [1], "copy", operationId);
+        const decoded = decodeHTML(encoded.textHtml);
+
+        expect(encoded.textPlain).toBe("2");
+        expect(encoded.textHtml).toContain(">2</td>");
+        expect(decoded?.[0][0].clipboardData).toEqual({
+            source: "workbook-1/sheet-1",
+            location: [1, 0],
+            gridLocation: [1, 0],
+            formula: "=A1+B1",
+            action: "copy",
+            operationId,
+        });
+        expect(resolveCopyBufferValue(decoded![0][0], {
+            source: "workbook-1/sheet-1",
+            location: [1, 1],
+        }, operationId)).toBe("=A2+B2");
+    });
+
+    test("translates each copied formula from its own origin and preserves absolute axes", () => {
+        const formula = (text: string, location: readonly [number, number]): CellBuffer => ({
+            rawValue: "cached",
+            formatted: "cached",
+            format: "string",
+            clipboardData: {
+                source: "workbook-1/sheet-1",
+                location,
+                gridLocation: location,
+                formula: text,
+                action: "copy",
+                operationId,
+            },
+        } as CellBuffer);
+
+        expect(resolveCopyBufferValue(formula("=$A$1+A$1+$A1+A1", [0, 0]), {
+            source: "workbook-1/sheet-1",
+            location: [1, 1],
+        }, operationId)).toBe("=$A$1+B$1+$A2+B2");
+        expect(resolveCopyBufferValue(formula("=A1+B1", [2, 3]), {
+            source: "workbook-1/sheet-1",
+            location: [5, 7],
+        }, operationId)).toBe("=D5+E5");
+    });
+
+    test("cut formulas stay verbatim and hostile metadata falls back to the value", () => {
+        const cut = {
+            rawValue: "cached",
+            formatted: "cached",
+            format: "string",
+            clipboardData: {
+                source: "workbook-1/sheet-1",
+                location: [0, 0],
+                gridLocation: [0, 0],
+                formula: "=A1+B1",
+                action: "cut",
+                operationId,
+            },
+        } as CellBuffer;
+        expect(resolveCopyBufferValue(cut, {
+            source: "workbook-1/sheet-1",
+            location: [0, 10],
+        }, operationId)).toBe("=A1+B1");
+
+        const oversized = `<table><tr><td gdg-raw-value="cached" data-tv-clipboard="1" `
+            + `data-tv-source="sheet" data-tv-column="0" data-tv-row="0" `
+            + `data-tv-grid-column="0" data-tv-grid-row="0" data-tv-action="copy" `
+            + `data-tv-formula="=${"x".repeat(8_193)}">cached</td></tr></table>`;
+        expect(decodeHTML(oversized)?.[0][0]).toEqual(makeCellBuffer("cached"));
+
+        const missingCoordinates = `<table><tr><td gdg-raw-value="cached" data-tv-clipboard="1" `
+            + `data-tv-source="sheet" data-tv-action="copy" data-tv-formula="=A1">cached</td></tr></table>`;
+        expect(decodeHTML(missingCoordinates)?.[0][0]).toEqual(makeCellBuffer("cached"));
+    });
+
+    test("only returns cut sources for one matching sheet and projection", () => {
+        const cutCell = (gridLocation: readonly [number, number]): CellBuffer => ({
+            rawValue: "value",
+            formatted: "value",
+            format: "string",
+            clipboardData: {
+                source: "workbook-1/sheet-1/projection-4",
+                location: gridLocation,
+                gridLocation,
+                action: "cut",
+                operationId,
+            },
+        });
+        const buffer = [[cutCell([2, 3]), cutCell([3, 3])]];
+        const expected = buffer;
+
+        expect(cutSourceGridLocations(buffer, "workbook-1/sheet-1/projection-4", operationId, expected))
+            .toEqual([[2, 3], [3, 3]]);
+        expect(cutSourceGridLocations(buffer, "workbook-1/sheet-2/projection-4", operationId, expected))
+            .toBeUndefined();
+        expect(copyBufferContainsCut(buffer)).toBe(true);
+        expect(cutSourceGridLocations(
+            [[buffer[0][0]], [buffer[0][1]]],
+            "workbook-1/sheet-1/projection-4",
+            operationId,
+            expected,
+        )).toBeUndefined();
+        expect(cutSourceGridLocations([[{
+            ...cutCell([2, 3]),
+            clipboardData: { ...cutCell([2, 3]).clipboardData!, action: "copy" },
+        }]], "workbook-1/sheet-1/projection-4", operationId, expected)).toBeUndefined();
+    });
+
     test("decode html", () => {
         const html = `
             <table>
@@ -38,6 +168,17 @@ describe("copy-paste", () => {
             [makeCellBuffer("1"), makeCellBuffer("2")],
             [makeCellBuffer("3"), makeCellBuffer("4")],
         ]);
+    });
+
+    test("Excel for Mac public HTML exposes a cached value, not its formula", () => {
+        // Captured from Excel 15 after copying a cell whose formula bar showed
+        // =A2+B2. Formula identity remained in Microsoft-only pasteboard types.
+        const html = `<html xmlns:x="urn:schemas-microsoft-com:office:excel">
+            <meta name="Generator" content="Microsoft Excel 15">
+            <table><tr><td align="right">0</td></tr></table>
+        </html>`;
+
+        expect(decodeHTML(html)).toEqual([[makeCellBuffer("0")]]);
     });
 
     test("decode html line breaks", () => {

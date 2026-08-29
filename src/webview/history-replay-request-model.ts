@@ -280,6 +280,12 @@ function entry_for_unwritten_cell(
         ...(dimension.kind === 'present' && dimension.basePending
             ? { base_pending: true }
             : {}),
+        ...(dimension.kind === 'present' && dimension.movedFrom !== undefined
+            ? { movedFrom: dimension.movedFrom }
+            : {}),
+        ...(dimension.kind === 'present' && dimension.valueEditOrder !== undefined
+            ? { valueEditOrder: dimension.valueEditOrder }
+            : {}),
         ...(value.runs !== undefined ? { valueRuns: value.runs } : {}),
         ...(base.runs !== undefined ? { baseRuns: base.runs } : {}),
         ...(link.kind === 'present' ? { link: link.value, baseLink: link.base } : {}),

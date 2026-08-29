@@ -24,6 +24,25 @@ describe('edit session registry', () => {
         expect(revisions).toEqual([1, 2]);
     });
 
+    it('projects ordered move provenance across worksheet stores', () => {
+        const { registry } = make_session_ref('session');
+        registry.for_sheet(1).commit('session', '2:3', {
+            value: 'moved',
+            base: 'old',
+            movedFrom: { row: 0, col: 1, order: 7 },
+            valueEditOrder: 7,
+        });
+
+        expect(registry.formula_projection().moves).toEqual([{
+            sheetIndex: 1,
+            sourceRow: 0,
+            sourceColumn: 1,
+            destinationRow: 2,
+            destinationColumn: 3,
+            order: 7,
+        }]);
+    });
+
     it('updates formula inputs incrementally without revisiting unchanged dirty cells', () => {
         const { registry } = make_session_ref('session');
         const store = registry.for_sheet(0);

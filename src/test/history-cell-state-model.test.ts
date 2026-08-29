@@ -120,6 +120,18 @@ describe('overlay_state_from_dirty_entry', () => {
         expect(state.hyperlink.kind).toBe('untouched');
     });
 
+    it('round-trips cut provenance through a value overlay', () => {
+        const entry = make_dirty_entry(
+            'moved', 'old', undefined, undefined, undefined, undefined,
+            { row: 4, col: 3, order: 1 },
+        );
+        const state = present(overlay_state_from_dirty_entry(entry));
+        expect(state.value.kind).toBe('present');
+        if (state.value.kind !== 'present') throw new Error('unreachable');
+        expect(state.value.movedFrom).toEqual({ row: 4, col: 3, order: 1 });
+        expect(dirty_entry_from_overlay_state(state)).toEqual(entry);
+    });
+
     it('keeps a present value dimension for an unresolved legacy entry', () => {
         const entry: HistoryDirtyEntry = { value: 'typed', base: '', base_pending: true };
         const state = present(overlay_state_from_dirty_entry(entry));

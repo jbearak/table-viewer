@@ -98,6 +98,13 @@ import {
     rich_cell_display_data,
     type CellEditOverlay,
 } from './cell-renderer';
+
+let last_value_edit_order = 0;
+function next_value_edit_order(): number {
+    const clock = Date.now() * 1_000;
+    last_value_edit_order = Math.max(clock, last_value_edit_order + 1);
+    return last_value_edit_order;
+}
 import { is_rich_text_cell, rich_text_cell_renderer } from './rich-text-cell-renderer';
 import { parse_http_external_url } from '../external-url';
 import type { CellHyperlink } from '../cell-content';
@@ -487,6 +494,12 @@ export interface GridShellProps {
     formula_results?: ReadonlyMap<string, string>;
     /** Source-pending results retained beneath the current edit overlay. */
     source_formula_results?: ReadonlyMap<string, string>;
+    /** Ordered unsaved cell moves, applied to formula source before display/edit. */
+    formula_move_retargeter?: (
+        formula: string,
+        formulaSheetIndex: number,
+        afterOrder?: number,
+    ) => string;
     generation: number;
     /**
      * Effective displayed row count (may be filtered).
@@ -684,6 +697,7 @@ export function GridShell({
     pending_formula_impact,
     formula_results,
     source_formula_results,
+    formula_move_retargeter,
     generation,
     row_count = sheet_meta.rowCount,
     show_formatting,
@@ -1143,6 +1157,15 @@ export function GridShell({
         syntax: edit_syntax,
         capture: history_capture,
         gestures_admitted,
+        formula_edit_text: (source_row, source_column, text, after_order) => {
+            const entry = store.snapshot().get(`${source_row}:${source_column}`);
+            const writes_formula = entry === undefined
+                ? get_cell_for_source_ref.current(source_row, source_column)?.formula !== undefined
+                : xlsx_edit_writes_formula(entry.value, entry.valueRuns?.runs);
+            return writes_formula
+                ? formula_move_retargeter?.(text, sheet_index, after_order) ?? text
+                : text;
+        },
         // Same identity discipline as get_cell_raw: rebinds with `version` so
         // freshly-loaded pages refresh markdown edit text and bases.
         get_cell: useCallback(
@@ -1248,6 +1271,13 @@ export function GridShell({
         && !save_in_flight
         && !highlight_in_flight
         && !close_barrier_active;
+    // Formula clipboard metadata must name workbook coordinates, not the
+    // current projection. The projection generation is part of the source
+    // identity so a pending cut cannot clear the wrong display cells after a
+    // sort or filter changes underneath it.
+    const clipboard_source = `${
+        sheet_meta.worksheetId ?? `${sheet_index}:${sheet_meta.name}`
+    }:${mapping_generation}`;
     // Edit callbacks can outlive the render that supplied them. Read admission
     // through refs updated only by the committed tree: mutating them during render
     // would let an abandoned concurrent render change the mounted callbacks' view.
@@ -1953,16 +1983,33 @@ export function GridShell({
         const dirty = store.get(key);
         if (dirty) {
             original = dirty_value_edit_text(dirty, edit_syntax);
+            if (xlsx_edit_writes_formula(dirty.value, dirty.valueRuns?.runs)) {
+                original = formula_move_retargeter?.(
+                    original,
+                    sheet_index,
+                    dirty.valueEditOrder ?? Number.POSITIVE_INFINITY,
+                ) ?? original;
+            }
         } else if (edit_syntax === 'markdown') {
             const cell = get_cell_for_source_ref.current(source_row, source_column);
-            original = cell
-                ? cell_edit_text(cell, edit_syntax)
+            original = cell?.formula !== undefined
+                ? formula_move_retargeter?.(cell.formula, sheet_index) ?? cell.formula
+                : cell
+                    ? cell_edit_text(cell, edit_syntax)
                 : get_cell_raw(source_row, source_column) ?? '';
         } else {
             original = get_cell_raw(source_row, source_column) ?? '';
         }
         return { key, value, original };
-    }, [commit_source_row, edit_syntax, get_cell_raw, source_column_for_display, store]);
+    }, [
+        commit_source_row,
+        edit_syntax,
+        formula_move_retargeter,
+        get_cell_raw,
+        sheet_index,
+        source_column_for_display,
+        store,
+    ]);
 
     // The tracking editor wrapper (provide_editor) refreshes live_uncommitted on
     // open and on every keystroke and clears it on close, so the editing-status
@@ -1983,7 +2030,7 @@ export function GridShell({
             return false;
         }
         const live = read_live_edit();
-        if (live) {
+        if (live && live.value !== live.original) {
             const [source_row, source_column] = live.key.split(':').map(Number);
             if (Number.isInteger(source_row) && Number.isInteger(source_column)) {
                 commit_edit(source_row, source_column, live.value);
@@ -2114,7 +2161,7 @@ export function GridShell({
             return;
         }
         const live = read_live_edit();
-        if (live) {
+        if (live && live.value !== live.original) {
             // Source-keyed already: `live.key` comes from read_live_edit and
             // commit_edit's first parameter is a source row. No conversion here.
             const [source_row, source_column] = live.key.split(':').map(Number);
@@ -2840,6 +2887,13 @@ export function GridShell({
                         dirty,
                         () => dirty_value_edit_text(dirty, edit_syntax),
                     );
+                    if (xlsx_edit_writes_formula(dirty.value, dirty.valueRuns?.runs)) {
+                        edit_value = formula_move_retargeter?.(
+                            edit_value,
+                            sheet_index,
+                            dirty.valueEditOrder ?? Number.POSITIVE_INFINITY,
+                        ) ?? edit_value;
+                    }
                 } else {
                     const loaded = loaded_row?.[source_column];
                     if (loaded) {
@@ -2847,6 +2901,12 @@ export function GridShell({
                             loaded,
                             () => cell_edit_text(loaded, edit_syntax),
                         );
+                        if (loaded.formula !== undefined) {
+                            edit_value = formula_move_retargeter?.(
+                                loaded.formula,
+                                sheet_index,
+                            ) ?? loaded.formula;
+                        }
                     }
                 }
             }
@@ -2904,7 +2964,7 @@ export function GridShell({
                         : highlight_bg ?? compare_bg),
                 };
             }
-            return build_grid_cell(
+            const grid_cell = build_grid_cell(
                 source_column,
                 loaded_row,
                 show_formatting,
@@ -2920,6 +2980,37 @@ export function GridShell({
                 link_modifier_held,
                 diff_colors,
             );
+            if (source_row === undefined) return grid_cell;
+            const dirty_formula_source = edit_syntax === 'markdown'
+                && dirty !== undefined
+                && xlsx_edit_writes_formula(dirty.value, dirty.valueRuns?.runs)
+                ? dirty.value
+                : undefined;
+            const dirty_formula = dirty_formula_source === undefined
+                ? undefined
+                : formula_move_retargeter?.(
+                    dirty_formula_source,
+                    sheet_index,
+                    dirty?.valueEditOrder ?? Number.POSITIVE_INFINITY,
+                ) ?? dirty_formula_source;
+            const loaded_formula = loaded_cell?.formula === undefined
+                ? undefined
+                : formula_move_retargeter?.(loaded_cell.formula, sheet_index)
+                    ?? loaded_cell.formula;
+            const formula = dirty_formula ?? (
+                dirty === undefined && edit_syntax === 'markdown'
+                    ? loaded_formula
+                    : undefined
+            );
+            return {
+                ...grid_cell,
+                clipboardData: {
+                    source: clipboard_source,
+                    location: [source_column, source_row],
+                    gridLocation: [display_column, row],
+                    ...(formula === undefined ? {} : { formula }),
+                },
+            };
         },
         // version: bumps when a page lands so the closure (and the redraw effect) refresh.
         [
@@ -2952,6 +3043,9 @@ export function GridShell({
             diff_mode,
             high_contrast,
             value_overlay_for_cell,
+            clipboard_source,
+            formula_move_retargeter,
+            sheet_index,
         ],
     );
 
@@ -2989,6 +3083,7 @@ export function GridShell({
             if (gestures_admitted !== undefined && !gestures_admitted()) return true;
 
             const edits: CellValueEdit[] = [];
+            const edit_order = next_value_edit_order();
             const damaged: { cell: Item }[] = [];
             const grown_rows = new Set<number>();
             // Rectangular gestures repeat each display row across every column
@@ -3004,7 +3099,7 @@ export function GridShell({
                 source_rows.set(row, resolved);
                 return resolved;
             };
-            for (const { location, value } of items) {
+            for (const { location, value, movedFrom } of items) {
                 const [display_column, row] = location;
                 // A late finish from an overlay belongs to the source column it
                 // opened on, even if a projection has since assigned its display
@@ -3040,7 +3135,20 @@ export function GridShell({
                     : value.kind === GridCellKind.Custom && is_rich_text_cell(value)
                         ? value.data.edit_value ?? ''
                         : '';
-                edits.push({ source_row, source_col: source_column, value: text });
+                edits.push({
+                    source_row,
+                    source_col: source_column,
+                    value: text,
+                    ...(edit_syntax === 'markdown' && (
+                        movedFrom !== undefined || xlsx_edit_writes_formula(text, undefined)
+                    ) ? { editOrder: edit_order } : {}),
+                    ...(movedFrom === undefined ? {} : {
+                        movedFrom: {
+                            source_row: movedFrom[1],
+                            source_col: movedFrom[0],
+                        },
+                    }),
+                });
 
                 // Auto-grow the row to fit hard line breaks (Shift+Alt+Enter),
                 // mirroring the old renderer. Only ever grows a row, never
@@ -4581,6 +4689,10 @@ export function GridShell({
                 // the entire clipboard into the single focused cell, tabs and
                 // newlines and all.
                 onPaste={editable_cells}
+                cutValidationKey={dirty_cells}
+                onClipboardPasteError={(message) => {
+                    host_bridge.postMessage({ type: 'showWarning', message });
+                }}
                 // Do not expose Glide's drag-to-fill affordance. It is easy to
                 // trigger accidentally and duplicates values rather than helping
                 // with Table Viewer's viewing and lightweight editing workflow.

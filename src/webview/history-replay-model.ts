@@ -143,11 +143,34 @@ export function plan_history_replay(
     // store for both would look for B, find C, and refuse a replay that is
     // perfectly consistent with itself.
     const planned_state = new Map<string, CellReplayState>();
+    if (direction === 'undo') {
+        for (const change of action_replay_changes(action, direction)) {
+            if (change.kind !== 'cell') continue;
+            const after = overlay_for_direction(change.delta, 'redo');
+            if (after.kind === 'absent' || after.value.kind !== 'present') continue;
+            const moved = after.value.movedFrom;
+            if (moved === undefined) continue;
+            const { worksheet, sourceRow, sourceColumn } = change.delta;
+            if (read_state(worksheet, sourceRow, sourceColumn)?.overlay.kind === 'absent') {
+                // Once saved, reversing only the address mapping would also
+                // rewrite formulas that already referred to the destination.
+                // Refuse instead of corrupting those independent references.
+                return {
+                    kind: 'refused',
+                    reason: 'conflict',
+                    worksheet,
+                    sourceRow,
+                    sourceColumn,
+                };
+            }
+        }
+    }
     const read_planned: ReadCellState = (worksheet, row, column) =>
         planned_state.get(cell_address(worksheet, row, column))
             ?? read_state(worksheet, row, column);
 
-    for (const change of action_replay_changes(action, direction)) {
+    const replay_changes = action_replay_changes(action, direction);
+    for (const change of replay_changes) {
         if (change.kind === 'highlight') {
             highlights.push(change.delta);
             continue;
@@ -279,6 +302,10 @@ function value_dimension_matches(
     if (recorded === undefined || recorded.kind !== 'present') return current?.kind !== 'present';
     if (current?.kind !== 'present') return false;
     return current.basePending === recorded.basePending
+        && current.movedFrom?.row === recorded.movedFrom?.row
+        && current.movedFrom?.col === recorded.movedFrom?.col
+        && current.movedFrom?.order === recorded.movedFrom?.order
+        && current.valueEditOrder === recorded.valueEditOrder
         && history_values_equal(current.value, recorded.value)
         && history_values_equal(current.base, recorded.base);
 }

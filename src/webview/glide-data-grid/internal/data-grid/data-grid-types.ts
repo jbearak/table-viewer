@@ -315,6 +315,19 @@ export interface BaseGridCell {
     readonly contentAlign?: "left" | "right" | "center";
     readonly cursor?: CSSProperties["cursor"];
     readonly copyData?: string;
+    /**
+     * Workbook-aware clipboard identity. Generic clipboard text still comes
+     * from `copyData`; this payload is emitted only as validated Table Viewer
+     * HTML metadata so an internal paste can preserve formula semantics.
+     */
+    readonly clipboardData?: {
+        readonly source: string;
+        /** Canonical workbook coordinates, column then row. */
+        readonly location: Item;
+        /** Coordinates in the current grid projection, column then row. */
+        readonly gridLocation: Item;
+        readonly formula?: string;
+    };
     readonly activationBehaviorOverride?: CellActiviationBehavior;
 }
 
@@ -484,7 +497,12 @@ export enum InnerGridCellKind {
     Marker = "marker",
 }
 
-export type EditListItem = { location: Item; value: EditableGridCell };
+export type EditListItem = {
+    location: Item;
+    value: EditableGridCell;
+    /** Canonical source location when this write is a cut destination. */
+    movedFrom?: Item;
+};
 
 /**
  * The gesture a batch of edits came from.

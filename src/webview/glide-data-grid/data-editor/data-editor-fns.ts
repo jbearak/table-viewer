@@ -1,6 +1,6 @@
 import type { DataGridSearchProps } from "../internal/data-grid-search/data-grid-search.js";
 import { type GridCell, type GridSelection, type Rectangle } from "../internal/data-grid/data-grid-types.js";
-import { getCopyBufferContents, type CopyBuffer } from "./copy-paste.js";
+import { getCopyBufferContents, type ClipboardAction, type CopyBuffer } from "./copy-paste.js";
 
 export function expandSelection(
     newVal: GridSelection,
@@ -168,9 +168,11 @@ export function unquote(str: string): CopyBuffer {
 export function copyToClipboard(
     cells: readonly (readonly GridCell[])[],
     columnIndexes: readonly number[],
-    e?: ClipboardEvent
+    e?: ClipboardEvent,
+    action: ClipboardAction = "copy",
+    operationId?: string,
 ) {
-    const copyBuffer = getCopyBufferContents(cells, columnIndexes);
+    const copyBuffer = getCopyBufferContents(cells, columnIndexes, action, operationId);
 
     // eslint-disable-next-line unicorn/consistent-function-scoping
     const copyWithWriteText = (s: string) => {

@@ -63,6 +63,12 @@ export function wire_overlay_from_cell_overlay_state(
             value: wire_history_value(state.value.value),
             base: wire_history_value(state.value.base),
             basePending: state.value.basePending,
+            ...(state.value.movedFrom === undefined
+                ? {}
+                : { movedFrom: state.value.movedFrom }),
+            ...(state.value.valueEditOrder === undefined
+                ? {}
+                : { valueEditOrder: state.value.valueEditOrder }),
         };
     const link = state.hyperlink;
     const hyperlink = link.kind === 'untouched'
@@ -108,7 +114,9 @@ export function cell_overlay_state_from_wire(
     const present = history_value_from_wire(dimension.value);
     const base = history_value_from_wire(dimension.base);
     if (hyperlink.kind === 'untouched') {
-        return value_only_overlay(present, base, dimension.basePending);
+        return value_only_overlay(
+            present, base, dimension.basePending, dimension.movedFrom, dimension.valueEditOrder,
+        );
     }
     return combined_overlay(
         present,
@@ -116,6 +124,8 @@ export function cell_overlay_state_from_wire(
         hyperlink.value,
         hyperlink.base,
         dimension.basePending,
+        dimension.movedFrom,
+        dimension.valueEditOrder,
     );
 }
 

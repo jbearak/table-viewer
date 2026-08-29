@@ -32,8 +32,10 @@ import {
 } from './formula-dependencies';
 import {
     is_xlsx_formula_text,
+    compile_a1_formula_move_retargeter,
     translate_a1_formula,
     workbook_a1_formula_references,
+    type XlsxFormulaCellMove,
 } from './xlsx-formula';
 import {
     classify_xlsx_cell_value,
@@ -100,6 +102,20 @@ export interface XlsxCellEdit {
      * back as the number 1000. Absent (the ordinary case) infers as before.
      */
     readonly force_text?: boolean;
+    /** Canonical source cell when this write is the destination of a cut move. */
+    readonly movedFrom?: {
+        readonly row: number;
+        readonly col: number;
+        readonly order?: number;
+        readonly previous?: readonly {
+            readonly sourceRow: number;
+            readonly sourceCol: number;
+            readonly destinationRow: number;
+            readonly destinationCol: number;
+            readonly order: number;
+        }[];
+    };
+    readonly valueEditOrder?: number;
 }
 
 /** Strings written to the workbook go inline, so the writer never needs the shared string table. */
@@ -1244,6 +1260,29 @@ export function cells_present(
     return found;
 }
 
+/** Which requested cells contain a stored value, inline string, or formula. */
+export function worksheet_content_cells(
+    source: Uint8Array | string,
+    coordinates: Iterable<{ readonly row: number; readonly col: number }>,
+): Set<string> {
+    const xml = typeof source === 'string' ? Buffer.from(source, 'utf8') : source;
+    const wanted = new Set<string>();
+    for (const { row, col } of coordinates) wanted.add(`${row}:${col}`);
+    const found = new Set<string>();
+    const sheet_data = scan_worksheet_structure(xml).sheet_data;
+    if (!sheet_data || wanted.size === 0) return found;
+    scan_rows(xml, sheet_data.inner_start, sheet_data.inner_end, {
+        on_cell: (row, col, cell) => {
+            const key = `${row}:${col}`;
+            if (!wanted.has(key)) return;
+            if (find_first_element(xml, 'f', cell.inner_start, cell.inner_end)
+                || find_first_element(xml, 'v', cell.inner_start, cell.inner_end)
+                || find_first_element(xml, 'is', cell.inner_start, cell.inner_end)) found.add(key);
+        },
+    });
+    return found;
+}
+
 /** One pending splice: replace `[start, end)` with `text`. */
 interface Splice { start: number; end: number; text: string }
 
@@ -1259,6 +1298,7 @@ interface WorksheetFormulaCell {
 
 interface WorksheetFormulaState {
     readonly dependencies: number[];
+    readonly formulas: readonly WorksheetFormulaCell[];
 }
 
 type FormulaCacheSpliceVisitor = (start: number, end: number, text: string) => void;
@@ -1481,7 +1521,7 @@ function worksheet_formula_state(
             }
         }
     }
-    return { dependencies };
+    return { dependencies, formulas };
 }
 
 /** Read workbook-resolved dependencies without materializing worksheet cells. */
@@ -1501,6 +1541,87 @@ export function worksheet_formula_dependencies(
         sheet_names,
         formula_budget,
     ).dependencies;
+}
+
+/**
+ * Materialize ordinary cell edits for formulas that must follow moved cells.
+ * Formula cells inside the moved source range are content of the move and keep
+ * their own formula text; explicit user edits likewise win over derived edits.
+ */
+export function worksheet_formula_move_edits(
+    xml: Uint8Array,
+    sheet_index: number,
+    sheet_names: readonly string[],
+    moves: readonly XlsxFormulaCellMove[],
+    excluded: ReadonlySet<string>,
+    formula_budget: WorkbookBudget = create_workbook_budget(),
+): XlsxCellEdit[] {
+    const sheet_data = scan_worksheet_structure(xml).sheet_data;
+    if (!sheet_data || moves.length === 0) return [];
+    const state = worksheet_formula_state(
+        xml,
+        sheet_data,
+        sheet_names[sheet_index],
+        sheet_index,
+        sheet_names,
+        formula_budget,
+    );
+    const moved_sources = new Set(moves.map(
+        (move) => `${move.sheetIndex}:${move.sourceRow}:${move.sourceColumn}`,
+    ));
+    const retarget_formula = compile_a1_formula_move_retargeter(sheet_names, moves);
+    const shared_masters = new Map<string, WorksheetFormulaCell>();
+    for (const formula of state.formulas) {
+        if (
+            formula.type === 'shared'
+            && formula.reference !== null
+            && formula.sharedIndex !== null
+            && formula.text !== ''
+        ) shared_masters.set(formula.sharedIndex, formula);
+    }
+
+    const edits: XlsxCellEdit[] = [];
+    for (const formula of state.formulas) {
+        if (formula.dataTableInputs.some(
+            (input) => retarget_formula(input, sheet_index) !== input,
+        )) {
+            throw grouped_formula_error(formula.row, formula.col, 'dataTable');
+        }
+        const key = `${formula.row}:${formula.col}`;
+        if (excluded.has(key) || moved_sources.has(`${sheet_index}:${key}`)) continue;
+        let effective: string | undefined;
+        if (formula.type === 'shared' && formula.reference === null) {
+            const master = formula.sharedIndex === null
+                ? undefined
+                : shared_masters.get(formula.sharedIndex);
+            if (master) {
+                effective = '=' + translate_a1_formula(
+                    master.text,
+                    formula.row - master.row,
+                    formula.col - master.col,
+                );
+            }
+        } else if (formula.text !== '') {
+            effective = `=${formula.text}`;
+        }
+        if (effective === undefined) continue;
+        const rewritten = retarget_formula(effective, sheet_index);
+        if (rewritten === effective) continue;
+        if (
+            formula.type === 'array'
+            || formula.type === 'dataTable'
+            || (formula.type === 'shared' && formula.reference !== null)
+        ) {
+            throw grouped_formula_error(
+                formula.row,
+                formula.col,
+                formula.type === 'dataTable' ? 'dataTable'
+                    : formula.type === 'array' ? 'array' : 'shared',
+            );
+        }
+        edits.push({ row: formula.row, col: formula.col, value: rewritten });
+    }
+    return edits;
 }
 
 /** Remove only cached results for formula cells selected by workbook planning. */

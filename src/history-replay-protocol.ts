@@ -70,6 +70,7 @@ import { sanitize_cell_highlight_color } from './cell-highlights';
 import {
     is_strict_wire_dirty_entry,
     make_dirty_entry,
+    sanitized_wire_dirty_entry,
     sanitized_wire_worksheet_target,
     type CellHighlightColor,
     type CsvDirtyEntry,
@@ -114,6 +115,8 @@ export interface WirePresentValueDimension {
     readonly value: WireHistoryValue;
     readonly base: WireHistoryValue;
     readonly basePending: boolean;
+    readonly movedFrom?: CsvDirtyEntry['movedFrom'];
+    readonly valueEditOrder?: number;
 }
 
 export interface WireUntouchedHyperlinkDimension {
@@ -448,11 +451,24 @@ function sanitized_wire_value_dimension(
     const present = sanitized_wire_history_value(value.value);
     const base = sanitized_wire_history_value(value.base);
     if (present === undefined || base === undefined) return undefined;
+    const moved_from = value.movedFrom === undefined ? undefined
+        : sanitized_wire_dirty_entry({
+            value: '', base: '', movedFrom: value.movedFrom,
+        })?.movedFrom ?? null;
+    if (moved_from === null) return undefined;
+    const value_edit_order = value.valueEditOrder === undefined
+        ? undefined
+        : is_source_index(value.valueEditOrder)
+            ? value.valueEditOrder
+            : null;
+    if (value_edit_order === null) return undefined;
     return Object.freeze({
         kind: 'present' as const,
         value: present,
         base,
         basePending: value.basePending,
+        ...(moved_from === undefined ? {} : { movedFrom: moved_from }),
+        ...(value_edit_order === undefined ? {} : { valueEditOrder: value_edit_order }),
     });
 }
 

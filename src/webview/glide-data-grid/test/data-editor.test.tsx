@@ -2782,19 +2782,87 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         vi.useRealTimers();
         await vi.waitFor(() => expect(navigator.clipboard.writeText).toHaveBeenCalled());
         expect(navigator.clipboard.writeText).toBeCalledWith("1, 2\t2, 2");
-        expect(editSpy).toHaveBeenCalledWith(
-            [
-                {
-                    location: [1, 2],
-                    value: expect.objectContaining({ data: "" }),
-                },
-                {
-                    location: [2, 2],
-                    value: expect.objectContaining({ data: "" }),
-                },
-            ],
-            "delete"
+        expect(editSpy).not.toHaveBeenCalled();
+    });
+
+    test("cut paste keeps formula references and clears the source in one batch", async () => {
+        const source = "workbook-1/sheet-1/projection-1";
+        const cell = ([col, row]: Item): GridCell => {
+            const clipboardData = {
+                source,
+                location: [col, row] as const,
+                gridLocation: [col, row] as const,
+                ...(col === 1 && row === 2 ? { formula: "=A1+B1" } : {}),
+            };
+            return {
+                kind: GridCellKind.Text,
+                data: `${col}, ${row}`,
+                displayData: `${col}, ${row}`,
+                allowOverlay: true,
+                ...(col === 1 && row === 2 ? { copyData: "cached formula result" } : {}),
+                clipboardData,
+            };
+        };
+        const editSpy = vi.fn();
+        vi.useFakeTimers();
+        render(
+            <EventedDataEditor
+                {...basicProps}
+                getCellContent={cell}
+                onPaste={true}
+                onCellsEdited={editSpy}
+            />,
+            { wrapper: Context }
         );
+        prep(false);
+        const canvas = screen.getByTestId("data-grid-canvas");
+        vi.spyOn(document, "activeElement", "get").mockImplementation(() => canvas);
+        sendClick(canvas, {
+            clientX: 300,
+            clientY: 36 + 32 * 2 + 16,
+        });
+        fireEvent.keyDown(canvas, { key: "ArrowRight", shiftKey: true });
+        const copied = new Map<string, string>();
+        fireEvent.cut(window, {
+            clipboardData: {
+                types: [],
+                setData: (type: string, value: string) => copied.set(type, value),
+            },
+        });
+        await vi.waitFor(() => expect(copied.get("text/html")).toContain("data-tv-operation"));
+        const html = copied.get("text/html")!;
+        Object.assign(navigator, {
+            clipboard: {
+                read: vi.fn(async () => [{
+                    types: ["text/html"],
+                    getType: vi.fn(async () => new Blob([html], { type: "text/html" })),
+                }]),
+            },
+        });
+        sendClick(canvas, {
+            clientX: 300,
+            clientY: 36 + 32 * 3 + 16,
+        });
+
+        fireEvent.paste(window);
+        vi.useRealTimers();
+        await vi.waitFor(() => expect(editSpy).toHaveBeenCalled());
+
+        expect(editSpy).toHaveBeenCalledOnce();
+        expect(editSpy).toHaveBeenCalledWith([
+            { location: [1, 2], value: expect.objectContaining({ data: "" }) },
+            { location: [2, 2], value: expect.objectContaining({ data: "" }) },
+            {
+                location: [1, 3],
+                value: expect.objectContaining({ data: "=A1+B1" }),
+                movedFrom: [1, 2],
+            },
+            {
+                location: [2, 3],
+                value: expect.objectContaining({ data: "2, 2" }),
+                movedFrom: [2, 2],
+            },
+        ], "paste");
     });
 
     test("Paste custom cell does not crash", async () => {

@@ -1974,6 +1974,138 @@ describe('write_xlsx_cell_edits', () => {
         });
     });
 
+    it('retargets formulas elsewhere when cells move within a worksheet', async () => {
+        const raw = patched_basic([
+            [
+                '/xl/worksheets/sheet1.xml',
+                '<c r="B2"><v>30</v></c><c r="C2" t="b"><v>1</v></c>',
+                '<c r="A1"><v>10</v></c>'
+                    + '<c r="B2"><f>$A$1+A1</f><v>20</v></c>',
+            ],
+            [
+                '/xl/worksheets/sheet2.xml',
+                '<c r="B2"><v>9.99</v></c>',
+                '<c r="B2"><f>people!A1*2</f><v>20</v></c>',
+            ],
+        ]);
+
+        const out = write_xlsx_workbook_cell_edits(raw, [{
+            sheetIndex: 0,
+            edits: [
+                { row: 0, col: 0, value: '' },
+                { row: 2, col: 2, value: '10', movedFrom: { row: 0, col: 0 } },
+            ],
+        }]);
+        const { data } = await parse_xlsx(out);
+
+        expect(data.sheets[0].rows[2][2]?.raw).toBe(10);
+        expect(data.sheets[0].rows[1][1]).toMatchObject({
+            formula: '=$C$3+C3',
+            formatted: '??',
+            formulaResultPending: true,
+        });
+        expect(data.sheets[1].rows[1][1]).toMatchObject({
+            formula: '=people!C3*2',
+            formatted: '??',
+            formulaResultPending: true,
+        });
+    });
+
+    it('applies chained moves in order and respects explicit formula edit order', async () => {
+        const raw = patched_basic([[
+            '/xl/worksheets/sheet1.xml',
+            '<c r="B2"><v>30</v></c><c r="C2" t="b"><v>1</v></c>',
+            '<c r="A1"><v>10</v></c>'
+                + '<c r="D1"><f>A1</f><v>10</v></c>'
+                + '<c r="D2"><f>A1</f><v>10</v></c>',
+        ]]);
+        const out = write_xlsx_workbook_cell_edits(raw, [{
+            sheetIndex: 0,
+            edits: [
+                { row: 0, col: 0, value: '' },
+                {
+                    row: 0, col: 1, value: '', valueEditOrder: 2,
+                    movedFrom: { row: 0, col: 0, order: 1 },
+                },
+                {
+                    row: 0, col: 2, value: '10', valueEditOrder: 2,
+                    movedFrom: { row: 0, col: 1, order: 2 },
+                },
+                { row: 0, col: 3, value: '=A1', valueEditOrder: 0 },
+                { row: 1, col: 3, value: '=A1', valueEditOrder: 3 },
+            ],
+        }]);
+        const { data } = await parse_xlsx(out);
+
+        expect(data.sheets[0].rows[0][3]?.formula).toBe('=C1');
+        expect(data.sheets[0].rows[1][3]?.formula).toBe('=A1');
+    });
+
+    it('refuses a move that would retarget a what-if data table input', () => {
+        const raw = patched_basic([[
+            '/xl/worksheets/sheet1.xml',
+            '<c r="B2"><v>30</v></c><c r="C2" t="b"><v>1</v></c>',
+            '<c r="A1"><v>10</v></c>'
+                + '<c r="D1"><f t="dataTable" ref="D1:D2" r1="A1"></f><v>20</v></c>',
+        ]]);
+        expect(() => write_xlsx_workbook_cell_edits(raw, [{
+            sheetIndex: 0,
+            edits: [
+                { row: 0, col: 0, value: '' },
+                {
+                    row: 2, col: 2, value: '10', valueEditOrder: 1,
+                    movedFrom: { row: 0, col: 0, order: 1 },
+                },
+            ],
+        }])).toThrow(/data table/i);
+    });
+
+    it('retains overwritten move provenance and leaves styled equals text literal', async () => {
+        const raw = patched_basic([[
+            '/xl/worksheets/sheet1.xml',
+            '<c r="B2"><v>30</v></c><c r="C2" t="b"><v>1</v></c>',
+            '<c r="A1"><v>10</v></c><c r="B1"><v>20</v></c>'
+                + '<c r="D1"><f>A1</f><v>10</v></c>',
+        ]]);
+        const out = write_xlsx_workbook_cell_edits(raw, [{
+            sheetIndex: 0,
+            edits: [
+                { row: 0, col: 0, value: '' },
+                { row: 0, col: 1, value: '' },
+                {
+                    row: 0, col: 2, value: '20', valueEditOrder: 2,
+                    movedFrom: {
+                        row: 0, col: 1, order: 2,
+                        previous: [{
+                            sourceRow: 0, sourceCol: 0,
+                            destinationRow: 0, destinationCol: 2, order: 1,
+                        }],
+                    },
+                },
+                {
+                    row: 1, col: 3, value: '=A1', valueEditOrder: 0,
+                    runs: [{ text: '=A1', style: { bold: true } }],
+                },
+            ],
+        }]);
+        const { data } = await parse_xlsx(out);
+
+        expect(data.sheets[0].rows[0][3]?.formula).toBe('=C1');
+        expect(data.sheets[0].rows[1][3]).toMatchObject({ raw: '=A1' });
+        expect(data.sheets[0].rows[1][3]?.formula).toBeUndefined();
+    });
+
+    it('allows a blank source cell to participate in an otherwise coherent move', () => {
+        const raw = readFileSync('src/test/fixtures/basic.xlsx');
+        expect(() => write_xlsx_workbook_cell_edits(raw, [{
+            sheetIndex: 0,
+            edits: [{
+                row: 20, col: 2, value: '', valueEditOrder: 1,
+                movedFrom: { row: 20, col: 1, order: 1 },
+            }],
+        }])).not.toThrow();
+    });
+
     it('writes several worksheets through one workbook operation', async () => {
         const raw = readFileSync('src/test/fixtures/basic.xlsx');
         const out = write_xlsx_workbook_cell_edits(raw, [

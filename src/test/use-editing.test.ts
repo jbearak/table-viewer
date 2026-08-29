@@ -976,6 +976,66 @@ describe('use_editing — history capture', () => {
         expect(hook_result!.is_dirty).toBe(false);
     });
 
+    it('retains the order of an explicit same-text formula choice', async () => {
+        await render_capturing();
+        await act(async () => {
+            hook_result!.commit_edits([{
+                source_row: 0, source_col: 0, value: 'a', editOrder: 9,
+            }], 'Edit cell');
+        });
+
+        expect(hook_result!.dirty_cells.get('0:0')).toEqual({
+            value: 'a', base: 'a', valueEditOrder: 9,
+        });
+    });
+
+    it('keeps canonical cut provenance even when the destination text is unchanged', async () => {
+        await render_capturing();
+        await act(async () => {
+            hook_result!.commit_edits([{
+                source_row: 0,
+                source_col: 0,
+                value: 'a',
+                movedFrom: { source_row: 4, source_col: 3 },
+                editOrder: 1,
+            }], 'Paste');
+        });
+
+        expect(hook_result!.dirty_cells.get('0:0')).toEqual({
+            value: 'a',
+            base: 'a',
+            movedFrom: { row: 4, col: 3, order: 1 },
+            valueEditOrder: 1,
+        });
+    });
+
+    it('keeps an earlier move when a later move overwrites its destination', async () => {
+        await render_capturing();
+        await act(async () => {
+            hook_result!.commit_edits([{
+                source_row: 0, source_col: 0, value: 'first', editOrder: 1,
+                movedFrom: { source_row: 1, source_col: 0 },
+            }], 'Paste');
+            hook_result!.commit_edits([{
+                source_row: 0, source_col: 0, value: 'second', editOrder: 2,
+                movedFrom: { source_row: 2, source_col: 0 },
+            }], 'Paste');
+        });
+
+        expect(hook_result!.dirty_cells.get('0:0')?.movedFrom).toEqual({
+            row: 2,
+            col: 0,
+            order: 2,
+            previous: [{
+                sourceRow: 1,
+                sourceCol: 0,
+                destinationRow: 0,
+                destinationCol: 0,
+                order: 1,
+            }],
+        });
+    });
+
     it('records a revert of a previous edit as leaving the overlay', async () => {
         await render_capturing();
         await act(async () => { hook_result!.commit_edit(0, 0, 'A'); });

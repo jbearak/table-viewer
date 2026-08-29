@@ -2,6 +2,9 @@ import {
     element_close,
     update_formula_cached_values,
     worksheet_formula_dependencies,
+    worksheet_formula_move_edits,
+    is_xlsx_formula_edit,
+    worksheet_content_cells,
     type XlsxCellEdit,
 } from './xlsx-cell-write';
 import {
@@ -9,6 +12,10 @@ import {
     type WorkbookFormulaPlan,
 } from './formula-dependencies';
 import type { FormulaCalculationResult } from './formula-calculation';
+import {
+    compile_a1_formula_move_retargeter,
+    type XlsxFormulaCellMove,
+} from './xlsx-formula';
 import type { PackedFormulaDependencies } from './data-source/interface';
 import { worksheet_scan_input } from './ooxml-worksheet-scan';
 import {
@@ -360,7 +367,7 @@ export function write_xlsx_workbook_cell_edits(
     worksheets: readonly XlsxWorksheetCellEdits[],
     options?: XlsxWorkbookWriteOptions,
 ): Uint8Array {
-    const active = worksheets.filter(
+    let active = worksheets.filter(
         ({ edits, link_edits }) => edits.length > 0 || (link_edits?.length ?? 0) > 0,
     );
     if (active.length === 0) return raw;
@@ -385,6 +392,166 @@ export function write_xlsx_workbook_cell_edits(
 
     const parts = worksheet_part_entries_from_package(zip);
     const sheet_names = parts.map((part) => part.name);
+    const moves: XlsxFormulaCellMove[] = [];
+    const moved_sources = new Map<string, string>();
+    const moved_destinations = new Set<string>();
+    for (const worksheet of active) {
+        for (const edit of worksheet.edits) {
+            if (edit.movedFrom === undefined) continue;
+            const source = edit.movedFrom;
+            for (const previous of source.previous ?? []) {
+                moves.push({
+                    order: previous.order,
+                    sheetIndex: worksheet.sheetIndex,
+                    sourceRow: previous.sourceRow,
+                    sourceColumn: previous.sourceCol,
+                    destinationRow: previous.destinationRow,
+                    destinationColumn: previous.destinationCol,
+                });
+            }
+            if (
+                !Number.isSafeInteger(source.row)
+                || source.row < 0
+                || source.row >= 1_048_576
+                || !Number.isSafeInteger(source.col)
+                || source.col < 0
+                || source.col >= 16_384
+                || !Number.isSafeInteger(source.order ?? 0)
+                || (source.order ?? 0) < 0
+                || !Number.isSafeInteger(edit.row)
+                || edit.row < 0
+                || edit.row >= 1_048_576
+                || !Number.isSafeInteger(edit.col)
+                || edit.col < 0
+                || edit.col >= 16_384
+            ) throw new Error('Invalid formula move coordinates');
+            const source_key = `${worksheet.sheetIndex}:${source.row}:${source.col}`;
+            const destination_key = `${worksheet.sheetIndex}:${edit.row}:${edit.col}`;
+            const ordered_source_key = `${source.order ?? 0}:${source_key}`;
+            const ordered_destination_key = `${source.order ?? 0}:${destination_key}`;
+            const previous = moved_sources.get(ordered_source_key);
+            if (previous !== undefined && previous !== destination_key) {
+                throw new Error('One source cell cannot move to several destinations');
+            }
+            if (moved_destinations.has(ordered_destination_key)) {
+                throw new Error('Several source cells cannot move to one destination');
+            }
+            moved_sources.set(ordered_source_key, destination_key);
+            moved_destinations.add(ordered_destination_key);
+            moves.push({
+                order: source.order ?? 0,
+                sheetIndex: worksheet.sheetIndex,
+                sourceRow: source.row,
+                sourceColumn: source.col,
+                destinationRow: edit.row,
+                destinationColumn: edit.col,
+            });
+        }
+    }
+    const validated_sources = new Set<string>();
+    const validated_destinations = new Set<string>();
+    for (const move of moves) {
+        if (!Number.isSafeInteger(move.sheetIndex) || move.sheetIndex < 0
+            || !Number.isSafeInteger(move.sourceRow) || move.sourceRow < 0 || move.sourceRow >= 1_048_576
+            || !Number.isSafeInteger(move.destinationRow) || move.destinationRow < 0 || move.destinationRow >= 1_048_576
+            || !Number.isSafeInteger(move.sourceColumn) || move.sourceColumn < 0 || move.sourceColumn >= 16_384
+            || !Number.isSafeInteger(move.destinationColumn) || move.destinationColumn < 0 || move.destinationColumn >= 16_384
+            || !Number.isSafeInteger(move.order ?? 0) || (move.order ?? 0) < 0) {
+            throw new Error('Invalid formula move coordinates');
+        }
+        const source_key = `${move.order ?? 0}:${move.sheetIndex}:${move.sourceRow}:${move.sourceColumn}`;
+        const destination_key = `${move.order ?? 0}:${move.sheetIndex}:${move.destinationRow}:${move.destinationColumn}`;
+        if (validated_sources.has(source_key) || validated_destinations.has(destination_key)) {
+            throw new Error('A move operation contains duplicate cells');
+        }
+        validated_sources.add(source_key);
+        validated_destinations.add(destination_key);
+    }
+    if (moves.length > 0) {
+        const edits_by_address = new Map<string, XlsxCellEdit>();
+        for (const worksheet of active) {
+            for (const edit of worksheet.edits) {
+                edits_by_address.set(`${worksheet.sheetIndex}:${edit.row}:${edit.col}`, edit);
+            }
+        }
+        const content_sources = new Set<string>();
+        const moves_by_sheet = new Map<number, XlsxFormulaCellMove[]>();
+        for (const move of moves) {
+            const sheet_moves = moves_by_sheet.get(move.sheetIndex) ?? [];
+            sheet_moves.push(move);
+            moves_by_sheet.set(move.sheetIndex, sheet_moves);
+        }
+        for (let sheet_index = 0; sheet_index < parts.length; sheet_index += 1) {
+            const sheet_moves = moves_by_sheet.get(sheet_index) ?? [];
+            if (sheet_moves.length === 0) continue;
+            const content = read_part_bytes(zip, `/${parts[sheet_index].path}`);
+            if (content === null) throw new Error('Could not read a worksheet to validate a move');
+            for (const key of worksheet_content_cells(
+                worksheet_scan_input(content),
+                sheet_moves.map((move) => ({ row: move.sourceRow, col: move.sourceColumn })),
+            )) content_sources.add(`${sheet_index}:${key}`);
+        }
+        const destinations_by_operation = new Set(moves.map((move) =>
+            `${move.order ?? 0}:${move.sheetIndex}:${move.destinationRow}:${move.destinationColumn}`));
+        for (const move of moves) {
+            const source_key = `${move.sheetIndex}:${move.sourceRow}:${move.sourceColumn}`;
+            const destination_key = `${move.sheetIndex}:${move.destinationRow}:${move.destinationColumn}`;
+            if (!edits_by_address.has(destination_key)) {
+                throw new Error('A move destination has no matching cell edit');
+            }
+            const destination_in_operation = destinations_by_operation.has(
+                `${move.order ?? 0}:${move.sheetIndex}:${move.sourceRow}:${move.sourceColumn}`,
+            );
+            const source_edit = edits_by_address.get(source_key);
+            if (!destination_in_operation && (
+                source_edit === undefined ? content_sources.has(source_key) : source_edit.value !== ''
+            )) {
+                throw new Error('A move source was not cleared');
+            }
+        }
+        const retarget_formula = compile_a1_formula_move_retargeter(sheet_names, moves);
+        active = active.map((worksheet) => ({
+            ...worksheet,
+            edits: worksheet.edits.map((edit) => {
+                if (!is_xlsx_formula_edit(edit)) return edit;
+                return {
+                    ...edit,
+                    value: retarget_formula(
+                        edit.value,
+                        worksheet.sheetIndex,
+                        edit.valueEditOrder ?? Number.POSITIVE_INFINITY,
+                    ),
+                };
+            }),
+        }));
+        const formula_budget = create_workbook_budget();
+        const active_by_index = new Map(active.map((entry) => [entry.sheetIndex, entry]));
+        for (let sheet_index = 0; sheet_index < parts.length; sheet_index += 1) {
+            const content = read_part_bytes(zip, `/${parts[sheet_index].path}`);
+            if (content === null) throw new Error('Could not read a worksheet to save');
+            const current = active_by_index.get(sheet_index);
+            const excluded = new Set((current?.edits ?? []).map(
+                (edit) => `${edit.row}:${edit.col}`,
+            ));
+            const derived = worksheet_formula_move_edits(
+                worksheet_scan_input(content),
+                sheet_index,
+                sheet_names,
+                moves,
+                excluded,
+                formula_budget,
+            );
+            if (derived.length === 0) continue;
+            active_by_index.set(sheet_index, {
+                sheetIndex: sheet_index,
+                edits: [...(current?.edits ?? []), ...derived],
+                ...(current?.link_edits === undefined ? {} : { link_edits: current.link_edits }),
+            });
+        }
+        active = [...active_by_index.values()].sort(
+            (left, right) => left.sheetIndex - right.sheetIndex,
+        );
+    }
     const formula_invalidations_by_sheet = new Map<number, Array<{
         readonly row: number;
         readonly column: number;
@@ -468,7 +635,10 @@ export function write_xlsx_workbook_cell_edits(
         readonly value: string;
     }>>();
     const formula_write_plan = options?.formulaWritePlan?.[XLSX_FORMULA_WRITE_PLAN];
-    for (const result of formula_write_plan?.results ?? []) {
+    // A move changes formula source text after the renderer's calculation plan
+    // was made. Its numeric results describe the old formulas, so retain none;
+    // every result address was already added to invalidations above.
+    for (const result of moves.length > 0 ? [] : formula_write_plan?.results ?? []) {
         const sheet = formula_results_by_sheet.get(result.sheetIndex) ?? [];
         sheet.push(result);
         formula_results_by_sheet.set(result.sheetIndex, sheet);

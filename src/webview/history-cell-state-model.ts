@@ -49,6 +49,7 @@ import {
 import {
     dirty_entry_value_changed,
     make_dirty_entry,
+    move_provenance_equal,
     worksheet_target_matches,
     type CsvDirtyEntry,
     type WorksheetTarget,
@@ -113,6 +114,8 @@ export interface PresentValueDimension {
     readonly value: HistoryValue;
     readonly base: HistoryValue;
     readonly basePending: boolean;
+    readonly movedFrom?: CsvDirtyEntry['movedFrom'];
+    readonly valueEditOrder?: number;
 }
 
 export type OverlayValueDimension = UntouchedValueDimension | PresentValueDimension;
@@ -176,10 +179,16 @@ export function value_only_overlay(
     value: HistoryValue,
     base: HistoryValue,
     base_pending = false,
+    moved_from?: CsvDirtyEntry['movedFrom'],
+    value_edit_order?: number,
 ): PresentCellOverlayState {
     return {
         kind: 'present',
-        value: { kind: 'present', value, base, basePending: base_pending },
+        value: {
+            kind: 'present', value, base, basePending: base_pending,
+            ...(moved_from === undefined ? {} : { movedFrom: moved_from }),
+            ...(value_edit_order === undefined ? {} : { valueEditOrder: value_edit_order }),
+        },
         hyperlink: { kind: 'untouched' },
     };
 }
@@ -202,10 +211,16 @@ export function combined_overlay(
     hyperlink: CellHyperlink | null,
     base_hyperlink: CellHyperlink | null,
     base_pending = false,
+    moved_from?: CsvDirtyEntry['movedFrom'],
+    value_edit_order?: number,
 ): PresentCellOverlayState {
     return {
         kind: 'present',
-        value: { kind: 'present', value, base, basePending: base_pending },
+        value: {
+            kind: 'present', value, base, basePending: base_pending,
+            ...(moved_from === undefined ? {} : { movedFrom: moved_from }),
+            ...(value_edit_order === undefined ? {} : { valueEditOrder: value_edit_order }),
+        },
         hyperlink: { kind: 'present', value: hyperlink, base: base_hyperlink },
     };
 }
@@ -265,9 +280,11 @@ export function overlay_state_from_dirty_entry(
             entry.link ?? null,
             entry.baseLink ?? null,
             base_pending,
+            entry.movedFrom,
+            entry.valueEditOrder,
         );
     }
-    return value_only_overlay(value, base, base_pending);
+    return value_only_overlay(value, base, base_pending, entry.movedFrom, entry.valueEditOrder);
 }
 
 /** Rebuild the store entry a present overlay state describes. */
@@ -283,6 +300,8 @@ export function dirty_entry_from_overlay_state(
         base.runs,
         state.hyperlink.kind === 'present' ? state.hyperlink.value : undefined,
         state.hyperlink.kind === 'present' ? state.hyperlink.base : undefined,
+        state.value.kind === 'present' ? state.value.movedFrom : undefined,
+        state.value.kind === 'present' ? state.value.valueEditOrder : undefined,
     );
     const base_pending = state.value.kind === 'present' && state.value.basePending;
     return base_pending ? { ...entry, base_pending: true } : entry;
@@ -305,6 +324,8 @@ function value_dimensions_equal(
     }
     if (right.kind === 'untouched') return false;
     return left.basePending === right.basePending
+        && move_provenance_equal(left.movedFrom, right.movedFrom)
+        && left.valueEditOrder === right.valueEditOrder
         && history_values_equal(left.value, right.value)
         && history_values_equal(left.base, right.base);
 }
@@ -522,6 +543,8 @@ function value_metadata_moved(before: CellOverlayState, after: CellOverlayState)
     const right = present_value_dimension(after);
     if (left === undefined || right === undefined) return false;
     return left.basePending !== right.basePending
+        || !move_provenance_equal(left.movedFrom, right.movedFrom)
+        || left.valueEditOrder !== right.valueEditOrder
         || !history_values_equal(left.base, right.base);
 }
 
@@ -841,6 +864,17 @@ function copy_overlay(
             value: value_of(value.value),
             base: value_of(value.base),
             basePending: value.basePending,
+            ...(value.movedFrom === undefined ? {} : {
+                movedFrom: {
+                    row: value.movedFrom.row,
+                    col: value.movedFrom.col,
+                    order: value.movedFrom.order,
+                    ...(value.movedFrom.previous === undefined ? {} : {
+                        previous: value.movedFrom.previous.map((move) => ({ ...move })),
+                    }),
+                },
+            }),
+            ...(value.valueEditOrder === undefined ? {} : { valueEditOrder: value.valueEditOrder }),
         }
         : { kind: 'untouched', anchor: value_of(value.anchor) };
     const copied_link_dimension: OverlayHyperlinkDimension = hyperlink.kind === 'present'

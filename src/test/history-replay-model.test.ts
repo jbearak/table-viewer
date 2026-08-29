@@ -100,6 +100,48 @@ function refusal_of(
 }
 
 describe('planning an undo', () => {
+    it('restores cut provenance when a move is redone', () => {
+        const destination = delta({
+            row: 2,
+            column: 3,
+            before: absent_overlay(),
+            after: value_only_overlay(
+                value('source'), value('destination'), false, { row: 0, col: 0, order: 1 },
+            ),
+            persisted: 'destination',
+        });
+        const plan = plan_of(
+            [cell(destination)],
+            'redo',
+            overlays(
+                { '0:2:3': absent_overlay() },
+                undefined,
+                { '0:2:3': 'destination' },
+            ),
+        );
+
+        expect(plan.writes[0]?.entry?.movedFrom).toEqual({ row: 0, col: 0, order: 1 });
+    });
+
+    it('refuses to synthesize an unsafe reverse move after save', () => {
+        const destination = delta({
+            row: 2,
+            column: 3,
+            before: absent_overlay(),
+            after: value_only_overlay(
+                value('source'), value('destination'), false, { row: 0, col: 0, order: 1 },
+            ),
+            persisted: 'destination',
+        });
+        const refusal = refusal_of(
+            [cell(destination)],
+            'undo',
+            overlays({ '0:2:3': absent_overlay() }, undefined, { '0:2:3': 'source' }),
+        );
+
+        expect(refusal.reason).toBe('conflict');
+    });
+
     it('restores the entry the cell held before the edit', () => {
         const before = value_only_overlay(value('first'), value('disk'));
         const after = value_only_overlay(value('second'), value('disk'));

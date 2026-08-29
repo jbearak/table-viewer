@@ -40,7 +40,10 @@ export function collect_save_payload(
         }
         // A link-only entry contributes no text edit: its value equals its
         // base, and emitting it would rewrite an unedited cell's `<c>`.
-        if (dirty_entry_value_changed(entry)) edits[key] = entry.value;
+        if (dirty_entry_value_changed(entry) || entry.movedFrom !== undefined
+            || entry.valueEditOrder !== undefined) {
+            edits[key] = entry.value;
+        }
         // Runs and the link dimension ride along: the xlsx save plan reads
         // `valueRuns`/`link` off the exact entry; string-only consumers
         // (the CSV serializer) ignore them.
