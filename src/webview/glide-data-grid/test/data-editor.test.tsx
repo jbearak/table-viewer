@@ -4280,35 +4280,38 @@ a new line char ""more quotes"" plus a tab  ."	https://google.com`)
         }
     );
 
-    test("Resize Last Column commits when a later move reports the primary button released", () => {
-        vi.useFakeTimers();
-        const resizeEnd = vi.fn();
-        render(
-            <EventedDataEditor
-                {...basicProps}
-                columns={[
-                    { title: "A", width: 500 },
-                    { title: "B", width: 494 },
-                ]}
-                overscrollX={32}
-                onColumnResize={vi.fn()}
-                onColumnResizeEnd={resizeEnd}
-            />,
-            { wrapper: Context }
-        );
-        prep();
-        const cancelAnimationFrame = vi.spyOn(window, "cancelAnimationFrame");
-        const canvas = screen.getByTestId("data-grid-canvas");
-        fireEvent.mouseDown(canvas, { clientX: 994, clientY: 16 });
-        fireEvent.mouseMove(canvas, { clientX: 999, clientY: 16, buttons: 1 });
+    test.each([0, 2])(
+        "Resize Last Column commits when a later move reports buttons=%i without the primary button",
+        buttons => {
+            vi.useFakeTimers();
+            const resizeEnd = vi.fn();
+            render(
+                <EventedDataEditor
+                    {...basicProps}
+                    columns={[
+                        { title: "A", width: 500 },
+                        { title: "B", width: 494 },
+                    ]}
+                    overscrollX={32}
+                    onColumnResize={vi.fn()}
+                    onColumnResizeEnd={resizeEnd}
+                />,
+                { wrapper: Context }
+            );
+            prep();
+            const cancelAnimationFrame = vi.spyOn(window, "cancelAnimationFrame");
+            const canvas = screen.getByTestId("data-grid-canvas");
+            fireEvent.mouseDown(canvas, { clientX: 994, clientY: 16 });
+            fireEvent.mouseMove(canvas, { clientX: 999, clientY: 16, buttons: 1 });
 
-        fireEvent.mouseMove(window, { clientX: 999, clientY: 16, buttons: 0 });
-        fireEvent.mouseMove(window, { clientX: 999, clientY: 16, buttons: 0 });
+            fireEvent.mouseMove(window, { clientX: 999, clientY: 16, buttons });
+            fireEvent.mouseMove(window, { clientX: 999, clientY: 16, buttons });
 
-        expect(resizeEnd).toHaveBeenCalledTimes(1);
-        expect(cancelAnimationFrame).toHaveBeenCalled();
-        cancelAnimationFrame.mockRestore();
-    });
+            expect(resizeEnd).toHaveBeenCalledTimes(1);
+            expect(cancelAnimationFrame).toHaveBeenCalled();
+            cancelAnimationFrame.mockRestore();
+        }
+    );
 
     test("Resize Last Column cancels edge scrolling on unmount", () => {
         vi.useFakeTimers();

@@ -299,7 +299,7 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
         [applyColumnResizeAtPointer, columns, eventTargetRef, maxColumnWidth, scheduleResizeEdgeScroll]
     );
 
-    React.useEffect(() => {
+    React.useLayoutEffect(() => {
         resizeEdgeScrollTickRef.current = resizeEdgeScrollTick;
     }, [resizeEdgeScrollTick]);
 
@@ -516,7 +516,7 @@ const DataGridDnd: React.FunctionComponent<DataGridDndProps> = p => {
             const canvas = canvasRef?.current;
             // A release outside the webview may not deliver mouseup. The first
             // later move still reports the current primary-button state.
-            if (resizeColRef.current !== undefined && event.buttons === 0) {
+            if (resizeColRef.current !== undefined && (event.buttons & 1) === 0) {
                 finishInterruptedResize();
                 return;
             }
